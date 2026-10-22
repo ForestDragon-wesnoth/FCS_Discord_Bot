@@ -22051,7 +22051,7 @@ SCENARIO 759 — System libraries: promote from a match, !match sync, undo, rest
 !match sync funcs nothere
 ?? ❌ system `default` has no formula function `nothere`
 !match sync spells
-?? ❌ `spells` — sync one of: aliases, tiles, funcs, all.
+?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, all.
 !match sync all calc
 ?? ❌
 ?tab "!system func info default ca"
@@ -28320,3 +28320,479 @@ host folders). `!server errors` (administrators) lists their own server's
 crashes and `show <ref>` adds the traceback; `!owner errors` lists every
 server's, and `clear` empties the log while ref numbers keep counting.
 The log is saved in data/errors.json, so a restart keeps it.
+
+
+SCENARIO 891 — max_entities_per_match caps a summoning passive, whole bodies, revives and copies
+-----------------------------------------------------------------------------------------------
+
+!match new mx MX 10 6
+!match use mx
+!ent add sm Summoner 20 1 1 10
+!ent add k Knight 20 8 5 5
+!assert "len(all_entities()) == 2"
+!gpassive add call on_turn_start "summon_near({'name': 'imp', 'vars': {'hp': 1}}, 3, 3, 3)"
+!system set default max_entities_per_match 4
+!turn next
+!turn next
+!assert "len(all_entities()) == 4"
+!turn next
+?? FAILED
+?? the match holds 4 of at most 4 units (max_entities_per_match)
+!assert "len(all_entities()) == 4"
+!gpassive remove call
+!ent remove imp2
+!ent add d Dragon 30 5 1 1
+!part add d head Head 5 5
+?? ❌ Can't add `head`
+!ent remove d
+!ent add d Dragon 30 5 1 1
+!ent remove imp
+!part add d head Head 5 5
+!template save d wyrm
+!ent remove d
+!ent add g2 G2 10 9 3 1
+!template spawn wyrm 5 1
+?? ❌ Can't add `wyrm` (2 units with its parts): the match holds 3 of at most 4 units
+!assert "not has_template('nope') and len(all_entities()) == 3"
+!ent kill k
+!ent add g Guard 10 9 1 1
+!ent add g3 G3 10 9 5 1
+!ent revive k
+?? ❌ Can't add `k`
+!assert "has_corpse('k') and len(all_entities()) == 4"
+!match new other Other 6 6
+!ent copy sm other
+?? Copied
+!system set default max_entities_per_match -1
+!template spawn wyrm 5 1
+?? Spawned `wyrm`
+!assert "len(all_entities()) == 5 and len(parts('wyrm')) == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. max_entities_per_match (default -1, no
+limit) caps the units a match holds; parts count, corpses don't. A global
+on_turn_start passive summoning an imp every turn stays under
+summon_event_limit forever, and the cap stops it at 4 units (its third
+summon FAILS with the cap's wording). Bodies are checked whole before the
+first unit spawns: `!part add` past the cap is refused, and a template with
+a part needing 2 slots when only 1 is free is refused with nothing
+spawned. A revive is refused at the cap (the corpse stays), a copy into
+another match counts against that match, and -1 lifts the cap.
+
+
+SCENARIO 892 — tile_place / tile_template_of: an attack that leaves a fire tile behind
+--------------------------------------------------------------------------------------
+
+!match new tp TP 8 6
+!match use tp
+!tile def new fire
+!tile def data fire glyph ^
+!tile def data fire burn 2
+!tile def hook fire on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
+!ent add mage Mage 20 1 1 10
+!ent add orc Orc 20 4 3 5
+!ent set_var mage actions.scorch.target location
+!ent set_var mage actions.scorch.body "tile_place('fire', target, data={'burn': 5})"
+!action mage scorch 3 3
+!assert "tile_template_of(3, 3) == 'fire' and tile_get(3, 3, 'burn') == 5"
+!ent move orc 1 left
+!assert "entity[orc].hp == 15"
+!ent kill orc
+!eval "tile_place('fire', 3, 3)"
+!assert "tile_get(3, 3, 'burn') == 2 and has_corpse('orc')"
+!assert "tile_template_of(5, 5) == None and tile_template_of([3, 3]) == 'fire'"
+!eval "tile_place('ice', 2, 2)"
+?? ❌ tile_place: tile template 'ice' not found.
+!eval "tile_place('fire', 20, 2)"
+?? ❌ tile_place: (20,2) outside 8x6
+!eval "tile_place('fire', 2, 2, ['burn'])"
+?? ❌ tile_place: data must be a dict of fields, got list.
+!eval "tile_place('fire', 2, 2, {'_template': 'x'})"
+?? reserved keys: _template
+!ent set_var mage n "$(tile_template_of(3, 3))"
+!assert "entity[mage].n == 'fire'"
+!ent set_var mage m "$(tile_place('fire', 5, 5))"
+?? ❌ function 'tile_place' changes game state and is banned in a $() inline argument
+!assert "tile_template_of(5, 5) == None"
+
+Expected: HARNESS-ALLOWS-ERRORS. tile_place(template, x, y, data=None) is
+`!tile place` from a formula: an action targeting a cell leaves a fire tile
+there with its burn overridden to 5 (a location target passes whole), the
+template's on_enter hook burns the orc that walks in (20 -> 15), and a
+second placement on the orc's corpse cell replaces the tile data while the
+corpse stays. tile_template_of reads the template name back (None for a
+plain cell; a coordinate list works). Unknown templates, off-map cells,
+non-dict data and reserved keys are refused; tile_template_of is allowed in
+`$()`, tile_place is not.
+
+
+SCENARIO 893 — !remind: public and secret reminders counted in turns
+-------------------------------------------------------------------
+
+!match new rm RM 8 6
+!match use rm
+!ent add a A 10 1 1 10
+!ent add b B 10 3 3 5
+!remind 2 the bridge collapses
+?? ⏰ Reminder `1` set for 2 turn(s) from now.
+!remind secret 1 ambush ready
+?? (secret: hosts only)
+!remind list
+?? `2` in 1 turn(s) 🔒 secret: ambush ready
+?? `1` in 2 turn(s): the bridge collapses
+!as player pip
+!remind list
+?! ambush
+?? the bridge collapses
+!as host
+!host access set "turn" all
+!as player pip
+!turn next
+?! ambush ready
+!as host
+!remind list
+?? 🔒 due, waiting for a host: ambush ready
+?? 🔒 (hosts) ⏰ Reminder: ambush ready
+!remind list
+?! ambush
+!turn next
+?? ⏰ Reminder: the bridge collapses
+?? It is now **B**'s turn
+!system set default reminder_message_format "Note from {by} after {turns}: {text}"
+!remind 1 check morale
+!turn next
+?? Note from cli after 1: check morale
+!remind 3 later
+!remind remove 4
+?? Removed reminder `4`.
+!undo command
+!remind list
+?? `4` in 3 turn(s): later
+!as restart
+!remind list
+?? `4` in 3 turn(s): later
+!remind remove 9
+?? ❌ No reminder `9`
+!remind 0 x
+?? ❌ The count must be at least 1
+!remind secret 2
+?? ❌ Usage: `!remind [secret] <n> <text ...>`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!remind <n> <text>` prints its line in
+the reply of the command that passes the n-th turn from now (turns_elapsed,
+so ATB counts the same). A `secret` reminder is for hosts: players' `!remind
+list` doesn't show it, and when a player passes its turn (here through
+`!host access set "turn" all`) its line waits; the host's next command on
+the match (`!remind list`) ends with it. reminder_message_format words the
+line ({text}, {by}, {turns}). Reminders are match state: `!remind remove`
+undoes, and a restart keeps them.
+
+
+SCENARIO 894 — !eval --trace lists the formula's reads and every var write it caused
+-------------------------------------------------------------------------------------
+
+!match new tr TR 8 6
+!match use tr
+!ent add a A 10 1 1 10
+!ent add b B 10 3 3 10
+!gpassive add mirror on_var_changed scope=deep target=hp "entity[b].seen = entity[a].hp"
+!match var set x 2
+!func def dmg n "entity[a].hp = entity[a].hp - n"
+!eval --trace "entity[a].hp = entity[a].hp - match.x\nmatch.x = 3\nvar_add('a', 'gold', 5)\nentity[a].hp = 99\ndmg(1)\nmatch_var_del('x')"
+?? read entity[a].hp = 10
+?? read match.x = 2
+?? write entity[a].hp: 10 → 8
+??   ↳ write entity[b].seen: None → 8
+?? write match.x: 2 → 3
+?? write entity[a].gold: None → 5
+?? write entity[a].hp: 8 → 10 (clamped from 99)
+?? write entity[a].hp: 10 → 9
+?? delete match.x (was 3)
+!assert "entity[a].hp == 9 and entity[b].seen == 9"
+!passive add a heal on_turn_start "entity[self].hp = entity[self].hp + 1"
+!eval --trace --as-passive a heal
+?? write entity[a].hp: 9 → 10
+!eval --trace --as a "entity[self].missing + 1"
+?? ❌ Variable 'missing' is not defined.
+?? Trace:
+!eval --trace "1 + 1"
+?? = `2`
+?? **Trace:** no var reads or writes.
+!eval --trace
+?? ❌ Usage: `!eval --trace
+
+Expected: HARNESS-ALLOWS-ERRORS. `--trace` lists, in order, each
+`entity[x].path` / `match.path` read the formula itself makes (a `!func`
+it calls included) with the value, and every var write and delete the eval
+caused, made through syntax, functions (var_add, match_var_del) or the
+passives those writes set off (indented with ↳): old → new, and the value a
+clamp cut down. The death checks the engine runs after a write aren't the
+formula's reads and aren't listed. A failing formula still shows its trace.
+
+
+SCENARIO 895 — The acting unit (opt-in rule): bold glyph, a "now acting" line, an image outline
+-------------------------------------------------------------------------------------------------
+
+!match new hl HL 8 6
+!match use hl
+!ent add d Dragon 30 2 2 10
+!ent set_vars d footprint_w=2 footprint_h=2 team=red
+!part add d head Head 5 5
+!ent set_var head initiative 50
+!ent add s Scout 10 7 5 1
+!ent set_var s team blue
+!turn next
+?? It is now **Head**'s turn
+!map
+?! now acting
+!map scene list
+?! acting
+!system set default active_unit_highlight true
+!map
+?? ▶ now acting: Head
+!map scene list
+?? • entity `d` at (2,2) 2x2
+?? (layer 100, acting)
+!turn next
+!map
+?? ▶ now acting: Dragon
+!system set default active_unit_image_highlight false
+!map scene list
+?! acting
+!map
+?? ▶ now acting: Dragon
+!system set default active_unit_line_format "Acting: {name}!"
+!map
+?? Acting: Dragon!
+!turn next
+!match fog on
+!ent set_var s fog_vision_radius 1
+!as view red
+!map
+?! Acting
+?! Scout
+!as view clear
+!map
+?? Acting: Scout!
+!system set default active_unit_highlight false
+!map
+?! Acting
+
+Expected: active_unit_highlight (off by default) marks the unit whose turn
+it is once a turn has started: bold where ANSI colour works, else a line
+under the plain-text map (active_unit_line_format), and in images an
+outline around it (its team colour brightened, white without a team
+colour; active_unit_image_highlight false drops the image outline only).
+The head's own turn marks the dragon's 2x2 body that draws it (`!map scene
+list` names the acting placement). A team view that can't see the actor
+(red can't see the fogged blue scout) gets no line.
+
+SCENARIO 896 — System status definitions: edited on the system, inherited, copied into a new match
+----------------------------------------------------------------------------------------------------
+
+!system new base
+!system status def base burn
+?? Set its effect with `!system status tick base burn "<formula>"`.
+!system status tick base burn "entity[self].hp = entity[self].hp - 2"
+!system status when base burn turn_start
+!system status maxlevel base burn 3
+!system status data base burn level 1
+!system status tags base burn fire
+!system status hook base burn on_added "log('burning')"
+!system status display base burn "{name} x{level}"
+!system status def base wet
+!system status removes base wet tag:fire
+?tab "!system status tick base b"
+?? → '!system status tick base burn '
+!system status list base
+?? - `burn` (when=turn_start, max_lvl=3)
+?? - `wet` (when=turn_end, no tick)
+!system new night parent=base
+!system status stack night burn add_level
+!system status list night
+?? - `burn` (when=turn_start, stack=add_level, max_lvl=3)
+?? - `wet` (when=turn_end, no tick) (inherited)
+!system status del night wet
+?? it hides the inherited one; `!system unset night status_definitions:wet` brings it back
+!system status info night wet
+?? ❌ status definition `wet` isn't defined on system `night`.
+!system status list night
+?? Hidden here: `wet`
+!system status info base burn
+?? "tick_when": "turn_start"
+?? "on_added": "log('burning')"
+!match new nm Night 8 6 system=night
+!match use nm
+!ent add k Knight 20 2 2 10
+!status apply k burn
+!status apply k burn
+?? Applied `burn` to `k` (level=2
+!status list
+?? - `burn` (when=turn_start, stack=add_level, max_lvl=3)
+?! wet
+!assert "status_get('k', 'burn', 'level') == 2"
+!turn next
+!assert "entity[k].hp == 18"
+!system unset night status_definitions:wet
+!system status list night
+?? - `wet` (when=turn_end, no tick) (inherited)
+!match new bm Base 8 6 system=base
+!match use bm
+!status list
+?? - `burn` (when=turn_start, max_lvl=3)
+?? - `wet` (when=turn_end, no tick)
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system status <action> <system> ...`
+runs every definition subcommand of `!status` on a system's library. The
+child `night` inherits `burn` and `wet`; setting burn's stack mode there
+makes it night's own (the list stops marking it inherited); deleting `wet`
+hides it until `!system unset` brings it back. A new match on night starts
+with night's effective definitions: two applications add a level
+(add_level), and the turn-start tick takes 2 hp. A match on base gets
+base's definitions, stack mode unset.
+
+SCENARIO 897 — System tables and macros: inherited, promoted, renamed, copied into a new match
+-----------------------------------------------------------------------------------------------
+
+!system new lib
+!system table def lib loot gold:3,sword:1
+?? Defined table `loot` = `gold:3,sword:1` on `lib`.
+!system macro set lib dmg "!ent hp $1 -$2\n!ent info $1"
+?? Saved macro `dmg` (2 line(s)) on `lib`.
+!system new lib2 parent=lib
+!system table list lib2
+?? - `loot`: `gold:3,sword:1` (inherited)
+!system macro show lib2 dmg
+?? **macro `dmg`** on `lib2` (inherited)
+!system macro copy lib2 dmg hurt
+!system macro list lib2
+?? - `dmg`: `!ent hp $1 -$2` (inherited)
+?? - `hurt`: `!ent hp $1 -$2`
+!system table rename lib loot spoils
+?? Renamed table `loot` to `spoils` on `lib`.
+!match new tm T 6 6 system=lib2
+!match use tm
+!ent add o Orc 12 2 2
+!macro list
+?? Macros: `dmg`, `hurt`
+!macro run hurt o 5
+?? HP: 7/12
+!table roll spoils
+?? 🎲 table `spoils` →
+!assert "table_roll('spoils') in ['gold', 'sword']"
+!table def herbs mint:1,sage:1
+!macro set heal "!ent hp $1 +$2"
+!system table promote lib2 herbs
+?? Promoted table `herbs` from match `tm` to `lib2`. New matches get it; live ones with `!match sync`.
+!system macro promote lib heal
+!system macro show lib2 heal
+?? **macro `heal`** on `lib2` (inherited)
+!system table list lib2
+?? - `herbs`: `mint:1,sage:1`
+?? - `spoils`: `gold:3,sword:1` (inherited)
+!system info lib2
+?? - tables: 2 (1 set here)
+?? - macros: 3 (1 set here)
+!system diff lib lib2
+?? - tables only in `lib2`: `herbs`
+?? - macros only in `lib2`: `hurt`
+!as restart
+!system macro list lib2
+?? - `heal`: `!ent hp $1 +$2` (inherited)
+?? - `hurt`: `!ent hp $1 -$2`
+
+Expected: `!system table` (the `!table` grammar: def) and `!system macro`
+(the `!macro` grammar: set) keep a system's tables and macros, inherited
+by child systems like the other libraries. A new match on lib2 starts with
+lib2's effective tables and macros and runs them (`hurt` takes 5 hp from
+the orc; `spoils` rolls). `promote` copies a match's table or macro into a
+system. Both libraries survive a restart.
+
+SCENARIO 898 — !match sync statuses / tables / macros into a live match, diff, undo
+------------------------------------------------------------------------------------
+
+!system new sy
+!match new sm S 6 6 system=sy
+!match use sm
+!ent add a A 10 2 2
+!status def burn
+!status maxlevel burn 5
+!status apply a burn 4
+!table def loot gold:1
+!macro set only "!roll 1d4"
+!system status def sy burn
+!system status maxlevel sy burn 2
+!system status def sy chill
+!system table def sy loot gold:1
+!system table def sy gems ruby:1,pearl:2
+!system macro set sy setup "!roll 1d6"
+!match sync statuses diff
+?? statuses: would add `chill`; would replace `burn`.
+?? `burn`: max_level: 5 → 2
+!assert "status_get('a', 'burn', 'level') == 4"
+!match sync statuses burn
+?? statuses: replaced `burn`.
+!assert "status_get('a', 'burn', 'level') == 2"
+!status list
+?! chill
+!match sync all
+?? statuses: added `chill`; 1 already the same.
+?? tables: added `gems`; 1 already the same.
+?? macros: added `setup`.
+!macro list
+?? Macros: `only`, `setup`
+!table list
+?? - `gems`: ruby:1,pearl:2
+!undo command
+!table list
+?! gems
+!macro list
+?! setup
+!match sync macros nope
+?? ❌ system `sy` has no macro `nope`.
+
+Expected: HARNESS-ALLOWS-ERRORS. `!match sync statuses|tables|macros
+[name]` copies the system's entries over the live match's, keeping
+match-only ones (`only`). A synced status definition with a lower
+max_level lowers the live instance (burn 4 → 2), as `!status maxlevel`
+does. `diff` shows the change first and changes nothing; undo takes a sync
+back.
+
+SCENARIO 899 — System status / table / macro refusals and lint
+--------------------------------------------------------------
+
+!system new bad
+!system status def bad sting
+!system status tick bad sting "zap(1)"
+?? ⚠️ Function 'zap' isn't a built-in or a `!func` on this system or its matches yet; it fails until one is defined.
+!system status hook bad sting on_removed "import os"
+?? ❌ Invalid on_removed formula:
+!system status tick nosystem sting "x = 1"
+?? ❌
+!system status when bad nosuch turn_end
+?? ❌ No status definition `nosuch`.
+!system status stack bad sting sideways
+?? ❌ stack mode must be one of
+!system table def bad t gold:x
+?? ❌ invalid table spec
+!system macro set bad m "if 1\n!roll 1d4"
+?? ❌ macro structure error
+!system macro promote bad nothing
+?? ❌ No active match
+!system table info bad nothing
+?? ❌ table `nothing` isn't defined on system `bad`.
+!system status apply bad sting
+?? ❌ Unexpected `apply bad sting`
+!system lint bad
+?? ⚠️ status `sting` tick: calls `zap`, which isn't in the system's functions
+!system func def bad zap n "n + 1"
+!system lint bad
+?? all clean
+!system status info bad sting
+?? "tick": "zap(1)"
+
+Expected: HARNESS-ALLOWS-ERRORS. A system status tick calling a function
+the system lacks is stored with a ⚠️ (a match may define it), a
+disallowed construct is refused; unknown definitions, stack modes, table
+specs and broken macro structure are refused as on a match. `!system
+lint` lists the system's status ticks and hooks; once the system defines
+`zap` it is clean.

@@ -26,13 +26,18 @@ _GROUND_FALLBACK = "#5b4632"  # muted brown earth
 def _unit_style(style: Any) -> Dict[str, int]:
     """A scene's unit_style (team outline / tint rules), with the rule
     defaults for anything missing or malformed."""
-    out = {"outline_width": 3, "outline_opacity": 100, "tint_opacity": 0}
+    out: Dict[str, Any] = {"outline_width": 3, "outline_opacity": 100,
+                           "tint_opacity": 0, "active_width": 3}
     if isinstance(style, dict):
-        for k in out:
+        for k in list(out):
             try:
                 out[k] = max(0, int(style.get(k, out[k])))
             except (TypeError, ValueError):
                 pass
+    on = style.get("active_on", True) if isinstance(style, dict) else True
+    out["active_on"] = bool(on)
+    color = style.get("active_color") if isinstance(style, dict) else None
+    out["active_color"] = color if isinstance(color, str) else "white"
     return out
 
 
@@ -567,10 +572,24 @@ class SceneRenderer:
         outline = None
         if img is not None and p.get("kind") == "entity":
             outline = self._rgb(p.get("tint"))
-        if outline is not None and self._unit["outline_width"] > 0:
-            margin = self._outline_px() + 2
+        wpx = self._outline_px()
+        if outline is None or self._unit["outline_width"] <= 0:
+            outline = None
+        # The acting unit (active_unit_image_highlight): its team colour
+        # brightened halfway to white, else the active colour (white), as
+        # an outline around its sprite or glyph.
+        u = self._unit
+        if p.get("active") and p.get("kind") == "entity" and u["active_on"]:
+            team = self._rgb(p.get("tint"))
+            if team is not None:
+                outline = tuple((c + 255) // 2 for c in team[:3])
+            else:
+                outline = self._rgb(u["active_color"]) or (255, 255, 255)
+            wpx = self._outline_px(u["active_width"])
+            ring_op = 100
         else:
-            outline, margin = None, 0
+            ring_op = None
+        margin = wpx + 2 if outline is not None else 0
         # The body's pixels, and the box of them that is drawn: the window
         # plus `margin` on each side (the outline reads its neighbours).
         W, H = w * cell, h * cell
@@ -634,25 +653,26 @@ class SceneRenderer:
                     body.alpha_composite(piece, (max(0, px), max(0, py)),
                                          (max(0, -px), max(0, -py)))
         if outline is not None:
-            body = self._outline(body, outline)
+            body = self._outline(body, outline, wpx, ring_op)
         bx, by = x0 + box[0], y0 + box[1]
         sx, sy = max(0, -bx), max(0, -by)
         canvas.alpha_composite(body, (bx + sx, by + sy), (sx, sy))
 
-    def _outline_px(self) -> int:
-        """team_outline_width at sprite_cell_size cells, scaled to this cell
-        size, in pixels."""
-        return max(1, round(self._unit["outline_width"] * self.cell
-                            / max(1, self._base)))
+    def _outline_px(self, width: Optional[int] = None) -> int:
+        """team_outline_width (or `width`) at sprite_cell_size cells, scaled
+        to this cell size, in pixels."""
+        w = self._unit["outline_width"] if width is None else width
+        return max(1, round(w * self.cell / max(1, self._base)))
 
-    def _outline(self, body, rgb):
+    def _outline(self, body, rgb, wpx: Optional[int] = None,
+                 opacity: Optional[int] = None):
         """`body` with an outline in `rgb` around its drawn shape:
         team_outline_width pixels at sprite_cell_size cells, scaled to this
         cell size. Drawn outside the shape where the body has transparent
         room, and just inside the body's edge where the shape reaches it."""
         from PIL import ImageFilter, ImageChops
         u = self._unit
-        wpx = self._outline_px()
+        wpx = wpx or self._outline_px()
         alpha = body.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
         pad = Image.new("L", (body.width + 2 * wpx, body.height + 2 * wpx), 0)
         pad.paste(alpha, (wpx, wpx))
@@ -666,7 +686,8 @@ class SceneRenderer:
                 [wpx, wpx, body.width - 1 - wpx, body.height - 1 - wpx], fill=0)
         inner = ImageChops.multiply(alpha, frame)
         ring = ImageChops.lighter(outer, inner)
-        a = max(0, min(255, int(u["outline_opacity"] / 100.0 * 255)))
+        op = u["outline_opacity"] if opacity is None else opacity
+        a = max(0, min(255, int(op / 100.0 * 255)))
         ring = ring.point(lambda v: a if v else 0)
         layer = Image.new("RGBA", body.size, tuple(rgb[:3]) + (0,))
         layer.putalpha(ring)

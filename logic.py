@@ -52,6 +52,25 @@ CROSS_MATCH_GUARD: "contextvars.ContextVar[Optional[Any]]" = (
 CRASH_CONTEXT: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = (
     contextvars.ContextVar("vtt_crash_context", default=None))
 
+# `!eval --trace`: a list collecting each var read the formula's own syntax
+# makes and every var write while the eval runs (record_trace); None = off.
+VAR_TRACE: "contextvars.ContextVar[Optional[List[Dict[str, Any]]]]" = (
+    contextvars.ContextVar("vtt_var_trace", default=None))
+
+
+def record_trace(kind: str, who: str, path: str, old: Any = None,
+                 new: Any = None, *, clamped_from: Any = None,
+                 depth: int = 0) -> None:
+    """Append one `!eval --trace` entry (kind read / write / delete) when a
+    trace is running; at most 1000 per eval."""
+    trace = VAR_TRACE.get()
+    if trace is not None and len(trace) <= 1000:
+        trace.append({"kind": kind, "who": who, "path": path,
+                      "old": copy.deepcopy(old), "new": copy.deepcopy(new),
+                      "clamped_from": copy.deepcopy(clamped_from),
+                      "depth": depth})
+
+
 # The (unit, status) whose tick formula is running: removing that status
 # from that unit inside its own tick is an expiry (`removed_by` expired).
 STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
@@ -2015,6 +2034,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "if a system genuinely needs bigger waves."
         ),
     },
+    "max_entities_per_match": {
+        "default": -1,
+        "schema": {"type": "int", "min": 0, "unlimited": True},
+        "desc": (
+            "The most units a match may hold at once (-1 = no limit, the "
+            "default). Every unit counts: body parts and snake segments "
+            "too, corpses not. Each way a unit is made is refused at the "
+            "limit: `!ent add`, summons, template spawns, clones, copies, "
+            "transfers arriving from another match and revives. "
+            "summon_event_limit resets with every command, so a passive "
+            "summoning one unit per turn stays under it forever; this cap "
+            "stops that."
+        ),
+    },
     # ---- Death system ---------------------------------------------------
     # An entity "dies" when a configurable formula condition evaluates
     # truthy on it. The check fires after every var-event chain (the
@@ -3642,6 +3675,68 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "{team}, any var, {?var?}...{/?} conditionals), plus {short_id} "
             "(the id's first 8 characters) and {round}. A viewer outside a "
             "disguised unit's team sees the disguise. Empty = no line."
+        ),
+    },
+    "active_unit_highlight": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Mark the unit whose turn it is on maps (off by default): its "
+            "glyph is bold on surfaces with ANSI colour, a plain-text map "
+            "ends with active_unit_line_format, and images outline it "
+            "(active_unit_image_highlight). A glued part's or a hidden "
+            "rider's turn marks the body / vehicle drawn for it; nothing is "
+            "marked before the first turn or where the channel's view can't "
+            "see it."
+        ),
+    },
+    "active_unit_line_format": {
+        "default": "▶ now acting: {name}",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line under a plain-text map (no ANSI colour) naming the "
+            "unit whose turn it is, when active_unit_highlight is on and the "
+            "view sees it on that map. {name} = its name (a disguise's to "
+            "viewers outside its team). Empty = no line."
+        ),
+    },
+    "active_unit_image_highlight": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Graphics, with active_unit_highlight on: outline the unit whose "
+            "turn it is, around its sprite or glyph and in place of its "
+            "team outline: its team colour brightened toward white, or "
+            "active_unit_outline_color when it has no team colour. False = "
+            "images mark nothing."
+        ),
+    },
+    "active_unit_outline_color": {
+        "default": "white",
+        "schema": {"type": "str"},
+        "desc": (
+            "Graphics: the active unit's outline colour for a unit without "
+            "a team colour (a colour name or #rrggbb)."
+        ),
+    },
+    "active_unit_outline_width": {
+        "default": 3,
+        "schema": {"type": "int", "min": 1, "max": 32},
+        "desc": (
+            "Graphics: thickness of the active unit's outline at "
+            "sprite_cell_size cells (scaled with the cell size, like "
+            "team_outline_width)."
+        ),
+    },
+    "reminder_message_format": {
+        "default": "⏰ Reminder: {text}",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line a `!remind` reminder prints when its turn comes, in "
+            "the reply of the command that passed the turn. Placeholders: "
+            "{text}, {by} (who set it), {turns} (the turns it waited). A "
+            "secret reminder's line starts with `🔒 (hosts)` and shows in "
+            "a host's reply. Empty = the text alone."
         ),
     },
     "turn_start_hidden_message_format": {
@@ -5464,7 +5559,9 @@ MERGE_RULES: Dict[str, Optional[str]] = {
     "default_entity_passives": "id",
 }
 SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
-                                     "formula_functions")
+                                     "formula_functions",
+                                     "status_definitions", "tables",
+                                     "macros")
 
 # Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
 # it can't bound the system chain itself). Set with `!owner ceiling <key>
@@ -5695,13 +5792,20 @@ class GameSystem:
     # shorthands (`dmg`, `heal`, `mv`, ...) that every match in this
     # system starts with. Stored as plain `name -> expansion` strings.
     aliases: Dict[str, str] = field(default_factory=dict)
+    # Status definitions (`!system status`, the shape of
+    # Match.status_definitions), named dice tables (`!system table`, name
+    # -> table text) and macros (`!system macro`, name -> body), copied
+    # into a new match like the libraries above.
+    status_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    tables: Dict[str, str] = field(default_factory=dict)
+    macros: Dict[str, str] = field(default_factory=dict)
     # The system this one inherits from (live: MatchManager resolves the
-    # chain on every read), or None for a root. `settings` and the three
+    # chain on every read), or None for a root. `settings` and the
     # libraries above then hold only this system's OWN overrides.
     parent: Optional[str] = None
     # Inherited entries this system removes: a merge rule's keys
-    # (MERGE_RULES) or a library's names ("aliases", "tile_templates",
-    # "formula_functions") -> the keys hidden here.
+    # (MERGE_RULES) or a library's names (SYSTEM_LIBRARIES) -> the keys
+    # hidden here.
     removed: Dict[str, List[str]] = field(default_factory=dict)
     # A GM's note on what the system is for (`!system describe`), shown in
     # `!system list` / `info`. Each system's own: not inherited.
@@ -5749,6 +5853,12 @@ class GameSystem:
                 aname: str(self.aliases[aname])
                 for aname in sorted(self.aliases.keys())
             },
+            "status_definitions": {
+                n: copy.deepcopy(d)
+                for n, d in sorted(self.status_definitions.items())
+            },
+            "tables": {n: str(t) for n, t in sorted(self.tables.items())},
+            "macros": {n: str(b) for n, b in sorted(self.macros.items())},
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
@@ -5797,6 +5907,14 @@ class GameSystem:
             str(k): str(v) for k, v in raw_sys_aliases.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        sys_statuses = {
+            k: copy.deepcopy(v)
+            for k, v in (d.get("status_definitions") or {}).items()
+            if isinstance(k, str) and isinstance(v, dict)}
+        sys_tables, sys_macros = (
+            {k: v for k, v in (d.get(key) or {}).items()
+             if isinstance(k, str) and isinstance(v, str)}
+            for key in ("tables", "macros"))
         if dropped:
             print(f"[systems] '{d.get('name')}': dropped gamerule(s) that no "
                   f"longer exist: {', '.join(sorted(map(str, dropped)))}")
@@ -5811,7 +5929,8 @@ class GameSystem:
         return GameSystem(
             name=d["name"], settings=settings,
             tile_templates=templates, formula_functions=funcs,
-            aliases=sys_aliases,
+            aliases=sys_aliases, status_definitions=sys_statuses,
+            tables=sys_tables, macros=sys_macros,
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
             description=str(d.get("description") or ""),
@@ -6255,6 +6374,7 @@ class Entity:
         """
         if self._match is not None:
             raise VTTError(f"Entity '{self.id}' is already in a match")
+        match.check_unit_room(1, f"`{self.id}`")
         self.map = match.get_map(map_name).name
         # ID collision check honors `corpse_id_uniqueness` — under the
         # default true setting a corpse's id reserves the name too, so
@@ -6883,6 +7003,13 @@ class Entity:
             self._match.check_body_fits(self, trial, f"`{self.id}`.{path}")
         old_post_attempt = _path_resolve(self.vars, path)
         self._set_path(path, value)
+        if VAR_TRACE.get() is not None:
+            record_trace("write", self.id, path,
+                         None if old_post_attempt is _MISSING
+                         else old_post_attempt, value,
+                         clamped_from=intended_value if was_clamped else None,
+                         depth=self._match._var_event_depth
+                         if self._match is not None else 0)
         if self._match is not None:
             self._match.track_template_change(self, path, deleted=False)
             self._match._body_reshaped(self, path)
@@ -7071,6 +7198,10 @@ class Entity:
         if old is _MISSING:
             raise NotFound(f"Variable '{path}' not found on entity '{self.id}'.")
         self._del_path(path)
+        if VAR_TRACE.get() is not None:
+            record_trace("delete", self.id, path, old,
+                         depth=self._match._var_event_depth
+                         if self._match is not None else 0)
         if self._match is not None:
             self._match.track_template_change(self, path, deleted=True)
             self._match._body_reshaped(self, path)
@@ -8100,6 +8231,12 @@ class Match:
     # name a player's.
     alias_authors: Dict[str, str] = field(default_factory=dict)
     func_authors: Dict[str, str] = field(default_factory=dict)
+    # `!remind`: [{id, due, text, secret, by}], due = the turns_elapsed value
+    # at which it fires; reminder_seq numbers them. A secret one that fires
+    # waits in held_reminders until a host runs a command on the match.
+    reminders: List[Dict[str, Any]] = field(default_factory=list)
+    reminder_seq: int = 0
+    held_reminders: List[Dict[str, Any]] = field(default_factory=list)
 
     # ---- named random tables ----
     # name -> a roll_table spec ("key:weight,..." CSV). Rolled by name via the
@@ -13537,7 +13674,31 @@ class Match:
         counter at each site so the two can't drift apart."""
         self.turns_elapsed += 1
         self._note_actor()
+        self._fire_reminders()
         self.history.record_turn(self)
+
+    def reminder_line(self, r: Dict[str, Any]) -> str:
+        """A reminder's line (reminder_message_format; a secret one marked)."""
+        fmt = str(self.rules.get("reminder_message_format", "") or "")
+        text = fmt.replace("{text}", str(r.get("text", ""))).replace(
+            "{by}", str(r.get("by") or "")).replace(
+            "{turns}", str(r.get("turns", ""))) if fmt else str(r.get("text"))
+        return ("🔒 (hosts) " + text) if r.get("secret") else text
+
+    def _fire_reminders(self) -> None:
+        """`!remind` reminders due at this turn boundary: a public one's line
+        goes out with the turn's output, a secret one waits in
+        held_reminders for a host."""
+        due = [r for r in self.reminders if r["due"] <= self.turns_elapsed]
+        if not due:
+            return
+        self.reminders = [r for r in self.reminders
+                          if r["due"] > self.turns_elapsed]
+        for r in due:
+            if r.get("secret"):
+                self.held_reminders.append(copy.deepcopy(r))
+            else:
+                self.surface_log([self.reminder_line(r)])
 
     def _note_actor(self) -> None:
         """Record the unit whose turn starts as its team's (and the table's)
@@ -15620,6 +15781,7 @@ class Match:
         from action import _rollback_match
         if not isinstance(template, dict):
             raise VTTError(f"Template `{name}` is not an entity dict.")
+        self.check_unit_room(self._body_count(template), f"`{name}`")
         pre = self.to_dict(include_history=False)
         root = {k: copy.deepcopy(v) for k, v in template.items()
                 if k not in ("parts",) + _TEMPLATE_META_KEYS}
@@ -16250,6 +16412,9 @@ class Match:
                 f"entities summoned in one command. Likely a runaway "
                 f"summon loop; raise the rule if this is intentional."
             )
+        self.check_unit_room(
+            self._body_count(template),
+            f"`{id_prefix or template.get('name') or 'the summon'}`")
 
         # Resolve placement.
         if not isinstance(x, int) or isinstance(x, bool) \
@@ -17383,6 +17548,7 @@ class Match:
         # Body parts snapshotted at death (see _store_corpse). Re-spawned
         # after the parent so reviving a creature restores its limbs.
         stored_parts = copy.deepcopy(corpse.get("parts") or [])
+        self.check_unit_room(1 + len(stored_parts), f"`{eid}`")
         # Stamp authoritative coords from the tile location, not the
         # embedded snapshot — desync defense.
         entity_dict["x"] = x
@@ -17724,6 +17890,31 @@ class Match:
             d["parts"] = parts
         return d
 
+    @staticmethod
+    def _body_count(form: Dict[str, Any]) -> int:
+        """Units a summon template / statblock makes: itself, its parts and
+        its segments."""
+        n = 1
+        for key in ("parts", "segments"):
+            spec = form.get(key)
+            if isinstance(spec, (dict, list, tuple)):
+                n += sum(1 for pt in (spec.values() if isinstance(spec, dict)
+                                      else spec) if isinstance(pt, dict))
+        return n
+
+    def check_unit_room(self, n: int, what: str) -> None:
+        """Refuse adding `n` units (`what`, for the message) past the
+        max_entities_per_match rule. Bodies check their whole count before
+        the first unit spawns, so none arrives without its parts."""
+        cap = int(self.rules.get("max_entities_per_match", -1))
+        if cap >= 0 and len(self.entities) + n > cap:
+            held = len(self.entities)
+            raise VTTError(
+                f"Can't add {what}" + (f" ({n} units with its parts)"
+                                       if n > 1 else "")
+                + f": the match holds {held} of at most {cap} units "
+                  f"(max_entities_per_match).")
+
     def _apply_statblock_parts(self, parent: "Entity",
                                parts_spec: Any) -> List[str]:
         """Spawn `parts_spec` as `parent`'s body parts. Accepts the two shapes
@@ -17776,6 +17967,7 @@ class Match:
                 d["x"], d["y"] = parent.x, parent.y
         if not part_list:
             return []
+        self.check_unit_room(len(part_list), f"the parts of `{parent.id}`")
         # Re-mint ids; remember the mapping so intra-subtree part_of links
         # resolve to the new ids (a child whose parent is also in the list).
         own_ids = {d["id"] for d in part_list if d.get("id")}
@@ -17921,6 +18113,9 @@ class Match:
         # GM edits freely, and a bad field used to crash halfway, after the
         # unit's parts were gone.
         check_unit_form(sb, "transform")
+        grown = self._body_count(sb) - 1 - len(self.entity_part_subtree(e.id))
+        if grown > 0:
+            self.check_unit_room(grown, f"`{e.id}`'s new form's parts")
         # Vehicle riders: if the entity currently carries riders, the new form
         # must still have a slot for each, or the riders would be orphaned
         # (flagged mounted to a slot-less form). If every rider's slot exists
@@ -18877,6 +19072,9 @@ class Match:
             "macro_authors": dict(self.macro_authors),
             "alias_authors": dict(self.alias_authors),
             "func_authors": dict(self.func_authors),
+            "reminders": copy.deepcopy(self.reminders),
+            "reminder_seq": self.reminder_seq,
+            "held_reminders": copy.deepcopy(self.held_reminders),
             "tables": dict(self.tables),
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
@@ -19096,6 +19294,12 @@ class Match:
             str(k): str(v) for k, v in raw_macros.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        m.reminders = [copy.deepcopy(r) for r in d.get("reminders") or []
+                       if isinstance(r, dict) and isinstance(r.get("due"), int)
+                       and isinstance(r.get("id"), int)]
+        m.reminder_seq = int(d.get("reminder_seq") or 0)
+        m.held_reminders = [copy.deepcopy(r) for r in
+                            d.get("held_reminders") or [] if isinstance(r, dict)]
         raw_ma = d.get("macro_authors")
         m.macro_authors = ({str(k): str(v) for k, v in raw_ma.items()
                             if k in m.macros and isinstance(v, str)}
@@ -20069,6 +20273,13 @@ class Match:
                     if meanings is not None:
                         meanings[my][mx] = "preview area"
 
+        # The acting unit's shown cells (active_unit_highlight): bold on a
+        # colour surface, a "now acting" line under a plain-text map.
+        actor = (self.active_display_unit(mp, pov_team)
+                 if "entities" not in hidden else None)
+        bold_cells = (set(self.entity_cells(self.entities[actor])) & unit_shown
+                      if actor is not None else set())
+
         # Window bounds: the viewport (vx, vy, vw, vh) clips the rendered
         # cells to a sub-rectangle of the grid (clamped); None = whole grid.
         if viewport is not None:
@@ -20099,6 +20310,8 @@ class Match:
                     parts.append(" ")     # stays in the previous run's span
                 name = colors[yy][xx]
                 code = TEXT_COLORS.get(name) if name else None
+                if (xx, yy) in bold_cells:
+                    code = f"1;{code}" if code else "1"
                 if code != active:
                     if active:
                         parts.append("\x1b[0m")
@@ -20111,6 +20324,12 @@ class Match:
             lines.append("".join(parts))
         if coords and x1 >= x0 and y1 >= y0:
             lines = self._ascii_rulers(lines, x0, x1, y0, y1)
+        if bold_cells and not colorize:
+            fmt = str(self.rules.get("active_unit_line_format", "") or "")
+            cur = self.entities.get(self.current_entity_id() or "")
+            if fmt and cur is not None:
+                lines.append(fmt.replace(
+                    "{name}", self.entity_display_name(cur, pov_team)))
         out = "\n".join(lines)
 
         # Auto-legend: glyph -> meanings, collected from the cells actually
@@ -20133,6 +20352,37 @@ class Match:
                         f"  {glyph} — " + ", ".join(legend_map[glyph]))
                 out = out + "\n" + "\n".join(leg_lines)
         return out
+
+    def active_display_unit(self, mp: "Map",
+                            pov_team: Optional[str]) -> Optional[str]:
+        """The unit drawn for the one whose turn it is, for the
+        active_unit_highlight marks on map `mp`: the actor itself, its body
+        when it is a glued part (or a region part without its own glyph),
+        its vehicle when it rides hidden. None when the rule is off, no
+        turn has started yet, or the view can't see it there."""
+        if not bool(self.rules.get("active_unit_highlight", False)) \
+                or self.turns_elapsed <= 0:
+            return None
+        e = self.entities.get(self.current_entity_id() or "")
+        if e is None or not getattr(e, "is_alive", True) \
+                or not self.entity_visible_to(e.id, pov_team):
+            return None
+        seen: "set[str]" = set()
+        while e.id not in seen:
+            seen.add(e.id)
+            if e.is_mounted and not e.is_visible_rider:
+                nxt = self.entities.get(e.mounted_on or "")
+            elif e.is_glued_part or (
+                    e.is_region_part and not self.entity_has_custom_glyph(e)):
+                nxt = self.entities.get(e.part_of or "")
+            else:
+                break
+            if nxt is None:
+                return None
+            e = nxt
+        if e.map != mp.name or not self.entity_visible_to(e.id, pov_team):
+            return None
+        return e.id
 
     # ---- graphics render model (render_scene) -----------------------
     # The sprite analog of render_ascii: a DECLARATIVE scene the graphics
@@ -20500,6 +20750,14 @@ class Match:
                         fog.append({"x": xx, "y": yy,
                                     "sprite": fog_sprite, "opacity": fog_op})
 
+        # The acting unit's placements carry `active` (active_unit_highlight;
+        # the same unit the ASCII map makes bold).
+        actor = (self.active_display_unit(mp, pov_team)
+                 if "entities" not in hidden else None)
+        if actor is not None:
+            for p in placements:
+                if p.get("kind") == "entity" and p.get("ref") == actor:
+                    p["active"] = True
         vp = None
         if viewport is not None:
             vx, vy, vw, vh = viewport
@@ -20517,6 +20775,12 @@ class Match:
                     "team_outline_opacity", 100))),
                 "tint_opacity": max(0, min(100, self._layer_rule(
                     "team_tint_opacity", 0))),
+                "active_on": bool(self.rules.get(
+                    "active_unit_image_highlight", True)),
+                "active_color": str(self.rules.get(
+                    "active_unit_outline_color", "white")),
+                "active_width": max(1, self._layer_rule(
+                    "active_unit_outline_width", 3)),
             },
             "tint_fill_opacity": max(0, min(100, self._layer_rule(
                 "tint_fill_opacity", 40))),
@@ -22124,8 +22388,8 @@ class MatchManager:
             s.set(key, copy.deepcopy(new))
 
     def system_library(self, s: "GameSystem", kind: str) -> Dict[str, Any]:
-        """`s`'s effective library `kind` (aliases / tile_templates /
-        formula_functions): each layer's entries over its parent's, minus
+        """`s`'s effective library `kind` (one of SYSTEM_LIBRARIES): each
+        layer's entries over its parent's, minus
         the names it hides. Copies."""
         out: Dict[str, Any] = {}
         for x in self.system_chain(s):
@@ -22424,6 +22688,10 @@ class MatchManager:
         for aname, expansion in self.system_library(sysobj, "aliases").items():
             if isinstance(aname, str) and isinstance(expansion, str):
                 m.aliases[aname] = expansion
+        # Status definitions, dice tables and macros, the same way. A
+        # system macro carries no author, so it runs as a host's.
+        for kind in ("status_definitions", "tables", "macros"):
+            setattr(m, kind, copy.deepcopy(self.system_library(sysobj, kind)))
         self.matches[m.id] = m
         return m.id
 
@@ -22476,6 +22744,7 @@ class MatchManager:
             for child in src.entities.values():
                 if child.part_of == pid and child.id not in order:
                     order.append(child.id)
+        dest.check_unit_room(len(order), f"`{eid}` to `{dest_mid}`")
         # Remap ids to avoid destination collisions (live ids + corpses).
         taken = set(dest._taken_entity_ids())
         idmap: Dict[str, str] = {}

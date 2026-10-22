@@ -7,13 +7,15 @@ list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
 they cite (L1-L15, D1-D18) are in `docs/combat_systems_fit.md`, and every
-"today" statement in them was checked on `836e3af`. When an idea ships, move
-its number to "Shipped" below; when the user strikes or rejects one, move it
-to "Off the list".
+"today" statement in them was checked on `836e3af`. When an idea ships in
+full (everything its entry asks for or assumes), its number moves to
+"Shipped" below and its entry is removed from the list; an idea shipped in
+part keeps its entry, trimmed to what is still open. When the user strikes
+or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#179-#181, #183, #186-#188, #200-#202, #205, #206, #216, #217, #222, #40 and #164 (multiple and nested maps, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), parts of #14.
 
 **Off the list:**
@@ -21,11 +23,6 @@ to "Off the list".
 - Covered by what shipped: #35 (a preset is a parent system), #85 (`!history
   export` + `!history import` into a new match).
 - Struck by the user: #7, #44, #45, #156.
-
-**Shipped from the list below:** #40 and #164 (multiple maps per match and
-nested maps; design, decisions and what stays deferred in
-`docs/multi_map_design.md`). Their entries below keep the original wording
-for reference.
 
 ## Small (a primitive, a rule, or a command)
 
@@ -49,15 +46,12 @@ for reference.
   - Note (with #70 / #115): private vars and hidden statuses need the existence-oracle treatment that document 2's audits apply to unit queries: `!find hp>5`, `status:`, `sort:`, `count` and `$()` must all treat a private var or a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
 - **#71 Progress clocks.** `!clock add/tick` keeps named clocks, shown in the `!state` header, firing a `clock_filled` event when one fills.
 - **#73 `!rest <selector>`.** Runs a GM-defined `rest_formula` rule on each selected unit.
-- **#75 `!remind <n> <text>`.** Posts a message after N turns, counted so it works under ATB.
 - **#76 Named map points.** `@gate` works anywhere a command takes `x y`, and `point_x` / `point_y` read it in formulas.
 - **#79 `!note add/list/remove`.** Per-match GM notes; pinned notes are visible to players and shown in `!state`.
 - **#83 `!roll <dice> <op> <n>`.** A roll against a target, e.g. "17 — success".
 - **#87 `line_walkable(eid, x, y)`.** Checks a straight-line walk for the unit's whole body, for charges and dashes.
 - **#89 `chance(percent)`** on the match RNG, so it respects `random_seed`.
 - **#90 `status_level` / `status_duration`.** Return 0 when the status is missing, so no `status_has` guard is needed.
-- **#93 `max_entities_per_match` rule,** a backstop against runaway summon loops in passives.
-  - Note: the rule sits next to `summon_event_limit`, which resets every command: a passive that summons one unit per turn stays under it forever, and only a per-match cap stops that. FCS1's Summoner, whose charged action summons units costing up to 300 arcana per cast, is the realistic case.
 - **#95 Vision radius through `apply_mods`,** so items and statuses can change sight.
 - **#98 Turn-order markers in `!list`.** Marks units that will skip their next turn and units with no initiative.
 - **#104 Dice pools in the dice grammar,** the same in `roll()`, `!roll` and `!roll odds`:
@@ -82,10 +76,8 @@ for reference.
 - **#122 `transform_keep_vars` rule.** Names vars a transform carries over. The default would be the ATB charge bar, which a transform resets today.
 - **#123 `round_end_message_format` and `match_start_message_format` rules,** twins of the round-start line.
 - **#124 Initiative reroll every round.** A rule that re-runs #59's formula at each round start.
-- **#127 `!eval --trace`.** Lists each var read and write a formula makes, for debugging GM formulas.
 - **#128 `!whisper <team> <text>`.** A host posts to every channel bound with that team's POV (handouts, secret info).
 - **#129 `!ent export <id>` / `!ent import <json>`.** A unit with its parts as JSON pasted in chat, to share between matches or bots without file access. Import goes through the template checks.
-- **#130 Active-unit highlight in ASCII.** Bold or inverted on color surfaces, plus a "now acting" legend line on plain text.
 - **#131 `!turn order [n]`.** The next n turns in round mode with skips marked; the round-mode twin of #27.
 - **#133 `!map around=<eid> [r]`.** A one-off window centered on a unit; the channel camera stays where it is.
 - **#134 `!history note <text>`.** Labels the latest snapshot, so `!history list` and undo previews say what it was.
@@ -133,9 +125,6 @@ for reference.
     - Names resolved per viewer: `say("{target} is hit")` shows a disguised unit's disguise to a POV that the disguise fools.
     - `say_to(team, text)` for information meant for one side.
     - One message per command on Discord: the `say()` lines of one command grouped into one reply.
-- **#218 `tile_place(template, x, y, map=None)`.**
-  - The formula twin of `!tile place`, for attacks that leave a tile behind: Solis Flame Throw places a fire tile when the attack is dodged; FCS1 Scorch Ground sets up to five tiles on fire. `tile_template_of(x, y)` reads it back.
-  - Today a formula writes the internal `_template` key with `tile_set` (D10). It works (`solis1.out`: a tree turned into fire from its own turn hook) and relies on an implementation detail.
 - **#219 Directional patterns.**
   - `cells_in_pattern(x, y, dir, offsets)`: offsets written for a unit facing `right` are rotated to `up`, `down` and `left`, clipped to the map and charged to `formula_cell_limit` like the other builders. Example: `[[1,-1],[1,0],[1,1],[2,-1],[2,0],[2,1]]` is FCS1 Frost Blast, a rectangle 2 deep and 3 wide in front of the caster. `!map preview pattern` draws it.
   - Open choice: diagonal directions. Rotating a grid shape by 45° isn't exact, so a pattern could carry its own diagonal list, or diagonals could be refused.
@@ -356,8 +345,6 @@ for reference.
   - A per-unit `layer` (ground / air / burrow) with occupancy tracked per layer.
   - A flyer passes over a ground unit or shares its cell, and block conditions can read the layer.
   - Elevation (#37) is separate: that one is terrain height.
-- **#140 System-wide status definitions, tables and macros.** `!defstatus`, `!deftable` and `!defmacro` give new matches on a system the GM's definitions, the way `!system tile` / `!system func` / `!system alias` now do for their libraries. Inheritance through the system chain comes with it.
-  - Note: this is D15 of docs/combat_systems_fit.md: today a prepared match cloned for each battle stands in for it.
 - **#141 User-defined commands.** `!cmd def <name> <usage> <body>` registers a command with named arguments, an access level and help text that runs an action or macro body. Players type `!attack goblin`, and the usage string feeds the stray-word check and Tab completion.
 - **#143 Team-based turns.** A `turn_mode` rule (`unit` | `team`). On a team's turn any of its units can act; `!turn next` passes to the next side, and hooks fire per side turn and per unit. Wesnoth / XCOM style.
 - **#144 Phase-based rounds.** A `round_phases` list (e.g. move, then act). `!turn next` cycles every unit through phase 1 before phase 2, with phase hooks.
@@ -428,7 +415,7 @@ for reference.
   - Two or three ready systems shipped with the bot as data, loadable on any server: status definitions, templates with actions, passives, tables, macros, a demo map.
   - Solis is a natural first one: its core is already built in `audit/combat/solis1.txt` and `solis2.txt`, and it is the smallest of the three systems.
   - The engine has no combat or inventory by design, so a new GM starts from an empty system. The scenarios show every piece on its own and none of them as a game. A starter system shows the composition, and doubles as a realistic board for the chaos harnesses.
-  - Shape depends on #162 (system packs) or a bundled `!store load` save, and on #140 (status definitions on systems).
+  - Shape depends on #162 (system packs) or a bundled `!store load` save.
 - **#227 Status application options.**
   - `status_apply(eid, name, level=None, duration=None, data=None, source=None, cap=None)`, and the same keys on `!status apply`:
     - `data` is merged into the instance before any add hook runs (L8: possession's new side, the taunter of a Taunted unit);
@@ -521,7 +508,6 @@ for reference.
 - **#37 Elevation.** Per-cell height, high-ground LOS, `height_diff`, and a link to #16's `move_cost`.
 - **#38 Light and darkness.** Light sources with radii, per-cell light levels, darkvision; fog and visibility read them.
 - **#39 Arbitrary and rotating footprints.** L-shaped and other non-rectangular bodies, and bodies that rotate with facing.
-- **#40 Linked maps.** Floors and portals: several matches connected, units moving between them, all with the same owner.
 - **#42 Discord interactive layer.** Select menus for `choose()`, action buttons, slash commands, turn pings and timers.
 - **#43 History replay.** Stepping through snapshots on a board, or an animated GIF of a session.
 - **#158 Campaign roster.** Characters stored at the server level, checked into a match and back out with their state (hp, inventory, XP vars). One roster serves a whole campaign of matches; it builds on the template library.
@@ -534,12 +520,8 @@ for reference.
 - **#162 System packs.**
   - A versioned file bundling a system (with its parent chain), its status definitions, templates, partials, macros and tables.
   - Servers can share a ruleset and upgrade it.
-  - Per-server storage (#41) has shipped; the pack still needs #140.
+  - Per-server storage (#41) and system status definitions, tables and macros (#140) have shipped.
 - **#163 Read-only web viewer.** A browser page showing a match's live map from the scene model, with per-team views behind a link token. Needs a web server and real security design.
-- **#164 Nested maps.**
-  - A small grid owned by a unit (a ship's deck, a building interior) that travels with it; units move between the outer and inner map.
-  - #40 links whole matches; this attaches a map to one unit.
-  - You said you want this eventually.
 
 ### New
 

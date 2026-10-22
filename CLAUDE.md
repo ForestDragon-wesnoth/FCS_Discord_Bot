@@ -388,7 +388,10 @@ back, load the schema with `ToolSearch` before calling
   match and nested maps (step 1 and 2a-2d built; §8).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
-  before proposing a feature, and keep it current when one ships.
+  before proposing a feature. When a feature ships in full (everything its
+  entry asks for or assumes), add its number to "Shipped" and DELETE its
+  entry in the same PR (user directive); a partly shipped one keeps its
+  entry, trimmed to what is still open.
 - **`docs/combat_systems_fit.md`**: three tabletop combat systems the user's
   group wrote (Solis, FCS1, NCS), what the bot can't do for them and what
   costs needless work; the background of ideas #200-#255.
@@ -1122,6 +1125,13 @@ hardcodes**.
   path.
 - **Occupancy:** one unit per cell, except units with the `__cell_stackable`
   var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
+- **Unit cap:** `max_entities_per_match` (-1 = none, the default) bounds
+  the units a match holds (parts and segments count, corpses don't):
+  `Match.check_unit_room` at `Entity.spawn`, and whole bodies are checked
+  before their first unit spawns (`_body_count`: `summon_entity`,
+  `spawn_template`, a revive with its stored parts, a transform's growth,
+  `copy_entity` into the destination, `_apply_statblock_parts`), so no body
+  arrives without its parts (891).
 - **Shields / temp hp:** named absorb pools under the roots in
   `temp_hp_sources` (default `shields`; per-unit `__temp_hp_sources`), each
   `{amount, priority, tags, not_tags}` or a number. `absorb_damage(eid, n,
@@ -1238,13 +1248,23 @@ hardcodes**.
   resume` runs them (`resume drop` discards); held commands are saved with
   the match (`paused.held`), so a restart keeps them; never an undo step;
   `!dry` runs during a pause (637-638, 822).
+- **Reminders** (`!remind [secret] <n> <text> | list | remove <id>`;
+  `Match.reminders` / `reminder_seq` / `held_reminders`, saved, undo
+  state): due at `turns_elapsed` + n, fired by `_begin_turn`
+  (`_fire_reminders`). A public one's line (`reminder_message_format`)
+  goes out through `surface_log` with the turn output; a secret one waits
+  in `held_reminders` and ends the reply of the next command a host runs
+  on the match (`CommandRegistry._run`, after the handler, inside that
+  command's undo step; `!as` doesn't count). Players' `!remind list` shows
+  the public ones only (893).
 
 ### 7.4 Statuses
 
 - **Instances** live in `entity.status[name]` (level, duration, any data);
   raw editing via `!ent status`. **Definitions** (`Match.status_definitions`,
   `!status def/tick/when/stack/maxlevel/data/tags/removes/blockedby/sprite/
-  drop/list/info`) describe a status ONCE; an instance resolves behaviour from
+  drop/list/info`; a system holds its own, `!system status`, copied into a
+  new match, §7.16) describe a status ONCE; an instance resolves behaviour from
   the definition of the same name. Duration decrement and self-removal live
   in the GM's tick formula; the engine forces no decay (390-391).
 - **Definition hooks** (`!status hook <name> <on_added|on_removed|on_changed>
@@ -1455,7 +1475,13 @@ hardcodes**.
   resolve BEFORE the access gate; an alias can't take a command's name
   (refused at def / promote, ignored if saved). Command roots and aliases
   are case-insensitive (`!Ent`, on Discord too). `!func` defines formula functions
-  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula.
+  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula;
+  `!eval --trace ...` lists, in order, the formula's own `entity[x]` /
+  `match.` reads (`FormulaEngine.trace_reads`, so engine-side checks such
+  as the death condition stay out) and every var write / delete the eval
+  caused, hook writes marked ↳ by `_var_event_depth` (`logic.VAR_TRACE`,
+  `record_trace` in `write_var` / `remove_var` and the match-var writers;
+  at most 1000 entries, 60 shown) (894).
 
 ### 7.8 Geometry, movement and blocking
 
@@ -1868,7 +1894,10 @@ hardcodes**.
 - **Tiles:** per-cell data (`!tile set/place/line/fill/copy/...`), templates
   (`!tile def` per match, `!system tile` per system, §7.16), precedence instance > template > rule for
   glyph / color / sprite / block / opaque; tile hooks (on_enter / on_exit /
-  on_stop / time hooks).
+  on_stop / time hooks). Formulas place a template with `tile_place(template,
+  x, y, data=None)` (`!tile place`: replaces the cell's data, corpses stay,
+  `data` overrides fields; mutating) and read it back with
+  `tile_template_of(x, y)` (892).
 - **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
   + time), dedicated glyph / color / sprite fields, `zone_shift`, `zone_*`
   prims, `zone_distance`.
@@ -2041,11 +2070,24 @@ hardcodes**.
   The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
+- **Acting unit** (`active_unit_highlight`, default OFF (user call), once
+  a turn has started): `Match.active_display_unit` picks the unit drawn for
+  the actor (its body for a glued part or a region part without a glyph,
+  its vehicle for a hidden rider; none when the view can't see it). ASCII
+  makes its shown cells bold (`1;` in the ANSI run code) or, without
+  colour, adds `active_unit_line_format` under the map; the scene marks its
+  placements `active` and `SceneRenderer` outlines them while
+  `active_unit_image_highlight` is on, in place of the team outline: the
+  team colour brightened halfway to white, or `active_unit_outline_color`
+  (white) without a team colour, `active_unit_outline_width` thick, sprites
+  and glyphs alike; `!map scene list` names the acting placement (895).
 - **Intended ASCII / graphics differences:** corpses and overlays are
   graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
   are a translucent fill; a unit's colour is an outline around its sprite;
   the image legend lists every look in the window (ASCII only top-layer
-  glyphs); layer order follows `sprite_layer_*`. Everything else must agree
+  glyphs); layer order follows `sprite_layer_*`; the acting unit is bold
+  (or named under a plain map) in ASCII and outlined in images.
+  Everything else must agree
   (§2 parity pass) (530-535, 711-717).
 
 ### 7.16 Matches, history and the table
@@ -2078,7 +2120,7 @@ hardcodes**.
   event_log_format by key, default_clamps by path, default_entity_passives
   by id — merge every layer over the parent's instead, a root's own value
   replacing the default as before), `system_value_source`,
-  `system_library(s, kind)` (aliases / tile_templates / formula_functions,
+  `system_library(s, kind)` (each of `SYSTEM_LIBRARIES`,
   copied into a NEW match at creation as before). Editors write an
   effective value back through `system_rule_write` /
   `system_library_write`, which store only the entries that differ from the
@@ -2097,19 +2139,28 @@ hardcodes**.
   on a parent moves the units of every inheriting system's matches and
   renames their clamps / default vars (`_inheritors`); a child's own engine
   formula equal to its parent's after a rename is dropped (753-756).
-- **System libraries** (aliases, tile templates, formula functions):
-  `!system alias|tile|func <action> <system> ...` edit them with the
-  grammar of `!alias` / `!tile def` / `!func` (action first, like alias),
-  through the effective library (editing an inherited entry makes it the
-  child's own whole entry; deleting one hides it). They reach NEW matches
-  only (copied at creation, user call); `!match sync <aliases|tiles|funcs>
+- **System libraries** (`SYSTEM_LIBRARIES`: aliases, tile templates,
+  formula functions, status definitions, tables, macros):
+  `!system alias|tile|func|status|table|macro <action> <system> ...` edit
+  them with the grammar of `!alias` / `!tile def` / `!func` / `!status` /
+  `!table` / `!macro` (action first, like alias), through the effective
+  library (editing an inherited entry makes it the child's own whole
+  entry; deleting one hides it). `!system status` runs the definition
+  subcommands of `!status` (`_status_def_sub`, shared with the match
+  command) on a scratch match holding the system's effective library
+  (`_system_scratch`) and writes it back. They reach NEW matches only
+  (copied at creation, user call; a system macro has no author, so it runs
+  as a host's); `!match sync <aliases|tiles|funcs|statuses|tables|macros>
   [name] | all` copies the system's effective entries over a live match's
-  (match-only entries kept, an undo step), and `!system <lib> promote
-  <system> <name>` copies one from the channel's match into the system.
+  (match-only entries kept, an undo step; a synced status definition
+  re-caps live instances like `!status maxlevel`), and `!system <lib>
+  promote <system> <name>` copies one from the channel's match into the
+  system.
   Formulas a system stores (rules, tile hooks / block / opaque, function
-  bodies) go through `_system_formula_warning`: a disallowed construct is
-  refused, a call to an unknown function is stored with a ⚠️ (a match may
-  define it later; a promote counts only the system's library) (757-759).
+  bodies, status ticks / hooks) go through `_system_formula_warning`: a
+  disallowed construct is refused, a call to an unknown function is
+  stored with a ⚠️ (a match may define it later; a promote counts only the
+  system's library) (757-759, 896-899).
 - **System tooling:** `!system rename` (`MatchManager.rename_system`: the
   matches on it, children's parent links, server / channel defaults follow;
   `system_name` survives `_rollback_match` and `_restore_snapshot` keeps
@@ -2118,7 +2169,8 @@ hardcodes**.
   <a> <b>` (effective rules and library entries, with each rule's source;
   open to players), `!system lint <name>` (admin: every formula the system
   and its matches store — formula rules, default passives, library tile
-  hooks / block / opaque / functions, and per match its functions,
+  hooks / block / opaque / functions / status ticks and hooks, and per
+  match its functions,
   passives, unit actions, watchers, status ticks, tile and zone hooks and
   conditions; an unknown function at system level is a ⚠️), `!help rule
   <rule>` (description, allowed values, default, value on this channel's
@@ -2451,6 +2503,13 @@ rejected already. Update this section in the PR that resolves an item.
   head's cell; a template spawn, revive or transform then puts that segment
   on the nearest free cell with a ⚠️. Whether spawns should recreate the
   overlap is open.
+
+- **A child's hide after a parent rename:** a child system's hidden
+  inherited entry (`GameSystem.removed`, any library or merge rule) is
+  stored by name, so when the parent renames that entry (`!system status
+  rename`, `!system table|macro rename`) the hide keeps the old name and
+  hides nothing; the renamed entry shows through in the child. Known
+  limitation, left as is (user: note it).
 
 - **Pass 43, deferred by the user ("decide later"):** T3 (a mid-round
   initiative change under `immediate` can cost a unit its turn or give it

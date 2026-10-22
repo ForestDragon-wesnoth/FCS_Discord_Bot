@@ -467,10 +467,12 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
 
 # `!system <sub>` library editors -> the library their `<name>` names.
 _SYSTEM_LIBS = {"alias": "aliases", "tile": "tile_templates",
-                "func": "formula_functions"}
+                "func": "formula_functions", "status": "status_definitions",
+                "table": "tables", "macro": "macros"}
 # `!match sync <kind>` -> the library named.
 _SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
-              "funcs": "formula_functions"}
+              "funcs": "formula_functions", "statuses": "status_definitions",
+              "tables": "tables", "macros": "macros"}
 
 
 # Placeholders _slot_names knows a source for (used to tell slots from
