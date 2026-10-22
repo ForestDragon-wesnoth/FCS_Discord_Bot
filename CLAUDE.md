@@ -1122,6 +1122,13 @@ hardcodes**.
   path.
 - **Occupancy:** one unit per cell, except units with the `__cell_stackable`
   var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
+- **Unit cap:** `max_entities_per_match` (-1 = none, the default) bounds
+  the units a match holds (parts and segments count, corpses don't):
+  `Match.check_unit_room` at `Entity.spawn`, and whole bodies are checked
+  before their first unit spawns (`_body_count`: `summon_entity`,
+  `spawn_template`, a revive with its stored parts, a transform's growth,
+  `copy_entity` into the destination, `_apply_statblock_parts`), so no body
+  arrives without its parts (891).
 - **Shields / temp hp:** named absorb pools under the roots in
   `temp_hp_sources` (default `shields`; per-unit `__temp_hp_sources`), each
   `{amount, priority, tags, not_tags}` or a number. `absorb_damage(eid, n,
@@ -1238,6 +1245,15 @@ hardcodes**.
   resume` runs them (`resume drop` discards); held commands are saved with
   the match (`paused.held`), so a restart keeps them; never an undo step;
   `!dry` runs during a pause (637-638, 822).
+- **Reminders** (`!remind [secret] <n> <text> | list | remove <id>`;
+  `Match.reminders` / `reminder_seq` / `held_reminders`, saved, undo
+  state): due at `turns_elapsed` + n, fired by `_begin_turn`
+  (`_fire_reminders`). A public one's line (`reminder_message_format`)
+  goes out through `surface_log` with the turn output; a secret one waits
+  in `held_reminders` and ends the reply of the next command a host runs
+  on the match (`CommandRegistry._run`, after the handler, inside that
+  command's undo step; `!as` doesn't count). Players' `!remind list` shows
+  the public ones only (893).
 
 ### 7.4 Statuses
 
@@ -1455,7 +1471,13 @@ hardcodes**.
   resolve BEFORE the access gate; an alias can't take a command's name
   (refused at def / promote, ignored if saved). Command roots and aliases
   are case-insensitive (`!Ent`, on Discord too). `!func` defines formula functions
-  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula.
+  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula;
+  `!eval --trace ...` lists, in order, the formula's own `entity[x]` /
+  `match.` reads (`FormulaEngine.trace_reads`, so engine-side checks such
+  as the death condition stay out) and every var write / delete the eval
+  caused, hook writes marked ↳ by `_var_event_depth` (`logic.VAR_TRACE`,
+  `record_trace` in `write_var` / `remove_var` and the match-var writers;
+  at most 1000 entries, 60 shown) (894).
 
 ### 7.8 Geometry, movement and blocking
 
@@ -1868,7 +1890,10 @@ hardcodes**.
 - **Tiles:** per-cell data (`!tile set/place/line/fill/copy/...`), templates
   (`!tile def` per match, `!system tile` per system, §7.16), precedence instance > template > rule for
   glyph / color / sprite / block / opaque; tile hooks (on_enter / on_exit /
-  on_stop / time hooks).
+  on_stop / time hooks). Formulas place a template with `tile_place(template,
+  x, y, data=None)` (`!tile place`: replaces the cell's data, corpses stay,
+  `data` overrides fields; mutating) and read it back with
+  `tile_template_of(x, y)` (892).
 - **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
   + time), dedicated glyph / color / sprite fields, `zone_shift`, `zone_*`
   prims, `zone_distance`.
@@ -2041,11 +2066,23 @@ hardcodes**.
   The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
+- **Acting unit** (`active_unit_highlight`, default on, once a turn has
+  started): `Match.active_display_unit` picks the unit drawn for the actor
+  (its body for a glued part or a region part without a glyph, its vehicle
+  for a hidden rider; none when the view can't see it). ASCII makes its
+  shown cells bold (`1;` in the ANSI run code) or, without colour, adds
+  `active_unit_line_format` under the map; the scene marks its placements
+  `active` and `SceneRenderer` outlines them per
+  `active_unit_image_highlight` (outline in `active_unit_outline_color`,
+  white, `active_unit_outline_width`; team_brighter; off), sprites and
+  glyphs alike; `!map scene list` names the acting placement (895).
 - **Intended ASCII / graphics differences:** corpses and overlays are
   graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
   are a translucent fill; a unit's colour is an outline around its sprite;
   the image legend lists every look in the window (ASCII only top-layer
-  glyphs); layer order follows `sprite_layer_*`. Everything else must agree
+  glyphs); layer order follows `sprite_layer_*`; the acting unit is bold
+  (or named under a plain map) in ASCII and outlined in images.
+  Everything else must agree
   (§2 parity pass) (530-535, 711-717).
 
 ### 7.16 Matches, history and the table

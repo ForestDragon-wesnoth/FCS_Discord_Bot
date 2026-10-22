@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace
 
 
 class FormulaError(VTTError):
@@ -2720,6 +2720,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Tile-key introspection: tile_keys(x, y) -> top-level keys in the
     # tile's data dict (symmetric companion to tile_get/tile_has).
     "tile_keys",
+    # tile_place(template, x, y, data=None): `!tile place` from a formula;
+    # tile_template_of(x, y): the template a cell was placed from.
+    "tile_place", "tile_template_of",
     # Reverse group index: entity_groups(eid) -> names of every group
     # containing the entity (insertion order over Match.groups).
     "entity_groups",
@@ -2963,7 +2966,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
 ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "map_var_set", "map_var_del", "transfer_entity",
     "group_add", "group_remove",
-    "tile_set", "tile_del", "tile_clear",
+    "tile_set", "tile_del", "tile_clear", "tile_place",
     "move_entity", "move_step", "push_entity", "pull_entity", "swap_entities",
     "fire_tile_hook",
     "absorb_damage",
@@ -3037,6 +3040,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'team_sees_cell_losonly', 'team_sees_cell_rangeonly',
     'team_sees_entity', 'team_sees_entity_losonly',
     'team_sees_entity_rangeonly', 'tile_get', 'tile_has', 'tile_keys',
+    'tile_template_of',
     'turn_index', 'turns_elapsed', 'var_count', 'var_get', 'var_has',
     'var_has_key',
     'var_keys', 'var_max_key', 'var_min_key', 'var_pick_random',
@@ -3081,6 +3085,7 @@ _MAP_CELL_RESULT_FUNCS: "frozenset[str]" = frozenset({
 })
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
+    "tile_place", "tile_template_of",
     "fire_tile_hook", "cell_entity", "entities_at", "zones_at",
     "entities_in_area", "entities_in_cone", "entities_in_rect",
     "entities_in_line_ignorelos", "entities_on_los", "entities_in_line_until",
@@ -4204,6 +4209,9 @@ class FormulaEngine:
         # no value (instead of a confusing "= None").
         self._affected_order: List[str] = []
         self._affected_set: set = set()
+        # `!eval --trace` records this engine's own entity[x] / match reads
+        # (the engine-side checks other engines run aren't the formula's).
+        self.trace_reads = False
 
     def _note_affected(self, eid: str) -> None:
         if eid not in self._affected_set:
@@ -4245,7 +4253,11 @@ class FormulaEngine:
         e = self._match.entities.get(eid)
         if e is None:
             raise FormulaError(f"Entity '{eid}' not found.")
-        return _read_entity_path(e, path)
+        value = _read_entity_path(e, path)
+        if self.trace_reads and VAR_TRACE.get() is not None:
+            record_trace("read", eid, path, new=value,
+                         depth=self._match._var_event_depth)
+        return value
 
     def _write(self, who: str, path: str, value: Any, ctx: EvalCtx) -> Any:
         """Route formula writes through Entity.write_var so var hooks fire.
@@ -4294,7 +4306,11 @@ class FormulaEngine:
         check with match_var_has)."""
         if self._match is None:
             raise FormulaError("match vars are unavailable in this context.")
-        return _get_path(self._match.vars, path)
+        value = _get_path(self._match.vars, path)
+        if self.trace_reads and VAR_TRACE.get() is not None:
+            record_trace("read", "match", path, new=value,
+                         depth=self._match._var_event_depth)
+        return value
 
     def _write_match(self, path: str, value: Any) -> Any:
         """Write match-level var at dotted `path`. Plain storage — match
@@ -4306,6 +4322,13 @@ class FormulaEngine:
             check_no_value_ancestor(self._match.vars, path, "match var")
         except VTTError as ex:
             raise FormulaError(str(ex))
+        if VAR_TRACE.get() is not None:
+            try:
+                prior = _get_path(self._match.vars, path)
+            except FormulaError:
+                prior = None
+            record_trace("write", "match", path, prior, value,
+                         depth=self._match._var_event_depth)
         _set_path(self._match.vars, path, _own_value(value))
         return value
 
@@ -6244,6 +6267,9 @@ class FormulaEngine:
             cur: Any = match.vars
             for k in keys[:-1]:
                 cur = cur[k]
+            if VAR_TRACE.get() is not None:
+                record_trace("delete", "match", path, cur[keys[-1]],
+                             depth=match._var_event_depth)
             del cur[keys[-1]]
             return True
 
@@ -6633,6 +6659,42 @@ class FormulaEngine:
                 return []
             return list(data.keys())
         ns["tile_keys"] = _tile_keys
+
+        def _tile_place(template: Any, x: Any, y: Any, data: Any = None) -> bool:
+            """tile_place(template, x, y, data=None): place tile template
+            `template` (`!tile def`) at the cell, as `!tile place` does: the
+            cell's tile data is replaced (corpses lying there stay) and the
+            fields of the `data` dict override the template's. Returns True."""
+            if not isinstance(template, str) or not template:
+                raise FormulaError("tile_place(template, x, y): template must "
+                                   "be a tile template's name.")
+            for n, v in (("x", x), ("y", y)):
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise FormulaError(f"tile_place: {n} must be int, got "
+                                       f"{type(v).__name__}.")
+            if data is not None and not isinstance(data, dict):
+                raise FormulaError(f"tile_place: data must be a dict of "
+                                   f"fields, got {type(data).__name__}.")
+            try:
+                match.place_tile_template(
+                    template, x, y, mp=_cur_map(),
+                    overrides=_own_value(data) if data else None)
+            except VTTError as ex:
+                raise FormulaError(f"tile_place: {ex}")
+            return True
+        ns["tile_place"] = _tile_place
+
+        def _tile_template_of(x: Any, y: Any) -> Any:
+            """tile_template_of(x, y): the name of the tile template the cell
+            was placed from (`!tile place`, tile_place), or None."""
+            for n, v in (("x", x), ("y", y)):
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise FormulaError(f"tile_template_of: {n} must be int, "
+                                       f"got {type(v).__name__}.")
+            data = _cur_map().tiles.get((x, y))
+            name = data.get("_template") if isinstance(data, dict) else None
+            return name if isinstance(name, str) else None
+        ns["tile_template_of"] = _tile_template_of
 
         def _entity_groups(eid_t: Any) -> list:
             """entity_groups(eid): names of groups containing this

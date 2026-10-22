@@ -28320,3 +28320,265 @@ host folders). `!server errors` (administrators) lists their own server's
 crashes and `show <ref>` adds the traceback; `!owner errors` lists every
 server's, and `clear` empties the log while ref numbers keep counting.
 The log is saved in data/errors.json, so a restart keeps it.
+
+
+SCENARIO 891 — max_entities_per_match caps a summoning passive, whole bodies, revives and copies
+-----------------------------------------------------------------------------------------------
+
+!match new mx MX 10 6
+!match use mx
+!ent add sm Summoner 20 1 1 10
+!ent add k Knight 20 8 5 5
+!assert "len(all_entities()) == 2"
+!gpassive add call on_turn_start "summon_near({'name': 'imp', 'vars': {'hp': 1}}, 3, 3, 3)"
+!system set default max_entities_per_match 4
+!turn next
+!turn next
+!assert "len(all_entities()) == 4"
+!turn next
+?? FAILED
+?? the match holds 4 of at most 4 units (max_entities_per_match)
+!assert "len(all_entities()) == 4"
+!gpassive remove call
+!ent remove imp2
+!ent add d Dragon 30 5 1 1
+!part add d head Head 5 5
+?? ❌ Can't add `head`
+!ent remove d
+!ent add d Dragon 30 5 1 1
+!ent remove imp
+!part add d head Head 5 5
+!template save d wyrm
+!ent remove d
+!ent add g2 G2 10 9 3 1
+!template spawn wyrm 5 1
+?? ❌ Can't add `wyrm` (2 units with its parts): the match holds 3 of at most 4 units
+!assert "not has_template('nope') and len(all_entities()) == 3"
+!ent kill k
+!ent add g Guard 10 9 1 1
+!ent add g3 G3 10 9 5 1
+!ent revive k
+?? ❌ Can't add `k`
+!assert "has_corpse('k') and len(all_entities()) == 4"
+!match new other Other 6 6
+!ent copy sm other
+?? Copied
+!system set default max_entities_per_match -1
+!template spawn wyrm 5 1
+?? Spawned `wyrm`
+!assert "len(all_entities()) == 5 and len(parts('wyrm')) == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. max_entities_per_match (default -1, no
+limit) caps the units a match holds; parts count, corpses don't. A global
+on_turn_start passive summoning an imp every turn stays under
+summon_event_limit forever, and the cap stops it at 4 units (its third
+summon FAILS with the cap's wording). Bodies are checked whole before the
+first unit spawns: `!part add` past the cap is refused, and a template with
+a part needing 2 slots when only 1 is free is refused with nothing
+spawned. A revive is refused at the cap (the corpse stays), a copy into
+another match counts against that match, and -1 lifts the cap.
+
+
+SCENARIO 892 — tile_place / tile_template_of: an attack that leaves a fire tile behind
+--------------------------------------------------------------------------------------
+
+!match new tp TP 8 6
+!match use tp
+!tile def new fire
+!tile def data fire glyph ^
+!tile def data fire burn 2
+!tile def hook fire on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
+!ent add mage Mage 20 1 1 10
+!ent add orc Orc 20 4 3 5
+!ent set_var mage actions.scorch.target location
+!ent set_var mage actions.scorch.body "tile_place('fire', target, data={'burn': 5})"
+!action mage scorch 3 3
+!assert "tile_template_of(3, 3) == 'fire' and tile_get(3, 3, 'burn') == 5"
+!ent move orc 1 left
+!assert "entity[orc].hp == 15"
+!ent kill orc
+!eval "tile_place('fire', 3, 3)"
+!assert "tile_get(3, 3, 'burn') == 2 and has_corpse('orc')"
+!assert "tile_template_of(5, 5) == None and tile_template_of([3, 3]) == 'fire'"
+!eval "tile_place('ice', 2, 2)"
+?? ❌ tile_place: tile template 'ice' not found.
+!eval "tile_place('fire', 20, 2)"
+?? ❌ tile_place: (20,2) outside 8x6
+!eval "tile_place('fire', 2, 2, ['burn'])"
+?? ❌ tile_place: data must be a dict of fields, got list.
+!eval "tile_place('fire', 2, 2, {'_template': 'x'})"
+?? reserved keys: _template
+!ent set_var mage n "$(tile_template_of(3, 3))"
+!assert "entity[mage].n == 'fire'"
+!ent set_var mage m "$(tile_place('fire', 5, 5))"
+?? ❌ function 'tile_place' changes game state and is banned in a $() inline argument
+!assert "tile_template_of(5, 5) == None"
+
+Expected: HARNESS-ALLOWS-ERRORS. tile_place(template, x, y, data=None) is
+`!tile place` from a formula: an action targeting a cell leaves a fire tile
+there with its burn overridden to 5 (a location target passes whole), the
+template's on_enter hook burns the orc that walks in (20 -> 15), and a
+second placement on the orc's corpse cell replaces the tile data while the
+corpse stays. tile_template_of reads the template name back (None for a
+plain cell; a coordinate list works). Unknown templates, off-map cells,
+non-dict data and reserved keys are refused; tile_template_of is allowed in
+`$()`, tile_place is not.
+
+
+SCENARIO 893 — !remind: public and secret reminders counted in turns
+-------------------------------------------------------------------
+
+!match new rm RM 8 6
+!match use rm
+!ent add a A 10 1 1 10
+!ent add b B 10 3 3 5
+!remind 2 the bridge collapses
+?? ⏰ Reminder `1` set for 2 turn(s) from now.
+!remind secret 1 ambush ready
+?? (secret: hosts only)
+!remind list
+?? `2` in 1 turn(s) 🔒 secret: ambush ready
+?? `1` in 2 turn(s): the bridge collapses
+!as player pip
+!remind list
+?! ambush
+?? the bridge collapses
+!as host
+!host access set "turn" all
+!as player pip
+!turn next
+?! ambush ready
+!as host
+!remind list
+?? 🔒 due, waiting for a host: ambush ready
+?? 🔒 (hosts) ⏰ Reminder: ambush ready
+!remind list
+?! ambush
+!turn next
+?? ⏰ Reminder: the bridge collapses
+?? It is now **B**'s turn
+!system set default reminder_message_format "Note from {by} after {turns}: {text}"
+!remind 1 check morale
+!turn next
+?? Note from cli after 1: check morale
+!remind 3 later
+!remind remove 4
+?? Removed reminder `4`.
+!undo command
+!remind list
+?? `4` in 3 turn(s): later
+!as restart
+!remind list
+?? `4` in 3 turn(s): later
+!remind remove 9
+?? ❌ No reminder `9`
+!remind 0 x
+?? ❌ The count must be at least 1
+!remind secret 2
+?? ❌ Usage: `!remind [secret] <n> <text ...>`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!remind <n> <text>` prints its line in
+the reply of the command that passes the n-th turn from now (turns_elapsed,
+so ATB counts the same). A `secret` reminder is for hosts: players' `!remind
+list` doesn't show it, and when a player passes its turn (here through
+`!host access set "turn" all`) its line waits; the host's next command on
+the match (`!remind list`) ends with it. reminder_message_format words the
+line ({text}, {by}, {turns}). Reminders are match state: `!remind remove`
+undoes, and a restart keeps them.
+
+
+SCENARIO 894 — !eval --trace lists the formula's reads and every var write it caused
+-------------------------------------------------------------------------------------
+
+!match new tr TR 8 6
+!match use tr
+!ent add a A 10 1 1 10
+!ent add b B 10 3 3 10
+!gpassive add mirror on_var_changed scope=deep target=hp "entity[b].seen = entity[a].hp"
+!match var set x 2
+!func def dmg n "entity[a].hp = entity[a].hp - n"
+!eval --trace "entity[a].hp = entity[a].hp - match.x\nmatch.x = 3\nvar_add('a', 'gold', 5)\nentity[a].hp = 99\ndmg(1)\nmatch_var_del('x')"
+?? read entity[a].hp = 10
+?? read match.x = 2
+?? write entity[a].hp: 10 → 8
+??   ↳ write entity[b].seen: None → 8
+?? write match.x: 2 → 3
+?? write entity[a].gold: None → 5
+?? write entity[a].hp: 8 → 10 (clamped from 99)
+?? write entity[a].hp: 10 → 9
+?? delete match.x (was 3)
+!assert "entity[a].hp == 9 and entity[b].seen == 9"
+!passive add a heal on_turn_start "entity[self].hp = entity[self].hp + 1"
+!eval --trace --as-passive a heal
+?? write entity[a].hp: 9 → 10
+!eval --trace --as a "entity[self].missing + 1"
+?? ❌ Variable 'missing' is not defined.
+?? Trace:
+!eval --trace "1 + 1"
+?? = `2`
+?? **Trace:** no var reads or writes.
+!eval --trace
+?? ❌ Usage: `!eval --trace
+
+Expected: HARNESS-ALLOWS-ERRORS. `--trace` lists, in order, each
+`entity[x].path` / `match.path` read the formula itself makes (a `!func`
+it calls included) with the value, and every var write and delete the eval
+caused, made through syntax, functions (var_add, match_var_del) or the
+passives those writes set off (indented with ↳): old → new, and the value a
+clamp cut down. The death checks the engine runs after a write aren't the
+formula's reads and aren't listed. A failing formula still shows its trace.
+
+
+SCENARIO 895 — The acting unit: bold glyph, a "now acting" line, an image outline
+--------------------------------------------------------------------------------
+
+!match new hl HL 8 6
+!match use hl
+!ent add d Dragon 30 2 2 10
+!ent set_vars d footprint_w=2 footprint_h=2 team=red
+!part add d head Head 5 5
+!ent set_var head initiative 50
+!ent add s Scout 10 7 5 1
+!ent set_var s team blue
+!map
+?! now acting
+!turn next
+?? It is now **Head**'s turn
+!map
+?? ▶ now acting: Head
+!map scene list
+?? • entity `d` at (2,2) 2x2
+?? acting: outline
+!turn next
+!map
+?? ▶ now acting: Dragon
+!system set default active_unit_image_highlight team_brighter
+!map scene list
+?? acting: team_brighter
+!system set default active_unit_line_format "Acting: {name}!"
+!map
+?? Acting: Dragon!
+!turn next
+!match fog on
+!ent set_var s fog_vision_radius 1
+!as view red
+!map
+?! Acting
+?! Scout
+!as view clear
+!map
+?? Acting: Scout!
+!system set default active_unit_highlight false
+!map
+?! Acting
+!map scene list
+?! acting:
+
+Expected: The unit whose turn it is gets marked on maps once a turn has
+started: bold where ANSI colour works, else a line under the plain-text map
+(active_unit_line_format), and in images an outline
+(active_unit_image_highlight: a white outline by default, team_brighter
+brightens its team outline, off). The head's own turn marks the dragon's
+2x2 body that draws it (`!map scene list` names the acting placement). A
+team view that can't see the actor (red can't see the fogged blue scout)
+gets no line, and active_unit_highlight off removes every mark.

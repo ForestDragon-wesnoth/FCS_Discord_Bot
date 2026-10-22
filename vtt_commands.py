@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, VAR_TRACE
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -156,6 +156,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # dump` is host-gated to hide.
     "part":       frozenset({"list"}),
     "passive":    frozenset({"list", "info"}),
+    "remind":     frozenset({"list"}),
     "reveal_fog": frozenset({"list"}),
     "schedule":   frozenset({"list"}),
     "server":     frozenset({"storage"}),
@@ -1065,6 +1066,14 @@ class CommandRegistry:
             _JOURNAL_AS_STATE.reset(jstate_token)
             sent = MATCHES_SENT_UNITS.get() or set()
             MATCHES_SENT_UNITS.reset(sent_token)
+        # Secret `!remind` reminders that came due wait for a host: they end
+        # the reply of the next command a host runs on the match (part of
+        # that command's undo step).
+        hm = (mgr.matches.get(pre_active_mid)
+              if pre_active_mid and name.lower() != "as" else None)
+        if hm is not None and hm.held_reminders and _acts_as_host(ctx, hm):
+            held, hm.held_reminders = hm.held_reminders, []
+            await ctx.send("\n".join(hm.reminder_line(r) for r in held))
         # Even a failed command goes through the bookkeeping below: it only
         # records a snapshot when the state REALLY changed, so a clean failure
         # stays a no-op, while a command that mutated and THEN failed (a hook
@@ -11112,8 +11121,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"{label} {p[key]}" for label, key in
                     (("sprite", "sprite"), ("glyph", "glyph"), ("color", "tint"))
                     if p.get(key)) or "nothing"
+                us = scene["unit_style"]
+                act = (f", acting: {us.get('active_mode')}"
+                       if p.get("active") and us.get("active_mode") != "off"
+                       else "")
                 lines.append(f"• {p['kind']} `{p['ref']}` at ({p['x']},{p['y']})"
-                             f"{size} — {what} (layer {p['layer']})")
+                             f"{size} — {what} (layer {p['layer']}{act})")
             for e in scene.get("legend") or []:
                 look = ", ".join(f"{label} {e[key]}" for label, key in
                                  (("sprite", "sprite"), ("glyph", "glyph"),
@@ -18656,6 +18669,72 @@ for _subs, _usage in (
 
 
 @registry.command(
+    "remind",
+    usage="!remind <n> <text ...> | !remind secret <n> <text ...> | !remind list | !remind remove <id>",
+    desc=(
+        "A note for later: `!remind 3 the bridge collapses` prints its text "
+        "(reminder_message_format) in the reply of the command that passes "
+        "the 3rd turn from now. Turns count every unit's turn "
+        "(turns_elapsed), so it works under ATB too. `secret` makes it a "
+        "host note: it shows only in a host's reply, waiting for the next "
+        "command a host runs on the match when a player passes that turn. "
+        "`list` shows what is pending (players see the public ones), "
+        "`remove <id>` drops one. Saved with the match; an undo step."
+    ),
+)
+async def remind_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["remind"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+    if sub == "list":
+        _check_tail(args, 1, (), "!remind list")
+        host = _acts_as_host(ctx, m)
+        rows = [r for r in m.reminders if host or not r.get("secret")]
+        held = m.held_reminders if host else []
+        if not rows and not held:
+            return await ctx.send("No reminders pending.")
+        lines = []
+        for r in sorted(rows, key=lambda r: (r["due"], r["id"])):
+            left = r["due"] - m.turns_elapsed
+            lines.append(f"- `{r['id']}` in {left} turn(s)"
+                         + (" 🔒 secret" if r.get("secret") else "")
+                         + f": {r.get('text', '')}")
+        for r in held:
+            lines.append(f"- `{r['id']}` 🔒 due, waiting for a host: "
+                         f"{r.get('text', '')}")
+        return await ctx.send("**Reminders**\n" + "\n".join(lines))
+    if sub == "remove":
+        _check_tail(args, 2, (), "!remind remove <id>")
+        if len(args) < 2:
+            raise VTTError("Usage: `!remind remove <id>`.")
+        rid = _parse_count(args[1], "!remind remove <id>")
+        for lst in (m.reminders, m.held_reminders):
+            for r in lst:
+                if r["id"] == rid:
+                    lst.remove(r)
+                    return await ctx.send(f"Removed reminder `{rid}`.")
+        raise VTTError(f"No reminder `{rid}` (`!remind list`).")
+    secret = sub == "secret"
+    rest = args[1:] if secret else args
+    if len(rest) < 2:
+        raise VTTError("Usage: `!remind [secret] <n> <text ...>`: n turns "
+                       "from now, then the text.")
+    n = _parse_count(rest[0], "!remind <n> <text ...>")
+    text = " ".join(str(a) for a in rest[1:]).strip()
+    if not text:
+        raise VTTError("A reminder needs a text.")
+    m.reminder_seq += 1
+    m.reminders.append({"id": m.reminder_seq, "due": m.turns_elapsed + n,
+                        "turns": n, "text": text, "secret": secret,
+                        "by": ctx_user_name(ctx) or ""})
+    return await ctx.send(
+        f"⏰ Reminder `{m.reminder_seq}` set for {n} turn(s) from now"
+        + (" (secret: hosts only)." if secret else "."))
+
+
+@registry.command(
     "table",
     usage="!table <def|roll|list|show|remove|rename> ...",
     desc=(
@@ -19061,7 +19140,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command(
     "eval",
     raw_args=True,
-    usage='!eval [--as <eid>] "<formula>" | !eval --as-passive <eid> <pid>',
+    usage='!eval [--trace] [--as <eid>] "<formula>" | !eval [--trace] --as-passive <eid> <pid>',
     desc=("Evaluate a formula against the active match (for testing). "
           "`this` = current-turn entity. By default `self` is unbound; "
           "pass `--as <eid>` as the first two args to bind `self` (and "
@@ -19071,13 +19150,23 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
           "`<eid>` — checks the entity's passives first, then global "
           "passives. Supports assignments and multi-statement bodies; "
           "if the source ends with an expression, its value is returned. "
-          "Quote the whole formula to preserve spaces."),
+          "Quote the whole formula to preserve spaces. `--trace` (first) "
+          "lists what the formula did, in order: each `entity[x].path` / "
+          "`match.path` read with its value, and every var write and "
+          "delete the eval caused (old → new), including those made "
+          "through functions and by the passives they set off (marked ↳)."),
 )
 async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["eval"])
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
+    trace = None
+    if args[0] == "--trace":
+        trace = []
+        args = args[1:]
+        if not args:
+            raise VTTError('Usage: `!eval --trace [--as <eid>] "<formula>"`.')
     # Optional `--as <eid>` prefix binds `self` for the evaluation, so a
     # GM can test a passive body (which references entity[self]) without
     # actually attaching it to an entity and advancing a turn.
@@ -19121,6 +19210,16 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     src = normalize_body_source(src)
     eval_ctx = EvalCtx(this=m.current_entity_id(), target=self_id)
     engine = FormulaEngine(m)
+    if trace is not None:
+        engine.trace_reads = True
+        token = VAR_TRACE.set(trace)
+        try:
+            val = engine.eval_program(src, eval_ctx)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}\n" + _trace_text(trace))
+        finally:
+            VAR_TRACE.reset(token)
+        return await ctx.send(f"= `{val!r}`\n" + _trace_text(trace))
     val = engine.eval_program(src, eval_ctx)
     # For side-effect-only formulas (e.g. `for eid in entities_within(...):
     # entity[eid].hp = entity[eid].hp - 7`) the trailing assignment makes
@@ -19131,6 +19230,42 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ids = ", ".join(f"`{eid}`" for eid in engine.affected_entities)
         return await ctx.send(f"Affected {len(engine.affected_entities)} entit{'y' if len(engine.affected_entities) == 1 else 'ies'}: {ids}")
     return await ctx.send(f"= `{val!r}`")
+
+
+# `!eval --trace` prints at most this many entries (the trace keeps 1000).
+_TRACE_SHOWN = 60
+
+
+def _trace_value(v: Any) -> str:
+    text = repr(v)
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def _trace_text(trace: List[Dict[str, Any]]) -> str:
+    """The `!eval --trace` listing: reads, writes and deletes in order; an
+    entry made inside var hooks the eval set off is marked ↳ per level."""
+    if not trace:
+        return "**Trace:** no var reads or writes."
+    lines = []
+    for t in trace[:_TRACE_SHOWN]:
+        where = (f"match.{t['path']}" if t["who"] == "match"
+                 else f"entity[{t['who']}].{t['path']}")
+        pre = "  " * t["depth"] + ("↳ " if t["depth"] else "")
+        if t["kind"] == "read":
+            lines.append(f"{pre}read {where} = {_trace_value(t['new'])}")
+        elif t["kind"] == "delete":
+            lines.append(f"{pre}delete {where} (was "
+                         f"{_trace_value(t['old'])})")
+        else:
+            clamp = (f" (clamped from {_trace_value(t['clamped_from'])})"
+                     if t.get("clamped_from") is not None else "")
+            lines.append(f"{pre}write {where}: {_trace_value(t['old'])} → "
+                         f"{_trace_value(t['new'])}{clamp}")
+    more = len(trace) - _TRACE_SHOWN
+    if more > 0:
+        lines.append(f"... and {more} more" + (" (the trace stops at 1000)"
+                                               if len(trace) > 1000 else ""))
+    return "**Trace:**\n" + "\n".join(lines)
 
 
 @registry.command(
