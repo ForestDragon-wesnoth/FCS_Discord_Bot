@@ -7,9 +7,11 @@ list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
 they cite (L1-L15, D1-D18) are in `docs/combat_systems_fit.md`, and every
-"today" statement in them was checked on `836e3af`. When an idea ships, move
-its number to "Shipped" below; when the user strikes or rejects one, move it
-to "Off the list".
+"today" statement in them was checked on `836e3af`. When an idea ships in
+full (everything its entry asks for or assumes), its number moves to
+"Shipped" below and its entry is removed from the list; an idea shipped in
+part keeps its entry, trimmed to what is still open. When the user strikes
+or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
@@ -21,11 +23,6 @@ to "Off the list".
 - Covered by what shipped: #35 (a preset is a parent system), #85 (`!history
   export` + `!history import` into a new match).
 - Struck by the user: #7, #44, #45, #156.
-
-**Shipped from the list below:** #40 and #164 (multiple maps per match and
-nested maps; design, decisions and what stays deferred in
-`docs/multi_map_design.md`). Their entries below keep the original wording
-for reference.
 
 ## Small (a primitive, a rule, or a command)
 
@@ -513,7 +510,6 @@ for reference.
 - **#37 Elevation.** Per-cell height, high-ground LOS, `height_diff`, and a link to #16's `move_cost`.
 - **#38 Light and darkness.** Light sources with radii, per-cell light levels, darkvision; fog and visibility read them.
 - **#39 Arbitrary and rotating footprints.** L-shaped and other non-rectangular bodies, and bodies that rotate with facing.
-- **#40 Linked maps.** Floors and portals: several matches connected, units moving between them, all with the same owner.
 - **#42 Discord interactive layer.** Select menus for `choose()`, action buttons, slash commands, turn pings and timers.
 - **#43 History replay.** Stepping through snapshots on a board, or an animated GIF of a session.
 - **#158 Campaign roster.** Characters stored at the server level, checked into a match and back out with their state (hp, inventory, XP vars). One roster serves a whole campaign of matches; it builds on the template library.
@@ -528,10 +524,6 @@ for reference.
   - Servers can share a ruleset and upgrade it.
   - Per-server storage (#41) has shipped; the pack still needs #140.
 - **#163 Read-only web viewer.** A browser page showing a match's live map from the scene model, with per-team views behind a link token. Needs a web server and real security design.
-- **#164 Nested maps.**
-  - A small grid owned by a unit (a ship's deck, a building interior) that travels with it; units move between the outer and inner map.
-  - #40 links whole matches; this attaches a map to one unit.
-  - You said you want this eventually.
 
 ### New
 

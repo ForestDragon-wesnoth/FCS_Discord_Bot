@@ -388,7 +388,10 @@ back, load the schema with `ToolSearch` before calling
   match and nested maps (step 1 and 2a-2d built; §8).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
-  before proposing a feature, and keep it current when one ships.
+  before proposing a feature. When a feature ships in full (everything its
+  entry asks for or assumes), add its number to "Shipped" and DELETE its
+  entry in the same PR (user directive); a partly shipped one keeps its
+  entry, trimmed to what is still open.
 - **`docs/combat_systems_fit.md`**: three tabletop combat systems the user's
   group wrote (Solis, FCS1, NCS), what the bot can't do for them and what
   costs needless work; the background of ideas #200-#255.
