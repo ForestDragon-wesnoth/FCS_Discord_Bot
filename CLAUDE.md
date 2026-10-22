@@ -2504,6 +2504,13 @@ rejected already. Update this section in the PR that resolves an item.
   on the nearest free cell with a ⚠️. Whether spawns should recreate the
   overlap is open.
 
+- **A child's hide after a parent rename:** a child system's hidden
+  inherited entry (`GameSystem.removed`, any library or merge rule) is
+  stored by name, so when the parent renames that entry (`!system status
+  rename`, `!system table|macro rename`) the hide keeps the old name and
+  hides nothing; the renamed entry shows through in the child. Known
+  limitation, left as is (user: note it).
+
 - **Pass 43, deferred by the user ("decide later"):** T3 (a mid-round
   initiative change under `immediate` can cost a unit its turn or give it
   a second; options: remember who acted this round, keep as is, or make
