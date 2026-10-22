@@ -28529,8 +28529,8 @@ clamp cut down. The death checks the engine runs after a write aren't the
 formula's reads and aren't listed. A failing formula still shows its trace.
 
 
-SCENARIO 895 — The acting unit: bold glyph, a "now acting" line, an image outline
---------------------------------------------------------------------------------
+SCENARIO 895 — The acting unit (opt-in rule): bold glyph, a "now acting" line, an image outline
+-------------------------------------------------------------------------------------------------
 
 !match new hl HL 8 6
 !match use hl
@@ -28540,21 +28540,26 @@ SCENARIO 895 — The acting unit: bold glyph, a "now acting" line, an image outl
 !ent set_var head initiative 50
 !ent add s Scout 10 7 5 1
 !ent set_var s team blue
-!map
-?! now acting
 !turn next
 ?? It is now **Head**'s turn
+!map
+?! now acting
+!map scene list
+?! acting
+!system set default active_unit_highlight true
 !map
 ?? ▶ now acting: Head
 !map scene list
 ?? • entity `d` at (2,2) 2x2
-?? acting: outline
+?? (layer 100, acting)
 !turn next
 !map
 ?? ▶ now acting: Dragon
-!system set default active_unit_image_highlight team_brighter
+!system set default active_unit_image_highlight false
 !map scene list
-?? acting: team_brighter
+?! acting
+!map
+?? ▶ now acting: Dragon
 !system set default active_unit_line_format "Acting: {name}!"
 !map
 ?? Acting: Dragon!
@@ -28571,14 +28576,12 @@ SCENARIO 895 — The acting unit: bold glyph, a "now acting" line, an image outl
 !system set default active_unit_highlight false
 !map
 ?! Acting
-!map scene list
-?! acting:
 
-Expected: The unit whose turn it is gets marked on maps once a turn has
-started: bold where ANSI colour works, else a line under the plain-text map
-(active_unit_line_format), and in images an outline
-(active_unit_image_highlight: a white outline by default, team_brighter
-brightens its team outline, off). The head's own turn marks the dragon's
-2x2 body that draws it (`!map scene list` names the acting placement). A
-team view that can't see the actor (red can't see the fogged blue scout)
-gets no line, and active_unit_highlight off removes every mark.
+Expected: active_unit_highlight (off by default) marks the unit whose turn
+it is once a turn has started: bold where ANSI colour works, else a line
+under the plain-text map (active_unit_line_format), and in images an
+outline around it (its team colour brightened, white without a team
+colour; active_unit_image_highlight false drops the image outline only).
+The head's own turn marks the dragon's 2x2 body that draws it (`!map scene
+list` names the acting placement). A team view that can't see the actor
+(red can't see the fogged blue scout) gets no line.

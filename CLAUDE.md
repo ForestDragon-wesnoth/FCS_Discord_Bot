@@ -2066,16 +2066,17 @@ hardcodes**.
   The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
-- **Acting unit** (`active_unit_highlight`, default on, once a turn has
-  started): `Match.active_display_unit` picks the unit drawn for the actor
-  (its body for a glued part or a region part without a glyph, its vehicle
-  for a hidden rider; none when the view can't see it). ASCII makes its
-  shown cells bold (`1;` in the ANSI run code) or, without colour, adds
-  `active_unit_line_format` under the map; the scene marks its placements
-  `active` and `SceneRenderer` outlines them per
-  `active_unit_image_highlight` (outline in `active_unit_outline_color`,
-  white, `active_unit_outline_width`; team_brighter; off), sprites and
-  glyphs alike; `!map scene list` names the acting placement (895).
+- **Acting unit** (`active_unit_highlight`, default OFF (user call), once
+  a turn has started): `Match.active_display_unit` picks the unit drawn for
+  the actor (its body for a glued part or a region part without a glyph,
+  its vehicle for a hidden rider; none when the view can't see it). ASCII
+  makes its shown cells bold (`1;` in the ANSI run code) or, without
+  colour, adds `active_unit_line_format` under the map; the scene marks its
+  placements `active` and `SceneRenderer` outlines them while
+  `active_unit_image_highlight` is on, in place of the team outline: the
+  team colour brightened halfway to white, or `active_unit_outline_color`
+  (white) without a team colour, `active_unit_outline_width` thick, sprites
+  and glyphs alike; `!map scene list` names the acting placement (895).
 - **Intended ASCII / graphics differences:** corpses and overlays are
   graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
   are a translucent fill; a unit's colour is an outline around its sprite;

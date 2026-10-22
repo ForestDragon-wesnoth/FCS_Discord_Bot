@@ -3678,15 +3678,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "active_unit_highlight": {
-        "default": True,
+        "default": False,
         "schema": {"type": "bool"},
         "desc": (
-            "Mark the unit whose turn it is on maps: its glyph is bold on "
-            "surfaces with ANSI colour, a plain-text map ends with "
-            "active_unit_line_format, and images draw the outline "
-            "active_unit_image_highlight picks. A glued part's or a hidden "
+            "Mark the unit whose turn it is on maps (off by default): its "
+            "glyph is bold on surfaces with ANSI colour, a plain-text map "
+            "ends with active_unit_line_format, and images outline it "
+            "(active_unit_image_highlight). A glued part's or a hidden "
             "rider's turn marks the body / vehicle drawn for it; nothing is "
-            "marked where the channel's view can't see it."
+            "marked before the first turn or where the channel's view can't "
+            "see it."
         ),
     },
     "active_unit_line_format": {
@@ -3700,23 +3701,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "active_unit_image_highlight": {
-        "default": "outline",
-        "schema": {"type": "str", "choices": ["outline", "team_brighter", "off"]},
+        "default": True,
+        "schema": {"type": "bool"},
         "desc": (
-            "Graphics: how images mark the unit whose turn it is "
-            "(active_unit_highlight on). 'outline' (default) draws an "
-            "outline in active_unit_outline_color around its sprite or "
-            "glyph, in place of its team outline; 'team_brighter' draws its "
-            "team-colour outline brightened toward white (white with no "
-            "team colour); 'off' marks nothing in images."
+            "Graphics, with active_unit_highlight on: outline the unit whose "
+            "turn it is, around its sprite or glyph and in place of its "
+            "team outline: its team colour brightened toward white, or "
+            "active_unit_outline_color when it has no team colour. False = "
+            "images mark nothing."
         ),
     },
     "active_unit_outline_color": {
         "default": "white",
         "schema": {"type": "str"},
         "desc": (
-            "Graphics: the colour of the active_unit_image_highlight "
-            "'outline' (a colour name or #rrggbb)."
+            "Graphics: the active unit's outline colour for a unit without "
+            "a team colour (a colour name or #rrggbb)."
         ),
     },
     "active_unit_outline_width": {
@@ -20336,7 +20336,7 @@ class Match:
         when it is a glued part (or a region part without its own glyph),
         its vehicle when it rides hidden. None when the rule is off, no
         turn has started yet, or the view can't see it there."""
-        if not bool(self.rules.get("active_unit_highlight", True)) \
+        if not bool(self.rules.get("active_unit_highlight", False)) \
                 or self.turns_elapsed <= 0:
             return None
         e = self.entities.get(self.current_entity_id() or "")
@@ -20751,8 +20751,8 @@ class Match:
                     "team_outline_opacity", 100))),
                 "tint_opacity": max(0, min(100, self._layer_rule(
                     "team_tint_opacity", 0))),
-                "active_mode": str(self.rules.get(
-                    "active_unit_image_highlight", "outline")),
+                "active_on": bool(self.rules.get(
+                    "active_unit_image_highlight", True)),
                 "active_color": str(self.rules.get(
                     "active_unit_outline_color", "white")),
                 "active_width": max(1, self._layer_rule(

@@ -11122,8 +11122,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     (("sprite", "sprite"), ("glyph", "glyph"), ("color", "tint"))
                     if p.get(key)) or "nothing"
                 us = scene["unit_style"]
-                act = (f", acting: {us.get('active_mode')}"
-                       if p.get("active") and us.get("active_mode") != "off"
+                act = (", acting" if p.get("active") and us.get("active_on")
                        else "")
                 lines.append(f"• {p['kind']} `{p['ref']}` at ({p['x']},{p['y']})"
                              f"{size} — {what} (layer {p['layer']}{act})")

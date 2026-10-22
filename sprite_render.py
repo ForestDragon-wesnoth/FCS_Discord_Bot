@@ -34,9 +34,8 @@ def _unit_style(style: Any) -> Dict[str, int]:
                 out[k] = max(0, int(style.get(k, out[k])))
             except (TypeError, ValueError):
                 pass
-    mode = style.get("active_mode") if isinstance(style, dict) else None
-    out["active_mode"] = (mode if mode in ("outline", "team_brighter", "off")
-                          else "outline")
+    on = style.get("active_on", True) if isinstance(style, dict) else True
+    out["active_on"] = bool(on)
     color = style.get("active_color") if isinstance(style, dict) else None
     out["active_color"] = color if isinstance(color, str) else "white"
     return out
@@ -576,14 +575,14 @@ class SceneRenderer:
         wpx = self._outline_px()
         if outline is None or self._unit["outline_width"] <= 0:
             outline = None
-        # The acting unit (active_unit_image_highlight): an outline in the
-        # active colour, or its team outline brightened, sprite or glyph.
+        # The acting unit (active_unit_image_highlight): its team colour
+        # brightened halfway to white, else the active colour (white), as
+        # an outline around its sprite or glyph.
         u = self._unit
-        if p.get("active") and p.get("kind") == "entity" \
-                and u["active_mode"] != "off":
-            if u["active_mode"] == "team_brighter":
-                base = self._rgb(p.get("tint")) or (255, 255, 255)
-                outline = tuple((c + 255) // 2 for c in base[:3])
+        if p.get("active") and p.get("kind") == "entity" and u["active_on"]:
+            team = self._rgb(p.get("tint"))
+            if team is not None:
+                outline = tuple((c + 255) // 2 for c in team[:3])
             else:
                 outline = self._rgb(u["active_color"]) or (255, 255, 255)
             wpx = self._outline_px(u["active_width"])
