@@ -28796,3 +28796,131 @@ disallowed construct is refused; unknown definitions, stack modes, table
 specs and broken macro structure are refused as on a match. `!system
 lint` lists the system's status ticks and hooks; once the system defines
 `zap` it is clean.
+
+
+SCENARIO 900 — Status hooks that keep changing statuses stop at status_hook_recursion_limit
+-------------------------------------------------------------------------------------------
+
+!match new sh SH 8 6
+!match use sh
+!ent add a A 10 1 1 10
+!status def burn
+!status hook burn on_changed "status_set(self, 'burn', 'n', status_get(self, 'burn', 'n') + 1)"
+!status apply a burn 1 1
+!ent status a set burn n 0
+?? Set `a.burn.n` = 32. (set to 0; then changed by the status hooks it fired)
+?? ⚠️ status hook recursion limit (32) reached on `on_status_changed` for `a.burn`
+!system set default status_hook_recursion_limit 5
+!ent status a set burn n 0
+?? Set `a.burn.n` = 5.
+!assert "status_get('a', 'burn', 'n') == 5"
+!status hook burn on_changed
+!status hook burn on_added "status_remove(self, 'burn')"
+!status hook burn on_removed "status_apply(self, 'burn', 1, 1)"
+!ent status a remove burn
+?? ⚠️ status hook recursion limit (5) reached
+!status hook burn on_added
+!status hook burn on_removed
+!passive add a again on_status_changed "status_set(self, 'burn', 'n', status_get(self, 'burn', 'n') + 1)"
+!ent status a set burn n 7
+?? ⚠️ status hook recursion limit (5) reached on `on_status_changed`
+!assert "status_get('a', 'burn', 'n') == 12"
+!passive remove a again
+!status maxlevel burn 3
+!ent status a set burn level 9
+?? Set `a.burn.level` = 3. (capped by `burn`'s max_level)
+
+Expected: HARNESS-ALLOWS-ERRORS. A status hook that changes its own
+status fires itself again; the chain stops at status_hook_recursion_limit
+(default 32) with one ⚠️, and the changes made up to there stay (n counts
+to 32, then to 5 with the limit at 5). Before the limit, Python's own
+recursion limit ended such a chain with a runtime error, after every hook
+line, or silently. The same limit covers an on_added hook removing the
+status while on_removed puts it back, and an on_status_changed passive.
+`!ent status set` says when the hooks changed the value it set, and names
+max_level only when that capped a level.
+
+
+SCENARIO 901 — Pass 47 small fixes: reminder text, empty system macro, trace cap, function signatures, completion
+------------------------------------------------------------------------------------------------------------------
+
+!system status def default burn
+!match new sf SF 8 6
+!match use sf
+!ent add a A 10 1 1 10
+!remind 1 ask {by} about {turns} coins
+!turn next
+?? ⏰ Reminder: ask {by} about {turns} coins
+!system macro set default empty ""
+?? ❌ macro body is empty.
+!system macro list default
+?? No macros on system `default`.
+!eval --trace "for i in range(1200): match.n = i"
+?? ... and 940 more (the trace stops at 1000)
+!help function random_free_cell
+?? random_free_cell(zone[, eid], fit='body') / random_free_cell(x1, y1, x2, y2[, eid], fit='body')
+!help function grid_width
+?? **`grid_width(map=None)`**
+!help function str
+?? **`str(value)`**
+!help function hit_location
+?? corner_arc=None, hitbox=None)`**
+!help function round
+?? **`round(x, ndigits=None)`**
+?tab "!system status hook default burn "
+?? on_added  on_changed  on_removed
+?! turn_end
+?tab "!system status when default burn "
+?? turn_end
+?tab "!map border c"
+?? color
+
+Expected: HARNESS-ALLOWS-ERRORS. A reminder's own text keeps `{by}` and
+`{turns}` (reminder_message_format is filled in one pass). `!system macro
+set` refuses an empty body as `!macro set` does. `!eval --trace` keeps at
+most 1000 entries and says so. `!help function` takes a signature from the
+call forms a docstring opens with even when they wrap over lines
+(random_free_cell, the sandbox's str / int / max / min), adds `map=None`
+without a stray comma, and falls back to the code's parameters when the
+docstring doesn't open with a call form (round). Tab completion reads an
+action word inside a `<a ... | b ...>` group as a word even when it is also
+a placeholder name: `!system status hook <sys> <name>` offers the hooks
+only, `!map border c` offers `color`.
+
+
+SCENARIO 902 — The acting unit: a team sees its own hidden rider's turn on its vehicle
+---------------------------------------------------------------------------------------
+
+!match new ar AR 8 6
+!match use ar
+!system set default active_unit_highlight true
+!ent add tank Tank 20 2 2 5
+!ent set_vars tank team=red footprint_w=2 footprint_h=2 slots.cockpit.capacity=1
+!ent add pilot Pilot 10 6 5 20
+!ent set_var pilot team red
+!mount pilot tank cockpit
+!ent add scout Scout 10 7 1 1
+!ent set_var scout team blue
+!turn next
+?? It is now **Pilot**'s turn
+!map
+?? ▶ now acting: Pilot
+!assert "footprint_width('tank') == 2 and footprint_height('tank') == 2"
+!map scene list
+?? entity `tank` at (2,2) 2x2 stretch — glyph v, color red (layer 100, acting)
+!match bind pov=red
+!map
+?? ▶ now acting: Pilot
+!map scene list
+?? layer 100, acting)
+!match bind pov=blue
+!map
+?! now acting
+!map scene list
+?! acting
+
+Expected: HARNESS-ALLOWS-ERRORS. Pilot rides hidden inside a 2x2 tank. On
+its turn the omniscient view and its own team (red) mark the tank, as the
+red turn line names Pilot; blue sees the tank but not who is inside, so
+nothing is marked (before, red saw no mark either: the highlight read a
+hidden rider as unseen by everyone).

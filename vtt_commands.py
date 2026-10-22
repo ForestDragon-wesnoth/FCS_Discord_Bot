@@ -3964,8 +3964,8 @@ def _crash_line(e: Dict[str, Any], owner: bool) -> str:
         key = e.get("server")
         where = (f" [{name} (`{key}`)]" if name and name != key
                  else f" [`{key}`]" if key else " [no server]")
-    who = f" by {e['user_name'] or e['user']}" if (e.get("user_name")
-                                                   or e.get("user")) else ""
+    who = (f" by {e.get('user_name') or e.get('user')}"
+           if (e.get("user_name") or e.get("user")) else "")
     cmd = e.get("command") or e.get("where") or "?"
     if len(cmd) > 80:
         cmd = cmd[:77] + "..."
@@ -4009,7 +4009,10 @@ async def _errors_cmd(ctx, args: List[str], mgr: MatchManager, scope: str):
         n = len(log.entries)
         log.entries = []
         if log.save is not None:
-            log.save(log)
+            try:
+                log.save(log)
+            except Exception as ex:  # noqa: BLE001 - as CrashLog.record
+                print(f"⚠️ The error log couldn't be saved ({ex}).")
         return await ctx.send(f"Cleared {n} crash(es) from the error log "
                               f"(ref numbers go on from {log.next_ref}).")
     n = _parse_count(args[1], f"{root} [n]") if len(args) > 1 else 10
@@ -8103,6 +8106,8 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
             raise VTTError(f"invalid table spec: {ex}")
         reply = f"Defined table `{name}` = `{body}` on `{sys_name}`."
     else:
+        if not body:
+            raise VTTError("macro body is empty.")
         try:
             _parse_macro(body)
         except _MacroError as ex:
@@ -8880,12 +8885,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 cur[parts_path[-1]] = value
                 after = copy.deepcopy(e.status[name])
                 event_log = m._emit_status_diff(eid, name, before, after)
-                # What is stored (a level is held to max_level).
-                stored = cur.get(parts_path[-1], value) \
-                    if eid in m.entities else value
+                # What is stored now: a level is held to max_level, and the
+                # status hooks the change fired may have changed it again.
+                stored: Any = (m.entities[eid].status.get(name)
+                               if eid in m.entities else None)
+                for key in parts_path:
+                    stored = (stored.get(key) if isinstance(stored, dict)
+                              else None)
                 msg = f"Set `{eid}.{name}.{path}` = {stored!r}."
+                cap = (m.status_definitions.get(name) or {}).get("max_level")
                 if stored != value:
-                    msg += f" (capped by `{name}`'s max_level)"
+                    msg += (f" (capped by `{name}`'s max_level)"
+                            if path == "level" and cap and stored == cap
+                            else f" (set to {value!r}; then changed by the "
+                                 f"status hooks it fired)")
                 if event_log:
                     msg += "\n" + "\n".join(event_log)
                 return await ctx.send(msg)
@@ -19608,7 +19621,7 @@ def _trace_text(trace: List[Dict[str, Any]]) -> str:
     more = len(trace) - _TRACE_SHOWN
     if more > 0:
         lines.append(f"... and {more} more" + (" (the trace stops at 1000)"
-                                               if len(trace) > 1000 else ""))
+                                               if len(trace) >= 1000 else ""))
     return "**Trace:**\n" + "\n".join(lines)
 
 

@@ -2353,3 +2353,48 @@ part through a teleport, a walk, a push and a cross-map move.
     refusals name `map=` (the pull one had no ❌); a match unit's or
     corpse's old `map` var moves to `map_old` at load.
   - X4+ and X5 stay deferred to the CPU work budget (§8).
+
+## Pass 47
+
+A by-hand pass over the features of the two newest PRs (passive
+priority, status definition hooks and `removed_by`, `{statuses}`, locals,
+list helpers, list rolls, the function reference, the crash log, the unit
+cap, `tile_place`, `!remind`, `!eval --trace`, the acting-unit highlight,
+system status / table / macro libraries and `!match sync`): every diff
+line read, then probes and a command / function fuzzer (31,500 runs over
+the new commands and list functions: only Python's own arity messages,
+as for every older function). Scenarios 900-902; verified after: 902/902,
+the replay differential, usage drift 0 of 906 servers; the acting-unit
+fix on a 2x2 vehicle with a hidden rider.
+  - **Status hook recursion:** a status hook (or an on_status_changed
+    passive, which predates the hooks) that changes its own status fired
+    itself until Python's recursion limit: ~120 hook lines and a raw
+    "maximum recursion depth" error, or, for an on_added hook removing the
+    status while on_removed puts it back, nothing at all in the reply.
+    `status_hook_recursion_limit` (32, ceiling 64) now stops the chain
+    with one ⚠️, like the var-hook and event-bus limits.
+  - `!ent status set` said "(capped by max_level)" whenever the stored
+    value differed from the typed one; hooks changing it now read as such,
+    and the value is read back from the unit (a hook that removed and
+    re-added the status left the old dict behind).
+  - **Acting unit:** the highlight read a hidden rider as unseen by every
+    team, its own included, while the turn line and the roster show a
+    team its own hidden rider: the rider's team saw no mark on its
+    vehicle. It now follows the turn line's rule.
+  - `reminder_message_format` was filled by chained replaces, so a
+    reminder whose own text held `{by}` or `{turns}` had them substituted.
+  - `!system macro set` stored an empty body that `!macro set` refuses.
+  - `!eval --trace` kept 1001 entries (the cap compared with `<=`).
+  - `!help function` signatures: a call form wrapped over two docstring
+    lines fell back to the code's parameters (`random_free_cell(*args,
+    ...)`), the sandbox's `str` / `int` / `max` / `min` showed `str(*a)` /
+    `int(...)`, a map-taking function without parameters read
+    `grid_width(, map=None)`, and `roll_table`'s was cut at the colon
+    inside its example; the docstrings of apply_mods / list_mods
+    (`target=,`) and hit_location (no `hitbox`) were stale.
+  - Tab completion read an alternative's leading word inside a `<... |
+    ...>` group as a placeholder when it is also a slot name: `!system
+    status hook <sys> <name>` offered the tick timings (`when` read as the
+    `when` slot), and `!map border c` didn't offer `color`.
+  - Smaller: `!owner errors clear` let a disk error escape, and a hand-
+    edited errors.json entry without `user_name` crashed the listing.
