@@ -20,7 +20,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -293,7 +293,8 @@ def _admin_required(name: str, args: List[str]) -> bool:
             return False
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
-        if sub in ("alias", "tile", "func", "status", "table", "macro"):
+        if sub in ("alias", "tile", "func", "status", "table", "macro",
+                   "zone"):
             # !system alias <action> <sys> ...
             return len(args) < 2 or args[1].lower() not in ("list", "info",
                                                             "show")
@@ -1271,27 +1272,30 @@ def _engine_var_warning(path: str, value: Any) -> str:
 
 
 def _template_data_set(name: str, data: Dict[str, Any], path: str,
-                       value: Any) -> None:
+                       value: Any, what: str = "template",
+                       reserved=TILE_RESERVED_KEYS) -> None:
     """Write `value` at dotted `path` of tile template `name`'s data dict
     (creating intermediate dicts), as `!tile def data` and `!system tile
-    data` do. Refuses the reserved keys and a path through a non-dict."""
-    if path.split(".", 1)[0] in TILE_RESERVED_KEYS:
-        raise VTTError(f"template data may not use reserved keys "
-                       f"({', '.join(sorted(TILE_RESERVED_KEYS))}).")
-    check_store_path(path, "template path")
+    data` do (`what` / `reserved`: a zone definition's, `!zone def data`).
+    Refuses the reserved keys and a path through a non-dict."""
+    if path.split(".", 1)[0] in reserved:
+        raise VTTError(f"{what} data may not use reserved keys "
+                       f"({', '.join(sorted(reserved))}).")
+    check_store_path(path, f"{what} path")
     parts = path.split(".")
     d = data
     for i, key in enumerate(parts[:-1]):
         existing = d.get(key)
         if existing is not None and not isinstance(existing, dict):
-            raise VTTError(f"template `{name}` value at "
+            raise VTTError(f"{what} `{name}` value at "
                            f"'{'.'.join(parts[:i + 1])}' is "
                            f"{type(existing).__name__}, not a dict.")
         d = d.setdefault(key, {})
     d[parts[-1]] = value
 
 
-def _template_data_del(name: str, data: Dict[str, Any], path: str) -> None:
+def _template_data_del(name: str, data: Dict[str, Any], path: str,
+                       what: str = "template") -> None:
     """Delete dotted `path` from tile template `name`'s data dict, pruning
     dicts left empty (as tile_del_path does)."""
     parts = path.split(".")
@@ -1299,10 +1303,10 @@ def _template_data_del(name: str, data: Dict[str, Any], path: str) -> None:
     for key in parts[:-1]:
         d = chain[-1]
         if not isinstance(d, dict) or key not in d:
-            raise VTTError(f"template `{name}` has no value at '{path}'.")
+            raise VTTError(f"{what} `{name}` has no value at '{path}'.")
         chain.append(d[key])
     if not isinstance(chain[-1], dict) or parts[-1] not in chain[-1]:
-        raise VTTError(f"template `{name}` has no value at '{path}'.")
+        raise VTTError(f"{what} `{name}` has no value at '{path}'.")
     del chain[-1][parts[-1]]
     for i in range(len(chain) - 1, 0, -1):
         if chain[i]:
@@ -1675,6 +1679,7 @@ def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
         for lib, word in (("aliases", "aliases"), ("tile_templates", "tiles"),
                           ("formula_functions", "functions"),
                           ("status_definitions", "statuses"),
+                          ("zone_definitions", "zone definitions"),
                           ("tables", "tables"), ("macros", "macros")):
             la, lb = a.get(lib) or {}, b.get(lib) or {}
             names = sorted(k for k in set(la) | set(lb)
@@ -3206,11 +3211,11 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         kinds = {"aliases": "aliases", "tiles": "tile_templates",
                  "funcs": "formula_functions",
                  "statuses": "status_definitions", "tables": "tables",
-                 "macros": "macros"}
+                 "macros": "macros", "zones": "zone_definitions"}
         singular = {"aliases": "alias", "tiles": "tile template",
                     "funcs": "formula function",
                     "statuses": "status definition", "tables": "table",
-                    "macros": "macro"}
+                    "macros": "macro", "zones": "zone definition"}
         kind = args[1].lower()
         if kind not in kinds and kind != "all":
             raise VTTError(f"`{args[1]}` — sync one of: "
@@ -3221,7 +3226,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             rest = rest[:-1]
         _check_tail(["sync", kind] + rest, 3 if kind != "all" else 2, (),
                     "!match sync <aliases|tiles|funcs|statuses|tables|"
-                    "macros> [name] [diff] | "
+                    "macros|zones> [name] [diff] | "
                     "!match sync all [diff]")
         want = rest[0] if rest else None
         sysobj = mgr.get_system(m.system_name)
@@ -3248,6 +3253,10 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     new = FormulaFunction.from_dict(entry)
                     old = mine[n].to_dict() if n in mine else None
                     differs = old != new.to_dict()
+                elif lib_name == "zone_definitions":
+                    new = normalize_zone_def(entry)
+                    old = mine.get(n)
+                    differs = old != new
                 else:
                     new, old = entry, mine.get(n)
                     differs = old != new
@@ -3489,17 +3498,18 @@ registry.annotate_sub(
           "(the seed predicts every roll); not an undo step."))
 registry.annotate_sub(
     "match", "sync",
-    usage=("!match sync <aliases|tiles|funcs|statuses|tables|macros> "
+    usage=("!match sync <aliases|tiles|funcs|statuses|tables|macros|zones> "
            "[name] [diff] | !match sync all [diff]"),
     desc=("Copy the GameSystem's aliases, tile templates, formula "
-          "functions, status definitions, tables or macros (its own and "
+          "functions, status definitions, tables, macros or zone "
+          "definitions (its own and "
           "inherited ones; one by name, or all) over this match's. A "
           "system's libraries reach only matches created after an edit by "
           "themselves; this brings a live match up to date. Entries only "
           "the match has are kept; undo reverts it. A synced status "
           "definition with a lower max_level lowers live instances. A "
           "trailing `diff` shows what would change and changes nothing. The "
-          "other way: `!system <alias|tile|func|status|table|macro> "
+          "other way: `!system <alias|tile|func|status|table|macro|zone> "
           "promote`."),
 )
 registry.annotate_sub(
@@ -7231,6 +7241,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_func(ctx, args, mgr)
     if sub == "status":
         return await _system_status(ctx, args, mgr)
+    if sub == "zone":
+        return await _system_zone(ctx, args, mgr)
     if sub in ("table", "macro"):
         return await _system_text_lib(ctx, args, mgr, sub)
 
@@ -7440,7 +7452,8 @@ def _match_formula_slots(m: Match):
     """Every formula match `m` stores, as (where, source, mode, params,
     action_mode): its functions, global / team / unit passives, unit
     actions, watchers, status ticks, tile templates' and tiles' hooks and
-    block / opaque conditions, zones' hooks and conditions. Read by
+    block / opaque conditions, zones' and zone definitions' hooks and
+    conditions. Read by
     `!system lint` and by renames looking for formulas that name a thing."""
     from action import discover_actions
     for fname, fn in sorted(m.formula_functions.items()):
@@ -7498,6 +7511,14 @@ def _match_formula_slots(m: Match):
         for key in ("block", "opaque"):
             yield (f"zone `{zname}` {key}", (z.get("data") or {}).get(key),
                    "eval", frozenset(), False)
+    for dname, zdef in sorted(m.zone_definitions.items()):
+        for when, src in sorted((zdef.get("hooks") or {}).items()):
+            yield (f"zone definition `{dname}` hook `{when}`", src, "exec",
+                   frozenset(), False)
+        for key in ("block", "opaque"):
+            yield (f"zone definition `{dname}` {key}",
+                   (zdef.get("data") or {}).get(key), "eval", frozenset(),
+                   False)
 
 
 def _rename_entry(d: Dict[str, Any], old: str, new: str, what: str) -> Dict[str, Any]:
@@ -7612,6 +7633,17 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
                 n += 1
                 check(f"status `{sname}` {where}", src, "exec", sys_known,
                       soft=True)
+    for zname, zdef in sorted(
+            mgr.system_library(s, "zone_definitions").items()):
+        zdef = normalize_zone_def(zdef)
+        for when, src in sorted(zdef["hooks"].items()):
+            n += 1
+            check(f"zone definition `{zname}` hook `{when}`", src, "exec",
+                  sys_known, soft=True)
+        for key in ("block", "opaque"):
+            n += 1
+            check(f"zone definition `{zname}` {key}", zdef["data"].get(key),
+                  "eval", sys_known, soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
@@ -7642,7 +7674,7 @@ def _sync_change(lib_name: str, name: str, old: Any, new: Any) -> str:
         return (f"  `{name}`: "
                 + (f"`{_clip(old, 40)}` → " if old is not None else "")
                 + f"`{_clip(new, 40)}`")
-    if lib_name == "status_definitions":
+    if lib_name in ("status_definitions", "zone_definitions"):
         if old is None:
             return f"  `{name}`: new definition"
         keys = sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
@@ -7716,7 +7748,7 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
     lib = mgr.system_library(s, "tile_templates")
     need = {"new": 4, "data": 6, "del-data": 5, "hook": 6, "del-hook": 5,
             "del": 4, "delete": 4, "remove": 4, "rm": 4, "info": 4,
-            "promote": 4, "list": 3}
+            "promote": 4, "list": 3, "rename": 5, "copy": 5, "tags": 5}
     if action not in need:
         return await _help_fallback(ctx, ["system", "tile"], args[1])
     if await return_help_if_not_enough_args(ctx, args, need[action],
@@ -7728,8 +7760,11 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
         lines = [f"**Tile templates on `{sys_name}`:**"]
         for tname in sorted(lib):
             hooks = ", ".join(sorted(lib[tname].get("hooks") or {})) or "—"
+            tags = normalize_tags(lib[tname].get("tags"))
             src = "" if tname in s.tile_templates else " (inherited)"
-            lines.append(f"- `{tname}` (hooks: {hooks}){src}")
+            lines.append(f"- `{tname}` (hooks: {hooks}"
+                         + (f"; tags: {', '.join(tags)}" if tags else "")
+                         + f"){src}")
         hidden = s.removed.get("tile_templates") or []
         if hidden:
             lines.append("Hidden here: " + ", ".join(f"`{h}`" for h in hidden))
@@ -7761,9 +7796,27 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
     entry = _system_lib_entry(mgr, s, "tile_templates", name, sys_name,
                               "tile template")
     tpl = SpecialTileTemplate.from_dict(entry)
+    if action in ("rename", "copy"):
+        _check_tail(args, 5, (), f"!system tile {action} <system> <name> "
+                                 f"<new_name>")
+        new = args[4]
+        if action == "copy":
+            _copy_entry(lib, name, new, "tile template")
+            lib[new]["name"] = new
+            mgr.system_library_write(s, "tile_templates", lib)
+            return await ctx.send(f"Copied tile template `{name}` to `{new}` "
+                                  f"on `{sys_name}`.")
+        lib = _rename_entry(lib, name, new, "tile template")
+        lib[new]["name"] = new
+        mgr.system_library_write(s, "tile_templates", lib)
+        return await ctx.send(f"Renamed tile template `{name}` to `{new}` on "
+                              f"`{sys_name}` (matches made from now on get "
+                              f"`{new}`; live ones keep their own).")
     if action == "info":
-        body = json.dumps({"data": tpl.data, "hooks": tpl.hooks}, indent=2,
-                          default=str)
+        view = {"data": tpl.data, "hooks": tpl.hooks}
+        if tpl.tags:
+            view["tags"] = tpl.tags
+        body = json.dumps(view, indent=2, default=str)
         src = "" if name in s.tile_templates else " (inherited)"
         return await ctx.send(f"**tile template `{name}`** on "
                               f"`{sys_name}`{src}\n```{body}\n```")
@@ -7792,6 +7845,16 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
     elif action == "del-data":
         _template_data_del(name, tpl.data, args[4])
         reply = f"Removed `{sys_name}` tile template `{name}`.{args[4]}."
+    elif action == "tags":
+        raw = " ".join(args[4:]).strip()
+        if raw in ("-", "none", "clear"):
+            tpl.tags = []
+        else:
+            for t in raw.replace(",", " ").split():
+                check_tag(t)
+            tpl.tags = normalize_tags(raw)
+        reply = (f"`{sys_name}` tile template `{name}` tags = "
+                 f"{', '.join(tpl.tags) or 'none'}.")
     elif action == "hook":
         when = args[4]
         if when not in TILE_HOOK_NAMES:
@@ -7912,7 +7975,8 @@ def _system_scratch(mgr: MatchManager, s: Any) -> Match:
     system's library (its renames and mention notes included)."""
     m = Match(id="_system", name="", maps=default_maps(1, 1),
               system_name=s.name, rules=mgr._build_rules_dict(s))
-    for kind in ("status_definitions", "tables", "macros"):
+    for kind in ("status_definitions", "tables", "macros",
+                 "zone_definitions"):
         setattr(m, kind, mgr.system_library(s, kind))
     for fname, fdef in mgr.system_library(s, "formula_functions").items():
         try:
@@ -8021,6 +8085,85 @@ async def _system_status(ctx: ReplyContext, args: List[str],
     reply = await _status_def_sub(ctx, [action] + args[3:], scratch,
                                   "!system status {sub} " + sys_name, check)
     mgr.system_library_write(s, kind, scratch.status_definitions)
+    if reply:
+        await ctx.send(reply)
+
+
+async def _system_zone(ctx: ReplyContext, args: List[str],
+                       mgr: MatchManager):
+    """`!system zone <action> <system> ...` — the `!zone def` subcommands on
+    a system's zone definitions."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "zone"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    kind = "zone_definitions"
+    need = {k: v + 2 for k, v in _ZONE_DEF_SUBS.items()}
+    need.update({"list": 3, "info": 4, "promote": 4,
+                 **{d: 4 for d in _SYSTEM_LIB_DELETES}})
+    if action not in need:
+        return await _help_fallback(ctx, ["system", "zone"], args[1])
+    if await return_help_if_not_enough_args(ctx, args, need[action],
+                                            "system", "zone"):
+        return
+    lib = mgr.system_library(s, kind)
+    if action == "list":
+        _check_tail(args, 3, (), "!system zone list <system>")
+        if not lib:
+            return await ctx.send(
+                f"No zone definitions on system `{sys_name}`.")
+        lines = [f"**Zone definitions on `{sys_name}`:**"]
+        for name in sorted(lib):
+            d = lib[name]
+            bits = []
+            if d.get("hooks"):
+                bits.append("hooks: " + ", ".join(sorted(d["hooks"])))
+            if d.get("tags"):
+                bits.append("tags: " + ", ".join(d["tags"]))
+            src = "" if name in s.zone_definitions else " (inherited)"
+            lines.append(f"- `{name}`" + (f" ({'; '.join(bits)})" if bits
+                                          else "") + src)
+        return await ctx.send("\n".join(lines + _system_hidden_line(s, kind)))
+    name = args[3]
+    if action == "promote":
+        _check_tail(args, 4, (), "!system zone promote <system> <name>")
+        m = active_match(mgr, ctx)
+        zdef = m.zone_definitions.get(name)
+        if zdef is None:
+            raise NotFound(f"zone definition `{name}` isn't defined on match "
+                           f"`{m.id}`.")
+        prior = lib.get(name)
+        lib[name] = normalize_zone_def(zdef)
+        mgr.system_library_write(s, kind, lib)
+        warns = [_promote_warning(mgr, s, src, f"its {when} hook")
+                 for when, src in sorted((zdef.get("hooks") or {}).items())]
+        return await ctx.send("\n".join(
+            [_promoted_line("zone definition", f"`{name}`", m.id, sys_name,
+                            prior is not None, prior == lib[name])]
+            + [w for w in warns if w]))
+    if action == "info":
+        _check_tail(args, 4, (), "!system zone info <system> <name>")
+        d = _system_lib_entry(mgr, s, kind, name, sys_name, "zone definition")
+        src = "" if name in s.zone_definitions else " (inherited)"
+        return await ctx.send(
+            f"**zone definition `{name}`** on `{sys_name}`{src}\n"
+            f"```{json.dumps(_zone_def_dict_view(d), indent=2, sort_keys=True, default=str)}\n```")
+    if action in _SYSTEM_LIB_DELETES:
+        _check_tail(args, 4, (), f"!system zone {action} <system> <name>")
+        _system_lib_entry(mgr, s, kind, name, sys_name, "zone definition")
+        del lib[name]
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(_system_deleted_line(
+            mgr, s, kind, "zone definition", name))
+
+    def check(body: str, what: str) -> Optional[str]:
+        return _system_formula_warning(
+            mgr, s, body, "exec", f"Invalid {what} formula", "it fails")
+
+    scratch = _system_scratch(mgr, s)
+    reply = await _zone_def_sub(ctx, [action] + args[3:], scratch,
+                                "!system zone {sub} " + sys_name, check)
+    mgr.system_library_write(s, kind, scratch.zone_definitions)
     if reply:
         await ctx.send(reply)
 
@@ -8237,7 +8380,9 @@ registry.annotate_sub(
         "new <system> <name> | data <system> <name> <path> <value> | "
         "del-data <system> <name> <path> | "
         "hook <system> <name> <when> <formula ...> | "
-        "del-hook <system> <name> <when> | del <system> <name> | "
+        "del-hook <system> <name> <when> | tags <system> <name> <tag ...> | "
+        "rename <system> <name> <new_name> | copy <system> <name> <new_name> | "
+        "del <system> <name> | "
         "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
         "promote <system> <name>>"
     ),
@@ -8270,6 +8415,33 @@ registry.annotate_sub(
         "channel's match into the system. Editing an inherited function "
         "makes it this system's own; deleting one hides it (`!system unset "
         "<sys> formula_functions:<name>` brings it back)."
+    ),
+)
+registry.annotate_sub(
+    "system", "zone",
+    usage=(
+        "!system zone <list <system> | info <system> <name> | "
+        "new <system> <name> | data <system> <name> <path> <value> | "
+        "del-data <system> <name> <path> | "
+        "hook <system> <name> <when> <formula ...> | "
+        "del-hook <system> <name> <when> | glyph <system> <name> <char|-> | "
+        "color <system> <name> <color|-> | sprite <system> <name> <key|-> | "
+        "legend <system> <name> <text ...> | tags <system> <name> <tag ...> | "
+        "rename <system> <name> <new_name> | copy <system> <name> <new_name> | "
+        "del <system> <name> | drop <system> <name> | "
+        "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
+        "promote <system> <name>>"
+    ),
+    desc=(
+        "Manage a GameSystem's zone definitions with the grammar of `!zone "
+        "def` (the system name after the action). Copied into every NEW "
+        "match on the system (and the systems inheriting from it); a live "
+        "match takes them with `!match sync zones`. `promote <sys> <name>` "
+        "copies a definition from the channel's match into the system. "
+        "Editing an inherited definition makes it this system's own; "
+        "deleting one hides it (`!system unset <sys> "
+        "zone_definitions:<name>` brings it back). A hook calling a function "
+        "the system doesn't define is stored with a ⚠️."
     ),
 )
 registry.annotate_sub(
@@ -10657,8 +10829,8 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             if src:
                 parts.append(f"{src}: {_fmt_spec(spec)}")
         for n in zones:
-            zspec = (m.find_zone(n).get("data") or {}).get(key)
-            if zspec not in (None, ""):
+            zspec = m.zone_data_spec(m.find_zone(n), key)
+            if zspec is not None:
                 parts.append(f"zone `{n}`: {_fmt_spec(zspec)}")
             elif m.rules.get(zone_rule, "") not in (None, ""):
                 parts.append(f"zone `{n}` (rule {zone_rule}): "
@@ -10679,12 +10851,12 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             sees_blocked = m._eval_opaque_spec(
                 m._tile_opaque_spec(x, y, mp), mover, dict(tx), oerr)
         for n in zones:
-            zd = m.find_zone(n).get("data") or {}
-            bspec = zd.get("block")
-            if bspec in (None, ""):
+            zn = m.find_zone(n)
+            bspec = m.zone_data_spec(zn, "block")
+            if bspec is None:
                 bspec = m.rules.get("zone_block_condition", "")
-            ospec = zd.get("opaque")
-            if ospec in (None, ""):
+            ospec = m.zone_data_spec(zn, "opaque")
+            if ospec is None:
                 ospec = m.rules.get("zone_opaque_condition", "")
             blocks = m._eval_block_spec(bspec, mover, {"zone_name": n,
                                                        "zone_map": mp.name},
@@ -15546,6 +15718,26 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await _fan_out(ctx, tile_cmd, mgr, args, maps)
         mp = maps[0]
 
+    # ---- tags <x> <y> <tag ...|-> ----  (the tile's own tags)
+    if sub == "tags":
+        if await return_help_if_not_enough_args(ctx, args, 4, "tile", "tags"):
+            return
+        x, y = _parse_xy(args)
+        raw = " ".join(args[3:]).strip()
+        if raw in ("-", "none", "clear"):
+            if "tags" in (mp.tiles.get((x, y)) or {}):
+                mp.tile_del_path(x, y, "tags")
+        else:
+            for t in raw.replace(",", " ").split():
+                check_tag(t)
+            mp.tile_set_path(x, y, "tags", normalize_tags(raw))
+        tags = m.tile_tags(x, y, mp)
+        own = normalize_tags((mp.tiles.get((x, y)) or {}).get("tags"))
+        return await ctx.send(
+            f"tile ({x},{y}) own tags: " + (", ".join(own) if own else "none")
+            + (f" (with its template's: {', '.join(tags)})." if tags != own
+               else "."))
+
     # ---- set <x> <y> <path> <value> ----
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 5, "tile", "set"):
@@ -15638,8 +15830,11 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         data = _visible_tile_data(m, x, y, pov, mp)
         if data is None:
             return await ctx.send(f"tile ({x},{y}): no data.")
+        tags = m.tile_tags(x, y, mp)
         return await ctx.send(
             f"**tile ({x},{y})**\n```{json.dumps(data, indent=2, sort_keys=True)}\n```"
+            + (f"\nTags (its template's and its own): {', '.join(tags)}"
+               if tags else "")
         )
 
     # ---- list ----
@@ -15867,6 +16062,37 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
             return await ctx.send(f"Deleted template `{name}`{extra}.")
 
+        if dsub == "rename":
+            # !tile def rename <name> <new_name>
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
+                return
+            _check_tail(args, 4, (), "!tile def rename <name> <new_name>")
+            n = m.rename_tile_template(args[2], args[3])
+            note = _mentions_note(m, args[2], "tile template")
+            return await ctx.send(
+                f"Renamed tile template `{args[2]}` to `{args[3]}`"
+                + (f" ({n} placed tile(s) follow it)." if n else ".")
+                + (f"\n{note}" if note else ""))
+
+        if dsub == "tags":
+            # !tile def tags <name> <tag ...|->
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
+                return
+            name = args[2]
+            if name not in m.tile_templates:
+                raise NotFound(f"template `{name}` not found.")
+            raw = " ".join(args[3:]).strip()
+            tpl = m.tile_templates[name]
+            if raw in ("-", "none", "clear"):
+                tpl.tags = []
+                return await ctx.send(f"Cleared template `{name}`'s tags.")
+            for t in raw.replace(",", " ").split():
+                check_tag(t)
+            tpl.tags = normalize_tags(raw)
+            return await ctx.send(
+                f"template `{name}` tags = {', '.join(tpl.tags)} (every tile "
+                f"placed from it carries them, with its own `tags` data).")
+
         if dsub == "copy":
             # !tile def copy <name> <new_name>
             if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
@@ -15893,8 +16119,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     if isinstance(t, dict) and t.get("_template") == tname
                 )
                 hook_keys = ", ".join(sorted(tpl.hooks.keys())) or "—"
+                tags = f"; tags: {', '.join(tpl.tags)}" if tpl.tags else ""
                 lines.append(
-                    f"- `{tname}` ({placed} placed; hooks: {hook_keys})"
+                    f"- `{tname}` ({placed} placed; hooks: {hook_keys}{tags})"
                 )
             return await ctx.send("\n".join(lines))
 
@@ -15910,10 +16137,10 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if isinstance(t, dict) and t.get("_template") == name
             )
             import json as _json
-            body = _json.dumps(
-                {"data": tpl.data, "hooks": tpl.hooks},
-                indent=2, default=str,
-            )
+            view = {"data": tpl.data, "hooks": tpl.hooks}
+            if tpl.tags:
+                view["tags"] = tpl.tags
+            body = _json.dumps(view, indent=2, default=str)
             return await ctx.send(
                 f"**template `{name}`** ({placed} placed)\n```{body}\n```"
             )
@@ -16257,6 +16484,13 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 registry.annotate_sub(
+    "tile", "tags",
+    usage="!tile tags <x> <y> <tag ...> [map=<map>]",
+    desc=("Set a tile's own tags (its `tags` data; `-` clears them). A "
+          "tile's tags are its template's (`!tile def tags`) plus these; "
+          "formulas test them with tile_has_tag / tiles_with_tag."),
+)
+registry.annotate_sub(
     "tile", "set",
     usage="!tile set <x> <y> <path> <value> [map=<map>]",
     desc=(
@@ -16338,7 +16572,9 @@ registry.annotate_sub(
         "!tile def del <name> [confirm] | "
         "!tile def list | "
         "!tile def info <name> | "
-        "!tile def copy <name> <new_name>"
+        "!tile def copy <name> <new_name> | "
+        "!tile def rename <name> <new_name> | "
+        "!tile def tags <name> <tag ...>"
     ),
     desc=(
         "Manage reusable tile templates. A template defines a kind of "
@@ -16347,10 +16583,13 @@ registry.annotate_sub(
         "with `!tile place`. Template data is deep-copied into each "
         "instance at placement (per-instance edits don't propagate), "
         "while template hooks are looked up live at fire time (template "
-        "hook edits propagate to all placed instances). Deleting a "
+        "hook edits propagate to all placed instances); so are its "
+        "`tags` (`tags <name> <tag ...>`, `-` clears), which a placed "
+        "tile carries with its own `tags` data (tile_has_tag, "
+        "tiles_with_tag). `rename` takes the placed tiles along. Deleting a "
         "template that still has placed instances requires the "
-        "trailing `confirm` token — orphaned instances continue to "
-        "exist but their hook firings warn instead of running."
+        "trailing `confirm` token — orphaned instances keep their data "
+        "and lose the template's hooks and tags."
     ),
 )
 registry.annotate_sub(
@@ -16446,7 +16685,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|info|list|cells|hook> ..."),
+    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|tags|setdef|def|info|list|cells|hook> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -16459,7 +16698,8 @@ registry.annotate_sub(
         "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
         "new, drop, rename, add, remove, fill, shift, anchor, "
         "unanchor, set, del, clear, glyph, sprite (a graphics sprite key, "
-        "like glyph), color, legend, info, list, cells, hook."
+        "like glyph), color, legend, tags, setdef, def (zone definitions: "
+        "a kind of zone described once), info, list, cells, hook."
     ),
 )
 async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -16482,17 +16722,75 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return owner
         return _one_map(ctx, m, mapspec, strict=True)
 
-    # ---- new <name> ----
+    if sub == "def":
+        return await _zone_def_cmd(ctx, args, m)
+
+    # ---- new [<name>] [def=<definition>] ----
     if sub == "new":
         if await return_help_if_not_enough_args(ctx, args, 2, "zone", "new"):
             return
-        name = args[1]
+        words = [a for a in args[1:] if not a.lower().startswith("def=")]
+        defs = [a.split("=", 1)[1] for a in args[1:]
+                if a.lower().startswith("def=")]
+        if len(words) > 1 or len(defs) > 1 or (not words and not defs) \
+                or (defs and not defs[0]):
+            raise VTTError("Usage: `!zone new [<name>] [def=<definition>] "
+                           "[map=<map>]` (a name, a definition or both).")
+        zmp = _one_map(ctx, m, mapspec, strict=True)
+        if defs:
+            name = m.create_zone_from_def(words[0] if words else None,
+                                          defs[0], zmp)
+            nd = len(m.find_zone(name).get("data") or {})
+            return await ctx.send(
+                f"Created empty zone `{name}` of definition `{defs[0]}`"
+                f"{_on_map(m, zmp)}"
+                + (f" ({nd} data key(s) copied)." if nd else "."))
+        name = words[0]
         try:
-            zmp = _one_map(ctx, m, mapspec, strict=True)
             m.create_zone(name, zmp)
         except (VTTError, DuplicateId) as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"Created empty zone `{name}`{_on_map(m, zmp)}.")
+
+    # ---- setdef <name> <definition|-> ----
+    if sub == "setdef":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "setdef"):
+            return
+        _check_tail(args, 3, (), "!zone setdef <name> <definition|->")
+        name, dname = args[1], args[2]
+        if dname in ("-", "none", "clear"):
+            old = m.zone_def_name(name)
+            m.set_zone_def(name, None)
+            return await ctx.send(
+                f"Zone `{name}` no longer names a definition"
+                + (f" (it had `{old}`; its data stays)." if old else "."))
+        n = m.set_zone_def(name, dname)
+        return await ctx.send(
+            f"Zone `{name}` is now of definition `{dname}`"
+            + (f" ({n} data key(s) it lacked copied in)." if n else "."))
+
+    # ---- tags <name> <tag ...|-> ----  (the zone's own tags)
+    if sub == "tags":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "tags"):
+            return
+        name = args[1]
+        z = m.find_zone(name)
+        if z is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        raw = " ".join(args[2:]).strip()
+        if raw in ("-", "none", "clear"):
+            z.pop("tags", None)
+        else:
+            for t in raw.replace(",", " ").split():
+                check_tag(t)
+            z["tags"] = normalize_tags(raw)
+        tags = m.zone_tags(name)
+        own = z.get("tags") or []
+        return await ctx.send(
+            f"Zone `{name}` own tags: "
+            + (", ".join(own) if own else "none")
+            + (f" (with its definition's: {', '.join(tags)})."
+               if tags != own else "."))
 
     # ---- rename <old> <new> ----
     if sub == "rename":
@@ -16789,9 +17087,30 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             "data": z.get("data") or {},
             "hooks": sorted((z.get("hooks") or {}).keys()),
         }
-        for key in ("glyph", "color", "sprite", "legend"):
+        for key in ZONE_LOOK_FIELDS:
             if isinstance(z.get(key), str) or z.get(key) is False:
                 view[key] = z[key]
+        if z.get("tags"):
+            view["tags"] = list(z["tags"])
+        # What the zone reads from its definition (live): the hooks, look
+        # fields and tags it doesn't set itself.
+        dname = z.get("def")
+        if isinstance(dname, str) and dname:
+            d = m.zone_def_dict(z)
+            view["def"] = dname if d is not None else f"{dname} (missing)"
+            if d is not None:
+                inh: Dict[str, Any] = {}
+                hk = sorted(h for h in (d.get("hooks") or {})
+                            if h not in (z.get("hooks") or {}))
+                if hk:
+                    inh["hooks"] = hk
+                for key in ZONE_LOOK_FIELDS:
+                    if key in d and key not in view:
+                        inh[key] = d[key]
+                if d.get("tags"):
+                    inh["tags"] = list(d["tags"])
+                if inh:
+                    view["from_def"] = inh
         if len(m.maps) > 1:
             view["map"] = m.zone_map(name).name
         if z.get("anchor"):
@@ -16805,24 +17124,43 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"```{json.dumps(view, indent=2, sort_keys=True)}\n```"
         )
 
-    # ---- list ----
+    # ---- list [tag=<tag>] [def=<definition>] ----
     if sub == "list":
+        opts = {}
+        for a in args[1:]:
+            k, eq, v = a.partition("=")
+            if not eq or k.lower() not in ("tag", "def") or not v \
+                    or k.lower() in opts:
+                raise VTTError("Usage: `!zone list [tag=<tag>] "
+                               "[def=<definition>] [map=<map>]`.")
+            opts[k.lower()] = v
         pov = _view_pov(ctx, m, args)
         names = [n for n in m.zone_names() if m.zone_visible_to(n, pov)]
+        names = m.zones_matching(names, opts.get("tag"), opts.get("def"))
         if not names:
-            return await ctx.send("No zones in this match.")
+            return await ctx.send("No zones in this match"
+                                  + (" match that." if opts else "."))
         lines = ["**Zones:**"]
         for name in names:
             z = m.find_zone(name)
             n = len(z.get("cells") or ())
-            hooks = sorted((z.get("hooks") or {}).keys())
+            hooks = sorted({h for h in (z.get("hooks") or {})}
+                           | set((m.zone_def_dict(z) or {}).get("hooks")
+                                 or {}))
             extras = []
+            if isinstance(z.get("def"), str):
+                extras.append(f"def `{z['def']}`" + (
+                    "" if z["def"] in m.zone_definitions else " (missing)"))
+            tags = m.zone_tags(name)
+            if tags:
+                extras.append(f"tags: {', '.join(tags)}")
             if z.get("data"):
                 extras.append(f"data: {', '.join(sorted(z['data'].keys()))}")
             if hooks:
                 extras.append(f"hooks: {', '.join(hooks)}")
-            if isinstance(z.get("glyph"), str):
-                extras.append(f"glyph '{z['glyph']}'")
+            g = m.zone_look(z, "glyph")
+            if g is not None:
+                extras.append(f"glyph '{g}'")
             if z.get("anchor"):
                 extras.append(
                     f"aura→`{z['anchor']}` r{z.get('anchor_radius', 0)}")
@@ -16839,7 +17177,6 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # self = the moving/acting entity, zone_name = the zone, tile_x/tile_y
     # = the crossed/stepped cell (None for time hooks).
     if sub == "hook":
-        from logic import ZONE_HOOK_NAMES
         if len(args) < 2:
             title, body = registry.help_for(["zone", "hook"])
             return await ctx.send(f"**{title}**\n{body}")
@@ -16882,6 +17219,13 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if z is None:
                 return await ctx.send(f"❌ Zone '{name}' not found.")
             if when not in (z.get("hooks") or {}):
+                d = m.zone_def_dict(z)
+                if when in ((d or {}).get("hooks") or {}):
+                    return await ctx.send(
+                        f"❌ zone `{name}` has no `{when}` hook of its own; it "
+                        f"runs definition `{z['def']}`'s (`!zone def "
+                        f"del-hook {z['def']} {when}` removes that one for "
+                        f"every zone of it).")
                 return await ctx.send(f"❌ zone `{name}` has no `{when}` hook.")
             del z["hooks"][when]
             return await ctx.send(f"Removed zone `{name}` `{when}` hook.")
@@ -16894,19 +17238,222 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             z = m.find_zone(name)
             if z is None:
                 return await ctx.send(f"❌ Zone '{name}' not found.")
-            hooks = z.get("hooks") or {}
-            if not hooks:
+            own = z.get("hooks") or {}
+            inherited = (m.zone_def_dict(z) or {}).get("hooks") or {}
+            if not own and not inherited:
                 return await ctx.send(f"zone `{name}`: no hooks.")
             lines = [f"**zone `{name}` hooks:**"]
-            for when in sorted(hooks.keys()):
-                src = hooks[when]
+            for when in sorted(set(own) | set(inherited)):
+                src = own.get(when) or inherited[when]
                 snippet = src if len(src) <= 80 else src[:77] + "..."
-                lines.append(f"- `{when}`: {snippet}")
+                tag = "" if when in own else f" (from `{z['def']}`)"
+                lines.append(f"- `{when}`{tag}: {snippet}")
             return await ctx.send("\n".join(lines))
 
         return await _help_fallback(ctx, ["zone", "hook"], args[1] if len(args) > 1 else None)
 
     return await _help_fallback(ctx, ["zone"], args[0] if args else None)
+
+
+# `!zone def <action> <name> ...` (and `!system zone <action> <system>
+# <name> ...`, which runs the same code on a scratch match): action -> the
+# words `!zone def` needs (action included).
+_ZONE_DEF_SUBS = {"new": 2, "data": 4, "del-data": 3, "hook": 4,
+                  "del-hook": 3, "glyph": 3, "color": 3, "sprite": 3,
+                  "legend": 3, "tags": 2, "rename": 3, "copy": 3}
+_ZONE_DEF_DELETES = ("del", "delete", "remove", "rm", "drop")
+
+
+def _zone_def_dict_view(d: Dict[str, Any]) -> Dict[str, Any]:
+    """A zone definition as `info` prints it: data, hooks, tags and the
+    look fields set."""
+    view: Dict[str, Any] = {"data": d.get("data") or {},
+                            "hooks": d.get("hooks") or {},
+                            "tags": d.get("tags") or []}
+    for key in ZONE_LOOK_FIELDS:
+        if key in d:
+            view[key] = d[key]
+    return view
+
+
+async def _zone_def_sub(ctx: ReplyContext, args: List[str], m: Match,
+                        prefix: str, check) -> Optional[str]:
+    """Run definition subcommand `args[0]` (`args` = the words after `!zone
+    def`) on `m`'s zone_definitions and return the reply ("" when help was
+    sent), or None when it isn't one. `prefix` is the command the hints name
+    (a format string over `sub`); `check(body, what)` validates a hook
+    program (raises, or returns a ⚠️ line)."""
+    sub = args[0].lower()
+    if sub not in _ZONE_DEF_SUBS:
+        return None
+    if await return_help_if_not_enough_args(ctx, args, _ZONE_DEF_SUBS[sub],
+                                            "zone", "def"):
+        return ""
+    name = args[1]
+    lib = m.zone_definitions
+    if sub == "new":
+        _check_tail(args, 2, (), prefix.format(sub="new") + " <name>")
+        m.define_zone_def(name)
+        return (f"Defined zone definition `{name}`. Make a zone of it with "
+                f"`!zone new <name> def={name}` (or `!zone new def={name}`, "
+                f"which names it for you).")
+    if sub == "rename":
+        _check_tail(args, 3, (), prefix.format(sub="rename")
+                    + " <name> <new_name>")
+        n = m.rename_zone_def(name, args[2])
+        note = _mentions_note(m, name, "zone definition")
+        return (f"Renamed zone definition `{name}` to `{args[2]}`"
+                + (f" ({n} zone(s) follow it)." if n else ".")
+                + (f"\n{note}" if note else ""))
+    if sub == "copy":
+        _check_tail(args, 3, (), prefix.format(sub="copy")
+                    + " <name> <new_name>")
+        check_zone_def_name(args[2])
+        _copy_entry(lib, name, args[2], "zone definition")
+        return (f"Copied zone definition `{name}` to `{args[2]}` (zones of "
+                f"`{name}` stay `{name}`).")
+    d = lib.get(name)
+    if d is None:
+        raise NotFound(f"No zone definition `{name}`. Make it with "
+                       f"`{prefix.format(sub='new')} {name}`.")
+    if sub == "data":
+        path, value = args[2], _parse_scalar(args[3])
+        _check_tail(args, 4, (), prefix.format(sub="data")
+                    + " <name> <path> <value>")
+        _template_data_set(name, d.setdefault("data", {}), path,
+                           _own_value(value), what="zone definition",
+                           reserved=())
+        return (f"zone definition `{name}`.{path} = {value!r} (zones made "
+                f"from it from now on get it)"
+                + _cell_formula_warning(m, path, value))
+    if sub == "del-data":
+        _check_tail(args, 3, (), prefix.format(sub="del-data")
+                    + " <name> <path>")
+        _template_data_del(name, d.setdefault("data", {}), args[2],
+                           what="zone definition")
+        return f"Removed zone definition `{name}`.{args[2]}."
+    if sub == "hook":
+        when = args[2]
+        if when not in ZONE_HOOK_NAMES:
+            raise VTTError(f"Unknown zone hook '{when}'. Allowed: "
+                           f"{', '.join(sorted(ZONE_HOOK_NAMES))}.")
+        body = normalize_body_source(" ".join(args[3:]).strip())
+        if not body:
+            raise VTTError("hook formula cannot be empty (`"
+                           + prefix.format(sub="del-hook")
+                           + f" {name} {when}` removes one).")
+        warn = check(body, f"{when} hook")
+        d.setdefault("hooks", {})[when] = body
+        return (f"Set zone definition `{name}` `{when}` hook (zones of it "
+                f"without their own `{when}` hook run it)."
+                + (f"\n{warn}" if warn else ""))
+    if sub == "del-hook":
+        _check_tail(args, 3, (), prefix.format(sub="del-hook")
+                    + " <name> <when>")
+        when = args[2]
+        if when not in (d.get("hooks") or {}):
+            raise NotFound(f"zone definition `{name}` has no `{when}` hook.")
+        del d["hooks"][when]
+        return f"Removed zone definition `{name}` `{when}` hook."
+    if sub == "tags":
+        raw = " ".join(args[2:]).strip()
+        if raw in ("", "-"):
+            d["tags"] = []
+            return f"Cleared zone definition `{name}`'s tags."
+        for t in raw.replace(",", " ").split():
+            check_tag(t)
+        d["tags"] = normalize_tags(raw)
+        return (f"zone definition `{name}` tags = {', '.join(d['tags'])} "
+                f"(every zone of it carries them).")
+    # glyph / color / sprite / legend: the look fields, read live.
+    val = " ".join(args[2:]).strip() if sub == "legend" else args[2]
+    if sub != "legend":
+        _check_tail(args, 3, (), prefix.format(sub=sub)
+                    + f" <name> <{sub}|->")
+    if val in ("-", "none", "clear"):
+        d.pop(sub, None)
+        return f"Cleared zone definition `{name}`'s {sub}."
+    if sub == "legend" and val.lower() == "false":
+        val = False
+    elif sub == "glyph" and len(val) != 1:
+        raise VTTError("glyph must be exactly one character (or `-` to "
+                       "clear).")
+    d[sub] = val
+    tail = ""
+    if sub == "color":
+        from logic import TEXT_COLORS
+        if val not in TEXT_COLORS and not any(c in val for c in "()[]. +-*/"):
+            tail = (f"\n⚠ `{val}` isn't a recognized color name (renders "
+                    f"uncolored unless it's a valid color formula). "
+                    f"{_color_guide()}")
+    shown = "left out of the legend" if val is False else f"`{val}`"
+    return (f"zone definition `{name}` {sub} = {shown} (zones of it without "
+            f"their own {sub} show it)." + tail)
+
+
+async def _zone_def_cmd(ctx: ReplyContext, args: List[str], m: Match):
+    """`!zone def <action> ...` on the channel's match (`args` start at
+    `def`)."""
+    if len(args) < 2:
+        title, body = registry.help_for(["zone", "def"])
+        return await ctx.send(f"**{title}**\n{body}")
+    dsub = args[1].lower()
+    if dsub == "list":
+        _check_tail(args, 2, (), "!zone def list")
+        if not m.zone_definitions:
+            return await ctx.send("No zone definitions on this match.")
+        lines = ["**Zone definitions:**"]
+        for dname in sorted(m.zone_definitions):
+            d = m.zone_definitions[dname]
+            bits = [f"{len(m.zones_using_def(dname))} zone(s)"]
+            if d.get("hooks"):
+                bits.append("hooks: " + ", ".join(sorted(d["hooks"])))
+            if d.get("tags"):
+                bits.append("tags: " + ", ".join(d["tags"]))
+            if d.get("glyph"):
+                bits.append(f"glyph '{d['glyph']}'")
+            lines.append(f"- `{dname}` ({'; '.join(bits)})")
+        return await ctx.send("\n".join(lines))
+    if dsub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "def"):
+            return
+        _check_tail(args, 3, (), "!zone def info <name>")
+        d = m.zone_definitions.get(args[2])
+        if d is None:
+            raise NotFound(f"No zone definition `{args[2]}`.")
+        used = m.zones_using_def(args[2])
+        return await ctx.send(
+            f"**zone definition `{args[2]}`** ({len(used)} zone(s)"
+            + (": " + ", ".join(f"`{z}`" for z in used[:10])
+               + (" ..." if len(used) > 10 else "") if used else "")
+            + f")\n```{json.dumps(_zone_def_dict_view(d), indent=2, sort_keys=True, default=str)}\n```")
+    if dsub in _ZONE_DEF_DELETES:
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "def"):
+            return
+        name = args[2]
+        extra = [a.lower() for a in args[3:]]
+        if extra not in ([], ["confirm"]):
+            raise VTTError(f"Usage: `!zone def {dsub} <name> [confirm]`.")
+        if name not in m.zone_definitions:
+            raise NotFound(f"No zone definition `{name}`.")
+        used = m.zones_using_def(name)
+        if used and not extra:
+            return await ctx.send(
+                f"⚠️ zone definition `{name}` is used by {len(used)} "
+                f"zone(s). Deleting it leaves them orphaned: they keep their "
+                f"own data and settings, and lose the definition's hooks, "
+                f"look and tags. To proceed: `!zone def {dsub} {name} "
+                f"confirm`.")
+        del m.zone_definitions[name]
+        return await ctx.send(f"Deleted zone definition `{name}`"
+                              + (f" ({len(used)} zone(s) now orphaned)."
+                                 if used else "."))
+    reply = await _zone_def_sub(ctx, args[1:], m, "!zone def {sub}",
+                                _match_program_check(m))
+    if reply is None:
+        return await _help_fallback(ctx, ["zone", "def"], args[1])
+    if reply:
+        return await ctx.send(reply)
 
 
 for _sub, _usage in (
@@ -17832,8 +18379,61 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "zone", "new",
-    usage="!zone new <name> [map=<map>]",
-    desc="Create an empty zone (no cells). Errors if the name is taken.",
+    usage="!zone new [<name>] [def=<definition>] [map=<map>]",
+    desc=("Create an empty zone (no cells). Errors if the name is taken. "
+          "`def=<definition>` makes it a zone of that zone definition (`!zone "
+          "def`): the definition's data is copied in, and its hooks, glyph, "
+          "colour, sprite, legend and tags apply live wherever the zone "
+          "doesn't set its own. With a definition and no name, the name is "
+          "made from the definition's (`poison_cloud`, `poison_cloud2`, ...)."),
+)
+registry.annotate_sub(
+    "zone", "setdef",
+    usage="!zone setdef <name> <definition|->",
+    desc=("Make an existing zone a zone of a zone definition (the "
+          "definition's data keys the zone lacks are copied in), or with `-` "
+          "stop it naming one (its own data and settings stay)."),
+)
+registry.annotate_sub(
+    "zone", "tags",
+    usage="!zone tags <name> <tag ...>",
+    desc=("Set a zone's own tags (`-` clears them). Its tags are its "
+          "definition's plus these; formulas test them with zone_has_tag / "
+          "zones_with_tag and the tag= filters of zones_at, entity_zones and "
+          "zone_names, and `!zone list tag=<tag>` lists them."),
+)
+_ZONE_DEF_USAGE = (
+    "!zone def new <name> | !zone def data <name> <path> <value> | "
+    "!zone def del-data <name> <path> | "
+    "!zone def hook <name> <when> <formula ...> | "
+    "!zone def del-hook <name> <when> | !zone def glyph <name> <char|-> | "
+    "!zone def color <name> <color|-> | !zone def sprite <name> <key|-> | "
+    "!zone def legend <name> <text ...> | "
+    "!zone def tags <name> <tag ...> | "
+    "!zone def rename <name> <new_name> | !zone def copy <name> <new_name> | "
+    "!zone def del <name> [confirm] | !zone def drop <name> [confirm] | "
+    "!zone def delete <name> [confirm] | !zone def remove <name> [confirm] | "
+    "!zone def rm <name> [confirm] | !zone def list | !zone def info <name>")
+registry.annotate_sub(
+    "zone", "def",
+    usage=_ZONE_DEF_USAGE,
+    desc=(
+        "Zone DEFINITIONS describe a kind of zone once (`poison_cloud`), the "
+        "way a tile template describes a kind of tile. A zone made with "
+        "`!zone new [<name>] def=<definition>` (or given one with `!zone "
+        "setdef`) names its definition: the definition's hooks, glyph, "
+        "colour, sprite, legend and tags apply LIVE (editing the definition "
+        "changes every zone of it) wherever the zone doesn't set its own; "
+        "its data is COPIED into the zone when the zone is made (a later "
+        "data edit reaches only zones made afterwards), and its `block` / "
+        "`opaque` data is read when the zone's data lacks them. Checks that "
+        "care about the kind of zone read the tags or zone_def_of(zone); "
+        "only \"which zone\" needs its name. Deleting a definition zones use "
+        "needs `confirm` and leaves them orphaned (they keep their own data "
+        "and settings). `rename` takes its zones along. A system holds "
+        "definitions too (`!system zone`), copied into new matches; `!match "
+        "sync zones` brings a live match up to date."
+    ),
 )
 registry.annotate_sub(
     "zone", "drop",
@@ -17935,16 +18535,20 @@ registry.annotate_sub(
     usage="!zone info <name>",
     desc=(
         "Show a zone's full state: its cells, data dict, registered hook "
-        "names, its glyph, colour, sprite and legend label (when set), its "
-        "aura binding and, on a match with several maps, its map."
+        "names, its glyph, colour, sprite, legend label and tags (when set), "
+        "its zone definition with what the zone takes from it (`from_def`: "
+        "the hooks, look and tags it doesn't set itself), its aura binding "
+        "and, on a match with several maps, its map."
     ),
 )
 registry.annotate_sub(
     "zone", "list",
-    usage="!zone list",
+    usage="!zone list [tag=<tag>] [def=<definition>]",
     desc=(
         "List every zone on the active match with cell counts and a "
-        "summary of its data keys, hooks, and glyph."
+        "summary of its definition, tags, data keys, hooks (its own and its "
+        "definition's) and glyph. `tag=` / `def=` keep only the zones "
+        "carrying that tag / of that zone definition."
     ),
 )
 registry.annotate_sub(

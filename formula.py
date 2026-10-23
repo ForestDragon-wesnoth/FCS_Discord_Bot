@@ -2814,6 +2814,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "zone_get", "zone_has", "zone_keys", "zone_set", "zone_del",
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift",
+    # Zone definitions and tags (zone_spawn makes a zone of a definition,
+    # minting its name), and tile tags.
+    "zone_tags", "zone_has_tag", "zones_with_tag", "zone_def_of",
+    "zone_spawn", "tile_tags", "tile_has_tag", "tiles_with_tag",
     # Entity-anchored auras: bind a zone to an entity so its cells track
     # the entity's footprint (re-stamped on move). radius 0 = the
     # footprint itself.
@@ -2988,7 +2992,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "map_with", "filter_with", "sort_by",
     "log",
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
-    "zone_fill", "zone_shift", "zone_set", "zone_del",
+    "zone_fill", "zone_shift", "zone_set", "zone_del", "zone_spawn",
     "zone_anchor", "zone_unanchor",
     "mount", "dismount", "switch_slot",
     "damage_part", "damage_spread",
@@ -3047,6 +3051,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'var_sum', 'var_sum_field', 'zone_anchor_of', 'zone_cells',
     'zone_exists', 'zone_get', 'zone_has', 'zone_keys', 'zone_names',
     'zone_size', 'zones_at',
+    'zone_tags', 'zone_has_tag', 'zones_with_tag', 'zone_def_of',
+    'tile_tags', 'tile_has_tag', 'tiles_with_tag',
 })
 # Drift guard (forced classification): the safe and mutating sets must be
 # DISJOINT and together cover EVERY _MATCH_FUNC_NAMES name. Adding a new match
@@ -3082,10 +3088,11 @@ _TUPLE_FREE_FUNCS = frozenset(_MATCH_FUNC_NAMES) | frozenset(_ALLOWED_FUNCS)
 _MAP_CELL_RESULT_FUNCS: "frozenset[str]" = frozenset({
     "first_opaque", "raycast", "free_cell_near", "clip_cells",
     "cells_in_burst", "cells_in_line", "cells_in_cone", "cells_in_rect",
+    "tiles_with_tag",
 })
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
-    "tile_place", "tile_template_of",
+    "tile_place", "tile_template_of", "tile_tags", "tile_has_tag",
     "fire_tile_hook", "cell_entity", "entities_at", "zones_at",
     "entities_in_area", "entities_in_cone", "entities_in_rect",
     "entities_in_line_ignorelos", "entities_on_los", "entities_in_line_until",
@@ -3254,6 +3261,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entities_in_zone",
     "zone_cells",
     "zone_keys",
+    "zone_tags", "zones_with_tag", "tile_tags", "tiles_with_tag",
     # Footprint cells — a list of (x,y) pairs (loop with `for (cx,cy) in
     # footprint_cells(eid)`).
     "footprint_cells",
@@ -7503,11 +7511,24 @@ class FormulaEngine:
             """zone_exists(name): True iff a zone with this name exists."""
             return match.has_zone(_zone_name(name, "zone_exists"))
 
-        def _zones_at(x: Any, y: Any) -> list:
-            """zones_at(x, y): list of zone names covering cell (x,y)
-            (sorted; loopable)."""
+        def _zone_filter(names: Any, tag: Any, definition: Any,
+                         fname: str) -> list:
+            """`names` kept when they carry `tag` and are of zone definition
+            `definition` (None = any), the tag= / definition= filters."""
+            for what, v in (("tag", tag), ("definition", definition)):
+                if v is not None and (not isinstance(v, str) or not v):
+                    raise FormulaError(f"{fname}(...): {what}= takes a "
+                                       f"name, got {v!r}.")
+            return match.zones_matching(names, tag, definition)
+
+        def _zones_at(x: Any, y: Any, tag: Any = None,
+                      definition: Any = None) -> list:
+            """zones_at(x, y, tag=None, definition=None): list of zone names
+            covering cell (x,y) (sorted; loopable); tag= keeps the zones
+            carrying that tag, definition= those of that zone definition."""
             xi, yi = _zone_xy(x, y, "zones_at")
-            return sorted(_cur_map().zones_at(xi, yi))
+            return _zone_filter(sorted(_cur_map().zones_at(xi, yi)), tag,
+                                definition, "zones_at")
 
         def _cell_in_zone(x: Any, y: Any, name: Any) -> bool:
             """cell_in_zone(x, y, name): True iff (x,y) is in the zone."""
@@ -7520,10 +7541,13 @@ class FormulaEngine:
             eid = _eid(eid_t)
             return name in match.entity_zones(eid) if isinstance(name, str) else False
 
-        def _entity_zones(eid_t: Any) -> list:
-            """entity_zones(eid): zone names the entity currently stands
-            in (sorted; loopable)."""
-            return sorted(match.entity_zones(_eid(eid_t)))
+        def _entity_zones(eid_t: Any, tag: Any = None,
+                          definition: Any = None) -> list:
+            """entity_zones(eid, tag=None, definition=None): zone names the
+            entity currently stands in (sorted; loopable); tag= /
+            definition= filter as in zones_at."""
+            return _zone_filter(sorted(match.entity_zones(_eid(eid_t))), tag,
+                                definition, "entity_zones")
 
         def _entities_in_zone(name: Any) -> list:
             """entities_in_zone(name): alive entity ids standing in the
@@ -7535,9 +7559,107 @@ class FormulaEngine:
             loop with `for (cx,cy) in zone_cells(name)`)."""
             return match.zone_cell_list(_zone_name(name, "zone_cells"))
 
-        def _zone_names() -> list:
-            """zone_names(): every zone name (sorted; loopable)."""
-            return match.zone_names()
+        def _zone_names(tag: Any = None, definition: Any = None) -> list:
+            """zone_names(tag=None, definition=None): every zone name
+            (sorted; loopable); tag= / definition= filter as in zones_at."""
+            return _zone_filter(match.zone_names(), tag, definition,
+                                "zone_names")
+
+        def _zone_tags(name: Any) -> list:
+            """zone_tags(zone): the zone's tags, its zone definition's then
+            its own (loopable; [] for a missing zone)."""
+            return match.zone_tags(_zone_name(name, "zone_tags"))
+
+        def _zone_has_tag(name: Any, tag: Any) -> bool:
+            """zone_has_tag(zone, tag): True iff the zone carries the tag
+            (its own or its zone definition's); False for a missing zone."""
+            if not isinstance(tag, str) or not tag:
+                raise FormulaError("zone_has_tag(zone, tag): tag must be a "
+                                   "non-empty string.")
+            return match.zone_has_tag(_zone_name(name, "zone_has_tag"), tag)
+
+        def _zones_with_tag(tag: Any, map: Any = None) -> list:
+            """zones_with_tag(tag, map=None): the zones carrying the tag
+            (sorted; loopable), on every map, or on the map `map=` names."""
+            if not isinstance(tag, str) or not tag:
+                raise FormulaError("zones_with_tag(tag): tag must be a "
+                                   "non-empty string.")
+            names = (match.zone_names() if map is None
+                     else sorted(_map_arg(map, "zones_with_tag").zones))
+            return match.zones_matching(names, tag)
+
+        def _zone_def_of(name: Any) -> Any:
+            """zone_def_of(zone): the name of the zone definition the zone
+            is of (`!zone new ... def=`, zone_spawn), or None."""
+            return match.zone_def_name(_zone_name(name, "zone_def_of"))
+
+        def _zone_spawn(definition: Any, cells: Any = None, map: Any = None,
+                        name: Any = None) -> str:
+            """zone_spawn(definition, cells=[], map=None, name=None): make a
+            zone of zone definition `definition` (its data copied in, its
+            hooks / look / tags read live) covering `cells` (a list of
+            [x, y]), on the map `map=` names, else the formula's map.
+            Returns the zone's name: `name`, or one made from the
+            definition's (`poison_cloud`, `poison_cloud2`, ...). A cell off
+            the map refuses the call."""
+            if not isinstance(definition, str) or not definition:
+                raise FormulaError("zone_spawn(definition, cells): definition "
+                                   "must be a zone definition's name.")
+            if name is not None and (not isinstance(name, str) or not name):
+                raise FormulaError("zone_spawn(...): name= must be a "
+                                   "non-empty string.")
+            cells = [] if cells is None else cells
+            if not isinstance(cells, list):
+                raise FormulaError("zone_spawn(definition, cells): cells must "
+                                   "be a list of [x, y] cells.")
+            mp = _map_arg(map, "zone_spawn") if map is not None else _cur_map()
+            pts = []
+            for c in cells:
+                if not (isinstance(c, list) and len(c) in (2, 3)
+                        and all(isinstance(v, int) and not isinstance(v, bool)
+                                for v in c[:2])):
+                    raise FormulaError(f"zone_spawn: {c!r} isn't an [x, y] "
+                                       f"cell.")
+                if len(c) == 3 and c[2] != mp.name:
+                    raise FormulaError(f"zone_spawn: cell {c!r} is on another "
+                                       f"map than `{mp.name}`.")
+                if not mp.in_bounds(c[0], c[1]):
+                    raise FormulaError(f"zone_spawn: ({c[0]},{c[1]}) is off "
+                                       f"the {mp.size_text()} map.")
+                pts.append((c[0], c[1]))
+            try:
+                zn = match.create_zone_from_def(name, definition, mp)
+            except VTTError as ex:
+                raise FormulaError(f"zone_spawn: {ex}")
+            for (cx, cy) in pts:
+                mp.zone_add_cell(zn, cx, cy, create=False)
+            return zn
+
+        def _tile_tags(x: Any, y: Any) -> list:
+            """tile_tags(x, y): the tile's tags, its template's then its own
+            `tags` data (loopable)."""
+            xi, yi = _zone_xy(x, y, "tile_tags")
+            return match.tile_tags(xi, yi, _cur_map())
+
+        def _tile_has_tag(x: Any, y: Any, tag: Any) -> bool:
+            """tile_has_tag(x, y, tag): True iff the tile carries the tag
+            (its template's or its own `tags` data)."""
+            xi, yi = _zone_xy(x, y, "tile_has_tag")
+            if not isinstance(tag, str) or not tag:
+                raise FormulaError("tile_has_tag(x, y, tag): tag must be a "
+                                   "non-empty string.")
+            return tag in match.tile_tags(xi, yi, _cur_map())
+
+        def _tiles_with_tag(tag: Any) -> list:
+            """tiles_with_tag(tag): the cells whose tile carries the tag, as
+            [x, y] (sorted by row; loopable)."""
+            if not isinstance(tag, str) or not tag:
+                raise FormulaError("tiles_with_tag(tag): tag must be a "
+                                   "non-empty string.")
+            mp = _cur_map()
+            return [[x, y] for (x, y) in sorted(mp.tiles,
+                                                key=lambda c: (c[1], c[0]))
+                    if tag in match.tile_tags(x, y, mp)]
 
         def _zone_size(name: Any) -> int:
             """zone_size(name): number of cells in the zone (0 if it
@@ -7812,6 +7934,14 @@ class FormulaEngine:
         ns["zone_remove_cell"]  = _zone_remove_cell
         ns["zone_fill"]         = _zone_fill
         ns["zone_shift"]        = _zone_shift
+        ns["zone_tags"]         = _zone_tags
+        ns["zone_has_tag"]      = _zone_has_tag
+        ns["zones_with_tag"]    = _zones_with_tag
+        ns["zone_def_of"]       = _zone_def_of
+        ns["zone_spawn"]        = _zone_spawn
+        ns["tile_tags"]         = _tile_tags
+        ns["tile_has_tag"]      = _tile_has_tag
+        ns["tiles_with_tag"]    = _tiles_with_tag
 
         def _rule_get(name: Any) -> Any:
             """rule_get(name): the effective value of a system rule on

@@ -389,6 +389,8 @@ back, load the schema with `ToolSearch` before calling
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
   match and nested maps (step 1 and 2a-2d built; §8).
+- **`docs/zones_prefabs_design.md`**: the agreed design for zone
+  definitions / tags and prefabs (#31; zones built, prefabs next; §8).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature. When a feature ships in full (everything its
@@ -1904,10 +1906,39 @@ hardcodes**.
   on_stop / time hooks). Formulas place a template with `tile_place(template,
   x, y, data=None)` (`!tile place`: replaces the cell's data, corpses stay,
   `data` overrides fields; mutating) and read it back with
-  `tile_template_of(x, y)` (892).
+  `tile_template_of(x, y)` (892). `!tile def rename` takes the placed tiles
+  along (`Match.rename_tile_template`).
 - **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
-  + time), dedicated glyph / color / sprite fields, `zone_shift`, `zone_*`
-  prims, `zone_distance`.
+  + time), dedicated glyph / color / sprite / legend fields, `zone_shift`,
+  `zone_*` prims, `zone_distance`; `create_zone` / `delete_zone` in
+  formulas.
+- **Zone definitions** (`docs/zones_prefabs_design.md` §1-§4; `!zone def`,
+  `Match.zone_definitions`, `normalize_zone_def`, a system library): a kind
+  of zone described once, the tile-template pattern (user call, for
+  consistency between the two map features with definitions). A zone
+  naming one (its `def` field: `!zone new [<name>] def=<d>`, `!zone
+  setdef`, `zone_spawn`) reads the definition's hooks, look fields
+  (`ZONE_LOOK_FIELDS`: glyph, color, sprite, legend) and tags LIVE, its own
+  value winning (`Match.zone_hook_source`, `zone_look`, `zone_tags`; every
+  hook-firing site, both renderers and the legend go through them); its
+  data is COPIED in when the zone is made, and `block` / `opaque` read
+  through to the definition's data when the zone's data lacks them
+  (`zone_data_spec`, as a tile reads its template's). A zone without a
+  name taken from a definition gets one minted like unit ids
+  (`Match.mint_zone_name`: `poison_cloud`, `poison_cloud2`). Rename takes
+  the zones along; deleting a used definition needs `confirm` and orphans
+  them silently (their own data stays). `!zone info` shows what a zone
+  takes from its definition (`from_def`) (904-906).
+- **Tags** on zones and tiles (`normalize_tags`, `check_tag`): a zone's are
+  its definition's plus its own (`!zone tags`, `!zone def tags`), a
+  tile's its template's (a `SpecialTileTemplate.tags` field, read live,
+  never copied into data) plus its own `tags` data (`!tile tags`, `!tile
+  def tags`). Reads: `zone_tags`, `zone_has_tag`, `zones_with_tag(tag,
+  map=)`, `zone_def_of`, `tile_tags`, `tile_has_tag`, `tiles_with_tag`, and
+  `tag=` / `definition=` filters on `zones_at`, `entity_zones`,
+  `zone_names` (`def` is a Python keyword), `tag=` / `def=` on `!zone
+  list`. `zone_spawn(definition, cells, map=None, name=None)` (mutating)
+  makes a zone of a definition (905, 907).
 - **Auras:** a zone anchored to a unit (`!zone anchor <name> <eid> [radius]
   [metric]`): cells re-stamped around every footprint cell when the anchor
   moves or its footprint var changes (`_body_reshaped`, which also re-seats
@@ -2149,18 +2180,20 @@ hardcodes**.
   renames their clamps / default vars (`_inheritors`); a child's own engine
   formula equal to its parent's after a rename is dropped (753-756).
 - **System libraries** (`SYSTEM_LIBRARIES`: aliases, tile templates,
-  formula functions, status definitions, tables, macros):
-  `!system alias|tile|func|status|table|macro <action> <system> ...` edit
+  formula functions, status definitions, tables, macros, zone
+  definitions):
+  `!system alias|tile|func|status|table|macro|zone <action> <system> ...` edit
   them with the grammar of `!alias` / `!tile def` / `!func` / `!status` /
   `!table` / `!macro` (action first, like alias), through the effective
   library (editing an inherited entry makes it the child's own whole
-  entry; deleting one hides it). `!system status` runs the definition
-  subcommands of `!status` (`_status_def_sub`, shared with the match
-  command) on a scratch match holding the system's effective library
-  (`_system_scratch`) and writes it back. They reach NEW matches only
+  entry; deleting one hides it). `!system status` / `!system zone` run the
+  definition subcommands of `!status` / `!zone def` (`_status_def_sub` /
+  `_zone_def_sub`, shared with the match command) on a scratch match
+  holding the system's effective library (`_system_scratch`) and write it
+  back. They reach NEW matches only
   (copied at creation, user call; a system macro has no author, so it runs
-  as a host's); `!match sync <aliases|tiles|funcs|statuses|tables|macros>
-  [name] | all` copies the system's effective entries over a live match's
+  as a host's); `!match sync <aliases|tiles|funcs|statuses|tables|macros|
+  zones> [name] | all` copies the system's effective entries over a live match's
   (match-only entries kept, an undo step; a synced status definition
   re-caps live instances like `!status maxlevel`), and `!system <lib>
   promote <system> <name>` copies one from the channel's match into the
@@ -2562,6 +2595,11 @@ rejected already. Update this section in the PR that resolves an item.
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.
+- **Prefabs (#31):** designed with the user; the agreed design is in
+  `docs/zones_prefabs_design.md` (read it whole first; ask before
+  deviating). Two PRs: zone definitions and tags (built, §7.12), then
+  prefabs (§5-§9 of the doc: save a rectangle of one map, stamp it with
+  overlay / replace / keep, rotation, game-system checks).
 - **Multiple maps per match (#40) and nested maps (#164):** designed with
   the user over a long discussion; the agreed decisions, deferred points, build
   order and test requirements (20+ scenarios) are in

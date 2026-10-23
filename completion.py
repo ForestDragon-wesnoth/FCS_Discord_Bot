@@ -418,6 +418,11 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(registry._handlers)
     if slot == "token":
         return sorted(m.status_definitions) if m is not None else []
+    if slot == "definition" and root == "zone":
+        # Zone definitions are a host's (`!zone def` is host-gated).
+        if m is None or _view(m, ctx) is not None:
+            return []
+        return sorted(m.zone_definitions)
     if slot == "slot" and m is not None:
         seen = set(_entity_ids(mgr, ctx))
         holder = binds.get("vehicle")
@@ -458,6 +463,9 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         }
         if root == "ent" and sub == "group":
             return sorted(m.groups) if _view(m, ctx) is None else []
+        if root == "zone" and sub == "def":
+            return (sorted(m.zone_definitions) if _view(m, ctx) is None
+                    else [])
         if root == "match" and sub == "templates":
             return sorted(m.template_pins)
         if root == "match" and sub == "sync":
@@ -474,11 +482,13 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
 # `!system <sub>` library editors -> the library their `<name>` names.
 _SYSTEM_LIBS = {"alias": "aliases", "tile": "tile_templates",
                 "func": "formula_functions", "status": "status_definitions",
-                "table": "tables", "macro": "macros"}
+                "table": "tables", "macro": "macros",
+                "zone": "zone_definitions"}
 # `!match sync <kind>` -> the library named.
 _SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
               "funcs": "formula_functions", "statuses": "status_definitions",
-              "tables": "tables", "macros": "macros"}
+              "tables": "tables", "macros": "macros",
+              "zones": "zone_definitions"}
 
 
 # Placeholders _slot_names knows a source for (used to tell slots from
@@ -486,7 +496,7 @@ _SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
 _KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
                "dest_match", "rule", "function", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
-               "slot", "corpse_id", "key", "path", "sub"}
+               "slot", "corpse_id", "key", "path", "sub", "definition"}
 
 
 # ---- the entry point -------------------------------------------------------
@@ -550,6 +560,10 @@ def _command_candidates(words: List[str], word: str, mgr, ctx) -> List[str]:
     elif (word.lower().startswith("map=") and "map" in walk.keys
           and m is not None):
         out |= {f"map={n}" for n in _map_names(m, ctx)}
+    elif (root == "zone" and word.lower().startswith("def=")
+          and "def" in walk.keys and m is not None
+          and _view(m, ctx) is None):
+        out |= {f"def={n}" for n in m.zone_definitions}
     return sorted(out)
 
 
