@@ -29220,3 +29220,411 @@ definition whose own `block` data was deleted still blocks: the read goes
 through to the definition's data, as a tile reads its template's; once
 the zone names no definition, it doesn't. A system's tile templates take
 tags, copy and rename too.
+
+
+SCENARIO 908 — Prefabs: save a rectangle, stamp it in another match, ids, zones, groups, definitions, the event
+-----------------------------------------------------------------------------------------------------------------
+
+!match new src Src 10 8
+!match use src
+!ent add orc1 Orc 10 2 2 5
+!ent set_var orc1 team red
+!ent face orc1 right
+!ent add orc2 Orc 10 3 3 4
+!ent set_var orc2 team red
+!ent group add guards orc1 orc2
+!tile def new campfire
+!tile def data campfire glyph *
+!tile def tags campfire fire
+!tile place campfire 4 2
+!tile set 2 4 note "a dropped map"
+!zone def new smoke
+!zone def glyph smoke ~
+!zone def tags smoke obscuring
+!zone new def=smoke
+!zone fill smoke 3 4 4 5
+!func def double x "x * 2"
+!status def burn
+!status tick burn "entity[self].hp = entity[self].hp - double(1)"
+!status apply orc2 burn 1 3
+!ent add far Far 10 9 7
+!prefab save camp 2 2 5 5
+?? 💾 Saved prefab `camp` — 4x4, 2 units, 2 tiles, 1 zone, system `default`
+!prefab show camp
+?? Carries: function `double`, status `burn`, tile template `campfire`, zone definition `smoke`
+?? *
+!prefab list
+?? `camp` — 4x4
+!match new dst Dst 12 10
+!match use dst
+!ent add orc1 Other 10 12 10 1
+!zone new smoke
+!gpassive add seen event:prefab_stamped "match_var_set('stamped', event_get('units'))\nmatch_var_set('where', [event_get('x'), event_get('y'), event_get('map')])"
+!prefab stamp camp 3 3
+?? 🧱 Stamped prefab `camp` at (3,3): `orc`, `orc2`; zones `smoke2`.
+?? Zone names taken here, so renamed: `smoke` → `smoke2`.
+!assert "entity[orc].x == 3 and entity[orc].y == 3 and facing_of('orc') == 'right'"
+!assert "entity[orc2].x == 4 and entity[orc2].y == 4 and entity[orc2].team == 'red'"
+!assert "status_has('orc2', 'burn')"
+!assert "tile_has_tag(5, 3, 'fire') and tile_template_of(5, 3) == 'campfire'"
+!assert "tile_get(3, 5, 'note') == 'a dropped map'"
+!assert "zone_def_of('smoke2') == 'smoke' and zone_has_tag('smoke2', 'obscuring')"
+!assert "zone_cells('smoke2') == [[4, 5], [4, 6], [5, 5], [5, 6]]"
+!assert "sorted(group_members('guards')) == ['orc', 'orc2']"
+!eval "double(4)"
+?? = `8`
+!assert "match_var_get('stamped') == ['orc', 'orc2'] and match_var_get('where') == [3, 3, 'main']"
+!prefab stamp camp 7 3
+?? `orc3`, `orc4`
+!assert "len(group_members('guards')) == 4"
+!undo command
+!assert "not 'orc3' in all_entities() and len(group_members('guards')) == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!prefab save` takes the units whose bodies
+lie in the rectangle (`far` stays out), the tile data (a placed template and
+a plain tile), the zone with its definition, the group and the definitions
+the contents use (the tile template, the zone definition, `burn` and the
+`double` function its tick calls). Stamped in another match at (3,3): a
+saved id that is free there is kept (`orc2`), a taken one mints from its
+name (`orc1` -> `orc`); the zone's name is taken, so it becomes `smoke2`;
+facing, team, the status and the definitions arrive; the units join the
+`guards` group; the prefab_stamped event carries the new ids and the cell.
+A second stamp mints `orc3`, `orc4`; undo takes it back.
+
+
+SCENARIO 909 — Prefabs: what a rectangle's edge leaves out, only=, corpses with parts, auras
+-------------------------------------------------------------------------------------------
+
+!match new src Src 10 8
+!match use src
+!ent add wide Wide 10 4 2 1
+!ent set_var wide footprint_w 3
+!ent add n Knight 10 2 5 1
+!part add n shield Shield 5 5
+!part locate shield 3 5
+!zone new halo
+!zone anchor halo shield 0
+!zone new far_aura
+!zone anchor far_aura wide 0
+!ent add m Mech 10 2 2 1
+!part add m arm Arm 5 5
+!part locate arm 3 2
+!ent kill m
+!zone new pond
+!zone fill pond 1 7 8 8
+!prefab save grave 1 1 5 8
+?? ⚠️ `wide` was left out: its body (parts and riders included) reaches past the rectangle
+!prefab show grave
+?? 1 unit, 2 zones, 1 corpse
+?! far_aura
+!prefab save tilesonly 1 1 5 8 only=zones
+?? `tilesonly` — 5x8, 1 zone
+!prefab save bad 1 1 5 8 only=units,people
+?? only= takes a comma list of units, tiles, zones, corpses.
+!map new deck 3 3
+!map attach deck n
+!prefab save boat 1 1 5 8
+?? `n` carries a map, and units carrying maps can't go into a prefab (not supported).
+!map detach deck
+!map delete deck
+!match new dst Dst 10 8
+!match use dst
+!prefab stamp grave 2 1
+!assert "has_corpse('m') and 'n' in all_entities() and 'shield' in all_entities()"
+!assert "entity[shield].x == 4 and entity[shield].y == 5"
+!assert "zone_anchor_of('halo') == 'shield' and zone_cells('halo') == [[4, 5]]"
+!assert "zone_cells('pond') == [[2, 7], [2, 8], [3, 7], [3, 8], [4, 7], [4, 8], [5, 7], [5, 8], [6, 7], [6, 8]]"
+!ent revive m
+!assert "entity[m].x == 3 and entity[m].y == 2 and entity[arm].x == 4 and entity[arm].y == 2"
+!ent move shield 1 down
+!assert "zone_cells('halo') == [[4, 6]]"
+
+Expected: HARNESS-ALLOWS-ERRORS. The 3-wide `wide` reaches past the
+rectangle and is left out with a ⚠️, and so is its aura `far_aura`; the
+knight with its located shield and the shield's aura are saved; the pond
+zone is clipped to the rectangle; the dead mech's corpse goes along with
+its arm. `only=zones` keeps the zones alone; an unknown kind is refused;
+a unit carrying a map is left out with the unsupported ⚠️. Stamped at
+(2,1): the corpse revives with its arm at the same offset, and the aura
+follows the shield when it moves.
+
+
+SCENARIO 910 — Prefabs: rotate and flip a multi-tile body, located parts, a snake and facings
+---------------------------------------------------------------------------------------------
+
+!match new src Src 8 6
+!match use src
+!ent add ogre Ogre 30 1 1 3
+!ent set_var ogre footprint_w 2
+!ent face ogre right
+!part add ogre gun Gun 5 5
+!part locate gun 3 1
+!ent add d Destroyer 50 4 4 9
+!ent face d right
+!part segment d b0 Body0 0 0
+!part segment d b1 Body1 0 0
+!prefab save beasts 1 1 4 4
+?? 2 units
+!match new dst Dst 12 12
+!match use dst
+!prefab stamp beasts 1 1
+!assert "entity[ogre].x == 1 and entity[gun].x == 3 and entity[d].x == 4 and entity[b0].x == 3 and entity[b1].x == 2"
+!prefab stamp beasts 6 1 rotate=90
+?? turned 90°
+!assert "entity[ogre2].x == 9 and entity[ogre2].y == 1 and footprint_width('ogre2') == 1 and footprint_height('ogre2') == 2"
+!assert "facing_of('ogre2') == 'down' and entity[gun2].x == 9 and entity[gun2].y == 3"
+!assert "entity[d2].x == 6 and entity[d2].y == 4 and facing_of('d2') == 'down'"
+!assert "entity[b].x == 6 and entity[b].y == 3 and entity[b2].x == 6 and entity[b2].y == 2"
+!prefab stamp beasts 1 6 flip=h
+!assert "entity[ogre3].x == 3 and entity[ogre3].y == 6 and facing_of('ogre3') == 'left' and entity[gun3].x == 2"
+!assert "entity[d3].x == 1 and entity[d3].y == 9 and facing_of('d3') == 'left'"
+!prefab stamp beasts 6 6 rotate=180 flip=v
+!assert "entity[ogre4].x == 8 and entity[ogre4].y == 6 and facing_of('ogre4') == 'left'"
+!ent move d2 1 down
+!assert "entity[d2].y == 5 and entity[b].y == 4 and entity[b2].y == 3"
+
+Expected: HARNESS-ALLOWS-ERRORS. A plain stamp keeps every offset. Turned
+90° clockwise the 2x1 ogre becomes 1x2 at the turned position of its body,
+its facing turns right -> down and the located gun moves from its right to
+below it; the snake head at (4,4) of the 4x4 prefab lands on (1,4) of the
+turned one, facing down, its segments trailing above it (`b0` is taken by
+the first stamp, so the segments mint `b` and `b2`). Flipped left-right
+the ogre faces left with its gun on its left side; rotate=180 with flip=v
+equals a left-right flip. The turned snake still walks as one body.
+
+
+SCENARIO 911 — Prefabs: a vehicle with a region driver and hidden cargo, turned
+------------------------------------------------------------------------------
+
+!match new src Src 8 6
+!match use src
+!ent add tank Tank 40 2 2 4
+!ent set_var tank footprint_w 2
+!ent set_var tank footprint_h 2
+!ent face tank right
+!ent set_var tank slots.driver.capacity 1
+!ent set_var tank slots.driver.region front
+!ent set_var tank slots.driver.controls_movement true
+!ent set_var tank slots.hold.capacity 2
+!ent add pilot Pilot 10 1 1 3
+!ent add crate Crate 5 1 2 1
+!mount pilot tank driver
+!mount crate tank hold
+!prefab save convoy 1 1 4 4
+?? 1 unit
+!match new dst Dst 10 10
+!match use dst
+!prefab stamp convoy 2 2 rotate=270
+!mount list tank
+?? - `driver` [drives, region=front] 1/1: `pilot`
+?? - `hold` [hidden] 1/2: `crate`
+!assert "facing_of('tank') == 'up' and entity[tank].x == 3 and entity[tank].y == 3"
+!assert "mount_of('pilot') == 'tank' and slot_of('crate') == 'hold'"
+!ent move pilot 1 up
+!assert "entity[tank].y == 2 and mount_of('pilot') == 'tank'"
+!prefab stamp convoy 6 6
+!assert "mount_of('pilot2') == 'tank2' and mount_of('crate2') == 'tank2'"
+!prefab stamp convoy 6 6 mode=replace confirm
+?? Cleared first: `tank2`.
+!assert "sorted(all_entities()) == ['pilot', 'pilot2', 'tank', 'tank2'] and mount_of('pilot2') == 'tank2' and mount_of('crate2') == 'tank2' and mount_of('crate') == 'tank'"
+
+Expected: HARNESS-ALLOWS-ERRORS. The tank's riders travel with it: the
+prefab holds one top-level unit. Stamped turned 270° the tank faces up
+with its driver in the front region and the crate hidden in the hold; the
+driver's move moves the tank (controls_movement). A second stamp mounts
+the new riders on the new tank. A replace stamp over the second tank
+deletes it with its riders (despawning the vehicle alone would eject
+them) and stamps a new tank that takes the freed ids `tank2`, `pilot2`,
+`crate2` (`all_entities()` leaves out the crates, hidden in the hold).
+
+
+SCENARIO 912 — Prefabs: overlay, keep and replace
+-------------------------------------------------
+
+!match new src Src 6 4
+!match use src
+!tile set 1 1 glyph #
+!tile set 2 1 glyph #
+!ent add orc Orc 10 3 1 5
+!prefab save wall 1 1 3 1
+!match new dst Dst 8 6
+!match use dst
+!tile set 1 1 glyph =
+!tile set 1 2 glyph x
+!ent add rock Rock 5 2 2 1
+!ent kill rock
+!prefab stamp wall 1 1
+!assert "tile_get(1, 1, 'glyph') == '#' and tile_get(1, 2, 'glyph') == 'x' and has_corpse('rock')"
+!prefab stamp wall 1 2 mode=keep
+!assert "tile_get(1, 2, 'glyph') == 'x' and tile_get(2, 2, 'glyph') == '#'"
+!ent add bob Bob 10 3 3 1
+!part add bob hat Hat 1 1
+!prefab stamp wall 1 3
+?? can't be stamped at (1,3): `bob` stand(s) where its units go
+!assert "not 'orc3' in all_entities()"
+!zone new marsh
+!zone fill marsh 1 3 5 4
+!gpassive add bye on_entity_despawned "match_var_set('gone', get(match_var_get('gone') or [], 0, []) + [self])"
+!prefab stamp wall 1 3 mode=replace
+?? deleting units `bob` (with their parts and riders)
+!assert "'bob' in all_entities()"
+!prefab stamp wall 1 3 mode=replace confirm
+?? Cleared first: `bob`.
+!assert "not 'bob' in all_entities() and not 'hat' in all_entities() and 'orc3' in all_entities()"
+!assert "len(zone_cells('marsh')) == 7 and cell_in_zone(4, 3, 'marsh') and not cell_in_zone(3, 3, 'marsh') and cell_in_zone(1, 4, 'marsh')"
+!system set default prefab_stamp_mode replace
+!prefab stamp wall 1 5
+!assert "'orc4' in all_entities()"
+!prefab stamp wall 1 5
+?? Run it again with `confirm`
+
+Expected: HARNESS-ALLOWS-ERRORS. overlay: the prefab's tile data replaces
+the cells it has data for (`=` -> `#`), other cells keep theirs (`x`), and
+the corpse lying under it stays. keep: existing tile data wins. A stamped
+unit landing on `bob` refuses the whole stamp, naming him. replace first
+lists what it would delete, then with `confirm` despawns bob with his hat,
+clears the marsh's cells in the rectangle and stamps. The
+prefab_stamp_mode rule sets the default mode: an empty rectangle stamps at
+once, a taken one asks for `confirm`.
+
+
+SCENARIO 913 — Prefabs: game systems, definitions=all and definitions a match already has
+----------------------------------------------------------------------------------------
+
+!system new base
+!system new child parent=base
+!system new other
+!match new src Src 6 4 base
+!match use src
+!status def stun
+!status data stun turns 2
+!func def triple x "x * 3"
+!func def sextuple x "triple(x) * 2"
+!ent add a A 10 1 1 1
+!ent set_var a power "$(1)"
+!passive add a onhit on_turn_start "entity[self].power = sextuple(1)"
+!status apply a stun 1
+!prefab save squad 1 1 2 2
+!prefab show squad
+?? Carries: function `sextuple`, function `triple`, status `stun`
+!match new kid Kid 6 4 child
+!match use kid
+!status def stun
+!status data stun turns 9
+!prefab stamp squad 1 1
+?? ⚠️ The match already has its own status definition `stun`, which differ from the prefab's; the match's are kept.
+!assert "status_has('a', 'stun')"
+!eval "triple(2)"
+?? = `6`
+!match new far Far 6 4 other
+!match use far
+!prefab stamp squad 1 1
+?? This prefab was made for game system `base`, and match `far` runs on `other`.
+!match use src
+!prefab save squadall 1 1 2 2 definitions=all
+?? every definition
+!match use far
+!prefab stamp squadall 1 1
+!assert "'a' in all_entities()"
+!eval "sextuple(1)"
+?? = `6`
+
+Expected: HARNESS-ALLOWS-ERRORS. A prefab records its game system (`base`)
+and carries the match-level definitions its contents use: `stun` and
+`sextuple` (named by a passive) with the `triple` it calls. A match on
+`child` (inheriting from `base`) takes it; its own different `stun` is
+kept, with a ⚠️. A match on `other` refuses it, naming both systems; a
+prefab saved with `definitions=all` stamps there and brings its
+definitions.
+
+
+SCENARIO 914 — Prefabs: the library (rename, copy, delete, trash, restore, import), restart, !map new from=, !dry
+----------------------------------------------------------------------------------------------------------------
+
+!match new src Src 6 4
+!match use src
+!ent add orc Orc 10 1 1 5
+!tile set 2 1 glyph #
+!prefab save hut 1 1 3 2
+!prefab rename hut cabin
+?? Renamed prefab `hut` to `cabin`.
+!prefab copy cabin lodge
+!prefab delete lodge
+?? kept 24 hours
+!prefab trash
+?? `lodge` #1
+!prefab restore lodge
+?? ♻️ Restored prefab `lodge`
+!prefab import tiny {"kind": "prefab", "width": 2, "height": 1, "system": "default", "tiles": [[0, 0, {"glyph": "@"}]]}
+?? 📥 Saved prefab `tiny` — 2x1, 1 tile
+!prefab import bad {"kind": "prefab", "width": 2, "height": 1, "system": "default", "tiles": [[5, 0, {"glyph": "@"}]]}
+?? a tile at (5,0) is outside its 2x1 rectangle
+!prefab import bad2 {"kind": "prefab", "width": 1, "height": 1, "system": "default", "units": [{"id": "x", "name": "X", "x": 0, "y": 0, "part_of": "ghost"}]}
+?? `x`'s part_of `ghost` isn't a unit of the prefab
+!as restart
+!prefab list
+?? `cabin` — 3x2, 1 unit, 1 tile
+?? `lodge`
+?? `tiny`
+!match use src
+!map new cellar from=cabin rotate=90
+?? Created map `cellar` (2x3)
+!assert "entity[orc2].map == 'cellar' and entity[orc2].x == 2 and entity[orc2].y == 1"
+!assert "tile_get(2, 2, 'glyph', map='cellar') == '#'"
+!dry !prefab stamp tiny 4 4 map=main
+?? Dry run
+!assert "not tile_has(4, 4, 'glyph', map='main')"
+!dry !prefab delete tiny
+?? the prefab library is written straight to disk
+!as player bob
+!prefab show cabin
+?? `cabin` — 3x2
+!prefab stamp tiny 1 1 map=main
+?? needs host approval
+?tab "!prefab show c"
+?? cabin
+
+Expected: HARNESS-ALLOWS-ERRORS. Prefabs are a library of their own
+(templates/prefabs/): rename, copy, delete into a 24-hour trash and restore
+from it, import JSON checked like a save (a cell outside the rectangle, a
+link to a unit the prefab lacks), and everything reloads after a restart.
+`!map new <name> from=<prefab>` makes a map the turned prefab's size with
+it stamped. `!dry` previews a stamp and refuses a library write. Players
+read the library; their stamp waits for a host. Tab completes prefab names.
+
+
+SCENARIO 915 — Prefabs in formulas: stamp_prefab from an action, confirm, $() refusal
+-------------------------------------------------------------------------------------
+
+!match new src Src 6 4
+!match use src
+!ent add imp Imp 5 1 1 1
+!ent set_var imp team demons
+!prefab save imps 1 1 1 1
+!match new dst Dst 8 8
+!match use dst
+!ent add wiz Wizard 20 1 1 9
+!ent set_var wiz actions.portal.target location
+!ent set_var wiz actions.portal.body "ids = stamp_prefab('imps', target.x, target.y, team='summoned')\nentity[self].last = ids"
+!action wiz portal 4 4
+!assert "entity[wiz].last == ['imp'] and entity[imp].team == 'summoned'"
+!action wiz portal 4 4
+?? can't be stamped at (4,4): `imp` stand(s) where its units go
+!assert "entity[wiz].last == ['imp']"
+!eval "stamp_prefab('imps', 4, 4, mode='replace')"
+?? (in a formula: confirm=True)
+!eval "stamp_prefab('imps', 4, 4, mode='replace', confirm=True)"
+?? = `['imp']`
+!assert "prefab_names() == ['imps'] and prefab_size('imps') == [1, 1]"
+!ent set_var wiz x "$(stamp_prefab('imps', 6, 6))"
+?? banned in a $() inline argument
+!assert "not 'imp2' in all_entities()"
+!ent set_var wiz n "$(len(prefab_names()))"
+!assert "entity[wiz].n == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. An action stamps a prefab at its target
+cell with team= and keeps the ids it returns; a second cast onto the
+standing imp fails the action whole (its `last` var unchanged). A replace
+from a formula needs confirm=True. prefab_names / prefab_size read the
+library, also inside `$()`, where stamp_prefab is refused and makes
+nothing.

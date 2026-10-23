@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
 from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 from match_history import MatchHistory, Snapshot, HistoryError, _now_iso
 from storage import storage_of, valid_id, fmt_bytes
+from prefab import capture_prefab, check_prefab, check_prefab_name, stamp_prefab, system_allows, Turn, PREFAB_KINDS
 
 #used for Gamesystem-related commands
 from logic import (
@@ -156,6 +157,9 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # dump` is host-gated to hide.
     "part":       frozenset({"list"}),
     "passive":    frozenset({"list", "info"}),
+    # The prefab library is readable by anyone, as the templates are; save /
+    # import / rename / delete check the saver, stamp changes the match.
+    "prefab":     frozenset({"list", "show", "trash"}),
     "remind":     frozenset({"list"}),
     "reveal_fog": frozenset({"list"}),
     "schedule":   frozenset({"list"}),
@@ -4376,12 +4380,13 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             mgr.default_system_name = "default"
             mgr.default_system_per_channel = {}
             mgr.templates = {}
+            mgr.prefabs = {}
         audit_note(f"wiped {scope}")
         tail = ("Changed your mind? `!server wipe undo` within 24 hours."
                 if st is not None else
                 "This bot keeps nothing on disk, so it can't be undone.")
         what = f"{n} match(es)" + (", the game systems, the saves folder "
-                                   "and the templates"
+                                   "and the templates and prefabs"
                                    if scope == "all" else "")
         return await ctx.send(f"🧹 Wiped {what}. {tail}")
     if action == "undo":
@@ -4782,7 +4787,7 @@ def split_command_args(root: str, tail: str) -> List[str]:
             if piece:
                 out += split_command_line(piece.lstrip("!"))
         return out
-    if low == "template":
+    if low in ("template", "prefab"):
         m = _RAW_JSON_TAIL.match(tail)
         if m:
             raw = m.group(3)
@@ -4804,7 +4809,7 @@ def _straight_quotes(text: str) -> str:
     return re.sub("\u2018([^\u2019]*)\u2019", r"'\1'", text)
 
 
-_IMPORT_HEAD = re.compile(r"!?\s*template\s+import\s+\S+\s*(.*)\Z",
+_IMPORT_HEAD = re.compile(r"!?\s*(?:template|prefab)\s+import\s+\S+\s*(.*)\Z",
                           re.I | re.S)
 
 
@@ -4975,6 +4980,19 @@ def _reserve_template_room(mgr: MatchManager,
     total = sum(len((json.dumps(d, indent=2) + "\n")
                     .encode("utf-8")) + 256 for d in datas)
     st._room_for_template(mgr.guild_key, total)
+
+
+def _prefab_ref_note(mgr: MatchManager, name: str) -> List[str]:
+    """A ⚠️ naming the prefabs whose units are built from partial `name`
+    (after it is renamed or deleted, their stamps fail until it's back)."""
+    refs = sorted(n for n, pf in (getattr(mgr, "prefabs", {}) or {}).items()
+                  if any(name in template_refs_of({"vars": u.get("vars")})
+                         for u in pf.get("units") or []))
+    if not refs:
+        return []
+    return [f"⚠️ Prefab(s) {', '.join(f'`{r}`' for r in refs)} hold units "
+            f"built from partial `{name}`; stamping them fails until a "
+            f"partial of that name exists again."]
 
 
 def _template_dependents(mgr: MatchManager, name: str) -> List[str]:
@@ -5585,6 +5603,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                          f"versions are kept 24 hours). Units built from "
                          f"`{name}` keep that name in their markers until "
                          f"resynced or saved.")
+        notes += _prefab_ref_note(mgr, name)
         return await ctx.send("\n".join(
             [f"🏷️ Renamed template `{name}` to `{new_name}`"
              + (" (replacing the old one)." if old is not None else ".")
@@ -5652,6 +5671,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                          f"{', '.join(f'`{d}`' for d in deps)} in place of the "
                          f"reference (their previous versions are kept 24 "
                          f"hours).")
+        notes += _prefab_ref_note(mgr, name)
         return await ctx.send("\n".join(
             [f"🗑️ Deleted template `{name}`. Units already built from it stay."
              + (f" It is kept 24 hours (`!template restore {name}`)."
@@ -5933,6 +5953,423 @@ for _subs, _usage, _desc in (
          "Which of a unit's containers are built from partial templates, and "
          "what the unit changed in each.")):
     registry.annotate_sub("template", *_subs, usage=_usage, desc=_desc)
+
+
+# ---- prefabs (prefab.py, docs/zones_prefabs_design.md §5-§9) ---------------
+
+def _prefab_changed(mgr: MatchManager, name: str, what: str) -> None:
+    """A prefab was saved, replaced, renamed or deleted: an audit line.
+    (Journals don't follow the prefab library: a stamp is journaled as the
+    state it left, prefab.stamp_prefab.)"""
+    audit_note(f"prefab `{name}` {what}")
+
+
+def _get_prefab(mgr: MatchManager, raw: str) -> Tuple[str, Dict[str, Any]]:
+    name = check_prefab_name(raw)
+    pf = mgr.prefabs.get(name)
+    if pf is None:
+        raise VTTError(f"No prefab `{name}` (`!prefab list`).")
+    return name, pf
+
+
+def _require_prefab_saver(ctx: ReplyContext, name: str, pf: Dict[str, Any],
+                          verb: str) -> None:
+    if not _template_saver_ok(ctx, pf):
+        who = pf.get("saved_by_name") or pf.get("saved_by") or "someone"
+        raise VTTError(f"Prefab `{name}` was saved by {who}: only they or a "
+                       f"server administrator can {verb} it.")
+
+
+def _store_prefab(ctx: ReplyContext, mgr: MatchManager, name: str,
+                  data: Dict[str, Any],
+                  saver: Optional[Tuple[Any, Any]] = None,
+                  check_saver: bool = True) -> Tuple[str, List[str]]:
+    """Write `data` as prefab `name` (memory + disk); 'Saved' or 'Replaced'
+    and notes. Replacing needs the old one's saver or an administrator; the
+    old version is kept 24 hours."""
+    old = mgr.prefabs.get(name)
+    if old is not None and check_saver:
+        _require_prefab_saver(ctx, name, old, "replace")
+    by, by_name = saver if saver is not None else (ctx_user(ctx),
+                                                   ctx_user_name(ctx))
+    for k, v in (("saved_by", by), ("saved_by_name", by_name)):
+        if v is None:
+            data.pop(k, None)
+        else:
+            data[k] = str(v)
+    notes: List[str] = []
+    st = storage_of(mgr)
+    if st is not None:
+        notes, trashed = st.write_template(mgr, name, data, lib="prefabs")
+        if trashed:
+            notes.append(f"The previous version is kept 24 hours "
+                         f"(`!prefab restore {name}`).")
+    mgr.prefabs[name] = data
+    _prefab_changed(mgr, name, "replaced" if old is not None else "saved")
+    return ("Replaced" if old is not None else "Saved"), notes
+
+
+def _prefab_summary(name: str, pf: Dict[str, Any]) -> str:
+    roots = [u for u in pf.get("units") or []
+             if not u.get("part_of") and not u.get("mounted_on")]
+    bits = [f"{pf.get('width')}x{pf.get('height')}"]
+    for n, word in ((len(roots), "unit"), (len(pf.get("tiles") or []), "tile"),
+                    (len(pf.get("zones") or {}), "zone"),
+                    (len(pf.get("corpses") or []), "corpse")):
+        if n:
+            bits.append(f"{n} {word}{'s' if n != 1 else ''}")
+    bits.append(f"system `{pf.get('system')}`"
+                + (", every definition" if pf.get("definitions_all") else ""))
+    who = pf.get("saved_by_name") or pf.get("saved_by")
+    return f"`{name}` — " + ", ".join(bits) + (f"; by {who}" if who else "")
+
+
+def _prefab_scratch(mgr: MatchManager, ctx: ReplyContext, name: str,
+                    pf: Dict[str, Any]) -> Tuple[Match, Dict[str, Any]]:
+    """A throwaway match holding prefab `pf` stamped at (1, 1), for showing
+    it: on the prefab's system when the server has it, else (every
+    definition it carries read as enough) the server's default."""
+    sysname = pf.get("system") if pf.get("system") in mgr.systems \
+        else mgr.default_system_name
+    sc = Match(id="_prefab", name=name,
+               maps=default_maps(int(pf["width"]), int(pf["height"])),
+               system_name=sysname,
+               rules=mgr._build_rules_dict(mgr.systems[sysname]))
+    shown = pf if sysname == pf.get("system") else dict(pf,
+                                                        definitions_all=True)
+    res = stamp_prefab(mgr, sc, name, shown, 1, 1, sc.get_map(),
+                       mode="overlay")
+    return sc, res
+
+
+_PREFAB_USAGE = {
+    "save": ("!prefab save <name> <x1> <y1> <x2> <y2> [map=<map>] "
+             "[only=<kinds>] [definitions=all]"),
+    "stamp": ("!prefab stamp <name> <x> <y> [map=<map>] [mode=<mode>] "
+              "[rotate=<deg>] [flip=<h|v>] [team=<team>] [confirm]"),
+    "show": "!prefab show <name> [text|image]",
+    "list": "!prefab list [prefix]",
+    "import": "!prefab import <name> <json ...>",
+    "rename": "!prefab rename <name> <new_name>",
+    "copy": "!prefab copy <name> <new_name>",
+    "delete": "!prefab delete <name>",
+    "trash": "!prefab trash [name]",
+    "restore": "!prefab restore <name> [n]",
+}
+
+
+@registry.command(
+    "prefab",
+    usage=("!prefab <save|stamp|show|list|import|rename|copy|delete|trash|"
+           "restore> ..."),
+    desc=(
+        "Prefabs: a saved rectangle of one map (its units with their parts "
+        "and riders, tile data, zones and corpses), stamped into any match "
+        "at an offset, turned and mirrored if you like: a dungeon room, a "
+        "camp, a ship. This server's library, beside the templates (its own "
+        "names). `save` needs a host of this channel's match or an "
+        "administrator; replacing, renaming or deleting one needs its saver "
+        "or an administrator; reading is open to everyone. A prefab records "
+        "the game system it was made for and stamps on that system or one "
+        "inheriting from it (`definitions=all` at save time lifts that), "
+        "carrying the match-level definitions its contents use (tile "
+        "templates, status and zone definitions, functions). See "
+        "docs/zones_prefabs_design.md."),
+)
+async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["prefab"])
+        return await ctx.send(f"**{title}**\n{body}")
+    sub = args[0].lower()
+    if sub not in _PREFAB_USAGE:
+        return await _help_fallback(ctx, ["prefab"], args[0])
+    usage = _PREFAB_USAGE[sub]
+
+    if sub == "list":
+        _check_tail(args, 2, (), usage)
+        prefix = args[1].lower() if len(args) > 1 else ""
+        names = [n for n in sorted(mgr.prefabs) if n.startswith(prefix)]
+        if not names:
+            return await ctx.send(
+                "No prefabs" + (f" starting with `{prefix}`" if prefix else "")
+                + " on this server. `!prefab save <name> <x1> <y1> <x2> <y2>` "
+                  "saves one.")
+        return await ctx.send("\n".join(
+            [f"**Prefabs ({len(names)}):**"]
+            + [f"- {_prefab_summary(n, mgr.prefabs[n])}" for n in names]))
+
+    if sub == "trash":
+        _check_tail(args, 2, (), usage)
+        st = storage_of(mgr)
+        if st is None:
+            return await ctx.send("This bot keeps nothing on disk, so old "
+                                  "prefab versions aren't kept.")
+        want = check_prefab_name(args[1]) if len(args) > 1 else None
+        entries = st.template_trash(mgr.guild_key, want, lib="prefabs")
+        if not entries:
+            return await ctx.send(
+                "No old prefab versions"
+                + (f" of `{want}`" if want else "") + " from the last 24 hours.")
+        now = time.time()
+        index: Dict[str, int] = {}
+        lines = [f"**Old prefab versions ({len(entries)}, kept 24 hours):**"]
+        for stamp, pname, path in entries[:40]:
+            index[pname] = index.get(pname, 0) + 1
+            try:
+                with open(path, encoding="utf-8") as f:
+                    desc = _prefab_summary(pname, json.load(f)).split(
+                        " — ", 1)[1]
+            except (OSError, ValueError, AttributeError, IndexError):
+                desc = "unreadable"
+            lines.append(f"- `{pname}` #{index[pname]} — "
+                         f"{_fmt_age(now - stamp)} ago ({desc})")
+        if len(entries) > 40:
+            lines.append(f"…and {len(entries) - 40} more.")
+        lines.append("`!prefab restore <name> [#]` brings one back "
+                     "(#1 = the newest).")
+        return await ctx.send("\n".join(lines))
+
+    if await return_help_if_not_enough_args(
+            ctx, args, {"save": 6, "stamp": 4, "import": 3, "rename": 3,
+                        "copy": 3}.get(sub, 2), "prefab", sub):
+        return
+
+    if sub == "show":
+        _check_tail(args, 3, (), usage)
+        name, pf = _get_prefab(mgr, args[1])
+        how = args[2].lower() if len(args) > 2 else None
+        if how not in (None, "text", "image"):
+            raise VTTError(f"Unexpected `{args[2]}` — usage: `{usage}`.")
+        sc, res = _prefab_scratch(mgr, ctx, name, pf)
+        defs = pf.get("definitions") or {}
+        lines = [f"**Prefab** {_prefab_summary(name, pf)}"]
+        word = {"formula_functions": "function", "status_definitions":
+                "status", "tile_templates": "tile template",
+                "zone_definitions": "zone definition"}
+        dnames = [f"{word.get(lib, lib)} `{n}`" for lib in sorted(defs)
+                  for n in sorted(defs[lib])]
+        if dnames:
+            lines.append("Carries: " + ", ".join(dnames))
+        if res["notes"]:
+            lines += res["notes"]
+        mid = mgr.get_active_for_channel(ctx.channel_key)
+        cm = mgr.matches.get(mid) if mid else None
+        image = how == "image" or (how is None and cm is not None and
+                                   getattr(cm, "render_mode", "text") == "image")
+        hook = getattr(ctx, "post_scene_image", None)
+        if image and hook is not None:
+            await ctx.send("\n".join(lines))
+            reply = await hook(sc, None, legend=True, mp=sc.get_map())
+            return await ctx.send(reply) if reply else None
+        body = sc.render_ascii(None, legend=True, mp=sc.get_map())
+        return await ctx.send("\n".join(lines) + f"\n```\n{body}\n```")
+
+    if sub == "save":
+        opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
+                for a in args[6:] if "=" in a}
+        _check_tail(args, 6, ("map", "only", "definitions"), usage)
+        _template_may_save(ctx, mgr)
+        m = active_match(mgr, ctx)
+        smp = _one_map(ctx, m, opts.get("map"))
+        name = check_prefab_name(args[1])
+        try:
+            x1, y1, x2, y2 = (int(a) for a in args[2:6])
+        except ValueError:
+            raise VTTError("The corners must be whole numbers: "
+                           "`<x1> <y1> <x2> <y2>`.")
+        only = None
+        if "only" in opts:
+            only = {w.strip().lower() for w in opts["only"].split(",")
+                    if w.strip()}
+            bad = sorted(only - set(PREFAB_KINDS))
+            if bad or not only:
+                raise VTTError(f"only= takes a comma list of "
+                               f"{', '.join(PREFAB_KINDS)}.")
+        every = False
+        if "definitions" in opts:
+            if opts["definitions"].lower() != "all":
+                raise VTTError("definitions= takes `all` (store every "
+                               "definition the contents use, so the prefab "
+                               "stamps on any game system).")
+            every = True
+        data, notes = capture_prefab(mgr, m, smp, x1, y1, x2, y2, only, every)
+        data = check_prefab(data, name)
+        verb, more = _store_prefab(ctx, mgr, name, data)
+        return await ctx.send("\n".join(
+            [f"💾 {verb} prefab {_prefab_summary(name, data)}."]
+            + notes + more))
+
+    if sub == "stamp":
+        opts = {}
+        for a in args[4:]:
+            if "=" in a:
+                opts[a.split("=", 1)[0].lower()] = a.split("=", 1)[1]
+        words = [a.lower() for a in args[4:] if "=" not in a]
+        if words not in ([], ["confirm"]):
+            raise VTTError(f"Unexpected `{' '.join(words)}` — usage: "
+                           f"`{usage}`.")
+        _check_options(args[4:], {"map", "mode", "rotate", "flip", "team"},
+                       "prefab stamp")
+        m = active_match(mgr, ctx)
+        smp = _one_map(ctx, m, opts.get("map"), strict=True)
+        name, pf = _get_prefab(mgr, args[1])
+        try:
+            x, y = int(args[2]), int(args[3])
+            rotate = int(opts.get("rotate", 0))
+        except ValueError:
+            raise VTTError("x, y and rotate= must be whole numbers.")
+        flip = opts.get("flip", "").lower() or None
+        res = stamp_prefab(mgr, m, name, pf, x, y, smp,
+                           mode=opts.get("mode", "").lower() or None,
+                           rotate=rotate, flip=flip, team=opts.get("team"),
+                           confirm=bool(words))
+        lines = [f"🧱 Stamped prefab `{name}` at ({x},{y})"
+                 + _on_map(m, smp)
+                 + (f", turned {rotate}°" if rotate else "")
+                 + (f", flipped {flip}" if flip else "") + ": "
+                 + (", ".join(f"`{u}`" for u in res["units"]) or "no units")
+                 + (f"; zones {', '.join(f'`{z}`' for z in res['zones'])}"
+                    if res["zones"] else "") + "."]
+        if res["removed"]:
+            lines.append("Cleared first: " + ", ".join(
+                f"`{v}`" for v in res["removed"]) + ".")
+        if res["renamed"]:
+            lines.append("Zone names taken here, so renamed: " + ", ".join(
+                f"`{a}` → `{b}`" for a, b in res["renamed"].items()) + ".")
+        return await ctx.send("\n".join(lines + res["notes"] + res["log"]))
+
+    if sub == "import":
+        name = check_prefab_name(args[1])
+        raw = args[2]
+        if ctx_user(ctx) is None:
+            raise VTTError("Prefabs can only be imported with an identity to "
+                           "record as the saver.")
+        try:
+            parsed = json.loads(raw)
+        except ValueError as ex:
+            raise VTTError(f"That isn't JSON: {ex}.")
+        data = check_prefab(parsed, name)
+        verb, notes = _store_prefab(ctx, mgr, name, data)
+        return await ctx.send("\n".join(
+            [f"📥 {verb} prefab {_prefab_summary(name, data)}."] + notes))
+
+    if sub in ("rename", "copy"):
+        _check_tail(args, 3, (), usage)
+        name, pf = _get_prefab(mgr, args[1])
+        new = check_prefab_name(args[2])
+        if new in mgr.prefabs:
+            raise VTTError(f"A prefab `{new}` already exists.")
+        st = storage_of(mgr)
+        if sub == "copy":
+            if ctx_user(ctx) is None:
+                raise VTTError("Prefabs can only be copied with an identity "
+                               "to record as the saver.")
+            _verb, notes = _store_prefab(ctx, mgr, new, copy.deepcopy(pf))
+            return await ctx.send("\n".join(
+                [f"📄 Copied prefab `{name}` to `{new}`; you are its saver."]
+                + notes))
+        _require_prefab_saver(ctx, name, pf, "rename")
+        if st is not None:
+            st.rename_template_file(mgr, name, new, lib="prefabs")
+        mgr.prefabs[new] = mgr.prefabs.pop(name)
+        _prefab_changed(mgr, name, f"renamed to `{new}`")
+        return await ctx.send(f"Renamed prefab `{name}` to `{new}`.")
+
+    if sub == "delete":
+        _check_tail(args, 2, (), usage)
+        name, pf = _get_prefab(mgr, args[1])
+        _require_prefab_saver(ctx, name, pf, "delete")
+        st = storage_of(mgr)
+        if st is not None:
+            st.delete_template(mgr, name, lib="prefabs")
+        del mgr.prefabs[name]
+        _prefab_changed(mgr, name, "deleted")
+        return await ctx.send(
+            f"🗑️ Deleted prefab `{name}`"
+            + (f" (kept 24 hours: `!prefab restore {name}`)." if st else "."))
+
+    # restore <name> [n]
+    _check_tail(args, 3, (), usage)
+    st = storage_of(mgr)
+    if st is None:
+        raise VTTError("This bot keeps nothing on disk, so there are no old "
+                       "prefab versions to restore.")
+    name = check_prefab_name(args[1])
+    try:
+        n = int(args[2]) if len(args) > 2 else 1
+    except ValueError:
+        raise VTTError(f"`{args[2]}` isn't a version number (1 = the newest; "
+                       f"see `!prefab trash {name}`).")
+    entries = st.template_trash(mgr.guild_key, name, lib="prefabs")
+    if not entries:
+        raise VTTError(f"No old version of prefab `{name}` from the last 24 "
+                       f"hours.")
+    if not 1 <= n <= len(entries):
+        raise VTTError(f"`{name}` has {len(entries)} old version(s); pick "
+                       f"1-{len(entries)} (`!prefab trash {name}`).")
+    if ctx_user(ctx) is None:
+        raise VTTError("Prefabs can only be restored by a person typing the "
+                       "command.")
+    _stamp, _pname, path = entries[n - 1]
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as ex:
+        raise VTTError(f"That old version can't be read ({type(ex).__name__}).")
+    data = check_prefab(raw, name)
+    if name not in mgr.prefabs:
+        _require_prefab_saver(ctx, name, data, "restore")
+    _verb, notes = _store_prefab(
+        ctx, mgr, name, data,
+        saver=(data.get("saved_by"), data.get("saved_by_name")))
+    st.drop_trashed_template(mgr.guild_key, path)
+    return await ctx.send("\n".join(
+        [f"♻️ Restored prefab {_prefab_summary(name, data)} (version "
+         f"#{n})."] + notes))
+
+
+for _sub, _usage in _PREFAB_USAGE.items():
+    registry.annotate_sub("prefab", _sub, usage=_usage, desc={
+        "save": ("Save the rectangle (x1,y1)-(x2,y2) of this channel's map "
+                 "(or map=) as a prefab: the units whose whole body (parts "
+                 "and riders included) lies inside it, the tile data, the "
+                 "corpses, and the zones' cells inside it (an aura only with "
+                 "its anchor). A body reaching past the edge, or a unit "
+                 "carrying a map, is left out with a ⚠️. `only=` keeps some "
+                 "kinds (units,tiles,zones,corpses); `definitions=all` "
+                 "stores every definition the contents use, so it stamps on "
+                 "any game system. Needs a host of this channel's match or "
+                 "an administrator."),
+        "stamp": ("Stamp a prefab with its top-left cell at (x, y) (map= on "
+                  "a match with several maps): new ids are minted, links "
+                  "between its units kept, zones whose name is taken get a "
+                  "fresh one. `mode=` (default: the prefab_stamp_mode rule): "
+                  "overlay (its tile data replaces the cells' own), keep "
+                  "(existing tile data wins); in both a unit landing on "
+                  "another refuses the stamp; replace clears the rectangle "
+                  "first, listing what goes until you add `confirm`. "
+                  "`rotate=90|180|270` (clockwise) and `flip=h|v` turn it "
+                  "(facings, footprints and part offsets follow); `team=` "
+                  "sets every stamped unit's team. Units fire "
+                  "on_entity_spawned; then the event `prefab_stamped` "
+                  "(payload prefab, x, y, map, units, zones). One undo step."),
+        "show": ("Show a prefab as a map (text, or an image where the "
+                 "channel's match draws images; `text` / `image` choose) "
+                 "with its size, contents and the definitions it carries."),
+        "list": "This server's prefabs (those starting with a prefix).",
+        "import": ("Save pasted JSON as a prefab, or replace one with JSON "
+                   "edited elsewhere (the rest of the line is the JSON; a "
+                   "```json fence is fine). It is checked like a save."),
+        "rename": "Rename a prefab (its saver or an administrator).",
+        "copy": "Save a copy under another name; you are the copy's saver.",
+        "delete": ("Delete a prefab (its saver or an administrator); it is "
+                   "kept 24 hours."),
+        "trash": ("Replaced and deleted prefab versions from the last 24 "
+                  "hours (cut first when the server nears its storage "
+                  "limit)."),
+        "restore": ("Bring back an old version (#1 = the newest); the "
+                    "current one, if any, goes to the trash."),
+    }[_sub])
 
 
 @registry.command(
@@ -11198,7 +11635,8 @@ for _sub, _usage in (
         ("pan", "!map pan <dir> [n] [map=<map>]"),
         ("center", "!map center <eid | <x> <y>> [map=<map>]"),
         ("view", "!map view <reset | <x> <y>> [map=<map>]"),
-        ("new", "!map new <new_map> <w> <h>"),
+        ("new", "!map new <new_map> <w> <h> | !map new <new_map> "
+                "from=<prefab> [rotate=<deg>] [flip=<h|v>] [team=<team>]"),
         ("list", "!map list"),
         ("delete", "!map delete <map>"),
         ("rename", "!map rename <map> <new_map>"),
@@ -11238,6 +11676,40 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                       args: List[str], mapspec: Optional[str]):
     """`!map new / list / delete / rename / copy / use / var`."""
     sub = args[0].lower()
+    if sub == "new" and any(a.lower().startswith("from=") for a in args):
+        # A map the prefab's size (turned), with the prefab stamped on it.
+        usage = ("!map new <name> from=<prefab> [rotate=<deg>] [flip=<h|v>] "
+                 "[team=<team>]")
+        _check_tail(args, 2, ("from", "rotate", "flip", "team"), usage)
+        if len(args) < 2 or "=" in args[1]:
+            raise VTTError(f"Usage: `{usage}`.")
+        opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
+                for a in args[2:]}
+        name, pf = _get_prefab(mgr, opts["from"])
+        try:
+            rotate = int(opts.get("rotate", 0))
+        except ValueError:
+            raise VTTError("rotate= must be 0, 90, 180 or 270.")
+        flip = opts.get("flip", "").lower() or None
+        refusal = system_allows(mgr, m, pf)
+        if refusal:
+            raise VTTError(refusal)
+        w, h = Turn(int(pf["width"]), int(pf["height"]), rotate, flip).size
+        pre = m.to_dict(include_history=False)
+        mp = m.add_map(args[1], w, h)
+        try:
+            res = stamp_prefab(mgr, m, name, pf, 1, 1, mp, mode="overlay",
+                               rotate=rotate, flip=flip,
+                               team=opts.get("team"))
+        except Exception:
+            from action import _rollback_match
+            _rollback_match(m, None, pre)
+            raise
+        return await ctx.send("\n".join(
+            [f"Created map `{mp.name}` ({mp.size_text()}) on **{m.name}** "
+             f"({len(m.maps)} maps) from prefab `{name}`: "
+             + (", ".join(f"`{u}`" for u in res["units"]) or "no units")
+             + "."] + res["notes"] + res["log"]))
     if sub == "new":
         _check_tail(args, 4, (), "!map new <name> <w> <h>")
         if len(args) < 4:
@@ -18915,6 +19387,8 @@ def _dry_refusal(name: str, args: List[str]) -> Optional[str]:
         why = "its effect lives outside the match, which a dry run can't undo"
     elif name == "template" and sub not in _DRY_TEMPLATE_READS:
         why = "the template library is written straight to disk"
+    elif name == "prefab" and sub not in ("stamp", "list", "show", "trash"):
+        why = "the prefab library is written straight to disk"
     elif name == "match" and sub in ("delete", "pause", "resume", "rng"):
         why = "a dry run can't put that back as it was"
     if why is None:

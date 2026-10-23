@@ -222,6 +222,12 @@ UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\
 CURRENT_WORKSPACE: "contextvars.ContextVar[Optional[Any]]" = (
     contextvars.ContextVar("vtt_current_workspace", default=None))
 
+# Unit ids a placement check also ignores for occupancy: a prefab stamp
+# spawns a rider onto its vehicle's cells (prefab.stamp_prefab), so the
+# vehicle mustn't read as standing in its way. Empty outside one.
+PLACEMENT_IGNORE: "contextvars.ContextVar[Tuple[str, ...]]" = (
+    contextvars.ContextVar("vtt_placement_ignore", default=()))
+
 # Partial templates resolved during the running command, by (server, match
 # id, pinning, name). The library can't change mid-command except through a
 # template command, which clears it (invalidate_partial_cache). Set by each
@@ -2256,6 +2262,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "unit on the free cell nearest its body where the whole "
             "footprint fits, searched outward like a dismount, and the "
             "reply names the cell it used."
+        ),
+    },
+    "prefab_stamp_mode": {
+        "default": "overlay",
+        "schema": {"type": "enum", "choices": ["overlay", "keep", "replace"]},
+        "desc": (
+            "How a prefab stamp (`!prefab stamp`, stamp_prefab) treats what "
+            "already lies in its rectangle, when the stamp doesn't say "
+            "(`mode=`). 'overlay' (default): the prefab's tile data replaces "
+            "the destination's cell by cell, cells it has no data for keep "
+            "theirs. 'keep': existing tile data wins. In both, a stamped "
+            "unit landing where another unit stands refuses the whole stamp. "
+            "'replace': the rectangle is cleared first (tile data, zone "
+            "cells, corpses, and every unit whose body covers a cell of it, "
+            "despawned whole), after a `confirm` that lists what goes."
         ),
     },
     "corpse_line_format": {
@@ -13076,7 +13097,7 @@ class Match:
         # entity to the match, when those can't see the parent yet.
         glued = bool(e.part_of) and not e.vars.get("__part_located")
         if not e.is_cell_stackable and not glued:
-            ignore_ids = self._occupancy_ignore(e)
+            ignore_ids = self._occupancy_ignore(e) + PLACEMENT_IGNORE.get()
             for cx, cy in cells:
                 if self.cell_occupant(cx, cy, ignore_ids, mp) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
@@ -16698,19 +16719,22 @@ class Match:
                 taken.add(eid)
         return taken
 
-    def mint_entity_id(self, prefix: str) -> str:
+    def mint_entity_id(self, prefix: str,
+                       also: Optional[Set[str]] = None) -> str:
         """Return an id not currently in use, derived from `prefix`.
         `prefix` itself if free, else prefix2, prefix3, ... Honors the
         `corpse_id_uniqueness` rule: when true (default) the scan
         considers corpse ids too, so a summoned skeleton becomes
         `skeleton2` if a `skeleton` corpse is already lying around.
         Prefix is sanitized to a reasonable id token (whitespace/dots
-        stripped) and lower-cased; falls back to 'summon' if empty."""
+        stripped) and lower-cased; falls back to 'summon' if empty.
+        `also`: ids to treat as taken too (minted for units not spawned
+        yet, a prefab stamp)."""
         base = "".join(
             ch for ch in str(prefix).strip().lower().replace(" ", "_")
             if ch.isalnum() or ch in ("_", "-")
         ) or "summon"
-        taken = self._taken_entity_ids()
+        taken = self._taken_entity_ids() | set(also or ())
         if (base not in taken and base not in RESERVED_IDS
                 and not unreachable_id(base)):
             return base
@@ -22597,6 +22621,9 @@ class MatchManager:
         # written to templates/<name>.json as each is saved (storage.py),
         # outside undo.
         self.templates: Dict[str, Dict[str, Any]] = {}
+        # Saved prefabs (prefab.py), by name: the server's other library,
+        # written to templates/prefabs/<name>.json, outside undo.
+        self.prefabs: Dict[str, Dict[str, Any]] = {}
         # `!system undo`: the server-wide state (server_state) as it was
         # before each command that changed it, oldest first, with who ran
         # the command and when (record_system_step). Saved as

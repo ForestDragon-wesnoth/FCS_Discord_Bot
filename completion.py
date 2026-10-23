@@ -52,7 +52,8 @@ _NEW_NAME = {("ent", "add", "id"), ("match", "new", "id"),
              ("part", "add", "part_id"), ("part", "segment", "seg_id"),
              ("system", "new", "name"), ("zone", "new", "name"),
              ("status", "def", "name"), ("ent", "add", "name"),
-             ("part", "add", "name"), ("part", "segment", "name")}
+             ("part", "add", "name"), ("part", "segment", "name"),
+             ("prefab", "save", "name"), ("prefab", "import", "name")}
 _DIRECTIONS = sorted(logic.ALLOWED_DIRECTIONS)
 _REGIONS = sorted(logic.Entity._PART_REGIONS) if hasattr(
     logic.Entity, "_PART_REGIONS") else []
@@ -431,6 +432,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         e = m.entities.get(holder or "") if holder in seen else None
         slots = e.vars.get("slots") if e is not None else None
         return sorted(str(s) for s in slots) if isinstance(slots, dict) else []
+    if slot == "prefab" or (slot == "name" and root == "prefab"):
+        return sorted(getattr(mgr, "prefabs", {}) or {})
     if slot == "name":
         if root == "template":
             return sorted(mgr.templates)
@@ -496,7 +499,8 @@ _SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
 _KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
                "dest_match", "rule", "function", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
-               "slot", "corpse_id", "key", "path", "sub", "definition"}
+               "slot", "corpse_id", "key", "path", "sub", "definition",
+               "prefab"}
 
 
 # ---- the entry point -------------------------------------------------------
@@ -560,6 +564,9 @@ def _command_candidates(words: List[str], word: str, mgr, ctx) -> List[str]:
     elif (word.lower().startswith("map=") and "map" in walk.keys
           and m is not None):
         out |= {f"map={n}" for n in _map_names(m, ctx)}
+    elif (word.lower().startswith("from=") and "from" in walk.keys
+          and root == "map"):
+        out |= {f"from={n}" for n in getattr(mgr, "prefabs", {}) or {}}
     elif (root == "zone" and word.lower().startswith("def=")
           and "def" in walk.keys and m is not None
           and _view(m, ctx) is None):
