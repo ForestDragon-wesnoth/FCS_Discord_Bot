@@ -4982,6 +4982,19 @@ def _reserve_template_room(mgr: MatchManager,
     st._room_for_template(mgr.guild_key, total)
 
 
+def _prefab_ref_note(mgr: MatchManager, name: str) -> List[str]:
+    """A ⚠️ naming the prefabs whose units are built from partial `name`
+    (after it is renamed or deleted, their stamps fail until it's back)."""
+    refs = sorted(n for n, pf in (getattr(mgr, "prefabs", {}) or {}).items()
+                  if any(name in template_refs_of({"vars": u.get("vars")})
+                         for u in pf.get("units") or []))
+    if not refs:
+        return []
+    return [f"⚠️ Prefab(s) {', '.join(f'`{r}`' for r in refs)} hold units "
+            f"built from partial `{name}`; stamping them fails until a "
+            f"partial of that name exists again."]
+
+
 def _template_dependents(mgr: MatchManager, name: str) -> List[str]:
     """The templates whose data references partial `name`."""
     return sorted(n for n, t in mgr.templates.items()
@@ -5590,6 +5603,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                          f"versions are kept 24 hours). Units built from "
                          f"`{name}` keep that name in their markers until "
                          f"resynced or saved.")
+        notes += _prefab_ref_note(mgr, name)
         return await ctx.send("\n".join(
             [f"🏷️ Renamed template `{name}` to `{new_name}`"
              + (" (replacing the old one)." if old is not None else ".")
@@ -5657,6 +5671,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                          f"{', '.join(f'`{d}`' for d in deps)} in place of the "
                          f"reference (their previous versions are kept 24 "
                          f"hours).")
+        notes += _prefab_ref_note(mgr, name)
         return await ctx.send("\n".join(
             [f"🗑️ Deleted template `{name}`. Units already built from it stay."
              + (f" It is kept 24 hours (`!template restore {name}`)."
@@ -6128,7 +6143,10 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         sc, res = _prefab_scratch(mgr, ctx, name, pf)
         defs = pf.get("definitions") or {}
         lines = [f"**Prefab** {_prefab_summary(name, pf)}"]
-        dnames = [f"{lib.split('_')[0]} `{n}`" for lib in sorted(defs)
+        word = {"formula_functions": "function", "status_definitions":
+                "status", "tile_templates": "tile template",
+                "zone_definitions": "zone definition"}
+        dnames = [f"{word.get(lib, lib)} `{n}`" for lib in sorted(defs)
                   for n in sorted(defs[lib])]
         if dnames:
             lines.append("Carries: " + ", ".join(dnames))

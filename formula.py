@@ -2754,6 +2754,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   template_data(name, path="")             -> a template, resolved
     "summon_template", "summon_template_near", "has_template",
     "template_names", "template_data",
+    # The server's prefabs (`!prefab`): stamp_prefab(name, x, y, ...) ->
+    # the new top-level unit ids; prefab_names(), prefab_size(name).
+    "stamp_prefab", "prefab_names", "prefab_size",
     # Partial templates on a unit's vars:
     #   give_template(eid, path, name) -> True (build partial `name` at path)
     #   template_of(eid, path="")      -> the partial a container is built
@@ -2986,6 +2989,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "use_action",
     "summon", "summon_near", "summon_from", "remove_entity",
     "summon_template", "summon_template_near", "give_template",
+    "stamp_prefab",
     "kill", "revive", "transform", "revert",
     "schedule", "schedule_on", "cancel_schedule",
     # They run a `!func` or a lambda per item, and a `!func` may write.
@@ -3008,6 +3012,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
     'map_carrier', 'inner_maps', 'outer_map',
     'has_template', 'template_names', 'template_of', 'template_data',
+    'prefab_names', 'prefab_size',
     'schedules_of', 'schedule_left',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
@@ -3208,6 +3213,7 @@ _HOF_FUNCS: "frozenset[str]" = frozenset({"map_with", "filter_with", "sort_by"})
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
+    "prefab_names",
     "range",
     "each",
     "keys",
@@ -7172,6 +7178,75 @@ class FormulaEngine:
         ns["summon_template_near"] = _summon_template_near
         ns["has_template"]         = _has_template
         ns["template_names"]       = _template_names
+
+        def _prefab_read() -> None:
+            # Journals don't carry the prefab library, so a replay couldn't
+            # read what this command read: journal the state it left.
+            jstate = JOURNAL_AS_STATE.get()
+            if jstate is not None:
+                jstate[0] = True
+
+        def _prefab_get(fn: str, name: Any) -> Tuple[Any, str, Dict[str, Any]]:
+            _prefab_read()
+            ws = CURRENT_WORKSPACE.get()
+            lib = getattr(ws, "prefabs", None) or {}
+            if not isinstance(name, str) or name.strip().lower() not in lib:
+                raise FormulaError(f"{fn}: this server has no prefab "
+                                   f"`{name}` (`!prefab list`).")
+            key_name = name.strip().lower()
+            return ws, key_name, lib[key_name]
+
+        def _stamp_prefab(name: Any, x: Any, y: Any, map: Any = None,
+                          mode: Any = None, rotate: Any = 0, flip: Any = None,
+                          team: Any = None, confirm: Any = False) -> list:
+            """stamp_prefab(name, x, y, map=None, mode=None, rotate=0,
+            flip=None, team=None, confirm=False): stamp the server's prefab
+            `name` (`!prefab save`) with its top-left cell at (x, y), as
+            `!prefab stamp` does: mode overlay / keep / replace (default the
+            prefab_stamp_mode rule; replace deletes what lies in the
+            rectangle and needs confirm=True), rotate 0 / 90 / 180 / 270
+            clockwise, flip 'h' / 'v', team= for every stamped unit.
+            Returns the new top-level unit ids; refused whole when it
+            can't be done."""
+            from prefab import stamp_prefab as _stamp, NeedsConfirm
+            ws, key_name, pf = _prefab_get("stamp_prefab", name)
+            for v, what in ((x, "x"), (y, "y"), (rotate, "rotate")):
+                if not isinstance(v, int) or isinstance(v, bool):
+                    raise FormulaError(f"stamp_prefab: {what} must be a "
+                                       f"whole number.")
+            for v, what in ((mode, "mode"), (flip, "flip"), (team, "team")):
+                if v is not None and not isinstance(v, str):
+                    raise FormulaError(f"stamp_prefab: {what}= must be text.")
+            mp = _map_arg(map, "stamp_prefab") if map is not None \
+                else _cur_map()
+            try:
+                res = _stamp(ws, match, key_name, pf, x, y, mp,
+                             mode=mode, rotate=rotate, flip=flip, team=team,
+                             confirm=bool(confirm))
+            except NeedsConfirm as ex:
+                raise FormulaError(f"stamp_prefab: {ex} (in a formula: "
+                                   f"confirm=True).")
+            except VTTError as ex:
+                raise FormulaError(f"stamp_prefab: {ex}")
+            match.surface_log(res["notes"] + res["log"])
+            return list(res["units"])
+
+        def _prefab_names() -> list:
+            """prefab_names(): the server's saved prefab names, sorted.
+            Loopable."""
+            _prefab_read()
+            ws = CURRENT_WORKSPACE.get()
+            return sorted(getattr(ws, "prefabs", None) or {})
+
+        def _prefab_size(name: Any) -> list:
+            """prefab_size(name): the prefab's [width, height] (before any
+            rotation)."""
+            _ws, _n, pf = _prefab_get("prefab_size", name)
+            return [int(pf["width"]), int(pf["height"])]
+
+        ns["stamp_prefab"] = _stamp_prefab
+        ns["prefab_names"] = _prefab_names
+        ns["prefab_size"] = _prefab_size
         ns["template_data"]        = _template_data
         ns["entity_snapshot"] = _entity_snapshot
         ns["summon"]          = _summon
