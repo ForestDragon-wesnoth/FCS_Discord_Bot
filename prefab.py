@@ -742,8 +742,13 @@ def _clear_rect(m: Match, mp: Map, x: int, y: int, w: int, h: int,
     corpses of the rectangle wiped, zones lose their cells there (a zone
     left without cells is removed, unless it is an aura)."""
     for v in victims:
-        if v in m.entities:
-            log.extend(m.entities[v].remove(despawn=True))
+        if v not in m.entities:
+            continue
+        # Riders first: despawning a vehicle ejects its riders, and a
+        # replace deletes the whole body (parts go with their root).
+        for u in reversed(_body_tree(m, m.entities[v])):
+            if not u.part_of and u.id in m.entities:
+                log.extend(u.remove(despawn=True))
     for cx in range(x, x + w):
         for cy in range(y, y + h):
             mp.tiles.pop((cx, cy), None)

@@ -29424,12 +29424,18 @@ SCENARIO 911 — Prefabs: a vehicle with a region driver and hidden cargo, turne
 !assert "entity[tank].y == 2 and mount_of('pilot') == 'tank'"
 !prefab stamp convoy 6 6
 !assert "mount_of('pilot2') == 'tank2' and mount_of('crate2') == 'tank2'"
+!prefab stamp convoy 6 6 mode=replace confirm
+?? Cleared first: `tank2`.
+!assert "sorted(all_entities()) == ['pilot', 'pilot2', 'tank', 'tank2'] and mount_of('pilot2') == 'tank2' and mount_of('crate2') == 'tank2' and mount_of('crate') == 'tank'"
 
 Expected: HARNESS-ALLOWS-ERRORS. The tank's riders travel with it: the
 prefab holds one top-level unit. Stamped turned 270° the tank faces up
 with its driver in the front region and the crate hidden in the hold; the
 driver's move moves the tank (controls_movement). A second stamp mounts
-the new riders on the new tank.
+the new riders on the new tank. A replace stamp over the second tank
+deletes it with its riders (despawning the vehicle alone would eject
+them) and stamps a new tank that takes the freed ids `tank2`, `pilot2`,
+`crate2` (`all_entities()` leaves out the crates, hidden in the hold).
 
 
 SCENARIO 912 — Prefabs: overlay, keep and replace
