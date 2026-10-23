@@ -22051,7 +22051,7 @@ SCENARIO 759 — System libraries: promote from a match, !match sync, undo, rest
 !match sync funcs nothere
 ?? ❌ system `default` has no formula function `nothere`
 !match sync spells
-?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, all.
+?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, zones, all.
 !match sync all calc
 ?? ❌
 ?tab "!system func info default ca"
@@ -28961,3 +28961,262 @@ there, it waits. The host's next command in a channel without a team POV
 (`!match bind pov=omniscient`) ends with its line, and the list no
 longer holds it; public reminders print with the turn output wherever the
 turn passes.
+
+
+SCENARIO 904 — Zone definitions: live hooks, look and tags; copied data; minted names; a 2x2 unit
+----------------------------------------------------------------------------------------------------
+
+!match new zd ZD 10 6
+!match use zd
+!ent add ogre Ogre 30 1 1
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent set_var ogre cells_hit 0
+!zone def new poison_cloud
+!zone def data poison_cloud dmg 2
+!zone def hook poison_cloud on_enter "entity[self].hp = entity[self].hp - zone_get(zone_name, 'dmg')"
+!zone def hook poison_cloud on_cell_enter "entity[self].cells_hit = entity[self].cells_hit + 1"
+!zone def glyph poison_cloud ~
+!zone def tags poison_cloud poison, gas
+!zone new def=poison_cloud
+?? Created empty zone `poison_cloud` of definition `poison_cloud` (1 data key(s) copied).
+!zone new def=poison_cloud
+?? Created empty zone `poison_cloud2` of definition `poison_cloud`
+!zone new acid def=poison_cloud
+!zone fill poison_cloud 4 1 5 3
+!zone fill poison_cloud2 8 5 9 5
+!zone set poison_cloud2 dmg 5
+!map
+?? ~ ~
+!zone info poison_cloud
+?? "from_def"
+!zone list tag=gas
+?? `poison_cloud2`: 2 cell(s) — def `poison_cloud`; tags: poison, gas
+!zone hook del poison_cloud on_enter
+?? has no `on_enter` hook of its own; it runs definition `poison_cloud`'s
+!ent move ogre 2 right
+?? ⚙️ zone `poison_cloud` hook `on_enter` fired for `ogre`
+!assert "entity[ogre].hp == 28"
+!assert "entity[ogre].cells_hit == 2"
+!zone def data poison_cloud dmg 9
+!assert "zone_get('poison_cloud', 'dmg') == 2"
+!assert "zone_get('poison_cloud2', 'dmg') == 5"
+!zone def glyph poison_cloud *
+!map
+?? * *
+!zone glyph acid a
+!assert "zone_def_of('acid') == 'poison_cloud'"
+!zone def rename poison_cloud miasma
+?? (3 zone(s) follow it)
+!assert "zone_def_of('acid') == 'miasma'"
+!assert "zone_has_tag('poison_cloud2', 'gas')"
+!zone def del miasma
+?? is used by 3 zone(s)
+!zone def del miasma confirm
+?? (3 zone(s) now orphaned)
+!assert "not zone_has_tag('poison_cloud2', 'gas')"
+!assert "zone_get('poison_cloud2', 'dmg') == 5"
+!zone list
+?? def `miasma` (missing)
+!zone def new poison_cloud
+!zone new nope def=missing
+?? No zone definition `missing`
+!zone new def=poison_cloud
+?? Created empty zone `poison_cloud3`
+
+Expected: HARNESS-ALLOWS-ERRORS. A zone made from a definition copies its
+data (dmg 2) and reads its hooks, glyph and tags live; `!zone new
+def=poison_cloud` without a name mints `poison_cloud`, then
+`poison_cloud2`. The 2x2 ogre stepping into the cloud runs the
+definition's on_enter once and its on_cell_enter once per covered cloud
+cell (two), so hp 30 -> 28. Raising the definition's dmg to 9 leaves the
+existing zones' copied values (2 and 5); a new glyph shows at once; a
+zone's own glyph wins. A rename takes the three zones along; deleting a
+used definition needs `confirm` and orphans them (their own data stays,
+the tags go). With `poison_cloud` and `poison_cloud2` taken, a third
+minted name is `poison_cloud3`.
+
+
+SCENARIO 905 — Zone and tile tags in formulas, zone_spawn, a composed cloud lifetime
+-------------------------------------------------------------------------------------
+
+!match new zf ZF 10 6
+!match use zf
+!ent add hero Hero 20 2 2 10
+!ent add imp Imp 10 9 6 5
+!zone def new smoke
+!zone def data smoke duration 2
+!zone def data smoke opaque true
+!zone def tags smoke obscuring
+!zone def hook smoke on_turn_end "zone_set(zone_name, 'duration', zone_get(zone_name, 'duration') - 1)\nif zone_get(zone_name, 'duration') <= 0:\n    delete_zone(zone_name)"
+!eval "zone_spawn('smoke', cells_in_rect(1, 1, 3, 3))"
+?? = `'smoke'`
+!eval "zone_spawn('smoke', [[7, 6]], name='puff')"
+?? = `'puff'`
+!eval "zone_spawn('smoke', [[11, 1]])"
+?? off the 10x6 map
+!eval "zone_spawn('nothing', [])"
+?? No zone definition `nothing`
+!eval "zone_spawn('smoke', [], name='puff')"
+?? already exists
+!assert "zones_at(2, 2, tag='obscuring') == ['smoke']"
+!assert "entity_zones('hero', tag='obscuring') == ['smoke']"
+!assert "entity_zones('hero', definition='smoke') == ['smoke']"
+!assert "zones_with_tag('obscuring') == ['puff', 'smoke']"
+!assert "zone_names(tag='nope') == []"
+!assert "cell_opaque(5, 5) == False"
+!assert "not has_los(4, 2, 1, 2)"
+!ent set_var hero hidden_bonus "$(len(entity_zones('hero', tag='obscuring')))"
+!assert "entity[hero].hidden_bonus == 1"
+!ent set_var hero x2 "$(zone_spawn('smoke', []))"
+?? banned in a $() inline argument
+!assert "len(zone_names()) == 2"
+!tile def new lava
+!tile def tags lava hot
+!tile place lava 5 1
+!tile tags 6 1 hot wet
+?? tile (6,1) own tags: hot, wet.
+!tile info 5 1
+?? Tags (its template's and its own): hot
+!assert "tiles_with_tag('hot') == [[5, 1], [6, 1]]"
+!assert "tile_has_tag(6, 1, 'wet') and not tile_has_tag(5, 1, 'wet')"
+!assert "tile_tags(5, 1) == ['hot']"
+!turn next
+!assert "zone_get('smoke', 'duration') == 2"
+!turn next
+!assert "zone_get('smoke', 'duration') == 1"
+!turn next
+!assert "zone_names() == []"
+
+Expected: HARNESS-ALLOWS-ERRORS. zone_spawn makes a zone of a definition,
+minting `smoke` or taking `name=`, and refuses a cell off the map, an
+unknown definition and a taken name. The tag= / definition= filters of
+zones_at, entity_zones, zone_names and zones_with_tag find the zones by
+kind. The smoke's `opaque` data, copied from the definition, blocks the
+line from (4,2) to (1,2). A read like entity_zones works inside `$()`;
+zone_spawn changes the match and is refused there (nothing made). Tile
+tags combine the template's (`hot`) with a tile's own `tags` data. The
+definition's on_turn_end hook counts the copied duration down per zone
+and deletes each with delete_zone: after two turn ends both clouds are
+gone.
+
+
+SCENARIO 906 — System zone definitions: inheritance, new matches, sync, promote, restart
+-----------------------------------------------------------------------------------------
+
+!system new base
+!system zone new base fog
+!system zone data base fog opaque true
+!system zone glyph base fog %
+!system zone tags base fog cloud
+!system zone hook base fog on_turn_start "log('fog ' + zone_name)"
+!system zone hook base fog on_turn_end "missing_fn()"
+?? ⚠️
+!system zone list base
+?? - `fog` (hooks: on_turn_end, on_turn_start; tags: cloud)
+!system new night parent=base
+!system zone color night fog grey
+!system zone list night
+?! (inherited)
+!system zone info night fog
+?? "color": "grey"
+!system zone info base fog
+?! grey
+!match new zs ZS 6 4 night
+!match use zs
+!zone def info fog
+?? "color": "grey"
+!zone new def=fog
+!system zone tags night fog cloud thick
+!match sync zones diff
+?? `fog`: tags: ['cloud'] → ['cloud', 'thick']
+!assert "zone_tags('fog') == ['cloud']"
+!match sync zones
+?? zones: replaced `fog`.
+!assert "zone_tags('fog') == ['cloud', 'thick']"
+!undo command
+!assert "zone_tags('fog') == ['cloud']"
+!zone def new mine
+!zone def tags mine boom
+!system zone promote base mine
+?? Promoted zone definition `mine` from match `zs` to `base`.
+!system zone del night fog
+?? (it hides the inherited one; `!system unset night zone_definitions:fog` brings it back).
+!system zone list night
+?? Hidden here: `fog`
+?! - `fog`
+!system unset night zone_definitions:fog
+!system zone list night
+?? `fog`
+!system lint base
+?? missing_fn
+!system zone rename base mine trap
+!system zone list base
+?? `trap`
+!as restart
+!system zone list base
+?? `trap` (tags: boom)
+!match use zs
+!zone def list
+?? `fog` (1 zone(s)
+!assert "zone_def_of('fog') == 'fog'"
+
+Expected: HARNESS-ALLOWS-ERRORS. A system holds zone definitions with the
+grammar of `!zone def`; a hook calling an unknown function is stored with
+a ⚠️ that `!system lint` repeats. A child system's edit makes the entry its
+own (night's grey fog), and a new match on night starts with it. `!match
+sync zones diff` previews the parent's newer tags and `sync` copies them
+over; undo takes the sync back. `promote` copies a match's definition into
+the system; deleting an inherited one hides it until `!system unset`.
+Everything survives `!as restart`.
+
+
+SCENARIO 907 — Tile template rename and tags; a zone's block read through its definition
+-------------------------------------------------------------------------------------------
+
+!match new tt TT 8 4
+!match use tt
+!ent add hero Hero 10 1 2
+!tile def new spikes
+!tile def data spikes dmg 3
+!tile def hook spikes on_enter "entity[self].hp = entity[self].hp - 3"
+!tile def tags spikes trap
+!tile place spikes 2 2
+!tile def rename spikes caltrops
+?? Renamed tile template `spikes` to `caltrops` (1 placed tile(s) follow it).
+!assert "tile_template_of(2, 2) == 'caltrops'"
+!assert "tile_has_tag(2, 2, 'trap')"
+!ent move hero 1 right
+!assert "entity[hero].hp == 7"
+!tile def rename caltrops caltrops
+?? already exists
+!tile def tags caltrops -
+!assert "not tile_has_tag(2, 2, 'trap')"
+!zone def new wall
+!zone def data wall block true
+!zone new w def=wall
+!zone fill w 4 1 4 4
+!zone del w block
+!map cell 4 2 for=hero
+?? Blocks movement: zone `w`: always
+!ent tp hero 4 2
+?? blocks `hero`
+!zone setdef w -
+!ent tp hero 4 2
+?? to (4,2)
+!system new tiles
+!system tile new tiles pit
+!system tile tags tiles pit hole
+!system tile copy tiles pit shaft
+!system tile rename tiles pit well
+!system tile list tiles
+?? - `shaft` (hooks: —; tags: hole)
+?? - `well` (hooks: —; tags: hole)
+
+Expected: HARNESS-ALLOWS-ERRORS. Renaming a tile template takes its placed
+tiles along (the hook still fires: hp 10 -> 7); a template's tags are read
+live, so clearing them clears the placed tile's. A zone of the `wall`
+definition whose own `block` data was deleted still blocks: the read goes
+through to the definition's data, as a tile reads its template's; once
+the zone names no definition, it doesn't. A system's tile templates take
+tags, copy and rename too.

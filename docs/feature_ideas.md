@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #256). Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #258). Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
@@ -327,8 +327,12 @@ or rejects one, it moves to "Off the list".
     - Summons follow their summoner's controllers (#223). FCS1: "summoned units are controlled by the user"; FCS1 Umbral Clone (a copy of the user, controlled by the user).
     - A `!ent control` listing for hosts; a spectator role that can read and never act (#190).
 - **#30 ASCII map import.** A pasted text block plus a glyph → tile template (or unit template) legend builds a board.
-- **#31 Prefabs (on hold).** A saved board fragment (units, tiles and zones in a rectangle) stamped into a match at an offset.
+- **#31 Prefabs.** A saved board fragment (units, tiles and zones in a rectangle) stamped into a match at an offset.
+  - Designed with the user: `docs/zones_prefabs_design.md`. Built in two PRs, zone definitions and tags first, then prefabs.
 - **#32 Procedural generation.** `noise(x, y, seed)` plus room and cave helpers that write tiles.
+- **#257 Tile and zone facing.** A `facing` field on tiles, tile templates, zones and zone definitions, per-facing glyphs and sprites (`glyphs.<facing>` / `sprites.<facing>`, as units have), and facing reads in formulas, for directional terrain (arrow traps, conveyors, one-way doors).
+  - Prefab rotation (#31) should turn tile and zone facing once this exists.
+- **#258 Reapply a definition's data.** `!zone def <d> reapply` / `!tile def <t> reapply` push the definition's or template's data to the zones and tiles made from it (data is copied at creation, so a later data edit reaches only new ones).
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
 - **#34 Session recap export.** The event log as markdown, filtered by POV, for posting a session summary.

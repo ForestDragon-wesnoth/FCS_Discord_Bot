@@ -5409,18 +5409,52 @@ _CORPSES_RESERVED = ("`corpses` in tile data is where the engine keeps the "
 # !tile def data rejects writes to either key.
 
 
+def normalize_tags(raw: Any) -> List[str]:
+    """A tag list in its stored shape: one-word strings, each once, in the
+    order given. A text value is split on commas and spaces (`!zone tags z
+    fire, poison`); anything else that isn't a list reads as no tags."""
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    for t in raw:
+        if isinstance(t, str):
+            t = t.strip()
+            if t and not any(c.isspace() for c in t) and "," not in t \
+                    and t not in out:
+                out.append(t)
+    return out
+
+
+def check_tag(tag: Any) -> str:
+    """`tag` when it can be a zone / tile tag (one word, no comma), else a
+    VTTError."""
+    if not isinstance(tag, str) or not tag.strip() or \
+            any(c.isspace() for c in tag.strip()) or "," in tag:
+        raise VTTError(f"`{tag}` can't be a tag: one word, no spaces or "
+                       f"commas.")
+    return tag.strip()
+
+
 @dataclass
 class SpecialTileTemplate:
     name: str
     data: Dict[str, Any] = field(default_factory=dict)
     hooks: Dict[str, str] = field(default_factory=dict)
+    # A template field (outside `data`, so placing a tile doesn't copy it):
+    # a placed tile's tags are these, read live, plus its own `tags` data.
+    tags: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "name": self.name,
             "data": copy.deepcopy(self.data),
             "hooks": dict(self.hooks),
         }
+        if self.tags:
+            out["tags"] = list(self.tags)
+        return out
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "SpecialTileTemplate":
@@ -5432,7 +5466,58 @@ class SpecialTileTemplate:
                 for k, v in (d.get("hooks", {}) or {}).items()
                 if isinstance(v, str)
             },
+            tags=normalize_tags(d.get("tags")),
         )
+
+
+# Zone DEFINITIONS describe a kind of zone once (`poison_cloud`), the way a
+# tile template describes a kind of tile. A zone naming one (its `def`
+# field) reads the definition's hooks, look fields (ZONE_LOOK_FIELDS) and
+# tags LIVE, its own value winning; the definition's `data` is copied into
+# the zone when it is made (and read through for `block` / `opaque` when the
+# zone's data lacks them, as a tile reads its template's). The tile-template
+# pattern, so the two map features with definitions behave alike. Stored as
+# plain dicts in Match.zone_definitions (and a system library), in the
+# shape normalize_zone_def gives.
+ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend")
+
+
+def zone_look_value(key: str, value: Any) -> bool:
+    """Whether `value` is a usable zone look field `key` (a one-character
+    glyph, a non-empty color / sprite text, a legend text or False)."""
+    if key == "glyph":
+        return isinstance(value, str) and len(value) == 1
+    if key == "legend":
+        return value is False or (isinstance(value, str) and bool(value))
+    return isinstance(value, str) and bool(value)
+
+
+def check_zone_def_name(name: Any) -> None:
+    """Raise unless `name` can name a zone definition: one word."""
+    if not isinstance(name, str) or not name or \
+            any(c.isspace() for c in name):
+        raise VTTError(f"`{name}` can't be a zone definition name: one "
+                       f"word, no spaces.")
+
+
+def normalize_zone_def(raw: Any) -> Dict[str, Any]:
+    """A zone definition in its stored shape: `data` (a dict), `hooks` (zone
+    hook name -> formula text), `tags` (a list) and the look fields that are
+    set. Malformed parts are dropped (a save from an older build loads)."""
+    raw = raw if isinstance(raw, dict) else {}
+    data = raw.get("data")
+    hooks = raw.get("hooks")
+    out: Dict[str, Any] = {
+        "data": copy.deepcopy(data) if isinstance(data, dict) else {},
+        "hooks": {k: v for k, v in hooks.items()
+                  if isinstance(k, str) and isinstance(v, str) and v}
+        if isinstance(hooks, dict) else {},
+        "tags": normalize_tags(raw.get("tags")),
+    }
+    for key in ZONE_LOOK_FIELDS:
+        if zone_look_value(key, raw.get(key)):
+            out[key] = raw[key]
+    return out
 
 
 # -------------------------
@@ -5574,7 +5659,7 @@ MERGE_RULES: Dict[str, Optional[str]] = {
 SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
                                      "formula_functions",
                                      "status_definitions", "tables",
-                                     "macros")
+                                     "macros", "zone_definitions")
 
 # Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
 # it can't bound the system chain itself). Set with `!owner ceiling <key>
@@ -5812,6 +5897,9 @@ class GameSystem:
     status_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     tables: Dict[str, str] = field(default_factory=dict)
     macros: Dict[str, str] = field(default_factory=dict)
+    # Zone definitions (`!system zone def`, the normalize_zone_def shape of
+    # Match.zone_definitions), copied into a new match the same way.
+    zone_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # The system this one inherits from (live: MatchManager resolves the
     # chain on every read), or None for a root. `settings` and the
     # libraries above then hold only this system's OWN overrides.
@@ -5872,6 +5960,10 @@ class GameSystem:
             },
             "tables": {n: str(t) for n, t in sorted(self.tables.items())},
             "macros": {n: str(b) for n, b in sorted(self.macros.items())},
+            "zone_definitions": {
+                n: normalize_zone_def(d)
+                for n, d in sorted(self.zone_definitions.items())
+            },
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
@@ -5928,6 +6020,10 @@ class GameSystem:
             {k: v for k, v in (d.get(key) or {}).items()
              if isinstance(k, str) and isinstance(v, str)}
             for key in ("tables", "macros"))
+        sys_zone_defs = {
+            k: normalize_zone_def(v)
+            for k, v in (d.get("zone_definitions") or {}).items()
+            if isinstance(k, str) and k and isinstance(v, dict)}
         if dropped:
             print(f"[systems] '{d.get('name')}': dropped gamerule(s) that no "
                   f"longer exist: {', '.join(sorted(map(str, dropped)))}")
@@ -5944,6 +6040,7 @@ class GameSystem:
             tile_templates=templates, formula_functions=funcs,
             aliases=sys_aliases, status_definitions=sys_statuses,
             tables=sys_tables, macros=sys_macros,
+            zone_definitions=sys_zone_defs,
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
             description=str(d.get("description") or ""),
@@ -7652,6 +7749,10 @@ class Map:
         lg = z.get("legend")
         if lg is False or (isinstance(lg, str) and lg):
             out["legend"] = lg
+        if isinstance(z.get("def"), str) and z["def"]:
+            out["def"] = z["def"]
+        if z.get("tags"):
+            out["tags"] = list(z["tags"])
         # Aura binding (entity-anchored zone), if present.
         if z.get("anchor"):
             out["anchor"] = z["anchor"]
@@ -7695,6 +7796,14 @@ class Map:
         lg = zdef.get("legend")
         if lg is False or (isinstance(lg, str) and lg):
             z["legend"] = lg
+        # The zone definition it names (Match.zone_definitions; a name
+        # without a definition is an orphan, as a tile's `_template`) and
+        # its own tags.
+        if isinstance(zdef.get("def"), str) and zdef["def"]:
+            z["def"] = zdef["def"]
+        tags = normalize_tags(zdef.get("tags"))
+        if tags:
+            z["tags"] = tags
         # Restore an aura binding. The cells were serialized at their
         # last-stamped positions (and re-stamp on the next anchor move),
         # so no recompute is needed at load time.
@@ -8089,6 +8198,12 @@ class Match:
     # Edits propagate live (the instance only stores dynamic state like
     # level/duration). Serialized with the match.
     status_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # Zone DEFINITIONS (`!zone def`): name -> normalize_zone_def shape. A
+    # zone naming one reads its hooks, look fields and tags live; its data
+    # was copied in when the zone was made (see ZONE_LOOK_FIELDS). Seeded
+    # from the system's library at creation, serialized with the match.
+    zone_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # User-defined formula functions, keyed by name. Defined via !func
     # def and callable by name from any formula on this match. Seeded
@@ -8597,6 +8712,192 @@ class Match:
     def zone_clear_data(self, name: str) -> int:
         return self._zone_owner(name).zone_clear_data(name)
 
+    # ---- zone definitions and tags ----------------------------------------
+    # The live reads (hooks, look fields, tags) go through these, so a zone's
+    # own value wins and a definition fills in what the zone doesn't set (a
+    # zone naming a missing definition reads as having none, like a tile
+    # whose template was deleted).
+    def zone_def_dict(self, z: Any) -> Optional[Dict[str, Any]]:
+        """The definition zone dict `z` names, or None (none named, or an
+        orphan)."""
+        dname = z.get("def") if isinstance(z, dict) else None
+        if not isinstance(dname, str):
+            return None
+        d = self.zone_definitions.get(dname)
+        return d if isinstance(d, dict) else None
+
+    def zone_hook_source(self, z: Any, when: str) -> Optional[str]:
+        """Zone dict `z`'s hook `when`: its own, else its definition's."""
+        if not isinstance(z, dict):
+            return None
+        for src in (z, self.zone_def_dict(z) or {}):
+            hooks = src.get("hooks")
+            cand = hooks.get(when) if isinstance(hooks, dict) else None
+            if isinstance(cand, str) and cand:
+                return cand
+        return None
+
+    def zone_look(self, z: Any, key: str) -> Any:
+        """Zone dict `z`'s look field `key` (ZONE_LOOK_FIELDS): its own, else
+        its definition's, else None."""
+        if not isinstance(z, dict):
+            return None
+        for src in (z, self.zone_def_dict(z) or {}):
+            if zone_look_value(key, src.get(key)):
+                return src[key]
+        return None
+
+    def zone_data_spec(self, z: Any, key: str) -> Any:
+        """Zone dict `z`'s data `key` (block / opaque), else its definition's
+        data `key`; None when neither sets it."""
+        if not isinstance(z, dict):
+            return None
+        val = (z.get("data") or {}).get(key)
+        if val in (None, ""):
+            val = ((self.zone_def_dict(z) or {}).get("data") or {}).get(key)
+        return None if val in (None, "") else val
+
+    def zone_tags(self, name: str) -> List[str]:
+        """Zone `name`'s tags: its definition's, then its own (each once)."""
+        z = self.find_zone(name)
+        if z is None:
+            return []
+        return normalize_tags(list((self.zone_def_dict(z) or {}).get("tags")
+                                   or []) + list(z.get("tags") or []))
+
+    def zone_has_tag(self, name: str, tag: str) -> bool:
+        return tag in self.zone_tags(name)
+
+    def zone_def_name(self, name: str) -> Optional[str]:
+        """The definition zone `name` names (an orphan's too), or None."""
+        z = self.find_zone(name)
+        d = z.get("def") if z is not None else None
+        return d if isinstance(d, str) and d else None
+
+    def zones_matching(self, names: Any, tag: Optional[str] = None,
+                       definition: Optional[str] = None) -> List[str]:
+        """`names` (zone names) kept in order when they carry `tag` and name
+        `definition` (None = any)."""
+        out = []
+        for n in names:
+            if tag is not None and not self.zone_has_tag(n, tag):
+                continue
+            if definition is not None and self.zone_def_name(n) != definition:
+                continue
+            out.append(n)
+        return out
+
+    def mint_zone_name(self, base: str) -> str:
+        """A zone name no map uses, minted like unit ids: `base`, `base2`,
+        `base3`, ..."""
+        taken = set(self.zone_names())
+        if base not in taken:
+            return base
+        i = 2
+        while f"{base}{i}" in taken:
+            i += 1
+        return f"{base}{i}"
+
+    def create_zone_from_def(self, name: Optional[str], definition: str,
+                             mp: Optional["Map"] = None) -> str:
+        """Make a zone from zone definition `definition` on map `mp`: its
+        data copied in, the definition named; `name` None mints one from the
+        definition's name. Returns the zone's name."""
+        d = self.zone_definitions.get(definition)
+        if d is None:
+            raise NotFound(f"No zone definition `{definition}`.")
+        name = name or self.mint_zone_name(definition)
+        z = self.create_zone(name, mp)
+        z["def"] = definition
+        z["data"] = copy.deepcopy(d.get("data") or {})
+        return name
+
+    def set_zone_def(self, name: str, definition: Optional[str]) -> int:
+        """Attach zone definition `definition` to zone `name` (its data keys
+        the zone lacks are copied in) or, with None, detach it. Returns the
+        number of data keys copied."""
+        z = self.find_zone(name)
+        if z is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        if definition is None:
+            z.pop("def", None)
+            return 0
+        d = self.zone_definitions.get(definition)
+        if d is None:
+            raise NotFound(f"No zone definition `{definition}`.")
+        z["def"] = definition
+        data = z.setdefault("data", {})
+        n = 0
+        for k, v in (d.get("data") or {}).items():
+            if k not in data:
+                data[k] = copy.deepcopy(v)
+                n += 1
+        return n
+
+    def define_zone_def(self, name: str) -> Dict[str, Any]:
+        """Create an empty zone definition."""
+        check_zone_def_name(name)
+        if name in self.zone_definitions:
+            raise DuplicateId(f"Zone definition `{name}` already exists.")
+        self.zone_definitions[name] = normalize_zone_def({})
+        return self.zone_definitions[name]
+
+    def zones_using_def(self, definition: str) -> List[str]:
+        """The zones (any map, sorted) naming zone definition `definition`."""
+        return sorted(n for mp in self.maps.values()
+                      for n, z in mp.zones.items()
+                      if isinstance(z, dict) and z.get("def") == definition)
+
+    def rename_zone_def(self, old: str, new: str) -> int:
+        """Rename zone definition `old` to `new`, and every zone naming it.
+        Returns the number of zones updated."""
+        if old not in self.zone_definitions:
+            raise NotFound(f"No zone definition `{old}`.")
+        check_zone_def_name(new)
+        if new in self.zone_definitions:
+            raise DuplicateId(f"Zone definition `{new}` already exists.")
+        self.zone_definitions = {(new if k == old else k): v
+                                 for k, v in self.zone_definitions.items()}
+        n = 0
+        for mp in self.maps.values():
+            for z in mp.zones.values():
+                if isinstance(z, dict) and z.get("def") == old:
+                    z["def"] = new
+                    n += 1
+        return n
+
+    def rename_tile_template(self, old: str, new: str) -> int:
+        """Rename tile template `old` to `new`, and every tile placed from
+        it (any map). Returns the number of tiles updated."""
+        if old not in self.tile_templates:
+            raise NotFound(f"tile template '{old}' not found.")
+        if not isinstance(new, str) or not new or new in self.tile_templates:
+            raise DuplicateId(f"tile template '{new}' already exists.")
+        tpl = self.tile_templates[old]
+        tpl.name = new
+        self.tile_templates = {(new if k == old else k): v
+                               for k, v in self.tile_templates.items()}
+        n = 0
+        for mp in self.maps.values():
+            for cell in mp.tiles.values():
+                if isinstance(cell, dict) and cell.get("_template") == old:
+                    cell["_template"] = new
+                    n += 1
+        return n
+
+    def tile_tags(self, x: int, y: int, mp: Optional["Map"] = None
+                  ) -> List[str]:
+        """The tags of the tile at (x, y) of map `mp`: its template's, then
+        its own `tags` data (each once)."""
+        mp = mp or self.get_map()
+        cell = mp.tiles.get((x, y))
+        if not isinstance(cell, dict):
+            return []
+        tpl = self.tile_templates.get(cell.get("_template")) \
+            if isinstance(cell.get("_template"), str) else None
+        return normalize_tags(list(tpl.tags if tpl is not None else [])
+                              + normalize_tags(cell.get("tags")))
+
     # ---- map vars and settings --------------------------------------------
     def map_var_name(self, setting: str) -> str:
         """The map var name the rules give a map setting (`fog`, ...)."""
@@ -8951,6 +9252,8 @@ class Match:
         stores += [e.vars for e in self.entities.values()]
         stores += [e.status for e in self.entities.values()]
         stores += [d.get("data") for d in self.status_definitions.values()]
+        stores += [d.get("data") for d in self.zone_definitions.values()]
+        stores += [t.data for t in self.tile_templates.values()]
         for m2 in self.maps.values():
             # Tile data holds the corpses too: their vars and statuses.
             stores += [m2.vars, m2.tiles]
@@ -11580,8 +11883,8 @@ class Match:
             cells = z.get("cells", ())
             if (x, y) not in cells:
                 continue
-            zspec = (z.get("data") or {}).get("opaque")
-            if zspec in (None, ""):
+            zspec = self.zone_data_spec(z, "opaque")
+            if zspec is None:
                 zspec = self.rules.get("zone_opaque_condition", "")
             if self._eval_opaque_spec(
                     zspec, viewer_id,
@@ -12400,8 +12703,7 @@ class Match:
         """Remove a template. Returns the number of placed instances
         that referenced it (now orphaned — they still exist as tiles
         with a `_template` field pointing at a missing definition;
-        fire_tile_hook degrades gracefully by emitting a warning and
-        no-opping on hook firings for those tiles)."""
+        fire_tile_hook finds no template hook for them and no-ops)."""
         if name not in self.tile_templates:
             raise NotFound(f"tile template '{name}' not found.")
         del self.tile_templates[name]
@@ -12852,8 +13154,8 @@ class Match:
             cells = z.get("cells", ())
             if (x, y) not in cells:
                 continue
-            zspec = (z.get("data") or {}).get("block")
-            if zspec in (None, ""):
+            zspec = self.zone_data_spec(z, "block")
+            if zspec is None:
                 zspec = self.rules.get("zone_block_condition", "")
             if self._eval_block_spec(zspec, mover_id, {"zone_name": name,
                                                        "zone_map": mp.name}):
@@ -13944,8 +14246,7 @@ class Match:
                 if isinstance(h, dict) and any(k in h for k in rnames):
                     return True
             for z in mp.zones.values():
-                h = z.get("hooks") if isinstance(z, dict) else None
-                if isinstance(h, dict) and any(k in h for k in rnames):
+                if any(self.zone_hook_source(z, k) for k in rnames):
                     return True
         return False
 
@@ -14314,11 +14615,9 @@ class Match:
         z = mp.zones.get(name)
         if not z:
             return []
-        hooks = z.get("hooks")
-        if not isinstance(hooks, dict):
-            return []
-        formula_src = hooks.get(when)
-        if not (isinstance(formula_src, str) and formula_src):
+        # The zone's own hook, else its definition's (live).
+        formula_src = self.zone_hook_source(z, when)
+        if formula_src is None:
             return []
         from formula import FormulaEngine, EvalCtx, FormulaError
         engine = FormulaEngine(self)
@@ -14546,9 +14845,7 @@ class Match:
                     continue
                 # tile_x/tile_y default to None for time hooks (no single
                 # firing cell); fire_zone_hook still binds zone_name.
-                z = mp.zones.get(name)
-                hooks = z.get("hooks") if z else None
-                if not (isinstance(hooks, dict) and hooks.get(when)):
+                if self.zone_hook_source(mp.zones.get(name), when) is None:
                     continue
                 log.extend(self._fire_zone_time_hook(when, name, cur, mp))
         return log
@@ -14561,8 +14858,8 @@ class Match:
         z = mp.zones.get(name)
         if not z:
             return []
-        formula_src = (z.get("hooks") or {}).get(when)
-        if not (isinstance(formula_src, str) and formula_src):
+        formula_src = self.zone_hook_source(z, when)
+        if formula_src is None:
             return []
         engine = FormulaEngine(self)
         ctx = EvalCtx(
@@ -19112,6 +19409,10 @@ class Match:
                 name: copy.deepcopy(d)
                 for name, d in sorted(self.status_definitions.items())
             },
+            "zone_definitions": {
+                name: normalize_zone_def(d)
+                for name, d in sorted(self.zone_definitions.items())
+            },
             "formula_functions": {
                 name: fn.to_dict()
                 for name, fn in sorted(self.formula_functions.items())
@@ -19322,6 +19623,10 @@ class Match:
         for sname, sdef in raw_status_defs.items():
             if isinstance(sname, str) and isinstance(sdef, dict):
                 m.status_definitions[sname] = copy.deepcopy(sdef)
+        m.zone_definitions = {
+            zname: normalize_zone_def(zdef)
+            for zname, zdef in (d.get("zone_definitions") or {}).items()
+            if isinstance(zname, str) and zname}
         raw_funcs = d.get("formula_functions", {}) or {}
         m.formula_functions = {}
         for fname, fdef in raw_funcs.items():
@@ -19652,9 +19957,13 @@ class Match:
         return self._legend_value(val, default)
 
     def legend_label_zone(self, name: str, mp: "Map") -> Optional[str]:
+        """A zone's legend label: its own `legend`, else its definition's,
+        else `zone: <definition>` / `zone: <name>`."""
         z = mp.zones.get(name)
-        return self._legend_value(z.get("legend") if isinstance(z, dict)
-                                  else None, f"zone: {name}")
+        dname = z.get("def") if isinstance(z, dict) else None
+        default = (f"zone: {dname}" if isinstance(dname, str) and
+                   dname in self.zone_definitions else f"zone: {name}")
+        return self._legend_value(self.zone_look(z, "legend"), default)
 
     def legend_label_corpse(self, eid: str) -> Optional[str]:
         c = self.find_corpse(eid)
@@ -19713,8 +20022,9 @@ class Match:
         z = mp.zones.get(name)
         if not isinstance(z, dict):
             return None
-        return self._resolve_color_value(z.get("color"), {"zone_name": name,
-                                                          "zone_map": mp.name})
+        return self._resolve_color_value(self.zone_look(z, "color"),
+                                         {"zone_name": name,
+                                          "zone_map": mp.name})
 
     # ---- sprite resolution (graphics render model) ------------------
     # Sprites are KEY strings stored in data, mirroring glyphs: a per-facing
@@ -19896,11 +20206,7 @@ class Match:
     def zone_sprite(self, name: str, mp: "Map") -> Optional[str]:
         """The sprite key for zone `name` of map `mp` (its `sprite` field),
         or None."""
-        z = mp.zones.get(name)
-        if not isinstance(z, dict):
-            return None
-        k = z.get("sprite")
-        return k if isinstance(k, str) and k else None
+        return self.zone_look(mp.zones.get(name), "sprite")
 
     def background_layer(self, mp: Optional["Map"] = None
                          ) -> Optional[Dict[str, Any]]:
@@ -20180,8 +20486,8 @@ class Match:
         for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
             if not self.zone_visible_to(zname, pov_team, mp):
                 continue
-            g = z.get("glyph")
-            has_glyph = isinstance(g, str) and len(g) == 1
+            g = self.zone_look(z, "glyph")
+            has_glyph = g is not None
             zc = self.zone_color(zname, mp)
             if not has_glyph and zc is None:
                 continue
@@ -20683,8 +20989,7 @@ class Match:
             if not self.zone_visible_to(zname, pov_team, mp):
                 continue
             spr = self.zone_sprite(zname, mp)
-            g = z.get("glyph")
-            g = g if isinstance(g, str) and len(g) == 1 else None
+            g = self.zone_look(z, "glyph")
             tint = self.zone_color(zname, mp)
             if spr is None and g is None and tint is None:
                 continue
@@ -22744,7 +23049,8 @@ class MatchManager:
                 m.aliases[aname] = expansion
         # Status definitions, dice tables and macros, the same way. A
         # system macro carries no author, so it runs as a host's.
-        for kind in ("status_definitions", "tables", "macros"):
+        for kind in ("status_definitions", "tables", "macros",
+                     "zone_definitions"):
             setattr(m, kind, copy.deepcopy(self.system_library(sysobj, kind)))
         self.matches[m.id] = m
         return m.id
