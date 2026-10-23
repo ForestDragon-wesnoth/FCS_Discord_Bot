@@ -1069,11 +1069,13 @@ class CommandRegistry:
             sent = MATCHES_SENT_UNITS.get() or set()
             MATCHES_SENT_UNITS.reset(sent_token)
         # Secret `!remind` reminders that came due wait for a host: they end
-        # the reply of the next command a host runs on the match (part of
-        # that command's undo step).
+        # the reply of the next command a host runs on the match in a
+        # channel without a team POV (a POV-bound channel is one players
+        # read), part of that command's undo step.
         hm = (mgr.matches.get(pre_active_mid)
               if pre_active_mid and name.lower() != "as" else None)
-        if hm is not None and hm.held_reminders and _acts_as_host(ctx, hm):
+        if hm is not None and hm.held_reminders and _acts_as_host(ctx, hm) \
+                and _view_pov(ctx, hm, []) is None:
             held, hm.held_reminders = hm.held_reminders, []
             await ctx.send("\n".join(hm.reminder_line(r) for r in held))
         # Even a failed command goes through the bookkeeping below: it only
@@ -3964,8 +3966,8 @@ def _crash_line(e: Dict[str, Any], owner: bool) -> str:
         key = e.get("server")
         where = (f" [{name} (`{key}`)]" if name and name != key
                  else f" [`{key}`]" if key else " [no server]")
-    who = f" by {e['user_name'] or e['user']}" if (e.get("user_name")
-                                                   or e.get("user")) else ""
+    who = (f" by {e.get('user_name') or e.get('user')}"
+           if (e.get("user_name") or e.get("user")) else "")
     cmd = e.get("command") or e.get("where") or "?"
     if len(cmd) > 80:
         cmd = cmd[:77] + "..."
@@ -4009,7 +4011,10 @@ async def _errors_cmd(ctx, args: List[str], mgr: MatchManager, scope: str):
         n = len(log.entries)
         log.entries = []
         if log.save is not None:
-            log.save(log)
+            try:
+                log.save(log)
+            except Exception as ex:  # noqa: BLE001 - as CrashLog.record
+                print(f"⚠️ The error log couldn't be saved ({ex}).")
         return await ctx.send(f"Cleared {n} crash(es) from the error log "
                               f"(ref numbers go on from {log.next_ref}).")
     n = _parse_count(args[1], f"{root} [n]") if len(args) > 1 else 10
@@ -8103,6 +8108,8 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
             raise VTTError(f"invalid table spec: {ex}")
         reply = f"Defined table `{name}` = `{body}` on `{sys_name}`."
     else:
+        if not body:
+            raise VTTError("macro body is empty.")
         try:
             _parse_macro(body)
         except _MacroError as ex:
@@ -8880,12 +8887,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 cur[parts_path[-1]] = value
                 after = copy.deepcopy(e.status[name])
                 event_log = m._emit_status_diff(eid, name, before, after)
-                # What is stored (a level is held to max_level).
-                stored = cur.get(parts_path[-1], value) \
-                    if eid in m.entities else value
+                # What is stored now: a level is held to max_level, and the
+                # status hooks the change fired may have changed it again.
+                stored: Any = (m.entities[eid].status.get(name)
+                               if eid in m.entities else None)
+                for key in parts_path:
+                    stored = (stored.get(key) if isinstance(stored, dict)
+                              else None)
                 msg = f"Set `{eid}.{name}.{path}` = {stored!r}."
+                cap = (m.status_definitions.get(name) or {}).get("max_level")
                 if stored != value:
-                    msg += f" (capped by `{name}`'s max_level)"
+                    msg += (f" (capped by `{name}`'s max_level)"
+                            if path == "level" and cap and stored == cap
+                            else f" (set to {value!r}; then changed by the "
+                                 f"status hooks it fired)")
                 if event_log:
                     msg += "\n" + "\n".join(event_log)
                 return await ctx.send(msg)
@@ -19020,9 +19035,11 @@ for _subs, _usage in (
         "(reminder_message_format) in the reply of the command that passes "
         "the 3rd turn from now. Turns count every unit's turn "
         "(turns_elapsed), so it works under ATB too. `secret` makes it a "
-        "host note: it shows only in a host's reply, waiting for the next "
-        "command a host runs on the match when a player passes that turn. "
-        "`list` shows what is pending (players see the public ones), "
+        "host note: it shows only in a host's reply in a channel without a "
+        "team POV, waiting for the next command a host runs on the match "
+        "there when the turn passes elsewhere (a player's turn, a "
+        "POV-bound channel). `list` shows what is pending (players, and "
+        "hosts in a POV-bound channel, see the public ones), "
         "`remove <id>` drops one. Saved with the match; an undo step."
     ),
 )
@@ -19035,10 +19052,16 @@ async def remind_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         _check_tail(args, 1, (), "!remind list")
         host = _acts_as_host(ctx, m)
-        rows = [r for r in m.reminders if host or not r.get("secret")]
-        held = m.held_reminders if host else []
+        # Secret ones only for a host in a channel without a team POV, where
+        # they are delivered too: a POV-bound channel is one players read.
+        private = host and _view_pov(ctx, m, []) is None
+        note = ([] if private or not host else
+                ["(Secret reminders are listed only in a channel without a "
+                 "team POV.)"])
+        rows = [r for r in m.reminders if private or not r.get("secret")]
+        held = m.held_reminders if private else []
         if not rows and not held:
-            return await ctx.send("No reminders pending.")
+            return await ctx.send("\n".join(["No reminders pending."] + note))
         lines = []
         for r in sorted(rows, key=lambda r: (r["due"], r["id"])):
             left = r["due"] - m.turns_elapsed
@@ -19048,7 +19071,7 @@ async def remind_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for r in held:
             lines.append(f"- `{r['id']}` 🔒 due, waiting for a host: "
                          f"{r.get('text', '')}")
-        return await ctx.send("**Reminders**\n" + "\n".join(lines))
+        return await ctx.send("**Reminders**\n" + "\n".join(lines + note))
     if sub == "remove":
         _check_tail(args, 2, (), "!remind remove <id>")
         if len(args) < 2:
@@ -19608,7 +19631,7 @@ def _trace_text(trace: List[Dict[str, Any]]) -> str:
     more = len(trace) - _TRACE_SHOWN
     if more > 0:
         lines.append(f"... and {more} more" + (" (the trace stops at 1000)"
-                                               if len(trace) > 1000 else ""))
+                                               if len(trace) >= 1000 else ""))
     return "**Trace:**\n" + "\n".join(lines)
 
 

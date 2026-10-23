@@ -85,7 +85,8 @@ def _bare(word: str, in_group: bool) -> tuple:
 
 def _parse_seq(text: str, in_group: bool) -> tuple:
     nodes: List[tuple] = []
-    for tok in _usage_tokens(text):
+    toks = _usage_tokens(text)
+    for pos, tok in enumerate(toks):
         tok = tok.strip('"')
         if not tok:
             continue
@@ -118,7 +119,12 @@ def _parse_seq(text: str, in_group: bool) -> tuple:
                 node = ("opt", node)
             nodes.append(node)
             continue
-        nodes.append(_bare(tok, in_group))
+        # An alternative's leading word followed by placeholders is its
+        # literal action (`when <system> <name> ...` inside `!system status
+        # <list <system> | when ...>`), even when it is also a slot name.
+        lead = (in_group and pos == 0 and pos + 1 < len(toks)
+                and toks[pos + 1][:1] == "<")
+        nodes.append(_bare(tok, in_group and not lead))
     return ("seq", nodes)
 
 

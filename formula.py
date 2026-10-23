@@ -8149,8 +8149,8 @@ class FormulaEngine:
                         tags: Any = None, target: Any = None,
                         attacker: Any = None, defender: Any = None,
                         other: Any = None) -> float:
-            """apply_mods(entity, stat, base, tags=None, target=, attacker=,
-            defender=, other=): the effective value of `base` after the
+            """apply_mods(entity, stat, base, tags=None, target=None,
+            attacker=None, defender=None, other=None): the effective value of `base` after the
             entity's modifiers for `stat` + `tags` (the HD-style derived
             stat). Modifiers come live from statuses / a direct
             `entity.modifiers` slot / scanned containers (e.g. equipped);
@@ -8176,8 +8176,8 @@ class FormulaEngine:
         def _list_mods(entity_token: Any, stat: Any, tags: Any = None,
                        target: Any = None, attacker: Any = None,
                        defender: Any = None, other: Any = None) -> list:
-            """list_mods(entity, stat, tags=None, target=, attacker=,
-            defender=, other=): the active modifier records for stat+tags
+            """list_mods(entity, stat, tags=None, target=None, attacker=None,
+            defender=None, other=None): the active modifier records for stat+tags
             (same filtering as apply_mods), for introspection / breakdowns.
             Mostly useful at the command layer or via len() ('is any X
             modifier active?')."""
@@ -9073,7 +9073,8 @@ class FormulaEngine:
                           sides: Any = 4, corner_arc: Any = None,
                           hitbox: Any = None) -> str:
             """hit_location(target, from_x, from_y, aim=None, aim_weight=None,
-            aim_bonus=None, mode=None, sides=4, corner_arc=None): roll WHICH
+            aim_bonus=None, mode=None, sides=4, corner_arc=None,
+            hitbox=None): roll WHICH
             body part of `target` a hit coming FROM (from_x, from_y) lands
             on, returning the part id. Modes (default hit_location_mode rule):
             `weighted` uses each part's hit_weights.<side> (side from
@@ -9809,6 +9810,31 @@ _PARAM_SHOWN = re.compile(r"_(t|token)$")
 _FUNCTION_REFERENCE: Optional[Dict[str, Dict[str, Any]]] = None
 
 
+def _doc_call_forms(name: str, doc: str) -> Optional[str]:
+    """The call forms a docstring opens with, up to the `:` after them
+    (`f(a) / f(a, b)`, `max(a, b, ...) or max(list)`), or None when it
+    doesn't open with `name(...)` followed by `:`."""
+    flat = " ".join(doc.split())
+    i, forms = 0, []
+    while flat.startswith(name + "(", i):
+        depth, j = 0, i
+        for j in range(i, len(flat)):
+            depth += {"(": 1, ")": -1}.get(flat[j], 0)
+            if depth == 0 and flat[j] == ")":
+                break
+        else:
+            return None
+        forms.append(flat[i:j + 1])
+        rest = flat[j + 1:]
+        if rest.startswith(":"):
+            return flat[:j + 1]
+        sep = next((x for x in (" / ", " or ") if rest.startswith(x)), None)
+        if sep is None:
+            return None
+        i = j + 1 + len(sep)
+    return None
+
+
 def function_reference() -> Dict[str, Dict[str, Any]]:
     """name -> {signature, doc, kind ('reads' / 'changes' / 'pure'),
     loopable, in_args} for every built-in formula function."""
@@ -9844,11 +9870,15 @@ def function_reference() -> Dict[str, Dict[str, Any]]:
             sig = f"{name}({', '.join(shown)})"
         except (TypeError, ValueError):
             sig = f"{name}(...)"
-        if doc.startswith(name + "(") and name not in _BUILTIN_DOCS:
-            sig = doc.split(":", 1)[0] if ":" in doc.split("\n")[0] else sig
-            if name in _MAP_ARG_FUNCS and "map" not in sig \
-                    and sig.endswith(")"):
-                sig = sig[:-1] + ", map=None)"
+        # The call form(s) a docstring opens with (wrapped over lines or
+        # not: `nearest_cell(eid, x, y) / nearest_cell(eid, coord)`) name
+        # the parameters better than the code does.
+        head = _doc_call_forms(name, doc)
+        if head is not None:
+            sig = head
+            if name in _MAP_ARG_FUNCS and "map" not in sig:
+                sig = sig[:-1] + (", map=None)" if not sig.endswith("()")
+                                  else "map=None)")
         out[name] = {
             "signature": sig, "doc": " ".join(doc.split()),
             "kind": ("changes" if name in ARG_MUTATING_MATCH_FUNCS

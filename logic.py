@@ -64,7 +64,7 @@ def record_trace(kind: str, who: str, path: str, old: Any = None,
     """Append one `!eval --trace` entry (kind read / write / delete) when a
     trace is running; at most 1000 per eval."""
     trace = VAR_TRACE.get()
-    if trace is not None and len(trace) <= 1000:
+    if trace is not None and len(trace) < 1000:
         trace.append({"kind": kind, "who": who, "path": path,
                       "old": copy.deepcopy(old), "new": copy.deepcopy(new),
                       "clamped_from": copy.deepcopy(clamped_from),
@@ -1724,6 +1724,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "30 makes a square's corners narrower targets than its flat "
             "faces. Per-call override: pass corner_arc= to any directional "
             "primitive. 4-way mode ignores this (faces are always 90°)."
+        ),
+    },
+    "status_hook_recursion_limit": {
+        "default": 32,
+        "schema": {"type": "int", "min": 1, "max": 64, "ceiling": True},
+        "desc": (
+            "Max nesting depth of status hooks (on_status_added / _removed / "
+            "_changed passives and a status definition's own `!status hook`s). "
+            "A hook that changes a status fires hooks again, so one that "
+            "changes its own status would loop; beyond the limit the rest of "
+            "the chain fires no status hooks (a single warning is logged), "
+            "while the status changes themselves still happen. Mirrors "
+            "var_hook_recursion_limit."
         ),
     },
     "event_recursion_limit": {
@@ -3736,7 +3749,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "the reply of the command that passed the turn. Placeholders: "
             "{text}, {by} (who set it), {turns} (the turns it waited). A "
             "secret reminder's line starts with `🔒 (hosts)` and shows in "
-            "a host's reply. Empty = the text alone."
+            "a host's reply in a channel without a team POV. Empty = the text alone."
         ),
     },
     "turn_start_hidden_message_format": {
@@ -8322,6 +8335,10 @@ class Match:
     # False when the chain unwinds (depth back to 0). Prevents the warning
     # from being spammed at every event past the threshold.
     _var_event_warned: bool = field(default=False, repr=False)
+    # The same guard for status hooks (fire_status_event: the on_status_*
+    # passives and a definition's own hooks), status_hook_recursion_limit.
+    _status_event_depth: int = field(default=0, repr=False)
+    _status_event_warned: bool = field(default=False, repr=False)
     # Buffer of warning log lines accumulated during a var-event chain.
     # The chain can fire nested writes whose warnings emerge deep in the
     # call stack — they need to bubble up to the top-level caller for
@@ -13680,9 +13697,11 @@ class Match:
     def reminder_line(self, r: Dict[str, Any]) -> str:
         """A reminder's line (reminder_message_format; a secret one marked)."""
         fmt = str(self.rules.get("reminder_message_format", "") or "")
-        text = fmt.replace("{text}", str(r.get("text", ""))).replace(
-            "{by}", str(r.get("by") or "")).replace(
-            "{turns}", str(r.get("turns", ""))) if fmt else str(r.get("text"))
+        # One pass: a reminder's own text may hold `{by}` / `{turns}`.
+        values = {"text": str(r.get("text", "")), "by": str(r.get("by") or ""),
+                  "turns": str(r.get("turns", ""))}
+        text = re.sub(r"\{(text|by|turns)\}", lambda mt: values[mt.group(1)],
+                      fmt) if fmt else values["text"]
         return ("🔒 (hosts) " + text) if r.get("secret") else text
 
     def _fire_reminders(self) -> None:
@@ -15221,6 +15240,36 @@ class Match:
         return log
 
     def fire_status_event(
+        self, when: str, entity_id: str, status_name: str,
+        *, old_value: Optional[Dict[str, Any]] = None,
+        new_value: Optional[Dict[str, Any]] = None,
+        removed_by: Optional[str] = None,
+    ) -> List[str]:
+        """_fire_status_event under the status_hook_recursion_limit rule: a
+        hook that changes a status fires hooks again, so a chain past the
+        limit fires nothing more (one ⚠️ per chain; the changes still
+        happen)."""
+        limit = int(self.rules.get("status_hook_recursion_limit", 32))
+        if self._status_event_depth >= limit:
+            if self._status_event_warned:
+                return []
+            self._status_event_warned = True
+            return [f"⚠️ status hook recursion limit ({limit}) reached on "
+                    f"`{when}` for `{entity_id}.{status_name}`; the rest of "
+                    f"this chain fires no status hooks. Check for a loop in "
+                    f"your status hooks / passives "
+                    f"(status_hook_recursion_limit)."]
+        self._status_event_depth += 1
+        try:
+            return self._fire_status_event(
+                when, entity_id, status_name, old_value=old_value,
+                new_value=new_value, removed_by=removed_by)
+        finally:
+            self._status_event_depth -= 1
+            if self._status_event_depth == 0:
+                self._status_event_warned = False
+
+    def _fire_status_event(
         self, when: str, entity_id: str, status_name: str,
         *, old_value: Optional[Dict[str, Any]] = None,
         new_value: Optional[Dict[str, Any]] = None,
@@ -20364,8 +20413,13 @@ class Match:
                 or self.turns_elapsed <= 0:
             return None
         e = self.entities.get(self.current_entity_id() or "")
-        if e is None or not getattr(e, "is_alive", True) \
-                or not self.entity_visible_to(e.id, pov_team):
+
+        def shown(u: "Entity") -> bool:
+            # As the turn line (`_pov_hides`): a team always sees its own
+            # units, a hidden rider of its own too.
+            return (pov_team is None or self.own_team_unit(u, pov_team)
+                    or self.entity_visible_to(u.id, pov_team))
+        if e is None or not getattr(e, "is_alive", True) or not shown(e):
             return None
         seen: "set[str]" = set()
         while e.id not in seen:
@@ -20380,7 +20434,7 @@ class Match:
             if nxt is None:
                 return None
             e = nxt
-        if e.map != mp.name or not self.entity_visible_to(e.id, pov_team):
+        if e.map != mp.name or not shown(e):
             return None
         return e.id
 

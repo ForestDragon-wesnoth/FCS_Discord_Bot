@@ -1598,6 +1598,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # The command journal records the match from outside its state.
         "journal",
         "_var_event_depth", "_var_event_warned", "_var_event_warnings",
+        "_status_event_depth", "_status_event_warned",
         "_action_depth", "_runtime_buffer",
         # The mid-body choice queue + cursor must survive an action's
         # rollback-and-retry (the whole point of replay).

@@ -312,7 +312,10 @@ The dispatcher refuses positional words past the end of a command's usage
 string (`_stray_words_error`): `!ent remove a b` used to remove only `a`. Usage
 grammar: `<x>` one word, `[...]` optional, `|` alternatives (an alternative LED
 by a literal word applies only when that word is typed), `...` / `<x ...>` any
-number more, `key=<v>` / `[key=value ...]` options (left to the handler). A
+number more, `key=<v>` / `[key=value ...]` options (left to the handler). Inside a
+`<a ... | b ...>` group, an alternative's first word followed by `<...>` is
+its literal action (Tab completion reads `when` in `!system status <... |
+when <system> ...>` as the word, though `when` also names a slot). A
 wrong usage string refuses a valid command; the regression catches most.
 
 ### Commit messages: dense, factual, no fluff
@@ -1254,9 +1257,10 @@ hardcodes**.
   (`_fire_reminders`). A public one's line (`reminder_message_format`)
   goes out through `surface_log` with the turn output; a secret one waits
   in `held_reminders` and ends the reply of the next command a host runs
-  on the match (`CommandRegistry._run`, after the handler, inside that
-  command's undo step; `!as` doesn't count). Players' `!remind list` shows
-  the public ones only (893).
+  on the match in a channel without a team POV (a POV-bound channel is
+  one players read; `CommandRegistry._run`, after the handler, inside that
+  command's undo step; `!as` doesn't count). `!remind list` shows the
+  secret ones only to a host in such a channel (893, 903).
 
 ### 7.4 Statuses
 
@@ -1275,7 +1279,10 @@ hardcodes**.
   (a counter reached 0, or the status's own tick removed it:
   `logic.STATUS_TICKING`) or `removed`; `_emit_status_diff(removed_by=)`
   carries a caller's cause (884). The formula status functions surface
-  the hook output they set off.
+  the hook output they set off. A hook that changes a status fires hooks
+  again: `fire_status_event` counts the nesting (`_status_event_depth`)
+  and past `status_hook_recursion_limit` (32) the rest of the chain fires
+  no status hooks, with one ⚠️ (900).
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
   from the definition's `stack`, else `status_default_stack` (refresh /
   add_level / extend / replace / none). `max_level` is a hard ceiling on
@@ -2073,7 +2080,9 @@ hardcodes**.
 - **Acting unit** (`active_unit_highlight`, default OFF (user call), once
   a turn has started): `Match.active_display_unit` picks the unit drawn for
   the actor (its body for a glued part or a region part without a glyph,
-  its vehicle for a hidden rider; none when the view can't see it). ASCII
+  its vehicle for a hidden rider; none when the view can't see it, where a
+  team sees its own units, hidden riders included, as the turn line does,
+  902). ASCII
   makes its shown cells bold (`1;` in the ANSI run code) or, without
   colour, adds `active_unit_line_format` under the map; the scene marks its
   placements `active` and `SceneRenderer` outlines them while
@@ -2310,12 +2319,13 @@ hardcodes**.
   entry whose state hash differs; the rebuilt match takes the recording as
   its journal (`_REPLAYING`) (778-780).
 - **Formula reference:** `formula.function_reference()` (built once from a
-  throwaway match's namespace) gives every function's signature, docstring
-  and kind (reads / changes the match, pure; loopable; allowed in `$()`).
+  throwaway match's namespace) gives every function's signature (the call
+  forms its docstring opens with, `_doc_call_forms`, else the code's
+  parameters), docstring and kind (reads / changes the match, pure; loopable; allowed in `$()`).
   `!help function <name>` shows one (a close-name suggestion when unknown;
   a match `!func` shows its parameters and body), `!help functions
   [reads|changes|pure|loopable]` lists them, `!help find` searches them, and
-  Tab completes the names (`function` slot) (889).
+  Tab completes the names (`function` slot) (889, 901).
 - **Crash log** (`logic.CrashLog`, `Workspaces.crashes`, bot-wide, saved in
   `data/errors.json` by `Storage.attach_crash_log`; memory only with match
   persistence off): an exception a command handler didn't expect, a passive,
