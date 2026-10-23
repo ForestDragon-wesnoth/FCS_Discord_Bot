@@ -393,6 +393,9 @@ back, load the schema with `ToolSearch` before calling
   match and nested maps (step 1 and 2a-2d built; §8).
 - **`docs/zones_prefabs_design.md`**: the agreed design for zone
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
+- **`docs/tags_design.md`**: the agreed design for widening tags (#260):
+  one filter rule, unit / corpse / container / team / map / library tags,
+  the vocabulary (PR 1 built, §7.20).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature. When a feature ships in full (everything its
@@ -1431,7 +1434,12 @@ hardcodes**.
   returns False) worded by `action_forbidden_message_format` /
   `action_immune_message_format`; an entity_list target drops its immune
   units with a ⚠️ naming each, refused only when none is left. Corpse
-  targets aren't checked (§8).
+  targets aren't checked for immunity (§8). Then the action's
+  `target_requires_tags` / `target_refuses_tags` filters (§7.20) against
+  the target's tags, a corpse's included (reason `target_tags`,
+  `action_target_tags_message_format`, list targets drop the misfits the
+  same way; a filter that doesn't parse refuses every target and `!action
+  info` names it).
 - **Choices:** `choose(prompt, options)` / `choose_number(prompt, lo, hi)`
   replay the body: on an unanswered choice the attempt rolls back and re-runs
   with answers replayed in order (`answer=` tokens, else the surface's
@@ -2622,6 +2630,43 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
   previews a stamp. Formulas: `stamp_prefab(name, x, y, map=, mode=,
   rotate=, flip=, team=, confirm=False)` (mutating, returns the new
   top-level ids), `prefab_names()` (loopable), `prefab_size(name)`.
+
+### 7.20 Tags
+
+The design is `docs/tags_design.md` (PR 1 of 3 built: §1 matcher, §2,
+§3) (919-921).
+- **Filters** (`logic.check_tag_filter`, `tag_filter_matches`): a list
+  (or comma / space text) means ANY of its tags; text holding `and` /
+  `or` / `not` or a parenthesis is an expression (`not` > `and` > `or`,
+  parsed once and cached, `_parse_tag_expression`). `check_tag` refuses
+  those three words and parentheses as tags. Pure `tags_match(tags,
+  filter)`. Zones, tiles, statuses, modifiers and shields still use their
+  old matching until PR 2.
+- **Unit tags** (`Match.unit_tag_sources` / `unit_tags`, `(tag, source)`
+  each once): own (the var named by `tags_var`, a VAR_NAME_RULES entry,
+  stored as a checked list), then `grants_unit_tags` of the unit's
+  statuses (`status_field`: an instance key replaces the definition's),
+  of containers under the `unit_tag_sources` roots (default `equipped`,
+  per-unit `__unit_tag_sources` / `_add`), of its team's data, then a
+  part's root's own and granted tags, then the ENGINE tags derived live
+  (`logic.ENGINE_TAGS`: part, segment, rider, vehicle, map_carrier;
+  `corpse` on corpses). Writes refuse engine tags and malformed words in
+  the tags var and every `grants_unit_tags` (`checked_tag_vars` in
+  write_var / checked_unit_vars, `team_set`, `!status grants_unit_tags`);
+  reads skip what isn't usable (`_read_tags`). A disguise's `vars` can
+  present decoy tags (`unit_tags(e, pov_team)`, read by `!find`).
+  Corpses: `corpse_tag_sources` from the snapshot plus `corpse`.
+- **Reads:** `unit_tags`, `unit_has_tag(eid, filter)`,
+  `units_with_tag(filter, map=None)` (alive units, parts included),
+  `corpse_tags`; `tag=` on the unit searches (`formula._TAG_ARG_FUNCS`,
+  wrapped by `_with_tag`; `nearest_entity` filters before choosing);
+  `!find` / `!foreach` `tag:<filter>` (an expression quoted); roster
+  placeholders `{tags}` / `{tags_sourced}` (the default
+  entity_info_format lists the sources).
+- **Statuses:** `cannot_affect_units_with_tag` (a filter; `!status
+  cannot_affect_units_with_tag`): `apply_status` refuses a unit whose tags
+  match (`status_tag_block`, named by `status_apply_block_reason`); a
+  forced application ignores it, like immunity.
 
 ---
 

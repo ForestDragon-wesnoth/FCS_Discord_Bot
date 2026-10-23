@@ -1968,14 +1968,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "{map_shown}{/?} facing {facing}"
             "{?team?}   Team: {team}{/?}\\n"
             "{?statuses?}Status: {statuses}\\n{/?}"
+            "{?tags?}Tags: {tags_sourced}\\n{/?}"
             "{?passives_csv?}Passives: {passives_csv}\\n{/?}"
             "{?inventory?}Inventory: {inventory}\\n{/?}"
         ),
         "schema": {"type": "str"},
         "desc": (
             "Multi-line template for the !ent info card. Same syntax as "
-            "entity_line_format. Use \\n for newlines. For complete raw info "
-            "regardless of template, use !ent dump."
+            "entity_line_format. Use \\n for newlines. `{tags}` lists the "
+            "unit's tags, `{tags_sourced}` the same with where each came from "
+            "(a status, a container path, its team, its root, `engine`). For "
+            "complete raw info regardless of template, use !ent dump."
         ),
     },
     ## Var-hook system rules
@@ -5558,6 +5561,9 @@ ENGINE_TAGS = ("corpse", "part", "segment", "rider", "vehicle", "map_carrier")
 # The key, in a status definition / instance, a var container or team data,
 # whose tags the unit holding it carries.
 GRANTS_UNIT_TAGS = "grants_unit_tags"
+# The status definition field: a tag filter; the status can't be applied to
+# a unit whose tags match it (fear on `mindless`).
+STATUS_UNIT_TAG_BLOCK = "cannot_affect_units_with_tag"
 _TAG_TOKEN_RE = re.compile(r"\(|\)|[^\s()]+")
 
 
@@ -11727,6 +11733,14 @@ class Match:
         check_store_path(path, "team path")
         check_no_value_ancestor(self.team_data.get(str(team), {}), path,
                                 f"team `{team}`")
+        # The tags every member carries (`grants_unit_tags` at the top of
+        # the team's data): a checked tag list, nothing under it.
+        seg0 = str(path).split(".", 1)[0]
+        if seg0 == GRANTS_UNIT_TAGS:
+            if "." in str(path):
+                raise VTTError(f"team `{team}`: `{GRANTS_UNIT_TAGS}` is a "
+                               f"list of tags; nothing nests under it.")
+            value = checked_tag_list(value, f"team `{team}` {path}")
         cur = self.team_data.setdefault(str(team), {})
         segs = str(path).split(".")
         for seg in segs[:-1]:
@@ -15423,11 +15437,20 @@ class Match:
                         self._read_tags(tdata.get(GRANTS_UNIT_TAGS))]
         return out
 
-    def unit_tag_sources(self, e: "Entity") -> List[Tuple[str, str]]:
+    def unit_tag_sources(self, e: "Entity", pov_team: Optional[str] = None
+                         ) -> List[Tuple[str, str]]:
         """(tag, source) for each of `e`'s tags, each tag once (its first
         source): own, granted (statuses, containers, team), a part's root's
-        own and granted tags, then the engine tags."""
-        pairs = self._own_and_granted_tags(e.vars, e.status, e.team)
+        own and granted tags, then the engine tags. With `pov_team`, the
+        vars a disguise presents to that team stand in for the real ones
+        (its `vars` can carry decoy tags), as `!find` reads them."""
+        vars_ = self.presented_vars(e, pov_team) if pov_team is not None \
+            else e.vars
+        team = e.team
+        if vars_ is not e.vars:
+            t = team_text(vars_.get(str(self.rules.get("team_var", "team"))))
+            team = t if t not in (None, "") else None
+        pairs = self._own_and_granted_tags(vars_, e.status, team)
         if e.part_of:
             root = self.body_root(e)
             if root is not e:
@@ -15445,14 +15468,17 @@ class Match:
             seen.setdefault(t, src)
         return list(seen.items())
 
-    def unit_tags(self, e: "Entity") -> List[str]:
+    def unit_tags(self, e: "Entity", pov_team: Optional[str] = None
+                  ) -> List[str]:
         """`e`'s tags (unit_tag_sources without the sources)."""
-        return [t for t, _s in self.unit_tag_sources(e)]
+        return [t for t, _s in self.unit_tag_sources(e, pov_team)]
 
     def corpse_tag_sources(self, corpse: Dict[str, Any]
                            ) -> List[Tuple[str, str]]:
         """(tag, source) for a corpse: what its snapshot's own tags var,
         statuses and containers give, its team's grants, then `corpse`."""
+        if isinstance(corpse.get("entity"), dict):
+            corpse = corpse["entity"]
         vars_ = corpse.get("vars") if isinstance(corpse.get("vars"), dict) \
             else {}
         team = team_text(vars_.get(str(self.rules.get("team_var", "team"))))
@@ -15755,6 +15781,27 @@ class Match:
             return level_given
         return False  # refresh / extend / none — no level applied
 
+    def status_tag_block(self, e: "Entity", name: str) -> Optional[str]:
+        """Why status `name` can't affect `e` by its tags (the definition's
+        cannot_affect_units_with_tag filter matches them; a filter that
+        doesn't parse blocks and names the error), or None. Skipped by a
+        forced application, like immunity."""
+        sdef = self.status_definitions.get(name)
+        filt = sdef.get(STATUS_UNIT_TAG_BLOCK) if isinstance(sdef, dict) \
+            else None
+        if filt is None or tag_filter_empty(filt):
+            return None
+        tags = self.unit_tags(e)
+        try:
+            if not tag_filter_matches(tags, filt):
+                return None
+        except VTTError as ex:
+            return (f"`{name}`'s {STATUS_UNIT_TAG_BLOCK} doesn't parse: {ex}")
+        shown = (", ".join(f"`{t}`" for t in filt) if isinstance(filt, list)
+                 else f"`{filt}`")
+        return (f"`{name}` can't affect units with tags {shown} "
+                f"(`{e.id}`: {', '.join(tags)})")
+
     def status_apply_block_reason(self, eid: str, name: str,
                                   level: Optional[int] = None) -> Optional[str]:
         """A human reason the status would NOT apply to `eid` (immunity,
@@ -15766,6 +15813,9 @@ class Match:
         immune, reduction = self.status_resistance(eid, name)
         if immune:
             return f"immune to `{name}`"
+        tag_block = self.status_tag_block(e, name)
+        if tag_block:
+            return tag_block
         sdef = self.status_definitions.get(name) or {}
         blockers = self._statuses_matching_tokens(
             e, self._token_list(sdef.get("blocked_by")))
@@ -15832,7 +15882,7 @@ class Match:
         # fully resisted (no-op).
         if not force:
             immune, reduction = self.status_resistance(eid, name)
-            if immune:
+            if immune or self.status_tag_block(e, name):
                 return []
             if reduction and self._resistance_applies(
                     e, name, sdef, new_level is not None):

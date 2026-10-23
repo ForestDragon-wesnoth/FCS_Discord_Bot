@@ -1,7 +1,8 @@
 # Tags: design
 
 The agreed design for widening the tag system (#260), settled with the user
-before any code. Action tags (#234) shipped first; this extends tags to
+before any code. Status: PR 1 built (§1's matcher, §2, §3; CLAUDE.md
+§7.20); PR 2 and PR 3 to come. Action tags (#234) shipped first; this extends tags to
 units, corpses, var containers (items), teams, maps and the template /
 prefab libraries, makes every tag field match the same way, and adds an
 optional vocabulary. Ask before deviating from it.
@@ -55,7 +56,8 @@ optional vocabulary. Ask before deviating from it.
   - its body root: a part has its root's tags (all of them, granted ones
     included).
 - **Engine tags**, reserved: `corpse`, `part`, `segment`, `rider`,
-  `vehicle`, `map_carrier`. Derived live from the state the engine
+  `vehicle`, `map_carrier`. A part takes its root's own and granted tags,
+  not the root's engine tags (it has its own: `part`). Derived live from the state the engine
   tracks (a unit stops being `rider` when it dismounts); no tags var,
   grant or vocabulary entry can hold one (refused at the write).
 - **A unit's tags** (`Match.unit_tags`): own, then granted (statuses,
