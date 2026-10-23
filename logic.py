@@ -972,8 +972,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "independent absorb layers coexist. A pool is a dict {amount, "
             "priority?, tags?, not_tags?} or a bare number (= amount). "
             "absorb_damage drains matching pools HIGHEST priority first (ties "
-            "by name); a pool with `tags`/`not_tags` only absorbs hits whose "
-            "tags match (a typed ward), an untagged pool absorbs anything; a "
+            "by name); a pool with `tags` (a tag filter: a list = any of "
+            "them, or an expression such as `fire and magic`) only absorbs "
+            "hits whose tags match it and none of its `not_tags` (a typed "
+            "ward), an untagged pool absorbs anything; a "
             "pool emptied to 0 is removed. Pools are plain vars — set/refresh "
             "them with `!ent set_var` (decay is GM-composed via a status tick "
             "or round hook), per 'what X does is stored in X'. Per-entity "
@@ -9076,8 +9078,10 @@ class Match:
         return normalize_tags(list((self.zone_def_dict(z) or {}).get("tags")
                                    or []) + list(z.get("tags") or []))
 
-    def zone_has_tag(self, name: str, tag: str) -> bool:
-        return tag in self.zone_tags(name)
+    def zone_has_tag(self, name: str, tag: Any) -> bool:
+        """Whether zone `name`'s tags match the tag filter `tag` (a tag, a
+        list = any of them, or an expression)."""
+        return tag_filter_matches(self.zone_tags(name), tag)
 
     def zone_def_name(self, name: str) -> Optional[str]:
         """The definition zone `name` names (an orphan's too), or None."""
@@ -9087,8 +9091,8 @@ class Match:
 
     def zones_matching(self, names: Any, tag: Optional[str] = None,
                        definition: Optional[str] = None) -> List[str]:
-        """`names` (zone names) kept in order when they carry `tag` and name
-        `definition` (None = any)."""
+        """`names` (zone names) kept in order when their tags match the
+        tag filter `tag` and they name `definition` (None = any)."""
         out = []
         for n in names:
             if tag is not None and not self.zone_has_tag(n, tag):
@@ -11424,6 +11428,30 @@ class Match:
             return {str(t) for t in raw}
         return set()
 
+    @staticmethod
+    def _record_tags_ok(raw: Any, tags: "set[str]",
+                        strict: bool = False) -> bool:
+        """Whether a modifier record's or shield pool's `tags` filter lets
+        a query carrying `tags` through: none = always; a list = any of
+        them; an expression. A filter that doesn't parse lets nothing
+        through (with `strict`, raises the VTTError naming why)."""
+        if tag_filter_empty(raw):
+            return True
+        try:
+            return tag_filter_matches(tags, raw)
+        except VTTError:
+            if strict:
+                raise
+            return False
+
+    @staticmethod
+    def _record_tags_shown(raw: Any) -> Any:
+        """A record's tags filter as `!mod show` / list_mods show it: the
+        sorted list, or an expression's text."""
+        if isinstance(raw, str) and _is_tag_expression(raw):
+            return raw.strip()
+        return sorted(normalize_tags(raw))
+
     def _walk_modifier_bundles(self, node: Any, base: str,
                                out: List[Tuple[dict, str]]) -> None:
         """Collect every `modifiers` bundle found anywhere under `node`
@@ -11482,15 +11510,17 @@ class Match:
                          context: Optional[Dict[str, Any]] = None,
                          problems: Optional[List[str]] = None) -> List[dict]:
         """The active modifier records on `eid` for `stat` + `tags`:
-        filtered by stat name, tag subset (required ⊆ query) and negative
-        tags (excluded ∩ query empty) and condition, with value formulas
+        filtered by stat name, the record's `tags` filter against the query
+        tags (a list = any of them, or an expression: `fire and magic`; a
+        record without tags always applies), negative tags (excluded ∩
+        query empty) and condition, with value formulas
         resolved to numbers and each record tagged with its `source`. The
         introspection half of the system (list_mods) and the input to
         apply_modifiers' fold.
 
         Tag-granting: a record's `grants_tags` adds tags to the query in a
         single pre-pass (the granting record must itself pass stat +
-        required tags vs the ORIGINAL query + not_tags + condition); the
+        its tags filter vs the ORIGINAL query + not_tags + condition); the
         main filter then runs against the expanded tag set. Single-pass —
         a granted tag can activate other modifiers but not chain-grant.
 
@@ -11535,9 +11565,9 @@ class Match:
                 continue
             if str(m.get("stat", "")) != str(stat):
                 continue
-            req = self._modifier_tagset(m.get("tags"))
             notg = self._modifier_tagset(m.get("not_tags"))
-            if not (req <= tagset) or (notg & tagset):
+            if not self._record_tags_ok(m.get("tags"), tagset) \
+                    or (notg & tagset):
                 continue
             if not _cond_ok(m, src):
                 continue
@@ -11549,8 +11579,12 @@ class Match:
         for m, src in records:
             if str(m.get("stat", "")) != str(stat):
                 continue
-            req = self._modifier_tagset(m.get("tags"))
-            if not req <= eff_tags:
+            try:
+                if not self._record_tags_ok(m.get("tags"), eff_tags,
+                                            strict=True):
+                    continue
+            except VTTError as ex:
+                _note(src, f"tags don't parse ({ex})")
                 continue
             notg = self._modifier_tagset(m.get("not_tags"))
             if notg & eff_tags:
@@ -11585,7 +11619,7 @@ class Match:
                 "op": str(m.get("op", "add")),
                 "value": val,
                 "priority": pri,
-                "tags": sorted(req),
+                "tags": self._record_tags_shown(m.get("tags")),
                 "not_tags": sorted(notg),
                 "source": src,
             })
@@ -15360,7 +15394,14 @@ class Match:
         if not token:
             return False
         if token.startswith("tag:"):
-            return token[4:].strip() in self.status_def_tags(status_name)
+            # A tag filter: `tag:fire`, or an expression in parentheses
+            # (`tag:(fire and magic)`, so a token list's commas stay
+            # separators). One that doesn't parse matches nothing.
+            try:
+                return tag_filter_matches(self.status_def_tags(status_name),
+                                          token[4:].strip())
+            except VTTError:
+                return False
         return token == status_name
 
     @staticmethod
@@ -15550,13 +15591,21 @@ class Match:
                 continue
             for sname, inst in list(e.status.items()):
                 for fld in fields:
-                    words = normalize_tags(self.status_field(inst, sname, fld))
-                    if not words:
-                        continue
+                    raw = self.status_field(inst, sname, fld)
                     if fld.endswith("_tag"):
-                        matched = [t for t in action_tags if t in words]
+                        if isinstance(raw, str) and _is_tag_expression(raw):
+                            # An expression: the whole of it is what matched.
+                            try:
+                                hit = tag_filter_matches(action_tags, raw)
+                            except VTTError:
+                                hit = False
+                            matched = [raw.strip()] if hit else []
+                        else:
+                            words = normalize_tags(raw)
+                            matched = [t for t in action_tags if t in words]
                     else:
-                        matched = ([action_name] if fold(action_name)
+                        words = normalize_tags(raw)
+                        matched = ([action_name] if words and fold(action_name)
                                    in {fold(w) for w in words} else [])
                     if not matched:
                         continue

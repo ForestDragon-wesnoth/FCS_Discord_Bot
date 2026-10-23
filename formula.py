@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches
 
 
 class FormulaError(VTTError):
@@ -5837,27 +5837,30 @@ class FormulaEngine:
             return list(match.status_def_tags(name))
 
         def _status_has_tag(eid_t: Any, name: Any, tag: Any) -> bool:
-            """status_has_tag(eid, name, tag): True iff `eid` has status
-            `name` and its definition carries `tag`."""
+            """status_has_tag(eid, name, filter): True iff `eid` has status
+            `name` and its definition's tags match the tag filter (a tag, a
+            list = any of them, or an expression)."""
             eid = _eid(eid_t)
-            if not isinstance(name, str) or not isinstance(tag, str):
-                raise FormulaError("status_has_tag(eid, name, tag): name and tag must be strings.")
+            if not isinstance(name, str):
+                raise FormulaError("status_has_tag(eid, name, tag): name must be a string.")
+            f = _tag_filter_arg(tag, "status_has_tag")
             e = match.entities.get(eid)
             if e is None:
                 raise FormulaError(f"unknown entity id '{eid}'.")
-            return name in e.status and tag in match.status_def_tags(name)
+            return name in e.status and tag_filter_matches(
+                match.status_def_tags(name), f)
 
         def _statuses_with_tag(eid_t: Any, tag: Any) -> list:
-            """statuses_with_tag(eid, tag): names of statuses on `eid` whose
-            definition carries `tag` (loopable, sorted) — e.g. loop it to
-            clear every 'debuff'-tagged status."""
+            """statuses_with_tag(eid, filter): names of statuses on `eid`
+            whose definition's tags match the tag filter (loopable, sorted)
+            — e.g. loop it to clear every 'debuff'-tagged status."""
             eid = _eid(eid_t)
-            if not isinstance(tag, str):
-                raise FormulaError("statuses_with_tag(eid, tag): tag must be a string.")
+            f = _tag_filter_arg(tag, "statuses_with_tag")
             e = match.entities.get(eid)
             if e is None:
                 raise FormulaError(f"unknown entity id '{eid}'.")
-            return sorted(s for s in e.status if tag in match.status_def_tags(s))
+            return sorted(s for s in e.status
+                          if tag_filter_matches(match.status_def_tags(s), f))
 
         def _status_resist_of(eid_t: Any, name: Any) -> int:
             """status_resist_of(eid, name): the aggregated level-reduction
@@ -7772,10 +7775,12 @@ class FormulaEngine:
                          fname: str) -> list:
             """`names` kept when they carry `tag` and are of zone definition
             `definition` (None = any), the tag= / definition= filters."""
-            for what, v in (("tag", tag), ("definition", definition)):
-                if v is not None and (not isinstance(v, str) or not v):
-                    raise FormulaError(f"{fname}(...): {what}= takes a "
-                                       f"name, got {v!r}.")
+            if definition is not None and (not isinstance(definition, str)
+                                           or not definition):
+                raise FormulaError(f"{fname}(...): definition= takes a "
+                                   f"name, got {definition!r}.")
+            if tag is not None:
+                tag = _tag_filter_arg(tag, fname)
             return match.zones_matching(names, tag, definition)
 
         def _zones_at(x: Any, y: Any, tag: Any = None,
@@ -7828,19 +7833,17 @@ class FormulaEngine:
             return match.zone_tags(_zone_name(name, "zone_tags"))
 
         def _zone_has_tag(name: Any, tag: Any) -> bool:
-            """zone_has_tag(zone, tag): True iff the zone carries the tag
-            (its own or its zone definition's); False for a missing zone."""
-            if not isinstance(tag, str) or not tag:
-                raise FormulaError("zone_has_tag(zone, tag): tag must be a "
-                                   "non-empty string.")
-            return match.zone_has_tag(_zone_name(name, "zone_has_tag"), tag)
+            """zone_has_tag(zone, filter): True iff the zone's tags (its own
+            and its zone definition's) match the tag filter (a tag, a list =
+            any of them, or an expression); False for a missing zone."""
+            f = _tag_filter_arg(tag, "zone_has_tag")
+            return match.zone_has_tag(_zone_name(name, "zone_has_tag"), f)
 
         def _zones_with_tag(tag: Any, map: Any = None) -> list:
-            """zones_with_tag(tag, map=None): the zones carrying the tag
-            (sorted; loopable), on every map, or on the map `map=` names."""
-            if not isinstance(tag, str) or not tag:
-                raise FormulaError("zones_with_tag(tag): tag must be a "
-                                   "non-empty string.")
+            """zones_with_tag(filter, map=None): the zones whose tags match
+            the tag filter (sorted; loopable), on every map, or on the map
+            `map=` names."""
+            tag = _tag_filter_arg(tag, "zones_with_tag")
             names = (match.zone_names() if map is None
                      else sorted(_map_arg(map, "zones_with_tag").zones))
             return match.zones_matching(names, tag)
@@ -7899,24 +7902,20 @@ class FormulaEngine:
             return match.tile_tags(xi, yi, _cur_map())
 
         def _tile_has_tag(x: Any, y: Any, tag: Any) -> bool:
-            """tile_has_tag(x, y, tag): True iff the tile carries the tag
-            (its template's or its own `tags` data)."""
+            """tile_has_tag(x, y, filter): True iff the tile's tags (its
+            template's and its own `tags` data) match the tag filter."""
             xi, yi = _zone_xy(x, y, "tile_has_tag")
-            if not isinstance(tag, str) or not tag:
-                raise FormulaError("tile_has_tag(x, y, tag): tag must be a "
-                                   "non-empty string.")
-            return tag in match.tile_tags(xi, yi, _cur_map())
+            f = _tag_filter_arg(tag, "tile_has_tag")
+            return tag_filter_matches(match.tile_tags(xi, yi, _cur_map()), f)
 
         def _tiles_with_tag(tag: Any) -> list:
-            """tiles_with_tag(tag): the cells whose tile carries the tag, as
-            [x, y] (sorted by row; loopable)."""
-            if not isinstance(tag, str) or not tag:
-                raise FormulaError("tiles_with_tag(tag): tag must be a "
-                                   "non-empty string.")
+            """tiles_with_tag(filter): the cells whose tile's tags match the
+            tag filter, as [x, y] (sorted by row; loopable)."""
+            f = _tag_filter_arg(tag, "tiles_with_tag")
             mp = _cur_map()
             return [[x, y] for (x, y) in sorted(mp.tiles,
                                                 key=lambda c: (c[1], c[0]))
-                    if tag in match.tile_tags(x, y, mp)]
+                    if tag_filter_matches(match.tile_tags(x, y, mp), f)]
 
         def _zone_size(name: Any) -> int:
             """zone_size(name): number of cells in the zone (0 if it
@@ -8434,14 +8433,14 @@ class FormulaEngine:
             return 0.0
 
         def _pool_matches(pool: Any, hit_tags: set) -> bool:
-            # A bare-number / untagged pool absorbs any hit. A pool with
-            # `tags` only absorbs hits carrying all of them; `not_tags`
-            # excludes. Mirrors the modifier tag-match.
+            # A bare-number / untagged pool absorbs any hit. A pool's
+            # `tags` is a tag filter (a list = any of them, or an
+            # expression: `fire and magic`); `not_tags` excludes. Mirrors
+            # the modifier tag-match.
             if not isinstance(pool, dict):
                 return True
-            req = _shield_tags(pool.get("tags"))
             exc = _shield_tags(pool.get("not_tags"))
-            if any(t not in hit_tags for t in req):
+            if not match._record_tags_ok(pool.get("tags"), set(hit_tags)):
                 return False
             if any(t in hit_tags for t in exc):
                 return False

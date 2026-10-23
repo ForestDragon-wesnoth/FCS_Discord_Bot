@@ -10273,7 +10273,7 @@ SCENARIO 399 — Stat modifiers: layered fold + tags + condition via apply_mods
 !ent set_var hero modifiers.fm.stat damage_dealt
 !ent set_var hero modifiers.fm.op inc%
 !ent set_var hero modifiers.fm.value 50
-!ent set_var hero modifiers.fm.tags fire,melee
+!ent set_var hero modifiers.fm.tags "fire and melee"
 !ent set_var hero modifiers.vu.stat damage_dealt
 !ent set_var hero modifiers.vu.op add
 !ent set_var hero modifiers.vu.value 25
@@ -10284,11 +10284,12 @@ SCENARIO 399 — Stat modifiers: layered fold + tags + condition via apply_mods
 !list
 
 Expected: a modifier is a data record (here a dict bundle authored with
-`!ent set_var hero modifiers.<name>.<field>`; tags accept CSV). apply_mods
+`!ent set_var hero modifiers.<name>.<field>`; tags take a tag filter: a
+list means any of them, `fire and melee` needs both). apply_mods
 folds hero's `damage_dealt` modifiers for tags [fire, melee] vs the undead
 goblin: adds (fire +10, vs-undead +25, the latter firing because its
-condition reads `entity[target].undead`) → 40+35 = 75; then inc% (fire+melee
-+50%) → ×1.5 = 112.5 → round 112. Goblin 200 → 88. Against a living target
+condition reads `entity[target].undead`) → 40+35 = 75; then inc% (fire and
+melee +50%) → ×1.5 = 112.5 → round 112. Goblin 200 → 88. Against a living target
 the +25 wouldn't apply.
 
 

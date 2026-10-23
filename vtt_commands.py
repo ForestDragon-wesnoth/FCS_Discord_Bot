@@ -17656,7 +17656,8 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     or k.lower() in opts:
                 raise VTTError("Usage: `!zone list [tag=<tag>] "
                                "[def=<definition>] [map=<map>]`.")
-            opts[k.lower()] = v
+            opts[k.lower()] = check_tag_filter(v) if k.lower() == "tag" \
+                else v
         pov = _view_pov(ctx, m, args)
         names = [n for n in m.zone_names() if m.zone_visible_to(n, pov)]
         names = m.zones_matching(names, opts.get("tag"), opts.get("def"))
@@ -18310,10 +18311,15 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
             if m.status_definitions[name].pop(sub, None) is None:
                 return (f"❌ `{name}` has no {sub} list.")
             return (f"Cleared `{name}` {sub}.")
-        words = [check_tag(w) for w in raw.replace(",", " ").split()]
-        words = list(dict.fromkeys(words))
+        if sub.endswith("_tag"):
+            # A tag filter: a list (any of them) or an expression.
+            words = check_tag_filter(raw)
+        else:
+            words = [check_tag(w) for w in raw.replace(",", " ").split()]
+            words = list(dict.fromkeys(words))
         m.status_definitions[name][sub] = words
-        return (f"`{name}` {sub} = {', '.join(words)}")
+        return (f"`{name}` {sub} = "
+                + (', '.join(words) if isinstance(words, list) else words))
 
     if sub in (GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK):
         # The tags the bearer carries while it has the status, or the tag
