@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text
 
 
 class FormulaError(VTTError):
@@ -2764,8 +2764,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    action_recursion_limit.
     "has_action", "entity_actions", "use_action",
     "action_tags_of", "action_forbidden_by", "immune_to_action",
-    "unit_tags", "units_with_tag", "corpse_tags",
     "unit_tags", "unit_has_tag", "units_with_tag", "corpse_tags",
+    "container_tags", "container_has_tag", "containers_with_tag",
+    "team_tags", "team_has_tag", "map_tags", "map_has_tag", "maps_with_tag",
     # Summon / despawn family. A template is an entity-shaped dict in
     # ordinary storage (vars / tile data); these turn one into a live
     # entity and back. All route through Match.summon_entity (shared
@@ -3045,6 +3046,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'prefab_names', 'prefab_size',
     'action_tags_of', 'action_forbidden_by', 'immune_to_action',
     'unit_tags', 'unit_has_tag', 'units_with_tag', 'corpse_tags',
+    'container_tags', 'container_has_tag', 'containers_with_tag',
+    'team_tags', 'team_has_tag', 'map_tags', 'map_has_tag', 'maps_with_tag',
     'schedules_of', 'schedule_left',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
@@ -3296,6 +3299,9 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entity_actions",
     # An action's tags, and the statuses forbidding / blocking one.
     "action_tags_of", "action_forbidden_by", "immune_to_action",
+    "unit_tags", "units_with_tag", "corpse_tags",
+    "container_tags", "containers_with_tag", "team_tags", "map_tags",
+    "maps_with_tag",
     # Corpse introspection — returns a list of corpse ids, loopable.
     "all_corpses",
     "corpse_status_names",
@@ -6994,6 +7000,108 @@ class FormulaEngine:
                 return []
             return match.corpse_tags(loc[2])
 
+        def _container_tags(eid_t: Any, path: Any) -> list:
+            """container_tags(eid, path): the tags of the var container at
+            `path` on the unit (an item): its own `tags`, then the
+            `inner_tags` of the containers above it (the vars root
+            included), nearest first, minus what an
+            `exclude_inherited_tags` cuts. Loopable."""
+            _id, e = _resolve_entity(eid_t, "container_tags")
+            if not isinstance(path, str) or not path:
+                raise FormulaError("container_tags(eid, path): path must be "
+                                   "a container's dotted var path.")
+            pairs = match.container_tag_sources(e.vars, path)
+            if pairs is None:
+                raise FormulaError(f"container_tags: `{e.id}` has no "
+                                   f"container (a dict) at `{path}`.")
+            return [t for t, _s in pairs]
+
+        def _container_has_tag(eid_t: Any, path: Any, filt: Any) -> bool:
+            """container_has_tag(eid, path, filter): whether the container's
+            tags (container_tags) match the tag filter."""
+            f = _tag_filter_arg(filt, "container_has_tag")
+            return tag_filter_matches(_container_tags(eid_t, path), f)
+
+        def _containers_with_tag(eid_t: Any, filt: Any,
+                                 root: Any = None) -> list:
+            """containers_with_tag(eid, filter, root=None): the dotted paths
+            of the unit's var containers (under `root`, else every one)
+            whose tags match the filter, in the order the vars hold them
+            (an inventory's `metal` items). Action dicts and `__` keys are
+            left out. Loopable."""
+            _id, e = _resolve_entity(eid_t, "containers_with_tag")
+            f = _tag_filter_arg(filt, "containers_with_tag")
+            if root is not None and (not isinstance(root, str) or not root):
+                raise FormulaError("containers_with_tag(...): root= is a "
+                                   "dotted var path.")
+            out: list = []
+
+            def walk(node: Any, path: str) -> None:
+                for k, v in node.items():
+                    if not isinstance(v, dict) or str(k).startswith("__") \
+                            or k == "actions":
+                        continue
+                    sub = f"{path}.{k}" if path else str(k)
+                    pairs = match.container_tag_sources(e.vars, sub) or []
+                    if tag_filter_matches([t for t, _s in pairs], f):
+                        out.append(sub)
+                    walk(v, sub)
+            start: Any = e.vars
+            if root is not None:
+                for seg in root.split("."):
+                    start = start.get(seg) if isinstance(start, dict) \
+                        else None
+                if not isinstance(start, dict):
+                    return []
+                if tag_filter_matches(
+                        [t for t, _s in match.container_tag_sources(
+                            e.vars, root) or []], f):
+                    out.append(root)
+            walk(start, root or "")
+            return out
+
+        def _team_tags(team: Any) -> list:
+            """team_tags(team): the team's own tags (`tags` in its team
+            data; `grants_unit_tags` there is what its members carry).
+            Loopable."""
+            if team is None or isinstance(team, (list, dict)):
+                raise FormulaError("team_tags(team): team must be a team "
+                                   "name.")
+            return match.team_tags(team_text(team))
+
+        def _team_has_tag(team: Any, filt: Any) -> bool:
+            """team_has_tag(team, filter): whether the team's own tags match
+            the tag filter."""
+            f = _tag_filter_arg(filt, "team_has_tag")
+            return tag_filter_matches(_team_tags(team), f)
+
+        def _map_tags(map: Any = None) -> list:
+            """map_tags(map=None): the map's tags (the map var map_tags_var
+            names), the formula's map when none is named. Loopable."""
+            mp = _map_arg(map, "map_tags") if map is not None else _cur_map()
+            return match.map_tags(mp)
+
+        def _map_has_tag(map: Any, filt: Any) -> bool:
+            """map_has_tag(map, filter): whether the map's tags match the tag
+            filter."""
+            f = _tag_filter_arg(filt, "map_has_tag")
+            return tag_filter_matches(_map_tags(map), f)
+
+        def _maps_with_tag(filt: Any) -> list:
+            """maps_with_tag(filter): the names of the maps whose tags match
+            the tag filter, in map order. Loopable."""
+            f = _tag_filter_arg(filt, "maps_with_tag")
+            return [n for n, mp in match.maps.items()
+                    if tag_filter_matches(match.map_tags(mp), f)]
+
+        ns["container_tags"] = _container_tags
+        ns["container_has_tag"] = _container_has_tag
+        ns["containers_with_tag"] = _containers_with_tag
+        ns["team_tags"] = _team_tags
+        ns["team_has_tag"] = _team_has_tag
+        ns["map_tags"] = _map_tags
+        ns["map_has_tag"] = _map_has_tag
+        ns["maps_with_tag"] = _maps_with_tag
         ns["unit_tags"] = _unit_tags
         ns["unit_has_tag"] = _unit_has_tag
         ns["units_with_tag"] = _units_with_tag

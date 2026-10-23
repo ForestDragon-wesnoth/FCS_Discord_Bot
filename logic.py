@@ -2619,6 +2619,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Changing this rule renames the var on every map."
         ),
     },
+    "map_tags_var": {
+        "default": "tags",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's tags (`underground`, `holy_ground`), "
+            "a list read with map_tags / map_has_tag / maps_with_tag. Units "
+            "on a map don't take its tags. Set with `!map var set tags "
+            "<tag,tag> map=<name>`. Changing this rule renames the var on "
+            "every map."
+        ),
+    },
     "map_unseen_var": {
         "default": "unseen",
         "schema": {"type": "str"},
@@ -5688,10 +5699,12 @@ def tag_filter_matches(tags: Any, raw: Any) -> bool:
     return any(t in have for t in check_tag_filter(raw))
 
 
-def checked_tag_list(raw: Any, where: str) -> List[str]:
+def checked_tag_list(raw: Any, where: str,
+                     engine_ok: bool = False) -> List[str]:
     """A list of tags a unit carries or grants (its tags var, a
     grants_unit_tags value): a list or comma / space text of tags, none of
-    them an engine tag. VTTError naming `where` otherwise."""
+    them an engine tag (`engine_ok` for tags no unit carries: a team's, a
+    map's). VTTError naming `where` otherwise."""
     if isinstance(raw, str):
         raw = raw.replace(",", " ").split()
     if not isinstance(raw, list):
@@ -5702,7 +5715,7 @@ def checked_tag_list(raw: Any, where: str) -> List[str]:
             t = check_tag(t)
         except VTTError as ex:
             raise VTTError(f"{where}: {ex}")
-        if t in ENGINE_TAGS:
+        if t in ENGINE_TAGS and not engine_ok:
             raise VTTError(
                 f"{where}: `{t}` is an engine tag ({', '.join(ENGINE_TAGS)}): "
                 f"the engine gives it from the unit's state.")
@@ -11769,12 +11782,14 @@ class Match:
                                 f"team `{team}`")
         # The tags every member carries (`grants_unit_tags` at the top of
         # the team's data): a checked tag list, nothing under it.
+        # and the team's own `tags`: checked tag lists, nothing under them.
         seg0 = str(path).split(".", 1)[0]
-        if seg0 == GRANTS_UNIT_TAGS:
+        if seg0 in (GRANTS_UNIT_TAGS, "tags"):
             if "." in str(path):
-                raise VTTError(f"team `{team}`: `{GRANTS_UNIT_TAGS}` is a "
-                               f"list of tags; nothing nests under it.")
-            value = checked_tag_list(value, f"team `{team}` {path}")
+                raise VTTError(f"team `{team}`: `{seg0}` is a list of tags; "
+                               f"nothing nests under it.")
+            value = checked_tag_list(value, f"team `{team}` {path}",
+                                     engine_ok=(seg0 == "tags"))
         cur = self.team_data.setdefault(str(team), {})
         segs = str(path).split(".")
         for seg in segs[:-1]:
@@ -15534,6 +15549,68 @@ class Match:
 
     def corpse_tags(self, corpse: Dict[str, Any]) -> List[str]:
         return [t for t, _s in self.corpse_tag_sources(corpse)]
+
+    def container_tag_sources(self, vars_: Dict[str, Any], path: str
+                              ) -> Optional[List[Tuple[str, str]]]:
+        """(tag, source) for the var container at `path` in `vars_`: its own
+        `tags`, then the `inner_tags` of every container above it, the
+        vars root included, nearest first, minus what an
+        `exclude_inherited_tags` (`all` / `*` or a list) on the container
+        or above cuts. None when `path` isn't a container (a dict)."""
+        segs = [p for p in str(path).split(".") if p] if path else []
+        if not segs:
+            return None
+        chain: List[Tuple[str, str]] = []
+        node: Any = vars_
+        at = ""
+        for i, seg in enumerate([""] + segs):
+            if seg:
+                if not isinstance(node, dict) or seg not in node:
+                    return None
+                node = node[seg]
+                at = f"{at}.{seg}" if at else seg
+            if not isinstance(node, dict):
+                return None
+            cut = node.get("exclude_inherited_tags")
+            if cut is not None:
+                if isinstance(cut, str) and cut.strip().lower() in ("all", "*"):
+                    chain = []
+                else:
+                    drop = set(self._read_plain_tags(cut))
+                    chain = [(t, s_) for t, s_ in chain if t not in drop]
+            if i < len(segs):
+                chain = chain + [(t, at or "the vars root") for t in
+                                 self._read_plain_tags(node.get("inner_tags"))]
+        own = [(t, "own") for t in self._read_plain_tags(node.get("tags"))]
+        order = list(dict.fromkeys(src for _t, src in chain))
+        nearest = [(t, src) for o in reversed(order)
+                   for t, src in chain if src == o]
+        seen: Dict[str, str] = {}
+        for t, src in own + nearest:
+            seen.setdefault(t, src)
+        return list(seen.items())
+
+    @staticmethod
+    def _read_plain_tags(raw: Any) -> List[str]:
+        """The usable tags of a stored list (engine words allowed: a
+        container's, a team's or a map's tags aren't a unit's)."""
+        out: List[str] = []
+        for t in normalize_tags(raw):
+            try:
+                out.append(check_tag(t))
+            except VTTError:
+                continue
+        return out
+
+    def team_tags(self, team: Any) -> List[str]:
+        """The team's own tags (`tags` in its team data)."""
+        tdata = self.team_data.get(str(team))
+        return self._read_plain_tags(tdata.get("tags")) \
+            if isinstance(tdata, dict) else []
+
+    def map_tags(self, mp: "Map") -> List[str]:
+        """Map `mp`'s tags (the map var map_tags_var names)."""
+        return self._read_plain_tags(self.map_setting(mp, "tags"))
 
     # ---- action restrictions (#234) ------------------------------------
 
@@ -22874,6 +22951,7 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
     "map_border_color_var": ("border_color", "border_color"),
     "map_border_opacity_var": ("border_opacity", "border_opacity"),
     "map_hidden_layers_var": ("hidden_layers", None),
+    "map_tags_var": ("tags", None),
     "map_unseen_var": ("unseen", "unseen_map_display"),
     "map_nested_vehicle_moves_var": ("nested_vehicle_moves",
                                      "nested_vehicle_moves"),
@@ -22919,6 +22997,8 @@ def map_setting_value(setting: str, value: Any) -> Any:
             raise VTTError(f"The background mode is stretch, tile or center, "
                            f"got `{value}`.")
         return str(value).lower()
+    if setting == "tags":
+        return checked_tag_list(value, "The map's tags", engine_ok=True)
     if setting == "hidden_layers":
         words = ([str(v) for v in value] if isinstance(value, list)
                  else [w.strip() for w in str(value).split(",") if w.strip()])

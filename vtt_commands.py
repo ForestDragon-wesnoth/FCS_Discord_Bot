@@ -18067,6 +18067,28 @@ def _match_program_check(m: Match):
     return check
 
 
+def _split_status_tokens(raw: str) -> List[str]:
+    """Status tokens typed as one text: split on commas and spaces outside
+    parentheses, so `tag:(fire and not magic), stunned` is two tokens."""
+    out: List[str] = []
+    cur = ""
+    depth = 0
+    for ch in raw:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and (ch == "," or ch.isspace()):
+            if cur.strip():
+                out.append(cur.strip())
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
 async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
                           prefix: str, check) -> Optional[str]:
     """Run definition subcommand `args[0]` of `!status` on `m`'s
@@ -18291,7 +18313,10 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
         if raw in ("", "-"):
             m.status_definitions[name][field] = [] if sub == "tags" else ""
             return (f"Cleared `{name}` {field}.")
-        toks = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
+        toks = _split_status_tokens(raw)
+        for t in toks:
+            if sub != "tags" and t.startswith("tag:"):
+                check_tag_filter(t[4:])
         if sub == "tags":
             m.status_definitions[name]["tags"] = toks
         else:

@@ -1,8 +1,8 @@
 # Tags: design
 
 The agreed design for widening the tag system (#260), settled with the user
-before any code. Status: PR 1 built (§1's matcher, §2, §3; CLAUDE.md
-§7.20); PR 2 and PR 3 to come. Action tags (#234) shipped first; this extends tags to
+before any code. Status: PRs 1 and 2 built (§1-§5; CLAUDE.md §7.20);
+PR 3 (§6, §7) to come. Action tags (#234) shipped first; this extends tags to
 units, corpses, var containers (items), teams, maps and the template /
 prefab libraries, makes every tag field match the same way, and adds an
 optional vocabulary. Ask before deviating from it.

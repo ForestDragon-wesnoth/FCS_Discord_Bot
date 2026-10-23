@@ -395,7 +395,7 @@ back, load the schema with `ToolSearch` before calling
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
-  the vocabulary (PR 1 built, §7.20).
+  the vocabulary (PRs 1-2 built, §7.20).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature. When a feature ships in full (everything its
@@ -1145,8 +1145,9 @@ hardcodes**.
   arrives without its parts (891).
 - **Shields / temp hp:** named absorb pools under the roots in
   `temp_hp_sources` (default `shields`; per-unit `__temp_hp_sources`), each
-  `{amount, priority, tags, not_tags}` or a number. `absorb_damage(eid, n,
-  tags)` drains matching pools highest priority first and returns what
+  `{amount, priority, tags, not_tags}` or a number (`tags` a tag filter,
+  §7.20). `absorb_damage(eid, n, tags)` drains matching pools highest
+  priority first and returns what
   penetrates (the GM applies it to hp); `shield_total`. Decay is GM-composed
   (440).
 
@@ -2633,15 +2634,36 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
 
 ### 7.20 Tags
 
-The design is `docs/tags_design.md` (PR 1 of 3 built: §1 matcher, §2,
-§3) (919-921).
+The design is `docs/tags_design.md` (PRs 1 and 2 of 3 built: §1-§5)
+(919-923).
 - **Filters** (`logic.check_tag_filter`, `tag_filter_matches`): a list
   (or comma / space text) means ANY of its tags; text holding `and` /
   `or` / `not` or a parenthesis is an expression (`not` > `and` > `or`,
   parsed once and cached, `_parse_tag_expression`). `check_tag` refuses
   those three words and parentheses as tags. Pure `tags_match(tags,
-  filter)`. Zones, tiles, statuses, modifiers and shields still use their
-  old matching until PR 2.
+  filter)`. EVERY tag field reads one: zone / tile reads and `tag=`
+  filters, `!zone list tag=`, the status tag reads, status `tag:` tokens
+  (`tag:(fire and magic)`, a bare `tag:fire` one tag; `!status
+  removes/blockedby` split tokens outside parentheses,
+  `_split_status_tokens`), the #234 restriction lists, modifier and
+  shield `tags` (`Match._record_tags_ok`: no tags = always; was "all of"
+  before PR 2, user call; `not_tags` stays "none of"; a modifier whose
+  filter doesn't parse is left out and `!mod show` names it).
+- **Containers** (§4): a var container's own `tags` are the item's;
+  `inner_tags` reach every container below (the vars root's too, never
+  the container itself); `exclude_inherited_tags` (`all` / `*` or a
+  list) cuts what arrives from above, for that container and below
+  (`Match.container_tag_sources`: own, then nearest first). Not action
+  tags, not the holder's (only `grants_unit_tags` reaches the holder).
+  Reads `container_tags(eid, path)`, `container_has_tag`,
+  `containers_with_tag(eid, filter, root=None)` (paths, action dicts and
+  `__` keys skipped).
+- **Teams and maps** (§5): team data `tags` (the team's own, engine
+  words allowed; `grants_unit_tags` is what members carry), checked in
+  `team_set`; `team_tags`, `team_has_tag`. A map's tags are the map var
+  named by `map_tags_var` (a MAP_VAR_NAME_RULES setting, checked by
+  `map_setting_value`); `map_tags(map=None)`, `map_has_tag`,
+  `maps_with_tag`; units don't take them.
 - **Unit tags** (`Match.unit_tag_sources` / `unit_tags`, `(tag, source)`
   each once): own (the var named by `tags_var`, a VAR_NAME_RULES entry,
   stored as a checked list), then `grants_unit_tags` of the unit's

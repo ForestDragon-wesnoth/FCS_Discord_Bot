@@ -30115,3 +30115,141 @@ through `!status apply` (which says why) and status_apply alike; a
 forced application ignores it, like immunity. `!system status` edits a
 system's grants. A target filter that doesn't parse is named by `!action
 info` and refuses every target.
+
+
+SCENARIO 922 — Container tags: an item's own tags, inner_tags, exclusions, containers_with_tag
+------------------------------------------------------------------------------------------------
+
+!match new ct Ct 8 8
+!match use ct
+!ent add smith Smith 20 1 1 5
+!ent add knight Knight 20 3 3 5
+!ent set_var knight footprint_w 2
+!ent set_var knight footprint_h 2
+!ent set_var knight inventory.inner_tags carried
+!ent set_var knight inventory.sword.tags "metal, blade"
+!ent set_var knight inventory.bag.tags cloth
+!ent set_var knight inventory.bag.inner_tags stolen
+!ent set_var knight inventory.bag.ring.tags "gold, metal"
+!ent set_var knight inventory.bag.apple.tags food
+!ent set_var knight inventory.bag.apple.exclude_inherited_tags stolen
+!ent set_var knight equipped.helm.tags metal
+!ent set_var knight equipped.helm.grants_unit_tags armored
+!ent set_var knight equipped.helm.exclude_inherited_tags all
+!assert "container_tags('knight', 'inventory.sword') == ['metal', 'blade', 'carried'] and container_tags('knight', 'inventory.bag') == ['cloth', 'carried']"
+!assert "container_tags('knight', 'inventory.bag.ring') == ['gold', 'metal', 'stolen', 'carried'] and container_tags('knight', 'inventory.bag.apple') == ['food', 'carried']"
+!assert "containers_with_tag('knight', 'metal') == ['inventory.sword', 'inventory.bag.ring', 'equipped.helm'] and containers_with_tag('knight', 'stolen and not gold') == []"
+!assert "containers_with_tag('knight', 'carried', root='inventory.bag') == ['inventory.bag', 'inventory.bag.ring', 'inventory.bag.apple']"
+!assert "container_has_tag('knight', 'inventory.bag.ring', 'gold and stolen') and not container_has_tag('knight', 'inventory.sword', 'cloth')"
+!assert "unit_tags('knight') == ['armored']"
+!eval "container_tags('knight', 'nowhere')"
+?? container_tags: `knight` has no container (a dict) at `nowhere`.
+!ent set_var smith actions.rust.target entity
+!ent set_var smith actions.rust.body "for p in containers_with_tag(target, 'metal and not gold'):\n    var_set(target, p + '.rusted', True)\nentity[self].rusted = containers_with_tag(target, 'metal and not gold')"
+!action smith rust knight
+!assert "entity[smith].rusted == ['inventory.sword', 'equipped.helm'] and entity[knight].inventory.sword.rusted == True and not var_has('knight', 'inventory.bag.ring.rusted')"
+!ent set_var knight inventory.sword.actions.slash.target entity
+!ent set_var knight inventory.sword.actions.slash.body "entity[target].hp = entity[target].hp - 1"
+!assert "action_tags_of('knight', 'slash') == [] and containers_with_tag('knight', 'metal') == ['inventory.sword', 'inventory.bag.ring', 'equipped.helm']"
+
+Expected: HARNESS-ALLOWS-ERRORS. A var container's own `tags` are the
+item's; `inner_tags` reach every container nested below (the bag's
+`stolen` reaches the ring, not the bag itself; the inventory's `carried`
+reaches all), nearest first after the item's own;
+`exclude_inherited_tags` cuts what arrives from above (the apple drops
+`stolen`, the helm drops everything). containers_with_tag finds matching
+paths (root= limits the walk and includes the root), action dicts left
+out; a missing path is refused. An item's tags are neither its actions'
+tags nor its holder's (only `grants_unit_tags` reaches the 2×2 knight).
+A rust action finds the non-gold metal items with an expression and
+marks them.
+
+
+SCENARIO 923 — One filter rule: modifiers, shields, status tag: tokens, restrictions, zones, tiles, teams, maps
+---------------------------------------------------------------------------------------------------------------
+
+!match new fr Fr 8 8
+!match use fr
+!ent add hero Hero 50 1 1 5
+!ent add foe Foe 50 5 5 3
+!ent set_var hero modifiers.ward.stat armor
+!ent set_var hero modifiers.ward.op add
+!ent set_var hero modifiers.ward.value 5
+!ent set_var hero modifiers.ward.tags "fire, cold"
+!ent set_var hero modifiers.both.stat armor
+!ent set_var hero modifiers.both.op add
+!ent set_var hero modifiers.both.value 100
+!ent set_var hero modifiers.both.tags "fire and magic"
+!assert "apply_mods('hero', 'armor', 0, ['fire']) == 5 and apply_mods('hero', 'armor', 0, ['cold']) == 5 and apply_mods('hero', 'armor', 0, ['fire', 'magic']) == 105 and apply_mods('hero', 'armor', 0, ['acid']) == 0"
+!ent set_var hero modifiers.bad.stat armor
+!ent set_var hero modifiers.bad.op add
+!ent set_var hero modifiers.bad.value 1
+!ent set_var hero modifiers.bad.tags "(fire"
+!mod show hero armor 0 fire
+?? tags don't parse
+!ent set_var hero shields.ward.amount 10
+!ent set_var hero shields.ward.tags "fire, cold"
+!eval "absorb_damage('hero', 4, 'cold')"
+?? = `0`
+!eval "absorb_damage('hero', 4, 'acid')"
+?? = `4`
+!status def burn
+!status tags burn fire
+!status def arcane_burn
+!status tags arcane_burn "fire, magic"
+!status def douse
+!status removes douse "tag:(fire and not magic)"
+!status apply hero burn
+!status apply hero arcane_burn
+!status apply hero douse
+!assert "not status_has('hero', 'burn') and status_has('hero', 'arcane_burn')"
+!assert "statuses_with_tag('hero', 'fire and magic') == ['arcane_burn'] and status_has_tag('hero', 'arcane_burn', 'not cold')"
+!status def heavy_load
+!status forbids_actions_with_tag heavy_load "melee and heavy"
+?? `heavy_load` forbids_actions_with_tag = melee and heavy
+!status apply hero heavy_load
+!ent set_var hero actions.smash.target entity
+!ent set_var hero actions.smash.tags "melee, heavy"
+!ent set_var hero actions.smash.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var hero actions.jab.target entity
+!ent set_var hero actions.jab.tags melee
+!ent set_var hero actions.jab.body "entity[target].hp = entity[target].hp - 1"
+!action hero smash foe
+?? heavy_load on `hero` forbids `melee and heavy` actions.
+!action hero jab foe
+?? `hero` used action `jab`.
+!zone new lava
+!zone add lava 2 2
+!zone tags lava "fire, hazard"
+!zone new pool
+!zone add pool 2 3
+!zone tags pool "water, hazard"
+!assert "zones_with_tag('hazard and not water') == ['lava'] and zone_has_tag('pool', 'water or fire') and zones_at(2, 2, tag='fire and hazard') == ['lava']"
+!zone list "tag=hazard and not fire"
+?? `pool`
+?! `lava`
+!tile tags 4 4 "stone, wall"
+!assert "tile_has_tag(4, 4, 'wall and not wood') and tiles_with_tag('stone or wood') == [[4, 4]]"
+!team set red tags "horde, orcish"
+!team set red grants_unit_tags orc
+!ent set_var foe team red
+!assert "team_tags('red') == ['horde', 'orcish'] and team_has_tag('red', 'horde and orcish') and unit_tags('foe') == ['orc']"
+!team set red tags "a and"
+?? ❌
+!map var set tags "underground, cursed"
+!assert "map_tags() == ['underground', 'cursed'] and map_has_tag('main', 'cursed') and maps_with_tag('underground') == ['main'] and maps_with_tag('holy') == []"
+!map var set tags "x or"
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. Every tag field reads a tag filter the
+same way. A modifier's `tags` list applies when the query carries any of
+its tags (fire or cold); "all of" is `fire and magic`; a filter that
+doesn't parse leaves the record out and `!mod show` names it. A shield
+pool tagged fire, cold absorbs a cold hit and lets acid through. A status
+`tag:(fire and not magic)` token removes burn and keeps arcane_burn; the
+status tag reads take expressions. A restriction list can be an
+expression: heavy_load forbids actions both melee and heavy, so smash is
+refused and jab isn't. Zone and tile reads and `!zone list tag=` take
+expressions. A team has its own `tags` (beside the `grants_unit_tags` its
+members carry); a map's tags are its `tags` map var. Malformed tags are
+refused in team data and map vars.
