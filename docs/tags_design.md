@@ -25,7 +25,15 @@ optional vocabulary. Ask before deviating from it.
   modifier and shield `tags`, and every new field below. Modifier and
   shield `tags` lists change from "all of" to "any of" (user call: one
   rule); records that need every tag write `a and b`. `not_tags` stays
-  on modifiers and shields as "none of" (open question 1).
+  on modifiers and shields as "none of": a record matches when its `tags`
+  filter matches AND none of its `not_tags` is present, so the two never
+  conflict (`tags: "fire or cold"`, `not_tags: [magic]` = fire or cold,
+  but not magical). It is a second way to write `and not (...)`, kept
+  because it costs nothing.
+- **Status `tag:` tokens** (`removes`, `blocked_by`, immunity,
+  resistance, dispel) take a filter after `tag:`; an expression goes in
+  parentheses so the token list's commas stay unambiguous: `removes:
+  tag:(fire and magic), stunned`. A bare `tag:fire` stays a single tag.
 - Pure helper `tags_match(tags, filter)`: whether a tag list matches a
   filter, for formulas that compose their own checks.
 
@@ -71,7 +79,8 @@ optional vocabulary. Ask before deviating from it.
   units that fail, with a note naming each. (Corpse targets are checked
   here, since a corpse carries tags; the #234 immunity skip for corpses
   stays as it is.)
-- **Status field** `cannot_affect_units_with_tag` (a filter): the status
+- **Status field** `cannot_affect_units_with_tag` (a filter, name
+  approved): the status
   can't be applied to a unit whose tags match (fear on `mindless`).
   Checked in `apply_status` with immunity, named by
   `status_apply_block_reason`; `status_force` ignores it like immunity.
@@ -143,9 +152,6 @@ new reads, the replay differential and usage drift.
 
 ## 9. Open questions
 
-1. `not_tags` on modifiers and shields: keep it as "none of" beside the
-   expressions, or drop it for `... and not x`?
-2. Status `tag:` tokens (`removes`, `blocked_by`, immunity, dispel) name
-   status tags one at a time; do they take expressions too
-   (`tag:(fire and magic)`), or stay single tags?
-3. The name `cannot_affect_units_with_tag` for the status-side field.
+None left from the first discussion: `not_tags` stays beside expressions
+(§1), status `tag:` tokens take expressions in parentheses (§1), and the
+status-side field is `cannot_affect_units_with_tag` (§3).
