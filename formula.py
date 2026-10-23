@@ -2736,6 +2736,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    clean fail(). Counts toward
     #                                    action_recursion_limit.
     "has_action", "entity_actions", "use_action",
+    "action_tags_of", "action_forbidden_by", "immune_to_action",
     # Summon / despawn family. A template is an entity-shaped dict in
     # ordinary storage (vars / tile data); these turn one into a live
     # entity and back. All route through Match.summon_entity (shared
@@ -3013,6 +3014,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'map_carrier', 'inner_maps', 'outer_map',
     'has_template', 'template_names', 'template_of', 'template_data',
     'prefab_names', 'prefab_size',
+    'action_tags_of', 'action_forbidden_by', 'immune_to_action',
     'schedules_of', 'schedule_left',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
@@ -3255,6 +3257,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entities_in_area",
     # Action introspection — returns a list of action names, loopable.
     "entity_actions",
+    # An action's tags, and the statuses forbidding / blocking one.
+    "action_tags_of", "action_forbidden_by", "immune_to_action",
     # Corpse introspection — returns a list of corpse ids, loopable.
     "all_corpses",
     "corpse_status_names",
@@ -3342,6 +3346,9 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # the bare action name; action_path is the full vars location
     # the action was loaded from.
     "action_name", "action_path",
+    # The action's final tags (#234): on_action_* passives, the action's own
+    # body and a status's `<field>_unless` restriction formulas.
+    "action_tags",
     # `target` and `args` overlap with the action-mode body bindings,
     # but inside a passive (where action_mode is NOT enabled) they're
     # populated from EvalCtx.extras for the on_action_used firing —
@@ -6817,7 +6824,78 @@ class FormulaEngine:
             ok, _msg = _sync_dispatch_returning(coro)
             return ok
 
+        def _one_action(eid_t: Any, name: Any, fname: str):
+            """The (eid, Action) `name` (a bare name or a full vars path)
+            names on `eid`; a name two containers share is refused."""
+            if not isinstance(name, str) or not name:
+                raise FormulaError(f"{fname}(eid, name): name must be a "
+                                   f"non-empty string.")
+            eid, e = _resolve_entity(eid_t, fname)
+            from action import discover_actions, lookup_action
+            actions = discover_actions(e, match.rules)
+            for acts in actions.values():
+                for act in acts:
+                    if act.full_path == name:
+                        return eid, act
+            found = lookup_action(actions, name, match.rules)
+            if not found:
+                raise FormulaError(f"{fname}: entity `{eid}` has no action "
+                                   f"`{name}`.")
+            if len(found) > 1:
+                paths = ", ".join(f"`{a.full_path}`" for a in found)
+                raise FormulaError(f"{fname}: entity `{eid}` has several "
+                                   f"`{name}` actions ({paths}); name one "
+                                   f"by its full path.")
+            return eid, found[0]
+
+        def _action_tags_of(eid_t: Any, name: Any) -> list:
+            """action_tags_of(eid, name): the action's final tags: its own
+            `tags`, then the `action_tags` of every container above it
+            (nearest first) that no `exclude_inherited_action_tags` cut.
+            `name` is a bare name or the action's full vars path."""
+            _, act = _one_action(eid_t, name, "action_tags_of")
+            return list(act.tags)
+
+        def _action_forbidden_by(eid_t: Any, name: Any) -> list:
+            """action_forbidden_by(eid, name): the statuses forbidding
+            `eid` its action `name` now (forbids_actions_with_tag /
+            _name on the unit or its body root, not lifted by their
+            _unless formula); [] when it may use it."""
+            from logic import ACTION_FORBID_FIELDS
+            eid, act = _one_action(eid_t, name, "action_forbidden_by")
+            hits = match.action_restrictions(
+                ACTION_FORBID_FIELDS, match.action_forbid_units(eid),
+                act.name, act.tags, eid)
+            return list(dict.fromkeys(h["status"] for h in hits))
+
+        def _immune_to_action(target_t: Any, tags: Any = None,
+                              name: Any = None, actor: Any = None) -> list:
+            """immune_to_action(target, tags, name=None, actor=None): the
+            statuses making `target` immune to an action with these tags
+            (a list, or one tag) and this action name
+            (immune_to_actions_with_tag / _name on the target or its body
+            root, not lifted by their _unless formula, which sees `actor`);
+            [] when the action reaches it. For bodies choosing their own
+            victims: `immune_to_action(u, action_tags, action_name, self)`."""
+            from logic import ACTION_IMMUNE_FIELDS, normalize_tags
+            tid, _e = _resolve_entity(target_t, "immune_to_action")
+            if tags is not None and not isinstance(tags, (str, list)):
+                raise FormulaError("immune_to_action: tags must be a list "
+                                   "of tags or one tag.")
+            if name is not None and not isinstance(name, str):
+                raise FormulaError("immune_to_action: name must be text.")
+            aid = None
+            if actor is not None:
+                aid, _a = _resolve_entity(actor, "immune_to_action")
+            hits = match.action_restrictions(
+                ACTION_IMMUNE_FIELDS, match.action_immune_units(tid),
+                name or "", normalize_tags(tags), aid, tid)
+            return list(dict.fromkeys(h["status"] for h in hits))
+
         ns["has_action"]     = _has_action
+        ns["action_tags_of"] = _action_tags_of
+        ns["action_forbidden_by"] = _action_forbidden_by
+        ns["immune_to_action"] = _immune_to_action
         ns["entity_actions"] = _entity_actions
         ns["use_action"]     = _use_action
 

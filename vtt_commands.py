@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -7921,6 +7921,9 @@ def _match_formula_slots(m: Match):
                                  else {}).items()):
             yield (f"status `{sname}` {hook} hook", src, "exec", frozenset(),
                    False)
+        for fld in ACTION_RESTRICTION_FIELDS:
+            yield (f"status `{sname}` {fld}{UNLESS_SUFFIX}",
+                   sdef.get(fld + UNLESS_SUFFIX), "eval", frozenset(), False)
     for tname, tpl in sorted(m.tile_templates.items()):
         for when, src in sorted(tpl.hooks.items()):
             yield (f"tile template `{tname}` hook `{when}`", src, "exec",
@@ -8070,6 +8073,12 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
                 n += 1
                 check(f"status `{sname}` {where}", src, "exec", sys_known,
                       soft=True)
+        for fld in ACTION_RESTRICTION_FIELDS:
+            src = sdef.get(fld + UNLESS_SUFFIX)
+            if isinstance(src, str) and src.strip():
+                n += 1
+                check(f"status `{sname}` {fld}{UNLESS_SUFFIX}", src, "eval",
+                      sys_known, soft=True)
     for zname, zdef in sorted(
             mgr.system_library(s, "zone_definitions").items()):
         zdef = normalize_zone_def(zdef)
@@ -8493,6 +8502,10 @@ async def _system_status(ctx: ReplyContext, args: List[str],
                  if isinstance(sdef.get("tick"), str) and sdef["tick"].strip()
                  else []) + [(f"its {h} hook", src)
                              for h, src in sorted(hooks.items())]
+        progs += [(f"its {f}{UNLESS_SUFFIX}", sdef[f + UNLESS_SUFFIX])
+                  for f in ACTION_RESTRICTION_FIELDS
+                  if isinstance(sdef.get(f + UNLESS_SUFFIX), str)
+                  and sdef[f + UNLESS_SUFFIX].strip()]
         warns = [_promote_warning(mgr, s, src, what) for what, src in progs]
         return await ctx.send("\n".join(
             [_promoted_line("status definition", f"`{name}`", m.id, sys_name,
@@ -8514,9 +8527,9 @@ async def _system_status(ctx: ReplyContext, args: List[str],
         return await ctx.send(_system_deleted_line(
             mgr, s, kind, "status definition", name))
 
-    def check(body: str, what: str) -> Optional[str]:
+    def check(body: str, what: str, mode: str = "exec") -> Optional[str]:
         return _system_formula_warning(
-            mgr, s, body, "exec", f"Invalid {what} formula", "it fails")
+            mgr, s, body, mode, f"Invalid {what} formula", "it fails")
 
     scratch = _system_scratch(mgr, s)
     reply = await _status_def_sub(ctx, [action] + args[3:], scratch,
@@ -8894,7 +8907,16 @@ registry.annotate_sub(
         "stack <system> <name> <refresh|add_level|extend|replace|none> | "
         "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
         "tags <system> <name> <csv ...> | removes <system> <name> <tokens ...> | "
-        "blockedby <system> <name> <tokens ...> | del <system> <name> | "
+        "blockedby <system> <name> <tokens ...> | "
+        "forbids_actions_with_tag <system> <name> [<tag ...>] | "
+        "forbids_actions_with_name <system> <name> [<name ...>] | "
+        "immune_to_actions_with_tag <system> <name> [<tag ...>] | "
+        "immune_to_actions_with_name <system> <name> [<name ...>] | "
+        "forbids_actions_with_tag_unless <system> <name> [<formula ...>] | "
+        "forbids_actions_with_name_unless <system> <name> [<formula ...>] | "
+        "immune_to_actions_with_tag_unless <system> <name> [<formula ...>] | "
+        "immune_to_actions_with_name_unless <system> <name> [<formula ...>] | "
+        "del <system> <name> | "
         "drop <system> <name> | delete <system> <name> | "
         "remove <system> <name> | rm <system> <name> | "
         "promote <system> <name>>"
@@ -17951,6 +17973,27 @@ for _sub, _usage in (
         ("apply", "!status apply <eid> <name> [level] [duration]"),
         ("force", "!status force <eid> <name> [level] [duration]")):
     registry.annotate_sub("status", _sub, usage=_usage)
+for _sub in ACTION_RESTRICTION_FIELDS:
+    _what = ("tag" if _sub.endswith("_tag") else "name")
+    _does = ("its bearer can't use actions with" if _sub in ACTION_FORBID_FIELDS
+             else "actions with")
+    registry.annotate_sub(
+        "status", _sub, usage=f"!status {_sub} <name> [<{_what} ...>]",
+        desc=(f"Set the action {_what}s of status `<name>`: {_does} one of "
+              f"them"
+              + ("" if _sub in ACTION_FORBID_FIELDS else
+                 " can't target its bearer (or the bearer's parts; an "
+                 "entity_list target drops it)")
+              + f". `-` or no {_what}s clears it. A status instance holding "
+              f"`{_sub}` replaces this list."))
+    registry.annotate_sub(
+        "status", _sub + UNLESS_SUFFIX,
+        usage=f"!status {_sub}{UNLESS_SUFFIX} <name> [<formula ...>]",
+        desc=(f"An expression that lifts `{_sub}` while true: self = the "
+              f"bearer; actor, action_name, action_tags, target and "
+              f"status_name bound. A formula that fails keeps the "
+              f"restriction and the refusal names the error. No formula "
+              f"clears it."))
 
 
 _TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end", "never")
@@ -17960,15 +18003,18 @@ _STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
 _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     "hook": 3, "display": 2, "when": 3, "sprite": 3,
                     "stack": 3, "maxlevel": 3, "data": 4, "tags": 2,
-                    "removes": 2, "blockedby": 2}
+                    "removes": 2, "blockedby": 2,
+                    **{f: 2 for f in ACTION_RESTRICTION_FIELDS},
+                    **{f + UNLESS_SUFFIX: 2
+                       for f in ACTION_RESTRICTION_FIELDS}}
 
 
 def _match_program_check(m: Match):
     """The formula check of a match's status ticks and hooks: a program
     calling only built-ins and the match's `!func`s."""
-    def check(body: str, what: str) -> None:
+    def check(body: str, what: str, mode: str = "exec") -> None:
         try:
-            validate_formula(body, mode="exec",
+            validate_formula(body, mode=mode,
                              known_funcs=frozenset(m.formula_functions.keys()))
         except FormulaError as ex:
             raise VTTError(f"Invalid {what} formula: {ex}")
@@ -18206,13 +18252,55 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
             m.status_definitions[name][field] = ",".join(toks)
         return (f"`{name}` {field} = {', '.join(toks)}")
 
+    if sub in ACTION_RESTRICTION_FIELDS:
+        # The action tags / names this status forbids its bearer or makes
+        # it immune to (#234); none (or `-`) clears the list.
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", sub):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        raw = " ".join(args[2:]).strip()
+        if raw in ("", "-"):
+            if m.status_definitions[name].pop(sub, None) is None:
+                return (f"❌ `{name}` has no {sub} list.")
+            return (f"Cleared `{name}` {sub}.")
+        words = [check_tag(w) for w in raw.replace(",", " ").split()]
+        words = list(dict.fromkeys(words))
+        m.status_definitions[name][sub] = words
+        return (f"`{name}` {sub} = {', '.join(words)}")
+
+    if sub.endswith(UNLESS_SUFFIX) and \
+            sub[:-len(UNLESS_SUFFIX)] in ACTION_RESTRICTION_FIELDS:
+        # The expression lifting that one list while true (self = the
+        # bearer); no formula clears it.
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", sub):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        body = normalize_body_source(" ".join(args[2:]).strip())
+        if not body:
+            if m.status_definitions[name].pop(sub, None) is None:
+                return (f"❌ `{name}` has no {sub} formula.")
+            return (f"Cleared `{name}` {sub}.")
+        warn = check(body, sub, "eval")
+        m.status_definitions[name][sub] = body
+        return (f"Set `{name}` {sub} (it lifts "
+                f"{sub[:-len(UNLESS_SUFFIX)]} while true)."
+                + (f"\n{warn}" if warn else ""))
+
     return None
 
 
 @registry.command(
     "status",
     usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|data|tags|"
-           "removes|blockedby|resist|counter|dispel|transfer|sprite|list|info|"
+           "removes|blockedby|forbids_actions_with_tag|forbids_actions_with_name|"
+           "immune_to_actions_with_tag|immune_to_actions_with_name|"
+           "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
+           "immune_to_actions_with_tag_unless|immune_to_actions_with_name_unless|"
+           "resist|counter|dispel|transfer|sprite|list|info|"
            "apply|force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
@@ -18245,8 +18333,14 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
         "`display <name> <format>` sets how the status shows in the "
         "`{statuses}` roster placeholder (its fields are placeholders, as in "
         "the status_line_format rule); no format clears it. "
+        "`forbids_actions_with_tag|forbids_actions_with_name <name> <words>` "
+        "forbid the bearer actions with those tags / names, "
+        "`immune_to_actions_with_tag|immune_to_actions_with_name` keep "
+        "such actions off it; each takes a `<field>_unless <name> "
+        "<formula>` lifting it while true. "
         "Subcommands: def, drop, rename, copy, tick, hook, display, when, stack, maxlevel, "
-        "data, list, info, apply, force, dispel, transfer, sprite."
+        "data, tags, removes, blockedby, the action restrictions, list, info, "
+        "apply, force, dispel, transfer, sprite."
     ),
 )
 async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -20956,7 +21050,13 @@ registry.annotate_sub("mount", "info",
         "`on_action_used` + per-target `on_action_used_on_target` "
         "fire. `<eid>` accepts `self`/`this`/`current`. When two "
         "actions share a name the handler shows a numbered "
-        "disambiguation menu — re-issue with the full path."
+        "disambiguation menu — re-issue with the full path. An action's "
+        "tags are its own `tags` plus the `action_tags` of every container "
+        "above it, minus what an `exclude_inherited_action_tags` (`all` or "
+        "tags) cuts; statuses forbid actions or make their bearer immune "
+        "by tag or name (`!status forbids_actions_with_tag`, ...), checked "
+        "before the body. `info` lists the tags, `list` marks what is "
+        "forbidden now."
     ),
 )
 async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -21020,9 +21120,12 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
         for act in actions[name]:
             container = act.container_path or "(entity root)"
             desc = f" — {act.description}" if act.description else ""
+            tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
+            forbid = _action_forbid_note(m, actor_id, act)
             lines.append(
                 f"- `{act.name}` (target: `{act.target_type}`, at "
-                f"`{container}`){desc}"
+                f"`{container}`{tags}){desc}"
+                + (f" 🚫 {forbid}" if forbid else "")
             )
     if mount_actions:
         lines.append(f"Via vehicle `{actor.mounted_on}` "
@@ -21030,11 +21133,42 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
         for name in sorted(mount_actions.keys()):
             for act in mount_actions[name]:
                 desc = f" — {act.description}" if act.description else ""
+                tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
+                forbid = _action_forbid_note(m, actor_id, act,
+                                             actor.mounted_on)
                 lines.append(
                     f"- `{act.name}` (target: `{act.target_type}`, at "
-                    f"`{act.full_path}`){desc}"
+                    f"`{act.full_path}`{tags}){desc}"
+                    + (f" 🚫 {forbid}" if forbid else "")
                 )
     await ctx.send("\n".join(lines))
+
+
+def _action_tags_text(act: Any) -> str:
+    """An action's final tags, each with where it came from."""
+    if not act.tags:
+        return "(none)"
+    out = []
+    for t in act.tags:
+        src = act.tag_sources.get(t, "")
+        where = ("own" if src == act.full_path
+                 else f"from `{src}`" if src else "from the vars root")
+        out.append(f"`{t}` ({where})")
+    return ", ".join(out)
+
+
+def _action_forbid_note(m: Match, actor_id: str, act: Any,
+                        vehicle: Optional[str] = None) -> str:
+    """What forbids `actor_id` the action now ("blind on `hunter`"), or ""."""
+    hits = m.action_restrictions(
+        ACTION_FORBID_FIELDS,
+        m.action_forbid_units(actor_id, vehicle,
+                              actor_id if vehicle else None),
+        act.name, act.tags, actor_id)
+    return ", ".join(dict.fromkeys(
+        f"{h['status']} on `{h['unit']}`"
+        + (" (its _unless formula failed)" if h["error"] else "")
+        for h in hits))
 
 
 async def _action_info(
@@ -21079,7 +21213,14 @@ async def _action_info(
         f"Path:        `{act.full_path}`",
         f"Container:   `{container}`",
         f"Target type: `{act.target_type}`",
+        f"Tags:        {_action_tags_text(act)}",
         f"Description: {desc}",
+    ]
+    lines += [f"⚠️ {p}" for p in act.tag_problems]
+    forbid = _action_forbid_note(m, actor_id, act)
+    if forbid:
+        lines.append(f"Forbidden:   {forbid}")
+    lines += [
         "Body:",
         "```",
         act.body,
