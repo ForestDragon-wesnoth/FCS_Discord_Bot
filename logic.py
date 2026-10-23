@@ -9,6 +9,7 @@ import uuid
 import json
 import copy
 import contextlib
+import functools
 import re
 import math
 import random
@@ -652,6 +653,33 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "optional: entities don't have to belong to a team, and removing "
             "the var (e.g. !ent del_var hero team) puts the entity back to "
             "'no team' rather than erroring."
+        ),
+    },
+    "tags_var": {
+        "default": "tags",
+        "schema": {"type": "str"},
+        "desc": (
+            "Variable name in entity vars holding a unit's OWN tags (a list; "
+            "comma text is stored as a list). Ordinary var writes add and "
+            "remove them. A unit's full tag set adds the tags its sources "
+            "grant (`grants_unit_tags` on its statuses, on containers under "
+            "unit_tag_sources, in its team's data; a body part also carries "
+            "its root's) and the engine tags (corpse, part, segment, rider, "
+            "vehicle, map_carrier), which no var can hold. Read with "
+            "unit_tags / unit_has_tag / units_with_tag, `tag:` in `!find`, "
+            "`{tags}` in the roster formats."
+        ),
+    },
+    "unit_tag_sources": {
+        "default": "equipped",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated vars roots walked for `grants_unit_tags` lists: "
+            "a container under one of them (an equipped item) gives its "
+            "holder those tags while it stays there; the same item in "
+            "`inventory` gives nothing. Per-entity override: the "
+            "`__unit_tag_sources` var (replaces this list) and/or "
+            "`__unit_tag_sources_add` var (extends it)."
         ),
     },
     "amount_field": {
@@ -3305,6 +3333,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "{matched}, {tags}, {field}. Empty = the default text."
         ),
     },
+    "action_target_tags_message_format": {
+        "default": ("`{target}` doesn't fit `{action}`: its tags "
+                    "({target_tags}) {fails}."),
+        "schema": {"type": "str"},
+        "desc": (
+            "The refusal of an action whose entity / corpse target fails the "
+            "action's target_requires_tags or target_refuses_tags filter, and "
+            "the note naming a unit dropped from a list target. "
+            "Placeholders: {target}, {actor}, {action}, {field}, {filter}, "
+            "{target_tags}, {fails} (`don't match `animal`` / `match "
+            "`undead``). Empty = the default text."
+        ),
+    },
     "action_choice_limit": {
         "default": 20,
         "schema": {"type": "int", "min": 0, "max": 100, "ceiling": True},
@@ -4366,7 +4407,8 @@ def reserved_path_meaning(seg0: str) -> str:
     return {"name": "display name", "map": "map"}.get(seg0, "position")
 
 def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str,
-                      team_var: Optional[str] = None) -> Dict[str, Any]:
+                      team_var: Optional[str] = None,
+                      tags_var: Optional[str] = None) -> Dict[str, Any]:
     """`vars_` ready to become a whole unit's vars, held to the rules
     write_var applies one write at a time: each vital var present (hp /
     max_hp / initiative) is a whole number (a numeric string or float is
@@ -4402,6 +4444,8 @@ def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str,
             raise VTTError(f"{where}: team var '{team_var}' must be text or "
                            f"a number, got {out[team_var]!r}.")
         out[team_var] = t
+    if tags_var:
+        out = checked_tag_vars("", out, tags_var, where)
     return out
 
 
@@ -5489,13 +5533,208 @@ def normalize_tags(raw: Any) -> List[str]:
 
 
 def check_tag(tag: Any) -> str:
-    """`tag` when it can be a zone / tile tag (one word, no comma), else a
-    VTTError."""
+    """`tag` when it can be a tag (one word: no spaces, commas or
+    parentheses, and not `and` / `or` / `not`, which tag filters read as
+    words of an expression), else a VTTError."""
     if not isinstance(tag, str) or not tag.strip() or \
-            any(c.isspace() for c in tag.strip()) or "," in tag:
-        raise VTTError(f"`{tag}` can't be a tag: one word, no spaces or "
-                       f"commas.")
+            any(c.isspace() for c in tag.strip()) or \
+            any(c in tag for c in ",()"):
+        raise VTTError(f"`{tag}` can't be a tag: one word, no spaces, "
+                       f"commas or parentheses.")
+    if tag.strip() in TAG_FILTER_WORDS:
+        raise VTTError(f"`{tag}` can't be a tag: and / or / not join the "
+                       f"words of a tag filter.")
     return tag.strip()
+
+
+# Tags (docs/tags_design.md). A tag FILTER is a list ("any of": a list, or
+# comma / space text) or an EXPRESSION (`animal and not (undead or
+# construct)`: `not` binds tightest, then `and`, then `or`). Text holding one
+# of these words or a parenthesis is an expression.
+TAG_FILTER_WORDS = ("and", "or", "not")
+# Tags the engine derives from a unit's state; no tags var, grant or
+# vocabulary entry can hold one.
+ENGINE_TAGS = ("corpse", "part", "segment", "rider", "vehicle", "map_carrier")
+# The key, in a status definition / instance, a var container or team data,
+# whose tags the unit holding it carries.
+GRANTS_UNIT_TAGS = "grants_unit_tags"
+_TAG_TOKEN_RE = re.compile(r"\(|\)|[^\s()]+")
+
+
+def _is_tag_expression(text: str) -> bool:
+    return "(" in text or ")" in text or any(
+        w in TAG_FILTER_WORDS for w in text.replace(",", " ").split())
+
+
+@functools.lru_cache(maxsize=512)
+def _parse_tag_expression(text: str) -> Tuple[Any, ...]:
+    """The tree of a tag expression: ('tag', t), ('not', a), ('and', a, b),
+    ('or', a, b). VTTError when it doesn't parse."""
+    toks = _TAG_TOKEN_RE.findall(text)
+    pos = 0
+
+    def bad(why: str) -> VTTError:
+        return VTTError(f"Tag filter `{text}`: {why}.")
+
+    def peek() -> Optional[str]:
+        return toks[pos] if pos < len(toks) else None
+
+    def take() -> str:
+        nonlocal pos
+        pos += 1
+        return toks[pos - 1]
+
+    def p_or() -> Tuple[Any, ...]:
+        left = p_and()
+        while peek() == "or":
+            take()
+            left = ("or", left, p_and())
+        return left
+
+    def p_and() -> Tuple[Any, ...]:
+        left = p_not()
+        while peek() == "and":
+            take()
+            left = ("and", left, p_not())
+        return left
+
+    def p_not() -> Tuple[Any, ...]:
+        if peek() == "not":
+            take()
+            return ("not", p_not())
+        return p_atom()
+
+    def p_atom() -> Tuple[Any, ...]:
+        t = peek()
+        if t is None:
+            raise bad("it ends where a tag or `(` should come")
+        if t == "(":
+            take()
+            inner = p_or()
+            if peek() != ")":
+                raise bad("a `(` is never closed")
+            take()
+            return inner
+        if t in (")", "and", "or"):
+            raise bad(f"`{t}` where a tag should come")
+        take()
+        if "," in t:
+            raise bad("commas list tags; inside an expression join them "
+                      "with `or`")
+        return ("tag", t)
+
+    if not toks:
+        raise bad("it's empty")
+    tree = p_or()
+    if pos < len(toks):
+        raise bad(f"`{toks[pos]}` after the end of the expression")
+    return tree
+
+
+def _eval_tag_tree(tree: Tuple[Any, ...], tags: Set[str]) -> bool:
+    op = tree[0]
+    if op == "tag":
+        return tree[1] in tags
+    if op == "not":
+        return not _eval_tag_tree(tree[1], tags)
+    if op == "and":
+        return _eval_tag_tree(tree[1], tags) and _eval_tag_tree(tree[2], tags)
+    return _eval_tag_tree(tree[1], tags) or _eval_tag_tree(tree[2], tags)
+
+
+def tag_filter_empty(raw: Any) -> bool:
+    """Whether a tag filter field holds nothing (no requirement)."""
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        return not raw.strip()
+    return isinstance(raw, list) and not raw
+
+
+def check_tag_filter(raw: Any) -> Any:
+    """A tag filter in its stored shape: a list of tags, or an expression's
+    text. VTTError when it is neither (a word that can't be a tag, an
+    expression that doesn't parse)."""
+    if isinstance(raw, str) and _is_tag_expression(raw):
+        _parse_tag_expression(raw.strip())
+        return raw.strip()
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    if not isinstance(raw, list):
+        raise VTTError(f"A tag filter is a list of tags or an expression, "
+                       f"got {raw!r}.")
+    out: List[str] = []
+    for t in raw:
+        t = check_tag(t)
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def tag_filter_matches(tags: Any, raw: Any) -> bool:
+    """Whether the tags `tags` match the filter `raw` (a list: any of them;
+    an expression). VTTError for a filter that doesn't parse."""
+    have = set(tags) if not isinstance(tags, str) else {tags}
+    if isinstance(raw, str) and _is_tag_expression(raw):
+        return _eval_tag_tree(_parse_tag_expression(raw.strip()), have)
+    return any(t in have for t in check_tag_filter(raw))
+
+
+def checked_tag_list(raw: Any, where: str) -> List[str]:
+    """A list of tags a unit carries or grants (its tags var, a
+    grants_unit_tags value): a list or comma / space text of tags, none of
+    them an engine tag. VTTError naming `where` otherwise."""
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    if not isinstance(raw, list):
+        raise VTTError(f"{where}: a list of tags, got {raw!r}.")
+    out: List[str] = []
+    for t in raw:
+        try:
+            t = check_tag(t)
+        except VTTError as ex:
+            raise VTTError(f"{where}: {ex}")
+        if t in ENGINE_TAGS:
+            raise VTTError(
+                f"{where}: `{t}` is an engine tag ({', '.join(ENGINE_TAGS)}): "
+                f"the engine gives it from the unit's state.")
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def checked_tag_vars(path: str, value: Any, tags_var: str,
+                     where: str) -> Any:
+    """`value` about to be written at the unit var `path`, with its tag
+    fields checked and normalized: the tags var itself (top level, nothing
+    under it) and every `grants_unit_tags` key at or under the path."""
+    segs = path.split(".") if path else []
+    if segs and segs[0] == tags_var:
+        if len(segs) > 1:
+            raise VTTError(f"{where}: the tags var `{tags_var}` is one list; "
+                           f"nothing nests under it.")
+        return checked_tag_list(value, f"{where}: `{tags_var}`")
+    if GRANTS_UNIT_TAGS in segs:
+        if segs[-1] != GRANTS_UNIT_TAGS:
+            raise VTTError(f"{where}: `{GRANTS_UNIT_TAGS}` is a list of "
+                           f"tags; nothing nests under it.")
+        return checked_tag_list(value, f"{where}: `{path}`")
+
+    def walk(node: Any, at: str) -> None:
+        if isinstance(node, dict):
+            for k in list(node):
+                sub = f"{at}.{k}" if at else str(k)
+                if k == GRANTS_UNIT_TAGS:
+                    node[k] = checked_tag_list(node[k], f"{where}: `{sub}`")
+                else:
+                    walk(node[k], sub)
+    if isinstance(value, dict):
+        if not segs:
+            if tags_var in value:
+                value[tags_var] = checked_tag_list(
+                    value[tags_var], f"{where}: `{tags_var}`")
+        walk(value, path)
+    return value
 
 
 @dataclass
@@ -6574,7 +6813,8 @@ class Entity:
             (match.rules.get("hp_var", "hp"),
              match.rules.get("max_hp_var", "max_hp"),
              match.rules.get("turnorder_var", "initiative")),
-            f"`{self.id}`", match.rules.get("team_var", "team"))
+            f"`{self.id}`", match.rules.get("team_var", "team"),
+            match.rules.get("tags_var", "tags"))
 
         # Validate the WHOLE footprint anchored at (x, y): every covered
         # cell in bounds and unoccupied (stackable spawners skip
@@ -7098,6 +7338,10 @@ class Entity:
                 f"(deleted paths) and can't be a var name (writing '{path}' "
                 f"on `{self.id}`).")
         check_live_markers(value, f"Writing '{path}' on `{self.id}`")
+        if self._match is not None:
+            value = checked_tag_vars(
+                path, value, str(self._match.rules.get("tags_var", "tags")),
+                f"Writing '{path}' on `{self.id}`")
         if self._match is not None:
             # A container whose marker was measured inside another
             # container (copied out of it) is re-measured on its own.
@@ -15114,6 +15358,116 @@ class Match:
             return [str(t).strip() for t in raw if str(t).strip()]
         return []
 
+    # ---- unit tags (docs/tags_design.md) ---------------------------------
+
+    @staticmethod
+    def _read_tags(raw: Any) -> List[str]:
+        """The usable tags of a stored list: words that can be tags and
+        aren't engine tags (a value from before the checks, or edited by
+        hand, reads as what it can)."""
+        out: List[str] = []
+        for t in normalize_tags(raw):
+            try:
+                check_tag(t)
+            except VTTError:
+                continue
+            if t not in ENGINE_TAGS:
+                out.append(t)
+        return out
+
+    def _tag_scan_roots(self, vars_: Dict[str, Any]) -> List[str]:
+        """The vars roots whose containers grant their holder tags: the
+        `__unit_tag_sources` var (replaces the rule) or the unit_tag_sources
+        rule, plus `__unit_tag_sources_add` (extends)."""
+        override = vars_.get("__unit_tag_sources")
+        if isinstance(override, list):
+            roots = [str(r) for r in override]
+        else:
+            roots = [r.strip() for r in
+                     str(self.rules.get("unit_tag_sources", "equipped")).split(",")
+                     if r.strip()]
+        add = vars_.get("__unit_tag_sources_add")
+        if isinstance(add, list):
+            roots = roots + [str(r) for r in add]
+        return roots
+
+    def _own_and_granted_tags(self, vars_: Dict[str, Any],
+                              statuses: Dict[str, Any], team: Optional[str],
+                              ) -> List[Tuple[str, str]]:
+        """(tag, source) for a unit's own tags var and what its statuses,
+        scanned containers and team grant, in that order."""
+        out: List[Tuple[str, str]] = []
+        tags_var = str(self.rules.get("tags_var", "tags"))
+        out += [(t, "own") for t in self._read_tags(vars_.get(tags_var))]
+        for sname, inst in (statuses or {}).items():
+            raw = self.status_field(inst, sname, GRANTS_UNIT_TAGS)
+            out += [(t, f"status {sname}") for t in self._read_tags(raw)]
+
+        def walk(node: Any, path: str) -> None:
+            if not isinstance(node, dict):
+                return
+            if GRANTS_UNIT_TAGS in node:
+                out.extend((t, path) for t in
+                           self._read_tags(node[GRANTS_UNIT_TAGS]))
+            for k, v in node.items():
+                if k != GRANTS_UNIT_TAGS and isinstance(v, dict):
+                    walk(v, f"{path}.{k}")
+        for root in self._tag_scan_roots(vars_):
+            found, node = _rel_get(vars_, root)
+            if found:
+                walk(node, root)
+        if team is not None:
+            tdata = self.team_data.get(team)
+            if isinstance(tdata, dict):
+                out += [(t, f"team {team}") for t in
+                        self._read_tags(tdata.get(GRANTS_UNIT_TAGS))]
+        return out
+
+    def unit_tag_sources(self, e: "Entity") -> List[Tuple[str, str]]:
+        """(tag, source) for each of `e`'s tags, each tag once (its first
+        source): own, granted (statuses, containers, team), a part's root's
+        own and granted tags, then the engine tags."""
+        pairs = self._own_and_granted_tags(e.vars, e.status, e.team)
+        if e.part_of:
+            root = self.body_root(e)
+            if root is not e:
+                pairs += [(t, f"root {root.id}") for t, _s in
+                          self._own_and_granted_tags(root.vars, root.status,
+                                                     root.team)]
+        engine = [("part", bool(e.part_of)),
+                  ("segment", bool(e.vars.get("__segment"))),
+                  ("rider", bool(e.mounted_on)),
+                  ("vehicle", self.is_vehicle(e.id)),
+                  ("map_carrier", bool(self.maps_carried_by(e.id)))]
+        pairs += [(t, "engine") for t, on in engine if on]
+        seen: Dict[str, str] = {}
+        for t, src in pairs:
+            seen.setdefault(t, src)
+        return list(seen.items())
+
+    def unit_tags(self, e: "Entity") -> List[str]:
+        """`e`'s tags (unit_tag_sources without the sources)."""
+        return [t for t, _s in self.unit_tag_sources(e)]
+
+    def corpse_tag_sources(self, corpse: Dict[str, Any]
+                           ) -> List[Tuple[str, str]]:
+        """(tag, source) for a corpse: what its snapshot's own tags var,
+        statuses and containers give, its team's grants, then `corpse`."""
+        vars_ = corpse.get("vars") if isinstance(corpse.get("vars"), dict) \
+            else {}
+        team = team_text(vars_.get(str(self.rules.get("team_var", "team"))))
+        statuses = corpse.get("status") \
+            if isinstance(corpse.get("status"), dict) else {}
+        seen: Dict[str, str] = {}
+        for t, src in self._own_and_granted_tags(
+                vars_, statuses, team if team not in (None, "") else None) \
+                + [("corpse", "engine")]:
+            seen.setdefault(t, src)
+        return list(seen.items())
+
+    def corpse_tags(self, corpse: Dict[str, Any]) -> List[str]:
+        return [t for t, _s in self.corpse_tag_sources(corpse)]
+
     # ---- action restrictions (#234) ------------------------------------
 
     def status_field(self, inst: Any, sname: str, key: str) -> Any:
@@ -18747,7 +19101,8 @@ class Match:
                 new_vars[k] = copy.deepcopy(e.vars[k])
         # Checked BEFORE the old parts go, so a bad statblock changes nothing.
         new_vars = checked_unit_vars(new_vars, (hp_var, max_hp_var, turnorder_var),
-                                     "transform", self.rules.get("team_var", "team"))
+                                     "transform", self.rules.get("team_var", "team"),
+                                     self.rules.get("tags_var", "tags"))
         if hp_var not in new_vars:
             raise VTTError(f"transform: the new form has no `{hp_var}`.")
         # The new body must fit where the unit stands (its own parts, which
@@ -22402,7 +22757,8 @@ VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "part_name_var", "footprint_width_var", "footprint_height_var",
                   "atb_charge_var", "disguise_var", "fog_vision_radius_var",
                   "overlay_var", "map_vehicle_death_effect_var",
-                  "map_vehicle_wreck_var", "mount_death_effect_var")
+                  "map_vehicle_wreck_var", "mount_death_effect_var",
+                  "tags_var")
 
 
 # Map-var-name rules: rule -> (the setting it names, the rule giving the
