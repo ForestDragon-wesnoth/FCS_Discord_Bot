@@ -227,8 +227,16 @@ class Storage:
     def templates_dir(self, key: str) -> str:
         return os.path.join(self.server_dir(key), "templates")
 
-    def template_file(self, key: str, name: str) -> str:
-        return os.path.join(self.templates_dir(key), f"{name}.json")
+    def library_dir(self, key: str, lib: str = "templates") -> str:
+        """The folder of server `key`'s library `lib`: templates/ for entity
+        and partial templates, templates/prefabs/ for prefabs (their own
+        namespace)."""
+        tdir = self.templates_dir(key)
+        return os.path.join(tdir, "prefabs") if lib == "prefabs" else tdir
+
+    def template_file(self, key: str, name: str,
+                      lib: str = "templates") -> str:
+        return os.path.join(self.library_dir(key, lib), f"{name}.json")
 
     # ---- entity templates -------------------------------------------------
     # Templates are the server's library, outside the match state: each one
@@ -239,18 +247,19 @@ class Storage:
     # previous file in templates/.trash/<stamp>-<name>.json for 24 hours
     # (`!template trash` / `!template restore`). They count toward the
     # server's limit and are the first thing cut when a write needs room.
-    def template_trash_dir(self, key: str) -> str:
-        return os.path.join(self.templates_dir(key), ".trash")
+    def template_trash_dir(self, key: str, lib: str = "templates") -> str:
+        return os.path.join(self.library_dir(key, lib), ".trash")
 
     def write_template(self, mgr: MatchManager, name: str,
-                       data: Dict[str, Any], keep_old: bool = True
-                       ) -> Tuple[List[str], bool]:
-        """Write template `name`, first moving the file it replaces into the
-        template trash (keep_old). Returns (notes, whether an old version
-        was kept). Room is made BEFORE anything moves (old versions are cut
-        oldest first), so a refused write changes nothing on disk."""
+                       data: Dict[str, Any], keep_old: bool = True,
+                       lib: str = "templates") -> Tuple[List[str], bool]:
+        """Write template `name` (a prefab with lib="prefabs"), first moving
+        the file it replaces into the library's trash (keep_old). Returns
+        (notes, whether an old version was kept). Room is made BEFORE
+        anything moves (old versions are cut oldest first), so a refused
+        write changes nothing on disk."""
         key = mgr.guild_key
-        path = self.template_file(key, name)
+        path = self.template_file(key, name, lib)
         # Keys in their order (a template's passives fire in it).
         text = json.dumps(data, indent=2) + "\n"
         size = len(text.encode("utf-8"))
@@ -259,20 +268,22 @@ class Storage:
         # A kept old version still counts, so the whole new file is growth.
         notes = self._room_for_template(key, size if kept else size - old)
         if kept:
-            self.trash_template(mgr, name)
+            self.trash_template(mgr, name, lib)
             old = 0
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         _write_text(path, text)
         self.note_written(key, path, old)
         return notes, kept
 
-    def trash_template(self, mgr: MatchManager, name: str) -> bool:
-        """Move template `name`'s file into the template trash (no change in
-        size). False when there is no file."""
+    def trash_template(self, mgr: MatchManager, name: str,
+                       lib: str = "templates") -> bool:
+        """Move template `name`'s file into the library's trash (no change
+        in size). False when there is no file."""
         key = mgr.guild_key
-        path = self.template_file(key, name)
+        path = self.template_file(key, name, lib)
         if not os.path.isfile(path):
             return False
-        tdir = self.template_trash_dir(key)
+        tdir = self.template_trash_dir(key, lib)
         os.makedirs(tdir, exist_ok=True)
         stamp = time.time()
         dest = os.path.join(tdir, f"{stamp:.6f}-{name}.json")
@@ -282,23 +293,26 @@ class Storage:
         os.replace(path, dest)
         return True
 
-    def delete_template(self, mgr: MatchManager, name: str) -> None:
-        """Move template `name` to the template trash."""
-        self.trash_template(mgr, name)
+    def delete_template(self, mgr: MatchManager, name: str,
+                        lib: str = "templates") -> None:
+        """Move template `name` to the library's trash."""
+        self.trash_template(mgr, name, lib)
 
     def rename_template_file(self, mgr: MatchManager, old: str,
-                             new: str) -> None:
+                             new: str, lib: str = "templates") -> None:
         key = mgr.guild_key
-        src, dest = self.template_file(key, old), self.template_file(key, new)
+        src = self.template_file(key, old, lib)
+        dest = self.template_file(key, new, lib)
         if os.path.isfile(src):
             os.replace(src, dest)
 
-    def template_trash(self, key: str, name: Optional[str] = None
+    def template_trash(self, key: str, name: Optional[str] = None,
+                       lib: str = "templates"
                        ) -> List[Tuple[float, str, str]]:
-        """(time, template name, path) of server `key`'s old template
-        versions from the last 24 hours, newest first; older ones are
+        """(time, template name, path) of server `key`'s old versions in
+        library `lib` from the last 24 hours, newest first; older ones are
         deleted on the way."""
-        tdir = self.template_trash_dir(key)
+        tdir = self.template_trash_dir(key, lib)
         out: List[Tuple[float, str, str]] = []
         if not os.path.isdir(tdir):
             return out
@@ -332,7 +346,9 @@ class Storage:
         """Delete server `key`'s oldest old template versions until `need`
         bytes are freed (or none are left). Returns (count, bytes freed)."""
         n = freed = 0
-        for _stamp, _name, path in reversed(self.template_trash(key)):
+        olds = sorted(self.template_trash(key)
+                      + self.template_trash(key, lib="prefabs"))
+        for _stamp, _name, path in olds:
             if freed >= need:
                 break
             size = _file_size(path)
@@ -354,8 +370,8 @@ class Storage:
         msg = self._over_limit(key, delta)
         if msg:
             raise VTTError(msg.removeprefix("❌ "))
-        return [f"🗄️ Storage limit: cut the {n} oldest old template "
-                f"version(s) to make room."] if n else []
+        return [f"🗄️ Storage limit: cut the {n} oldest old template / "
+                f"prefab version(s) to make room."] if n else []
 
     def load_templates(self, mgr: MatchManager) -> List[str]:
         """Read the server's templates/ folder into `mgr.templates`; a file
@@ -400,6 +416,31 @@ class Storage:
                         "at": _now_iso(),
                         "by": "", "what": "updated at load",
                         "data": copy.deepcopy(mgr.templates[name])})
+        return notes
+
+    def load_prefabs(self, mgr: MatchManager) -> List[str]:
+        """Read the server's templates/prefabs/ folder into `mgr.prefabs`; a
+        file that doesn't load is moved to corrupt/."""
+        from prefab import check_prefab, check_prefab_name
+        key = mgr.guild_key
+        notes: List[str] = []
+        mgr.prefabs = {}
+        pdir = self.library_dir(key, "prefabs")
+        if not os.path.isdir(pdir):
+            return notes
+        for fname in sorted(os.listdir(pdir)):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(pdir, fname)
+            try:
+                name = check_prefab_name(fname[:-5])
+                if name != fname[:-5]:
+                    raise ValueError("file name isn't a prefab name")
+                data = check_prefab(self._read_json(fpath), name)
+            except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
+                notes.append(self._quarantine(key, fpath, type(ex).__name__))
+                continue
+            mgr.prefabs[name] = data
         return notes
 
     # ---- error log --------------------------------------------------------
@@ -496,8 +537,13 @@ class Storage:
         tdir = os.path.join(sdir, "templates")
         if os.path.isdir(tdir):
             trash = _dir_size(os.path.join(tdir, TRASH_DIR))
-            out["templates"] = _dir_size(tdir) - trash
+            pdir = os.path.join(tdir, "prefabs")
+            ptrash = _dir_size(os.path.join(pdir, TRASH_DIR))
+            prefabs = _dir_size(pdir)
+            out["templates"] = _dir_size(tdir) - trash - prefabs
             out["old template versions"] = trash
+            out["prefabs"] = prefabs - ptrash
+            out["old prefab versions"] = ptrash
         for sub, label in (("saves", "saves"), ("sprites", "sprites"),
                            ("corrupt", "corrupt files"),
                            (BACKUP_DIR, "server file backups")):
@@ -570,6 +616,7 @@ class Storage:
                 path = os.path.join(self.root, name, "templates")
                 if os.path.isdir(path) and valid_id(name):
                     notes.extend(self.load_templates(workspaces.get(name)))
+                    notes.extend(self.load_prefabs(workspaces.get(name)))
             self.rescan()
             for n in notes:
                 print(n)
@@ -694,6 +741,7 @@ class Storage:
                     notes.append(self._quarantine(key, path,
                                                   type(ex).__name__))
         notes.extend(self.load_templates(mgr))
+        notes.extend(self.load_prefabs(mgr))
         self._journal_load_changes(mgr)
         lost = any(m.system_name not in mgr.systems
                    for m in mgr.matches.values())
@@ -1500,6 +1548,9 @@ class Storage:
             if valid_id(server) and os.path.isdir(
                     os.path.join(self.root, server, "templates", ".trash")):
                 self.template_trash(server)
+            if valid_id(server) and os.path.isdir(os.path.join(
+                    self.root, server, "templates", "prefabs", ".trash")):
+                self.template_trash(server, lib="prefabs")
 
     def trash_entries(self, key: str) -> List[Tuple[float, str, str]]:
         """(time, scope, path) of server `key`'s trash entries, newest first."""

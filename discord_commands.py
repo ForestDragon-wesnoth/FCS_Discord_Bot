@@ -134,7 +134,7 @@ def _command_lines(content: str, prefix: str) -> List[str]:
             continue
         s = ln.strip()
         if (out and not (prefix and s.startswith(prefix))
-                and re.match(r"template\s+import\s",
+                and re.match(r"(template|prefab)\s+import\s",
                              _strip_prefix(out[-1].split("\n", 1)[0], prefix),
                              re.IGNORECASE)):
             out[-1] += "\n" + s

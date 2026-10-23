@@ -604,7 +604,7 @@ class GuiApp:
             if not ln:
                 continue        # a blank line (in pasted JSON too) is nothing
             if (lines and not ln.startswith("!")
-                    and re.match(r"!template\s+import\s", lines[-1],
+                    and re.match(r"!(template|prefab)\s+import\s", lines[-1],
                                  re.IGNORECASE)):
                 lines[-1] += "\n" + ln
             elif (lines and not ln.startswith("!")
