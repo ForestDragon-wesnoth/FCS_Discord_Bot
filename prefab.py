@@ -15,7 +15,9 @@ The agreed design is docs/zones_prefabs_design.md §5-§9. A prefab holds:
    "groups": {group: [saved id, ...]},
    "definitions": {library: {name: entry}}, the match-level definitions the
                                             contents use (§8)
-   "saved_by": ..., "saved_by_name": ...}
+   "saved_by": ..., "saved_by_name": ...,
+   "tags": [tag, ...]}                      library tags (`!prefab tags`),
+                                            for `!prefab list tag=`
 
 Offsets are 0-based from the rectangle's top-left cell. Saved ids are link
 keys: a stamp keeps a saved id while the match has it free and mints a new
@@ -45,7 +47,7 @@ PREFAB_LIBRARIES: Tuple[str, ...] = ("tile_templates", "status_definitions",
 _FOOTPRINT_RULES = ("footprint_width_var", "footprint_height_var")
 _PREFAB_KEYS = ("kind", "width", "height", "system", "definitions_all",
                 "var_names", "tiles", "corpses", "zones", "units", "groups",
-                "definitions", "saved_by", "saved_by_name")
+                "definitions", "saved_by", "saved_by_name", "tags")
 
 
 def check_prefab_name(name: Any) -> str:
@@ -334,6 +336,11 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
         raise VTTError(f"Prefab `{name}`: `system` must name the game "
                        f"system it was made for.")
     d["definitions_all"] = bool(d.get("definitions_all"))
+    if "tags" in d:
+        d["tags"] = logic.checked_tag_list(d["tags"], f"Prefab `{name}` tags",
+                                           engine_ok=True)
+        if not d["tags"]:
+            del d["tags"]
     for t in d["tiles"]:
         if not (isinstance(t, list) and len(t) == 3 and isinstance(t[2], dict)):
             raise VTTError(f"Prefab `{name}`: a tile entry is [dx, dy, "

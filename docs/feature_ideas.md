@@ -15,7 +15,8 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #234, #40 and #164 (multiple and nested maps, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #234, #260 (tags, see
+`docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
 
@@ -335,7 +336,6 @@ or rejects one, it moves to "Off the list".
 - **#259 Per-level status data.** (To discuss, user.) A status definition holds entries per level, exact (`3`) or from a level up (`3+`), each carrying its own data that applies while the instance is at that level: the action restriction lists of #234 (Solis freeze forbids sprint and rest, and dodge from level 3), modifiers, a tick, a display.
   - Open: how entries combine with the definition's own fields and with each other (merge or replace, and which entry wins when `2+` and `3` both match), how an instance's own keys override them, and how `!status` edits them.
   - The #234 checks read every list through `Match.status_field`, the one place a level entry would merge in.
-- **#260 A wider tag system.** Designed in `docs/tags_design.md`; PRs 1 and 2 (the filter rule everywhere, unit / corpse / container / team / map tags, the action and status fields) are built. Open: PR 3 (library tags for templates, partials and prefabs; the optional vocabulary).
 - **#258 Reapply a definition's data.** `!zone def <d> reapply` / `!tile def <t> reapply` push the definition's or template's data to the zones and tiles made from it (data is copied at creation, so a later data edit reaches only new ones).
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.

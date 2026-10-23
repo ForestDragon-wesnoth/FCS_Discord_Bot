@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -298,7 +298,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
         if sub in ("alias", "tile", "func", "status", "table", "macro",
-                   "zone"):
+                   "zone", "tags"):
             # !system alias <action> <sys> ...
             return len(args) < 2 or args[1].lower() not in ("list", "info",
                                                             "show")
@@ -315,6 +315,39 @@ def _admin_required(name: str, args: List[str]) -> bool:
         # (every match on it refreshes); bare `!log format` only lists.
         return sub == "format" and len(args) >= 2
     return False
+
+
+def _vocabulary_warns(mgr: MatchManager) -> bool:
+    """Whether a system of the server warns about undeclared tags."""
+    return any(mgr.system_value(s, "tag_vocabulary_mode") == "warn"
+               for s in mgr.systems.values())
+
+
+def _vocabulary_warning(mgr: MatchManager, ctx: ReplyContext,
+                        stored: Dict[Optional[str], set]) -> str:
+    """The ⚠️ ending a command that stored tags a warning system's
+    vocabulary lacks (STORED_TAGS: system -> tags; None = the command's own
+    system, the channel's match's or else the channel's default)."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    own = (mgr.matches[mid].system_name if mid in mgr.matches
+           else mgr.effective_system_name(ctx.channel_key))
+    found: Dict[str, set] = {}
+    for sysname, tags in stored.items():
+        found.setdefault(sysname or own, set()).update(tags)
+    lines = []
+    for sysname in sorted(found):
+        s = mgr.systems.get(sysname)
+        if s is None or mgr.system_value(s, "tag_vocabulary_mode") != "warn":
+            continue
+        missing = sorted(found[sysname]
+                         - set(mgr.system_library(s, "tag_vocabulary")))
+        if missing:
+            lines.append(
+                f"⚠️ Not in system `{sysname}`'s tag vocabulary: "
+                + ", ".join(f"`{t}`" for t in missing)
+                + f" (`!system tags add {sysname} <tag> <description>` "
+                  f"declares one).")
+    return "\n".join(lines)
 
 
 class AssertionStop(VTTError):
@@ -865,6 +898,10 @@ class CommandRegistry:
         outer = (_RUN_DEPTH.get() == 1 and name.lower() != "as"
                  and not _AGAIN_ACTIVE.get())
         audit_token = _AUDIT_NOTES.set([]) if outer else None
+        # The tags this command stores, while a system of the server warns
+        # about tags its vocabulary lacks (tag_vocabulary_mode).
+        tags_token = (STORED_TAGS.set({}) if outer and _vocabulary_warns(mgr)
+                      else None)
         pre_text = mgr.server_state_text() if outer else ""
         pre_matches = ({mid: m.system_name for mid, m in mgr.matches.items()}
                        if outer else {})
@@ -887,8 +924,14 @@ class CommandRegistry:
                                            pre_matches, _AUDIT_NOTES.get())
                     _journal_after(mgr)
             await _flush_formula_log(ctx)
+            if tags_token is not None:
+                warn = _vocabulary_warning(mgr, ctx, STORED_TAGS.get() or {})
+                if warn:
+                    await ctx.send(warn)
             return result
         finally:
+            if tags_token is not None:
+                STORED_TAGS.reset(tags_token)
             if audit_token is not None:
                 _AUDIT_NOTES.reset(audit_token)
             CRASH_CONTEXT.reset(crash_token)
@@ -1684,7 +1727,8 @@ def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
                           ("formula_functions", "functions"),
                           ("status_definitions", "statuses"),
                           ("zone_definitions", "zone definitions"),
-                          ("tables", "tables"), ("macros", "macros")):
+                          ("tables", "tables"), ("macros", "macros"),
+                          ("tag_vocabulary", "tag vocabulary")):
             la, lb = a.get(lib) or {}, b.get(lib) or {}
             names = sorted(k for k in set(la) | set(lb)
                            if la.get(k) != lb.get(k))
@@ -4937,6 +4981,8 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
                 f"name, or `!template delete {name} force` first (it writes "
                 f"`{name}` into them).")
     _check_expansion(ctx, mgr, name, data)
+    note_stored_tags(None, old, data, extra_keys=[
+        v for v in ((data.get("var_names") or {}).get("tags_var"),) if v])
     by, by_name = saver if saver is not None else (ctx_user(ctx),
                                                    ctx_user_name(ctx))
     for k, v in (("saved_by", by), ("saved_by_name", by_name)):
@@ -5103,7 +5149,8 @@ _TEMPLATE_EDIT_FIELDS = ("name", "vars", "status", "passives", "clamps",
                          "facing")
 
 
-def _template_summary(name: str, tpl: Dict[str, Any]) -> str:
+def _template_summary(name: str, tpl: Dict[str, Any],
+                      tags: Optional[List[str]] = None) -> str:
     by = tpl.get("saved_by_name") or tpl.get("saved_by")
     if _is_partial(tpl):
         data = tpl.get("data") or {}
@@ -5121,9 +5168,49 @@ def _template_summary(name: str, tpl: Dict[str, Any]) -> str:
             bits.append(f"hp {tvars.get('hp')}")
         if n:
             bits.append(f"{n} part(s)")
+    if tags is None:
+        # Unresolved (no partial expanded): the partial's own field, or
+        # the tags var as saved.
+        raw = (tpl.get("tags") if _is_partial(tpl) else (tpl.get("vars") or {})
+               .get((tpl.get("var_names") or {}).get("tags_var") or "tags"))
+        tags = [str(t) for t in raw] if isinstance(raw, list) else []
+    if tags:
+        bits.append("tags " + ", ".join(tags))
     if by:
         bits.append(f"saved by {by}")
     return ", ".join(bits)
+
+
+def _template_tags_var(tpl: Dict[str, Any], resolver: Match) -> str:
+    """The var holding an entity template's tags: the name it was saved
+    with, else the tags_var rule of `resolver`'s system."""
+    return ((tpl.get("var_names") or {}).get("tags_var")
+            or str(resolver.rules.get("tags_var", "tags")))
+
+
+def _template_tags(tpl: Dict[str, Any], resolver: Match) -> List[str]:
+    """A library entry's tags: a partial's `tags` field, an entity
+    template's tags var (with its partial references resolved, so a tag
+    an `orc_base` gives shows), each once. Unusable words are skipped."""
+    if _is_partial(tpl):
+        raw: Any = tpl.get("tags")
+    else:
+        try:
+            tvars = _expanded_template(tpl, resolver).get("vars") or {}
+        except (VTTError, FormulaError):
+            tvars = tpl.get("vars") or {}
+        raw = tvars.get(_template_tags_var(tpl, resolver))
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    out: List[str] = []
+    for t in raw if isinstance(raw, list) else []:
+        try:
+            t = check_tag(t)
+        except VTTError:
+            continue
+        if t not in out:
+            out.append(t)
+    return out
 
 
 def _template_options(args: List[str], start: int, usage: str,
@@ -5254,7 +5341,7 @@ _TEMPLATE_DIFF_ROWS = 40
 
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|give|list|diff|show|import|set|unset|part|rename|copy|delete|trash|restore|resync|detach|refs> ...",
+    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|part|rename|copy|delete|trash|restore|resync|detach|refs> ...",
     desc=(
         "This server's library of saved templates, shared by all its matches "
         "and kept on disk (even when the CLI / GUI don't keep matches). An "
@@ -5267,7 +5354,7 @@ _TEMPLATE_DIFF_ROWS = 40
         "and saving the unit stores only those changes. `save <unit> [name] "
         "[path=<var.path>]`, `spawn`, `give <partial> <unit> <path>`, `list`, "
         "`show <name> [path] [compact] [expanded] [part=]`, `import <name> "
-        "<json>`, `set` / `unset`, `part remove`, `rename`, `copy`, `delete`, "
+        "<json>`, `set` / `unset`, `tags`, `part remove`, `rename`, `copy`, `delete`, "
         "`trash` / `restore`, `resync <unit> [path]`, `detach <unit> [path]`, "
         "`refs <unit>`. Only whoever saved a template, or a server "
         "administrator, can change or delete it. Formulas: summon_template / "
@@ -5282,9 +5369,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sub = args[0].lower()
 
     if sub == "list":
-        usage = "!template list [kind=<entity|partial>] [by=<user>] [prefix]"
+        usage = ("!template list [kind=<entity|partial>] [by=<user>] "
+                 "[tag=<filter>] [prefix]")
         words, opts = _template_options(args, 1, usage,
-                                        allowed=("kind", "by"))
+                                        allowed=("kind", "by", "tag"))
         if len(words) > 1:
             raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
                            f"`{usage}`.")
@@ -5292,23 +5380,30 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if kind not in ("", "entity", "partial"):
             raise VTTError(f"kind= is `entity` or `partial`, not `{kind}`.")
         by = (opts.get("by") or "").lower()
+        tag_filter = (check_tag_filter(opts["tag"]) if "tag" in opts
+                      else None)
         prefix = words[0].lower() if words else ""
         if not mgr.templates:
             return await ctx.send("This server has no saved templates "
                                   "(`!template save <unit> [name]`).")
+        resolver = _template_resolver(mgr, ctx, library=True)
+        tags = {n: _template_tags(t, resolver)
+                for n, t in mgr.templates.items()}
         names = [n for n in sorted(mgr.templates)
                  if n.startswith(prefix)
                  and (not kind or (kind == "partial")
                       == _is_partial(mgr.templates[n]))
                  and (not by or by in (
                      str(mgr.templates[n].get("saved_by_name") or "").lower(),
-                     str(mgr.templates[n].get("saved_by") or "").lower()))]
+                     str(mgr.templates[n].get("saved_by") or "").lower()))
+                 and (tag_filter is None
+                      or tag_filter_matches(tags[n], tag_filter))]
         if not names:
             return await ctx.send("No template matches those filters.")
         filtered = len(names) != len(mgr.templates)
         lines = [f"**Templates ({len(names)}"
                  + (f" of {len(mgr.templates)}" if filtered else "") + "):**"]
-        lines += [f"- {_template_summary(n, mgr.templates[n])}"
+        lines += [f"- {_template_summary(n, mgr.templates[n], tags[n])}"
                   for n in names]
         return await ctx.send("\n".join(lines))
 
@@ -5418,6 +5513,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             name = check_template_name(words[1] if len(words) > 1 else default)
             data = {"kind": "partial",
                     "data": m.capture_partial(e, path, notes)}
+            old = mgr.templates.get(name)
+            if isinstance(old, dict) and _is_partial(old) and old.get("tags"):
+                # A re-save keeps the partial's library tags.
+                data["tags"] = list(old["tags"])
         else:
             name = check_template_name(words[1] if len(words) > 1 else e.id)
             data = m.capture_template(e, notes=notes)
@@ -5506,6 +5605,46 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg = f"✏️ Template {where}: `{path}` = `{shown}`."
         else:
             msg = f"✏️ Template {where}: removed `{path}`."
+        return await ctx.send("\n".join([msg] + notes))
+
+    if sub == "tags":
+        if await return_help_if_not_enough_args(ctx, args, 2, "template", "tags"):
+            return
+        name, tpl = _get_template(mgr, args[1])
+        resolver = _template_resolver(mgr, ctx, library=True)
+        raw = " ".join(args[2:]).strip()
+        if not raw:
+            have = _template_tags(tpl, resolver)
+            return await ctx.send(
+                f"Template `{name}` tags: " + (", ".join(have) if have
+                                               else "(none)"))
+        _require_saver(ctx, name, tpl, "edit")
+        new = copy.deepcopy(tpl)
+        if _is_partial(tpl):
+            value = ([] if raw == "-" else
+                     checked_tag_list(raw, f"Template `{name}` tags",
+                                      engine_ok=True))
+            if value:
+                new["tags"] = value
+            else:
+                new.pop("tags", None)
+        else:
+            # An entity template's tags are its unit's tags var: the
+            # tags its spawned units carry.
+            tvar = _template_tags_var(tpl, resolver)
+            value = ([] if raw == "-" else
+                     checked_tag_list(raw, f"Template `{name}` tags"))
+            tvars = new.setdefault("vars", {})
+            if value:
+                tvars[tvar] = value
+            else:
+                tvars.pop(tvar, None)
+        new, _ = check_template(new, name, mgr.templates)
+        _verb, notes = _store_template(
+            ctx, mgr, name, new,
+            saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
+        msg = (f"🏷️ Template `{name}` tags: {', '.join(value)}." if value
+               else f"🏷️ Cleared template `{name}`'s tags.")
         return await ctx.send("\n".join([msg] + notes))
 
     if sub == "part":
@@ -5909,10 +6048,18 @@ for _subs, _usage, _desc in (
         (("give",), "!template give <partial> <unit> <path>",
          "Build a partial template into a unit's var path (replacing what is "
          "there); the unit's own changes to it are recorded from then on."),
-        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [prefix]",
+        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [prefix]",
          "This server's saved templates; kind= keeps entity or partial "
-         "templates, by= those a user saved, a prefix those whose name starts "
+         "templates, by= those a user saved, tag= those whose tags match a "
+         "tag filter (a list = any of them, or an expression such as "
+         "`\"undead and not boss\"`), a prefix those whose name starts "
          "with it."),
+        (("tags",), "!template tags <name> [<tag ...> | -]",
+         "A template's library tags (what `list tag=` matches): an entity "
+         "template's are its unit's tags var (this writes that var, so "
+         "spawned units carry them), a partial's a `tags` field of its own "
+         "(units built from it don't take them). No tags shows them, `-` "
+         "clears them. Its saver or an administrator."),
         (("diff",), "!template diff <name> <other | unit=<id>>",
          "The paths where two templates differ, or a template and a unit of "
          "this channel's match (host only, it shows the unit's vars), with "
@@ -6001,6 +6148,7 @@ def _store_prefab(ctx: ReplyContext, mgr: MatchManager, name: str,
     old = mgr.prefabs.get(name)
     if old is not None and check_saver:
         _require_prefab_saver(ctx, name, old, "replace")
+    note_stored_tags(None, old, data)
     by, by_name = saver if saver is not None else (ctx_user(ctx),
                                                    ctx_user_name(ctx))
     for k, v in (("saved_by", by), ("saved_by_name", by_name)):
@@ -6031,6 +6179,8 @@ def _prefab_summary(name: str, pf: Dict[str, Any]) -> str:
             bits.append(f"{n} {word}{'s' if n != 1 else ''}")
     bits.append(f"system `{pf.get('system')}`"
                 + (", every definition" if pf.get("definitions_all") else ""))
+    if pf.get("tags"):
+        bits.append("tags " + ", ".join(map(str, pf["tags"])))
     who = pf.get("saved_by_name") or pf.get("saved_by")
     return f"`{name}` — " + ", ".join(bits) + (f"; by {who}" if who else "")
 
@@ -6048,8 +6198,12 @@ def _prefab_scratch(mgr: MatchManager, ctx: ReplyContext, name: str,
                rules=mgr._build_rules_dict(mgr.systems[sysname]))
     shown = pf if sysname == pf.get("system") else dict(pf,
                                                         definitions_all=True)
-    res = stamp_prefab(mgr, sc, name, shown, 1, 1, sc.get_map(),
-                       mode="overlay")
+    token = STORED_TAGS.set(None)     # a throwaway: nothing is stored
+    try:
+        res = stamp_prefab(mgr, sc, name, shown, 1, 1, sc.get_map(),
+                           mode="overlay")
+    finally:
+        STORED_TAGS.reset(token)
     return sc, res
 
 
@@ -6059,7 +6213,8 @@ _PREFAB_USAGE = {
     "stamp": ("!prefab stamp <name> <x> <y> [map=<map>] [mode=<mode>] "
               "[rotate=<deg>] [flip=<h|v>] [team=<team>] [confirm]"),
     "show": "!prefab show <name> [text|image]",
-    "list": "!prefab list [prefix]",
+    "list": "!prefab list [tag=<filter>] [prefix]",
+    "tags": "!prefab tags <name> [<tag ...> | -]",
     "import": "!prefab import <name> <json ...>",
     "rename": "!prefab rename <name> <new_name>",
     "copy": "!prefab copy <name> <new_name>",
@@ -6071,8 +6226,8 @@ _PREFAB_USAGE = {
 
 @registry.command(
     "prefab",
-    usage=("!prefab <save|stamp|show|list|import|rename|copy|delete|trash|"
-           "restore> ..."),
+    usage=("!prefab <save|stamp|show|list|tags|import|rename|copy|delete|"
+           "trash|restore> ..."),
     desc=(
         "Prefabs: a saved rectangle of one map (its units with their parts "
         "and riders, tile data, zones and corpses), stamped into any match "
@@ -6097,17 +6252,51 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     usage = _PREFAB_USAGE[sub]
 
     if sub == "list":
-        _check_tail(args, 2, (), usage)
-        prefix = args[1].lower() if len(args) > 1 else ""
-        names = [n for n in sorted(mgr.prefabs) if n.startswith(prefix)]
+        words, opts = _template_options(args, 1, usage, allowed=("tag",))
+        if len(words) > 1:
+            raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
+                           f"`{usage}`.")
+        prefix = words[0].lower() if words else ""
+        tag_filter = (check_tag_filter(opts["tag"]) if "tag" in opts
+                      else None)
+        names = [n for n in sorted(mgr.prefabs) if n.startswith(prefix)
+                 and (tag_filter is None or tag_filter_matches(
+                     list(mgr.prefabs[n].get("tags") or []), tag_filter))]
         if not names:
+            if mgr.prefabs and (prefix or tag_filter is not None):
+                return await ctx.send("No prefab matches those filters.")
             return await ctx.send(
-                "No prefabs" + (f" starting with `{prefix}`" if prefix else "")
-                + " on this server. `!prefab save <name> <x1> <y1> <x2> <y2>` "
-                  "saves one.")
+                "No prefabs on this server. `!prefab save <name> <x1> <y1> "
+                "<x2> <y2>` saves one.")
         return await ctx.send("\n".join(
             [f"**Prefabs ({len(names)}):**"]
             + [f"- {_prefab_summary(n, mgr.prefabs[n])}" for n in names]))
+
+    if sub == "tags":
+        if await return_help_if_not_enough_args(ctx, args, 2, "prefab", "tags"):
+            return
+        name, pf = _get_prefab(mgr, args[1])
+        raw = " ".join(args[2:]).strip()
+        if not raw:
+            have = list(pf.get("tags") or [])
+            return await ctx.send(f"Prefab `{name}` tags: "
+                                  + (", ".join(have) if have else "(none)"))
+        _require_prefab_saver(ctx, name, pf, "edit")
+        value = ([] if raw == "-" else
+                 checked_tag_list(raw, f"Prefab `{name}` tags",
+                                  engine_ok=True))
+        new = copy.deepcopy(pf)
+        if value:
+            new["tags"] = value
+        else:
+            new.pop("tags", None)
+        new = check_prefab(new, name)
+        _verb, notes = _store_prefab(
+            ctx, mgr, name, new,
+            saver=(pf.get("saved_by"), pf.get("saved_by_name")))
+        msg = (f"🏷️ Prefab `{name}` tags: {', '.join(value)}." if value
+               else f"🏷️ Cleared prefab `{name}`'s tags.")
+        return await ctx.send("\n".join([msg] + notes))
 
     if sub == "trash":
         _check_tail(args, 2, (), usage)
@@ -6204,6 +6393,9 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                "stamps on any game system).")
             every = True
         data, notes = capture_prefab(mgr, m, smp, x1, y1, x2, y2, only, every)
+        old = mgr.prefabs.get(name)
+        if isinstance(old, dict) and old.get("tags"):
+            data["tags"] = list(old["tags"])     # a re-save keeps its tags
         data = check_prefab(data, name)
         verb, more = _store_prefab(ctx, mgr, name, data)
         return await ctx.send("\n".join(
@@ -6367,7 +6559,12 @@ for _sub, _usage in _PREFAB_USAGE.items():
         "show": ("Show a prefab as a map (text, or an image where the "
                  "channel's match draws images; `text` / `image` choose) "
                  "with its size, contents and the definitions it carries."),
-        "list": "This server's prefabs (those starting with a prefix).",
+        "list": ("This server's prefabs: tag= keeps those whose tags match "
+                 "a tag filter (a list = any of them, or an expression), a "
+                 "prefix those whose name starts with it."),
+        "tags": ("A prefab's library tags (what `list tag=` matches; "
+                 "stamped units don't take them). No tags shows them, `-` "
+                 "clears them. Its saver or an administrator."),
         "import": ("Save pasted JSON as a prefab, or replace one with JSON "
                    "edited elsewhere (the rest of the line is the JSON; a "
                    "```json fence is fine). It is checked like a save."),
@@ -7691,6 +7888,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_status(ctx, args, mgr)
     if sub == "zone":
         return await _system_zone(ctx, args, mgr)
+    if sub == "tags":
+        return await _system_tags(ctx, args, mgr)
     if sub in ("table", "macro"):
         return await _system_text_lib(ctx, args, mgr, sub)
 
@@ -8112,6 +8311,7 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             n += 1
             check(f"match `{m.id}` {where}", src, mode, known, params,
                   action_mode)
+    warn += _lint_undeclared_tags(mgr, s, matches)
     head = (f"🔍 `{s.name}` and its {len(matches)} match"
             f"{'es' if len(matches) != 1 else ''}: {n} formula slot(s) "
             f"checked")
@@ -8119,6 +8319,64 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         return head + " — all clean."
     return "\n".join([head + f" — {len(bad)} problem(s), {len(warn)} "
                       f"warning(s):"] + bad + warn)
+
+
+def _lint_undeclared_tags(mgr: MatchManager, s: Any,
+                          matches: List[Match]) -> List[str]:
+    """`!system lint`'s tag check, once the system declares tags: each tag
+    its libraries, its matches (units and their statuses, team data, map
+    tags, tiles, zones, definitions) and its prefabs store that the
+    vocabulary lacks, with where it was found."""
+    vocab = set(mgr.system_library(s, "tag_vocabulary"))
+    if not vocab:
+        return []
+    found: Dict[str, List[str]] = {}
+
+    def look(where: str, node: Any, key: Optional[str] = None,
+             extra: Tuple[str, ...] = ()) -> None:
+        for t in sorted(tag_words(node, key, extra) - vocab):
+            found.setdefault(t, []).append(where)
+
+    for kind, what in (("status_definitions", "status"),
+                       ("zone_definitions", "zone definition"),
+                       ("tile_templates", "tile template")):
+        for name, d in sorted(mgr.system_library(s, kind).items()):
+            look(f"{what} `{name}`", d)
+    look("default_entity_vars", mgr.system_value(s, "default_entity_vars"))
+    for m in matches:
+        at = f"match `{m.id}`"
+        tvar = str(m.rules.get("tags_var", "tags"))
+        for eid, e in sorted(m.entities.items()):
+            look(f"{at} unit `{eid}`", {"vars": e.vars, "status": e.status},
+                 extra=(tvar,))
+        for team, d in sorted(m.team_data.items(), key=lambda kv: str(kv[0])):
+            look(f"{at} team `{team}`", d)
+        for kind, what in (("status_definitions", "status"),
+                           ("zone_definitions", "zone definition")):
+            for name, d in sorted(getattr(m, kind).items()):
+                look(f"{at} {what} `{name}`", d)
+        for name, tpl in sorted(m.tile_templates.items()):
+            look(f"{at} tile template `{name}`", tpl.to_dict())
+        for mp in m.maps.values():
+            look(f"{at} map `{mp.name}`", mp.vars.get(m.map_var_name("tags")),
+                 "tags")
+            for (x, y), d in sorted(mp.tiles.items()):
+                look(f"{at} tile ({x},{y})" + (f" on `{mp.name}`"
+                                               if len(m.maps) > 1 else ""), d)
+            for zname, z in sorted(mp.zones.items()):
+                look(f"{at} zone `{zname}`", {"tags": z.get("tags"),
+                                              "data": z.get("data")})
+    for name, pf in sorted((getattr(mgr, "prefabs", {}) or {}).items()):
+        if pf.get("system") == s.name:
+            look(f"prefab `{name}`", pf)
+    out = []
+    for t in sorted(found):
+        places = found[t]
+        out.append(f"⚠️ tag `{t}` isn't in the vocabulary: "
+                   + ", ".join(places[:3])
+                   + (f" (+{len(places) - 3} more)" if len(places) > 3
+                      else ""))
+    return out
 
 
 def _sync_change(lib_name: str, name: str, old: Any, new: Any) -> str:
@@ -8309,6 +8567,7 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
         else:
             for t in raw.replace(",", " ").split():
                 check_tag(t)
+            note_stored_tags(sys_name, tpl.tags, raw, "tags")
             tpl.tags = normalize_tags(raw)
         reply = (f"`{sys_name}` tile template `{name}` tags = "
                  f"{', '.join(tpl.tags) or 'none'}.")
@@ -8627,6 +8886,69 @@ async def _system_zone(ctx: ReplyContext, args: List[str],
     mgr.system_library_write(s, kind, scratch.zone_definitions)
     if reply:
         await ctx.send(reply)
+
+
+_SYSTEM_TAGS_USAGE = ("!system tags <list <system> | "
+                      "add <system> <tag> [<description ...>] | "
+                      + " | ".join(f"{d} <system> <tag ...>"
+                                   for d in _SYSTEM_LIB_DELETES) + ">")
+
+
+async def _system_tags(ctx: ReplyContext, args: List[str],
+                       mgr: MatchManager):
+    """`!system tags <list|add|remove> <system> ...` — the system's tag
+    vocabulary (docs/tags_design.md §7): declared tags with descriptions,
+    inherited entry by entry, read live (never copied into a match)."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "tags"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    kind = "tag_vocabulary"
+    if action not in ("list", "add") + _SYSTEM_LIB_DELETES:
+        return await _help_fallback(ctx, ["system", "tags"], args[1])
+    lib = mgr.system_library(s, kind)
+    if action == "list":
+        _check_tail(args, 3, (), "!system tags list <system>")
+        mode = mgr.system_value(s, "tag_vocabulary_mode")
+        if not lib:
+            return await ctx.send("\n".join(
+                [f"No tags declared on system `{sys_name}` (tag_vocabulary_"
+                 f"mode {mode})."] + _system_hidden_line(s, kind)))
+        lines = [f"**Tag vocabulary of `{sys_name}`** ({len(lib)}, "
+                 f"tag_vocabulary_mode {mode}):"]
+        for t in sorted(lib):
+            src = "" if t in s.tag_vocabulary else " (inherited)"
+            lines.append(f"- `{t}`" + (f": {lib[t]}" if lib[t] else "")
+                         + src)
+        return await ctx.send("\n".join(lines + _system_hidden_line(s, kind)))
+    if await return_help_if_not_enough_args(ctx, args, 4, "system", "tags"):
+        return
+    if action == "add":
+        tag = check_tag(args[3])
+        if tag in ENGINE_TAGS:
+            raise VTTError(f"`{tag}` is an engine tag ({', '.join(ENGINE_TAGS)}"
+                           f"): the engine declares it.")
+        desc = " ".join(args[4:]).strip()
+        prior = lib.get(tag)
+        lib[tag] = desc
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(
+            f"🏷️ Declared tag `{tag}` on `{sys_name}`"
+            + (f": {desc}" if desc else "")
+            + (" (replaced the previous description)."
+               if prior is not None and prior != desc else "."))
+    gone = []
+    for raw in args[3:]:
+        tag = check_tag(raw)
+        if tag not in lib:
+            raise VTTError(f"`{tag}` isn't declared on system `{sys_name}` "
+                           f"(`!system tags list {sys_name}`).")
+        gone.append(tag)
+    for tag in gone:
+        del lib[tag]
+    mgr.system_library_write(s, kind, lib)
+    return await ctx.send("\n".join(
+        _system_deleted_line(mgr, s, kind, "tag", t) for t in gone))
 
 
 async def _system_text_lib(ctx: ReplyContext, args: List[str],
@@ -8972,6 +9294,23 @@ for _sub, _write, _what, _gram in (
             f"back)." + (" A system macro has no author, so it runs as a "
                          "host's." if _sub == "macro" else "")),
     )
+registry.annotate_sub(
+    "system", "tags",
+    usage=_SYSTEM_TAGS_USAGE,
+    desc=(
+        "A GameSystem's tag vocabulary: the tags its game uses, each with a "
+        "description (`add <sys> <tag> [description]`; adding a declared "
+        "tag again replaces its description). It explains and warns, never "
+        "refuses: `!help tag <tag>` and Tab completion show the declared "
+        "tags, `!system lint` lists tags its matches store that it doesn't "
+        "declare, and with the tag_vocabulary_mode rule at `warn` a command "
+        "storing an undeclared tag ends with a ⚠️. Read live from the "
+        "system (a match takes no copy); a child system inherits its "
+        "parent's entries, and removing an inherited one hides it "
+        "(`!system unset <sys> tag_vocabulary:<tag>` brings it back). "
+        "Engine tags (corpse, part, segment, rider, vehicle, map_carrier) "
+        "are declared by the engine."),
+)
 registry.annotate_sub("system", "default", usage="!system default <server|channel> <name>", desc="Set the GameSystem new matches use: this server's default, or this channel's own.")
 
 # ---- group fan-out helpers -------------------------------------------------
@@ -11883,6 +12222,9 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                                f"{setting} setting: it holds one value.")
             value = map_setting_value(setting, value)
         check_no_value_ancestor(mp.vars, args[2], "map var")
+        if setting == "tags":
+            note_stored_tags(m.system_name, mp.vars.get(args[2]), value,
+                             "tags")
         _set_path(mp.vars, args[2], _own_value(value))
         return await ctx.send(f"{where} var `{args[2]}` = {value!r}")
     if vsub == "get":
@@ -16611,6 +16953,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"Cleared template `{name}`'s tags.")
             for t in raw.replace(",", " ").split():
                 check_tag(t)
+            note_stored_tags(m.system_name, tpl.tags, raw, "tags")
             tpl.tags = normalize_tags(raw)
             return await ctx.send(
                 f"template `{name}` tags = {', '.join(tpl.tags)} (every tile "
@@ -17306,6 +17649,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             for t in raw.replace(",", " ").split():
                 check_tag(t)
+            note_stored_tags(m.system_name, z.get("tags"), raw, "tags")
             z["tags"] = normalize_tags(raw)
         tags = m.zone_tags(name)
         own = z.get("tags") or []
@@ -17801,6 +18145,18 @@ def _zone_def_dict_view(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _zone_def_sub(ctx: ReplyContext, args: List[str], m: Match,
+                        *rest, **kw):
+    """`_zone_def_body`, recording the tags it stored (the vocabulary)."""
+    if STORED_TAGS.get() is None:
+        return await _zone_def_body(ctx, args, m, *rest, **kw)
+    before = copy.deepcopy(m.zone_definitions)
+    try:
+        return await _zone_def_body(ctx, args, m, *rest, **kw)
+    finally:
+        note_stored_tags(m.system_name, before, m.zone_definitions)
+
+
+async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
                         prefix: str, check) -> Optional[str]:
     """Run definition subcommand `args[0]` (`args` = the words after `!zone
     def`) on `m`'s zone_definitions and return the reply ("" when help was
@@ -18090,6 +18446,18 @@ def _split_status_tokens(raw: str) -> List[str]:
 
 
 async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
+                          *rest, **kw):
+    """`_status_def_body`, recording the tags it stored (the vocabulary)."""
+    if STORED_TAGS.get() is None:
+        return await _status_def_body(ctx, args, m, *rest, **kw)
+    before = copy.deepcopy(m.status_definitions)
+    try:
+        return await _status_def_body(ctx, args, m, *rest, **kw)
+    finally:
+        note_stored_tags(m.system_name, before, m.status_definitions)
+
+
+async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                           prefix: str, check) -> Optional[str]:
     """Run definition subcommand `args[0]` of `!status` on `m`'s
     status_definitions and return the reply ("" when help was sent), or
@@ -21704,7 +22072,7 @@ def _help_functions(kind: Optional[str]) -> str:
     return "\n".join(out)
 
 
-@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
+@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help tag [<tag>] | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help tag [tag]` shows a tag's description from the tag vocabulary of this channel's game system (`!system tags`), or lists the declared tags. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "find":
         return await ctx.send(_help_find(ctx, mgr, args[1:]))
@@ -21722,8 +22090,57 @@ async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "rule":
         _check_tail(args, 2, (), "!help rule <rule>")
         return await ctx.send(_help_rule(ctx, mgr, args[1]))
+    if args and args[0].lower() == "tag":
+        _check_tail(args, 2, (), "!help tag [<tag>]")
+        return await ctx.send(_help_tag(ctx, mgr, args[1] if len(args) > 1
+                                        else None))
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
+
+
+# What each engine tag means (`!help tag`): the engine declares them.
+_ENGINE_TAG_DESCS = {
+    "corpse": "a dead unit's remains (corpse tags only)",
+    "part": "a body part of another unit",
+    "segment": "a snake segment",
+    "rider": "a unit mounted on a vehicle",
+    "vehicle": "a unit with riders aboard",
+    "map_carrier": "a unit carrying a map (a nested map)",
+}
+assert set(_ENGINE_TAG_DESCS) == set(ENGINE_TAGS)
+
+
+def _help_tag(ctx: ReplyContext, mgr: MatchManager,
+              raw: Optional[str]) -> str:
+    """`!help tag [tag]`: the channel's system's tag vocabulary (its
+    match's system, else the channel's default)."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    sysname = (mgr.matches[mid].system_name if mid in mgr.matches
+               else mgr.effective_system_name(ctx.channel_key))
+    s = mgr.systems.get(sysname)
+    vocab = mgr.system_library(s, "tag_vocabulary") if s is not None else {}
+    if raw is None:
+        if not vocab:
+            return (f"System `{sysname}` declares no tags (`!system tags add "
+                    f"{sysname} <tag> <description>`). Engine tags: "
+                    + ", ".join(ENGINE_TAGS) + ".")
+        return "\n".join(
+            [f"**Tags of system `{sysname}`** ({len(vocab)}):"]
+            + [f"- `{t}`" + (f": {vocab[t]}" if vocab[t] else "")
+               for t in sorted(vocab)]
+            + ["Engine tags: " + ", ".join(ENGINE_TAGS) + "."])
+    tag = check_tag(raw)
+    if tag in ENGINE_TAGS:
+        return (f"**`{tag}`** (engine tag): {_ENGINE_TAG_DESCS[tag]}. The "
+                f"engine gives it from the unit's state; no var holds it.")
+    if tag not in vocab:
+        return (f"`{tag}` isn't in system `{sysname}`'s tag vocabulary "
+                f"(`!help tag` lists the declared tags).")
+    # The nearest system in the chain declaring it.
+    src = next((x.name for x in reversed(mgr.system_chain(s))
+                if tag in x.tag_vocabulary), None)
+    return (f"**`{tag}`**: {vocab[tag] or '(no description)'}"
+            + (f" (declared on `{src}`)" if src and src != sysname else ""))
 
 
 # Every root with a read-only-subcommand downgrade must be a registered

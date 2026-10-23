@@ -670,6 +670,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`{tags}` in the roster formats."
         ),
     },
+    "tag_vocabulary_mode": {
+        "default": "off",
+        "schema": {"type": "enum", "choices": ["off", "warn"]},
+        "desc": (
+            "What the system's tag vocabulary (`!system tags`: each declared "
+            "tag with a description) does when a command stores a tag it "
+            "doesn't declare. `off`: nothing. `warn`: the command ends with "
+            "a ⚠️ naming the undeclared tags it stored (in unit vars and "
+            "containers, team data, map tags, status / zone definitions, "
+            "zone and tile tags, tile templates, template and prefab tags). "
+            "Nothing is ever refused for being undeclared. With or without "
+            "it, `!system lint` lists undeclared tags once a vocabulary "
+            "exists, and Tab completion / `!help tag <tag>` show the "
+            "declared ones."
+        ),
+    },
     "unit_tag_sources": {
         "default": "equipped",
         "schema": {"type": "str"},
@@ -5579,6 +5595,124 @@ GRANTS_UNIT_TAGS = "grants_unit_tags"
 STATUS_UNIT_TAG_BLOCK = "cannot_affect_units_with_tag"
 _TAG_TOKEN_RE = re.compile(r"\(|\)|[^\s()]+")
 
+# The tag vocabulary (docs/tags_design.md §7): a system's `tag_vocabulary`
+# library names its tags; under `tag_vocabulary_mode` warn, a command that
+# stores a tag the vocabulary lacks ends with a ⚠️. The keys whose values
+# hold tags or tag filters wherever they sit (unit vars and containers,
+# team data, status definitions, zone / tile data); the status token keys
+# hold `tag:<filter>` tokens beside status names.
+TAG_FIELD_KEYS = frozenset({
+    "tags", "inner_tags", "exclude_inherited_tags", "action_tags",
+    "exclude_inherited_action_tags", GRANTS_UNIT_TAGS, "not_tags",
+    "target_requires_tags", "target_refuses_tags",
+    "forbids_actions_with_tag", "immune_to_actions_with_tag",
+    STATUS_UNIT_TAG_BLOCK})
+_TAG_TOKEN_KEYS = frozenset({"removes", "blocked_by", "status_immune",
+                             "__status_immune"})
+# The tags a running top-level command stored that weren't there before,
+# per the system whose vocabulary judges them (None = the command's own:
+# the channel's match's system, else the server's default). Set by
+# CommandRegistry._run_top only while a system of the server warns.
+STORED_TAGS: "contextvars.ContextVar[Optional[Dict[Optional[str], Set[str]]]]" = (
+    contextvars.ContextVar("vtt_stored_tags", default=None))
+
+
+def _field_tag_words(value: Any, key: str) -> Set[str]:
+    """The tags named in one tag field's value (a list, comma / space text
+    or a filter expression; for a token key only its `tag:` tokens)."""
+    items = value if isinstance(value, list) else [value]
+    out: Set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        if key in _TAG_TOKEN_KEYS:
+            depth, cur, toks = 0, "", []
+            for ch in item:
+                depth += (ch == "(") - (ch == ")")
+                if ch == "," and depth == 0:
+                    toks.append(cur)
+                    cur = ""
+                else:
+                    cur += ch
+            toks.append(cur)
+            text = " ".join(t.strip()[4:] for t in toks
+                            if t.strip().startswith("tag:"))
+        else:
+            text = item
+        for w in _TAG_TOKEN_RE.findall(text.replace(",", " ")):
+            if w in ("(", ")") or w in TAG_FILTER_WORDS or w in ("all", "*"):
+                continue
+            try:
+                out.add(check_tag(w))
+            except VTTError:
+                pass
+    return out
+
+
+def tag_words(node: Any, key: Optional[str] = None,
+              extra_keys: Iterable[str] = ()) -> Set[str]:
+    """Every tag a stored value names: under `key` (the field the value is
+    stored at) or, walking dicts and lists, under any TAG_FIELD_KEYS key
+    (plus `extra_keys`, e.g. a renamed tags var). Engine tags are left out:
+    the engine declares them."""
+    keys = TAG_FIELD_KEYS | frozenset(extra_keys)
+    out: Set[str] = set()
+
+    def walk(n: Any, k: Optional[str], depth: int) -> None:
+        if depth > STORE_DEPTH_LIMIT:
+            return
+        if k is not None and (k in keys or k in _TAG_TOKEN_KEYS) \
+                and not isinstance(n, dict):
+            out.update(_field_tag_words(n, k))
+            return
+        if isinstance(n, dict):
+            for ck, cv in n.items():
+                walk(cv, str(ck), depth + 1)
+        elif isinstance(n, list):
+            for cv in n:
+                if isinstance(cv, (dict, list)):
+                    walk(cv, None, depth + 1)
+    walk(node, key, 0)
+    return {t for t in out if t not in ENGINE_TAGS}
+
+
+def written_tag_words(old: Any, new: Any, key: Optional[str] = None,
+                      extra_keys: Iterable[str] = ()) -> Set[str]:
+    """The tags of every tag field `new` writes over `old` (a field whose
+    value changed counts all its tags; an unchanged one none). Engine tags
+    are left out."""
+    keys = TAG_FIELD_KEYS | frozenset(extra_keys)
+    out: Set[str] = set()
+
+    def walk(o: Any, n: Any, k: Optional[str], depth: int) -> None:
+        if depth > STORE_DEPTH_LIMIT or o == n:
+            return
+        if k is not None and (k in keys or k in _TAG_TOKEN_KEYS) \
+                and not isinstance(n, dict):
+            out.update(_field_tag_words(n, k))
+        elif isinstance(n, dict):
+            for ck, cv in n.items():
+                walk(o.get(ck) if isinstance(o, dict) else None, cv,
+                     str(ck), depth + 1)
+        elif isinstance(n, list):
+            out.update(tag_words(n, None, extra_keys))
+    walk(old, new, key, 0)
+    return {t for t in out if t not in ENGINE_TAGS}
+
+
+def note_stored_tags(system: Optional[str], old: Any, new: Any,
+                     key: Optional[str] = None,
+                     extra_keys: Iterable[str] = ()) -> None:
+    """Record, for the running command, the tags of the tag fields `new`
+    writes over `old` (at the field `key`), judged by `system`'s
+    vocabulary. Nothing while no system of the server warns."""
+    log = STORED_TAGS.get()
+    if log is None:
+        return
+    words = written_tag_words(old, new, key, extra_keys)
+    if words:
+        log.setdefault(system, set()).update(words)
+
 
 def _is_tag_expression(text: str) -> bool:
     return "(" in text or ")" in text or any(
@@ -5980,7 +6114,8 @@ MERGE_RULES: Dict[str, Optional[str]] = {
 SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
                                      "formula_functions",
                                      "status_definitions", "tables",
-                                     "macros", "zone_definitions")
+                                     "macros", "zone_definitions",
+                                     "tag_vocabulary")
 
 # Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
 # it can't bound the system chain itself). Set with `!owner ceiling <key>
@@ -6221,6 +6356,10 @@ class GameSystem:
     # Zone definitions (`!system zone def`, the normalize_zone_def shape of
     # Match.zone_definitions), copied into a new match the same way.
     zone_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # The tag vocabulary (`!system tags`, docs/tags_design.md §7): tag ->
+    # description. Read live from the system (never copied into a match):
+    # it only explains tags and, under tag_vocabulary_mode warn, warns.
+    tag_vocabulary: Dict[str, str] = field(default_factory=dict)
     # The system this one inherits from (live: MatchManager resolves the
     # chain on every read), or None for a root. `settings` and the
     # libraries above then hold only this system's OWN overrides.
@@ -6285,6 +6424,8 @@ class GameSystem:
                 n: normalize_zone_def(d)
                 for n, d in sorted(self.zone_definitions.items())
             },
+            "tag_vocabulary": {t: str(d) for t, d
+                               in sorted(self.tag_vocabulary.items())},
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
@@ -6345,6 +6486,14 @@ class GameSystem:
             k: normalize_zone_def(v)
             for k, v in (d.get("zone_definitions") or {}).items()
             if isinstance(k, str) and k and isinstance(v, dict)}
+        vocab: Dict[str, str] = {}
+        for k, v in (d.get("tag_vocabulary") or {}).items():
+            try:
+                t = check_tag(k)
+            except VTTError:
+                continue
+            if t not in ENGINE_TAGS:
+                vocab[t] = str(v) if v is not None else ""
         if dropped:
             print(f"[systems] '{d.get('name')}': dropped gamerule(s) that no "
                   f"longer exist: {', '.join(sorted(map(str, dropped)))}")
@@ -6362,6 +6511,7 @@ class GameSystem:
             aliases=sys_aliases, status_definitions=sys_statuses,
             tables=sys_tables, macros=sys_macros,
             zone_definitions=sys_zone_defs,
+            tag_vocabulary=vocab,
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
             description=str(d.get("description") or ""),
@@ -7385,6 +7535,11 @@ class Entity:
         # by both the clamp logic AND the attempt hook (the attempt fires
         # BEFORE the write, so old_value reflects pre-write state).
         old = _path_resolve(self.vars, path)
+        if self._match is not None and STORED_TAGS.get() is not None:
+            tvar = str(self._match.rules.get("tags_var", "tags"))
+            note_stored_tags(self._match.system_name,
+                             None if old is _MISSING else old, value,
+                             path.split(".")[-1] if path else None, (tvar,))
 
         # Apply clamp, unless bypassed or there's no match to consult for
         # clamp rules. Clamps only meaningful for numeric writes; _apply_clamp
@@ -8000,6 +8155,7 @@ class Map:
             if key not in d:
                 d[key] = {}
             d = d[key]
+        note_stored_tags(None, d.get(parts[-1]), value, parts[-1])
         d[parts[-1]] = _own_value(value)
 
     def tile_del_path(self, x: int, y: int, path: Optional[str]) -> None:
@@ -8297,6 +8453,7 @@ class Map:
             if key not in d:
                 d[key] = {}
             d = d[key]
+        note_stored_tags(None, d.get(parts[-1]), value, parts[-1])
         d[parts[-1]] = _own_value(value)
 
     def zone_del_path(self, name: str, path: str) -> None:
@@ -9248,6 +9405,9 @@ class Match:
         if value is None:
             mp.vars.pop(var, None)
         else:
+            if setting == "tags":
+                note_stored_tags(self.system_name, mp.vars.get(var), value,
+                                 "tags")
             mp.vars[var] = _own_value(value)
         mp.var_names[MAP_SETTING_RULES[setting]] = var
 
@@ -11781,8 +11941,8 @@ class Match:
         check_no_value_ancestor(self.team_data.get(str(team), {}), path,
                                 f"team `{team}`")
         # The tags every member carries (`grants_unit_tags` at the top of
-        # the team's data): a checked tag list, nothing under it.
-        # and the team's own `tags`: checked tag lists, nothing under them.
+        # the team's data) and the team's own `tags`: checked tag lists,
+        # nothing under them.
         seg0 = str(path).split(".", 1)[0]
         if seg0 in (GRANTS_UNIT_TAGS, "tags"):
             if "." in str(path):
@@ -11798,6 +11958,7 @@ class Match:
                 nxt = {}
                 cur[seg] = nxt
             cur = nxt
+        note_stored_tags(self.system_name, cur.get(segs[-1]), value, segs[-1])
         cur[segs[-1]] = _own_value(value)
 
     def team_add(self, team: str, path: str, delta: float) -> Any:
@@ -22332,7 +22493,7 @@ def check_template_name(name: Any, legacy: bool = False) -> str:
     return n
 
 
-_PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name")
+_PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags")
 
 
 def _check_file_markers(value: Any, where: str) -> None:
@@ -22525,11 +22686,18 @@ def check_template(data: Any, name: str,
         d = {k: copy.deepcopy(v) for k, v in data.items() if k in _PARTIAL_KEYS}
         extra = sorted(k for k in data if k not in _PARTIAL_KEYS)
         notes = [f"Dropped {', '.join(f'`{k}`' for k in extra)}: a partial "
-                 f"template is `kind`, `data`."] if extra else []
+                 f"template is `kind`, `data`, `tags`."] if extra else []
         if not isinstance(d.get("data"), dict):
             raise VTTError(f"Partial template `{name}` needs `data`: an object "
                            f"(the container it describes).")
         _check_file_markers(d["data"], f"Partial template `{name}`")
+        if "tags" in d:
+            # Library tags (`!template tags`, `list tag=`): the partial's,
+            # never copied into the units built from it.
+            d["tags"] = checked_tag_list(
+                d["tags"], f"Partial template `{name}` tags", engine_ok=True)
+            if not d["tags"]:
+                del d["tags"]
         for k in ("saved_by", "saved_by_name"):
             if k in d and d[k] is not None and not isinstance(d[k], str):
                 d[k] = str(d[k])
