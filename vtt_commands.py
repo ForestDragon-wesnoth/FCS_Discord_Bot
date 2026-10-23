@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -2150,6 +2150,13 @@ def _entity_template_context(e: Entity,
             if isinstance(dvars, dict):
                 for k, v in dvars.items():
                     ctx[k] = v
+    # The unit's full tag set (own, granted, engine), as the viewer's
+    # disguise presents it; `tags_sourced` names where each came from.
+    if e._match is not None:
+        pairs = e._match.unit_tag_sources(e, pov_team)
+        ctx["tags"] = ", ".join(t for t, _s in pairs)
+        ctx["tags_sourced"] = ", ".join(
+            t if src == "own" else f"{t} ({src})" for t, src in pairs)
     return ctx
 
 
@@ -2253,6 +2260,10 @@ def _corpse_template_context(
         "passives_csv": ", ".join(sorted(passives.keys())) if passives else "",
         "died_round": corpse.get("died_round", "?"),
     }
+    pairs = m.corpse_tag_sources(corpse)
+    ctx["tags"] = ", ".join(t for t, _s in pairs)
+    ctx["tags_sourced"] = ", ".join(
+        t if src == "own" else f"{t} ({src})" for t, src in pairs)
     for k, v in ent_vars.items():
         if k not in ctx:
             ctx[k] = v
@@ -8916,6 +8927,8 @@ registry.annotate_sub(
         "forbids_actions_with_name_unless <system> <name> [<formula ...>] | "
         "immune_to_actions_with_tag_unless <system> <name> [<formula ...>] | "
         "immune_to_actions_with_name_unless <system> <name> [<formula ...>] | "
+        "grants_unit_tags <system> <name> [<tag ...>] | "
+        "cannot_affect_units_with_tag <system> <name> [<filter ...>] | "
         "del <system> <name> | "
         "drop <system> <name> | delete <system> <name> | "
         "remove <system> <name> | rm <system> <name> | "
@@ -12495,6 +12508,7 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 #   <var>>=<value>     vars[var] >= value
 #   status:<name>      entity.status has the named status
 #   group:<name>       entity is a member of the named group
+#   tag:<filter>       the entity's tags match a tag filter
 # Dotted var names address nested dicts (e.g. inventory.sword.damage).
 _FIND_OPS = ("!=", "<=", ">=", "=", "<", ">")
 
@@ -12521,6 +12535,14 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
         if not name:
             raise VTTError("`action:` predicate needs an action name.")
         return "action", name, None
+    if token.startswith("tag:"):
+        # tag:<filter> — the unit's tags match a tag filter (a tag, a comma
+        # list = any of them, or a quoted expression `"tag:(a and not b)"`).
+        filt = token[len("tag:"):]
+        if not filt:
+            raise VTTError("`tag:` predicate needs a tag or a tag filter.")
+        check_tag_filter(filt)
+        return "tag", filt, None
     if token.startswith("map:"):
         name = token[len("map:"):]
         if not name:
@@ -12664,7 +12686,7 @@ def _parse_find_selector(token: str) -> Tuple[bool, List[Tuple[str, str, Optiona
             if not alts:
                 raise
         kind, key, _val = alts[-1]
-        if kind in ("status", "group", "action", "map"):
+        if kind in ("status", "group", "action", "map", "tag"):
             alts.append((kind, raw, None))
         elif kind == "near":
             alts.append(_parse_find_predicate("near:" + raw))
@@ -12722,6 +12744,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             continue
         if kind == "map":
             if e.map != key:
+                return False
+            continue
+        if kind == "tag":
+            if not tag_filter_matches(m.unit_tags(e, pov), key):
                 return False
             continue
         if kind == "action":
@@ -12828,7 +12854,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
         "`var=value`, `var!=value`, `var<value`, `var<=value`, "
         "`var>value`, `var>=value` for vars; `status:NAME` for a status "
         "flag; `group:NAME` for group membership; `action:NAME` for "
-        "discoverable-action availability; `map:NAME` for the units on a "
+        "discoverable-action availability; `tag:<filter>` for the units "
+        "whose tags match a tag filter (`tag:undead`, `tag:animal,beast` = "
+        "either, a quoted expression `\"tag:(animal and not undead)\"`); "
+        "`map:NAME` for the units on a "
         "map; `near:<eid>:<radius>` (units on that unit's map) and "
         "`within:<x>:<y>:<radius>` (on the map a `map:` word names, else "
         "this channel's map) for spatial range (footprint-aware "
@@ -17973,6 +18002,21 @@ for _sub, _usage in (
         ("apply", "!status apply <eid> <name> [level] [duration]"),
         ("force", "!status force <eid> <name> [level] [duration]")):
     registry.annotate_sub("status", _sub, usage=_usage)
+registry.annotate_sub(
+    "status", GRANTS_UNIT_TAGS,
+    usage=f"!status {GRANTS_UNIT_TAGS} <name> [<tag ...>]",
+    desc=("The tags a unit carries while it bears status `<name>` (a "
+          "`zombified` status makes it `undead`). `-` or no tags clears it; "
+          "an instance holding the key replaces the definition's list. "
+          "Engine tags (corpse, part, segment, rider, vehicle, map_carrier) "
+          "are refused."))
+registry.annotate_sub(
+    "status", STATUS_UNIT_TAG_BLOCK,
+    usage=f"!status {STATUS_UNIT_TAG_BLOCK} <name> [<filter ...>]",
+    desc=("A tag filter: status `<name>` can't be applied to a unit whose "
+          "tags match it (fear on `mindless`; a list = any of them, or an "
+          "expression `mindless or construct`). Checked with immunity, so a "
+          "forced application ignores it. `-` or no filter clears it."))
 for _sub in ACTION_RESTRICTION_FIELDS:
     _what = ("tag" if _sub.endswith("_tag") else "name")
     _does = ("its bearer can't use actions with" if _sub in ACTION_FORBID_FIELDS
@@ -18006,7 +18050,8 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     "removes": 2, "blockedby": 2,
                     **{f: 2 for f in ACTION_RESTRICTION_FIELDS},
                     **{f + UNLESS_SUFFIX: 2
-                       for f in ACTION_RESTRICTION_FIELDS}}
+                       for f in ACTION_RESTRICTION_FIELDS},
+                    GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2}
 
 
 def _match_program_check(m: Match):
@@ -18270,6 +18315,29 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
         m.status_definitions[name][sub] = words
         return (f"`{name}` {sub} = {', '.join(words)}")
 
+    if sub in (GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK):
+        # The tags the bearer carries while it has the status, or the tag
+        # filter of units the status can't affect; none (or `-`) clears it.
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", sub):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        raw = " ".join(args[2:]).strip()
+        if raw in ("", "-"):
+            if m.status_definitions[name].pop(sub, None) is None:
+                return (f"❌ `{name}` has no {sub}.")
+            return (f"Cleared `{name}` {sub}.")
+        if sub == GRANTS_UNIT_TAGS:
+            value = checked_tag_list(raw, f"`{name}` {sub}")
+            shown = ", ".join(value)
+        else:
+            value = check_tag_filter(raw)
+            shown = (", ".join(value) + " (any of them)"
+                     if isinstance(value, list) else value)
+        m.status_definitions[name][sub] = value
+        return (f"`{name}` {sub} = {shown}")
+
     if sub.endswith(UNLESS_SUFFIX) and \
             sub[:-len(UNLESS_SUFFIX)] in ACTION_RESTRICTION_FIELDS:
         # The expression lifting that one list while true (self = the
@@ -18300,6 +18368,7 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
            "immune_to_actions_with_tag|immune_to_actions_with_name|"
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
            "immune_to_actions_with_tag_unless|immune_to_actions_with_name_unless|"
+           "grants_unit_tags|cannot_affect_units_with_tag|"
            "resist|counter|dispel|transfer|sprite|list|info|"
            "apply|force> ..."),
     desc=(
@@ -21216,6 +21285,13 @@ async def _action_info(
         f"Tags:        {_action_tags_text(act)}",
         f"Description: {desc}",
     ]
+    for key, label in (("target_requires_tags", "Target must match:"),
+                       ("target_refuses_tags", "Target can't match:")):
+        filt = getattr(act, key)
+        if filt is not None:
+            shown = (", ".join(f"`{t}`" for t in filt)
+                     if isinstance(filt, list) else f"`{filt}`")
+            lines.append(f"{label} {shown}")
     lines += [f"⚠️ {p}" for p in act.tag_problems]
     forbid = _action_forbid_note(m, actor_id, act)
     if forbid:

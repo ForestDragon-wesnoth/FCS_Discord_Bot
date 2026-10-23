@@ -335,7 +335,7 @@ or rejects one, it moves to "Off the list".
 - **#259 Per-level status data.** (To discuss, user.) A status definition holds entries per level, exact (`3`) or from a level up (`3+`), each carrying its own data that applies while the instance is at that level: the action restriction lists of #234 (Solis freeze forbids sprint and rest, and dodge from level 3), modifiers, a tick, a display.
   - Open: how entries combine with the definition's own fields and with each other (merge or replace, and which entry wins when `2+` and `3` both match), how an instance's own keys override them, and how `!status` edits them.
   - The #234 checks read every list through `Match.status_field`, the one place a level entry would merge in.
-- **#260 A wider tag system.** (To discuss, user.) Tags exist on zones, tiles, statuses and actions, each with its own reads; extend them to more of the game (units, items, templates, damage) and let them interact more, possibly through one shared vocabulary and a common set of reads and filters.
+- **#260 A wider tag system.** Designed in `docs/tags_design.md`; PR 1 (the filter matcher, unit and corpse tags, the action and status fields) is built. Open: PR 2 (every existing tag field on the one rule, container / team / map tags) and PR 3 (library tags, the vocabulary).
 - **#258 Reapply a definition's data.** `!zone def <d> reapply` / `!tile def <t> reapply` push the definition's or template's data to the zones and tiles made from it (data is copied at creation, so a later data edit reaches only new ones).
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.

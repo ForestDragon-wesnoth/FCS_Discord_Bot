@@ -51,7 +51,9 @@ import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import VTTError, NotFound, CROSS_MATCH_GUARD, normalize_tags
+from logic import (VTTError, NotFound, CROSS_MATCH_GUARD, normalize_tags,
+                   check_tag_filter, tag_filter_matches, tag_filter_empty,
+                   RULES_REGISTRY)
 
 # The other-matches guards of the action levels running now, outermost
 # first (each a run_action's `cross`): a level that changes another match
@@ -116,6 +118,8 @@ ACTIONS_KEY = "actions"
 # it. Statuses forbid or block actions by their final tags (logic.py,
 # Match.action_restrictions).
 ACTION_OWN_TAGS_KEY = "tags"
+# Action fields filtering an entity / corpse target by the target's tags.
+TARGET_TAG_FIELDS = ("target_requires_tags", "target_refuses_tags")
 ACTION_TAGS_KEY = "action_tags"
 ACTION_TAG_EXCLUDE_KEY = "exclude_inherited_action_tags"
 # Keys of an `actions` dict read as the dict's own tag fields, never as
@@ -329,6 +333,11 @@ class Action:
     # Tag fields that weren't a tag list (a value dropped from discovery's
     # view, named by `!action info`).
     tag_problems: List[str] = field(default_factory=list)
+    # Tag filters an entity / corpse target must match (requires) and must
+    # not match (refuses); None = no such field. A filter that doesn't
+    # parse is kept as written and refuses every target, naming the error.
+    target_requires_tags: Any = None
+    target_refuses_tags: Any = None
 
     @staticmethod
     def from_dict(
@@ -390,12 +399,24 @@ class Action:
             if t not in sources:
                 tags.append(t)
                 sources[t] = src
+        filters: Dict[str, Any] = {}
+        for key in TARGET_TAG_FIELDS:
+            raw_f = raw.get(key)
+            if raw_f is None or tag_filter_empty(raw_f):
+                continue
+            try:
+                filters[key] = check_tag_filter(raw_f)
+            except VTTError as ex:
+                problems.append(f"`{full_path}.{key}`: {ex}")
+                filters[key] = raw_f
         return Action(
             name=name, body=body, description=description,
             target_type=target_type,
             container_path=container_path, full_path=full_path,
             allowed_slots=allowed_slots,
             tags=tags, tag_sources=sources, tag_problems=problems,
+            target_requires_tags=filters.get("target_requires_tags"),
+            target_refuses_tags=filters.get("target_refuses_tags"),
         )
 
 
@@ -1641,25 +1662,89 @@ def _restriction_refusal(action: Action, actor_id: str, target: Any,
                     ACTION_IMMUNE_FIELDS, match.action_immune_units(tid),
                     action.name, action.tags, actor_id, tid)]
 
-    if action.target_type == "entity" and isinstance(target, str):
-        lines = immune_lines(target)
+    corpse_target = action.target_type in ("corpse", "corpse_list")
+
+    def refusals(tid: str) -> Tuple[str, List[str]]:
+        # (reason, lines): immunity first (units only), then the target tag
+        # filters (units and corpses).
+        if not corpse_target:
+            lines = immune_lines(tid)
+            if lines:
+                return "immune", lines
+        lines = _target_tag_lines(action, actor_id, tid, match,
+                                  corpse_target)
+        return ("target_tags", lines) if lines else ("", [])
+
+    if action.target_type in ("entity", "corpse") and isinstance(target, str):
+        reason, lines = refusals(target)
         if lines:
-            return "immune", "\n".join(lines), target, []
-    elif action.target_type == "entity_list" and isinstance(target, list):
+            return reason, "\n".join(lines), target, []
+    elif action.target_type in ("entity_list", "corpse_list") \
+            and isinstance(target, list):
         kept: List[Any] = []
         dropped: List[str] = []
+        reasons: List[str] = []
         for tid in target:
-            lines = immune_lines(tid) if isinstance(tid, str) else []
+            reason, lines = refusals(tid) if isinstance(tid, str) \
+                else ("", [])
             if lines:
                 dropped.extend(lines)
+                reasons.append(reason)
             else:
                 kept.append(tid)
         if dropped and not kept:
-            return "immune", "\n".join(dropped), target, []
+            return reasons[0], "\n".join(dropped), target, []
         if dropped:
             return "", "", kept, [
                 f"⚠️ `{action.name}` dropped a target: {ln}" for ln in dropped]
     return None
+
+
+def _target_tag_lines(action: Action, actor_id: str, tid: str,
+                      match: "Match", corpse: bool) -> List[str]:
+    """Why target `tid` (a unit, or a corpse id) fails the action's
+    target_requires_tags / target_refuses_tags filters, worded by
+    action_target_tags_message_format; [] when it fits."""
+    if action.target_requires_tags is None and \
+            action.target_refuses_tags is None:
+        return []
+    if corpse:
+        loc = match.find_corpse(tid)
+        tags = match.corpse_tags(loc[2]) if loc and isinstance(loc[2], dict) \
+            else []
+    else:
+        e = match.entities.get(tid)
+        if e is None:
+            return []
+        tags = match.unit_tags(e)
+    out: List[str] = []
+    for key, want in (("target_requires_tags", True),
+                      ("target_refuses_tags", False)):
+        filt = getattr(action, key)
+        if filt is None:
+            continue
+        try:
+            ok = tag_filter_matches(tags, filt) == want
+            err = None
+        except VTTError as ex:
+            ok, err = False, str(ex)
+        if ok:
+            continue
+        shown = (", ".join(f"`{t}`" for t in filt) if isinstance(filt, list)
+                 else f"`{filt}`")
+        fmt = str(match.rules.get("action_target_tags_message_format") or "") \
+            or RULES_REGISTRY["action_target_tags_message_format"]["default"]
+        fixed = {"target": tid, "actor": actor_id, "action": action.name,
+                 "field": key, "filter": shown,
+                 "target_tags": ", ".join(tags) or "none",
+                 "fails": (f"don't match {shown}" if want
+                           else f"match {shown}")}
+        text = match._MSG_FMT_RE.sub(
+            lambda mo: str(fixed.get(mo.group(1), mo.group(0))), fmt)
+        if err:
+            text += f" (its `{key}` doesn't parse: {err})"
+        out.append(text)
+    return out
 
 
 _ROLLBACK_FIELDS_CHECKED = False

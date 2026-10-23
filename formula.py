@@ -2452,8 +2452,35 @@ def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
     return _check_text_size("".join(out), "fmt", _limit)
 
 
+def _tag_filter_arg(filt: Any, fname: str) -> Any:
+    """A tag filter argument in its checked shape, or a FormulaError."""
+    from logic import check_tag_filter, VTTError as _VE
+    try:
+        return check_tag_filter(filt)
+    except _VE as ex:
+        raise FormulaError(f"{fname}: {ex}")
+
+
+def _tags_match(tags: Any, filt: Any) -> bool:
+    """tags_match(tags, filter): whether the tag list `tags` (or one tag)
+    matches the tag filter: a list means any of its tags, text with `and`
+    / `or` / `not` / parentheses is an expression (`animal and not
+    undead`)."""
+    from logic import tag_filter_matches, VTTError as _VE
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, list):
+        raise FormulaError("tags_match(tags, filter): tags must be a list "
+                           "of tags.")
+    try:
+        return tag_filter_matches([str(t) for t in tags], filt)
+    except _VE as ex:
+        raise FormulaError(f"tags_match: {ex}")
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": _round,
+    "tags_match": _tags_match,
     "int": int, "float": float, "str": lambda *a: _text_of(a[0]) if len(a) == 1 else str(*a),
     "len": _len,
     "random_int": _random_int,
@@ -2737,6 +2764,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    action_recursion_limit.
     "has_action", "entity_actions", "use_action",
     "action_tags_of", "action_forbidden_by", "immune_to_action",
+    "unit_tags", "units_with_tag", "corpse_tags",
+    "unit_tags", "unit_has_tag", "units_with_tag", "corpse_tags",
     # Summon / despawn family. A template is an entity-shaped dict in
     # ordinary storage (vars / tile data); these turn one into a live
     # entity and back. All route through Match.summon_entity (shared
@@ -3015,6 +3044,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'has_template', 'template_names', 'template_of', 'template_data',
     'prefab_names', 'prefab_size',
     'action_tags_of', 'action_forbidden_by', 'immune_to_action',
+    'unit_tags', 'unit_has_tag', 'units_with_tag', 'corpse_tags',
     'schedules_of', 'schedule_left',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
@@ -3097,6 +3127,13 @@ _MAP_CELL_RESULT_FUNCS: "frozenset[str]" = frozenset({
     "cells_in_burst", "cells_in_line", "cells_in_cone", "cells_in_rect",
     "tiles_with_tag",
 })
+# Unit searches taking `tag=` (a tag filter the units' tags must match).
+_TAG_ARG_FUNCS: "frozenset[str]" = frozenset({
+    "entities_within", "entities_in_area", "entities_in_cone",
+    "entities_in_rect", "entities_in_zone", "entities_at",
+    "visible_entities",
+})
+
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
     "tile_place", "tile_template_of", "tile_tags", "tile_has_tag",
@@ -4485,6 +4522,23 @@ class FormulaEngine:
                 return [c + [name] for c in res]
             return res
 
+        def _with_tag(fname: str, fn: Any) -> Any:
+            """`fn` (returning unit ids) taking `tag=`: only the units whose
+            tags match the filter are kept."""
+            def _call(*a: Any, **k: Any) -> Any:
+                tv = k.pop("tag", None)
+                res = fn(*a, **k)
+                if tv is None:
+                    return res
+                from logic import tag_filter_matches
+                f = _tag_filter_arg(tv, fname)
+                ents = self._match.entities
+                return [i for i in res if i in ents and tag_filter_matches(
+                    self._match.unit_tags(ents[i]), f)]
+            _call.__doc__ = getattr(fn, "__doc__", None)
+            _call.__wrapped__ = fn
+            return _call
+
         def _with_map(fname: str, fn: Any, cells: bool = False) -> Any:
             """`fn` taking `map=`: the call runs on that map (_cur_map), and
             with `cells` its cell results carry the map when it isn't the
@@ -5264,19 +5318,27 @@ class FormulaEngine:
             return [oid for _, oid in scored]
 
         def _nearest_entity(eid_token: Any, relation: Any = "",
-                            mode: Any = "square_radius_distance") -> str:
-            """nearest_entity(eid, relation='', mode='square_radius_distance'):
-            the id of the unit nearest to this one's body ('' when none),
-            relation any / hostile / ally / same_team / attackable. The
-            relation comes SECOND."""
+                            mode: Any = "square_radius_distance",
+                            tag: Any = None) -> str:
+            """nearest_entity(eid, relation='', mode='square_radius_distance',
+            tag=None): the id of the unit nearest to this one's body ('' when
+            none), relation any / hostile / ally / same_team / attackable,
+            tag= a tag filter its tags must match. The relation comes
+            SECOND."""
             eid = _eid(eid_token)
             if not isinstance(relation, str):
                 raise FormulaError(
                     "nearest_entity(...): relation must be a string."
                 )
+            from logic import tag_filter_matches
+            f = _tag_filter_arg(tag, "nearest_entity") \
+                if tag is not None else None
             best_id = ""
             best_d = None
             for oid, oe, ref_e in _candidates(eid, relation):
+                if f is not None and not tag_filter_matches(
+                        match.unit_tags(oe), f):
+                    continue
                 d = _ent_dist(ref_e, oe, mode)
                 # Tie-break by id so the result is deterministic.
                 if best_d is None or d < best_d or (d == best_d and oid < best_id):
@@ -6891,6 +6953,48 @@ class FormulaEngine:
                 ACTION_IMMUNE_FIELDS, match.action_immune_units(tid),
                 name or "", normalize_tags(tags), aid, tid)
             return list(dict.fromkeys(h["status"] for h in hits))
+
+        def _unit_tags(eid_t: Any) -> list:
+            """unit_tags(eid): the unit's tags: its own (the tags var), those
+            its statuses, equipped containers (unit_tag_sources) and team
+            grant (`grants_unit_tags`), a body part's root's, then the engine
+            tags (part, segment, rider, vehicle, map_carrier). Loopable."""
+            _id, e = _resolve_entity(eid_t, "unit_tags")
+            return match.unit_tags(e)
+
+        def _unit_has_tag(eid_t: Any, filt: Any) -> bool:
+            """unit_has_tag(eid, filter): whether the unit's tags match the
+            tag filter (a tag, a list = any of them, or an expression such
+            as `animal and not undead`)."""
+            _id, e = _resolve_entity(eid_t, "unit_has_tag")
+            from logic import tag_filter_matches
+            return tag_filter_matches(match.unit_tags(e),
+                                      _tag_filter_arg(filt, "unit_has_tag"))
+
+        def _units_with_tag(filt: Any, map: Any = None) -> list:
+            """units_with_tag(filter, map=None): ids of the alive units (body
+            parts included) whose tags match the filter, in the order added;
+            map= keeps one map's. Loopable."""
+            from logic import tag_filter_matches
+            f = _tag_filter_arg(filt, "units_with_tag")
+            mp = _map_arg(map, "units_with_tag") if map is not None else None
+            return [eid for eid, e in list(match.entities.items())
+                    if e.is_alive and (mp is None or e.map == mp.name)
+                    and tag_filter_matches(match.unit_tags(e), f)]
+
+        def _corpse_tags(cid_t: Any) -> list:
+            """corpse_tags(id): the tags of the corpse with that id: what its
+            stored unit carried (own, granted by its statuses, containers and
+            team) plus `corpse`; [] when there is no such corpse."""
+            loc = match.find_corpse(str(_eid(cid_t)))
+            if loc is None or not isinstance(loc[2], dict):
+                return []
+            return match.corpse_tags(loc[2])
+
+        ns["unit_tags"] = _unit_tags
+        ns["unit_has_tag"] = _unit_has_tag
+        ns["units_with_tag"] = _units_with_tag
+        ns["corpse_tags"] = _corpse_tags
 
         ns["has_action"]     = _has_action
         ns["action_tags_of"] = _action_tags_of
@@ -9650,6 +9754,10 @@ class FormulaEngine:
         for fname in _MAP_ARG_FUNCS:
             ns[fname] = _with_map(fname, ns[fname],
                                   cells=fname in _MAP_CELL_RESULT_FUNCS)
+        # `tag=` on the unit searches (docs/tags_design.md §2): keep the
+        # units whose tags match the filter.
+        for fname in _TAG_ARG_FUNCS:
+            ns[fname] = _with_tag(fname, ns[fname])
 
         # A coordinate where a function takes an x / y pair: [x, y] (or a
         # location target) fills both slots, and the map of an [x, y, map]
@@ -10150,6 +10258,8 @@ def function_reference() -> Dict[str, Dict[str, Any]]:
             if name in _MAP_ARG_FUNCS and not any(
                     s.startswith("map") for s in shown):
                 shown.append("map=None")
+            if name in _TAG_ARG_FUNCS:
+                shown.append("tag=None")
             sig = f"{name}({', '.join(shown)})"
         except (TypeError, ValueError):
             sig = f"{name}(...)"
@@ -10162,6 +10272,8 @@ def function_reference() -> Dict[str, Dict[str, Any]]:
             if name in _MAP_ARG_FUNCS and "map" not in sig:
                 sig = sig[:-1] + (", map=None)" if not sig.endswith("()")
                                   else "map=None)")
+            if name in _TAG_ARG_FUNCS and "tag=" not in sig:
+                sig = sig[:-1] + ", tag=None)"
         out[name] = {
             "signature": sig, "doc": " ".join(doc.split()),
             "kind": ("changes" if name in ARG_MUTATING_MATCH_FUNCS

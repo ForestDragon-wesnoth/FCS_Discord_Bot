@@ -29892,3 +29892,225 @@ also when the vehicle runs the action (mount_action_actor vehicle). An
 `actions` dict's own `action_tags` reach its actions (and it is no action
 itself). A tag field that isn't a tag list is named by `!action info`;
 only its usable words count.
+
+
+SCENARIO 919 — Unit tags: the tags var, granted tags, engine tags, corpses
+---------------------------------------------------------------------------
+
+!match new ut Ut 10 10
+!match use ut
+!ent add horse Horse 20 2 2 5
+!ent set_var horse footprint_w 2
+!ent set_var horse footprint_h 2
+!ent set_var horse tags "animal, rideable"
+!ent set_var horse slots.saddle.capacity 1
+!ent add knight Rider 10 6 6 5
+!ent set_var knight team red
+!mount knight horse saddle
+!ent add zed Zombie 12 8 1 3
+!ent set_var zed tags mindless
+!part add horse horse_head Head 5 5
+!assert "unit_tags('horse') == ['animal', 'rideable', 'vehicle'] and unit_tags('horse_head') == ['animal', 'rideable', 'part'] and unit_tags('knight') == ['rider']"
+!status def zombified
+!status grants_unit_tags zombified undead
+?? `zombified` grants_unit_tags = undead
+!status apply zed zombified
+!team set red grants_unit_tags "human, soldier"
+!ent set_var knight equipped.amulet.grants_unit_tags blessed
+!ent set_var knight inventory.relic.grants_unit_tags cursed
+!assert "unit_tags('zed') == ['mindless', 'undead'] and unit_tags('knight') == ['blessed', 'human', 'soldier', 'rider']"
+!ent info knight
+?? Tags: blessed (equipped.amulet), human (team red), soldier (team red), rider (engine)
+!ent info zed
+?? Tags: mindless, undead (status zombified)
+!eval "entity[knight].__unit_tag_sources_add = ['inventory']"
+!assert "'cursed' in unit_tags('knight')"
+!ent status zed set zombified grants_unit_tags rotting
+!assert "unit_tags('zed') == ['mindless', 'rotting']"
+!ent set_var zed tags "mindless, corpse"
+?? ❌
+?? `corpse` is an engine tag
+!ent set_var zed tags.x 1
+?? ❌
+!ent set_var zed tags "a and"
+?? can't be a tag
+!team set red grants_unit_tags.x y
+?? ❌
+!status grants_unit_tags zombified rider
+?? ❌ `zombified` grants_unit_tags: `rider` is an engine tag
+!assert "unit_tags('zed') == ['mindless', 'rotting']"
+!ent kill zed
+!assert "corpse_tags('zed') == ['mindless', 'rotting', 'corpse'] and corpse_tags('nobody') == []"
+!mount dismount knight
+!assert "unit_tags('knight') == ['blessed', 'cursed', 'human', 'soldier'] and unit_tags('horse') == ['animal', 'rideable', 'vehicle']"
+!as restart
+!match use ut
+!assert "unit_tags('horse_head') == ['animal', 'rideable', 'part'] and entity[horse].tags == ['animal', 'rideable']"
+
+Expected: HARNESS-ALLOWS-ERRORS. A unit's tags are its own (the `tags` var,
+comma text stored as a list), then what its statuses, equipped containers
+and team grant (`grants_unit_tags`), then the engine tags derived from
+its state: the 2×2 horse with a `slots` var is a `vehicle`, its knight a
+`rider` until it dismounts, its head a `part` that also carries the
+horse's own tags. `!ent info` lists them with their sources. A container
+under `inventory` grants nothing until `__unit_tag_sources_add` adds the
+root. A status instance's own `grants_unit_tags` replaces the
+definition's. An engine tag, a word that can't be a tag, or a path under
+a tag list is refused in the tags var, team data and a status definition.
+A corpse keeps its snapshot's tags plus `corpse`. Tags persist across a
+restart.
+
+
+SCENARIO 920 — Unit tags: filters, expressions, tag= searches, !find tag:, disguises
+--------------------------------------------------------------------------------------
+
+!match new tf Tf 10 10
+!match use tf
+!ent add hero Hero 20 1 1 5
+!ent set_var hero team blue
+!ent add horse Horse 20 3 1 5
+!ent set_var horse tags "animal, rideable"
+!ent add wolf Wolf 10 6 1 3
+!ent set_var wolf tags "animal, beast"
+!ent add zed Zombie 12 3 4 3
+!ent set_var zed tags "undead, mindless"
+!ent add golem Golem 30 6 5 3
+!ent set_var golem footprint_w 2
+!ent set_var golem footprint_h 2
+!ent set_var golem tags "construct, mindless"
+!assert "tags_match(['animal', 'beast'], 'animal and not undead') and not tags_match(['animal'], 'animal and beast') and tags_match('fire', ['fire', 'cold']) and tags_match(['a'], 'not (b or c)')"
+!eval "tags_match(['a'], 'a and')"
+?? tags_match: Tag filter `a and`: it ends where a tag or `(` should come.
+!assert "unit_has_tag('wolf', 'animal and beast') and not unit_has_tag('horse', 'animal and beast') and unit_has_tag('zed', ['construct', 'undead'])"
+!assert "units_with_tag('mindless') == ['zed', 'golem'] and units_with_tag('animal and not beast') == ['horse']"
+!assert "entities_within('hero', 9, tag='animal') == ['horse', 'wolf'] and entities_in_area(7, 6, 0, tag='construct') == ['golem'] and entities_in_area(7, 6, 0, tag='undead') == []"
+!assert "nearest_entity('hero', tag='mindless') == 'zed' and nearest_entity('hero', tag='construct') == 'golem' and nearest_entity('hero', tag='dragon') == ''"
+!find tag:animal ids
+?? horse wolf
+!find "tag:(animal and not rideable)" ids
+?? wolf
+!find tag:undead|construct ids
+?? golem zed
+!find !tag:mindless ids
+?? hero horse wolf
+!find "tag:(animal and" ids
+?? ❌
+!ent set_var hero n "$(len(units_with_tag('mindless')))"
+!assert "entity[hero].n == 2"
+!ent set_var hero m "$(tags_match(unit_tags('wolf'), 'beast'))"
+!assert "entity[hero].m == True"
+!help function unit_has_tag
+?? unit_has_tag(eid, filter)
+!help function entities_within
+?? tag=None
+!ent set_var zed team red
+!ent set_var zed disguise.name Villager
+!ent set_var zed disguise.vars.tags "human"
+!as view blue
+!find tag:human ids
+?? zed
+!find tag:undead count
+?? 0
+!as view omniscient
+!find tag:undead ids
+?? zed
+
+Expected: HARNESS-ALLOWS-ERRORS. A tag filter is a list (any of its tags)
+or an expression with and / or / not and parentheses; tags_match tests a
+list against one, and a filter that doesn't parse is refused with where
+it stopped. unit_has_tag and units_with_tag read units' full tag sets;
+the unit searches take `tag=` (entities_within, entities_in_area finding
+the 2×2 golem by any covered cell, nearest_entity). `!find tag:` takes a
+tag, `|` alternatives, a negation and a quoted expression; a broken one
+is refused. The reads work in `$()`. `!help function` shows `tag=None`.
+A disguise's decoy `tags` is what a fooled team's `!find` matches, while
+the omniscient view sees the real ones.
+
+
+SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses that can't affect a tag
+---------------------------------------------------------------------------------------------------
+
+!match new tp Tp 10 10
+!match use tp
+!ent add druid Druid 20 1 1 5
+!ent add horse Horse 20 3 1 5
+!ent set_var horse tags "animal, rideable"
+!ent add zed Zombie 12 5 1 3
+!ent set_var zed tags mindless
+!ent add bandit Bandit 10 7 1 3
+!ent set_var bandit tags humanoid
+!ent set_var druid actions.command.target entity
+!ent set_var druid actions.command.target_requires_tags animal
+!ent set_var druid actions.command.body "entity[target].commanded = True"
+!ent set_var druid actions.banish.target entity_list
+!ent set_var druid actions.banish.target_requires_tags undead
+!ent set_var druid actions.banish.body "for t in target:\n    entity[t].banished = True"
+!ent set_var druid actions.raise.target corpse
+!ent set_var druid actions.raise.target_requires_tags "humanoid and not undead"
+!ent set_var druid actions.raise.body "revive(target)"
+!ent set_var druid actions.fear.target entity
+!ent set_var druid actions.fear.target_refuses_tags "mindless, construct"
+!ent set_var druid actions.fear.body "status_apply(target, 'feared')"
+!action info druid raise
+?? Target must match: `humanoid and not undead`
+!action druid command horse
+?? `druid` used action `command`.
+!action druid command zed
+?? ❌ action `command`: [target_tags] `zed` doesn't fit `command`: its tags (mindless) don't match `animal`.
+!assert "entity[horse].commanded == True and not var_has('zed', 'commanded')"
+!action druid banish zed horse
+?? ❌ action `banish`: [target_tags]
+!status def zombified
+!status grants_unit_tags zombified undead
+!status apply zed zombified
+!action druid banish zed horse
+?? ⚠️ `banish` dropped a target: `horse` doesn't fit `banish`: its tags (animal, rideable) don't match `undead`.
+!assert "entity[zed].banished == True and not var_has('horse', 'banished')"
+!action druid fear zed
+?? its tags (mindless, undead) match `mindless`, `construct`.
+!ent kill bandit
+!ent kill horse
+!action druid raise horse
+?? ❌ action `raise`: [target_tags] `horse` doesn't fit `raise`: its tags (animal, rideable, corpse) don't match `humanoid and not undead`.
+!action druid raise bandit
+?? `druid` used action `raise`.
+!assert "'bandit' in all_entities() and has_corpse('horse')"
+!status def feared
+!status cannot_affect_units_with_tag feared "mindless or construct"
+?? `feared` cannot_affect_units_with_tag = mindless or construct
+!status apply zed feared
+?? `zed`: `feared` can't affect units with tags `mindless or construct` (`zed`: mindless, undead) — no effect.
+!assert "not status_has('zed', 'feared')"
+!eval "status_apply('zed', 'feared')"
+!assert "not status_has('zed', 'feared')"
+!status force zed feared
+!assert "status_has('zed', 'feared')"
+!status apply bandit feared
+!assert "status_has('bandit', 'feared')"
+!status cannot_affect_units_with_tag feared "mindless or"
+?? ❌
+!system status def default zombified
+!system status grants_unit_tags default zombified undead
+?? `zombified` grants_unit_tags = undead
+!ent set_var druid actions.odd.target entity
+!ent set_var druid actions.odd.target_requires_tags "(animal"
+!ent set_var druid actions.odd.body "entity[self].odd = True"
+!action info druid odd
+?? ⚠️ `actions.odd.target_requires_tags`: Tag filter `(animal`: a `(` is never closed.
+!action druid odd bandit
+?? doesn't parse
+!assert "not var_has('druid', 'odd')"
+
+Expected: HARNESS-ALLOWS-ERRORS. An action's target_requires_tags /
+target_refuses_tags filter its target by the target's tags before the
+body runs. Command animal works on the horse and is refused for the
+zombie; banish (undead) refuses a list with no undead, then, once a
+`zombified` status grants `undead`, drops the horse with a note and
+banishes the zombie. Fear refuses mindless targets. A corpse target is
+checked against the corpse's tags (`corpse` included): raise takes the
+humanoid bandit's corpse and refuses the horse's. A status with
+cannot_affect_units_with_tag doesn't land on a unit whose tags match it,
+through `!status apply` (which says why) and status_apply alike; a
+forced application ignores it, like immunity. `!system status` edits a
+system's grants. A target filter that doesn't parse is named by `!action
+info` and refuses every target.
