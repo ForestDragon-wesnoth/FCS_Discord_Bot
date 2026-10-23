@@ -2363,7 +2363,7 @@ cap, `tile_place`, `!remind`, `!eval --trace`, the acting-unit highlight,
 system status / table / macro libraries and `!match sync`): every diff
 line read, then probes and a command / function fuzzer (31,500 runs over
 the new commands and list functions: only Python's own arity messages,
-as for every older function). Scenarios 900-902; verified after: 902/902,
+as for every older function). Scenarios 900-903; verified after: 903/903,
 the replay differential, usage drift 0 of 906 servers; the acting-unit
 fix on a 2x2 vehicle with a hidden rider.
   - **Status hook recursion:** a status hook (or an on_status_changed
@@ -2396,5 +2396,10 @@ fix on a 2x2 vehicle with a hidden rider.
     ...>` group as a placeholder when it is also a slot name: `!system
     status hook <sys> <name>` offered the tick timings (`when` read as the
     `when` slot), and `!map border c` didn't offer `color`.
+  - **Secret reminders** (user call, after the pass): a held secret
+    reminder ended the next host reply in any channel, a POV-bound one
+    players read included. It now waits for a host command in a channel
+    without a team POV, and `!remind list` there is the only listing that
+    shows secret ones (903).
   - Smaller: `!owner errors clear` let a disk error escape, and a hand-
     edited errors.json entry without `user_name` crashed the listing.

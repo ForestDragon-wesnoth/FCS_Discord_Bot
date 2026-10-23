@@ -3749,7 +3749,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "the reply of the command that passed the turn. Placeholders: "
             "{text}, {by} (who set it), {turns} (the turns it waited). A "
             "secret reminder's line starts with `🔒 (hosts)` and shows in "
-            "a host's reply. Empty = the text alone."
+            "a host's reply in a channel without a team POV. Empty = the text alone."
         ),
     },
     "turn_start_hidden_message_format": {

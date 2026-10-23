@@ -28924,3 +28924,40 @@ its turn the omniscient view and its own team (red) mark the tank, as the
 red turn line names Pilot; blue sees the tank but not who is inside, so
 nothing is marked (before, red saw no mark either: the highlight read a
 hidden rider as unseen by everyone).
+
+
+SCENARIO 903 — A secret reminder shows only in a channel without a team POV
+---------------------------------------------------------------------------
+
+!match new rp RP 8 6
+!match use rp
+!ent add a A 10 1 1 10
+!ent add b B 10 3 3 5
+!remind secret 1 the floor is trapped
+!remind 2 reinforcements arrive
+!match bind pov=red
+!remind list
+?? reinforcements arrive
+?! trapped
+?? (Secret reminders are listed only in a channel without a team POV.)
+!turn next
+?! trapped
+!ent info a
+?! trapped
+!remind list
+?! trapped
+!match bind pov=omniscient
+?? 🔒 (hosts) ⏰ Reminder: the floor is trapped
+!remind list
+?! trapped
+!turn next
+?? ⏰ Reminder: reinforcements arrive
+
+Expected: HARNESS-ALLOWS-ERRORS. A POV-bound channel is one players read,
+so a secret reminder never shows there: the host's `!remind list` in it
+lists only the public reminder (with a note saying where secret ones are
+listed), and when the secret one comes due on the host's own `!turn next`
+there, it waits. The host's next command in a channel without a team POV
+(`!match bind pov=omniscient`) ends with its line, and the list no
+longer holds it; public reminders print with the turn output wherever the
+turn passes.

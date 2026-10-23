@@ -1257,9 +1257,10 @@ hardcodes**.
   (`_fire_reminders`). A public one's line (`reminder_message_format`)
   goes out through `surface_log` with the turn output; a secret one waits
   in `held_reminders` and ends the reply of the next command a host runs
-  on the match (`CommandRegistry._run`, after the handler, inside that
-  command's undo step; `!as` doesn't count). Players' `!remind list` shows
-  the public ones only (893).
+  on the match in a channel without a team POV (a POV-bound channel is
+  one players read; `CommandRegistry._run`, after the handler, inside that
+  command's undo step; `!as` doesn't count). `!remind list` shows the
+  secret ones only to a host in such a channel (893, 903).
 
 ### 7.4 Statuses
 
