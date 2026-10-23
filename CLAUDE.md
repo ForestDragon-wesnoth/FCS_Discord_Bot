@@ -362,6 +362,8 @@ back, load the schema with `ToolSearch` before calling
 - **`journal.py`**: the per-match command journal (segments, entries, the
   state hash, the export bundle); recorded from `CommandRegistry._run`,
   replayed by `!match replay` (§7.16).
+- **`prefab.py`**: prefabs (§7.19): `capture_prefab`, `check_prefab`, the
+  `Turn` rotation / mirroring, `stamp_prefab` and its id / link remapping.
 - **`completion.py`**: Tab completion for a typed line, shared by gui.py and
   cli.py (readline). It walks the typed words through the command's usage
   strings (`_usage_tails` / `_usage_tokens`, the stray-word check's
@@ -390,7 +392,7 @@ back, load the schema with `ToolSearch` before calling
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
   match and nested maps (step 1 and 2a-2d built; §8).
 - **`docs/zones_prefabs_design.md`**: the agreed design for zone
-  definitions / tags and prefabs (#31; zones built, prefabs next; §8).
+  definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature. When a feature ships in full (everything its
@@ -489,7 +491,8 @@ one folder per server (`local` for the CLI / GUI):
 `<n>.jsonl` = its entries, appended to; `Storage.write_journals` after each
 commit, `_truncate_journal` on a rollback), `saves/`, `sprites/`, `templates/`
 (entity templates, outside commits; `templates/.trash/` = their replaced /
-edited / deleted versions, 24 h), `backups/` (a dated copy of
+edited / deleted versions, 24 h; `templates/prefabs/` the prefabs, with
+their own `.trash/`, §7.19), `backups/` (a dated copy of
 systems.json, workspace.json, system_history.json and audit.json, written
 by each commit that changes one, `<stem>.<unix ms>.json`; kept for the
 owner limits `server_backup_days` (7) and `server_backup_count` (200 per
@@ -2516,6 +2519,71 @@ same library and namespace as entity templates: `{"kind": "partial",
   partial is only pinned (gone from the library) in full, with a ⚠️
   (`_SAVING_TO_LIBRARY`: the library can't hold a reference to it).
 
+### 7.19 Prefabs
+
+A saved rectangle of one map stamped into a match (`prefab.py`; the agreed
+design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
+- **Shape** (documented at the top of prefab.py): size, the system it was
+  saved under, `definitions_all`, the var names of the footprint and team
+  rules, tile data, corpses, zones (cells relative, an aura's `anchor` a
+  saved id), units (entity dicts at 0-based offsets, parts and riders as
+  their own entries, links by saved ids, vars in the partial-template FILE
+  form), groups and the `definitions` it carries.
+- **Saving** (`capture_prefab`, `!prefab save <name> <x1> <y1> <x2> <y2>
+  [map=] [only=units,tiles,zones,corpses] [definitions=all]`, a host of
+  the channel's match or an admin): a body (parts, riders, segments) is
+  saved whole or left out with a ⚠️; a unit carrying a map is left out
+  (unsupported); a zone is clipped to the rectangle; an aura goes only
+  with its anchor; a corpse holding a wrecked map loses the map.
+  Definitions (`_collect_definitions`): the tile templates, zone and status
+  definitions and `!func`s (called anywhere in the saved strings) its
+  contents use that the system lacks or holds differently; all of them
+  with `definitions=all`.
+- **Stamping** (`stamp_prefab`, `!prefab stamp <name> <x> <y> [map=]
+  [mode=] [rotate=] [flip=] [team=] [confirm]`, a host command): refused
+  unless the match's system is the prefab's or inherits from it
+  (`system_allows`; `definitions=all` goes anywhere); the turned rectangle
+  must fit the map. `mode=` (default rule `prefab_stamp_mode`): overlay /
+  keep (prefab tiles win / existing tiles win; a unit where another stands
+  refuses the whole stamp naming the blockers' roots) or replace (clears
+  the rectangle: units covering a cell despawned whole, tile data, corpses,
+  zone cells; the first run lists what goes and raises `NeedsConfirm`).
+  All or nothing (`_rollback_match`). Missing definitions are added; one
+  the match holds differently stays the match's, with a ⚠️.
+- **Turning** (`Turn`): flip first, then clockwise quarter turns; cells,
+  rectangles, facings (two steps per 90°), footprint W / H swap, snake
+  trail vars. GM data keeps its directional words.
+- **Ids:** a saved id is kept while the match has it free, else minted
+  from it without trailing digits (`orc3` -> `orc`, `orc2`); a part named
+  `<root>_<x>` follows its root's new id; ids a replace removes are free.
+  `part_of`, `mounted_on`, `__follows` and aura anchors are remapped; GM
+  vars holding ids stay as written. A zone name clash mints a new name
+  (`mint_zone_name`, named in the reply); groups join existing ones;
+  `team=` sets every stamped unit's team.
+- **Spawning** (`_spawn_units`): parents and vehicles first through
+  `Entity.spawn` (on_entity_spawned fires; no tile enter / stop hooks);
+  riders spawn mounted, their vehicle ignored for occupancy through the
+  context var `logic.PLACEMENT_IGNORE`; the saved facing is set after the
+  spawn (the spawn-facing rule would replace it). Then a `prefab_stamped`
+  event (prefab, x, y, map, units, zones).
+- **Journal:** a stamp, and any formula reading the library
+  (`prefab_names`, `prefab_size`), journals as the state it left
+  (`JOURNAL_AS_STATE`): journals carry no prefab library.
+- **Library** (`MatchManager.prefabs`, `templates/prefabs/<name>.json`,
+  its own namespace and trash; `storage.library_dir`, the template file
+  helpers' `lib=`): `show <name> [text|image]` (rendered through a scratch
+  match, the channel match's render mode by default, plus a contents
+  summary), `list`, `import <name> <json>`, `rename`, `copy`, `delete`,
+  `trash`, `restore`; edits need the saver or an admin, reads are open.
+  Size limits cut old prefab versions with old template versions;
+  `!server storage` lists both. Renaming or deleting a partial names the
+  prefabs whose units reference it.
+- **Elsewhere:** `!map new <name> from=<prefab> [rotate=] [flip=] [team=]`
+  makes a map the turned prefab's size and stamps it; `!dry !prefab stamp`
+  previews a stamp. Formulas: `stamp_prefab(name, x, y, map=, mode=,
+  rotate=, flip=, team=, confirm=False)` (mutating, returns the new
+  top-level ids), `prefab_names()` (loopable), `prefab_size(name)`.
+
 ---
 
 ## 8. Open questions, planned work, deferred and rejected ideas
@@ -2553,6 +2621,9 @@ rejected already. Update this section in the PR that resolves an item.
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
   limitation, left as is (user: note it).
+- **Stamped units ignore blocking tiles:** a prefab stamp (like every
+  spawn) checks occupancy only, so a stamped unit can land on a cell whose
+  tile, zone or corpse blocks it. Known issue (user: list it).
 
 - **Pass 43, deferred by the user ("decide later"):** T3 (a mid-round
   initiative change under `immediate` can cost a unit its turn or give it
@@ -2595,11 +2666,6 @@ rejected already. Update this section in the PR that resolves an item.
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.
-- **Prefabs (#31):** designed with the user; the agreed design is in
-  `docs/zones_prefabs_design.md` (read it whole first; ask before
-  deviating). Two PRs: zone definitions and tags (built, §7.12), then
-  prefabs (§5-§9 of the doc: save a rectangle of one map, stamp it with
-  overlay / replace / keep, rotation, game-system checks).
 - **Multiple maps per match (#40) and nested maps (#164):** designed with
   the user over a long discussion; the agreed decisions, deferred points, build
   order and test requirements (20+ scenarios) are in

@@ -17,8 +17,9 @@ The agreed design is docs/zones_prefabs_design.md §5-§9. A prefab holds:
                                             contents use (§8)
    "saved_by": ..., "saved_by_name": ...}
 
-Offsets are 0-based from the rectangle's top-left cell. Saved ids are only
-link keys: a stamp mints every unit and corpse a new id. The units are
+Offsets are 0-based from the rectangle's top-left cell. Saved ids are link
+keys: a stamp keeps a saved id while the match has it free and mints a new
+one from it otherwise. The units are
 stored the way the cross-match copy moves a body (MatchManager.copy_entity):
 entity dicts at offsets, spawned parents first, so rotation, riders and id
 remapping act on one shape.

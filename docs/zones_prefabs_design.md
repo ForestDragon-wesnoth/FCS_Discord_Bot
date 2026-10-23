@@ -1,6 +1,7 @@
 # Zone definitions, tags and prefabs (#31): agreed design
 
-Status: design agreed with the user in chat. Two PRs, in order:
+Status: design agreed with the user in chat; both PRs built (CLAUDE.md
+§7.12 and §7.19 describe what shipped). Two PRs, in order:
 
 1. **Zones and tiles** (§1-§4): zone definitions, zone and tile tags,
    minted zone names (`zone_spawn`).
@@ -130,7 +131,7 @@ offset.
 - **Permissions:** save needs a host of the channel's match or an admin
   (as `!template save`); stamp is a host command (a player's is queued);
   edits need the saver or an admin; reads are open to everyone.
-- **`!prefab show <name>`** renders the prefab through a scratch match,
+- **`!prefab show <name> [text|image]`** renders the prefab through a scratch match,
   plus a contents summary; text or image follows the channel match's
   render mode (`!map mode`).
 - **`!map new <name> from=<prefab>`** makes a map the prefab's size and
@@ -162,7 +163,10 @@ offset.
   block conditions today). Known issue, listed in CLAUDE.md §8.
 - **Zone names:** a clash mints a fresh name (§3 minting); the reply names
   each rename.
-- **Ids and links:** unit ids minted from names, as template spawn does.
+- **Ids and links:** a unit keeps its saved id while the match has it
+  free; otherwise one is minted from it (trailing digits dropped: `orc3`
+  stamps as `orc`, `orc2`, ...), and a part named after its root follows
+  the root's new id.
   Engine links inside the prefab (parts, mounts, `__follows`, aura
   anchors) are remapped to the new ids. GM vars holding a unit id as text
   stay as written. A group whose members are stamped is recreated, joining
@@ -178,6 +182,9 @@ offset.
   cell, map, the new unit ids and zone names). Stamped units join the
   turn order like spawns, keeping their saved initiative.
 - **Undo:** a stamp is one undo step; `!dry !prefab stamp` previews one.
+- **Journal:** command journals don't carry the prefab library, so a
+  stamp (and a formula reading the library) is journaled as the state it
+  left.
 
 ## 8. Prefabs and game systems
 
