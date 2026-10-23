@@ -30253,3 +30253,264 @@ refused and jab isn't. Zone and tile reads and `!zone list tag=` take
 expressions. A team has its own `tags` (beside the `grants_unit_tags` its
 members carry); a map's tags are its `tags` map var. Malformed tags are
 refused in team data and map vars.
+
+SCENARIO 924 — Library tags: entity templates read their unit's tags, partials and list tag=
+-------------------------------------------------------------------------------------------
+
+!match new lt Lt 8 8
+!match use lt
+!ent add skel Skeleton 20 1 1 5
+!ent set_var skel tags "undead, skeleton"
+!template save skel
+!ent add wolf Wolf 15 2 1 5
+!ent set_var wolf tags "animal, beast"
+!template save wolf
+!ent set_var wolf gear.fang.damage 3
+!template save wolf fang_base path=gear.fang
+!template tags fang_base "natural, weapon"
+?? 🏷️ Template `fang_base` tags: natural, weapon.
+!template tags skel
+?? Template `skel` tags: undead, skeleton
+!template list "tag=undead or animal"
+?? `skel`
+?? `wolf`
+?! `fang_base`
+!template list "tag=weapon and not magic"
+?? `fang_base`
+?? tags natural, weapon
+?! `skel`
+!template list kind=entity tag=beast
+?? `wolf`
+?! `skel`
+!template tags wolf "animal, beast, pack"
+?? 🏷️ Template `wolf` tags: animal, beast, pack.
+!template spawn wolf 4 4
+!assert "unit_tags('wolf2') == ['animal', 'beast', 'pack']"
+!template give fang_base skel gear.fang
+!assert "not unit_has_tag('skel', 'natural') and container_tags('skel', 'gear.fang') == []"
+!ent set_var wolf gear.fang.damage 5
+!template save wolf fang_base path=gear.fang
+!template tags fang_base
+?? natural, weapon
+!template tags fang_base -
+?? 🏷️ Cleared template `fang_base`'s tags.
+!template list tag=weapon
+?? No template matches those filters.
+!template tags skel rider
+?? engine tag
+!template tags fang_base "a and"
+?? ❌
+!template import bonepile {"kind": "partial", "data": {"bones": 3}, "tags": ["remains", "rider"]}
+!template list tag=rider
+?? `bonepile`
+!template list "tag=(undead"
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. An entity template's tags are its saved
+unit's tags var (skel: undead, skeleton); a partial has a `tags` field of
+its own, set with `!template tags` (no words shows them, `-` clears them).
+`!template list tag=` takes any tag filter, with `kind=` and the other
+filters, and the listing shows each template's tags. `!template tags` on
+an entity template writes its tags var, so a spawned wolf2 carries pack.
+A partial's library tags stay on the library entry: a unit built from
+fang_base takes none of them. Re-saving a partial over itself keeps its
+tags. An entity template refuses an engine tag (no unit var can hold one);
+a partial's library tags may name one (a partial for riders' gear). A
+malformed tag or filter is refused.
+
+SCENARIO 925 — Prefab tags: !prefab tags, list tag=, re-save keeps them
+-----------------------------------------------------------------------
+
+!match new pt Pt 8 8
+!match use pt
+!ent add guard Guard 10 2 2 5
+!tile set 3 3 terrain.kind rock
+!prefab save hut 1 1 4 4
+!prefab save cave 2 2 5 5
+!prefab tags hut "village, small"
+?? 🏷️ Prefab `hut` tags: village, small.
+!prefab tags cave "dungeon, small"
+!prefab list "tag=small and not dungeon"
+?? `hut`
+?? tags village, small
+?! `cave`
+!prefab list tag=dungeon
+?? `cave`
+?! `hut`
+!prefab list tag=dungeon hu
+?? No prefab matches those filters.
+!prefab tags hut
+?? village, small
+!prefab save hut 1 1 3 3
+!prefab tags hut
+?? village, small
+!prefab tags hut -
+?? Cleared prefab `hut`'s tags.
+!prefab list tag=village
+?? No prefab matches those filters.
+!prefab tags cave "x or"
+?? ❌
+!prefab stamp cave 4 4
+!assert "unit_tags('guard2') == []"
+!as restart
+!match use pt
+!prefab tags cave
+?? dungeon, small
+
+Expected: HARNESS-ALLOWS-ERRORS. A prefab's tags are a metadata field
+(`!prefab tags`: no words shows them, `-` clears them), matched by
+`!prefab list tag=` with any tag filter, beside a name prefix. Saving a
+prefab over an existing one keeps its tags. Stamped units don't take the
+prefab's tags. A malformed tag is refused. The tags are saved with the
+prefab (they survive a restart).
+
+SCENARIO 926 — Tag vocabulary: !system tags, inheritance, !help tag, warn mode
+-----------------------------------------------------------------------------
+
+!system new base
+!system tags add base undead Risen dead: banish works on them
+?? 🏷️ Declared tag `undead` on `base`: Risen dead: banish works on them.
+!system tags add base animal A beast, commandable by druids
+!system tags add base rider
+?? engine tag
+!system tags add base "a b"
+?? ❌
+!system new night parent=base
+!system tags add night nocturnal Active at night
+!system tags list night
+?? `animal`: A beast, commandable by druids (inherited)
+?? `nocturnal`: Active at night
+?? `undead`: Risen dead: banish works on them (inherited)
+?? tag_vocabulary_mode off
+!system tags remove night animal
+?? hides the inherited one
+!system tags list night
+?? Hidden here: `animal`
+?! `animal`:
+!system unset night tag_vocabulary:animal
+!system tags list night
+?? `animal`
+!system info night
+?? tag_vocabulary: 3 (1 set here)
+!system diff base night
+?? tag_vocabulary only in `night`: `nocturnal`
+!system tags remove night ghost
+?? ❌
+!match new tv Tv 8 8 night
+!match use tv
+!help tag undead
+?? **`undead`**: Risen dead: banish works on them (declared on `base`)
+!help tag nocturnal
+?? **`nocturnal`**: Active at night
+!help tag rider
+?? engine tag
+!help tag ghost
+?? isn't in system `night`'s tag vocabulary
+!help tag
+?? **Tags of system `night`** (3):
+!ent add z Zombie 10 1 1 5
+!ent set_var z tags "undead, ghoul"
+?! Not in system
+!system set night tag_vocabulary_mode warn
+!ent set_var z tags "undead, ghoul, sneaky"
+?? ⚠️ Not in system `night`'s tag vocabulary: `ghoul`, `sneaky`
+!ent set_var z tags "undead, nocturnal"
+?! ⚠️
+!ent set_var z gear.cloak.grants_unit_tags "hidden"
+?? ⚠️ Not in system `night`'s tag vocabulary: `hidden`
+!assert "unit_tags('z') == ['undead', 'nocturnal']"
+!status def fear
+!status cannot_affect_units_with_tag fear "undead or mindless"
+?? `mindless`
+?! `undead`
+!zone new mist
+!zone add mist 3 3
+!zone tags mist "fog, nocturnal"
+?? ⚠️ Not in system `night`'s tag vocabulary: `fog`
+!team set red grants_unit_tags orcish
+?? `orcish`
+!map var set tags "cursed"
+?? `cursed`
+!tile tags 2 2 "wet"
+?? `wet`
+!system tags add night ghoul Eats corpses
+!ent set_var z tags "undead, ghoul, nocturnal"
+?! ⚠️
+!system tags remove base undead
+!ent set_var z tags "undead, nocturnal"
+?? `undead`
+!system set night tag_vocabulary_mode off
+!ent set_var z tags "wraith"
+?! ⚠️
+
+Expected: HARNESS-ALLOWS-ERRORS. A system's tag vocabulary is a library
+(`!system tags add <sys> <tag> [description]`, `list`, `remove`): a child
+inherits its parent's entries live, removing one hides it, `!system unset
+<sys> tag_vocabulary:<tag>` brings it back, and `!system info` / `diff`
+count it like the other libraries. Engine tags and malformed words can't
+be declared. `!help tag <tag>` shows a declared tag's description and the
+system declaring it, explains an engine tag, and names an undeclared one;
+bare `!help tag` lists the vocabulary. With tag_vocabulary_mode off
+nothing warns; at warn, a command writing a tag field ends with a ⚠️
+naming each of its tags the channel's system doesn't declare (ghoul, which
+z already held, too): a unit's tags var, grants_unit_tags in a container,
+a status definition's filter, zone and tile tags, team data and map tags.
+A write leaving no undeclared tag stays silent, nothing is refused (z
+keeps ghoul), and a tag removed from the vocabulary warns again.
+
+SCENARIO 927 — Tag vocabulary: !system lint, Tab completion, templates and prefabs, persistence
+---------------------------------------------------------------------------------------------
+
+!system new realm
+!match new tl Tl 8 8 realm
+!match use tl
+!ent add bat Bat 5 1 1 5
+!ent set_var bat tags "flying, nocturnal"
+!system lint realm
+?! isn't in the vocabulary
+!system tags add realm flying Ignores difficult terrain
+!system lint realm
+?? ⚠️ tag `nocturnal` isn't in the vocabulary: match `tl` unit `bat`
+?! tag `flying`
+!status def dazed
+!status tags dazed "mental, stun"
+!system lint realm
+?? ⚠️ tag `mental` isn't in the vocabulary: match `tl` status `dazed`
+!system tags add realm nocturnal Active at night
+!system tags add realm mental Mind-affecting
+!system tags add realm stun Loses actions
+!system lint realm
+?? all clean
+?tab "!help tag fl"
+?? → '!help tag flying '
+?tab "!zone tags mist n"
+?? → '!zone tags mist nocturnal '
+?tab "!system tags remove realm m"
+?? → '!system tags remove realm mental '
+!system set realm tag_vocabulary_mode warn
+!template save bat
+!template tags bat "flying, swarm"
+?? ⚠️ Not in system `realm`'s tag vocabulary: `swarm`
+!prefab save roost 1 1 2 2
+!prefab tags roost "cave"
+?? ⚠️ Not in system `realm`'s tag vocabulary: `cave`
+!ent set_var bat footprint_w 2
+!part add bat wing "Bat Wing" 3 3
+!ent set_var wing tags "membrane"
+?? `membrane`
+!as restart
+!system tags list realm
+?? `flying`: Ignores difficult terrain
+?? tag_vocabulary_mode warn
+!match use tl
+!ent set_var bat tags "flying, swarm"
+?? `swarm`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system lint` lists undeclared tags only
+once the system declares some: each tag its library and its matches store
+that the vocabulary lacks, with where it was found (a unit, a status
+definition). Tab completion offers the declared tags (and the engine
+tags) where a command takes a tag, and `!system tags remove` the system's
+own. Under warn, `!template tags` and `!prefab tags` warn about the
+channel's system's vocabulary too, and a body part's tags warn like any
+unit's. The vocabulary and the mode are saved with the system.

@@ -34,7 +34,7 @@ _FREE_SLOTS = {
     "hp", "maxhp", "w", "h", "delay", "delta", "level", "duration", "count",
     "r", "radius", "dx", "dy", "expansion", "params", "spec", "json", "text",
     "phrase", "condition", "effect", "new_name", "new_id", "init", "field",
-    "base", "tag", "op", "0-100", "MB", "csv", "row", "legend", "char", "color",
+    "base", "op", "0-100", "MB", "csv", "row", "legend", "char", "color",
     "r,g,b", "predicate", "selector", "selector_a", "selector_b", "reason",
     "args", "tokens", "label", "user", "server", "metric",
     "anchor", "word", "type", "template_text", "winner", "stat", "pid",
@@ -329,6 +329,17 @@ def _general_pool(mgr, ctx) -> List[str]:
     return sorted(str(x) for x in out)
 
 
+def _declared_tags(mgr, ctx) -> List[str]:
+    """The tags the channel's game system declares (its tag vocabulary:
+    the match's system, else the channel's default) and the engine tags."""
+    m = _match(mgr, ctx)
+    sysname = (m.system_name if m is not None
+               else mgr.effective_system_name(getattr(ctx, "channel_key", "")))
+    s = mgr.systems.get(sysname)
+    vocab = mgr.system_library(s, "tag_vocabulary") if s is not None else {}
+    return sorted(set(vocab) | set(logic.ENGINE_TAGS))
+
+
 def _slot_names(slot: str, root: str, sub: Optional[str],
                 binds: Dict[str, str], word: str, mgr, ctx) -> List[str]:
     """The candidates for one placeholder, from its name and command."""
@@ -401,6 +412,14 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(mgr.systems if slot == "system" else mgr.matches)
     if slot == "rule":
         return sorted(logic.RULES_REGISTRY)
+    if slot in ("tag", "filter"):
+        if root == "system" and sub == "tags":
+            # `add` names a new tag; the others one the system declares.
+            if binds.get(_LAST_LIT) == "add":
+                return []
+            s = mgr.systems.get(binds.get("system", ""))
+            return sorted(mgr.system_library(s, "tag_vocabulary")) if s else []
+        return _declared_tags(mgr, ctx)
     if slot == "function":
         from formula import function_reference
         own = (set(m.formula_functions) if m is not None else set())
@@ -500,7 +519,7 @@ _KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
                "dest_match", "rule", "function", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
                "slot", "corpse_id", "key", "path", "sub", "definition",
-               "prefab"}
+               "prefab", "tag", "filter"}
 
 
 # ---- the entry point -------------------------------------------------------

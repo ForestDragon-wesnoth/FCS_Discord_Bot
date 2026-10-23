@@ -395,7 +395,7 @@ back, load the schema with `ToolSearch` before calling
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
-  the vocabulary (PRs 1-2 built, §7.20).
+  the vocabulary (built, §7.20).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature. When a feature ships in full (everything its
@@ -2634,8 +2634,7 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
 
 ### 7.20 Tags
 
-The design is `docs/tags_design.md` (PRs 1 and 2 of 3 built: §1-§5)
-(919-923).
+The design is `docs/tags_design.md` (built, PRs 1-3) (919-927).
 - **Filters** (`logic.check_tag_filter`, `tag_filter_matches`): a list
   (or comma / space text) means ANY of its tags; text holding `and` /
   `or` / `not` or a parenthesis is an expression (`not` > `and` > `or`,
@@ -2689,6 +2688,39 @@ The design is `docs/tags_design.md` (PRs 1 and 2 of 3 built: §1-§5)
   cannot_affect_units_with_tag`): `apply_status` refuses a unit whose tags
   match (`status_tag_block`, named by `status_apply_block_reason`); a
   forced application ignores it, like immunity.
+- **Library tags** (§6): an entity template's tags are its saved unit's
+  tags var (`_template_tags`, partial references resolved; the var named
+  by its `var_names` else the rule); a partial's and a prefab's are a
+  `tags` metadata field (engine words allowed, `checked_tag_list(...,
+  engine_ok=True)` in check_template / check_prefab), never copied into
+  units. `!template tags` / `!prefab tags <name> [<tag ...> | -]` (no
+  words shows, `-` clears; on an entity template it writes the tags var);
+  a re-save over a partial / prefab keeps its tags; `!template list` /
+  `!prefab list` take `tag=<filter>` and show the tags (924-925).
+- **Vocabulary** (§7): the system library `tag_vocabulary` (tag ->
+  description; in SYSTEM_LIBRARIES, so inheritance, hides, `!system
+  unset`, info / diff, server undo and audit come with it) is read LIVE,
+  never copied into a match (absent from the create / sync / scratch
+  lists). `!system tags <list|add|remove> <sys> ...` (admin; engine tags
+  refused). `!help tag [<tag>]` and the `tag` / `filter` completion slots
+  read the channel's system (its match's, else the channel's default).
+  Rule `tag_vocabulary_mode` off / warn: under warn `_run_top` sets
+  `logic.STORED_TAGS` (only when a system of the server warns) and the
+  store chokepoints record the tags of each tag field a write CHANGES
+  (`note_stored_tags` / `written_tag_words` over `TAG_FIELD_KEYS` and the
+  `tag:` tokens of the status token keys; engine tags skipped):
+  `write_var`, `team_set`, map tag writes (`!map var set`,
+  `map_var_set`, `set_map_setting`), `Map.tile_set_path` /
+  `zone_set_path`, `!zone tags`, tile template tags, the status / zone
+  definition editors (`_status_def_sub` / `_zone_def_sub` wrap a
+  before / after diff), `_store_template` / `_store_prefab`. Each records
+  under the system judging it (a match's own, a scratch match's, None =
+  the command's channel system); the command ends with one ⚠️ per system
+  naming the undeclared ones. Spawns, summons, stamps and restores copy
+  stored data and record nothing. `!system lint` lists undeclared tags
+  with where they are once the vocabulary is non-empty
+  (`_lint_undeclared_tags`: libraries, the system's matches, its
+  prefabs) (926-927).
 
 ---
 
