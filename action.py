@@ -51,7 +51,7 @@ import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import VTTError, NotFound, CROSS_MATCH_GUARD
+from logic import VTTError, NotFound, CROSS_MATCH_GUARD, normalize_tags
 
 # The other-matches guards of the action levels running now, outermost
 # first (each a run_action's `cross`): a level that changes another match
@@ -107,6 +107,20 @@ class _BufferCtx:
 # dictionary. A container with a key named "actions" whose value is a
 # dict has each child of that dict treated as an Action definition.
 ACTIONS_KEY = "actions"
+
+# Action tags (#234). An action's own `tags` stay with it; a container's
+# `action_tags` (any dict above an action: the vars root, an item, an
+# `actions` dict, a mount slot) reach every action below it; an
+# `exclude_inherited_action_tags` (`all` / `*`, or tags) on an action or a
+# container cuts the tags arriving from above, for everything at and below
+# it. Statuses forbid or block actions by their final tags (logic.py,
+# Match.action_restrictions).
+ACTION_OWN_TAGS_KEY = "tags"
+ACTION_TAGS_KEY = "action_tags"
+ACTION_TAG_EXCLUDE_KEY = "exclude_inherited_action_tags"
+# Keys of an `actions` dict read as the dict's own tag fields, never as
+# actions.
+_ACTIONS_DICT_FIELDS = (ACTION_TAGS_KEY, ACTION_TAG_EXCLUDE_KEY)
 
 # Allowed values for an Action dict's `target` field. Anything else at
 # definition time is a validation error.
@@ -306,11 +320,22 @@ class Action:
     # action (the vehicle's own). Only consulted for vehicle-owned actions
     # during mount-action discovery; ignored for ordinary entity actions.
     allowed_slots: Optional[List[str]] = None
+    # The action's final tags: its own `tags`, then the inherited ones
+    # nearest first (what survived the exclusions), each once.
+    tags: List[str] = field(default_factory=list)
+    # tag -> where it came from: the action's own path, a container's path
+    # ("" = the vars root).
+    tag_sources: Dict[str, str] = field(default_factory=dict)
+    # Tag fields that weren't a tag list (a value dropped from discovery's
+    # view, named by `!action info`).
+    tag_problems: List[str] = field(default_factory=list)
 
     @staticmethod
     def from_dict(
         name: str, raw: Any, *,
         container_path: str, full_path: str,
+        inherited: Optional[List[Tuple[str, str]]] = None,
+        inherited_problems: Optional[List[str]] = None,
     ) -> "Action":
         """Build an Action from a vars subtree. Raises
         ActionValidationError if the shape is wrong."""
@@ -350,12 +375,64 @@ class Action:
             allowed_slots = _split_csv(raw_slots)
         elif isinstance(raw_slots, (list, tuple)):
             allowed_slots = [str(s).strip() for s in raw_slots if str(s).strip()]
+        problems: List[str] = list(inherited_problems or [])
+        chain = _inherit_tags(inherited or [], raw, full_path, problems,
+                              own_key=None)
+        own = _tag_field(raw, ACTION_OWN_TAGS_KEY, full_path, problems)
+        tags: List[str] = []
+        sources: Dict[str, str] = {}
+        # Own tags first, then each container's nearest first, in the
+        # order the container lists them.
+        order = list(dict.fromkeys(src for _t, src in chain))
+        nearest = [(t, src) for o in reversed(order)
+                   for t, src in chain if src == o]
+        for t, src in [(t, full_path) for t in own] + nearest:
+            if t not in sources:
+                tags.append(t)
+                sources[t] = src
         return Action(
             name=name, body=body, description=description,
             target_type=target_type,
             container_path=container_path, full_path=full_path,
             allowed_slots=allowed_slots,
+            tags=tags, tag_sources=sources, tag_problems=problems,
         )
+
+
+def _tag_field(d: Dict[str, Any], key: str, path: str,
+               problems: List[str]) -> List[str]:
+    """The tags `d[key]` holds (a list or comma / space text), noting in
+    `problems` a value that isn't a tag list or words that can't be tags."""
+    raw = d.get(key)
+    if raw is None:
+        return []
+    tags = normalize_tags(raw)
+    if not isinstance(raw, (str, list)) or (isinstance(raw, list) and any(
+            not isinstance(t, str) or t.strip() not in tags for t in raw)):
+        where = f"{path}.{key}" if path else key
+        problems.append(f"`{where}` isn't a list of one-word tags "
+                        f"({raw!r}); only {tags or 'nothing'} counts.")
+    return tags
+
+
+def _inherit_tags(chain: List[Tuple[str, str]], d: Dict[str, Any],
+                  path: str, problems: List[str],
+                  own_key: Optional[str] = ACTION_TAGS_KEY,
+                  ) -> List[Tuple[str, str]]:
+    """The (tag, source) list reaching below the dict `d` at `path`: the
+    `chain` arriving from above minus what `d`'s
+    exclude_inherited_action_tags cuts, plus `d`'s own `own_key` tags."""
+    out = list(chain)
+    if ACTION_TAG_EXCLUDE_KEY in d:
+        raw = d[ACTION_TAG_EXCLUDE_KEY]
+        if isinstance(raw, str) and raw.strip().lower() in ("all", "*"):
+            out = []
+        else:
+            cut = set(_tag_field(d, ACTION_TAG_EXCLUDE_KEY, path, problems))
+            out = [(t, s) for t, s in out if t not in cut]
+    if own_key is not None:
+        out += [(t, path) for t in _tag_field(d, own_key, path, problems)]
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -443,21 +520,16 @@ def discover_actions(
     (insertion order), so `entity_actions()` and the disambiguation
     menu give a stable view across calls."""
     out: Dict[str, List[Action]] = {}
+    # The vars root is a container too: its action_tags reach every action.
+    problems: List[str] = []
+    root_chain = _inherit_tags([], entity.vars, "", problems)
 
     # Top-level intrinsic actions: entity.vars.actions.<name>. Bypass
     # the container scoping (it's the catch-all slot for entity-level
     # actions that don't belong to any item/skill/etc.).
     intrinsic = entity.vars.get(ACTIONS_KEY)
     if isinstance(intrinsic, dict):
-        for name, raw in intrinsic.items():
-            try:
-                act = Action.from_dict(
-                    name, raw, container_path="",
-                    full_path=f"{ACTIONS_KEY}.{name}",
-                )
-            except ActionValidationError:
-                continue
-            out.setdefault(name, []).append(act)
+        _add_actions(intrinsic, "", root_chain, problems, out)
 
     # Container actions. Each top-level key (subject to the container
     # rules) is the root of a recursive walk that looks for `.actions.`
@@ -473,13 +545,38 @@ def discover_actions(
             continue
         _walk_for_actions(
             top_val, base_path=top_key, out=out,
+            chain=root_chain, problems=problems,
         )
     return out
+
+
+def _add_actions(actions_subtree: Dict[str, Any], base_path: str,
+                 chain: List[Tuple[str, str]], problems: List[str],
+                 out: Dict[str, List[Action]]) -> None:
+    """Each action of the `actions` dict of the container at `base_path`
+    ("" = the vars root) into `out`, with the tags arriving from above
+    (`chain`) and the `actions` dict's own tag fields."""
+    path = f"{base_path}.{ACTIONS_KEY}" if base_path else ACTIONS_KEY
+    probs = list(problems)
+    chain = _inherit_tags(chain, actions_subtree, path, probs)
+    for name, raw in actions_subtree.items():
+        if name in _ACTIONS_DICT_FIELDS:
+            continue
+        try:
+            act = Action.from_dict(
+                name, raw, container_path=base_path,
+                full_path=f"{path}.{name}",
+                inherited=chain, inherited_problems=probs,
+            )
+        except ActionValidationError:
+            continue
+        out.setdefault(name, []).append(act)
 
 
 def _walk_for_actions(
     container: Dict[str, Any], *,
     base_path: str, out: Dict[str, List[Action]],
+    chain: List[Tuple[str, str]], problems: List[str],
 ) -> None:
     """Recursive helper for discover_actions. Walks `container` and:
       - if it has an `actions` key with a dict value, every child of
@@ -488,19 +585,14 @@ def _walk_for_actions(
         extended path (so nested containers like
         `inventory.bags.left.sword` are reachable)
     Non-dict children are leaves and ignored. The `actions` subkey
-    is NEVER recursed into."""
+    is NEVER recursed into. `chain` is the (tag, source) list of the
+    action_tags reaching `container` from above, `problems` the tag
+    fields above it that weren't tag lists."""
+    problems = list(problems)
+    chain = _inherit_tags(chain, container, base_path, problems)
     actions_subtree = container.get(ACTIONS_KEY)
     if isinstance(actions_subtree, dict):
-        for name, raw in actions_subtree.items():
-            try:
-                act = Action.from_dict(
-                    name, raw,
-                    container_path=base_path,
-                    full_path=f"{base_path}.{ACTIONS_KEY}.{name}",
-                )
-            except ActionValidationError:
-                continue
-            out.setdefault(name, []).append(act)
+        _add_actions(actions_subtree, base_path, chain, problems, out)
     for k, v in container.items():
         if k == ACTIONS_KEY:
             continue
@@ -508,7 +600,7 @@ def _walk_for_actions(
             _walk_for_actions(
                 v,
                 base_path=f"{base_path}.{k}",
-                out=out,
+                out=out, chain=chain, problems=problems,
             )
 
 
@@ -1318,6 +1410,7 @@ async def run_action(
         if is_top_level:
             match._runtime_buffer = None
         match.fire_action_failed(
+            action_tags=action.tags,
             actor_id=actor_id,
             action_name=action.name,
             action_path=action.full_path,
@@ -1335,13 +1428,33 @@ async def run_action(
         )
         return False, (af.reason, af.message)
 
+    # Statuses that forbid the action, or make its targets immune (#234),
+    # before the body runs; an immune unit in a list target is dropped.
+    refusal = _restriction_refusal(action, actor_id, target, match,
+                                   extra_ctx)
+    if refusal is not None:
+        reason, message, kept, notes = refusal
+        if reason:
+            return _finish_action_fail(ActionFail(message, reason=reason))
+        if notes:
+            if is_top_level:
+                for note in notes:
+                    await ctx.send(note)
+            else:
+                match.surface_log(notes)
+        target = kept
+        bindings["target"] = target
+
     match._action_depth += 1
     try:
         engine = FormulaEngine(match)
+        extras = dict(extra_ctx) if extra_ctx else {}
+        extras.setdefault("action_name", action.name)
+        extras.setdefault("action_tags", list(action.tags))
         eval_ctx = EvalCtx(
             this=match.current_entity_id(),
             target=actor_id,
-            extras=dict(extra_ctx) if extra_ctx else None,
+            extras=extras,
         )
         # Mid-body choices use a REPLAY model: only the top-level
         # invocation owns the loop + answer queue. It seeds the queue
@@ -1450,6 +1563,7 @@ async def run_action(
     # body's writes have settled (so a passive observing this hook
     # sees post-action state).
     match.fire_action_used(
+        action_tags=action.tags,
         actor_id=actor_id,
         action_name=action.name,
         action_path=action.full_path,
@@ -1478,6 +1592,7 @@ async def run_action(
         target_eids = [t for t in target if isinstance(t, str) and t in match.entities]
     for tid in target_eids:
         match.fire_action_used_on_target(
+            action_tags=action.tags,
             target_id=tid,
             actor_id=actor_id,
             action_name=action.name,
@@ -1497,6 +1612,54 @@ async def run_action(
             for line in flush.out:
                 await ctx.send(line)
     return True, None
+
+
+def _restriction_refusal(action: Action, actor_id: str, target: Any,
+                         match: "Match", extra_ctx: Optional[Dict[str, Any]],
+                         ) -> Optional[Tuple[str, str, Any, List[str]]]:
+    """None when no status restricts the action; else (reason, message,
+    target, notes): reason `forbidden` / `immune` with the refusal, or ""
+    with the entity_list target minus its immune units and the notes naming
+    them."""
+    from logic import ACTION_FORBID_FIELDS, ACTION_IMMUNE_FIELDS
+    extra = extra_ctx or {}
+    units = match.action_forbid_units(actor_id, extra.get("vehicle"),
+                                      extra.get("rider"))
+    hits = match.action_restrictions(ACTION_FORBID_FIELDS, units, action.name,
+                                     action.tags, actor_id)
+    if hits:
+        return ("forbidden", "\n".join(
+            match.action_restriction_line(
+                "action_forbidden_message_format", h, action.name,
+                action.tags, actor_id) for h in hits), target, [])
+
+    def immune_lines(tid: str) -> List[str]:
+        return [match.action_restriction_line(
+                    "action_immune_message_format", h, action.name,
+                    action.tags, actor_id, tid)
+                for h in match.action_restrictions(
+                    ACTION_IMMUNE_FIELDS, match.action_immune_units(tid),
+                    action.name, action.tags, actor_id, tid)]
+
+    if action.target_type == "entity" and isinstance(target, str):
+        lines = immune_lines(target)
+        if lines:
+            return "immune", "\n".join(lines), target, []
+    elif action.target_type == "entity_list" and isinstance(target, list):
+        kept: List[Any] = []
+        dropped: List[str] = []
+        for tid in target:
+            lines = immune_lines(tid) if isinstance(tid, str) else []
+            if lines:
+                dropped.extend(lines)
+            else:
+                kept.append(tid)
+        if dropped and not kept:
+            return "immune", "\n".join(dropped), target, []
+        if dropped:
+            return "", "", kept, [
+                f"⚠️ `{action.name}` dropped a target: {ln}" for ln in dropped]
+    return None
 
 
 _ROLLBACK_FIELDS_CHECKED = False

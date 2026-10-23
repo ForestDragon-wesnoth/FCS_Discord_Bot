@@ -86,6 +86,19 @@ STATUS_DEF_HOOKS = {"on_status_added": "on_added",
                     "on_status_removed": "on_removed",
                     "on_status_changed": "on_changed"}
 
+# Status fields restricting actions (#234), by what they do: a list of
+# action tags or action names each, and beside each a `<field>_unless`
+# expression (self = the bearer; actor, action_name, action_tags, target,
+# status_name bound) that lifts only that list while true. A status
+# instance holding one of these keys replaces its definition's value.
+# Innate or equipment restrictions are a permanent status (a construct's
+# `no_rest`), so these live on statuses alone.
+ACTION_FORBID_FIELDS = ("forbids_actions_with_tag", "forbids_actions_with_name")
+ACTION_IMMUNE_FIELDS = ("immune_to_actions_with_tag",
+                        "immune_to_actions_with_name")
+ACTION_RESTRICTION_FIELDS = ACTION_FORBID_FIELDS + ACTION_IMMUNE_FIELDS
+UNLESS_SUFFIX = "_unless"
+
 # The channel map of the running command (tier 4 of the map hierarchy):
 # a function of a Match giving the map name the command's channel views
 # there. Formulas resolve `map='view'` through it; None outside a command
@@ -3263,6 +3276,33 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "action ...); hitting it almost always means a cyclic "
             "definition. The dispatcher raises an ActionFail on "
             "overflow rather than blowing Python's stack."
+        ),
+    },
+    "action_forbidden_message_format": {
+        "default": ("`{actor}` can't use `{action}`: {status} on `{unit}` "
+                    "forbids {matched}."),
+        "schema": {"type": "str"},
+        "desc": (
+            "The refusal of an action a status forbids (a status's "
+            "forbids_actions_with_tag / forbids_actions_with_name, on the "
+            "acting unit, its body root, or the vehicle / rider of a mount "
+            "action). Placeholders: {actor}, {action}, {status}, {unit} "
+            "(the unit bearing the status), {matched} (`ranged` actions / "
+            "`aimed_shot`), {tags} (the action's tags), {field}. Empty = the "
+            "default text."
+        ),
+    },
+    "action_immune_message_format": {
+        "default": ("`{target}` is immune to `{action}`: {status} on "
+                    "`{unit}` blocks {matched}."),
+        "schema": {"type": "str"},
+        "desc": (
+            "The refusal of an action whose target a status makes immune "
+            "(immune_to_actions_with_tag / immune_to_actions_with_name on the "
+            "target or its body root), and the note naming a unit dropped "
+            "from an entity_list target. Placeholders: {target}, {actor}, "
+            "{action}, {status}, {unit} (the unit bearing the status), "
+            "{matched}, {tags}, {field}. Empty = the default text."
         ),
     },
     "action_choice_limit": {
@@ -15074,6 +15114,128 @@ class Match:
             return [str(t).strip() for t in raw if str(t).strip()]
         return []
 
+    # ---- action restrictions (#234) ------------------------------------
+
+    def status_field(self, inst: Any, sname: str, key: str) -> Any:
+        """Status `sname`'s `key`: the instance's own value when the
+        instance holds the key (it replaces the definition's), else the
+        definition's (None without one)."""
+        if isinstance(inst, dict) and key in inst:
+            return inst[key]
+        sdef = self.status_definitions.get(sname)
+        return sdef.get(key) if isinstance(sdef, dict) else None
+
+    def action_forbid_units(self, actor_id: str,
+                            vehicle_id: Optional[str] = None,
+                            rider_id: Optional[str] = None) -> List[str]:
+        """The units whose statuses can forbid an action: the actor and its
+        body root, and for a mount action the rider and the vehicle with
+        their body roots (a blind gunner, a jammed tank)."""
+        out: List[str] = []
+        for uid in (actor_id, rider_id, vehicle_id):
+            e = self.entities.get(uid) if uid else None
+            if e is None:
+                continue
+            for u in (e, self.body_root(e)):
+                if u.id not in out:
+                    out.append(u.id)
+        return out
+
+    def action_immune_units(self, target_id: str) -> List[str]:
+        """The units whose statuses can make `target_id` immune to an
+        action: itself and its body root (a flyer's limbs fly with it)."""
+        e = self.entities.get(target_id)
+        if e is None:
+            return []
+        root = self.body_root(e)
+        return [e.id] if root is e else [e.id, root.id]
+
+    def action_restrictions(self, fields: Tuple[str, ...],
+                            unit_ids: List[str], action_name: str,
+                            action_tags: List[str], actor_id: Optional[str],
+                            target_id: Optional[str] = None,
+                            ) -> List[Dict[str, Any]]:
+        """Every restriction of `fields` (ACTION_FORBID_FIELDS or
+        ACTION_IMMUNE_FIELDS) the statuses of `unit_ids` put on the action:
+        one dict per status and field whose list names one of the action's
+        tags (or its name) and whose `<field>_unless` doesn't lift it, with
+        `unit`, `status`, `field`, `matched` and `error` (a broken _unless
+        formula: the restriction holds, the error is named)."""
+        fold = (lambda n: n) if self.rules.get(
+            "action_names_case_sensitive", True) else (lambda n: n.lower())
+        hits: List[Dict[str, Any]] = []
+        for uid in unit_ids:
+            e = self.entities.get(uid)
+            if e is None:
+                continue
+            for sname, inst in list(e.status.items()):
+                for fld in fields:
+                    words = normalize_tags(self.status_field(inst, sname, fld))
+                    if not words:
+                        continue
+                    if fld.endswith("_tag"):
+                        matched = [t for t in action_tags if t in words]
+                    else:
+                        matched = ([action_name] if fold(action_name)
+                                   in {fold(w) for w in words} else [])
+                    if not matched:
+                        continue
+                    lifted, err = self._restriction_lifted(
+                        inst, sname, fld, uid, action_name, action_tags,
+                        actor_id, target_id)
+                    if not lifted:
+                        hits.append({"unit": uid, "status": sname,
+                                     "field": fld, "matched": matched,
+                                     "error": err})
+                # A formula above may have removed the unit (ghost firing).
+                if uid not in self.entities:
+                    break
+        return hits
+
+    def _restriction_lifted(self, inst: Any, sname: str, fld: str, uid: str,
+                            action_name: str, action_tags: List[str],
+                            actor_id: Optional[str],
+                            target_id: Optional[str],
+                            ) -> Tuple[bool, Optional[str]]:
+        """(lifted, error) for one restriction's `<fld>_unless` expression:
+        empty = never lifted; a formula that fails keeps the restriction
+        and returns its error."""
+        src = self.status_field(inst, sname, fld + UNLESS_SUFFIX)
+        if not isinstance(src, str) or not src.strip():
+            return False, None
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        ctx = EvalCtx(this=self.current_entity_id(), target=uid, extras={
+            "actor": actor_id, "action_name": action_name,
+            "action_tags": list(action_tags), "target": target_id,
+            "status_name": sname})
+        try:
+            return bool(FormulaEngine(self).eval_expression(src, ctx)), None
+        except (FormulaError, VTTError) as ex:
+            return False, str(ex)
+
+    def action_restriction_line(self, rule: str, hit: Dict[str, Any],
+                                action_name: str, action_tags: List[str],
+                                actor_id: Optional[str],
+                                target_id: Optional[str] = None) -> str:
+        """One restriction as the `rule` format (action_forbidden_ /
+        action_immune_message_format) words it."""
+        fmt = str(self.rules.get(rule) or "") or RULES_REGISTRY[rule]["default"]
+        matched = hit["matched"]
+        if hit["field"].endswith("_tag"):
+            what = ", ".join(f"`{t}`" for t in matched) + " actions"
+        else:
+            what = f"`{matched[0]}`"
+        fixed = {"actor": actor_id or "", "action": action_name,
+                 "status": hit["status"], "unit": hit["unit"],
+                 "target": target_id or "", "matched": what,
+                 "tags": ", ".join(action_tags), "field": hit["field"]}
+        text = self._MSG_FMT_RE.sub(
+            lambda mo: str(fixed.get(mo.group(1), mo.group(0))), fmt)
+        if hit["error"]:
+            text += (f" (its `{hit['field']}{UNLESS_SUFFIX}` formula failed: "
+                     f"{hit['error']})")
+        return text
+
     def _statuses_matching_tokens(self, e: "Entity",
                                   tokens: List[str]) -> List[str]:
         """Names of statuses currently on `e` that match ANY of `tokens`."""
@@ -15955,6 +16117,7 @@ class Match:
         action_path: str,
         target: Any,
         args: Dict[str, Any],
+        action_tags: Optional[List[str]] = None,
     ) -> List[str]:
         """Fire on_action_used passives after an action's body has
         completed successfully. Bindings (per the hook contract in
@@ -15972,6 +16135,7 @@ class Match:
         extras = {
             "action_name": action_name,
             "action_path": action_path,
+            "action_tags": list(action_tags or []),
             "target": target,
             "args": args,
             "actor": actor_id,
@@ -15990,6 +16154,7 @@ class Match:
         action_name: str,
         action_path: str,
         args: Dict[str, Any],
+        action_tags: Optional[List[str]] = None,
     ) -> List[str]:
         """Fire on_action_used_on_target passives on a SPECIFIC target
         entity. Called once per entity by the action runner (for
@@ -16007,6 +16172,7 @@ class Match:
         extras = {
             "action_name": action_name,
             "action_path": action_path,
+            "action_tags": list(action_tags or []),
             # Shadow `target` to the per-fire eid so a passive reading
             # `entity[target].hp` (or comparing `target == self`) sees
             # this specific defender, not the whole entity_list.
@@ -16030,6 +16196,7 @@ class Match:
         args: Dict[str, Any],
         fail_reason: str,
         fail_message: str,
+        action_tags: Optional[List[str]] = None,
     ) -> List[str]:
         """Fire on_action_failed passives on the ACTOR after a clean
         fail() abort. The runner has already rolled back to
@@ -16049,6 +16216,7 @@ class Match:
         extras = {
             "action_name": action_name,
             "action_path": action_path,
+            "action_tags": list(action_tags or []),
             "target": target,
             "args": args,
             "actor": actor_id,
