@@ -17656,7 +17656,8 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     or k.lower() in opts:
                 raise VTTError("Usage: `!zone list [tag=<tag>] "
                                "[def=<definition>] [map=<map>]`.")
-            opts[k.lower()] = v
+            opts[k.lower()] = check_tag_filter(v) if k.lower() == "tag" \
+                else v
         pov = _view_pov(ctx, m, args)
         names = [n for n in m.zone_names() if m.zone_visible_to(n, pov)]
         names = m.zones_matching(names, opts.get("tag"), opts.get("def"))
@@ -18066,6 +18067,28 @@ def _match_program_check(m: Match):
     return check
 
 
+def _split_status_tokens(raw: str) -> List[str]:
+    """Status tokens typed as one text: split on commas and spaces outside
+    parentheses, so `tag:(fire and not magic), stunned` is two tokens."""
+    out: List[str] = []
+    cur = ""
+    depth = 0
+    for ch in raw:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and (ch == "," or ch.isspace()):
+            if cur.strip():
+                out.append(cur.strip())
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
 async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
                           prefix: str, check) -> Optional[str]:
     """Run definition subcommand `args[0]` of `!status` on `m`'s
@@ -18290,7 +18313,10 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
         if raw in ("", "-"):
             m.status_definitions[name][field] = [] if sub == "tags" else ""
             return (f"Cleared `{name}` {field}.")
-        toks = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
+        toks = _split_status_tokens(raw)
+        for t in toks:
+            if sub != "tags" and t.startswith("tag:"):
+                check_tag_filter(t[4:])
         if sub == "tags":
             m.status_definitions[name]["tags"] = toks
         else:
@@ -18310,10 +18336,15 @@ async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
             if m.status_definitions[name].pop(sub, None) is None:
                 return (f"❌ `{name}` has no {sub} list.")
             return (f"Cleared `{name}` {sub}.")
-        words = [check_tag(w) for w in raw.replace(",", " ").split()]
-        words = list(dict.fromkeys(words))
+        if sub.endswith("_tag"):
+            # A tag filter: a list (any of them) or an expression.
+            words = check_tag_filter(raw)
+        else:
+            words = [check_tag(w) for w in raw.replace(",", " ").split()]
+            words = list(dict.fromkeys(words))
         m.status_definitions[name][sub] = words
-        return (f"`{name}` {sub} = {', '.join(words)}")
+        return (f"`{name}` {sub} = "
+                + (', '.join(words) if isinstance(words, list) else words))
 
     if sub in (GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK):
         # The tags the bearer carries while it has the status, or the tag

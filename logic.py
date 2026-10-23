@@ -972,8 +972,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "independent absorb layers coexist. A pool is a dict {amount, "
             "priority?, tags?, not_tags?} or a bare number (= amount). "
             "absorb_damage drains matching pools HIGHEST priority first (ties "
-            "by name); a pool with `tags`/`not_tags` only absorbs hits whose "
-            "tags match (a typed ward), an untagged pool absorbs anything; a "
+            "by name); a pool with `tags` (a tag filter: a list = any of "
+            "them, or an expression such as `fire and magic`) only absorbs "
+            "hits whose tags match it and none of its `not_tags` (a typed "
+            "ward), an untagged pool absorbs anything; a "
             "pool emptied to 0 is removed. Pools are plain vars — set/refresh "
             "them with `!ent set_var` (decay is GM-composed via a status tick "
             "or round hook), per 'what X does is stored in X'. Per-entity "
@@ -2615,6 +2617,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "hasn't set its own value. Set per map with `!map var set "
             "<path> <value> map=<name>` (or the command that writes it). "
             "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_tags_var": {
+        "default": "tags",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's tags (`underground`, `holy_ground`), "
+            "a list read with map_tags / map_has_tag / maps_with_tag. Units "
+            "on a map don't take its tags. Set with `!map var set tags "
+            "<tag,tag> map=<name>`. Changing this rule renames the var on "
+            "every map."
         ),
     },
     "map_unseen_var": {
@@ -5686,10 +5699,12 @@ def tag_filter_matches(tags: Any, raw: Any) -> bool:
     return any(t in have for t in check_tag_filter(raw))
 
 
-def checked_tag_list(raw: Any, where: str) -> List[str]:
+def checked_tag_list(raw: Any, where: str,
+                     engine_ok: bool = False) -> List[str]:
     """A list of tags a unit carries or grants (its tags var, a
     grants_unit_tags value): a list or comma / space text of tags, none of
-    them an engine tag. VTTError naming `where` otherwise."""
+    them an engine tag (`engine_ok` for tags no unit carries: a team's, a
+    map's). VTTError naming `where` otherwise."""
     if isinstance(raw, str):
         raw = raw.replace(",", " ").split()
     if not isinstance(raw, list):
@@ -5700,7 +5715,7 @@ def checked_tag_list(raw: Any, where: str) -> List[str]:
             t = check_tag(t)
         except VTTError as ex:
             raise VTTError(f"{where}: {ex}")
-        if t in ENGINE_TAGS:
+        if t in ENGINE_TAGS and not engine_ok:
             raise VTTError(
                 f"{where}: `{t}` is an engine tag ({', '.join(ENGINE_TAGS)}): "
                 f"the engine gives it from the unit's state.")
@@ -9076,8 +9091,10 @@ class Match:
         return normalize_tags(list((self.zone_def_dict(z) or {}).get("tags")
                                    or []) + list(z.get("tags") or []))
 
-    def zone_has_tag(self, name: str, tag: str) -> bool:
-        return tag in self.zone_tags(name)
+    def zone_has_tag(self, name: str, tag: Any) -> bool:
+        """Whether zone `name`'s tags match the tag filter `tag` (a tag, a
+        list = any of them, or an expression)."""
+        return tag_filter_matches(self.zone_tags(name), tag)
 
     def zone_def_name(self, name: str) -> Optional[str]:
         """The definition zone `name` names (an orphan's too), or None."""
@@ -9087,8 +9104,8 @@ class Match:
 
     def zones_matching(self, names: Any, tag: Optional[str] = None,
                        definition: Optional[str] = None) -> List[str]:
-        """`names` (zone names) kept in order when they carry `tag` and name
-        `definition` (None = any)."""
+        """`names` (zone names) kept in order when their tags match the
+        tag filter `tag` and they name `definition` (None = any)."""
         out = []
         for n in names:
             if tag is not None and not self.zone_has_tag(n, tag):
@@ -11424,6 +11441,30 @@ class Match:
             return {str(t) for t in raw}
         return set()
 
+    @staticmethod
+    def _record_tags_ok(raw: Any, tags: "set[str]",
+                        strict: bool = False) -> bool:
+        """Whether a modifier record's or shield pool's `tags` filter lets
+        a query carrying `tags` through: none = always; a list = any of
+        them; an expression. A filter that doesn't parse lets nothing
+        through (with `strict`, raises the VTTError naming why)."""
+        if tag_filter_empty(raw):
+            return True
+        try:
+            return tag_filter_matches(tags, raw)
+        except VTTError:
+            if strict:
+                raise
+            return False
+
+    @staticmethod
+    def _record_tags_shown(raw: Any) -> Any:
+        """A record's tags filter as `!mod show` / list_mods show it: the
+        sorted list, or an expression's text."""
+        if isinstance(raw, str) and _is_tag_expression(raw):
+            return raw.strip()
+        return sorted(normalize_tags(raw))
+
     def _walk_modifier_bundles(self, node: Any, base: str,
                                out: List[Tuple[dict, str]]) -> None:
         """Collect every `modifiers` bundle found anywhere under `node`
@@ -11482,15 +11523,17 @@ class Match:
                          context: Optional[Dict[str, Any]] = None,
                          problems: Optional[List[str]] = None) -> List[dict]:
         """The active modifier records on `eid` for `stat` + `tags`:
-        filtered by stat name, tag subset (required ⊆ query) and negative
-        tags (excluded ∩ query empty) and condition, with value formulas
+        filtered by stat name, the record's `tags` filter against the query
+        tags (a list = any of them, or an expression: `fire and magic`; a
+        record without tags always applies), negative tags (excluded ∩
+        query empty) and condition, with value formulas
         resolved to numbers and each record tagged with its `source`. The
         introspection half of the system (list_mods) and the input to
         apply_modifiers' fold.
 
         Tag-granting: a record's `grants_tags` adds tags to the query in a
         single pre-pass (the granting record must itself pass stat +
-        required tags vs the ORIGINAL query + not_tags + condition); the
+        its tags filter vs the ORIGINAL query + not_tags + condition); the
         main filter then runs against the expanded tag set. Single-pass —
         a granted tag can activate other modifiers but not chain-grant.
 
@@ -11535,9 +11578,9 @@ class Match:
                 continue
             if str(m.get("stat", "")) != str(stat):
                 continue
-            req = self._modifier_tagset(m.get("tags"))
             notg = self._modifier_tagset(m.get("not_tags"))
-            if not (req <= tagset) or (notg & tagset):
+            if not self._record_tags_ok(m.get("tags"), tagset) \
+                    or (notg & tagset):
                 continue
             if not _cond_ok(m, src):
                 continue
@@ -11549,8 +11592,12 @@ class Match:
         for m, src in records:
             if str(m.get("stat", "")) != str(stat):
                 continue
-            req = self._modifier_tagset(m.get("tags"))
-            if not req <= eff_tags:
+            try:
+                if not self._record_tags_ok(m.get("tags"), eff_tags,
+                                            strict=True):
+                    continue
+            except VTTError as ex:
+                _note(src, f"tags don't parse ({ex})")
                 continue
             notg = self._modifier_tagset(m.get("not_tags"))
             if notg & eff_tags:
@@ -11585,7 +11632,7 @@ class Match:
                 "op": str(m.get("op", "add")),
                 "value": val,
                 "priority": pri,
-                "tags": sorted(req),
+                "tags": self._record_tags_shown(m.get("tags")),
                 "not_tags": sorted(notg),
                 "source": src,
             })
@@ -11735,12 +11782,14 @@ class Match:
                                 f"team `{team}`")
         # The tags every member carries (`grants_unit_tags` at the top of
         # the team's data): a checked tag list, nothing under it.
+        # and the team's own `tags`: checked tag lists, nothing under them.
         seg0 = str(path).split(".", 1)[0]
-        if seg0 == GRANTS_UNIT_TAGS:
+        if seg0 in (GRANTS_UNIT_TAGS, "tags"):
             if "." in str(path):
-                raise VTTError(f"team `{team}`: `{GRANTS_UNIT_TAGS}` is a "
-                               f"list of tags; nothing nests under it.")
-            value = checked_tag_list(value, f"team `{team}` {path}")
+                raise VTTError(f"team `{team}`: `{seg0}` is a list of tags; "
+                               f"nothing nests under it.")
+            value = checked_tag_list(value, f"team `{team}` {path}",
+                                     engine_ok=(seg0 == "tags"))
         cur = self.team_data.setdefault(str(team), {})
         segs = str(path).split(".")
         for seg in segs[:-1]:
@@ -15360,7 +15409,14 @@ class Match:
         if not token:
             return False
         if token.startswith("tag:"):
-            return token[4:].strip() in self.status_def_tags(status_name)
+            # A tag filter: `tag:fire`, or an expression in parentheses
+            # (`tag:(fire and magic)`, so a token list's commas stay
+            # separators). One that doesn't parse matches nothing.
+            try:
+                return tag_filter_matches(self.status_def_tags(status_name),
+                                          token[4:].strip())
+            except VTTError:
+                return False
         return token == status_name
 
     @staticmethod
@@ -15494,6 +15550,68 @@ class Match:
     def corpse_tags(self, corpse: Dict[str, Any]) -> List[str]:
         return [t for t, _s in self.corpse_tag_sources(corpse)]
 
+    def container_tag_sources(self, vars_: Dict[str, Any], path: str
+                              ) -> Optional[List[Tuple[str, str]]]:
+        """(tag, source) for the var container at `path` in `vars_`: its own
+        `tags`, then the `inner_tags` of every container above it, the
+        vars root included, nearest first, minus what an
+        `exclude_inherited_tags` (`all` / `*` or a list) on the container
+        or above cuts. None when `path` isn't a container (a dict)."""
+        segs = [p for p in str(path).split(".") if p] if path else []
+        if not segs:
+            return None
+        chain: List[Tuple[str, str]] = []
+        node: Any = vars_
+        at = ""
+        for i, seg in enumerate([""] + segs):
+            if seg:
+                if not isinstance(node, dict) or seg not in node:
+                    return None
+                node = node[seg]
+                at = f"{at}.{seg}" if at else seg
+            if not isinstance(node, dict):
+                return None
+            cut = node.get("exclude_inherited_tags")
+            if cut is not None:
+                if isinstance(cut, str) and cut.strip().lower() in ("all", "*"):
+                    chain = []
+                else:
+                    drop = set(self._read_plain_tags(cut))
+                    chain = [(t, s_) for t, s_ in chain if t not in drop]
+            if i < len(segs):
+                chain = chain + [(t, at or "the vars root") for t in
+                                 self._read_plain_tags(node.get("inner_tags"))]
+        own = [(t, "own") for t in self._read_plain_tags(node.get("tags"))]
+        order = list(dict.fromkeys(src for _t, src in chain))
+        nearest = [(t, src) for o in reversed(order)
+                   for t, src in chain if src == o]
+        seen: Dict[str, str] = {}
+        for t, src in own + nearest:
+            seen.setdefault(t, src)
+        return list(seen.items())
+
+    @staticmethod
+    def _read_plain_tags(raw: Any) -> List[str]:
+        """The usable tags of a stored list (engine words allowed: a
+        container's, a team's or a map's tags aren't a unit's)."""
+        out: List[str] = []
+        for t in normalize_tags(raw):
+            try:
+                out.append(check_tag(t))
+            except VTTError:
+                continue
+        return out
+
+    def team_tags(self, team: Any) -> List[str]:
+        """The team's own tags (`tags` in its team data)."""
+        tdata = self.team_data.get(str(team))
+        return self._read_plain_tags(tdata.get("tags")) \
+            if isinstance(tdata, dict) else []
+
+    def map_tags(self, mp: "Map") -> List[str]:
+        """Map `mp`'s tags (the map var map_tags_var names)."""
+        return self._read_plain_tags(self.map_setting(mp, "tags"))
+
     # ---- action restrictions (#234) ------------------------------------
 
     def status_field(self, inst: Any, sname: str, key: str) -> Any:
@@ -15550,13 +15668,21 @@ class Match:
                 continue
             for sname, inst in list(e.status.items()):
                 for fld in fields:
-                    words = normalize_tags(self.status_field(inst, sname, fld))
-                    if not words:
-                        continue
+                    raw = self.status_field(inst, sname, fld)
                     if fld.endswith("_tag"):
-                        matched = [t for t in action_tags if t in words]
+                        if isinstance(raw, str) and _is_tag_expression(raw):
+                            # An expression: the whole of it is what matched.
+                            try:
+                                hit = tag_filter_matches(action_tags, raw)
+                            except VTTError:
+                                hit = False
+                            matched = [raw.strip()] if hit else []
+                        else:
+                            words = normalize_tags(raw)
+                            matched = [t for t in action_tags if t in words]
                     else:
-                        matched = ([action_name] if fold(action_name)
+                        words = normalize_tags(raw)
+                        matched = ([action_name] if words and fold(action_name)
                                    in {fold(w) for w in words} else [])
                     if not matched:
                         continue
@@ -22825,6 +22951,7 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
     "map_border_color_var": ("border_color", "border_color"),
     "map_border_opacity_var": ("border_opacity", "border_opacity"),
     "map_hidden_layers_var": ("hidden_layers", None),
+    "map_tags_var": ("tags", None),
     "map_unseen_var": ("unseen", "unseen_map_display"),
     "map_nested_vehicle_moves_var": ("nested_vehicle_moves",
                                      "nested_vehicle_moves"),
@@ -22870,6 +22997,8 @@ def map_setting_value(setting: str, value: Any) -> Any:
             raise VTTError(f"The background mode is stretch, tile or center, "
                            f"got `{value}`.")
         return str(value).lower()
+    if setting == "tags":
+        return checked_tag_list(value, "The map's tags", engine_ok=True)
     if setting == "hidden_layers":
         words = ([str(v) for v in value] if isinstance(value, list)
                  else [w.strip() for w in str(value).split(",") if w.strip()])
