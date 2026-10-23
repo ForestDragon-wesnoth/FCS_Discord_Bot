@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, ACTION_IMMUNE_FIELDS, UNLESS_SUFFIX
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -7921,6 +7921,9 @@ def _match_formula_slots(m: Match):
                                  else {}).items()):
             yield (f"status `{sname}` {hook} hook", src, "exec", frozenset(),
                    False)
+        for fld in ACTION_RESTRICTION_FIELDS:
+            yield (f"status `{sname}` {fld}{UNLESS_SUFFIX}",
+                   sdef.get(fld + UNLESS_SUFFIX), "eval", frozenset(), False)
     for tname, tpl in sorted(m.tile_templates.items()):
         for when, src in sorted(tpl.hooks.items()):
             yield (f"tile template `{tname}` hook `{when}`", src, "exec",
@@ -8070,6 +8073,12 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
                 n += 1
                 check(f"status `{sname}` {where}", src, "exec", sys_known,
                       soft=True)
+        for fld in ACTION_RESTRICTION_FIELDS:
+            src = sdef.get(fld + UNLESS_SUFFIX)
+            if isinstance(src, str) and src.strip():
+                n += 1
+                check(f"status `{sname}` {fld}{UNLESS_SUFFIX}", src, "eval",
+                      sys_known, soft=True)
     for zname, zdef in sorted(
             mgr.system_library(s, "zone_definitions").items()):
         zdef = normalize_zone_def(zdef)
@@ -8493,6 +8502,10 @@ async def _system_status(ctx: ReplyContext, args: List[str],
                  if isinstance(sdef.get("tick"), str) and sdef["tick"].strip()
                  else []) + [(f"its {h} hook", src)
                              for h, src in sorted(hooks.items())]
+        progs += [(f"its {f}{UNLESS_SUFFIX}", sdef[f + UNLESS_SUFFIX])
+                  for f in ACTION_RESTRICTION_FIELDS
+                  if isinstance(sdef.get(f + UNLESS_SUFFIX), str)
+                  and sdef[f + UNLESS_SUFFIX].strip()]
         warns = [_promote_warning(mgr, s, src, what) for what, src in progs]
         return await ctx.send("\n".join(
             [_promoted_line("status definition", f"`{name}`", m.id, sys_name,
@@ -21037,7 +21050,13 @@ registry.annotate_sub("mount", "info",
         "`on_action_used` + per-target `on_action_used_on_target` "
         "fire. `<eid>` accepts `self`/`this`/`current`. When two "
         "actions share a name the handler shows a numbered "
-        "disambiguation menu — re-issue with the full path."
+        "disambiguation menu — re-issue with the full path. An action's "
+        "tags are its own `tags` plus the `action_tags` of every container "
+        "above it, minus what an `exclude_inherited_action_tags` (`all` or "
+        "tags) cuts; statuses forbid actions or make their bearer immune "
+        "by tag or name (`!status forbids_actions_with_tag`, ...), checked "
+        "before the body. `info` lists the tags, `list` marks what is "
+        "forbidden now."
     ),
 )
 async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):

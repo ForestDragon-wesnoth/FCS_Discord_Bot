@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #258). Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #260). Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #40 and #164 (multiple and nested maps, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #234, #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
 
@@ -271,6 +271,7 @@ or rejects one, it moves to "Off the list".
 - **#21 Cover primitive.** `cover_between(a, b)` gives the fraction of the line between two units that is obstructed, footprint-aware.
 - **#22 Action cooldowns and charges.** Fields on an action that count uses and turns; the engine refuses the action while on cooldown or out of charges.
   - See #24's sketch, which covers #22, #23 and #24 together.
+  - With action tags (#234) shipped: Solis shock forbids every action with a cooldown, so an action with a cooldown could carry a derived tag (`cooldown`) a status can forbid; until then the GM tags those actions by hand.
 - **#23 Declarative action targeting.** `range`, `requires_los` and `relation` fields on an action, checked before the body runs, with the refusal reason reported.
   - See #24's sketch, which covers #22, #23 and #24 together.
 - **#24 Action economy.** `turn_resources` pools (actions, bonus actions, movement) refilled at turn start, plus a `cost` field on actions that spends from them.
@@ -331,6 +332,10 @@ or rejects one, it moves to "Off the list".
 - **#32 Procedural generation.** `noise(x, y, seed)` plus room and cave helpers that write tiles.
 - **#257 Tile and zone facing.** A `facing` field on tiles, tile templates, zones and zone definitions, per-facing glyphs and sprites (`glyphs.<facing>` / `sprites.<facing>`, as units have), and facing reads in formulas, for directional terrain (arrow traps, conveyors, one-way doors).
   - Prefab rotation (#31) should turn tile and zone facing once this exists.
+- **#259 Per-level status data.** (To discuss, user.) A status definition holds entries per level, exact (`3`) or from a level up (`3+`), each carrying its own data that applies while the instance is at that level: the action restriction lists of #234 (Solis freeze forbids sprint and rest, and dodge from level 3), modifiers, a tick, a display.
+  - Open: how entries combine with the definition's own fields and with each other (merge or replace, and which entry wins when `2+` and `3` both match), how an instance's own keys override them, and how `!status` edits them.
+  - The #234 checks read every list through `Match.status_field`, the one place a level entry would merge in.
+- **#260 A wider tag system.** (To discuss, user.) Tags exist on zones, tiles, statuses and actions, each with its own reads; extend them to more of the game (units, items, templates, damage) and let them interact more, possibly through one shared vocabulary and a common set of reads and filters.
 - **#258 Reapply a definition's data.** `!zone def <d> reapply` / `!tile def <t> reapply` push the definition's or template's data to the zones and tiles made from it (data is copied at creation, so a later data edit reaches only new ones).
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
@@ -449,25 +454,6 @@ or rejects one, it moves to "Off the list".
     - the rules that differ from the defaults.
   - The user's groups keep their rules as documents (like the three evaluated here) and implement them by hand; this shows the bot's actual version next to the document and keeps the two in step.
   - Reuses #202's function table for formulas it quotes.
-- **#234 Action tags, with statuses that forbid or protect.**
-  - Actions carry `tags` (melee, ranged, spell, rest, sprint, consumable, reaction, light, heavy, …).
-  - A status definition lists `forbids: [ranged, sprint]`: the bearer can't use actions with those tags, and the refusal names the status ("Blind: you can't use ranged actions").
-  - A status definition lists `protects: [melee]`: actions with those tags can't target the bearer, with an exception formula (`protects_unless: status_has(actor, 'flying')`). Examples:
-    - flying units can't be hit in melee except by other flyers;
-    - Take Cover makes the unit immune to ranged attacks;
-    - NCS Invisible: no direct attacks, area attacks still land;
-    - the FCS1 joke enemy's "executing" status blocks every attack.
-  - Solis alone has a dozen statuses of the forbidding shape:
-    - burn and poison forbid rest;
-    - freeze forbids sprint and rest (and dodge from level 3);
-    - shock forbids rest, dodge and every action with a cooldown;
-    - blind forbids ranged attacks and sprint;
-    - disorientation forbids crit rolls, sprint, dodge and ranged;
-    - rage forbids ranged and rest; fear forbids melee;
-    - immobilize forbids all movement;
-    - a critted hunter can't sprint, rest, heal, take cover or use consumables.
-  - FCS1 and NCS have their own lists. Today each one is a check at the top of every action it touches (D17).
-  - `!action list <eid>` marks each action a status forbids, and why.
 - **#239 Kill credit and damage attribution.**
   - `on_death` binds `killer`: the unit whose action, reaction or status tick made the lethal write (a tick through the status's source, #227).
   - The engine keeps a per-match tally of damage dealt and taken per pair of units.

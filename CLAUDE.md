@@ -1331,6 +1331,19 @@ hardcodes**.
   from the source unconditionally and re-applies on the destination through
   apply_status — resistible, consumed on rejection, and the moved instance
   keeps its custom data (`seed_data`) (528-529, 683).
+- **Action restrictions** (#234, `logic.ACTION_RESTRICTION_FIELDS`):
+  `forbids_actions_with_tag` / `forbids_actions_with_name` (the bearer
+  can't use such actions) and `immune_to_actions_with_tag` /
+  `immune_to_actions_with_name` (such actions can't target the bearer or
+  its parts), each with a `<field>_unless` expression lifting only that
+  list while true (self = the bearer; actor, action_name, action_tags,
+  target, status_name bound; a formula that fails keeps the restriction
+  and the refusal names the error). `!status <field> <name> [words]`
+  (`-` clears), `!status <field>_unless <name> [formula]`; an instance
+  holding the key replaces the definition's (`Match.status_field`, the
+  one read path, where per-level data, idea #259, would merge in).
+  Innate or equipment restrictions are a permanent status. Checked in
+  `run_action` (§7.6); `!system lint` covers the formulas.
 - **Display:** status sprite overlays (§7.13); the `{statuses}` roster
   placeholder (`vtt_commands._statuses_text`, in the default
   entity_info_format): each status through its definition's `display`
@@ -1393,6 +1406,32 @@ hardcodes**.
   (`_CROSS_LEVELS`), so a failed outer action restores them too (812, 818,
   856). Writing under an `actions` var needs a host (`!ent set_var` /
   `set_vars` / `delete_var`), so a player can't author an action body.
+- **Action tags** (#234, 916-918): an action's own `tags` stay with
+  it; a container's `action_tags` (any dict above the action: the vars
+  root, an item, an `actions` dict, a mount slot) reach every action
+  below it; `exclude_inherited_action_tags` (`all` / `*` or a list) on
+  an action or a container cuts tags arriving from above, for everything
+  at and below it. Discovery carries the (tag, source) chain down the
+  walk (`action._inherit_tags`); `Action.tags` is own first, then each
+  container nearest first, with `tag_sources` and `tag_problems` (a field
+  that isn't a tag list: only its usable words count, `!action info`
+  names it). `!action info` lists the tags and their sources, `!action
+  list` marks forbidden actions (🚫 status on unit). The body, the
+  on_action_* passives and the `_unless` formulas bind `action_tags`;
+  reads `action_tags_of(eid, name)`, `action_forbidden_by(eid, name)`,
+  `immune_to_action(target, tags, name=None, actor=None)` (for bodies
+  that pick their own victims, e.g. from a location).
+- **Restrictions** (`_restriction_refusal`, in `run_action` before the
+  body, so `!action`, `use_action` and rider actions all pass it): the
+  status fields of §7.4 on the actor, its body root and, for a mount
+  action, the rider and vehicle with their roots
+  (`Match.action_forbid_units`) forbid it; those on an entity target and
+  its body root (`action_immune_units`) make it immune. A refusal is a
+  clean fail (`forbidden` / `immune`, on_action_failed fires, use_action
+  returns False) worded by `action_forbidden_message_format` /
+  `action_immune_message_format`; an entity_list target drops its immune
+  units with a ⚠️ naming each, refused only when none is left. Corpse
+  targets aren't checked (§8).
 - **Choices:** `choose(prompt, options)` / `choose_number(prompt, lo, hi)`
   replay the body: on an unanswered choice the attempt rolls back and re-runs
   with answers replayed in order (`answer=` tokens, else the surface's
@@ -2621,6 +2660,10 @@ rejected already. Update this section in the PR that resolves an item.
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
   limitation, left as is (user: note it).
+- **Corpse targets and immunity:** `corpse` / `corpse_list` action
+  targets skip the immune_to_actions_* check (a corpse's statuses are a
+  snapshot; a dead flyer can be looted in melee). Kept for now, a known
+  topic of debate (user: write it down).
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
   tile, zone or corpse blocks it. Known issue (user: list it).

@@ -29630,8 +29630,8 @@ library, also inside `$()`, where stamp_prefab is refused and makes
 nothing.
 
 
-SCENARIO 916 — Action tags: inheritance, forbids, the _unless lift, on_action_failed
------------------------------------------------------------------------------------
+SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless lift
+--------------------------------------------------------------------------------
 
 !match new tags Tags 8 8
 !match use tags
@@ -29648,23 +29648,247 @@ SCENARIO 916 — Action tags: inheritance, forbids, the _unless lift, on_action_
 !ent set_var hunter inventory.bow.actions.bash.body "entity[target].hp = entity[target].hp - 1"
 !ent set_var hunter actions.rest.tags rest
 !ent set_var hunter actions.rest.exclude_inherited_action_tags all
-!ent set_var hunter actions.rest.body "entity[self].rested = True"
+!ent set_var hunter actions.rest.body "entity[self].rested = action_tags"
 !action info hunter shoot
+?? Tags:        `ranged` (from `inventory.bow`), `two_handed` (from `inventory.bow`), `weapon` (from `inventory`), `item` (from the vars root)
 !action info hunter bash
-!action info hunter rest
-!eval "action_tags_of('hunter', 'bash')"
+?? `melee` (own), `two_handed` (from `inventory.bow`), `weapon` (from `inventory`), `item` (from the vars root)
+!assert "action_tags_of('hunter', 'bash') == ['melee', 'two_handed', 'weapon', 'item']"
+!assert "action_tags_of('hunter', 'actions.rest') == ['rest']"
+!action hunter rest
+!assert "entity[hunter].rested == ['rest']"
 !status def blind
 !status forbids_actions_with_tag blind ranged
+?? `blind` forbids_actions_with_tag = ranged
 !status forbids_actions_with_name blind aimed_shot
 !status apply hunter blind
 !action list hunter
+?? tags: ranged, two_handed, weapon, item) 🚫 blind on `hunter`
+?! `bash` (target: `entity`, at `inventory.bow`, tags: melee, two_handed, weapon, item) 🚫
 !action hunter shoot wolf
+?? ❌ action `shoot`: [forbidden] `hunter` can't use `shoot`: blind on `hunter` forbids `ranged` actions.
+!assert "entity[wolf].hp == 10 and action_forbidden_by('hunter', 'shoot') == ['blind']"
 !action hunter bash wolf
+!assert "entity[wolf].hp == 9 and action_forbidden_by('hunter', 'bash') == []"
+!ent set_var hunter inventory.bow.actions.aimed_shot.target entity
+!ent set_var hunter inventory.bow.actions.aimed_shot.exclude_inherited_action_tags all
+!ent set_var hunter inventory.bow.actions.aimed_shot.body "entity[target].hp = entity[target].hp - 6"
+!action hunter aimed_shot wolf
+?? blind on `hunter` forbids `aimed_shot`.
 !status forbids_actions_with_tag_unless blind "entity[self].blindsight == True"
 !ent set_var hunter blindsight true
 !action hunter shoot wolf
+?? `hunter` used action `shoot`.
+!assert "entity[wolf].hp == 5"
+!action hunter aimed_shot wolf
+?? forbids `aimed_shot`.
 !status forbids_actions_with_tag_unless blind "entity[self].nope.x"
 !action hunter shoot wolf
-!eval "action_forbidden_by('hunter', 'shoot')"
+?? (its `forbids_actions_with_tag_unless` formula failed:
+!assert "entity[wolf].hp == 5"
+!status forbids_actions_with_tag_unless blind
+?? Cleared `blind` forbids_actions_with_tag_unless.
+!system set default action_forbidden_message_format "{status} keeps {actor} from {action} ({matched}; tags {tags})"
+!action hunter bash wolf
+!status forbids_actions_with_tag blind melee
+!action hunter bash wolf
+?? ❌ action `bash`: [forbidden] blind keeps hunter from bash (`melee` actions; tags melee, two_handed, weapon, item)
+?! failed
+!status forbids_actions_with_tag blind -
+?? Cleared `blind` forbids_actions_with_tag.
+!action hunter bash wolf
+?? `hunter` used action `bash`.
 
-Expected: probe.
+Expected: An action's tags are its own `tags` plus the `action_tags` of every
+container above it, the vars root included, nearest first, and `!action
+info` names where each came from. `bash` cuts `ranged` from what it
+inherits; `rest` cuts everything (`all`). The action body reads its tags
+through the `action_tags` binding. A status forbidding `ranged` refuses
+`shoot` before its body runs (the wolf keeps its hp) and `!action list`
+marks it; `bash` still lands. A name list forbids `aimed_shot` though it
+has no tags. The tag list's `_unless` formula lifts that list alone while
+true (blindsight lets `shoot` through, `aimed_shot` stays forbidden); a
+formula that fails keeps the restriction and the refusal names the
+error. The refusal follows action_forbidden_message_format; `-` clears a
+list.
+
+
+SCENARIO 917 — Action tags: immune statuses on single and list targets, body roots, instance overrides
+-------------------------------------------------------------------------------------------------------
+
+!match new imm Imm 10 10
+!match use imm
+!ent add archer Archer 20 1 1 5
+!ent add knight Knight 20 2 1 5
+!ent add bird Bird 10 5 5 3
+!ent add drake Drake 30 7 7 3
+!ent set_var drake footprint_w 2
+!ent set_var drake footprint_h 2
+!part add drake drake_wing Wing 8 8
+!ent add rat Rat 5 4 1 3
+!ent set_var archer actions.arrow.target entity
+!ent set_var archer actions.arrow.tags ranged
+!ent set_var archer actions.arrow.body "entity[target].hp = entity[target].hp - 2"
+!ent set_var knight actions.hack.target entity
+!ent set_var knight actions.hack.tags melee
+!ent set_var knight actions.hack.body "entity[target].hp = entity[target].hp - 3"
+!ent set_var knight actions.sweep.target entity_list
+!ent set_var knight actions.sweep.tags "melee, area"
+!ent set_var knight actions.sweep.body "for t in target:\n    entity[t].hp = entity[t].hp - 1\nentity[self].swept = target"
+!ent set_var knight actions.quake.target location
+!ent set_var knight actions.quake.tags "melee, area"
+!ent set_var knight actions.quake.body "entity[self].hit = filter_with(entities_in_area(target.x, target.y, 9), lambda u: u != self and not immune_to_action(u, action_tags, action_name, self))"
+!status def flying
+!status immune_to_actions_with_tag flying melee
+!status immune_to_actions_with_tag_unless flying "status_has(actor, 'flying')"
+!status apply bird flying
+!status apply drake flying
+!action knight hack bird
+?? ❌ action `hack`: [immune] `bird` is immune to `hack`: flying on `bird` blocks `melee` actions.
+!assert "entity[bird].hp == 10"
+!action archer arrow bird
+!assert "entity[bird].hp == 8"
+!action knight hack drake_wing
+?? flying on `drake` blocks `melee` actions.
+!assert "entity[drake_wing].hp == 8"
+!action knight sweep bird drake rat
+?? ⚠️ `sweep` dropped a target: `bird` is immune to `sweep`: flying on `bird` blocks `melee` actions.
+?? ⚠️ `sweep` dropped a target: `drake` is immune to `sweep`
+!assert "entity[knight].swept == ['rat'] and entity[rat].hp == 4 and entity[bird].hp == 8"
+!action knight sweep bird drake
+?? ❌ action `sweep`: [immune]
+!assert "entity[knight].swept == ['rat']"
+!status apply knight flying
+!action knight hack bird
+?? `knight` used action `hack`.
+!assert "entity[bird].hp == 5"
+!status dispel knight flying
+!ent status bird set flying immune_to_actions_with_tag ranged
+!action knight hack bird
+?? `knight` used action `hack`.
+!action archer arrow bird
+?? flying on `bird` blocks `ranged` actions.
+!assert "entity[bird].hp == 2"
+!action knight quake 5 5
+!assert "sorted(entity[knight].hit) == ['archer', 'bird', 'rat']"
+!assert "immune_to_action('drake_wing', ['melee']) == ['flying'] and immune_to_action('drake', 'melee', 'hack', 'rat') == ['flying'] and immune_to_action('drake', 'melee', 'hack', 'drake') == [] and immune_to_action('rat', ['melee']) == []"
+!ent set_var knight n "$(len(immune_to_action('bird', ['ranged'])))"
+!assert "entity[knight].n == 1"
+!status def executing
+!status immune_to_actions_with_name executing hack
+!status apply rat executing
+!ent set_var knight actions.try.body "entity[self].ok = use_action(self, 'hack', 'rat')"
+!action knight try
+!assert "entity[knight].ok == False and entity[rat].hp == 4"
+!passive add knight failwatch on_action_failed "entity[self].why = fail_reason + ':' + action_name"
+!action knight hack rat
+?? executing on `rat` blocks `hack`.
+!assert "entity[knight].why == 'immune:hack'"
+
+Expected: An immune status keeps actions with its tags off its bearer:
+`hack` (melee) is refused against the flying bird before its body runs,
+while `arrow` (ranged) lands. A flying root covers its parts (the drake's
+wing). An entity_list target drops each immune unit with a note naming
+it, and the action runs on the rest; when none is left it is refused.
+The `_unless` formula sees `actor`: a flying knight hacks the bird. An
+instance's own `immune_to_actions_with_tag` replaces the definition's
+(the bird becomes open to melee and closed to ranged). A location action
+picks its own victims, filtering with immune_to_action and its
+`action_tags` / `action_name` bindings (the flying drake is left out of
+the melee quake; the bird's ranged-only instance lets it in). immune_to_action reads in `$()`. A name list blocks `hack` by name;
+use_action reports the refusal as False, and on_action_failed sees
+fail_reason `immune`.
+
+
+SCENARIO 918 — Action tags: mounts, the system library, lint, malformed tag fields
+---------------------------------------------------------------------------------
+
+!system new tagsys
+!system status def tagsys jammed
+!system status forbids_actions_with_tag tagsys jammed vehicle_weapon
+?? `jammed` forbids_actions_with_tag = vehicle_weapon
+!system status forbids_actions_with_tag_unless tagsys jammed "(lambda: 1)()"
+?? ❌ Invalid forbids_actions_with_tag_unless formula
+!system status forbids_actions_with_tag_unless tagsys jammed "entity[self].crew >= 3"
+!system status def tagsys blind
+!system status forbids_actions_with_tag tagsys blind ranged
+!match new mt Mt 10 10 tagsys
+!match use mt
+!status info jammed
+?? "forbids_actions_with_tag_unless": "entity[self].crew >= 3"
+!ent add tank Tank 40 2 2 5
+!ent set_var tank footprint_w 2
+!ent set_var tank footprint_h 2
+!ent set_var tank slots.action_tags vehicle_weapon
+!ent set_var tank crew 1
+!ent set_var tank slots.gunner.capacity 1
+!ent set_var tank slots.gunner.actions.cannon.target entity
+!ent set_var tank slots.gunner.actions.cannon.tags ranged
+!ent set_var tank slots.gunner.actions.cannon.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var tank slots.gunner.actions.horn.exclude_inherited_action_tags all
+!ent set_var tank slots.gunner.actions.horn.body "entity[self].honked = True"
+!ent add gun Gunner 10 1 1 5
+!ent add ogre Ogre 30 8 8 3
+!mount gun tank gunner
+!action list gun
+?? `cannon` (target: `entity`, at `slots.gunner.actions.cannon`, tags: ranged, vehicle_weapon)
+!status apply tank jammed
+!action list gun
+?? 🚫 jammed on `tank`
+!action gun cannon ogre
+?? ❌ action `cannon`: [forbidden] `gun` can't use `cannon`: jammed on `tank` forbids `vehicle_weapon` actions.
+?! failed
+!assert "entity[ogre].hp == 30"
+!action gun horn
+?? `gun` used action `horn`.
+!ent set_var tank crew 3
+!action gun cannon ogre
+?? `gun` used action `cannon`.
+!assert "entity[ogre].hp == 25"
+!status apply gun blind
+!action gun cannon ogre
+?? blind on `gun` forbids `ranged` actions.
+!assert "entity[ogre].hp == 25"
+!ent set_var tank mount_action_actor vehicle
+!action gun cannon ogre
+?? blind on `gun` forbids `ranged` actions.
+!system lint tagsys
+?! nope
+!ent set_var ogre action_tags 5
+!ent set_var ogre actions.smash.tags "melee, heavy"
+!ent set_var ogre actions.smash.body "entity[self].smashed = True"
+!action info ogre smash
+?? Tags:        `melee` (own), `heavy` (own)
+?? ⚠️ `action_tags` isn't a list of one-word tags (5); only nothing counts.
+!ent set_var ogre actions.action_tags brute
+!eval "entity[ogre].actions.smash.exclude_inherited_action_tags = {'a': [1]}"
+!action list ogre
+?? (1 total)
+?? tags: melee, heavy, brute)
+!action info ogre smash
+?? ⚠️ `actions.smash.exclude_inherited_action_tags` isn't a list of one-word tags ({'a': [1]}); only nothing counts.
+!eval "entity[ogre].actions.smash.tags = ['melee', 3, 'two words']"
+!assert "action_tags_of('ogre', 'smash') == ['melee', 'brute']"
+!status forbids_actions_with_tag nosuch melee
+?? ❌ No status definition `nosuch`.
+!status forbids_actions_with_tag_unless blind "(lambda: 1)()"
+?? ❌ Invalid forbids_actions_with_tag_unless formula
+?tab "!status forbids_actions_with_t"
+?? forbids_actions_with_tag
+!system status forbids_actions_with_name_unless tagsys blind "unknown_fn(self)"
+?? ⚠️ Function 'unknown_fn' isn't a built-in or a `!func`
+!system lint tagsys
+?? calls `unknown_fn`
+
+Expected: HARNESS-ALLOWS-ERRORS. A system's status definitions carry the
+restriction lists and `_unless` formulas (`!system status`, a broken
+formula refused, an unknown function stored with a ⚠️ and named by
+`!system lint`) into a new match. A slot's actions inherit the
+`action_tags` of `slots` on the 2×2 tank. The vehicle's jammed status
+forbids its gunner the cannon (`vehicle_weapon`) and `!action list` marks
+it, while the horn, which cuts every inherited tag, still works; three
+crew lift the jam. The gunner's own blindness forbids the ranged cannon,
+also when the vehicle runs the action (mount_action_actor vehicle). An
+`actions` dict's own `action_tags` reach its actions (and it is no action
+itself). A tag field that isn't a tag list is named by `!action info`;
+only its usable words count.
