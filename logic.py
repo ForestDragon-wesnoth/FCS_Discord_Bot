@@ -1423,7 +1423,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "<y> block \"<formula>\"`. Empty = tiles never block. Malformed "
             "formula = treated as not blocking. Which MOVEMENT kinds honor "
             "blocking is set by the block_walk / block_tp / block_push / "
-            "block_swap rules (all default True)."
+            "block_swap rules (all default True). A step also binds "
+            "move_dir (the direction it moves in) and from_x / from_y (the "
+            "cell it comes from); a teleport, swap or placement binds them "
+            "to None. A one-way door: `move_dir != tile_facing(tile_x, "
+            "tile_y)`."
         ),
     },
     "zone_block_condition": {
@@ -1435,7 +1439,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "= the moving entity. Truthy = blocked. A zone's own `block` "
             "data field overrides it (`!zone set <name> block \"<formula>\"`). "
             "Empty = zones never block. Malformed = not blocking. A cell is "
-            "blocked if its tile OR any covering zone blocks the mover."
+            "blocked if its tile OR any covering zone blocks the mover. Also "
+            "bound: tile_x / tile_y (the cell entered), and for a step "
+            "move_dir / from_x / from_y (None for a teleport, swap or "
+            "placement), so `move_dir != zone_facing(zone_name)` makes a "
+            "one-way zone."
         ),
     },
     "corpse_block_condition": {
@@ -5934,16 +5942,55 @@ class SpecialTileTemplate:
 # pattern, so the two map features with definitions behave alike. Stored as
 # plain dicts in Match.zone_definitions (and a system library), in the
 # shape normalize_zone_def gives.
-ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend")
+ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend",
+                                     "facing", "glyphs", "sprites")
+# The per-facing look fields (#257) and the plain field each stands in for:
+# `glyphs.<facing>` / `sprites.<facing>` on units, tiles (data, template
+# data), zones and zone definitions.
+FACING_LOOK_FIELDS: Dict[str, str] = {"glyphs": "glyph", "sprites": "sprite"}
+# The tile data key / zone field holding a facing (#257).
+FACING_FIELD = "facing"
+
+
+def checked_facing_data(path: str, value: Any) -> Any:
+    """`value` about to be stored at tile data `path`: a write at `facing`
+    must name a direction (stored as its canonical name), and nothing
+    nests under it. Other paths pass unchanged."""
+    segs = str(path).split(".")
+    if segs[0] != FACING_FIELD:
+        return value
+    if len(segs) > 1:
+        raise VTTError("`facing` holds one direction; nothing nests under "
+                       "it.")
+    canon = normalize_direction(value) if isinstance(value, str) else None
+    if canon is None:
+        raise VTTError(f"`facing` must be a direction (up, down, left, "
+                       f"right, or a diagonal), not {value!r}.")
+    return canon
+
+
+def facing_look_entry(kind: str, facing: Any, value: Any) -> bool:
+    """Whether `value` is a usable `glyphs` / `sprites` entry for `facing`."""
+    if not isinstance(facing, str) or facing not in ALLOWED_DIRECTIONS:
+        return False
+    if kind == "glyphs":
+        return isinstance(value, str) and len(value) == 1
+    return isinstance(value, str) and bool(value)
 
 
 def zone_look_value(key: str, value: Any) -> bool:
     """Whether `value` is a usable zone look field `key` (a one-character
-    glyph, a non-empty color / sprite text, a legend text or False)."""
+    glyph, a non-empty color / sprite text, a legend text or False, a
+    direction, a {facing: glyph / sprite} dict with a usable entry)."""
     if key == "glyph":
         return isinstance(value, str) and len(value) == 1
     if key == "legend":
         return value is False or (isinstance(value, str) and bool(value))
+    if key == "facing":
+        return isinstance(value, str) and value in ALLOWED_DIRECTIONS
+    if key in FACING_LOOK_FIELDS:
+        return isinstance(value, dict) and any(
+            facing_look_entry(key, f, v) for f, v in value.items())
     return isinstance(value, str) and bool(value)
 
 
@@ -5971,7 +6018,7 @@ def normalize_zone_def(raw: Any) -> Dict[str, Any]:
     }
     for key in ZONE_LOOK_FIELDS:
         if zone_look_value(key, raw.get(key)):
-            out[key] = raw[key]
+            out[key] = copy.deepcopy(raw[key])
     return out
 
 
@@ -7271,7 +7318,8 @@ class Entity:
                         raise OutOfBounds(f"({cx},{cy}) outside {mp.size_text()}")
                 if block_mode is not None:
                     for cx, cy in m.entity_cells(self, nx, ny):
-                        if m._check_block(self.id, cx, cy, block_mode):
+                        if m._check_block(self.id, cx, cy, block_mode,
+                                          step=(canon, dx, dy)):
                             raise Blocked(f"Cell ({cx},{cy}) blocks `{self.id}`")
                 step_path.append((nx, ny, step_facing))
                 x, y = nx, ny
@@ -8141,6 +8189,7 @@ class Map:
         check_store_path(path, "tile path")
         if path.split(".")[0] == "corpses":
             raise VTTError(_CORPSES_RESERVED)
+        value = checked_facing_data(path, value)
         d = self.tiles.setdefault((x, y), {})
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
@@ -8219,18 +8268,9 @@ class Map:
             "data": copy.deepcopy(z.get("data") or {}),
             "hooks": copy.deepcopy(z.get("hooks") or {}),
         }
-        g = z.get("glyph")
-        if isinstance(g, str) and len(g) == 1:
-            out["glyph"] = g
-        c = z.get("color")
-        if isinstance(c, str) and c:
-            out["color"] = c
-        sp = z.get("sprite")
-        if isinstance(sp, str) and sp:
-            out["sprite"] = sp
-        lg = z.get("legend")
-        if lg is False or (isinstance(lg, str) and lg):
-            out["legend"] = lg
+        for key in ZONE_LOOK_FIELDS:
+            if zone_look_value(key, z.get(key)):
+                out[key] = copy.deepcopy(z[key])
         if isinstance(z.get("def"), str) and z["def"]:
             out["def"] = z["def"]
         if z.get("tags"):
@@ -8266,18 +8306,9 @@ class Map:
                 if isinstance(k, str) and isinstance(v, str)
             } if isinstance(hooks, dict) else {},
         }
-        g = zdef.get("glyph")
-        if isinstance(g, str) and len(g) == 1:
-            z["glyph"] = g
-        c = zdef.get("color")
-        if isinstance(c, str) and c:
-            z["color"] = c
-        sp = zdef.get("sprite")
-        if isinstance(sp, str) and sp:
-            z["sprite"] = sp
-        lg = zdef.get("legend")
-        if lg is False or (isinstance(lg, str) and lg):
-            z["legend"] = lg
+        for key in ZONE_LOOK_FIELDS:
+            if zone_look_value(key, zdef.get(key)):
+                z[key] = copy.deepcopy(zdef[key])
         # The zone definition it names (Match.zone_definitions; a name
         # without a definition is an orphan, as a tile's `_template`) and
         # its own tags.
@@ -9326,6 +9357,32 @@ class Match:
             raise DuplicateId(f"Zone definition `{name}` already exists.")
         self.zone_definitions[name] = normalize_zone_def({})
         return self.zone_definitions[name]
+
+    def reapply_zone_definition(self, definition: str,
+                                reset: bool = False) -> List[str]:
+        """Push zone definition `definition`'s data to every zone naming it
+        (#258): its keys overwrite the zone's same keys, the zone's other
+        keys stay; with `reset` the zone's data becomes a copy of the
+        definition's. Hooks, look fields and tags are read live already.
+        Returns the zones whose data changed."""
+        d = self.zone_definitions.get(definition)
+        if d is None:
+            raise NotFound(f"No zone definition `{definition}`.")
+        ddata = d.get("data") or {}
+        changed: List[str] = []
+        for name in self.zones_using_def(definition):
+            z = self.find_zone(name)
+            old = z.get("data") or {}
+            if reset:
+                new = copy.deepcopy(ddata)
+            else:
+                new = copy.deepcopy(old)
+                new.update(copy.deepcopy(ddata))
+            if new != old:
+                note_stored_tags(self.system_name, old, new)
+                z["data"] = new
+                changed.append(name)
+        return changed
 
     def zones_using_def(self, definition: str) -> List[str]:
         """The zones (any map, sorted) naming zone definition `definition`."""
@@ -13283,6 +13340,9 @@ class Match:
                     f"placement overrides may not use reserved keys: "
                     f"{', '.join(sorted(bad))}."
                 )
+            if FACING_FIELD in overrides:
+                overrides = dict(overrides, **{FACING_FIELD: self.checked_facing(
+                    overrides[FACING_FIELD])})
             tile.update(copy.deepcopy(overrides))
         tile["_template"] = name
         # Placing terrain keeps the corpses lying on the cell.
@@ -13291,6 +13351,36 @@ class Match:
             tile["corpses"] = old["corpses"]
         mp.tiles[(x, y)] = tile
         return tile
+
+    def reapply_tile_template(self, name: str, maps: List["Map"],
+                              reset: bool = False) -> int:
+        """Push tile template `name`'s data to the tiles placed from it on
+        `maps` (#258): its keys overwrite the tile's same keys, the tile's
+        other keys stay; with `reset` the tile's data becomes a copy of the
+        template's (its own hooks and tags data go too). Corpses always
+        stay. Hooks and tags of the template are read live already.
+        Returns the number of tiles whose data changed."""
+        tpl = self.tile_templates.get(name)
+        if tpl is None:
+            raise NotFound(f"tile template '{name}' not found.")
+        n = 0
+        for mp in maps:
+            for cell, old in list(mp.tiles.items()):
+                if not isinstance(old, dict) or old.get("_template") != name:
+                    continue
+                if reset:
+                    new = copy.deepcopy(tpl.data)
+                    new["_template"] = name
+                    if old.get("corpses"):
+                        new["corpses"] = old["corpses"]
+                else:
+                    new = dict(old)
+                    new.update(copy.deepcopy(tpl.data))
+                if new != old:
+                    note_stored_tags(None, old, new)
+                    mp.tiles[cell] = new
+                    n += 1
+        return n
 
     def tile_template_for(self, x: int, y: int, mp: Optional["Map"] = None
                           ) -> Optional[SpecialTileTemplate]:
@@ -13669,15 +13759,22 @@ class Match:
             return False
 
     def cell_blocks(self, mover_id: str, x: int, y: int,
-                    mp: Optional["Map"] = None) -> bool:
+                    mp: Optional["Map"] = None,
+                    step: Optional[Tuple[str, int, int]] = None) -> bool:
         """True iff the tile or any zone covering (x, y) of map `mp` (None:
         the mover's map, else the only map) blocks `mover_id` from entering.
         The raw geometry query — does NOT consult the block_* movement-mode
-        rules (use _check_block for that)."""
+        rules (use _check_block for that). `step` = (direction, dx, dy) of
+        a stepwise move: the conditions bind move_dir and from_x / from_y
+        (the cell the body's cell steps from); None (a teleport, swap,
+        placement) binds all three to None (#257: one-way doors)."""
         mp = self._map_for(mp, self.entities.get(mover_id))
+        move = ({"move_dir": step[0], "from_x": x - step[1],
+                 "from_y": y - step[2]} if step is not None else
+                {"move_dir": None, "from_x": None, "from_y": None})
         if self._eval_block_spec(
                 self._tile_block_spec(x, y, mp), mover_id,
-                {"tile_x": x, "tile_y": y, "tile_map": mp.name}):
+                {"tile_x": x, "tile_y": y, "tile_map": mp.name, **move}):
             return True
         for name, z in mp.zones.items():
             cells = z.get("cells", ())
@@ -13686,8 +13783,9 @@ class Match:
             zspec = self.zone_data_spec(z, "block")
             if zspec is None:
                 zspec = self.rules.get("zone_block_condition", "")
-            if self._eval_block_spec(zspec, mover_id, {"zone_name": name,
-                                                       "zone_map": mp.name}):
+            if self._eval_block_spec(zspec, mover_id, {
+                    "zone_name": name, "zone_map": mp.name, "tile_x": x,
+                    "tile_y": y, **move}):
                 return True
         # Corpses can block, per corpse_block_condition (off by default).
         # Gated on the rule being set so there's zero cost when corpses are
@@ -13707,19 +13805,20 @@ class Match:
                 if self._eval_block_spec(
                         cspec, mover_id,
                         {"tile_x": x, "tile_y": y, "tile_map": mp.name,
-                         "corpse_id": cid, "corpse_team": ct}):
+                         "corpse_id": cid, "corpse_team": ct, **move}):
                     return True
         return False
 
     def _check_block(self, mover_id: str, x: int, y: int, mode: str,
-                     mp: Optional["Map"] = None) -> bool:
+                     mp: Optional["Map"] = None,
+                     step: Optional[Tuple[str, int, int]] = None) -> bool:
         """Whether a movement of kind `mode` ('walk'/'tp'/'push'/'swap')
         onto (x, y) of map `mp` (None: the mover's) is blocked for
         `mover_id` — i.e. the matching block_<mode> rule is on AND the cell
-        blocks the mover."""
+        blocks the mover. `step`: see cell_blocks."""
         if not self.rules.get(f"block_{mode}", True):
             return False
-        return self.cell_blocks(mover_id, x, y, mp)
+        return self.cell_blocks(mover_id, x, y, mp, step)
 
     def push_entity(self, eid: str, direction: str, n: int = 1) -> Tuple[int, List[str]]:
         """Forced movement: step `eid` up to `n` cells in `direction`,
@@ -13785,7 +13884,8 @@ class Match:
             # A blocked cell stops the push at the cell before it (knockback
             # into a wall) — same "stops at the first blocker" rule as
             # occupancy above.
-            if any(self._check_block(e.id, cx, cy, "push")
+            if any(self._check_block(e.id, cx, cy, "push",
+                                     step=(canon, dx, dy))
                    for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             x, y = nx, ny
@@ -13868,7 +13968,9 @@ class Match:
                 break
             # Blocking stops the drag at the cell before a blocked one,
             # mirroring push_entity's "stops at the first blocker" rule.
-            if any(self._check_block(e.id, cx, cy, "push")
+            if any(self._check_block(
+                    e.id, cx, cy, "push",
+                    step=(_VECTOR_TO_DIRECTION[(sx, sy)], sx, sy))
                    for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             moves.append((_VECTOR_TO_DIRECTION[(sx, sy)], 1))
@@ -20922,23 +21024,35 @@ class Match:
                  "up_left": "down_left", "down_left": "up_left",
                  "up_right": "down_right", "down_right": "up_right"}
 
-    def _sprite_mirror_axes(self, e: "Entity") -> frozenset:
-        """Which mirror axes ('h'/'v') are allowed when filling a missing
-        facing sprite for `e`: the `sprite_mirror` var > the rule."""
-        val = e.vars.get("sprite_mirror")
-        if not (isinstance(val, str) and val.strip()):
+    def _mirror_axes(self, *vals: Any) -> frozenset:
+        """Which mirror axes ('h'/'v') fill a missing facing sprite: the
+        first usable `sprite_mirror` value of `vals` (the thing's own, then
+        its template's ...) > the sprite_mirror rule."""
+        val = next((v for v in vals if isinstance(v, str) and v.strip()),
+                   None)
+        if val is None:
             val = str(self.rules.get("sprite_mirror", "horizontal"))
         val = val.strip().lower()
         return {"none": frozenset(), "horizontal": frozenset({"h"}),
                 "vertical": frozenset({"v"}),
                 "both": frozenset({"h", "v"})}.get(val, frozenset({"h"}))
 
+    def _sprite_mirror_axes(self, e: "Entity") -> frozenset:
+        """Which mirror axes ('h'/'v') are allowed when filling a missing
+        facing sprite for `e`: the `sprite_mirror` var > the rule."""
+        return self._mirror_axes(e.vars.get("sprite_mirror"))
+
     def _mirror_sprite(self, e: "Entity", sprites: Dict[str, Any],
                        facing: str) -> Optional[Tuple[str, bool, bool]]:
         """Find a mirror of an existing facing in `sprites` to stand in for
         the missing `facing`, per the entity's allowed mirror axes. Returns
         (key, flip_h, flip_v) or None."""
-        axes = self._sprite_mirror_axes(e)
+        return self._mirror_in(sprites, facing, self._sprite_mirror_axes(e))
+
+    def _mirror_in(self, sprites: Dict[str, Any], facing: str,
+                   axes: frozenset) -> Optional[Tuple[str, bool, bool]]:
+        """A mirror of an existing facing in `sprites` standing in for the
+        missing `facing` along `axes`: (key, flip_h, flip_v) or None."""
         if "h" in axes:
             p = self._MIRROR_H.get(facing)
             k = sprites.get(p) if p else None
@@ -20949,6 +21063,42 @@ class Match:
             k = sprites.get(p) if p else None
             if isinstance(k, str) and k:
                 return (k, False, True)
+        return None
+
+    def _facing_sprite(self, sources: List[Dict[str, Any]], facing: str,
+                       axes: frozenset) -> Optional[Tuple[str, bool, bool]]:
+        """A tile's / zone's sprite from its look `sources` (own first):
+        within each, `sprites.<facing>`, then a mirror of another facing,
+        then the plain `sprite`. (key, flip_h, flip_v) or None."""
+        for src in sources:
+            sprites = src.get("sprites")
+            if isinstance(sprites, dict):
+                k = sprites.get(facing)
+                if isinstance(k, str) and k:
+                    return (k, False, False)
+                mir = self._mirror_in(sprites, facing, axes)
+                if mir is not None:
+                    return mir
+            k = src.get("sprite")
+            if isinstance(k, str) and k:
+                return (k, False, False)
+        return None
+
+    @staticmethod
+    def _facing_glyph(sources: List[Dict[str, Any]], facing: str
+                      ) -> Optional[str]:
+        """A tile's / zone's glyph from its look `sources` (own first):
+        within each, `glyphs.<facing>`, then the plain `glyph`. No facing
+        arrow: a tile or zone without a glyph shows none."""
+        for src in sources:
+            glyphs = src.get("glyphs")
+            if isinstance(glyphs, dict):
+                g = glyph_of(glyphs.get(facing))
+                if isinstance(g, str) and len(g) == 1:
+                    return g
+            g = glyph_of(src.get("glyph"))
+            if isinstance(g, str) and len(g) == 1:
+                return g
         return None
 
     def entity_sprite(self, e: "Entity", pov_team: Optional[str] = None
@@ -21069,28 +21219,70 @@ class Match:
                     out.append(rec)
         return out
 
-    def tile_sprite(self, x: int, y: int, mp: "Map") -> Optional[str]:
-        """The sprite key for the tile at (x, y) of map `mp`: instance
-        `sprite` data > the template's `sprite`. None when unset."""
+    def _tile_look_sources(self, x: int, y: int, mp: "Map"
+                           ) -> List[Dict[str, Any]]:
+        """The dicts a tile's look reads, own first: its data, then its
+        template's data. Empty when the cell has no tile data."""
         cell = mp.tiles.get((x, y))
         if not isinstance(cell, dict):
-            return None
-        k = cell.get("sprite")
-        if isinstance(k, str) and k:
-            return k
+            return []
+        out = [cell]
         tpl_name = cell.get("_template")
         if isinstance(tpl_name, str):
             tpl = self.tile_templates.get(tpl_name)
             if tpl is not None:
-                tk = tpl.data.get("sprite")
-                if isinstance(tk, str) and tk:
-                    return tk
-        return None
+                out.append(tpl.data)
+        return out
+
+    def _zone_look_sources(self, z: Any) -> List[Dict[str, Any]]:
+        """The dicts a zone's look reads, own first: the zone, then its
+        definition."""
+        if not isinstance(z, dict):
+            return []
+        d = self.zone_def_dict(z)
+        return [z] + ([d] if d is not None else [])
+
+    def tile_sprite_info(self, x: int, y: int, mp: "Map"
+                         ) -> Optional[Tuple[str, bool, bool]]:
+        """The sprite for the tile at (x, y) of map `mp` as (key, flip_h,
+        flip_v): `sprites.<facing>` / a mirror of another facing /
+        `sprite`, the instance's data before the template's. None when
+        unset."""
+        src = self._tile_look_sources(x, y, mp)
+        if not src:
+            return None
+        axes = self._mirror_axes(*(d.get("sprite_mirror") for d in src))
+        return self._facing_sprite(src, self.tile_facing(x, y, mp), axes)
+
+    def tile_sprite(self, x: int, y: int, mp: "Map") -> Optional[str]:
+        """The sprite key for the tile at (x, y) of map `mp` (see
+        tile_sprite_info). None when unset."""
+        info = self.tile_sprite_info(x, y, mp)
+        return info[0] if info else None
+
+    def zone_sprite_info(self, name: str, mp: "Map"
+                         ) -> Optional[Tuple[str, bool, bool]]:
+        """The sprite for zone `name` of map `mp` as (key, flip_h, flip_v),
+        from the zone's then its definition's look fields; the mirror axes
+        from the `sprite_mirror` data (zone, definition) > the rule."""
+        z = mp.zones.get(name)
+        src = self._zone_look_sources(z)
+        if not src:
+            return None
+        axes = self._mirror_axes(self.zone_data_spec(z, "sprite_mirror"))
+        return self._facing_sprite(src, self.zone_facing(name, mp), axes)
 
     def zone_sprite(self, name: str, mp: "Map") -> Optional[str]:
-        """The sprite key for zone `name` of map `mp` (its `sprite` field),
-        or None."""
-        return self.zone_look(mp.zones.get(name), "sprite")
+        """The sprite key for zone `name` of map `mp`, or None."""
+        info = self.zone_sprite_info(name, mp)
+        return info[0] if info else None
+
+    def zone_glyph(self, name: str, mp: "Map") -> Optional[str]:
+        """The glyph for zone `name` of map `mp`: `glyphs.<facing>` then
+        `glyph`, the zone's before its definition's. None when unset."""
+        z = mp.zones.get(name)
+        return self._facing_glyph(self._zone_look_sources(z),
+                                  self.zone_facing(name, mp))
 
     def background_layer(self, mp: Optional["Map"] = None
                          ) -> Optional[Dict[str, Any]]:
@@ -21107,23 +21299,11 @@ class Match:
                 else "stretch"}
 
     def tile_glyph(self, x: int, y: int, mp: "Map") -> Optional[str]:
-        """The glyph for the tile at (x, y) of map `mp`: instance > template
-        (mirrors the inline resolution in _render_ascii_impl). None when
-        unset."""
-        cell = mp.tiles.get((x, y))
-        if not isinstance(cell, dict):
-            return None
-        g = glyph_of(cell.get("glyph"))
-        if isinstance(g, str) and len(g) == 1:
-            return g
-        tpl_name = cell.get("_template")
-        if isinstance(tpl_name, str):
-            tpl = self.tile_templates.get(tpl_name)
-            if tpl is not None:
-                tg = glyph_of(tpl.data.get("glyph"))
-                if isinstance(tg, str) and len(tg) == 1:
-                    return tg
-        return None
+        """The glyph for the tile at (x, y) of map `mp`: `glyphs.<facing>`
+        then `glyph`, the instance's data before the template's (both
+        renderers read it). None when unset."""
+        return self._facing_glyph(self._tile_look_sources(x, y, mp),
+                                  self.tile_facing(x, y, mp))
 
     def entity_has_custom_sprite(self, e: "Entity") -> bool:
         """True when `e` has a custom sprite (per-facing `sprites` or the base
@@ -21370,7 +21550,7 @@ class Match:
         for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
             if not self.zone_visible_to(zname, pov_team, mp):
                 continue
-            g = self.zone_look(z, "glyph")
+            g = self.zone_glyph(zname, mp)
             has_glyph = g is not None
             zc = self.zone_color(zname, mp)
             if not has_glyph and zc is None:
@@ -21394,16 +21574,8 @@ class Match:
                 continue
             if not self.tile_visible_to(tx, ty, pov_team, mp):
                 continue
-            glyph = glyph_of(data.get("glyph"))
-            if not (isinstance(glyph, str) and len(glyph) == 1):
-                tpl_name = data.get("_template")
-                if isinstance(tpl_name, str):
-                    tpl = self.tile_templates.get(tpl_name)
-                    if tpl is not None:
-                        cand = glyph_of(tpl.data.get("glyph"))
-                        if isinstance(cand, str) and len(cand) == 1:
-                            glyph = cand
-            has_glyph = isinstance(glyph, str) and len(glyph) == 1
+            glyph = self.tile_glyph(tx, ty, mp)
+            has_glyph = glyph is not None
             tc = self.tile_color(tx, ty, mp)
             if has_glyph:
                 grid[ty][tx] = glyph
@@ -21872,8 +22044,9 @@ class Match:
         for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
             if not self.zone_visible_to(zname, pov_team, mp):
                 continue
-            spr = self.zone_sprite(zname, mp)
-            g = self.zone_look(z, "glyph")
+            sinfo = self.zone_sprite_info(zname, mp)
+            spr, fh, fv = sinfo if sinfo else (None, False, False)
+            g = self.zone_glyph(zname, mp)
             tint = self.zone_color(zname, mp)
             if spr is None and g is None and tint is None:
                 continue
@@ -21884,14 +22057,15 @@ class Match:
                     "kind": "zone", "ref": zname, "x": zx, "y": zy,
                     "w": 1, "h": 1, "mode": "single", "sprite": spr,
                     "glyph": g, "tint": tint, "opacity": 100,
-                    "flip_h": False, "flip_v": False, "layer": zone_layer})
+                    "flip_h": fh, "flip_v": fv, "layer": zone_layer})
 
         # Tile layer (20).
         for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
             if not mp.in_bounds(tx, ty) or not self.tile_visible_to(
                     tx, ty, pov_team, mp):
                 continue
-            spr = self.tile_sprite(tx, ty, mp)
+            sinfo = self.tile_sprite_info(tx, ty, mp)
+            spr, fh, fv = sinfo if sinfo else (None, False, False)
             g = self.tile_glyph(tx, ty, mp)
             tint = self.tile_color(tx, ty, mp)
             if spr is None and g is None and tint is None:
@@ -21904,7 +22078,7 @@ class Match:
                 "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
                 "glyph": g, "tint": tint, "opacity": 100,
-                "flip_h": False, "flip_v": False, "layer": t_layer})
+                "flip_h": fh, "flip_v": fv, "layer": t_layer})
 
         # Corpse layer (25): the dead entity's stored sprite, tinted +
         # semi-transparent (corpse_sprite_tint / corpse_sprite_opacity).
@@ -22044,10 +22218,20 @@ class Match:
         unknown direction, or a diagonal while allow_diagonal_facing is off.
         Riders in a facing-relative slot region are re-seated, since the
         region turns with the vehicle. Returns the new facing."""
+        canon = self.checked_facing(raw, e.facing)
+        e.facing = canon
+        self._restamp_riders_for(e.id)
+        return canon
+
+    def checked_facing(self, raw: Any, current: str = "up") -> Direction:
+        """The facing `raw` names (any normalize_direction alias), or
+        `current` turned one step with cw / ccw. VTTError on an unknown
+        word, or a diagonal while allow_diagonal_facing is off. Shared by
+        units, tiles and zones (#257)."""
         tok = str(raw).strip().lower() if isinstance(raw, str) else ""
         eight_way = bool(self.rules.get("allow_diagonal_facing", False))
         if tok in self._FACING_CW or tok in self._FACING_CCW:
-            canon = rotate_direction(e.facing, clockwise=tok in self._FACING_CW,
+            canon = rotate_direction(current, clockwise=tok in self._FACING_CW,
                                      eight_way=eight_way)
         else:
             canon = normalize_direction(tok)
@@ -22061,8 +22245,56 @@ class Match:
                     f"Diagonal facing '{raw}' is not allowed by the active "
                     "game system. Enable rule 'allow_diagonal_facing' to "
                     "permit it.")
-        e.facing = canon
-        self._restamp_riders_for(e.id)
+        return canon
+
+    # ---- tile and zone facing (#257) ---------------------------------
+    # A tile's facing is its `facing` data (else its template's), a zone's
+    # its `facing` field (else its definition's); `up` when none is set.
+    # Most tiles never set one: it is there for directional terrain
+    # (conveyors, arrow traps, one-way doors), read by formulas
+    # (tile_facing / zone_facing), the per-facing looks and block
+    # conditions (move_dir).
+
+    def tile_facing(self, x: int, y: int, mp: "Map") -> Direction:
+        """The facing of the tile at (x, y) of map `mp`: its `facing` data,
+        else its template's, else `up`."""
+        for src in self._tile_look_sources(x, y, mp):
+            f = src.get(FACING_FIELD)
+            if isinstance(f, str) and f in ALLOWED_DIRECTIONS:
+                return f
+        return "up"
+
+    def tile_data_value(self, path: str, value: Any) -> Any:
+        """`value` for tile data `path` as a command or formula stores it: a
+        `facing` passes checked_facing (a diagonal needs
+        allow_diagonal_facing)."""
+        if str(path).split(".")[0] == FACING_FIELD and "." not in str(path):
+            return self.checked_facing(value)
+        return value
+
+    def tile_face(self, x: int, y: int, raw: Any, mp: "Map") -> Direction:
+        """Turn the tile at (x, y) of map `mp` to `raw` (a direction, or
+        cw / ccw from its current facing): writes its `facing` data."""
+        canon = self.checked_facing(raw, self.tile_facing(x, y, mp))
+        mp.tile_set_path(x, y, FACING_FIELD, canon)
+        return canon
+
+    def zone_facing(self, name: str, mp: Optional["Map"] = None
+                    ) -> Direction:
+        """The facing of zone `name`: its own, else its definition's, else
+        `up`."""
+        z = (mp.zones.get(name) if mp is not None else self.find_zone(name))
+        f = self.zone_look(z, FACING_FIELD)
+        return f if isinstance(f, str) else "up"
+
+    def zone_face(self, name: str, raw: Any) -> Direction:
+        """Turn zone `name` to `raw` (a direction, or cw / ccw from its
+        current facing): sets its own `facing` field."""
+        z = self.find_zone(name)
+        if z is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        canon = self.checked_facing(raw, self.zone_facing(name))
+        z[FACING_FIELD] = canon
         return canon
 
     def facing_toward(self, e: "Entity", tx: float, ty: float) -> Optional[Direction]:
@@ -22290,7 +22522,8 @@ class Match:
                                 f"Group '{group_name}' move aborted: member "
                                 f"'{eid}' would leave the grid at ({cx},{cy})."
                             )
-                        if self._check_block(eid, cx, cy, "walk"):
+                        if self._check_block(eid, cx, cy, "walk",
+                                             step=(canon, dx, dy)):
                             raise Blocked(
                                 f"Group '{group_name}' move aborted: member "
                                 f"'{eid}' is blocked at ({cx},{cy})."

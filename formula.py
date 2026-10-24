@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS
 
 
 class FormulaError(VTTError):
@@ -2750,6 +2750,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # tile_place(template, x, y, data=None): `!tile place` from a formula;
     # tile_template_of(x, y): the template a cell was placed from.
     "tile_place", "tile_template_of",
+    # Tile and zone facing (#257): reads and writers.
+    "tile_facing", "tile_face", "zone_facing", "zone_face",
     # Reverse group index: entity_groups(eid) -> names of every group
     # containing the entity (insertion order over Match.groups).
     "entity_groups",
@@ -3005,6 +3007,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "map_var_set", "map_var_del", "transfer_entity",
     "group_add", "group_remove",
     "tile_set", "tile_del", "tile_clear", "tile_place",
+    "tile_face", "zone_face",
     "move_entity", "move_step", "push_entity", "pull_entity", "swap_entities",
     "fire_tile_hook",
     "absorb_damage",
@@ -3084,7 +3087,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'team_sees_cell_losonly', 'team_sees_cell_rangeonly',
     'team_sees_entity', 'team_sees_entity_losonly',
     'team_sees_entity_rangeonly', 'tile_get', 'tile_has', 'tile_keys',
-    'tile_template_of',
+    'tile_template_of', 'tile_facing', 'zone_facing',
     'turn_index', 'turns_elapsed', 'var_count', 'var_get', 'var_has',
     'var_has_key',
     'var_keys', 'var_max_key', 'var_min_key', 'var_pick_random',
@@ -3140,7 +3143,7 @@ _TAG_ARG_FUNCS: "frozenset[str]" = frozenset({
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
     "tile_place", "tile_template_of", "tile_tags", "tile_has_tag",
-    "fire_tile_hook", "cell_entity", "entities_at", "zones_at",
+    "tile_facing", "tile_face", "fire_tile_hook", "cell_entity", "entities_at", "zones_at",
     "entities_in_area", "entities_in_cone", "entities_in_rect",
     "entities_in_line_ignorelos", "entities_on_los", "entities_in_line_until",
     "cell_opaque", "cell_blocked", "in_bounds", "grid_width", "grid_height",
@@ -3377,6 +3380,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # fires ONCE with from=(3,3), to=(7,5) — per-step observation is
     # via tile on_enter/on_exit.
     "from_x", "from_y", "to_x", "to_y",
+    # Block conditions (tile / zone / corpse, #257): the direction of the
+    # step entering the cell (None for a teleport, swap or placement);
+    # from_x / from_y there are the cell that body cell steps from.
+    "move_dir",
     # The maps of a move (on_entity_moved, on_entity_changed_map): equal
     # for an ordinary move.
     "from_map", "to_map",
@@ -4885,6 +4892,7 @@ class FormulaEngine:
                     f"{type(path).__name__}."
                 )
             try:
+                value = match.tile_data_value(path, value)
                 _cur_map().tile_set_path(x, y, path, value)
             except VTTError as ex:
                 raise FormulaError(str(ex))
@@ -6790,6 +6798,53 @@ class FormulaEngine:
             name = data.get("_template") if isinstance(data, dict) else None
             return name if isinstance(name, str) else None
         ns["tile_template_of"] = _tile_template_of
+
+        def _tile_xy(fname: str, x: Any, y: Any) -> Tuple[int, int]:
+            for n, v in (("x", x), ("y", y)):
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise FormulaError(f"{fname}: {n} must be int, got "
+                                       f"{type(v).__name__}.")
+            if not _cur_map().in_bounds(x, y):
+                raise FormulaError(f"{fname}: ({x},{y}) is off the map.")
+            return x, y
+
+        def _tile_facing(x: Any, y: Any) -> str:
+            """tile_facing(x, y, map=None): the facing of the tile at (x, y):
+            its `facing` data, else its template's, else 'up'."""
+            x, y = _tile_xy("tile_facing", x, y)
+            return match.tile_facing(x, y, _cur_map())
+        ns["tile_facing"] = _tile_facing
+
+        def _tile_face(x: Any, y: Any, direction: Any) -> str:
+            """tile_face(x, y, dir, map=None): turn the tile at (x, y) to a
+            direction, or one step with 'cw' / 'ccw' (diagonals need
+            allow_diagonal_facing); returns its new facing."""
+            x, y = _tile_xy("tile_face", x, y)
+            try:
+                return match.tile_face(x, y, direction, _cur_map())
+            except VTTError as ex:
+                raise FormulaError(f"tile_face: {ex}")
+        ns["tile_face"] = _tile_face
+
+        def _zone_facing(name: Any) -> str:
+            """zone_facing(zone): the zone's facing: its own, else its zone
+            definition's, else 'up'."""
+            if not isinstance(name, str) or match.find_zone(name) is None:
+                raise FormulaError(f"zone_facing: no zone {name!r}.")
+            return match.zone_facing(name)
+        ns["zone_facing"] = _zone_facing
+
+        def _zone_face(name: Any, direction: Any) -> str:
+            """zone_face(zone, dir): turn the zone to a direction, or one
+            step with 'cw' / 'ccw' (diagonals need allow_diagonal_facing);
+            returns its new facing."""
+            if not isinstance(name, str):
+                raise FormulaError("zone_face: zone name must be a string.")
+            try:
+                return match.zone_face(name, direction)
+            except VTTError as ex:
+                raise FormulaError(f"zone_face: {ex}")
+        ns["zone_face"] = _zone_face
 
         def _entity_groups(eid_t: Any) -> list:
             """entity_groups(eid): names of groups containing this
@@ -9196,25 +9251,37 @@ class FormulaEngine:
                 return None                    # no distance across maps
             return match.entity_gap_distance(ea, eb, mode)
 
-        def _cell_blocked(eid_t: Any, x: Any, y: Any, mode: Any = None) -> bool:
-            """cell_blocked(eid, x, y, mode=None): whether the unit can't
-            enter (x, y) — the tile, a zone or a corpse there blocks it, or
-            the cell is off the map. Units standing there don't count (see
-            cell_entity). With a mode ('walk', 'tp', 'push' or 'swap') a
-            block only counts when that block_<mode> rule is on."""
+        def _cell_blocked(eid_t: Any, x: Any, y: Any, mode: Any = None,
+                          dir: Any = None) -> bool:
+            """cell_blocked(eid, x, y, mode=None, dir=None): whether the
+            unit can't enter (x, y) — the tile, a zone or a corpse there
+            blocks it, or the cell is off the map. Units standing there
+            don't count (see cell_entity). With a mode ('walk', 'tp', 'push'
+            or 'swap') a block only counts when that block_<mode> rule is
+            on. dir= judges a step entering the cell that way (the block
+            conditions' move_dir / from_x / from_y: one-way doors)."""
             eid, _ = _resolve_entity(eid_t, "cell_blocked")
             cx = _cell_arg(x, "cell_blocked", "x")
             cy = _cell_arg(y, "cell_blocked", "y")
             bmp = _explicit_map() or match.map_of(match.entities[eid])
             if not bmp.in_bounds(cx, cy):
                 return True
+            step = None
+            if dir is not None:
+                canon = normalize_direction(dir) if isinstance(dir, str) \
+                    else None
+                if canon is None:
+                    raise FormulaError(f"cell_blocked(...): dir must be a "
+                                       f"direction, not {dir!r}.")
+                sdx, sdy = DIRECTION_VECTORS[canon]
+                step = (canon, sdx, sdy)
             if mode is None:
-                return match.cell_blocks(eid, cx, cy, bmp)
+                return match.cell_blocks(eid, cx, cy, bmp, step)
             if mode not in ("walk", "tp", "push", "swap"):
                 raise FormulaError(
                     "cell_blocked(...): mode must be 'walk', 'tp', 'push' or "
                     "'swap'.")
-            return match._check_block(eid, cx, cy, mode, bmp)
+            return match._check_block(eid, cx, cy, mode, bmp, step)
 
         def _cell_opaque(x: Any, y: Any, viewer: Any = None) -> bool:
             """cell_opaque(x, y, viewer=None): whether (x, y) blocks sight —

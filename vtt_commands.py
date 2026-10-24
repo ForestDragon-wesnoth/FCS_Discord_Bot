@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -1318,6 +1318,45 @@ def _engine_var_warning(path: str, value: Any) -> str:
             f"(it overrides the `{rule}` rule).")
 
 
+_FACING_CLEAR = ("-", "none", "clear")
+
+
+def _facing_look_set(target: Dict[str, Any], kind: str, value: str,
+                     facing: Optional[str]) -> str:
+    """Set (or with `-` clear) a zone's / zone definition's `glyph` or
+    `sprite`, or with `facing` its `glyphs.<facing>` / `sprites.<facing>`
+    entry (#257). Returns a reply fragment naming what changed."""
+    if facing is None:
+        if value in _FACING_CLEAR:
+            target.pop(kind, None)
+            return f"cleared its {kind}"
+        if kind == "glyph" and len(value) != 1:
+            raise VTTError("glyph must be exactly one character (or `-` to "
+                           "clear).")
+        target[kind] = value
+        return f"{kind} `{value}`"
+    canon = normalize_direction(facing)
+    if canon is None:
+        raise VTTError(f"`{facing}` isn't a facing (up, down, left, right "
+                       f"or a diagonal).")
+    many = kind + "s"
+    if value in _FACING_CLEAR:
+        entries = target.get(many)
+        if isinstance(entries, dict):
+            entries.pop(canon, None)
+            if not entries:
+                target.pop(many, None)
+        return f"cleared its {kind} facing {canon}"
+    if kind == "glyph" and len(value) != 1:
+        raise VTTError("glyph must be exactly one character (or `-` to "
+                       "clear).")
+    entries = target.get(many)
+    if not isinstance(entries, dict):
+        entries = target[many] = {}
+    entries[canon] = value
+    return f"{kind} `{value}` when facing {canon}"
+
+
 def _template_data_set(name: str, data: Dict[str, Any], path: str,
                        value: Any, what: str = "template",
                        reserved=TILE_RESERVED_KEYS) -> None:
@@ -1329,6 +1368,8 @@ def _template_data_set(name: str, data: Dict[str, Any], path: str,
         raise VTTError(f"{what} data may not use reserved keys "
                        f"({', '.join(sorted(reserved))}).")
     check_store_path(path, f"{what} path")
+    if what == "template":
+        value = checked_facing_data(path, value)
     parts = path.split(".")
     d = data
     for i, key in enumerate(parts[:-1]):
@@ -3283,10 +3324,20 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         preview = bool(rest) and rest[-1].lower() == "diff"
         if preview:
             rest = rest[:-1]
+        # #258: `reapply` also pushes the synced tile templates' / zone
+        # definitions' data to the tiles / zones made from them.
+        reapply = bool(rest) and rest[-1].lower() == "reapply"
+        if reapply:
+            rest = rest[:-1]
+            if kind not in ("tiles", "zones", "all"):
+                raise VTTError("`reapply` goes with `tiles`, `zones` or "
+                               "`all`: it pushes tile template / zone "
+                               "definition data to what was made from "
+                               "them.")
         _check_tail(["sync", kind] + rest, 3 if kind != "all" else 2, (),
                     "!match sync <aliases|tiles|funcs|statuses|tables|"
-                    "macros|zones> [name] [diff] | "
-                    "!match sync all [diff]")
+                    "macros|zones> [name] [reapply] [diff] | "
+                    "!match sync all [reapply] [diff]")
         want = rest[0] if rest else None
         sysobj = mgr.get_system(m.system_name)
         lines: List[str] = []
@@ -3341,6 +3392,22 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if not lib:
                 lines.append(f"{word}: system `{m.system_name}` has none.")
                 continue
+            if reapply and lib_name in ("tile_templates", "zone_definitions"):
+                if preview:
+                    changes.append(f"  and would reapply the data of "
+                                   f"{len(lib)} to what was made from them")
+                else:
+                    n_re = 0
+                    for n in sorted(lib):
+                        if lib_name == "tile_templates":
+                            n_re += m.reapply_tile_template(
+                                n, list(m.maps.values()))
+                        else:
+                            n_re += len(m.reapply_zone_definition(n))
+                    changes.append(
+                        f"  reapplied: {n_re} "
+                        + ("tile(s)" if lib_name == "tile_templates"
+                           else "zone(s)") + " changed")
             bits = []
             verbs = ("would add", "would replace") if preview else \
                 ("added", "replaced")
@@ -3558,7 +3625,7 @@ registry.annotate_sub(
 registry.annotate_sub(
     "match", "sync",
     usage=("!match sync <aliases|tiles|funcs|statuses|tables|macros|zones> "
-           "[name] [diff] | !match sync all [diff]"),
+           "[name] [reapply] [diff] | !match sync all [reapply] [diff]"),
     desc=("Copy the GameSystem's aliases, tile templates, formula "
           "functions, status definitions, tables, macros or zone "
           "definitions (its own and "
@@ -3567,7 +3634,10 @@ registry.annotate_sub(
           "themselves; this brings a live match up to date. Entries only "
           "the match has are kept; undo reverts it. A synced status "
           "definition with a lower max_level lowers live instances. A "
-          "trailing `diff` shows what would change and changes nothing. The "
+          "trailing `diff` shows what would change and changes nothing. "
+          "`reapply` (tiles, zones, all) then pushes each synced tile "
+          "template's / zone definition's data to the tiles / zones made "
+          "from it, as `!tile def reapply` / `!zone def reapply` do. The "
           "other way: `!system <alias|tile|func|status|table|macro|zone> "
           "promote`."),
 )
@@ -8463,7 +8533,8 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
     lib = mgr.system_library(s, "tile_templates")
     need = {"new": 4, "data": 6, "del-data": 5, "hook": 6, "del-hook": 5,
             "del": 4, "delete": 4, "remove": 4, "rm": 4, "info": 4,
-            "promote": 4, "list": 3, "rename": 5, "copy": 5, "tags": 5}
+            "promote": 4, "list": 3, "rename": 5, "copy": 5, "tags": 5,
+            "face": 5}
     if action not in need:
         return await _help_fallback(ctx, ["system", "tile"], args[1])
     if await return_help_if_not_enough_args(ctx, args, need[action],
@@ -8560,6 +8631,19 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
     elif action == "del-data":
         _template_data_del(name, tpl.data, args[4])
         reply = f"Removed `{sys_name}` tile template `{name}`.{args[4]}."
+    elif action == "face":
+        _check_tail(args, 5, (), "!system tile face <system> <name> <dir|->")
+        if args[4] in _FACING_CLEAR:
+            tpl.data.pop(FACING_FIELD, None)
+            reply = f"Cleared `{sys_name}` tile template `{name}`'s facing."
+        else:
+            canon = checked_facing_data(FACING_FIELD, args[4])
+            if canon in DIAGONAL_DIRECTIONS and not mgr.system_value(
+                    s, "allow_diagonal_facing"):
+                raise VTTError(f"Diagonal facing '{args[4]}' needs "
+                               f"allow_diagonal_facing on `{sys_name}`.")
+            tpl.data[FACING_FIELD] = canon
+            reply = f"`{sys_name}` tile template `{name}` faces {canon}."
     elif action == "tags":
         raw = " ".join(args[4:]).strip()
         if raw in ("-", "none", "clear"):
@@ -9164,6 +9248,7 @@ registry.annotate_sub(
         "del-data <system> <name> <path> | "
         "hook <system> <name> <when> <formula ...> | "
         "del-hook <system> <name> <when> | tags <system> <name> <tag ...> | "
+        "face <system> <name> <dir|-> | "
         "rename <system> <name> <new_name> | copy <system> <name> <new_name> | "
         "del <system> <name> | "
         "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
@@ -9207,8 +9292,11 @@ registry.annotate_sub(
         "new <system> <name> | data <system> <name> <path> <value> | "
         "del-data <system> <name> <path> | "
         "hook <system> <name> <when> <formula ...> | "
-        "del-hook <system> <name> <when> | glyph <system> <name> <char|-> | "
-        "color <system> <name> <color|-> | sprite <system> <name> <key|-> | "
+        "del-hook <system> <name> <when> | "
+        "glyph <system> <name> <char|-> [<facing>] | "
+        "color <system> <name> <color|-> | "
+        "sprite <system> <name> <key|-> [<facing>] | "
+        "face <system> <name> <dir|-> | "
         "legend <system> <name> <text ...> | tags <system> <name> <tag ...> | "
         "rename <system> <name> <new_name> | copy <system> <name> <new_name> | "
         "del <system> <name> | drop <system> <name> | "
@@ -11575,7 +11663,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
     movement / sight block settings — plus, with for=<eid>, whether the cell
     blocks that unit. Hidden layers are left out of the evaluation too, so
     the for= answer can't reveal an unseen zone."""
-    _check_options(args[3:], {"for", "as"}, "!map cell")
+    _check_options(args[3:], {"for", "as", "dir"}, "!map cell")
     try:
         x, y = int(args[1]), int(args[2])
     except (IndexError, ValueError):
@@ -11590,9 +11678,18 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
                        f"map{_on_map(m, mp).replace(' on ', ' ')}.")
     pov = _view_pov(ctx, m, args[3:])
     mover = None
+    move: Dict[str, Any] = {"move_dir": None, "from_x": None, "from_y": None}
     for a in args[3:]:
         if a.lower().startswith("for="):
             mover = _query_eid(ctx, m, a[4:])
+        elif a.lower().startswith("dir="):
+            # The step the block conditions see (#257): entering the cell
+            # moving that way, from the cell behind it.
+            d = normalize_direction(a[4:])
+            if d is None:
+                raise VTTError(f"dir= takes a direction, not `{a[4:]}`.")
+            ddx, ddy = DIRECTION_VECTORS[d]
+            move = {"move_dir": d, "from_x": x - ddx, "from_y": y - ddy}
     head = _as_note(args[3:]) + f"📍 **Cell ({x}, {y})**{_on_map(m, mp)}"
     if not m._fog_terrain_visible(pov, x, y, mp):
         return head + " — unseen (fog)."
@@ -11658,7 +11755,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
         if show_tile:
             tx = {"tile_x": x, "tile_y": y, "tile_map": mp.name}
             blocks = m._eval_block_spec(m._tile_block_spec(x, y, mp), mover,
-                                        dict(tx), berr)
+                                        dict(tx, **move), berr)
             sees_blocked = m._eval_opaque_spec(
                 m._tile_opaque_spec(x, y, mp), mover, dict(tx), oerr)
         for n in zones:
@@ -11669,9 +11766,9 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             ospec = m.zone_data_spec(zn, "opaque")
             if ospec is None:
                 ospec = m.rules.get("zone_opaque_condition", "")
-            blocks = m._eval_block_spec(bspec, mover, {"zone_name": n,
-                                                       "zone_map": mp.name},
-                                        berr) or blocks
+            blocks = m._eval_block_spec(bspec, mover, {
+                "zone_name": n, "zone_map": mp.name, "tile_x": x,
+                "tile_y": y, **move}, berr) or blocks
             sees_blocked = m._eval_opaque_spec(
                 ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y,
                                "zone_map": mp.name},
@@ -11684,8 +11781,8 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
                 if m._eval_block_spec(cspec, mover, {
                         "tile_x": x, "tile_y": y, "tile_map": mp.name,
                         "corpse_id": cid,
-                        "corpse_team": str(cv.get(team_var, "") or "")},
-                        berr):
+                        "corpse_team": str(cv.get(team_var, "") or ""),
+                        **move}, berr):
                     blocks = True
         lines.append(f"For `{mover}`: blocks movement: "
                      f"{'yes' if blocks else 'no'} · blocks sight: "
@@ -11990,7 +12087,7 @@ def _color_guide() -> str:
 
 for _sub, _usage in (
         ("colors", "!map colors"),
-        ("cell", "!map cell <x> <y> [for=<eid>] [as=<team>] [map=<map>]"),
+        ("cell", "!map cell <x> <y> [for=<eid>] [dir=<dir>] [as=<team>] [map=<map>]"),
         ("preview", "!map preview <burst|cone|line|rect> <shape args ...> [map=<map>]"),
         ("ent_sight", "!map ent_sight <eid> [color=<r,g,b>] [opacity=<0-100>]"),
         ("background", "!map background <key|clear> [stretch|tile|center] [map=<map>]"),
@@ -12258,7 +12355,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                    f"del / list.")
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map attach <map> <eid>` makes a unit carry a map (a map vehicle: a ship's deck, a building's interior), `!map detach <map>` frees it; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out), and `dir=<dir>` judges it for a step entering the cell that way (the block conditions' move_dir / from_x / from_y: a one-way door). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map attach <map> <eid>` makes a unit carry a map (a map vehicle: a ship's deck, a building's interior), `!map detach <map>` frees it; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     args, mapspec = _pop_map_opt(args)
@@ -12472,8 +12569,13 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # Drawing order (lowest layer first), one line per placement.
             for p in sorted(scene["placements"], key=lambda d: d.get("layer", 0)):
                 size = f" {p['w']}x{p['h']} {p['mode']}" if (p["w"], p["h"]) != (1, 1) else ""
+                flips = "".join(a for a, k in (("h", "flip_h"), ("v", "flip_v"))
+                                if p.get(k))
                 what = ", ".join(
-                    f"{label} {p[key]}" for label, key in
+                    f"{label} {p[key]}"
+                    + (f" (mirrored {flips})" if key == "sprite" and flips
+                       else "")
+                    for label, key in
                     (("sprite", "sprite"), ("glyph", "glyph"), ("color", "tint"))
                     if p.get(key)) or "nothing"
                 us = scene["unit_style"]
@@ -16555,7 +16657,7 @@ def _parse_xy(args: List[str], offset: int = 1) -> Tuple[int, int]:
 
 @registry.command(
     "tile",
-    usage=("!tile <set|line|fill|copy|del|info|list|clear> ..."),
+    usage=("!tile <set|line|fill|copy|del|info|list|clear|face|face_area> ..."),
     desc=(
         "Special-tile data store. Each (x, y) tile has a free-form "
         "data dict — set arbitrary nested keys with `set`, read with "
@@ -16583,6 +16685,51 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await _fan_out(ctx, tile_cmd, mgr, args, maps)
         mp = maps[0]
 
+    # ---- face <x> <y> <dir|cw|ccw|-> / face_area (#257) ----
+    if sub == "face":
+        if await return_help_if_not_enough_args(ctx, args, 4, "tile", "face"):
+            return
+        _check_tail(args, 4, (), "!tile face <x> <y> <dir|cw|ccw|->")
+        x, y = _parse_xy(args)
+        if not mp.in_bounds(x, y):
+            raise OutOfBounds(f"({x},{y}) outside {mp.size_text()}")
+        if args[3] in _FACING_CLEAR:
+            if FACING_FIELD in (mp.tiles.get((x, y)) or {}):
+                mp.tile_del_path(x, y, FACING_FIELD)
+            return await ctx.send(
+                f"tile ({x},{y}) faces {m.tile_facing(x, y, mp)} (its "
+                f"template's, else up){_on_map(m, mp)}.")
+        f = m.tile_face(x, y, args[3], mp)
+        return await ctx.send(f"tile ({x},{y}) faces {f}{_on_map(m, mp)}.")
+    if sub == "face_area":
+        if await return_help_if_not_enough_args(ctx, args, 6, "tile",
+                                                "face_area"):
+            return
+        _check_tail(args, 6, (), "!tile face_area <x1> <y1> <x2> <y2> "
+                                 "<dir|cw|ccw|->")
+        try:
+            x1, y1, x2, y2 = (int(a) for a in args[1:5])
+        except ValueError:
+            raise VTTError("x1 y1 x2 y2 must be whole numbers.")
+        cells = sorted(_grid_box(mp, x1, y1, x2, y2),
+                       key=lambda c: (c[1], c[0]))
+        word = args[5]
+        if word not in _FACING_CLEAR:
+            m.checked_facing(word)          # refuse a bad word up front
+        n = 0
+        for cx, cy in cells:
+            if word in _FACING_CLEAR:
+                if FACING_FIELD in (mp.tiles.get((cx, cy)) or {}):
+                    mp.tile_del_path(cx, cy, FACING_FIELD)
+                    n += 1
+            else:
+                m.tile_face(cx, cy, word, mp)
+                n += 1
+        what = ("cleared the facing of" if word in _FACING_CLEAR
+                else f"turned ({word})")
+        return await ctx.send(f"{what.capitalize()} {n} tile(s)"
+                              f"{_on_map(m, mp)}.")
+
     # ---- tags <x> <y> <tag ...|-> ----  (the tile's own tags)
     if sub == "tags":
         if await return_help_if_not_enough_args(ctx, args, 4, "tile", "tags"):
@@ -16609,7 +16756,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         x, y = _parse_xy(args)
         path = args[3]
-        value = _parse_scalar(args[4])
+        value = m.tile_data_value(path, _parse_scalar(args[4]))
         mp.tile_set_path(x, y, path, value)
         ack = f"tile ({x},{y}).{path} = {value!r}" + _cell_formula_warning(m, path, value)
         if path in m.maps:
@@ -16853,6 +17000,48 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             _template_data_set(name, m.tile_templates[name].data, path, value)
             return await ctx.send(f"template `{name}`.{path} = {value!r}"
                                   + _cell_formula_warning(m, path, value))
+
+        if dsub == "face":
+            # !tile def face <name> <dir|->  (#257): the template's facing
+            # data, read live by tiles without their own.
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
+                return
+            _check_tail(args, 4, (), "!tile def face <name> <dir|->")
+            name = args[2]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            data = m.tile_templates[name].data
+            if args[3] in _FACING_CLEAR:
+                data.pop(FACING_FIELD, None)
+                return await ctx.send(f"Cleared template `{name}`'s facing "
+                                      f"(its tiles without their own face "
+                                      f"up).")
+            data[FACING_FIELD] = m.checked_facing(args[3])
+            return await ctx.send(
+                f"template `{name}` faces {data[FACING_FIELD]} (new placements "
+                f"copy it; placed tiles without their own facing read it; "
+                f"`!tile def reapply {name}` pushes it to the rest).")
+
+        if dsub == "reapply":
+            # !tile def reapply <name> [reset] [map=<map>|all]  (#258)
+            rest, mapspec = _pop_map_opt(args)
+            if await return_help_if_not_enough_args(ctx, rest, 3, "tile", "def"):
+                return
+            _check_tail(rest, 4, ("reset",),
+                        "!tile def reapply <name> [reset] [map=<map>]")
+            name = rest[2]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            maps = (list(m.maps.values()) if mapspec is None
+                    else _resolve_maps(ctx, m, mapspec, many=True))
+            reset = len(rest) > 3
+            n = m.reapply_tile_template(name, maps, reset=reset)
+            placed = sum(1 for mp_ in maps for d in mp_.tiles.values()
+                         if isinstance(d, dict) and d.get("_template") == name)
+            return await ctx.send(
+                f"Reapplied template `{name}`'s data"
+                + (" (reset)" if reset else "") + f": {n} of {placed} placed "
+                f"tile(s) changed.")
 
         if dsub == "del-data":
             # !tile def del-data <name> <path>
@@ -17323,7 +17512,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except ValueError:
             return await ctx.send("❌ coordinates must be integers.")
         path = args[5]
-        value = _parse_scalar(args[6])
+        value = m.tile_data_value(path, _parse_scalar(args[6]))
         if sub == "line":
             m._check_line_budget(x1, y1, x2, y2, "line")
             cells = m._line_cells(x1, y1, x2, y2, clip=False)
@@ -17440,7 +17629,9 @@ registry.annotate_sub(
         "!tile def info <name> | "
         "!tile def copy <name> <new_name> | "
         "!tile def rename <name> <new_name> | "
-        "!tile def tags <name> <tag ...>"
+        "!tile def tags <name> <tag ...> | "
+        "!tile def face <name> <dir|-> | "
+        "!tile def reapply <name> [reset] [map=<map>]"
     ),
     desc=(
         "Manage reusable tile templates. A template defines a kind of "
@@ -17452,11 +17643,36 @@ registry.annotate_sub(
         "hook edits propagate to all placed instances); so are its "
         "`tags` (`tags <name> <tag ...>`, `-` clears), which a placed "
         "tile carries with its own `tags` data (tile_has_tag, "
-        "tiles_with_tag). `rename` takes the placed tiles along. Deleting a "
+        "tiles_with_tag). `face` sets the template's facing, read by placed "
+        "tiles without their own (#257). `reapply` pushes the template's "
+        "data to its placed tiles on every map (or map=): its keys "
+        "overwrite theirs, their other keys stay; `reset` makes each tile's "
+        "data a copy of the template's again (corpses stay). `rename` "
+        "takes the placed tiles along. Deleting a "
         "template that still has placed instances requires the "
         "trailing `confirm` token — orphaned instances keep their data "
         "and lose the template's hooks and tags."
     ),
+)
+registry.annotate_sub(
+    "tile", "face",
+    usage="!tile face <x> <y> <dir|cw|ccw|-> [map=<map>]",
+    desc=(
+        "Turn the tile at (x, y) to a direction, or one step with cw / ccw "
+        "(diagonals need allow_diagonal_facing): its `facing` data. `-` "
+        "drops it, so the tile faces as its template does, else up. Most "
+        "tiles never need one; it is for directional terrain (a conveyor, "
+        "an arrow trap, a one-way door): tile_facing reads it, "
+        "`glyphs.<facing>` / `sprites.<facing>` data draws it, block "
+        "conditions compare it with move_dir, a rotated prefab stamp turns "
+        "it."),
+)
+registry.annotate_sub(
+    "tile", "face_area",
+    usage="!tile face_area <x1> <y1> <x2> <y2> <dir|cw|ccw|-> [map=<map>]",
+    desc=(
+        "`!tile face` on every cell of a rectangle (a conveyor belt); cw / "
+        "ccw turn each tile from its own facing, `-` drops their facings."),
 )
 registry.annotate_sub(
     "tile", "place",
@@ -17551,7 +17767,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|tags|setdef|def|info|list|cells|hook> ..."),
+    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|tags|face|setdef|def|info|list|cells|hook> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -17840,20 +18056,31 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "glyph":
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "glyph"):
             return
+        _check_tail(args, 4, (), "!zone glyph <name> <char|-> [<facing>]")
         name = args[1]
         z = m.find_zone(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
-        g = args[2]
-        if g in ("-", "none", "clear"):
-            z.pop("glyph", None)
-            return await ctx.send(f"Cleared map glyph for zone `{name}`.")
-        if len(g) != 1:
+        what = _facing_look_set(z, "glyph", args[2],
+                                args[3] if len(args) > 3 else None)
+        return await ctx.send(f"Zone `{name}`: {what}.")
+
+    # ---- face <name> <dir|cw|ccw|-> ----  (#257)
+    if sub == "face":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "face"):
+            return
+        _check_tail(args, 3, (), "!zone face <name> <dir|cw|ccw|->")
+        name = args[1]
+        z = m.find_zone(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        if args[2] in _FACING_CLEAR:
+            z.pop(FACING_FIELD, None)
             return await ctx.send(
-                "❌ glyph must be exactly one character (or `-` to clear)."
-            )
-        z["glyph"] = g
-        return await ctx.send(f"Zone `{name}` map glyph set to `{g}`.")
+                f"Zone `{name}` faces {m.zone_facing(name)} again (its "
+                f"definition's, else up).")
+        return await ctx.send(f"Zone `{name}` faces "
+                              f"{m.zone_face(name, args[2])}.")
 
     if sub == "legend":
         # !zone legend <name> <text ...|false|->  — what the map legend calls
@@ -17881,16 +18108,14 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # by the graphics surface; cleared with `-`.
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "sprite"):
             return
+        _check_tail(args, 4, (), "!zone sprite <name> <key|-> [<facing>]")
         name = args[1]
         z = m.find_zone(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
-        key = args[2]
-        if key in ("-", "none", "clear"):
-            z.pop("sprite", None)
-            return await ctx.send(f"Cleared sprite for zone `{name}`.")
-        z["sprite"] = key
-        return await ctx.send(f"Zone `{name}` sprite set to `{key}`.")
+        what = _facing_look_set(z, "sprite", args[2],
+                                args[3] if len(args) > 3 else None)
+        return await ctx.send(f"Zone `{name}`: {what}.")
 
     if sub == "color":
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "color"):
@@ -17955,7 +18180,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             "hooks": sorted((z.get("hooks") or {}).keys()),
         }
         for key in ZONE_LOOK_FIELDS:
-            if isinstance(z.get(key), str) or z.get(key) is False:
+            if key in z:
                 view[key] = z[key]
         if z.get("tags"):
             view["tags"] = list(z["tags"])
@@ -18128,6 +18353,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # words `!zone def` needs (action included).
 _ZONE_DEF_SUBS = {"new": 2, "data": 4, "del-data": 3, "hook": 4,
                   "del-hook": 3, "glyph": 3, "color": 3, "sprite": 3,
+                  "face": 3, "reapply": 2,
                   "legend": 3, "tags": 2, "rename": 3, "copy": 3}
 _ZONE_DEF_DELETES = ("del", "delete", "remove", "rm", "drop")
 
@@ -18196,6 +18422,39 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
     if d is None:
         raise NotFound(f"No zone definition `{name}`. Make it with "
                        f"`{prefix.format(sub='new')} {name}`.")
+    if sub == "reapply":
+        # #258: the definition's data pushed to its zones. Not in `!system
+        # zone`'s usage: a system's definitions have no zones (`!match sync
+        # zones ... reapply`).
+        _check_tail(args, 3, ("reset",), prefix.format(sub="reapply")
+                    + " <name> [reset]")
+        reset = len(args) > 2
+        changed = m.reapply_zone_definition(name, reset=reset)
+        n_all = len(m.zones_using_def(name))
+        return (f"Reapplied zone definition `{name}`'s data"
+                + (" (reset)" if reset else "") + f": {len(changed)} of "
+                f"{n_all} zone(s) changed"
+                + (": " + ", ".join(f"`{c}`" for c in changed)
+                   if changed else "") + ".")
+    if sub == "face":
+        _check_tail(args, 3, (), prefix.format(sub="face")
+                    + " <name> <dir|->")
+        if args[2] in _FACING_CLEAR:
+            d.pop(FACING_FIELD, None)
+            return (f"Cleared zone definition `{name}`'s facing (its zones "
+                    f"without their own face up).")
+        canon = m.checked_facing(args[2])
+        d[FACING_FIELD] = canon
+        return (f"zone definition `{name}` faces {canon} (zones of it "
+                f"without their own facing face {canon}).")
+    if sub in ("glyph", "sprite"):
+        _check_tail(args, 4, (), prefix.format(sub=sub)
+                    + f" <name> <{'char' if sub == 'glyph' else 'key'}|-> "
+                      f"[<facing>]")
+        what = _facing_look_set(d, sub, args[2],
+                                args[3] if len(args) > 3 else None)
+        return (f"zone definition `{name}`: {what} (zones of it without "
+                f"their own show it).")
     if sub == "data":
         path, value = args[2], _parse_scalar(args[3])
         _check_tail(args, 4, (), prefix.format(sub="data")
@@ -19440,8 +19699,11 @@ _ZONE_DEF_USAGE = (
     "!zone def new <name> | !zone def data <name> <path> <value> | "
     "!zone def del-data <name> <path> | "
     "!zone def hook <name> <when> <formula ...> | "
-    "!zone def del-hook <name> <when> | !zone def glyph <name> <char|-> | "
-    "!zone def color <name> <color|-> | !zone def sprite <name> <key|-> | "
+    "!zone def del-hook <name> <when> | "
+    "!zone def glyph <name> <char|-> [<facing>] | "
+    "!zone def color <name> <color|-> | "
+    "!zone def sprite <name> <key|-> [<facing>] | "
+    "!zone def face <name> <dir|-> | !zone def reapply <name> [reset] | "
     "!zone def legend <name> <text ...> | "
     "!zone def tags <name> <tag ...> | "
     "!zone def rename <name> <new_name> | !zone def copy <name> <new_name> | "
@@ -19462,7 +19724,11 @@ registry.annotate_sub(
         "data edit reaches only zones made afterwards), and its `block` / "
         "`opaque` data is read when the zone's data lacks them. Checks that "
         "care about the kind of zone read the tags or zone_def_of(zone); "
-        "only \"which zone\" needs its name. Deleting a definition zones use "
+        "only \"which zone\" needs its name. `face` gives its zones a facing "
+        "(and `glyph` / `sprite` take a facing for a per-facing look); "
+        "`reapply` pushes its data to its zones (its keys overwrite theirs, "
+        "their other keys stay; `reset` makes their data a copy of it). "
+        "Deleting a definition zones use "
         "needs `confirm` and leaves them orphaned (they keep their own data "
         "and settings). `rename` takes its zones along. A system holds "
         "definitions too (`!system zone`), copied into new matches; `!match "
@@ -19540,12 +19806,24 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "zone", "glyph",
-    usage="!zone glyph <name> <char|->",
+    usage="!zone glyph <name> <char|-> [<facing>]",
     desc=(
         "Set the zone's single-character map glyph (shown in !map on "
         "every zone cell that has no tile glyph or entity on top), or "
         "pass `-` / `none` to clear it. Zone glyphs are the lowest "
-        "render layer."
+        "render layer. With a facing, the glyph shown while the zone "
+        "faces that way (`glyphs.<facing>`, before the plain glyph)."
+    ),
+)
+registry.annotate_sub(
+    "zone", "face",
+    usage="!zone face <name> <dir|cw|ccw|->",
+    desc=(
+        "Turn a zone to a direction, or one step with cw / ccw (diagonals "
+        "need allow_diagonal_facing); `-` drops its own facing, so it "
+        "faces as its definition does, else up. Read with zone_facing; "
+        "picks the zone's per-facing glyph / sprite; turned by a rotated "
+        "prefab stamp."
     ),
 )
 registry.annotate_sub(
@@ -22197,7 +22475,7 @@ for _root, _sub, _usage in (
         ("tile", "fill", "!tile fill <x1> <y1> <x2> <y2> <path> <value> [map=<map>]"),
         ("zone", "anchor", "!zone anchor <name> <eid> [radius] [metric]"),
         ("zone", "unanchor", "!zone unanchor <name>"),
-        ("zone", "sprite", "!zone sprite <name> <key|clear>"),
+        ("zone", "sprite", "!zone sprite <name> <key|-> [<facing>]"),
         ("zone", "legend", "!zone legend <name> <text ...>")):
     registry.annotate_sub(_root, _sub, usage=_usage,
                           desc=_SUB_DESCS.get((_root, _sub)))
