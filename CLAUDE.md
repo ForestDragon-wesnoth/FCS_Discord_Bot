@@ -1786,7 +1786,8 @@ hardcodes**.
   anchor)`, `entities_at`, `cell_entity`, `grid_width/height`, `in_bounds`.
   Membership in an area = ANY covered cell. Builders are clipped to the map
   and charged to `formula_cell_limit`. `!dist` and `!map preview
-  <burst|cone|line|rect>` show the same geometry.
+  <burst|cone|line|rect>` show the same geometry. Block conditions also
+  see the step (`move_dir`, §7.12 "Facing").
 
 ### 7.9 Multi-tile bodies
 
@@ -1959,6 +1960,39 @@ hardcodes**.
   `data` overrides fields; mutating) and read it back with
   `tile_template_of(x, y)` (892). `!tile def rename` takes the placed tiles
   along (`Match.rename_tile_template`).
+- **Facing** (#257, 928-931): a tile's facing is its `facing` data (else
+  its template's, read live; data is copied at placement), a zone's its
+  `facing` field (else its definition's, a ZONE_LOOK_FIELDS entry), else
+  `up`; most never set one. `Match.checked_facing` (shared with units:
+  cw / ccw, diagonals need allow_diagonal_facing) behind `!tile face` /
+  `face_area`, `!tile def face`, `!system tile face`, `!zone face`, `!zone
+  def face`, placement `facing=`, `!tile set ... facing` and tile_set
+  (`tile_data_value`); `checked_facing_data` makes any stored tile
+  `facing` a canonical direction. Reads `tile_facing(x, y, map=)`,
+  `zone_facing(zone)`; writers `tile_face` / `zone_face` (mutating). Hooks
+  call `tile_facing(tile_x, tile_y)` / `zone_facing(zone_name)` (a binding
+  of the same name would hide the function). Looks: `glyphs.<facing>` /
+  `sprites.<facing>` (tile data, template data, zone and definition
+  fields; `!zone glyph|sprite <name> <v> [<facing>]`) before the plain
+  glyph / sprite, own before template / definition (`_facing_glyph`,
+  `_facing_sprite`); a missing facing sprite is mirrored per the
+  `sprite_mirror` data (tile, template; zone data, definition data) else
+  the rule (`_mirror_axes`); no facing-arrow fallback. Block conditions
+  (tile / zone / corpse) bind `move_dir` and `from_x` / `from_y` for a step
+  (`cell_blocks(step=)`, passed by walks, pushes, pulls, group moves; None
+  for a teleport, swap or placement), so a one-way door is `move_dir !=
+  tile_facing(tile_x, tile_y)`; `!map cell ... for= dir=` and
+  `cell_blocked(..., dir=)` judge a step. A rotated / flipped prefab stamp
+  turns each stamped tile's and zone's facing, own or inherited, written
+  as its own (`prefab._turn_facing`).
+- **Reapply** (#258, 932): `!tile def reapply <t> [reset] [map=]`
+  (`Match.reapply_tile_template`, every map by default) and `!zone def
+  reapply <d> [reset]` (`reapply_zone_definition`): the template's /
+  definition's data keys overwrite the tile's / zone's same keys, the
+  others stay; `reset` makes the data a copy (a tile keeps its corpses
+  only). Hooks, look fields and tags are live already. `!match sync
+  tiles|zones|all [name] reapply` syncs then reapplies; `!system zone` has
+  no reapply (a system's definitions have no zones).
 - **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
   + time), dedicated glyph / color / sprite / legend fields, `zone_shift`,
   `zone_*` prims, `zone_distance`; `create_zone` / `delete_zone` in

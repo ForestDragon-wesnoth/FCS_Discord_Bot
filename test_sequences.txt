@@ -30514,3 +30514,311 @@ tags) where a command takes a tag, and `!system tags remove` the system's
 own. Under warn, `!template tags` and `!prefab tags` warn about the
 channel's system's vocabulary too, and a body part's tags warn like any
 unit's. The vocabulary and the mode are saved with the system.
+
+SCENARIO 928 — Tile facing: !tile face, templates, per-facing glyphs and sprites, formulas
+--------------------------------------------------------------------------------------
+
+!match new tf Tf 6 4
+!match use tf
+!tile def new arrow
+!tile def data arrow glyphs.up ^
+!tile def data arrow glyphs.right >
+!tile def data arrow glyphs.down v
+!tile def data arrow glyphs.left <
+!tile def data arrow sprites.right arrow_r
+!tile place arrow 2 2
+!assert "tile_facing(2, 2) == 'up'"
+!map
+?? ^
+!tile face 2 2 right
+?? tile (2,2) faces right.
+!map
+?? >
+!tile face 2 2 cw
+?? faces down
+!tile face 2 2 ccw
+?? faces right
+!tile def face arrow left
+?? template `arrow` faces left
+!tile place arrow 3 2
+!assert "tile_facing(3, 2) == 'left' and tile_facing(2, 2) == 'right'"
+!map scene list
+?? tile `2,2` at (2,2) — sprite arrow_r, glyph >
+?? tile `3,2` at (3,2) — sprite arrow_r (mirrored h), glyph <
+!tile face 2 2 -
+?? faces left (its template's, else up)
+!tile face 2 2 up_left
+?? ❌ Diagonal facing
+!tile set 4 4 facing sideways
+?? ❌ Unknown direction 'sideways'
+!tile set 4 4 facing r
+!assert "tile_get(4, 4, 'facing') == 'right' and tile_facing(4, 4) == 'right' and tile_facing(5, 1) == 'up'"
+!tile place arrow 1 1 facing=down
+!assert "tile_facing(1, 1) == 'down'"
+!tile face_area 1 3 6 3 right
+?? Turned (right) 6 tile(s).
+!assert "tile_facing(6, 3) == 'right' and tile_facing(1, 3) == 'right'"
+!tile face_area 1 3 3 3 -
+?? Cleared the facing of 3 tile(s).
+!eval "tile_face(6, 3, 'cw')"
+?? = `'down'`
+!eval "tile_face(6, 3, 'diagonal')"
+?? ❌
+!assert "tile_facing(6, 3) == 'down'"
+!tile info $(1+1) 2
+!eval "tile_face(9, 9, 'up')"
+?? off the map
+!tile def face arrow -
+!assert "tile_facing(2, 2) == 'up' and tile_facing(3, 2) == 'left'"
+
+Expected: HARNESS-ALLOWS-ERRORS. A tile's facing is its `facing` data, else
+its template's (read live), else up. `!tile face` sets a direction or turns
+one step (cw / ccw), `-` drops it; a diagonal needs allow_diagonal_facing,
+and a stored `facing` must name a direction (`r` is stored as `right`).
+`glyphs.<facing>` / `sprites.<facing>` pick the look: the arrow shows ^ then
+> on the text map; the tile facing left has no left sprite, so it borrows
+the right one mirrored (sprite_mirror horizontal). Placement takes
+`facing=`; face_area turns a rectangle (`-` clears it). tile_face /
+tile_facing are the formula forms; tile_face refuses a bad word and an
+off-map cell. A template's data (its facing too) is copied at
+placement, so clearing the template's facing reaches only the tile that
+reads it live, (2,2), which has no facing of its own.
+
+SCENARIO 929 — Directional terrain in play: a conveyor, a one-way door, a 2x2 body
+---------------------------------------------------------------------------------
+
+!match new cv Cv 8 5
+!match use cv
+!ent add hero Hero 20 1 1 5
+!tile def new belt
+!tile def hook belt on_stop "push_entity(self, tile_facing(tile_x, tile_y), 1)"
+!tile place belt 2 1 facing=right
+!ent move hero 1 right
+!assert "entity[hero].x == 3 and entity[hero].y == 1"
+!tile def new door
+!tile def data door block "move_dir != tile_facing(tile_x, tile_y)"
+!tile def data door glyph D
+!tile place door 5 1 facing=right
+!ent move hero 1 right
+!ent move hero 1 right
+!assert "entity[hero].x == 5"
+!ent move hero 1 right
+!ent move hero 1 left
+?? ❌
+!assert "entity[hero].x == 6"
+!map cell 5 1 for=hero dir=left
+?? blocks movement: yes
+!map cell 5 1 for=hero dir=right
+?? blocks movement: no
+!assert "cell_blocked('hero', 5, 1, dir='right') == False and cell_blocked('hero', 5, 1, dir='left') == True and cell_blocked('hero', 5, 1) == True"
+!ent tp hero 5 1
+?? ❌
+!ent add ogre Ogre 40 1 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!tile place door 2 2 facing=up
+!ent move ogre 1 up
+!assert "entity[ogre].x == 1 and entity[ogre].y == 2"
+!ent push ogre right 1
+!assert "entity[ogre].x == 1 and entity[ogre].y == 2"
+!ent move ogre 1 down
+!tile face 2 2 down
+!ent move ogre 1 up
+?? ❌ Cell (2,2) blocks `ogre`
+!assert "entity[ogre].y == 3"
+
+Expected: HARNESS-ALLOWS-ERRORS. A conveyor belt tile's on_stop hook pushes
+whoever stops on it along its facing, so the hero stepping onto (2,1)
+facing right ends on (3,1). A one-way door's block data compares the
+step's move_dir with its facing: the hero walks through (5,1) moving right
+and can't come back moving left; `!map cell ... for= dir=` and
+cell_blocked(..., dir=) judge a step either way, and with no step (a
+teleport, cell_blocked without dir) move_dir is None, so the door blocks.
+A 2x2 ogre is judged per covered cell: its upper-right cell steps onto
+the up-facing door at (2,2) moving up, which the door lets through; a push
+right moves its upper-left cell sideways onto the door, which blocks (the
+push stops before it, 0 cells); with the door turned down, stepping up
+onto it is refused.
+
+SCENARIO 930 — Zone facing: !zone face, definitions, per-facing looks, one-way zones, persistence
+-----------------------------------------------------------------------------------------------
+
+!match new zf Zf 6 4
+!match use zf
+!zone def new wind
+!zone def face wind left
+?? zone definition `wind` faces left
+!zone def glyph wind < left
+?? glyph `<` when facing left
+!zone def glyph wind > right
+!zone new gust def=wind
+!zone add gust 2 2
+!assert "zone_facing('gust') == 'left'"
+!map
+?? <
+!zone face gust right
+?? Zone `gust` faces right.
+!map
+?? >
+!zone info gust
+?? "facing": "right"
+!zone face gust -
+?? faces left again
+!zone def face wind up_right
+?? ❌ Diagonal facing
+!eval "zone_face('gust', 'ccw')"
+?? = `'down'`
+!eval "zone_facing('nope')"
+?? ❌
+!zone sprite gust breeze_up up
+?? sprite `breeze_up` when facing up
+!zone face gust down
+!map scene list
+?! breeze_up
+!zone set gust sprite_mirror vertical
+!map scene list
+?? zone `gust` at (2,2) — sprite breeze_up (mirrored v)
+!zone set gust sprite_mirror none
+!map scene list
+?! breeze_up
+!ent add hero Hero 20 1 2 5
+!zone set gust block "move_dir != zone_facing(zone_name)"
+!zone face gust right
+!ent move hero 1 right
+!ent move hero 1 right
+!assert "entity[hero].x == 3"
+!ent move hero 1 left
+?? ❌
+!ent set_var hero wind "$(zone_facing('gust'))"
+!assert "entity[hero].wind == 'right'"
+!ent set_var hero x2 "$(tile_face(1,1,'up'))"
+?? ❌
+!assert "not tile_has(1, 1, 'facing')"
+!as restart
+!match use zf
+!assert "zone_facing('gust') == 'right' and zone_def_of('gust') == 'wind'"
+!zone info gust
+?? "glyphs"
+
+Expected: HARNESS-ALLOWS-ERRORS. A zone's facing is its own `facing`, else
+its definition's (live), else up; `!zone face` / `!zone def face` set it,
+`-` drops a zone's own. `!zone glyph` / `!zone sprite` (and the definition
+forms) take a facing for a per-facing look, before the plain one; a
+missing facing borrows another mirrored per the `sprite_mirror` data (zone,
+definition) or rule: facing down, the up sprite shows only once the zone's
+sprite_mirror is vertical (the rule's default mirrors left and right), and
+`sprite_mirror none` leaves it out again. zone_face /
+zone_facing are the formula forms; zone_face is a mutator, so `$()`
+refuses tile_face. A zone's block data can compare move_dir with its
+facing: a one-way gust. Facings and per-facing looks are saved.
+
+SCENARIO 931 — Facing turns with a rotated or flipped prefab stamp
+-----------------------------------------------------------------
+
+!match new pr Pr 8 8
+!match use pr
+!tile def new arrow
+!tile place arrow 1 1
+!tile def face arrow right
+!assert "not tile_has(1, 1, 'facing') and tile_facing(1, 1) == 'right'"
+!tile place arrow 2 1 facing=down
+!tile set 3 1 terrain rock
+!zone new vent
+!zone add vent 1 2
+!zone face vent left
+!prefab save corner 1 1 3 2
+!prefab stamp corner 5 5 rotate=90
+?? turned 90°
+!assert "tile_facing(6, 5) == 'down' and tile_get(6, 5, 'facing') == 'down'"
+!assert "tile_facing(6, 6) == 'left'"
+!assert "tile_has(6, 7, 'terrain') and not tile_has(6, 7, 'facing')"
+!assert "zone_facing('vent2') == 'up'"
+!prefab stamp corner 1 6 flip=h
+!assert "tile_facing(3, 6) == 'left' and tile_facing(2, 6) == 'down'"
+
+Expected: HARNESS-ALLOWS-ERRORS. A rotated or flipped stamp turns each
+stamped tile's and zone's facing: its own, or the one it reads from its
+template / definition, written as its own (the arrow at (1,1), which
+reads right from its template live, faces down after a 90° turn and holds
+that as its own data; the one facing down faces
+left; the vent facing left faces up). A tile with no facing anywhere (the
+rock) gets none. A horizontal flip mirrors right to left and leaves down.
+
+SCENARIO 932 — Reapply: tile templates and zone definitions push their data
+-------------------------------------------------------------------------
+
+!match new ra Ra 6 4
+!match use ra
+!map new cellar 4 4
+!tile def new trap
+!tile def data trap damage 3
+!tile def data trap armed true
+!tile place trap 1 1 map=main
+!tile place trap 2 1 map=main
+!tile place trap 1 1 map=cellar
+!tile set 1 1 damage 9 map=main
+!tile set 1 1 note rusty map=main
+!ent add mook Mook 5 3 3 5 map=main
+!ent kill mook
+!tile place trap 3 3 map=main
+!tile def data trap damage 5
+!tile place trap 4 1 map=main
+!tile def reapply trap
+?? 4 of 5 placed tile(s) changed.
+!assert "tile_get(1, 1, 'damage', map='main') == 5 and tile_get(1, 1, 'note', map='main') == 'rusty' and tile_get(1, 1, 'damage', map='cellar') == 5"
+!tile info 3 3 map=main
+?? mook
+!tile def reapply trap reset map=main
+?? 1 of 4 placed tile(s) changed.
+!assert "not tile_has(1, 1, 'note', map='main') and tile_get(1, 1, 'armed', map='main') == True"
+!tile info 3 3 map=main
+?? mook
+!undo command
+!assert "tile_get(1, 1, 'note', map='main') == 'rusty'"
+!tile def reapply nothing
+?? ❌
+!zone def new mire
+!zone def data mire slow 2
+!zone new bog def=mire map=main
+!zone add bog 4 1
+!zone set bog slow 7
+!zone set bog smell bad
+!zone def data mire slow 3
+!zone def data mire wet true
+!zone def reapply mire
+?? 1 of 1 zone(s) changed: `bog`.
+!assert "zone_get('bog', 'slow') == 3 and zone_get('bog', 'smell') == 'bad' and zone_get('bog', 'wet') == True"
+!zone def reapply mire reset
+!assert "not zone_has('bog', 'smell') and zone_get('bog', 'slow') == 3"
+!system new realm
+!system tile new realm spikes
+!system tile data realm spikes hurt 1
+!system zone new realm smog
+!system zone data realm smog choke 1
+!match new rb Rb 4 4 realm
+!match use rb
+!tile place spikes 1 1
+!zone new cloud def=smog
+!zone add cloud 2 2
+!system tile data realm spikes hurt 4
+!system zone data realm smog choke 2
+!system zone reapply realm smog
+?? ❌
+!match sync tiles reapply
+?? reapplied: 1 tile(s) changed
+!match sync zones smog reapply
+?? reapplied: 1 zone(s) changed
+!assert "tile_get(1, 1, 'hurt') == 4 and zone_get('cloud', 'choke') == 2"
+!match sync funcs reapply
+?? ❌ `reapply` goes with `tiles`, `zones` or `all`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!tile def reapply` pushes a template's
+data to every tile placed from it, on every map by default: its keys
+overwrite theirs (damage 9 back to 5), their other keys stay (the note),
+corpses stay; the reply counts the tiles that changed (the trap placed
+after the edit already matches). `reset` makes each
+tile's data a copy of the template's again (the note goes, corpses stay),
+here on map= main only. One undo step. `!zone def reapply` does the same
+for zones of a definition, and `reset` there too. A system's definitions
+have no zones, so `!system zone` has no reapply; `!match sync tiles|
+zones [name] reapply` copies the system's entries and reapplies them.
