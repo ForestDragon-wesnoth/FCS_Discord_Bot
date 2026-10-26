@@ -31096,6 +31096,18 @@ SCENARIO 939 — Players name units through the view on every opened root
 !as player bob
 !part info zqxhead
 ?? Body part of: `ogre`
+!as host
+!ent tp ogre 8 8
+!ent dump ogre
+?? **Ogre** (`ogre`)
+?! host_reveal_warning
+!system set default host_reveal_warning true
+!ent dump ogre
+?? named `ogre`, hidden from it
+!ent info ogre
+?! host_reveal_warning
+!ent dump scout
+?! host_reveal_warning
 
 Expected: HARNESS-ALLOWS-ERRORS. Only `!ent` used to read units through
 the channel's view for a non-host; opened to players, `!part info` showed
@@ -31104,7 +31116,11 @@ and the others acted on hidden units by id (V9). Every typed unit id of a
 non-host's command under a team view now reads through the view
 (`_resolve_eid`): a hidden unit and a missing one get the same two-sided
 reply. A glued part shows while the body it sits on shows (L22): once the
-ogre walks into the scout's sight, its head can be read.
+ogre walks into the scout's sight, its head can be read. A host's command
+in the same channel still reaches a hidden unit (user call: a host may
+reveal something on purpose); with host_reveal_warning on (default off)
+it ends with a ⚠️ naming the hidden units it named. `!ent info` keeps the
+view for hosts too, so it reveals nothing and warns of nothing.
 
 
 SCENARIO 940 — A disguise presents its own statuses and the tags they grant
@@ -31350,3 +31366,31 @@ take var roots, active_unit_outline_color a palette name or #rrggbb
 `--trace` works after `--as <eid>` (L18). `!undo command` right after
 `!turn next` says it takes the turn back too (L20). Zone names take id
 characters (L18).
+
+
+SCENARIO 946 — A zone read naming a missing zone answers empty and says so
+---------------------------------------------------------------------------
+
+!match new zw946 Zones 6 6
+!match use zw946
+!ent add hero Hero 10 1 1
+!zone new zz
+!zone add zz 1 1
+!eval "[zone_size('burnign'), zone_size('burnign'), cell_in_zone(1, 1, 'burnign'), entities_in_zone('zz'), in_zone('hero', 'zz'), zone_has('nope', 'a')]"
+?? = `[0, 0, False, ['hero'], True, False]`
+?? ⚠️ zone_size: no zone named `burnign` (answered as an empty zone).
+?? ⚠️ cell_in_zone: no zone named `burnign`
+?? ⚠️ zone_has: no zone named `nope`
+!eval "zone_exists('burnign')"
+?! ⚠️
+!watch add w1 "len(entities_in_zone('burnign')) > 0" "match_var_set('fired', 1)"
+!ent hp hero -1
+?? ⚠️ entities_in_zone: no zone named `burnign`
+
+Expected: entities_in_zone, cell_in_zone, in_zone, zone_has and
+zone_size answer empty, False or 0 for a zone that doesn't exist, as
+before, and now say so in chat (user call, L22): a misspelled name in a
+watcher or a passive gave no sign at all. One line per function and name
+per command (a condition read per cell of a render runs one formula per
+cell). zone_exists stays the silent test. A watcher polled after a
+command shows the line with that command's reply.

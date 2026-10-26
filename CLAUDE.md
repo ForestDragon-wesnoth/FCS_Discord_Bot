@@ -2023,7 +2023,9 @@ hardcodes**.
   take id characters, `check_zone_name`): data, hooks (boundary + per-cell
   + time), dedicated glyph / color / sprite / legend fields, `zone_shift`,
   `zone_*` prims, `zone_distance`; `create_zone` / `delete_zone` in
-  formulas.
+  formulas. entities_in_zone / cell_in_zone / in_zone / zone_has /
+  zone_size answer empty for a missing zone with a ⚠️ once per command
+  (`_known_zone`, user call); zone_exists is the silent test (946).
 - **Zone definitions** (`docs/zones_prefabs_design.md` §1-§4; `!zone def`,
   `Match.zone_definitions`, `normalize_zone_def`, a system library): a kind
   of zone described once, the tile-template pattern (user call, for
@@ -2142,10 +2144,13 @@ hardcodes**.
   Every unit id a NON-HOST's typed command names (any root an override
   opened: `!part info`, `!status`, `!turn set`, `!mount`, `!template
   give`, ...) reads through the view in `_resolve_eid`
-  (`_TYPED_UNIT_VIEW`, set by `_run` / `dispatch_no_snapshot`, None for a
-  host and inside an action body; `view=False` for a caller that also
-  takes other words). A glued part shows while the body it sits on shows
-  (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
+  (`_TYPED_UNIT_VIEW`, set by `_run` / `dispatch_no_snapshot`, None
+  inside an action body; `view=False` for a caller that also takes other
+  words). A HOST's command still reaches a hidden unit (user call: a host
+  may reveal on purpose; `!ent dump` / `diff` show everything); with the
+  `host_reveal_warning` rule on (default off) it ends with a ⚠️ naming the
+  hidden units it named (`_HOST_REVEALS`). A glued part shows while the
+  body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`). `team_data_visibility` (own / all / host)
   filters `!team list/get`. `inline_args_access` closes the `$()` route

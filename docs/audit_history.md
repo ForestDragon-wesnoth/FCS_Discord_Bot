@@ -2455,6 +2455,7 @@ over 40 forms of every root opened to players (0 differences).
     `!turn set`'s "set by a host" to players (L17, V9).
   - Not reproduced as written: L17's "no units" stamp reply came from the
     loops S7 now refuses; W7's `user_name` crash was fixed in pass 47.
-    Left as questions: J14, Z1, the host's `!ent dump` / `diff` in a
-    team-view channel (V9), the missing-zone reads (L22), `!func` bodies
-    for players (L16).
+    Left as questions: J14, Z1, `!func` bodies for players (L16).
+    Answered after the pass: a host's commands keep reaching hidden units
+    in a team-view channel, with an optional ⚠️ (`host_reveal_warning`,
+    default off); missing-zone reads answer empty with a ⚠️ (946).

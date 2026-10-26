@@ -1114,6 +1114,8 @@ class CommandRegistry:
         result = None
         vtoken = _TYPED_UNIT_VIEW.set(
             _typed_unit_view(ctx, mgr, pre_active_mid))
+        reveals_token = (_HOST_REVEALS.set([])
+                         if _HOST_REVEALS.get() is None else None)
         try:
             result = await h(ctx, args, mgr)
         except VTTError as e:
@@ -1123,10 +1125,26 @@ class CommandRegistry:
             await ctx.send(f"💥 Unexpected error{ref}: {e}")
         finally:
             _TYPED_UNIT_VIEW.reset(vtoken)
+            if reveals_token is not None:
+                revealed = _HOST_REVEALS.get() or []
+                _HOST_REVEALS.reset(reveals_token)
+            else:
+                revealed = []
             _JOURNALED_IN.reset(jtoken)
             _JOURNAL_AS_STATE.reset(jstate_token)
             sent = MATCHES_SENT_UNITS.get() or set()
             MATCHES_SENT_UNITS.reset(sent_token)
+        if revealed:
+            # host_reveal_warning: the host named units this channel's
+            # team view hides, and players read this channel.
+            vm = mgr.matches.get(pre_active_mid)
+            pov = _query_pov(ctx, vm) if vm is not None else None
+            await ctx.send(
+                f"⚠️ This channel shows team `{pov}`'s view, and this command "
+                f"named " + ", ".join(f"`{e}`" for e in revealed)
+                + ", hidden from it: the reply above may reveal "
+                + ("it" if len(revealed) == 1 else "them")
+                + " to the players here (host_reveal_warning).")
         # Secret `!remind` reminders that came due wait for a host: they end
         # the reply of the next command a host runs on the match in a
         # channel without a team POV (a POV-bound channel is one players
@@ -2529,23 +2547,30 @@ async def return_help_if_not_enough_args(
     return False
 
 
-# (match id, team view) while a non-host's typed command runs on that match
+# (match id, team view, host) while a typed command runs on that match
 # under a team view (`_typed_unit_view`): every unit id it names reads
-# through the view in _resolve_eid, a hidden unit exactly like a missing
-# one. None for a host, outside a view and inside an action's body (whose
-# cmd() lines name the units the engine picked).
-_TYPED_UNIT_VIEW: contextvars.ContextVar[Optional[Tuple[str, str]]] = \
+# through the view in _resolve_eid. A non-host gets a hidden unit refused
+# exactly like a missing one; a host's command still reaches it (a host
+# may reveal on purpose), and with the host_reveal_warning rule on the
+# unit is noted in _HOST_REVEALS for a ⚠️ after the reply. None outside a
+# view and inside an action's body (whose cmd() lines name the units the
+# engine picked).
+_TYPED_UNIT_VIEW: contextvars.ContextVar[Optional[Tuple[str, str, bool]]] = \
     contextvars.ContextVar("_TYPED_UNIT_VIEW", default=None)
+_HOST_REVEALS: contextvars.ContextVar[Optional[List[str]]] = \
+    contextvars.ContextVar("_HOST_REVEALS", default=None)
 
 
 def _typed_unit_view(ctx: ReplyContext, mgr: MatchManager,
-                     mid: Optional[str]) -> Optional[Tuple[str, str]]:
+                     mid: Optional[str]) -> Optional[Tuple[str, str, bool]]:
     m = mgr.matches.get(mid) if mid else None
-    if m is None or getattr(m, "_action_depth", 0) > 0 \
-            or _acts_as_host(ctx, m):
+    if m is None or getattr(m, "_action_depth", 0) > 0:
+        return None
+    host = _acts_as_host(ctx, m)
+    if host and not m.rules.get("host_reveal_warning", False):
         return None
     pov = _query_pov(ctx, m)
-    return (m.id, pov) if pov is not None else None
+    return (m.id, pov, host) if pov is not None else None
 
 
 def _resolve_eid(m, token: str, view: bool = True) -> str:
@@ -2574,6 +2599,13 @@ def _resolve_eid(m, token: str, view: bool = True) -> str:
     tv = _TYPED_UNIT_VIEW.get() if view else None
     if tv is not None and tv[0] == getattr(m, "id", None) and (
             eid not in m.entities or _pov_hides(m, tv[1], eid)):
+        if tv[2]:
+            # A host's command goes on; the reply may show the unit.
+            reveals = _HOST_REVEALS.get()
+            if eid in m.entities and reveals is not None \
+                    and eid not in reveals:
+                reveals.append(eid)
+            return eid
         raise NotFound(
             f"Could not find a unit named `{token}`. Either it does not "
             f"exist, or this channel currently does not have permission "
@@ -11576,7 +11608,7 @@ def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
     """Resolve an entity id for a read-only query, treating an entity the
     channel's POV can't see exactly like a missing one (same message, which
     echoes what was typed — never the resolved id)."""
-    eid = _resolve_eid(m, token)
+    eid = _resolve_eid(m, token, view=False)
     pov = _query_pov(ctx, m)
     if eid not in m.entities or _pov_hides(m, pov, eid):
         if pov is not None:

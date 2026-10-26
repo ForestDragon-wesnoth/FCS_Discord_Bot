@@ -7905,6 +7905,29 @@ class FormulaEngine:
                 raise FormulaError(f"{fname}: zone name must be a non-empty string.")
             return v
 
+        warned_zones: set = set()
+
+        def _known_zone(name: str, fname: str) -> bool:
+            """Whether zone `name` exists. A read that answers empty for a
+            missing zone (zone_size 0, cell_in_zone False, ...) says so
+            in chat once per formula: a misspelled name in a watcher or a
+            passive gave no sign at all (zone_exists is the silent test)."""
+            if match.has_zone(name):
+                return True
+            if (fname, name) not in warned_zones:
+                warned_zones.add((fname, name))
+                line = (f"⚠️ {fname}: no zone named `{name}` (answered as "
+                        f"an empty zone).")
+                # Once per command: a condition read per cell of a render
+                # runs one formula per cell.
+                from logic import FORMULA_LOG_SINK
+                buf = match._runtime_buffer
+                said = (buf.out if buf is not None
+                        else FORMULA_LOG_SINK.get() or [])
+                if line not in said:
+                    match.surface_log([line])
+            return False
+
         def _zone_xy(x: Any, y: Any, fname: str) -> Tuple[int, int]:
             if (not isinstance(x, int) or isinstance(x, bool)
                     or not isinstance(y, int) or isinstance(y, bool)):
@@ -7939,13 +7962,17 @@ class FormulaEngine:
         def _cell_in_zone(x: Any, y: Any, name: Any) -> bool:
             """cell_in_zone(x, y, name): True iff (x,y) is in the zone."""
             xi, yi = _zone_xy(x, y, "cell_in_zone")
-            return match.cell_in_zone(xi, yi, _zone_name(name, "cell_in_zone"))
+            zn = _zone_name(name, "cell_in_zone")
+            return _known_zone(zn, "cell_in_zone") and \
+                match.cell_in_zone(xi, yi, zn)
 
         def _in_zone(eid_t: Any, name: Any) -> bool:
             """in_zone(eid, name): True iff the entity's current cell is
             in the zone."""
             eid = _eid(eid_t)
-            return name in match.entity_zones(eid) if isinstance(name, str) else False
+            zn = _zone_name(name, "in_zone")
+            return _known_zone(zn, "in_zone") and \
+                zn in match.entity_zones(eid)
 
         def _entity_zones(eid_t: Any, tag: Any = None,
                           definition: Any = None) -> list:
@@ -7958,7 +7985,9 @@ class FormulaEngine:
         def _entities_in_zone(name: Any) -> list:
             """entities_in_zone(name): alive entity ids standing in the
             zone (insertion order; loopable)."""
-            return match.entities_in_zone(_zone_name(name, "entities_in_zone"))
+            zn = _zone_name(name, "entities_in_zone")
+            return match.entities_in_zone(zn) \
+                if _known_zone(zn, "entities_in_zone") else []
 
         def _zone_cells(name: Any) -> list:
             """zone_cells(name): the zone's cells as [x,y] pairs (sorted;
@@ -8064,9 +8093,10 @@ class FormulaEngine:
                     if tag_filter_matches(match.tile_tags(x, y, mp), f)]
 
         def _zone_size(name: Any) -> int:
-            """zone_size(name): number of cells in the zone (0 if it
-            doesn't exist)."""
-            z = match.find_zone(_zone_name(name, "zone_size"))
+            """zone_size(name): number of cells in the zone (0, with a
+            warning, if it doesn't exist)."""
+            zn = _zone_name(name, "zone_size")
+            z = match.find_zone(zn) if _known_zone(zn, "zone_size") else None
             return len(z["cells"]) if z is not None else 0
 
         def _zone_get(name: Any, path: Any) -> Any:
@@ -8081,10 +8111,13 @@ class FormulaEngine:
 
         def _zone_has(name: Any, path: Any) -> bool:
             """zone_has(name, path): True iff the dotted data path
-            resolves on the zone (False on a missing zone)."""
+            resolves on the zone (False, with a warning, on a missing
+            zone)."""
             if not isinstance(path, str) or not path:
                 raise FormulaError("zone_has(name, path): path must be a non-empty string.")
-            return match.zone_has_path(_zone_name(name, "zone_has"), path)
+            zn = _zone_name(name, "zone_has")
+            return _known_zone(zn, "zone_has") and \
+                match.zone_has_path(zn, path)
 
         def _zone_keys(name: Any, path: Any = "") -> list:
             """zone_keys(name, path=""): keys at a dotted data path (""

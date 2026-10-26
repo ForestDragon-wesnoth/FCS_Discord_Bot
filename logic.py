@@ -2422,6 +2422,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "access` instead). Omniscient channels are unaffected either way."
         ),
     },
+    "host_reveal_warning": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a host's command in a channel with a team POV (one "
+            "players read) ends with a ⚠️ when it names a unit that view "
+            "hides: `!ent dump`, `!ent diff`, `!part info`, `!status`, "
+            "`!turn set` and the other commands taking a unit id still run "
+            "for a host (to reveal something on purpose), and their reply "
+            "may show the unit to the players there. Off (default) = no "
+            "warning. A player's command refuses a hidden unit like a "
+            "missing one either way."
+        ),
+    },
     "team_data_visibility": {
         "default": "own",
         "schema": {"type": "enum", "choices": ["own", "all", "host"]},
