@@ -688,7 +688,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "unit_tag_sources": {
         "default": "equipped",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars roots walked for `grants_unit_tags` lists: "
             "a container under one of them (an equipped item) gives its "
@@ -966,7 +966,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # may be formulas (eval'd with self=owner + the call's context names).
     "modifier_sources": {
         "default": "equipped",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars roots walked for `modifiers` bundles when "
             "computing effective stats — so an item under one of these "
@@ -980,7 +980,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "temp_hp_sources": {
         "default": "shields",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars roots scanned for temporary-HP / shield "
             "POOLS by absorb_damage / shield_total. Each root is a dict of "
@@ -1325,7 +1325,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "status_resist_sources": {
         "default": "equipped",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars subtree roots scanned for status "
             "resistance/immunity records (like modifier_sources). A nested "
@@ -3868,7 +3868,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "active_unit_outline_color": {
         "default": "white",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "color": True},
         "desc": (
             "Graphics: the active unit's outline colour for a unit without "
             "a team colour (a colour name or #rrggbb)."
@@ -4153,6 +4153,25 @@ def _coerce_rule_value(key: str, raw_value: str):
             return check_var_name_rule(key, raw_value)
         if key in MAP_VAR_NAME_RULES:
             return check_map_var_name_rule(key, raw_value)
+        if spec.get("var_roots"):
+            # Comma-separated var roots (`equipped,worn`): a root read as a
+            # var path, so a typo is said now rather than walking nothing.
+            got = [w.strip() for w in raw_value.split(",")]
+            if raw_value.strip() and any(
+                    not w or w.startswith("__") or any(c.isspace() for c in w)
+                    or "" in w.split(".") for w in got):
+                raise VTTError(f"Setting '{key}' takes a comma list of var "
+                               f"roots (`equipped,worn`): no empty word, "
+                               f"spaces, empty path segment or `__` name.")
+            return ",".join(got) if raw_value.strip() else ""
+        if spec.get("color"):
+            v = raw_value.strip()
+            if v.lower() not in TEXT_COLORS and not re.fullmatch(
+                    r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", v):
+                raise VTTError(f"Setting '{key}' takes a colour name ("
+                               f"{', '.join(sorted(TEXT_COLORS))}) or "
+                               f"#rrggbb, got `{raw_value}`.")
+            return v
         words = spec.get("word_list")
         if words is not None:
             # A comma list of known words; a typo'd one used to be ignored.
@@ -4284,6 +4303,15 @@ def check_map_name(name: Any) -> None:
             f"characters); `{name}` can't be one.")
     if name.lower() in MAP_RESERVED_NAMES:
         raise VTTError(f"`{name}` is a reserved word, so it can't name a map.")
+
+
+def check_zone_name(name: Any) -> None:
+    """Raise unless `name` can name a zone: id characters, as a map name
+    (a backtick or a space broke every reply quoting it)."""
+    if not isinstance(name, str) or not ID_RE.fullmatch(name):
+        raise VTTError(
+            f"A zone name can use letters, digits, `_` and `-` only (1-40 "
+            f"characters); `{name}` can't be one.")
 
 
 def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
@@ -4895,7 +4923,9 @@ def checked_priority(v: Any, what: str = "priority") -> Any:
     if isinstance(v, bool) or not isinstance(v, (int, float)) \
             or not math.isfinite(v):
         raise VTTError(f"{what} must be a finite number, got {v!r}.")
-    return int(v) if float(v).is_integer() else v
+    # A huge whole number stays a float, so a listing prints 1e+308, not
+    # its 309 digits.
+    return int(v) if float(v).is_integer() and abs(v) < 1e15 else v
 
 
 @dataclass
@@ -5573,14 +5603,16 @@ def normalize_tags(raw: Any) -> List[str]:
 
 
 def check_tag(tag: Any) -> str:
-    """`tag` when it can be a tag (one word: no spaces, commas or
-    parentheses, and not `and` / `or` / `not`, which tag filters read as
-    words of an expression), else a VTTError."""
+    """`tag` when it can be a tag (one word: no spaces, commas,
+    parentheses, brackets or double quotes, and not `and` / `or` / `not`,
+    which tag filters read as words of an expression), else a VTTError.
+    (`!ent set_var a tags ["fire"]` stored the one tag `[fire]`.)"""
     if not isinstance(tag, str) or not tag.strip() or \
             any(c.isspace() for c in tag.strip()) or \
-            any(c in tag for c in ",()"):
+            any(c in tag for c in ',()[]"'):
         raise VTTError(f"`{tag}` can't be a tag: one word, no spaces, "
-                       f"commas or parentheses.")
+                       f"commas, parentheses, brackets or double quotes "
+                       f"(several tags: `fire,ice`).")
     if tag.strip() in TAG_FILTER_WORDS:
         raise VTTError(f"`{tag}` can't be a tag: and / or / not join the "
                        f"words of a tag filter.")
@@ -5727,15 +5759,30 @@ def _is_tag_expression(text: str) -> bool:
         w in TAG_FILTER_WORDS for w in text.replace(",", " ").split())
 
 
+# A tag expression's bounds: parentheses and `not`s nested at most this
+# deep, at most this many words and parentheses. Parsing and matching
+# recurse per nesting level, and a filter is text a player types (`!find
+# tag:`) or stores in a var; 400 parentheses reached Python's stack limit.
+TAG_EXPRESSION_DEPTH = 32
+TAG_EXPRESSION_TOKENS = 256
+
+
 @functools.lru_cache(maxsize=512)
 def _parse_tag_expression(text: str) -> Tuple[Any, ...]:
-    """The tree of a tag expression: ('tag', t), ('not', a), ('and', a, b),
-    ('or', a, b). VTTError when it doesn't parse."""
+    """The tree of a tag expression: ('tag', t), ('not', a), ('and', [a,
+    b, ...]), ('or', [a, b, ...]) (a chain is one flat node, so only
+    nesting deepens it). VTTError when it doesn't parse or passes the
+    TAG_EXPRESSION_* bounds."""
     toks = _TAG_TOKEN_RE.findall(text)
     pos = 0
+    depth = 0
 
     def bad(why: str) -> VTTError:
-        return VTTError(f"Tag filter `{text}`: {why}.")
+        shown = text if len(text) <= 80 else text[:77] + "..."
+        return VTTError(f"Tag filter `{shown}`: {why}.")
+
+    if len(toks) > TAG_EXPRESSION_TOKENS:
+        raise bad(f"over {TAG_EXPRESSION_TOKENS} words and parentheses")
 
     def peek() -> Optional[str]:
         return toks[pos] if pos < len(toks) else None
@@ -5745,36 +5792,50 @@ def _parse_tag_expression(text: str) -> Tuple[Any, ...]:
         pos += 1
         return toks[pos - 1]
 
+    def deeper() -> None:
+        nonlocal depth
+        depth += 1
+        if depth > TAG_EXPRESSION_DEPTH:
+            raise bad(f"parentheses and `not`s nest over "
+                      f"{TAG_EXPRESSION_DEPTH} deep")
+
     def p_or() -> Tuple[Any, ...]:
-        left = p_and()
+        items = [p_and()]
         while peek() == "or":
             take()
-            left = ("or", left, p_and())
-        return left
+            items.append(p_and())
+        return items[0] if len(items) == 1 else ("or", items)
 
     def p_and() -> Tuple[Any, ...]:
-        left = p_not()
+        items = [p_not()]
         while peek() == "and":
             take()
-            left = ("and", left, p_not())
-        return left
+            items.append(p_not())
+        return items[0] if len(items) == 1 else ("and", items)
 
     def p_not() -> Tuple[Any, ...]:
+        nonlocal depth
         if peek() == "not":
             take()
-            return ("not", p_not())
+            deeper()
+            inner = p_not()
+            depth -= 1
+            return ("not", inner)
         return p_atom()
 
     def p_atom() -> Tuple[Any, ...]:
+        nonlocal depth
         t = peek()
         if t is None:
             raise bad("it ends where a tag or `(` should come")
         if t == "(":
             take()
+            deeper()
             inner = p_or()
             if peek() != ")":
                 raise bad("a `(` is never closed")
             take()
+            depth -= 1
             return inner
         if t in (")", "and", "or"):
             raise bad(f"`{t}` where a tag should come")
@@ -5799,8 +5860,8 @@ def _eval_tag_tree(tree: Tuple[Any, ...], tags: Set[str]) -> bool:
     if op == "not":
         return not _eval_tag_tree(tree[1], tags)
     if op == "and":
-        return _eval_tag_tree(tree[1], tags) and _eval_tag_tree(tree[2], tags)
-    return _eval_tag_tree(tree[1], tags) or _eval_tag_tree(tree[2], tags)
+        return all(_eval_tag_tree(t, tags) for t in tree[1])
+    return any(_eval_tag_tree(t, tags) for t in tree[1])
 
 
 def tag_filter_empty(raw: Any) -> bool:
@@ -5995,11 +6056,11 @@ def zone_look_value(key: str, value: Any) -> bool:
 
 
 def check_zone_def_name(name: Any) -> None:
-    """Raise unless `name` can name a zone definition: one word."""
-    if not isinstance(name, str) or not name or \
-            any(c.isspace() for c in name):
-        raise VTTError(f"`{name}` can't be a zone definition name: one "
-                       f"word, no spaces.")
+    """Raise unless `name` can name a zone definition: id characters, as a
+    zone name (a zone made from it takes its name)."""
+    if not isinstance(name, str) or not ID_RE.fullmatch(name):
+        raise VTTError(f"`{name}` can't be a zone definition name: letters, "
+                       f"digits, `_` and `-` only (1-40 characters).")
 
 
 def normalize_zone_def(raw: Any) -> Dict[str, Any]:
@@ -6208,6 +6269,13 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many crashes (an `Unexpected error (ref N)` reply, "
                 "a passive or hook that CRASHED) the bot keeps in its error log for `!owner "
                 "errors` / `!server errors` (0 = no log).",
+    },
+    "error_log_server_entries": {
+        "default": 50, "min": 0, "max": 2000,
+        "desc": "How many of the error log's entries one server may hold "
+                "(its oldest go first), so one server's crashes can't push "
+                "every other server's out of the bot-wide log (0 = no "
+                "per-server cap).",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -8062,6 +8130,105 @@ DEFAULT_MAP_NAME = "main"
 AURA_METRICS = ("square_radius", "manhattan", "euclidean")
 
 
+def line_span(x1: int, y1: int, x2: int, y2: int, width: int, height: int
+              ) -> Optional[Tuple[int, int, int, int]]:
+    """The part of the segment between the centres of cells (x1,y1) and
+    (x2,y2) that crosses a width x height map, in line-walk steps: (nx0,
+    ny0, nx1, ny1), where the walk's x / y boundary crossings numbered
+    nx0..nx1-1 / ny0..ny1-1 are the ones on or inside the map's edge.
+    Starting the walk at crossing (nx0, ny0) puts it on the cell just before
+    the line enters the map, so a corner check at the edge still runs; after
+    crossing (nx1, ny1) it has left the map for good. None if the line never
+    touches the map. Off-map cells hold nothing and are never opaque, so the
+    sight / line walks skip them: their cost follows the map, not
+    coordinates a formula made up."""
+    from fractions import Fraction
+    dx, dy = x2 - x1, y2 - y1
+    t0, t1 = Fraction(0), Fraction(1)
+    # Liang-Barsky against the closed rectangle [0.5, W+0.5] x [0.5, H+0.5]
+    # (cell (x, y) spans x-0.5..x+0.5).
+    for p, q in ((-dx, Fraction(x1) - Fraction(1, 2)),
+                 (dx, Fraction(width) + Fraction(1, 2) - x1),
+                 (-dy, Fraction(y1) - Fraction(1, 2)),
+                 (dy, Fraction(height) + Fraction(1, 2) - y1)):
+        if p == 0:
+            if q < 0:
+                return None
+            continue
+        r = q / p
+        if p < 0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+        if t0 > t1:
+            return None
+
+    def crossings(a: int, t: Fraction, strict: bool) -> int:
+        # Boundary k is crossed at t = (2k+1)/(2a): count those < t
+        # (strict) or <= t.
+        if a == 0:
+            return 0
+        v = a * t - Fraction(1, 2)
+        if strict:
+            n = -((-v.numerator) // v.denominator)        # ceil(v)
+        else:
+            n = v.numerator // v.denominator + 1          # floor(v) + 1
+        return max(0, min(a, n))
+
+    adx, ady = abs(dx), abs(dy)
+    return (crossings(adx, t0, True), crossings(ady, t0, True),
+            crossings(adx, t1, False), crossings(ady, t1, False))
+
+
+def line_cells(x1: int, y1: int, x2: int, y2: int,
+               bounds: Optional[Tuple[int, int]] = None
+               ) -> List[Tuple[int, int]]:
+    """The ordered cells the segment between the centres of (x1,y1) and
+    (x2,y2) passes through, near->far: every cell it crosses, with one
+    diagonal step where it passes exactly through a corner (the line every
+    sight check walks, Match._line_cells). With `bounds` (width, height)
+    only the cells on that map are listed and only the map's part of the
+    line is walked; without, every cell (the caller bounds the length)."""
+    def inside(cx: int, cy: int) -> bool:
+        return bounds is None or (1 <= cx <= bounds[0] and 1 <= cy <= bounds[1])
+
+    if (x1, y1) == (x2, y2):
+        return [(x1, y1)] if inside(x1, y1) else []
+    dx, dy = x2 - x1, y2 - y1
+    sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
+    sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
+    adx, ady = abs(dx), abs(dy)
+    if bounds is not None:
+        span = line_span(x1, y1, x2, y2, bounds[0], bounds[1])
+        if span is None:
+            return []
+        nx, ny, nx1, ny1 = span
+    else:
+        nx, ny, nx1, ny1 = 0, 0, adx, ady
+    cx, cy = x1 + sx * nx, y1 + sy * ny
+    cells = [(cx, cy)]
+    guard = (nx1 - nx) + (ny1 - ny) + 2
+    while (cx, cy) != (x2, y2) and guard > 0 and (nx < nx1 or ny < ny1):
+        guard -= 1
+        if adx == 0:
+            cy += sy; ny += 1
+        elif ady == 0:
+            cx += sx; nx += 1
+        else:
+            a = (2 * nx + 1) * ady
+            b = (2 * ny + 1) * adx
+            if a == b:
+                cx += sx; cy += sy; nx += 1; ny += 1
+            elif a < b:
+                cx += sx; nx += 1
+            else:
+                cy += sy; ny += 1
+        cells.append((cx, cy))
+    if bounds is not None:
+        cells = [c for c in cells if inside(*c)]
+    return cells
+
+
 @dataclass
 class Map:
     """One grid of a match: its size, the tiles and zones on it, and the fog
@@ -9156,6 +9323,7 @@ class Match:
         """Create an empty zone on map `mp`. Refused when a zone of that
         name exists on any map (unless overwrite, and only on the same
         map)."""
+        check_zone_name(name)
         mp = mp or self.get_map()
         other = self.zone_map(name)
         if other is not None and other is not mp:
@@ -12241,6 +12409,7 @@ class Match:
             eid for eid, e in self.entities.items()
             if e.map == mp.name
             and getattr(e, "is_alive", True) and not e.is_glued_part
+            and not e.is_hidden_rider
             and any(c in cells for c in self.entity_cells(e))
         ]
 
@@ -12584,52 +12753,8 @@ class Match:
 
     def _line_span(self, x1: int, y1: int, x2: int, y2: int, mp: "Map"
                    ) -> Optional[Tuple[int, int, int, int]]:
-        """The part of the segment between the centres of cells (x1,y1) and
-        (x2,y2) that crosses map `mp`, in line-walk steps: (nx0, ny0, nx1,
-        ny1), where the walk's x / y boundary crossings numbered nx0..nx1-1 /
-        ny0..ny1-1 are the ones on or inside the map's edge. Starting the walk
-        at crossing (nx0, ny0) puts it on the cell just before the line enters
-        the map, so a corner check at the edge still runs; after crossing
-        (nx1, ny1) it has left the map for good. None if the line never
-        touches the map. Off-map cells hold nothing and are never opaque, so
-        the sight / line walks skip them: their cost follows the map, not
-        coordinates a formula made up."""
-        from fractions import Fraction
-        dx, dy = x2 - x1, y2 - y1
-        t0, t1 = Fraction(0), Fraction(1)
-        # Liang-Barsky against the closed rectangle [0.5, W+0.5] x [0.5, H+0.5]
-        # (cell (x, y) spans x-0.5..x+0.5).
-        for p, q in ((-dx, Fraction(x1) - Fraction(1, 2)),
-                     (dx, Fraction(mp.grid_width) + Fraction(1, 2) - x1),
-                     (-dy, Fraction(y1) - Fraction(1, 2)),
-                     (dy, Fraction(mp.grid_height) + Fraction(1, 2) - y1)):
-            if p == 0:
-                if q < 0:
-                    return None
-                continue
-            r = q / p
-            if p < 0:
-                t0 = max(t0, r)
-            else:
-                t1 = min(t1, r)
-            if t0 > t1:
-                return None
-
-        def crossings(a: int, t: Fraction, strict: bool) -> int:
-            # Boundary k is crossed at t = (2k+1)/(2a): count those < t
-            # (strict) or <= t.
-            if a == 0:
-                return 0
-            v = a * t - Fraction(1, 2)
-            if strict:
-                n = -((-v.numerator) // v.denominator)        # ceil(v)
-            else:
-                n = v.numerator // v.denominator + 1          # floor(v) + 1
-            return max(0, min(a, n))
-
-        adx, ady = abs(dx), abs(dy)
-        return (crossings(adx, t0, True), crossings(ady, t0, True),
-                crossings(adx, t1, False), crossings(ady, t1, False))
+        """line_span on map `mp`'s size (see there)."""
+        return line_span(x1, y1, x2, y2, mp.grid_width, mp.grid_height)
 
     def _line_cells(self, x1: int, y1: int, x2: int, y2: int, *,
                     clip: bool = True,
@@ -12637,49 +12762,18 @@ class Match:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
         near->far — the same thin line the LOS walk uses (a diagonal step at
         an exact corner). Geometry only, no opacity. The shared path behind
-        first_opaque / entities_on_los / entities_in_line_ignorelos. With
-        `clip` (default) only cells ON the map are listed (endpoints included
-        when on the map) and the walk covers only the map's part of the line
-        (_line_span); without it, every cell of the line, endpoints included.
-        `mp`: the map clipped to (None = the only map)."""
+        first_opaque / entities_on_los / entities_in_line_ignorelos /
+        cells_in_line. With `clip` (default) only cells ON the map are
+        listed (endpoints included when on the map) and the walk covers
+        only the map's part of the line (line_span); without it, every cell
+        of the line, endpoints included. `mp`: the map clipped to (None =
+        the only map)."""
         if clip:
             mp = mp or self.get_map()
-        if (x1, y1) == (x2, y2):
-            return [(x1, y1)] if (not clip or mp.in_bounds(x1, y1)) else []
-        dx, dy = x2 - x1, y2 - y1
-        sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
-        sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
-        adx, ady = abs(dx), abs(dy)
-        if clip:
-            span = self._line_span(x1, y1, x2, y2, mp)
-            if span is None:
-                return []
-            nx, ny, nx1, ny1 = span
-        else:
-            self._check_line_budget(x1, y1, x2, y2)
-            nx, ny, nx1, ny1 = 0, 0, adx, ady
-        cx, cy = x1 + sx * nx, y1 + sy * ny
-        cells = [(cx, cy)]
-        guard = (nx1 - nx) + (ny1 - ny) + 2
-        while (cx, cy) != (x2, y2) and guard > 0 and (nx < nx1 or ny < ny1):
-            guard -= 1
-            if adx == 0:
-                cy += sy; ny += 1
-            elif ady == 0:
-                cx += sx; nx += 1
-            else:
-                a = (2 * nx + 1) * ady
-                b = (2 * ny + 1) * adx
-                if a == b:
-                    cx += sx; cy += sy; nx += 1; ny += 1
-                elif a < b:
-                    cx += sx; nx += 1
-                else:
-                    cy += sy; ny += 1
-            cells.append((cx, cy))
-        if clip:
-            cells = [c for c in cells if mp.in_bounds(*c)]
-        return cells
+            return line_cells(x1, y1, x2, y2,
+                              (mp.grid_width, mp.grid_height))
+        self._check_line_budget(x1, y1, x2, y2)
+        return line_cells(x1, y1, x2, y2, None)
 
     def first_opaque(self, viewer_id: Optional[str], x1: int, y1: int,
                      x2: int, y2: int,
@@ -13502,9 +13596,46 @@ class Match:
 
     def entity_occupies(self, e: "Entity", x: int, y: int) -> bool:
         """True iff (x, y) lies within `e`'s footprint at its current
-        anchor — the membership test behind cell_occupant."""
+        anchor — the membership test behind cell_occupant. A region part
+        covers its region's cells."""
+        if e.is_region_part:
+            return (x, y) in self.part_region_cells(e)
         w, h = self.entity_footprint(e)
         return e.x <= x < e.x + w and e.y <= y < e.y + h
+
+    def body_rects(self, e: "Entity") -> List[Tuple[int, int, int, int]]:
+        """`e`'s body as (x, y, w, h) rectangles: its footprint, or for a
+        region part one rectangle per horizontal run of its region's cells
+        (at most one per row), so distances measure a region by its own
+        cells, `corners` included."""
+        if not e.is_region_part:
+            w, h = self.entity_footprint(e)
+            return [(e.x, e.y, w, h)]
+        rects: List[Tuple[int, int, int, int]] = []
+        for cx, cy in sorted(set(self.part_region_cells(e) or [(e.x, e.y)]),
+                             key=lambda c: (c[1], c[0])):
+            if rects and rects[-1][1] == cy and \
+                    rects[-1][0] + rects[-1][2] == cx:
+                rx, ry, rw, rh = rects[-1]
+                rects[-1] = (rx, ry, rw + 1, rh)
+            else:
+                rects.append((cx, cy, 1, 1))
+        return rects
+
+    def body_center(self, e: "Entity") -> Tuple[int, int]:
+        """The centre cell of `e`'s body, rounded down for an even size; for
+        a region part the region cell nearest its bounding box's centre
+        (ties in row order), so the result is always a covered cell."""
+        if not e.is_region_part:
+            w, h = self.entity_footprint(e)
+            return (e.x + (w - 1) // 2, e.y + (h - 1) // 2)
+        cells = self.part_region_cells(e) or [(e.x, e.y)]
+        xs = [c[0] for c in cells]
+        ys = [c[1] for c in cells]
+        mx2, my2 = min(xs) + max(xs), min(ys) + max(ys)   # doubled centre
+        return min(cells, key=lambda c: ((2 * c[0] - mx2) ** 2
+                                         + (2 * c[1] - my2) ** 2,
+                                         c[1], c[0]))
 
     def _rect_gap(self, ax: int, ay: int, aw: int, ah: int,
                   bx: int, by: int, bw: int, bh: int,
@@ -13537,18 +13668,17 @@ class Match:
         the gap between their footprint rectangles. The single source of
         truth for entity-to-entity distance (entities_within/nearest_entity
         and the `near:` find predicate both route through here)."""
-        rw, rh = self.entity_footprint(e_ref)
-        ow, oh = self.entity_footprint(e_other)
-        return self._rect_gap(e_ref.x, e_ref.y, rw, rh,
-                              e_other.x, e_other.y, ow, oh, mode)
+        return min(self._rect_gap(ax, ay, aw, ah, bx, by, bw, bh, mode)
+                   for ax, ay, aw, ah in self.body_rects(e_ref)
+                   for bx, by, bw, bh in self.body_rects(e_other))
 
     def cell_entity_distance(self, x: int, y: int, e: "Entity",
                              mode: str = "square_radius") -> float:
         """Footprint-aware nearest-cell distance from a single cell (x, y)
         to entity `e` — the point-vs-footprint gap behind the `within:`
         find predicate."""
-        ow, oh = self.entity_footprint(e)
-        return self._rect_gap(x, y, 1, 1, e.x, e.y, ow, oh, mode)
+        return min(self._rect_gap(x, y, 1, 1, bx, by, bw, bh, mode)
+                   for bx, by, bw, bh in self.body_rects(e))
 
     def cell_occupant(self, x: int, y: int,
                       ignore: Tuple[str, ...] = (),
@@ -13565,8 +13695,8 @@ class Match:
             # Glued body parts ride on the parent's cell and never block —
             # the parent is the occupant. A LOCATED part has its own cell
             # and occupies it normally.
-            if e.is_glued_part:
-                continue
+            if e.is_glued_part or e.is_region_part:
+                continue    # a region lies on its parent, the occupant
             # Mounted riders are aboard the vehicle, not on the ground — they
             # never block (the vehicle's own footprint is the occupant). This
             # holds for visible riders too (a gunner shares the tank's cell).
@@ -15766,10 +15896,12 @@ class Match:
         vars_ = self.presented_vars(e, pov_team) if pov_team is not None \
             else e.vars
         team = e.team
+        status = e.status
         if vars_ is not e.vars:
             t = team_text(vars_.get(str(self.rules.get("team_var", "team"))))
             team = t if t not in (None, "") else None
-        pairs = self._own_and_granted_tags(vars_, e.status, team)
+            status = self.presented_statuses(e, pov_team)
+        pairs = self._own_and_granted_tags(vars_, status, team)
         if e.part_of:
             root = self.body_root(e)
             if root is not e:
@@ -19731,9 +19863,16 @@ class Match:
     def _run_ordered(self, engine: Any, ctx: Any, target_eid: str,
                      pred, log: List[str], **kinds: bool) -> None:
         """Run `_ordered_passives(target_eid, pred)` into `log`: self =
-        the target; an own passive is skipped once its unit is gone."""
+        the target; an own passive is skipped once its unit is gone. When
+        a passive removes or kills the target, the rest of the hook's
+        passives (global and team too) don't run on it (ghost firing); a
+        hook fired for a unit already gone (on_death, a despawn) still
+        reaches its global and team passives."""
+        present = target_eid in self.entities
         for p, kind in self._ordered_passives(target_eid, pred, **kinds):
-            if kind == "own" and target_eid not in self.entities:
+            if target_eid not in self.entities and (present or kind == "own"):
+                if present:
+                    break
                 continue
             log.append(_run_passive_safely(
                 engine, p, ctx, target_id=target_eid,
@@ -20885,6 +21024,19 @@ class Match:
         if isinstance(dvars, dict):
             out.update(dvars)
         return out
+
+    def presented_statuses(self, e: "Entity",
+                           pov_team: Optional[str] = None) -> Dict[str, Any]:
+        """The statuses `e` presents to `pov_team`: the real ones, or under a
+        disguise its `status` dict (name -> instance data), none when it has
+        no such key (the image hides status overlays under a disguise too).
+        Read-only."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is None:
+            return e.status
+        st = dis.get("status")
+        return {str(k): v for k, v in st.items()} \
+            if isinstance(st, dict) else {}
 
     def entity_display_name(self, e: "Entity",
                             pov_team: Optional[str] = None) -> str:
@@ -23507,6 +23659,19 @@ def rename_unit_vars(vars_: Dict[str, Any], clamps: Dict[str, Dict[str, Any]],
         _rel_del(vars_, o)
     for _o, n, v in plan:
         _rel_set(vars_, n, v)
+    moved = [(o, n) for o, n, _v in plan]
+    # A disguise's decoy `vars` follow too, or they'd stop covering the
+    # real values (a decoy team under the old name shows the real one).
+    dname = want.get("disguise_var") or ""
+    found, dis = _rel_get(vars_, dname) if dname else (False, None)
+    dvars = dis.get("vars") if found and isinstance(dis, dict) else None
+    if isinstance(dvars, dict):
+        dplan = [(o, n) for k, o, n in moves if k != "disguise_var"
+                 and o in dvars and (n not in dvars or n in leaving)]
+        values = {o: dvars.pop(o) for o, _n in dplan}
+        for o, n in dplan:
+            dvars[n] = values[o]
+            moved.append((f"{dname}.vars.{o}", f"{dname}.vars.{n}"))
     names = {o: n for _k, o, n in moves}
     new_clamps: Dict[str, Dict[str, Any]] = {}
     for path, cd in clamps.items():
@@ -23515,7 +23680,7 @@ def rename_unit_vars(vars_: Dict[str, Any], clamps: Dict[str, Dict[str, Any]],
             if isinstance(cd.get(f), str) and cd[f] in names:
                 cd[f] = names[cd[f]]
         new_clamps[names.get(path, path)] = cd
-    return want, new_clamps, notes, [(o, n) for o, n, _v in plan]
+    return want, new_clamps, notes, moved
 
 
 def strip_markers(value: Any) -> Any:
@@ -24541,6 +24706,16 @@ class MatchManager:
 _CRASH_TRACE_MAX = 6000
 _CRASH_TEXT_MAX = 1000
 _TRACE_FILE_RE = re.compile(r'File "([^"]+)"')
+# An absolute path in an error message (an OSError names the file it
+# failed on): an admin reading the log mustn't learn the host's folders, so
+# only its last part stays (`…/history`).
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s'\"]*")
+
+
+def _redact_paths(text: str) -> str:
+    return _ABS_PATH_RE.sub(
+        lambda mt: "…/" + os.path.basename(mt.group(0).rstrip("/\\"))
+        if len(mt.group(0)) > 1 else mt.group(0), text)
 
 
 class CrashLog:
@@ -24562,11 +24737,17 @@ class CrashLog:
                 "entries": copy.deepcopy(self.entries)}
 
     def load(self, data: Dict[str, Any]) -> None:
-        self.entries = [e for e in (data.get("entries") or [])
-                        if isinstance(e, dict)
-                        and isinstance(e.get("ref"), int)]
-        self.next_ref = max([int(data.get("next_ref") or 1)]
-                            + [e["ref"] + 1 for e in self.entries])
+        """Read a saved log. A bad `next_ref` counts on from the highest
+        ref kept (refs must stay unique: a player quotes one)."""
+        entries = [e for e in (data.get("entries") or [])
+                   if isinstance(e, dict) and isinstance(e.get("ref"), int)
+                   and not isinstance(e.get("ref"), bool)]
+        try:
+            stored = int(data.get("next_ref") or 1)
+        except (TypeError, ValueError):
+            stored = 1
+        self.entries = entries
+        self.next_ref = max([stored] + [e["ref"] + 1 for e in entries])
 
     def find(self, ref: int) -> Optional[Dict[str, Any]]:
         for e in self.entries:
@@ -24575,44 +24756,65 @@ class CrashLog:
         return None
 
     def record(self, where: str, exc: BaseException,
-               server: Optional[str] = None) -> Optional[int]:
+               server: Optional[str] = None,
+               repeat_of: Optional[int] = None) -> Optional[int]:
         """Record the exception being handled (call from its except block)
         with the running command's context (`server` names the server when
         no command is running); return its ref, or None when the log keeps
-        nothing."""
+        nothing. `repeat_of`: the ref of the entry this failure repeats (a
+        disk that keeps failing): that entry counts it instead of a new one,
+        while it is still in the log. A server keeps at most
+        error_log_server_entries of the bot-wide error_log_entries."""
         import traceback
         limit = owner_limit("error_log_entries")
         if limit <= 0:
             return None
         c = CRASH_CONTEXT.get() or {}
+        srv = c.get("server") or server
+        old = self.find(repeat_of) if repeat_of is not None else None
+        if old is not None and old.get("server") == srv:
+            old["repeats"] = int(old.get("repeats") or 0) + 1
+            old["last_at"] = _utc_now()
+            self._save()
+            return repeat_of
         trace = "".join(traceback.format_exception(
             type(exc), exc, exc.__traceback__))
         # File names only: an admin reading the log mustn't learn the
         # host's folders.
-        trace = _TRACE_FILE_RE.sub(
-            lambda mt: f'File "{os.path.basename(mt.group(1))}"', trace)
+        trace = _redact_paths(_TRACE_FILE_RE.sub(
+            lambda mt: f'File "{os.path.basename(mt.group(1))}"', trace))
         if len(trace) > _CRASH_TRACE_MAX:
             trace = "...\n" + trace[-_CRASH_TRACE_MAX:]
         ref = self.next_ref
         self.next_ref += 1
         self.entries.append({
             "ref": ref, "at": _utc_now(),
-            "server": c.get("server") or server,
+            "server": srv,
             "server_name": c.get("server_name"),
             "match": c.get("match"), "user": c.get("user"),
             "user_name": c.get("user_name"),
             "command": (c.get("command") or "")[:_CRASH_TEXT_MAX],
             "where": where[:_CRASH_TEXT_MAX],
-            "error": f"{type(exc).__name__}: {exc}"[:_CRASH_TEXT_MAX],
+            "error": _redact_paths(
+                f"{type(exc).__name__}: {exc}")[:_CRASH_TEXT_MAX],
             "trace": trace,
         })
+        # One server's stream of crashes can't push the others' out.
+        per = owner_limit("error_log_server_entries")
+        mine = [e for e in self.entries if e.get("server") == srv]
+        if per > 0 and len(mine) > per:
+            drop = {id(e) for e in mine[:len(mine) - per]}
+            self.entries = [e for e in self.entries if id(e) not in drop]
         del self.entries[:-limit]
+        self._save()
+        return ref
+
+    def _save(self) -> None:
         if self.save is not None:
             try:
                 self.save(self)
             except Exception as ex:  # noqa: BLE001 - logging must not crash
                 print(f"⚠️ The error log couldn't be saved ({ex}).")
-        return ref
 
 
 def crash_ref(where: str, exc: BaseException) -> str:

@@ -25408,7 +25408,7 @@ SCENARIO 827 — !turn set is a turn change; quiet moves only the marker
 !gpassive add st on_turn_start "entity[self].starts = entity[self].starts + 1"
 !gpassive add en on_turn_end "entity[self].ends = entity[self].ends + 1"
 !turn set c
-?? It is now `c`'s turn (set by a host).
+?? It is now `c`'s turn (set by `!turn set`).
 !assert "entity[c].starts == 1 and entity[a].starts == 0 and turns_elapsed() == 1"
 !turn set b
 !assert "entity[c].ends == 1 and entity[b].starts == 1"
@@ -27715,10 +27715,15 @@ SCENARIO 877 — The summons take the map after the coordinates, an id prefix on
 !eval --as hero "occupies('mate', [2, 2, 'deck'])"
 ?? = `True`
 !eval --as hero "occupies('hero', [2, 2, 'deck'])"
-?? the cell is on map `deck`, and occupies works on map `main`
+?? = `False`
+!zone new zz map=main
+!eval --as hero "zone_add_cell('zz', [2, 2, 'deck'])"
+?? the cell is on map `deck`, and zone_add_cell works on map `main`
 !eval --as hero "can_see('mate', [3, 3, 'deck'], map='main')"
 ?? the cell is on map `deck` and map= names `main`
 !eval --as hero "distance([1, 1, 'deck'], [4, 5, 'main'])"
+?? = `None`
+!eval --as hero "first_opaque([1, 1, 'deck'], [4, 5, 'main'])"
 ?? the cells name different maps
 !eval --as hero "can_see('hero', 3, 3, 'deck')"
 ?? `deck` is a map; a map goes in map='deck'
@@ -27742,9 +27747,12 @@ own map. A word that is no map is refused, naming id_prefix=. A cell
 list goes wherever a function takes x and y: [x, y] fills both, and the
 map of an [x, y, map] cell (what free_cell_near, entity_center and
 footprint_cells return for another map) goes to the map slot of a
-function that has one; a function without one works on its unit's map
-and refuses a cell on another, two cells must name one map, and a cell
-can't disagree with map=. A map name typed after the coordinates of a
+function that has one; a function without one works on its unit's map.
+Cells on two maps (or a cell on another map than the function's unit or
+zone) have no relation: distance / angle / direction_to answer None,
+has_los / occupies / cell_in_zone False and the line searches [] (F23),
+while the writers and the reads with no such answer (first_opaque,
+raycast, side_hit, ...) refuse them; a cell can't disagree with map=. A map name typed after the coordinates of a
 function that refuses it is named in the refusal. entity_center,
 aoe_origin and footprint_cells give [x, y, map] for a unit on a map
 other than the formula's own, as corpse_at does.
@@ -30822,3 +30830,523 @@ here on map= main only. One undo step. `!zone def reapply` does the same
 for zones of a definition, and `reset` there too. A system's definitions
 have no zones, so `!system zone` has no reapply; `!match sync tiles|
 zones [name] reapply` copies the system's entries and reapplies them.
+
+
+SCENARIO 933 — Every area search skips glued parts and riders hidden in a vehicle
+-----------------------------------------------------------------------------------
+
+!match new as933 Areas 12 12
+!match use as933
+!ent add hero Hero 30 1 1
+!ent add ogre Ogre 30 5 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre head head 5 5
+!ent add cart Cart 20 8 8
+!ent set_var cart slots.hold.capacity 1
+!ent add thief Thief 10 10 10
+!mount thief cart hold
+!zone new zz
+!zone add zz 5 5
+!zone add zz 8 8
+!eval "entities_in_rect(1, 1, 12, 12)"
+?? = `['hero', 'ogre', 'cart']`
+!eval "entities_in_cone(1, 1, 'down_right', 12, 90)"
+?? = `['ogre', 'cart']`
+!eval "entities_in_line_ignorelos(1, 1, 9, 9)"
+?? = `['hero', 'ogre', 'cart']`
+!eval "entities_on_los(1, 1, 9, 9)"
+?? = `['ogre', 'cart']`
+!assert "entities_in_zone('zz') == ['ogre', 'cart'] and entities_in_area(5, 5, 3) == ['ogre', 'cart'] and entities_in_line_until(1, 1, 9, 9, 10) == ['hero', 'ogre', 'cart']"
+!find near:ogre:2
+?? 2 matches
+?! Thief
+!find within:5:5:3
+?? 2 matches
+?! head
+!eval "parts('ogre') + riders('cart')"
+?? = `['head', 'thief']`
+
+Expected: The rectangle, cone and line searches leave out the ogre's
+glued head and the thief riding inside the cart (a slot with no region),
+as entities_in_area, entities_within and entities_at always did: a blast
+hits the same targets whatever its shape (K7). entities_in_zone leaves
+out the hidden rider too. `!find near:` / `within:` follow the same
+spatial rule (a glued part, a hidden rider and a destroyed part are off
+the ground; L22). parts() / riders() still reach them.
+
+
+SCENARIO 934 — A region part is measured by its own cells
+-----------------------------------------------------------
+
+!match new rp934 Region 12 12
+!match use rp934
+!ent add ogre Ogre 30 5 5
+!ent set_var ogre footprint_w 3
+!ent set_var ogre footprint_h 3
+!ent face ogre up
+!part add ogre tail tail 10 10
+!part region tail back
+!part add ogre snout snout 10 10
+!part region snout front
+!ent add archer Archer 10 6 10
+!ent add knight Knight 10 6 8
+!eval "footprint_cells('tail')"
+?? = `[[5, 7], [6, 7], [7, 7]]`
+!eval "[entity_distance('archer', 'tail'), entity_distance('archer', 'snout'), entity_distance('knight', 'tail')]"
+?? = `[3, 5, 1]`
+!dist archer tail
+?? **3**
+!eval "nearest_entity('archer', 'any', tag='part')"
+?? = `'tail'`
+!eval "[occupies('tail', 6, 7), occupies('tail', 5, 5), entity_center('tail'), aoe_origin('tail')]"
+?? = `[True, False, [6, 7], [6, 7]]`
+!eval "entities_in_area(6, 8, 1)"
+?? = `['knight', 'ogre', 'tail']`
+!assert "cell_entity(6, 7) == 'ogre' and cell_entity(5, 5) == 'ogre'"
+!zone new tailrow
+!zone add tailrow 5 7
+!zone add tailrow 6 7
+!zone add tailrow 7 7
+!assert "zone_distance('tail', 'tailrow') == 0"
+
+Expected: The tail covers the ogre's back row (facing up: y 7), and every
+measure reads those cells (K8): 3 from the archer where the snout across
+the body is 5, 1 from the knight beside it, the nearest part to the
+archer, occupies() true on its row and false on the snout's cell, its
+centre the middle of its row, a burst at (6, 8) radius 1 reaches it, and
+a zone made of its row is 0 away. A region lies on its parent, so
+cell_entity names the ogre on every cell of it.
+
+
+SCENARIO 935 — cells_in_line, line previews and fog reveals walk the sight line
+---------------------------------------------------------------------------------
+
+!match new ln935 Lines 10 10
+!match use ln935
+!ent add a A 5 1 1
+!ent add b B 5 2 2
+!ent add c C 5 4 3
+!ent add d D 5 7 4
+!eval "cells_in_line(1, 1, 7, 4)"
+?? = `[[1, 1], [2, 1], [2, 2], [3, 2], [4, 2], [4, 3], [5, 3], [6, 3], [6, 4], [7, 4]]`
+!assert "entities_in_line_ignorelos(1, 1, 7, 4) == ['a', 'b', 'c', 'd']"
+!map preview line 1 1 7 4
+?? 10 cell(s) on the map
+?? In area: A (`a`), B (`b`), C (`c`), D (`d`)
+?! D (`d`), A
+!tile line 1 1 7 4 mark true
+?? on 10 tile(s)
+!reveal_fog red line 1 1 7 4
+?? Revealed 10 cell(s)
+!assert "len(cells_in_line(-5, -5, 100, 100)) == 10 and cells_in_line([1, 1], [3, 1]) == [[1, 1], [2, 1], [3, 1]]"
+
+Expected: cells_in_line used Bresenham (7 cells here) while has_los, the
+line searches and `!tile line` walk every cell the segment crosses (10):
+a preview of a piercing shot named two of the four units it hits (F24).
+Now every line is the sight walk (logic.line_cells): the preview lists
+all four units, each once (it listed every unit twice before a turn
+order existed), `!reveal_fog line` reveals the 10 cells, and a line
+running off the map is clipped to its 10 on-map cells. cells_in_line
+takes coordinate lists like every x / y function.
+
+
+SCENARIO 936 — Cells on two maps have no relation; the area builders take coordinates
+---------------------------------------------------------------------------------------
+
+!match new mm936 Decks 10 10
+!match use mm936
+!map new deck 6 6
+!ent add hero Hero 10 2 2 map=main
+!ent add orc Orc 10 4 4 map=main
+!ent add mate Mate 10 3 3 map=deck
+!zone new zz map=main
+!zone add zz 4 4
+!eval --as hero "out = []\nfor t in all_entities():\n    out = out + [distance(entity_center(self), entity_center(t))]\nout"
+?? = `[0, 2, None]`
+!eval --as hero "[has_los(entity_center(self), entity_center('mate')), occupies('orc', entity_center('mate')), cell_in_zone(entity_center('mate'), 'zz'), entities_on_los(entity_center(self), entity_center('mate'))]"
+?? = `[False, False, False, []]`
+!eval --as hero "first_opaque(entity_center(self), entity_center('mate'))"
+?? the cells name different maps
+!eval --as hero "zone_add_cell('zz', entity_center('mate'))"
+?? the cell is on map `deck`, and zone_add_cell works on map `main`
+!eval --as hero "len(cells_in_burst(entity_center('mate'), 1))"
+?? = `9`
+!eval "cells_in_rect([1, 1, 'deck'], [2, 2, 'deck'])"
+?? = `[[1, 1, 'deck'], [1, 2, 'deck'], [2, 1, 'deck'], [2, 2, 'deck']]`
+!help function cells_in_cone
+?? reads the match
+!eval "unit_tags('hero', map='main')"
+?? unit_tags takes no map=
+
+Expected: HARNESS-ALLOWS-ERRORS. The design's rule (multi_map_design §2):
+spatial questions across two maps get "no relation", never an error
+(F23). distance answers None (so a loop over every unit runs past the one
+on the deck), has_los / occupies / cell_in_zone False and the line
+searches []. A writer (zone_add_cell) and a read with no such answer
+(first_opaque) still refuse. The four cells_in_* builders take [x, y] and
+[x, y, map] cells like every x / y function, name their map in the
+result, and are listed with the functions that read the match. map= on a
+function without a map slot is named (L19).
+
+
+SCENARIO 937 — A passive that removes its unit stops the rest of the hook; on_death globals still run
+-------------------------------------------------------------------------------------------------------
+
+!match new gh937 Ghosts 10 10
+!match use gh937
+!ent add a A 1 1 1
+!ent add b B 5 3 3
+!ent init a 20
+!ent init b 10
+!gpassive add poison on_turn_start priority=5 "entity[self].hp = entity[self].hp - 1"
+!gpassive add tally on_turn_start priority=1 "match_var_set('ticks', match_var_get('ticks', 0) + 1)\nentity[self].regen = 1"
+!gpassive add obit on_death "match_var_set('obits', match_var_get('obits', 0) + 1)"
+!turn next
+?! FAILED
+?? global passive `obit` fired on `a` (on_death)
+!assert "match_var_get('ticks', 0) == 1 and match_var_get('obits', 0) == 1 and has_corpse('a')"
+!ent add c C 5 6 6
+!passive add c vanish on_entity_despawned priority=9 "match_var_set('gone', 1)"
+!gpassive add gone2 on_entity_despawned "match_var_set('gone2', 1)"
+!ent remove c
+!assert "match_var_get('gone', 0) == 1 and match_var_get('gone2', 0) == 1"
+
+Expected: `poison` (priority 5) kills `a` at its turn start; the lower
+`tally` used to run on the dead id anyway, failing in chat and counting
+the dead unit's turn (T6). Once a passive removes or kills the hook's
+unit, the rest of that hook's passives (global and team too) don't run
+on it: tally counts only b's turn. A hook fired for a unit already on
+its way out still reaches its globals: on_death's `obit`, and
+on_entity_despawned's global next to the unit's own.
+
+
+SCENARIO 938 — Tag filters nest at most 32 deep and hold at most 256 words
+---------------------------------------------------------------------------
+
+!match new tf938 Filters 6 6
+!match use tf938
+!ent add hero Hero 10 1 1
+!ent set_var hero tags fire
+!find tag:"((((((((((((((((((((((((((((((((fire))))))))))))))))))))))))))))))))"
+?? 1 match
+!find tag:"(((((((((((((((((((((((((((((((((fire)))))))))))))))))))))))))))))))))"
+?? nest over 32 deep
+!eval "unit_has_tag('hero', 'fire or ' * 200 + 'fire')"
+?? over 256 words and parentheses
+!eval "unit_has_tag('hero', 'not not not fire')"
+?? = `False`
+!ent set_var hero actions.hit.body "entity[target].hp = 1"
+!ent set_var hero actions.hit.target entity
+!ent set_var hero actions.hit.target_requires_tags "(((((((((((((((((((((((((((((((((fire)))))))))))))))))))))))))))))))))"
+!action info hero hit
+?! 💥
+?? nest over 32 deep
+!ent set_var hero tags "[fire]"
+?? can't be a tag
+
+Expected: HARNESS-ALLOWS-ERRORS. A player's `!find tag:` with 400 nested
+parentheses crashed at Python's recursion limit (X9). A filter now nests
+at most 32 deep (parentheses and `not`s) and holds at most 256 words, a
+refusal naming the bound; an `and` / `or` chain is one flat node. A deep
+filter stored in an action's target_requires_tags (X9+) reads as a filter
+that doesn't parse: `!action info` names it, no 💥. A tag can't hold
+brackets or double quotes, so a JSON list typed into the tags var is
+refused (L17).
+
+
+SCENARIO 939 — Players name units through the view on every opened root
+-------------------------------------------------------------------------
+
+!match new pv939 Fogged 10 10
+!match use pv939
+!ent add scout Scout 10 1 1
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 2
+!ent add ogre Ogre 10 8 8
+!ent set_var ogre team blue
+!part add ogre zqxhead head 5 5
+!match fog on
+!host access set "part info" all
+!host access set "status resist" all
+!host access set status all
+!host access set turn all
+!host access set mount all
+!match bind pov=red
+!as player bob
+!part info zqxhead
+?? Could not find a unit named `zqxhead`. Either it does not exist
+!part info ogre
+?? Could not find a unit named `ogre`. Either it does not exist
+!part info nosuchunit
+?? Could not find a unit named `nosuchunit`. Either it does not exist
+!status resist ogre stun
+?? Could not find a unit named `ogre`. Either it does not exist
+!status apply ogre stun 1 1
+?? Could not find a unit named `ogre`. Either it does not exist
+!turn set ogre
+?? Could not find a unit named `ogre`. Either it does not exist
+!mount scout ogre seat
+?? Could not find a unit named `ogre`. Either it does not exist
+!status apply scout stun 1 1
+?? Applied `stun` to `scout`
+!as host
+!assert "not status_has('ogre', 'stun') and status_has('scout', 'stun')"
+!ent tp ogre 2 2
+!as player bob
+!part info zqxhead
+?? Body part of: `ogre`
+
+Expected: HARNESS-ALLOWS-ERRORS. Only `!ent` used to read units through
+the channel's view for a non-host; opened to players, `!part info` showed
+a fogged unit's part and every var, and `!status`, `!turn set`, `!mount`
+and the others acted on hidden units by id (V9). Every typed unit id of a
+non-host's command under a team view now reads through the view
+(`_resolve_eid`): a hidden unit and a missing one get the same two-sided
+reply. A glued part shows while the body it sits on shows (L22): once the
+ogre walks into the scout's sight, its head can be read.
+
+
+SCENARIO 940 — A disguise presents its own statuses and the tags they grant
+-----------------------------------------------------------------------------
+
+!match new dg940 Masks 10 10
+!match use dg940
+!ent add spy Spy 10 2 2
+!ent set_var spy team blue
+!ent add scout Scout 10 5 5
+!ent set_var scout team red
+!ent set_var spy tags assassin
+!status def cloak
+!status grants_unit_tags cloak invisible
+!status apply spy cloak 1 3
+!status apply spy poison 1 2
+!ent set_var spy disguise.name Merchant
+!ent set_var spy disguise.vars.tags trader
+!system set default entity_line_format "{name} ({id}) {statuses}"
+!match bind pov=red
+!as player bob
+!list
+?? Merchant (spy)
+?! poison
+!ent info spy
+?? Tags: trader
+?! invisible
+?! cloak
+!find tag:invisible
+?? No entities match
+!find status:poison
+?? No entities match
+!as host
+!ent set_var spy disguise.status.drunk.level 1
+!as player bob
+!find status:drunk
+?? Merchant (spy)
+!as host
+!match unbind
+!match use dg940
+!ent info spy
+?? cloak
+
+Expected: A disguised unit's real statuses (with levels and turns left)
+and the tags they grant showed to other teams in the roster, `!ent info`
+and `!find` (V5, V5+). A disguise now presents its own `status` dict
+(none without one), as the image hides status overlays under it: red
+sees the merchant with no statuses, its decoy tag only, and `!find
+status:` / `tag:` read the presented ones (a decoy `drunk` matches).
+The omniscient channel sees the truth.
+
+
+SCENARIO 941 — Secret text stays out of command labels; a player's macro needs `trust` to become a system macro
+-----------------------------------------------------------------------------------------------------------------
+
+!match new pm941 Promote 8 8
+!match use pm941
+!ent add boss Boss 50 2 2
+!remind secret 2 AMBUSH-AT-BRIDGE
+!match rng set 12345
+!history list command
+?! AMBUSH
+?! 12345
+?? !remind secret 2 …
+!host access set macro all
+!as player alice
+!macro set hit "ent hp boss -10"
+!as host
+!system macro promote default hit
+?? was written by
+?? trust
+!system macro promote default hit trust
+?? Promoted macro `hit`
+!assert "entity[boss].hp == 50"
+
+Expected: HARNESS-ALLOWS-ERRORS. A command label (`!history list`, undo
+previews, `!system history`, `!server audit`) quoted the command as
+typed, so a player read a secret reminder's text there when nothing on
+the board was hidden (V6); a secret reminder's text and an RNG seed are
+cut to `…`. A macro a player wrote lost its author when promoted into the
+system, and a system macro runs as a host's, ungated, in every new match
+(G6): the promote now refuses, naming the author and showing the body,
+until `trust` is added.
+
+
+SCENARIO 942 — A var-name rule renames a disguise's decoy vars too
+-------------------------------------------------------------------
+
+!match new vn942 Renames 10 10
+!match use vn942
+!ent add spy Spy 20 2 2
+!ent set_var spy team blue
+!ent set_var spy tags assassin
+!ent add hero Hero 20 5 5
+!ent set_var hero team red
+!ent set_var spy disguise.name Merchant
+!ent set_var spy disguise.vars.team red
+!ent set_var spy disguise.vars.hp 99
+!ent set_var spy disguise.vars.tags trader
+!system set default team_var side
+!system set default hp_var health
+!system set default tags_var labels
+!eval "entity[spy].disguise"
+?? = `{'name': 'Merchant', 'vars': {'side': 'red', 'health': 99, 'labels': 'trader'}}`
+!system set default entity_line_format "{name} ({id}) side={side} health={health} {tags}"
+!match bind pov=red
+!list
+?? Merchant (spy) side=red health=99 trader
+!find side=red
+?? 2 matches
+!ent info spy
+?? HP: 99/20
+?? Team: red
+?? Tags: trader
+
+Expected: Renaming team_var, hp_var and tags_var moved the units' vars
+but left the disguise's decoys under the old names, which then covered
+nothing: the other team saw the real side, health and tags (V8). The
+decoy keys move with the rules (rename_unit_vars), and `!ent info`'s HP /
+Team read the decoy of the var behind them, whatever it is called.
+
+
+SCENARIO 943 — A prefab import checks corpses, link loops and carried status definitions
+------------------------------------------------------------------------------------------
+
+!match new pf943 Imports 10 10
+!match use pf943
+!prefab import corpsebad {"kind": "prefab", "width": 4, "height": 4, "system": "default", "corpses": [[0, 0, "dead", {"entity": {"id": "dead", "vars": "zz"}}]]}
+?? unit `dead` of corpse `dead` has no `name`
+!prefab import partbad {"kind": "prefab", "width": 4, "height": 4, "system": "default", "corpses": [[0, 0, "dead", {"entity": {"id": "dead", "name": "Dead", "x": 0, "y": 0, "vars": {"hp": 0}}, "parts": [{"id": "p"}]}]]}
+?? unit `p` of corpse `dead` has no `name`
+!prefab import loop {"kind": "prefab", "width": 4, "height": 4, "system": "default", "units": [{"id": "a", "name": "A", "x": 0, "y": 0, "part_of": "b", "vars": {"hp": 10}}, {"id": "b", "name": "B", "x": 1, "y": 0, "part_of": "a", "vars": {"hp": 10}}]}
+?? the `part_of` links of `a` -> `b` -> `a` form a loop
+!prefab import self {"kind": "prefab", "width": 4, "height": 4, "system": "default", "units": [{"id": "a", "name": "A", "x": 0, "y": 0, "mounted_on": "a", "vars": {"hp": 10}}]}
+?? the `mounted_on` links of `a` -> `a` form a loop
+!prefab import sdef {"kind": "prefab", "width": 4, "height": 4, "system": "default", "definitions": {"status_definitions": {"burn": {"stack": "bogus"}}}}
+?? stack must be one of
+!prefab import ok {"kind": "prefab", "width": 4, "height": 4, "system": "default", "corpses": [[0, 0, "dead", {"entity": {"id": "dead", "name": "Dead", "x": 0, "y": 0, "vars": {"hp": 0, "max_hp": 5}}}]], "definitions": {"status_definitions": {"burn": {"stack": "refresh", "max_level": 2}}}}
+?? Saved prefab `ok`
+!prefab stamp ok 2 2
+!list
+?! 💥
+?? Dead
+!ent revive dead
+?! 💥
+
+Expected: HARNESS-ALLOWS-ERRORS. A prefab import checked shape and link
+targets only: a malformed corpse made every `!list` of the match it was
+stamped into crash, and part / mount loops and broken status definitions
+came through (S7). check_prefab (import and load) now reads each corpse's
+body and parts as units (an id, a name, whole x / y), refuses a
+`part_of`, `mounted_on` or `__follows` loop, and checks carried status
+definitions like `!status` would (stack, tick time, max_level, hooks,
+tag filters) and zone definitions. A sound corpse stamps, lists and
+revives.
+
+
+SCENARIO 944 — A prefab carries the statuses its hooks and definitions name
+-----------------------------------------------------------------------------
+
+!match new pf944 Pits 8 8
+!match use pf944
+!status def burn
+!status tick burn "entity[self].hp = entity[self].hp - 3"
+!status def soot
+!status removes burn soot
+!tile def new lava
+!tile def hook lava on_enter "status_apply(self, 'burn', 1, 3)"
+!tile place lava 2 2
+!prefab save pit 1 1 4 4
+!prefab show pit
+?? status `burn`
+?? status `soot`
+?? tile template `lava`
+!match new dst944 Dst 8 8
+!match use dst944
+!prefab stamp pit 1 1
+!status list
+?? `burn`
+?? `soot`
+
+Expected: A prefab carried status definitions only for statuses its units
+held, so a status its tile, zone or function hooks applied stayed behind
+and never ticked in another match (S8). The saved strings are scanned for
+quoted status names the match defines (as `!func` calls are), and the
+`removes` / `blocked_by` tokens of what is carried are followed: the lava
+tile's `burn` and the `soot` burn removes go along.
+
+
+SCENARIO 945 — Smaller items: locals before assignment, rolls, priorities, rule values, numeric bodies, the trace flag, command undo after a turn, zone names
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sm945 Smalls 10 10
+!match use sm945
+!ent add a A 11 1 1
+!ent add b B 22 2 2
+!eval "entity[b].tag2 = 'y'\nb = 'a'\n1"
+?? `b` is used before it is assigned
+?? entity['b']
+!eval "a = 'b'\nentity[a].hp"
+?? = `22`
+!roll 20x 1000d1000
+?? (the dice of each roll are left out: too many to list)
+!roll 3x 2d6
+?? 1.
+!gpassive add pp on_turn_start priority=1e308 "1"
+!gpassive list
+?? pri 1e+308
+!system set default unit_tag_sources "equipped,,x"
+?? comma list of var roots
+!system set default modifier_sources __engine
+?? comma list of var roots
+!system set default active_unit_outline_color notacolor
+?? takes a colour name
+!system set default active_unit_outline_color #ff8800
+?? '#ff8800'
+!ent set_var a actions.hit.body 1
+!action list a
+?? `actions.hit` isn't an action: its body is int
+!eval --as b --trace "entity[self].hp"
+?? = `22`
+?? **Trace:**
+!ent init a 9
+!ent init b 5
+!turn next
+!ent hp a -3
+!turn next
+!undo command
+?? Reverted past `!ent hp a -3`
+?? also takes back the 1 turn advance(s)
+!zone new "bad name"
+?? A zone name can use letters, digits
+!eval "zone_spawn('x', [[1, 1]], name='a;b')"
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. A local read before its assignment says
+so and names entity['b'] for the unit (P3); `entity[a]` after `a = 'b'`
+reads the local. A repeated roll lists each roll's dice only while the
+reply fits one message (L16). A priority too big to print whole stays
+1e+308. unit_tag_sources / modifier_sources (and the other source lists)
+take var roots, active_unit_outline_color a palette name or #rrggbb
+(L19). An action whose body isn't text is named in `!action list`.
+`--trace` works after `--as <eid>` (L18). `!undo command` right after
+`!turn next` says it takes the turn back too (L20). Zone names take id
+characters (L18).

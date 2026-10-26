@@ -1369,6 +1369,9 @@ _X_PARAMS = {"x": "y", "x1": "y1", "x2": "y2", "from_x": "from_y",
              "origin_x": "origin_y"}
 _UNIT_REF_PARAMS = frozenset({"eid_t", "target_t", "target_token", "rider"})
 _COORD_PARAM_CACHE: Dict[Any, Optional[List[str]]] = {}
+# fname -> (code object, params) of the built-ins a namespace wraps: a
+# namespace is built per formula, so _namespace reads this first.
+_COORD_PARAMS_BY_NAME: Dict[str, Tuple[Any, Optional[List[str]]]] = {}
 
 
 def _coord_pair_params(fn: Callable) -> Optional[List[str]]:
@@ -1390,6 +1393,31 @@ def _coord_pair_params(fn: Callable) -> Optional[List[str]]:
     return out
 
 
+# What a reading function answers for cells on two maps (or a cell on
+# another map than its unit / zone): no relation (multi_map_design §2), as
+# entity_distance and can_see answer for units. A function not listed
+# refuses such cells (the writers, and reads with no meaningful answer).
+_CROSS_MAP_NO_RELATION: Dict[str, Any] = {
+    "distance": None, "angle": None, "direction_to": None,
+    "has_los": False, "occupies": False, "cell_in_zone": False,
+    "entities_on_los": [], "entities_in_line_ignorelos": [],
+    "entities_in_line_until": [],
+}
+
+_COORD_X_SLOTS: Dict[Tuple[str, ...], List[int]] = {}
+
+
+def _coord_x_slots(params: List[str]) -> List[int]:
+    """The indexes of the x parameters of `params`' x / y pairs (cached)."""
+    key = tuple(params)
+    xs = _COORD_X_SLOTS.get(key)
+    if xs is None:
+        xs = [i for i, p in enumerate(params) if p in _X_PARAMS
+              and i + 1 < len(params) and params[i + 1] == _X_PARAMS[p]]
+        _COORD_X_SLOTS[key] = xs
+    return xs
+
+
 def _is_coord_value(v: Any) -> bool:
     """A cell value: [x, y], [x, y, map] or a location target (Coord)."""
     if isinstance(v, (list, tuple)):
@@ -1400,13 +1428,33 @@ def _is_coord_value(v: Any) -> bool:
     return type(v).__name__ == "Coord" and hasattr(v, "x")
 
 
-def _lists_out(fn: Callable) -> Callable:
-    def wrapped(*a: Any, **k: Any) -> Any:
-        return _listify(fn(*a, **k))
-    wrapped.__name__ = getattr(fn, "__name__", "fn")
-    wrapped.__doc__ = getattr(fn, "__doc__", None)
-    wrapped.__wrapped__ = fn        # !help function reads the signature
-    return wrapped
+def _wrapping(inner: Callable, outer: Callable) -> Callable:
+    """`outer` (a wrapper calling `inner`) marked as wrapping it."""
+    outer.__wrapped__ = inner
+    outer.__doc__ = inner.__doc__
+    return outer
+
+
+class _lists_out:
+    """A built-in function whose result has its tuples turned into lists.
+    A slotted object: a namespace wraps every built-in on each build, and
+    a closure with its name and docstring copied cost several times more.
+    `__wrapped__` is the function (!help function reads its signature)."""
+    __slots__ = ("__wrapped__",)
+
+    def __init__(self, fn: Callable) -> None:
+        self.__wrapped__ = fn
+
+    def __call__(self, *a: Any, **k: Any) -> Any:
+        return _listify(self.__wrapped__(*a, **k))
+
+    @property
+    def __name__(self) -> str:
+        return getattr(self.__wrapped__, "__name__", "fn")
+
+    @property
+    def __doc__(self) -> Optional[str]:   # type: ignore[override]
+        return getattr(self.__wrapped__, "__doc__", None)
 
 
 def _guard_arith(tree: ast.AST) -> ast.AST:
@@ -1571,7 +1619,17 @@ def _runtime_msg(e: BaseException) -> str:
     wrong-arity call reports `slot_capacity() missing 2 required positional
     arguments`, not the private `FormulaEngine._namespace.<locals>.
     _slot_capacity()` it is implemented as."""
-    return _IMPL_NAME_RE.sub(r"\1()", str(e))
+    msg = _IMPL_NAME_RE.sub(r"\1()", str(e))
+    mt = _MAP_KW_RE.search(msg)
+    if mt is not None:
+        # map= on a function with no map slot (it works on its unit's or
+        # zone's map), said as L15's hint says a map word.
+        return (f"{mt.group(1)} takes no map= (it works on one map: its "
+                f"unit's, its zone's or the formula's).")
+    return msg
+
+
+_MAP_KW_RE = re.compile(r"(\w+)\(\) got an unexpected keyword argument 'map'")
 
 
 def _cell_arg(v: Any, fname: str, argname: str) -> int:
@@ -1644,109 +1702,23 @@ def _cells_in_burst(x: Any, y: Any, r: Any,
 def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any, *,
                    limit: int = _DEFAULT_CELL_LIMIT,
                    bounds: Optional[Tuple[int, int]] = None) -> list:
-    """cells_in_line(x1, y1, x2, y2): the cells on the straight line from
-    (x1,y1) to (x2,y2) inclusive, via Bresenham's algorithm. Returns a
-    list of (x, y) tuples ordered from start to end. Useful as the basis
-    of a line-of-sight or beam-attack check. With `bounds` (width, height;
+    """cells_in_line(x1, y1, x2, y2): the cells the straight line from the
+    centre of (x1,y1) to the centre of (x2,y2) crosses, both ends included,
+    ordered from start to end — the line has_los, entities_on_los,
+    entities_in_line_ignorelos and !tile line walk (a diagonal step where
+    it passes exactly through a corner). With `bounds` (width, height;
     formulas always pass the map's) only the cells on the map are listed,
     and only those are computed."""
+    from logic import line_cells
     ax = _coord_int(x1, "cells_in_line", "x1")
     ay = _coord_int(y1, "cells_in_line", "y1")
     bx = _coord_int(x2, "cells_in_line", "x2")
     by = _coord_int(y2, "cells_in_line", "y2")
-    dx = abs(bx - ax)
-    dy = abs(by - ay)
-    if bounds is not None:
-        return _bresenham_on_map(ax, ay, bx, by, bounds, limit)
-    _cell_budget(max(dx, dy) + 1, "cells_in_line", limit)
-    sx = 1 if ax < bx else -1
-    sy = 1 if ay < by else -1
-    err = dx - dy
-    out = []
-    cx, cy = ax, ay
-    while True:
-        out.append((cx, cy))
-        if cx == bx and cy == by:
-            break
-        e2 = 2 * err
-        if e2 > -dy:
-            err -= dy
-            cx += sx
-        if e2 < dx:
-            err += dx
-            cy += sy
-    return out
-
-
-def _bresenham_on_map(ax: int, ay: int, bx: int, by: int,
-                      bounds: Tuple[int, int], limit: int) -> list:
-    """The on-map cells of _cells_in_line's Bresenham line, computed without
-    visiting the off-map ones. Step k of that line (k = 0..L along the major
-    axis) is the cell major = a + s*k, minor = b + s'*max(0, ceil((2*dmin*k
-    - dmaj) / (2*dmaj))) — the same cells the step-by-step loop yields. The
-    minor coordinate never goes back, so the steps on the map are one run,
-    found by binary search."""
-    w, h = bounds
-    dx, dy = abs(bx - ax), abs(by - ay)
-    if dx == 0 and dy == 0:
-        return [(ax, ay)] if (1 <= ax <= w and 1 <= ay <= h) else []
-    sx = 1 if ax < bx else -1
-    sy = 1 if ay < by else -1
-    if dx >= dy:
-        a0, sa, amax = ax, sx, w
-        b0, sb, bmax = ay, sy, h
-        dmaj, dmin = dx, dy
-    else:
-        a0, sa, amax = ay, sy, h
-        b0, sb, bmax = ax, sx, w
-        dmaj, dmin = dy, dx
-
-    def minor(k: int) -> int:
-        v = 2 * dmin * k - dmaj
-        return b0 + sb * max(0, -((-v) // (2 * dmaj)))
-
-    def first_k(pred) -> int:
-        # Smallest k in 0..dmaj+1 with pred(k) (pred is monotone).
-        lo, hi = 0, dmaj + 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if pred(mid):
-                hi = mid
-            else:
-                lo = mid + 1
-        return lo
-
-    def inside_major(k: int) -> bool:
-        return 1 <= a0 + sa * k <= amax
-
-    def inside_minor(k: int) -> bool:
-        return 1 <= minor(k) <= bmax
-
-    # Major axis: a0 + sa*k in [1, amax] is an interval of k.
-    if sa > 0:
-        k_lo, k_hi = 1 - a0, amax - a0
-    else:
-        k_lo, k_hi = a0 - amax, a0 - 1
-    k_lo, k_hi = max(k_lo, 0), min(k_hi, dmaj)
-    if k_lo > k_hi:
-        return []
-    # Minor axis: monotone in k, so the k with minor in [1, bmax] form an
-    # interval too. Moving up (sb > 0): below 1 first, then inside, then
-    # above bmax; moving down: the reverse.
-    if sb > 0:
-        m_lo = first_k(lambda k: minor(k) >= 1)
-        m_hi = first_k(lambda k: minor(k) > bmax) - 1
-    else:
-        m_lo = first_k(lambda k: minor(k) <= bmax)
-        m_hi = first_k(lambda k: minor(k) < 1) - 1
-    k_lo, k_hi = max(k_lo, m_lo), min(k_hi, m_hi)
-    if k_lo > k_hi:
-        return []
-    _cell_budget(k_hi - k_lo + 1, "cells_in_line", limit)
-    out = []
-    for k in range(k_lo, k_hi + 1):
-        a, b = a0 + sa * k, minor(k)
-        out.append((a, b) if dx >= dy else (b, a))
+    if bounds is None:
+        _cell_budget(abs(bx - ax) + abs(by - ay) + 1, "cells_in_line", limit)
+        return line_cells(ax, ay, bx, by)
+    out = line_cells(ax, ay, bx, by, bounds)
+    _cell_budget(len(out), "cells_in_line", limit)
     return out
 
 
@@ -2498,10 +2470,6 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "clamp": _clamp,
     "band": _band,
     "sign": _sign,
-    "cells_in_burst": _cells_in_burst,
-    "cells_in_line": _cells_in_line,
-    "cells_in_cone": _cells_in_cone,
-    "cells_in_rect": _cells_in_rect,
     "relative_angle": _relative_angle,
     "coord_x": _coord_x,
     "coord_y": _coord_y,
@@ -2560,6 +2528,8 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
 # But a passive that mutates groups can still cascade indirectly via
 # subsequent commands; that's the GM's problem to design around.
 _MATCH_FUNC_NAMES: Tuple[str, ...] = (
+    # Area builders: the cells of a shape, clipped to the map (map=).
+    "cells_in_burst", "cells_in_line", "cells_in_cone", "cells_in_rect",
     # Maps (multi_map_design §3): a unit's map, the match's map names, and
     # each map's own vars (context map, or map=).
     "map_of", "maps", "map_var_get", "map_var_set", "map_var_del",
@@ -3096,6 +3066,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'zone_size', 'zones_at',
     'zone_tags', 'zone_has_tag', 'zones_with_tag', 'zone_def_of',
     'tile_tags', 'tile_has_tag', 'tiles_with_tag',
+    'cells_in_burst', 'cells_in_line', 'cells_in_cone', 'cells_in_rect',
 })
 # Drift guard (forced classification): the safe and mutating sets must be
 # DISJOINT and together cover EVERY _MATCH_FUNC_NAMES name. Adding a new match
@@ -4634,10 +4605,12 @@ class FormulaEngine:
                                                "*"),
             "__safe_add": _charge_add,
             "__safe_mod": _safe_mod,
-            "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, bounds=_grid(), **k),
-            "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, bounds=_grid(), **k),
-            "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, bounds=_grid(), **k),
-            "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, bounds=_grid(), **k),
+            # (__wrapped__ = the builder, so a coordinate list fills its x /
+            # y slots and !help function shows its parameters.)
+            "cells_in_burst": _wrapping(_cells_in_burst, lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, bounds=_grid(), **k)),
+            "cells_in_line": _wrapping(_cells_in_line, lambda *a, **k: _cells_in_line(*a, limit=cell_limit, bounds=_grid(), **k)),
+            "cells_in_cone": _wrapping(_cells_in_cone, lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, bounds=_grid(), **k)),
+            "cells_in_rect": _wrapping(_cells_in_rect, lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, bounds=_grid(), **k)),
             "range": lambda *a: _charge(_range(*a, limit=size_limit),
                                         "range"),
             "each": lambda v: _charge(_each(v, limit=size_limit), "each"),
@@ -5522,8 +5495,7 @@ class FormulaEngine:
             # The footprint's center CELL (rounding down for even sizes so
             # the result is always a covered integer cell).
             e = _require_e(eid_t, "entity_center")
-            w, h = match.entity_footprint(e)
-            return _unit_cells(e, (e.x + (w - 1) // 2, e.y + (h - 1) // 2))
+            return _unit_cells(e, match.body_center(e))
 
         def _aoe_origin(eid_t: Any) -> tuple:
             """aoe_origin(eid): where an area effect cast by the unit starts:
@@ -5533,9 +5505,8 @@ class FormulaEngine:
             # center cell or its anchor, per the aoe_origin_mode rule.
             e = _require_e(eid_t, "aoe_origin")
             if str(match.rules.get("aoe_origin_mode", "center")) == "anchor":
-                return _unit_cells(e, (e.x, e.y))
-            w, h = match.entity_footprint(e)
-            return _unit_cells(e, (e.x + (w - 1) // 2, e.y + (h - 1) // 2))
+                return _unit_cells(e, match.entity_cells(e)[0])
+            return _unit_cells(e, match.body_center(e))
 
         ns["footprint_width"] = _footprint_width
         ns["footprint_height"] = _footprint_height
@@ -6950,7 +6921,14 @@ class FormulaEngine:
                 args=args_dict, match=match, mgr=mgr_local,
                 ctx=ctx_local,
             )
-            ok, _msg = _sync_dispatch_returning(coro)
+            ok, why = _sync_dispatch_returning(coro)
+            # A status refusing the nested action (forbidden / immune /
+            # the target's tags) is the engine's, worded by its rules: the
+            # body only sees False, so the line reaches the chat. A body's
+            # own fail() stays its own to report.
+            if not ok and isinstance(why, tuple) and len(why) == 2 \
+                    and why[0] in ("forbidden", "immune", "target_tags"):
+                match.surface_log([f"↳ use_action `{name}`: {why[1]}"])
             return ok
 
         def _one_action(eid_t: Any, name: Any, fname: str):
@@ -8079,6 +8057,8 @@ class FormulaEngine:
             tag filter, as [x, y] (sorted by row; loopable)."""
             f = _tag_filter_arg(tag, "tiles_with_tag")
             mp = _cur_map()
+            # It reads every tile with data: charged like an area walk.
+            _cell_budget(len(mp.tiles), "tiles_with_tag", cell_limit)
             return [[x, y] for (x, y) in sorted(mp.tiles,
                                                 key=lambda c: (c[1], c[0]))
                     if tag_filter_matches(match.tile_tags(x, y, mp), f)]
@@ -8852,20 +8832,26 @@ class FormulaEngine:
             # Footprint-aware membership: a large entity is "in" the shape
             # if ANY cell it covers is in cellset (listed once, by anchor).
             # Only units on the shape's map (the formula's map).
+            # Glued parts and hidden riders are left out, as in
+            # entities_in_area / entities_at (reach them with parts() /
+            # riders()).
             mname = (mp or _cur_map()).name
             return [(e.x, e.y, eid) for eid, e in match.entities.items()
                     if e.is_alive and e.map == mname
+                    and not e.is_glued_part and not e.is_hidden_rider
                     and any(c in cellset for c in match.entity_cells(e))]
 
         def _occupants(mp=None) -> dict:
             # Footprint-aware: a large entity registers under EVERY cell it
             # covers, so it's "on the line" / "in the way" if any part of
             # its body is. Consumers dedupe across cells. Only units on map
-            # `mp` (the formula's map by default).
+            # `mp` (the formula's map by default); glued parts and hidden
+            # riders are left out, as in _alive_at.
             mname = (mp or _cur_map()).name
             here: dict = {}
             for eid, e in match.entities.items():
-                if e.is_alive and e.map == mname:
+                if e.is_alive and e.map == mname and not e.is_glued_part \
+                        and not e.is_hidden_rider:
                     for c in match.entity_cells(e):
                         here.setdefault(c, []).append(eid)
             return here
@@ -9918,13 +9904,23 @@ class FormulaEngine:
         # free_cell_near / raycast / cells_in_* equals one read back from a
         # var (stored values are lists, as a save/load makes them).
         coord_params = {}
+        by_name = _COORD_PARAMS_BY_NAME
         for fname in _TUPLE_FREE_FUNCS:
             fn = ns.get(fname)
-            if callable(fn):
+            if fn is None:
+                continue
+            code = getattr(fn, "__code__", fn)
+            hit = by_name.get(fname)
+            if hit is not None and hit[0] is code:
+                params = hit[1]
+            elif callable(fn):
                 params = _coord_pair_params(fn)
-                if params is not None:
-                    coord_params[fname] = params
-                ns[fname] = _lists_out(fn)
+                by_name[fname] = (code, params)
+            else:
+                continue
+            if params is not None:
+                coord_params[fname] = params
+            ns[fname] = _lists_out(fn)
         # `map=` on the unit-less spatial functions (multi_map_design §3):
         # the call runs on that map, and a cell result names it when it
         # isn't the formula's own map.
@@ -9987,6 +9983,7 @@ class FormulaEngine:
                     return fn(*a, **k)
                 args = list(a)
                 maps: List[str] = []
+                pairs = False          # a cell given without a map
                 for xi in xs:
                     if xi < len(args) and _is_coord_value(args[xi]):
                         c = args[xi]
@@ -9994,24 +9991,42 @@ class FormulaEngine:
                         mv = _coord_map(c)
                         if mv is not None:
                             maps.append(mv)
+                        else:
+                            pairs = True
+                    elif xi < len(args):
+                        pairs = True
                 if not maps:
                     return fn(*args, **k)
+                named = None
+                if takes_map:
+                    named = k.get("map")
+                    if named is None and "map" in params:
+                        mi = params.index("map")
+                        named = args[mi] if mi < len(args) else None
+                # A cell without a map is on map= when the call names
+                # one, else on the formula's own map (a cell on another
+                # map carries it, _tag_cells); on neither (several maps, no
+                # hook map) it goes with the others.
+                if named is None:
+                    own = _default_map_name()
+                else:      # a map name ('view' / '@unit' resolve later)
+                    own = named if isinstance(named, str) \
+                        and named in self._match.maps else None
+                if pairs and own is not None and own not in maps:
+                    maps.append(own)
                 if len(set(maps)) > 1:
+                    if fname in _CROSS_MAP_NO_RELATION:
+                        return _own_value(_CROSS_MAP_NO_RELATION[fname])
                     raise FormulaError(
                         f"{fname}(...): the cells name different maps "
                         f"({', '.join(dict.fromkeys(maps))}).")
                 mv = maps[0]
                 if takes_map:
-                    named = k.get("map")
-                    if "map" in params and named is None:
-                        mi = params.index("map")
-                        named = args[mi] if mi < len(args) else None
-                        if named is None and mi < len(args):
-                            args[mi] = mv
-                        elif named is None:
+                    if named is None:
+                        if "map" in params and params.index("map") < len(args):
+                            args[params.index("map")] = mv
+                        else:
                             k["map"] = mv
-                    elif named is None:
-                        k["map"] = mv
                     if named is not None and named != mv:
                         raise FormulaError(
                             f"{fname}(...): the cell is on map `{mv}` and "
@@ -10019,6 +10034,8 @@ class FormulaEngine:
                     return fn(*args, **k)
                 ref = _ref_map(fname, params, args)
                 if ref is not None and ref != mv:
+                    if fname in _CROSS_MAP_NO_RELATION:
+                        return _own_value(_CROSS_MAP_NO_RELATION[fname])
                     raise FormulaError(
                         f"{fname}(...): the cell is on map `{mv}`, and "
                         f"{fname} works on map `{ref}`.")
@@ -10029,8 +10046,7 @@ class FormulaEngine:
             return _call
 
         for fname, params in coord_params.items():
-            xs = [i for i, p in enumerate(params) if p in _X_PARAMS
-                  and i + 1 < len(params) and params[i + 1] == _X_PARAMS[p]]
+            xs = _coord_x_slots(params)
             ns[fname] = _coord_lists(
                 fname, ns[fname], params, xs,
                 "map" in params or fname in _MAP_ARG_FUNCS)
@@ -10251,6 +10267,17 @@ class FormulaEngine:
                 # occupied, a budget exceeded) and its message says what.
                 # "Runtime error:" is kept for raw Python errors.
                 raise FormulaError(str(e))
+            name = getattr(e, "name", None)
+            if isinstance(e, NameError) and name in full_locals:
+                # A name assigned anywhere in a program is its local from
+                # the first line, entity[<name>] included.
+                unit = (f" `entity[{name}]` reads this local too; write "
+                        f"entity['{name}'] for the unit `{name}`."
+                        if self._match is not None
+                        and name in self._match.entities else "")
+                raise FormulaError(
+                    f"`{name}` is used before it is assigned (it is a "
+                    f"local of this formula).{unit}")
             raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
 
 

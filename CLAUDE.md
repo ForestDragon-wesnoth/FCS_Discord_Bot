@@ -688,11 +688,14 @@ supplies in EvalCtx.extras: actor, target, args, changed_key, pov_team,
 tile_x, corpse_id, vehicle, slot, skip_status, event_name, ...),
 `_ENTITY_TOKEN_NAMES` (self / this / current, and `parent` for a body part),
 `known_funcs` (the match's `!func`s), `known_params` (loop variables, and
-locals in action mode).
+the locals of every program).
 
 **`entity[X].path`** reads and writes entity vars. X is a literal id, a token,
 a known param, an action binding or any HOOK_CONTEXT name; any OTHER bare Name
-is read as a LITERAL id (`entity[foo]` = the unit with id "foo"). The path side
+is read as a LITERAL id (`entity[foo]` = the unit with id "foo"). A name the
+program assigns anywhere is its local from the first line, so `entity[b]`
+reads the local `b` (before its assignment: "`b` is used before it is
+assigned", naming `entity['b']` when a unit `b` exists). The path side
 has reserved names (`logic.RESERVED_VAR_PATHS`): `x`, `y` and `name` read the
 unit's position / display name, and nothing can be written at or under them.
 
@@ -1161,7 +1164,10 @@ hardcodes**.
   finite number, default 0; `priority=` on every passive add, `!passive /
   !gpassive / !team passive / !defpassive priority`), ties in the old order
   (globals, team, own, each as added). An own passive is skipped once its
-  unit is gone (ghost firing, §5) (882).
+  unit is gone (ghost firing, §5) (882); once a passive removes or kills
+  the hook's unit, the rest of that hook's passives, global and team
+  ones too, don't run on it, while a hook fired for a unit already gone
+  (on_death, a despawn) still reaches its globals (937).
 - **Var hooks** (`on_var_*`, `on_var_written`, `on_var_write_attempt`): run
   bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
   extras carry changed_key / old_value / new_value / intended_value /
@@ -1587,7 +1593,13 @@ hardcodes**.
   refused and a driver moves its vehicle, as `!ent tp`, 872). `coord_x` /
   `coord_y` read triples, `coord_map` names the map (None for a pair);
   `nearest_cell` / `face_toward` / `clip_cells` honour a triple's map;
-  across maps `can_see` / `has_los` are False and `nearest_cell` None. A
+  across maps `can_see` / `has_los` are False and `nearest_cell` None;
+  the coordinate wrapper answers no relation for cells on two maps (or a
+  cell on another map than the function's unit / zone):
+  `formula._CROSS_MAP_NO_RELATION` (distance / angle / direction_to None,
+  has_los / occupies / cell_in_zone False, the line searches []); the
+  writers and reads with no such answer refuse; an untagged pair is on
+  map= or the formula's own map (936). A
   location target is a `Coord` with `.map` (the actor's, or a triple's
   map via `use_action`; stored as `[x, y, map]` only when it isn't the
   actor's); a body passes `target` whole to a move or a summon, since
@@ -1784,7 +1796,12 @@ hardcodes**.
   judged against the ORIGIN), `entity_distance`, `nearest_cell`,
   `free_cell_near`, `random_cell`, `random_free_cell(..., fit=body|center|any|
   anchor)`, `entities_at`, `cell_entity`, `grid_width/height`, `in_bounds`.
-  Membership in an area = ANY covered cell. Builders are clipped to the map
+  Membership in an area = ANY covered cell. Every area search (burst,
+  rect, cone, line, zone, `!find near:` / `within:`) leaves out glued
+  parts and riders hidden in a vehicle (`formula._alive_at` /
+  `_occupants`; 933). Every line is the sight walk (`logic.line_cells`:
+  cells_in_line, `!map preview line`, `!reveal_fog line`, `!tile line`,
+  has_los, the line searches; 935). Builders are clipped to the map
   and charged to `formula_cell_limit`. `!dist` and `!map preview
   <burst|cone|line|rect>` show the same geometry. Block conditions also
   see the step (`move_dir`, §7.12 "Facing").
@@ -1800,6 +1817,11 @@ hardcodes**.
   parts return their region), `entity_occupies`, `cell_occupant`. Policies
   (user calls, hardcoded): distance = nearest cell; membership (fog, AoE,
   zones, lines) = any cell; outward vision = union of every cell's sight.
+  A region part is measured by its own cells: `Match.body_rects` (one
+  rectangle per row run of its region) behind entity_gap_distance /
+  cell_entity_distance, `entity_occupies` tests its cells, `body_center`
+  (the region cell nearest its box's centre) behind entity_center /
+  aoe_origin; it never is a cell's occupant (its parent is) (934).
 - Movement hooks fire per covered cell (a 2×2 crossing a fire band burns once
   per fire cell). A large corpse keeps one id; its cells derive from its
   stored footprint vars. Prims: `footprint_width/height`, `footprint_cells`,
@@ -1945,7 +1967,11 @@ hardcodes**.
 - **Disguise** (`disguise_var`): `{name, glyph, glyphs, color, vars}` shown
   to viewers outside the unit's team (maps, roster, `!ent info`, `!find`
   rows); mechanics always read the real unit; overlays hidden under a
-  disguise (484-485).
+  disguise (484-485). Its `status` dict stands in for the real statuses
+  (`Match.presented_statuses`: roster, `!ent info`, `!find status:`, and
+  the tags statuses grant; none without the key), and a var-name rule
+  rename moves its `vars` decoys too (`rename_unit_vars`); `!ent info`'s
+  HP / Team read the decoy of the var behind them (940, 942).
 - **Outcome:** `declare_winner` / `!match win`, `match_winner()`,
   `match_over()`; win conditions are composed (watchers, on_death passives),
   never configured.
@@ -1993,7 +2019,8 @@ hardcodes**.
   only). Hooks, look fields and tags are live already. `!match sync
   tiles|zones|all [name] reapply` syncs then reapplies; `!system zone` has
   no reapply (a system's definitions have no zones).
-- **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
+- **Zones:** named cell sets (`!zone ...`; names and definition names
+  take id characters, `check_zone_name`): data, hooks (boundary + per-cell
   + time), dedicated glyph / color / sprite / legend fields, `zone_shift`,
   `zone_*` prims, `zone_distance`; `create_zone` / `delete_zone` in
   formulas.
@@ -2111,8 +2138,14 @@ hardcodes**.
   non-host), `!action` (actor and targets; a corpse target and `!ent
   revive` through `_query_corpse`, 870), `!dist`, `!find`, `!foreach`, `!turn`,
   `!map center/cell`, `!part`, `!mount`, `!action`, `!passive`, `!clamp`,
-  `!mod`, `!schedule`, `!tile info` (corpses inside tile data too);
-  whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
+  `!mod`, `!schedule`, `!tile info` (corpses inside tile data too).
+  Every unit id a NON-HOST's typed command names (any root an override
+  opened: `!part info`, `!status`, `!turn set`, `!mount`, `!template
+  give`, ...) reads through the view in `_resolve_eid`
+  (`_TYPED_UNIT_VIEW`, set by `_run` / `dispatch_no_snapshot`, None for a
+  host and inside an action body; `view=False` for a caller that also
+  takes other words). A glued part shows while the body it sits on shows
+  (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`). `team_data_visibility` (own / all / host)
   filters `!team list/get`. `inline_args_access` closes the `$()` route
@@ -2277,7 +2310,8 @@ hardcodes**.
   holding the system's effective library (`_system_scratch`) and write it
   back. They reach NEW matches only
   (copied at creation, user call; a system macro has no author, so it runs
-  as a host's); `!match sync <aliases|tiles|funcs|statuses|tables|macros|
+  as a host's: promoting a macro a player wrote needs `trust`, after a
+  refusal naming the author and showing the body, 941); `!match sync <aliases|tiles|funcs|statuses|tables|macros|
   zones> [name] | all` copies the system's effective entries over a live match's
   (match-only entries kept, an undo step; a synced status definition
   re-caps live instances like `!status maxlevel`), and `!system <lib>
@@ -2450,9 +2484,14 @@ hardcodes**.
   tile / zone hook or status tick that CRASHED, and a failed disk save each
   record an entry (`crash_ref` / `CrashLog.record`: time, server, match,
   user, the command as typed from the `CRASH_CONTEXT` `_run_top` sets, the
-  traceback with file names only) and the reply names it (`💥 Unexpected
+  traceback with file names only, absolute paths in the message cut to
+  `…/<last part>`) and the reply names it (`💥 Unexpected
   error (ref N)`, `CRASHED (ref N)`). Refs count bot-wide past the owner
-  limit `error_log_entries` (200). `!owner errors [n] | show <ref> | clear`
+  limit `error_log_entries` (200); one server keeps at most
+  `error_log_server_entries` (50) of them; a disk that keeps failing is
+  one entry counting its repeats until a save works
+  (`mgr._save_failure_ref`); a bad `next_ref` counts on from the highest
+  kept ref. `!owner errors [n] | show <ref> | clear`
   (every server), `!server errors [n] | show <ref>` (admin, own server). `!as
   crash [text]` (CLI / harness) raises one on purpose (890).
 - **Other:** `!help find <words>` (commands, subcommands, rules and formula functions),
@@ -2620,7 +2659,14 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
   Definitions (`_collect_definitions`): the tile templates, zone and status
   definitions and `!func`s (called anywhere in the saved strings) its
   contents use that the system lacks or holds differently; all of them
-  with `definitions=all`.
+  with `definitions=all`. Statuses count as used when a unit holds one, a
+  saved string quotes its name (a lava tile's `status_apply(self,
+  'burn', ...)`) or a carried status's removes / blocked_by names it,
+  repeated until nothing new turns up (944). `check_prefab` (import and
+  load) reads corpse bodies and parts as units, refuses part_of /
+  mounted_on / `__follows` loops and checks carried status definitions
+  (stack, tick_when, max_level, hooks, tag filters) and zone definitions
+  (943).
 - **Stamping** (`stamp_prefab`, `!prefab stamp <name> <x> <y> [map=]
   [mode=] [rotate=] [flip=] [team=] [confirm]`, a host command): refused
   unless the match's system is the prefab's or inherits from it
@@ -2672,8 +2718,10 @@ The design is `docs/tags_design.md` (built, PRs 1-3) (919-927).
 - **Filters** (`logic.check_tag_filter`, `tag_filter_matches`): a list
   (or comma / space text) means ANY of its tags; text holding `and` /
   `or` / `not` or a parenthesis is an expression (`not` > `and` > `or`,
-  parsed once and cached, `_parse_tag_expression`). `check_tag` refuses
-  those three words and parentheses as tags. Pure `tags_match(tags,
+  parsed once and cached, `_parse_tag_expression`; `and` / `or` chains
+  are one flat node, nesting at most `TAG_EXPRESSION_DEPTH` (32) deep and
+  `TAG_EXPRESSION_TOKENS` (256) words, 938). `check_tag` refuses
+  those three words, parentheses, brackets and double quotes as tags. Pure `tags_match(tags,
   filter)`. EVERY tag field reads one: zone / tile reads and `tag=`
   filters, `!zone list tag=`, the status tag reads, status `tag:` tokens
   (`tag:(fire and magic)`, a bare `tag:fire` one tag; `!status
@@ -2750,7 +2798,9 @@ The design is `docs/tags_design.md` (built, PRs 1-3) (919-927).
   before / after diff), `_store_template` / `_store_prefab`. Each records
   under the system judging it (a match's own, a scratch match's, None =
   the command's channel system); the command ends with one ⚠️ per system
-  naming the undeclared ones. Spawns, summons, stamps and restores copy
+  naming the undeclared ones, except in a channel with a team POV (a
+  hook may have written them on a unit the view hides). Spawns, summons,
+  stamps and restores copy
   stored data and record nothing. `!system lint` lists undeclared tags
   with where they are once the vocabulary is non-empty
   (`_lint_undeclared_tags`: libraries, the system's matches, its
