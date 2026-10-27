@@ -2458,4 +2458,13 @@ over 40 forms of every root opened to players (0 differences).
     Left as questions: J14, Z1, `!func` bodies for players (L16).
     Answered after the pass: a host's commands keep reaching hidden units
     in a team-view channel, with an optional ⚠️ (`host_reveal_warning`,
-    default off); missing-zone reads answer empty with a ⚠️ (946).
+    default off); missing-zone reads answer empty with a ⚠️ (946); a
+    command reading the prefab library journals what it read (J14,
+    947); deleting a used zone definition detaches its zones (Z1, 904);
+    formula text for players is deferred (§8). L16's premise didn't
+    hold: `!func` has no `show`, and `!func info` was open to players; a
+    player's unknown subcommand was queued for approval, now refused at
+    once (948). Tile facing became materialized (user call): a tile
+    reads only its own `facing`, copied from its template when placed
+    (928, 931). A watcher's effect now journals with its command
+    (`transfer_entity` in a watcher left a replayable-looking `cmd`).

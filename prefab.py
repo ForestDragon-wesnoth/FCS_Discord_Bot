@@ -870,11 +870,6 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
     except Exception:
         _rollback_match(m, None, pre)
         raise
-    # A replay of the command can't redo this without the library's copy
-    # of the prefab as it was: the journal stores the state it left.
-    jstate = logic.JOURNAL_AS_STATE.get()
-    if jstate is not None:
-        jstate[0] = True
     return {"units": roots, "all_units": all_units, "zones": new_zones,
             "renamed": renamed, "log": log, "notes": notes,
             "removed": victims, "size": (W, H)}
@@ -945,9 +940,9 @@ def _merge_definitions(m: Match, pf: Dict[str, Any],
 def _turn_facing(d: Dict[str, Any], turn: Turn,
                  inherited: Optional[Dict[str, Any]]) -> None:
     """Turn a stamped tile's / zone's facing (#257): its own `facing`, or
-    the one it reads from its template / definition (`inherited`), written
-    as its own. A tile or zone with no facing anywhere stays without one
-    (it has no direction to turn)."""
+    for a zone the one it reads from its definition (`inherited`), written
+    as its own. One with no facing stays without one (it has no direction
+    to turn)."""
     if turn.steps == 0 and turn.flip is None:
         return
     f = d.get(logic.FACING_FIELD)
@@ -967,8 +962,7 @@ def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
         if mode == "keep" and has_data:
             continue
         new = copy.deepcopy(tdata)
-        _turn_facing(new, turn, m.tile_templates.get(new.get("_template"))
-                     and m.tile_templates[new["_template"]].data)
+        _turn_facing(new, turn, None)
         if isinstance(old, dict) and old.get("corpses"):
             new["corpses"] = old["corpses"]
         mp.tiles[(cx, cy)] = new

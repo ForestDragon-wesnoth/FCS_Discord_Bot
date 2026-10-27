@@ -29020,13 +29020,20 @@ SCENARIO 904 — Zone definitions: live hooks, look and tags; copied data; minte
 !assert "zone_def_of('acid') == 'miasma'"
 !assert "zone_has_tag('poison_cloud2', 'gas')"
 !zone def del miasma
-?? is used by 3 zone(s)
+?? is used by 3 zone(s): `acid`, `poison_cloud`, `poison_cloud2`.
+?? `!undo command` after the delete brings the definition and the links back.
 !zone def del miasma confirm
-?? (3 zone(s) now orphaned)
+?? (3 zone(s) detached; `!undo command` brings it back)
 !assert "not zone_has_tag('poison_cloud2', 'gas')"
 !assert "zone_get('poison_cloud2', 'dmg') == 5"
 !zone list
-?? def `miasma` (missing)
+?! miasma
+!undo command
+!assert "zone_def_of('acid') == 'miasma' and zone_has_tag('poison_cloud2', 'gas')"
+!zone def del miasma confirm
+!zone def new miasma
+!zone def tags miasma gas
+!assert "zone_def_of('acid') == None and not zone_has_tag('poison_cloud2', 'gas')"
 !zone def new poison_cloud
 !zone new nope def=missing
 ?? No zone definition `missing`
@@ -29041,8 +29048,10 @@ definition's on_enter once and its on_cell_enter once per covered cloud
 cell (two), so hp 30 -> 28. Raising the definition's dmg to 9 leaves the
 existing zones' copied values (2 and 5); a new glyph shows at once; a
 zone's own glyph wins. A rename takes the three zones along; deleting a
-used definition needs `confirm` and orphans them (their own data stays,
-the tags go). With `poison_cloud` and `poison_cloud2` taken, a third
+used definition needs `confirm`, its warning naming the zones and
+`!undo command`, and detaches them (their own data stays, the tags go);
+the undo brings the links back, and after a second delete a new `miasma`
+takes none of them over. With `poison_cloud` and `poison_cloud2` taken, a third
 minted name is `poison_cloud3`.
 
 
@@ -30554,7 +30563,10 @@ SCENARIO 928 — Tile facing: !tile face, templates, per-facing glyphs and sprit
 ?? tile `2,2` at (2,2) — sprite arrow_r, glyph >
 ?? tile `3,2` at (3,2) — sprite arrow_r (mirrored h), glyph <
 !tile face 2 2 -
-?? faces left (its template's, else up)
+?? tile (2,2) has no facing of its own: it faces up.
+!tile def face arrow down
+?? new placements copy it
+!assert "tile_facing(3, 2) == 'left' and tile_facing(2, 2) == 'up'"
 !tile face 2 2 up_left
 ?? ❌ Diagonal facing
 !tile set 4 4 facing sideways
@@ -30580,7 +30592,9 @@ SCENARIO 928 — Tile facing: !tile face, templates, per-facing glyphs and sprit
 !assert "tile_facing(2, 2) == 'up' and tile_facing(3, 2) == 'left'"
 
 Expected: HARNESS-ALLOWS-ERRORS. A tile's facing is its `facing` data, else
-its template's (read live), else up. `!tile face` sets a direction or turns
+up; placing copies the template's facing with its data, so turning the
+template to down leaves the placed tile at (3,2) facing left, and (2,2),
+its own facing dropped, faces up. `!tile face` sets a direction or turns
 one step (cw / ccw), `-` drops it; a diagonal needs allow_diagonal_facing,
 and a stored `facing` must name a direction (`r` is stored as `right`).
 `glyphs.<facing>` / `sprites.<facing>` pick the look: the arrow shows ^ then
@@ -30588,9 +30602,7 @@ and a stored `facing` must name a direction (`r` is stored as `right`).
 the right one mirrored (sprite_mirror horizontal). Placement takes
 `facing=`; face_area turns a rectangle (`-` clears it). tile_face /
 tile_facing are the formula forms; tile_face refuses a bad word and an
-off-map cell. A template's data (its facing too) is copied at
-placement, so clearing the template's facing reaches only the tile that
-reads it live, (2,2), which has no facing of its own.
+off-map cell. Clearing the template's facing changes no placed tile.
 
 SCENARIO 929 — Directional terrain in play: a conveyor, a one-way door, a 2x2 body
 ---------------------------------------------------------------------------------
@@ -30726,9 +30738,9 @@ SCENARIO 931 — Facing turns with a rotated or flipped prefab stamp
 !match new pr Pr 8 8
 !match use pr
 !tile def new arrow
-!tile place arrow 1 1
 !tile def face arrow right
-!assert "not tile_has(1, 1, 'facing') and tile_facing(1, 1) == 'right'"
+!tile place arrow 1 1
+!assert "tile_get(1, 1, 'facing') == 'right'"
 !tile place arrow 2 1 facing=down
 !tile set 3 1 terrain rock
 !zone new vent
@@ -30745,11 +30757,9 @@ SCENARIO 931 — Facing turns with a rotated or flipped prefab stamp
 !assert "tile_facing(3, 6) == 'left' and tile_facing(2, 6) == 'down'"
 
 Expected: HARNESS-ALLOWS-ERRORS. A rotated or flipped stamp turns each
-stamped tile's and zone's facing: its own, or the one it reads from its
-template / definition, written as its own (the arrow at (1,1), which
-reads right from its template live, faces down after a 90° turn and holds
-that as its own data; the one facing down faces
-left; the vent facing left faces up). A tile with no facing anywhere (the
+stamped tile's and zone's facing (the arrow at (1,1), which copied right
+from its template when placed, faces down after a 90° turn; the one
+facing down faces left; the vent facing left faces up). A tile with no facing anywhere (the
 rock) gets none. A horizontal flip mirrors right to left and leaves down.
 
 SCENARIO 932 — Reapply: tile templates and zone definitions push their data
@@ -31394,3 +31404,71 @@ watcher or a passive gave no sign at all. One line per function and name
 per command (a condition read per cell of a render runs one formula per
 cell). zone_exists stays the silent test. A watcher polled after a
 command shows the line with that command's reply.
+
+
+SCENARIO 947 — A journal entry carries the prefabs its command read; a replay stamps from them
+-----------------------------------------------------------------------------------------------
+
+!store save blank947
+!match new j947 Lab 8 8
+!match use j947
+!ent add imp Imp 5 1 1 1
+!prefab save imps 1 1 1 1
+!ent remove imp
+!prefab stamp imps 3 3
+!gpassive add census on_turn_start "match_var_set('lib', prefab_names())"
+!turn next
+!eval "stamp_prefab('imps', 6, 6)"
+!batch !prefab stamp imps 1 8 ; !prefab save imps 6 6 6 6 ; !prefab stamp imps 8 1
+!match journal
+?! stored state after `!prefab stamp
+?! stored state after `!eval
+?! stored state after `!turn
+?? `!prefab stamp imps 3 3`
+?? `!eval stamp_prefab('imps', 6, 6)`
+?? stored state after `!batch prefab stamp imps 1 8 ; prefab save imps 6 6 6 6 ; prefab stamp imps 8 1`
+!match journal export j947.json
+!prefab delete imps
+!store load blank947
+!match replay j947.json
+?? ✅ The state matched the recording after every command.
+!assert "all_entities() == ['imp', 'imp2', 'imp3', 'imp4']"
+!assert "match_var_get('lib') == ['imps'] and prefab_names() == []"
+!assert "entity[imp].x == 3 and entity[imp2].x == 6"
+
+Expected: a command that reads the prefab library (`!prefab stamp`,
+stamp_prefab, prefab_names in a passive, `!map new from=`) is journaled
+as the command, its entry carrying what it read: the name list, and each
+prefab read once per journal segment (a later entry stamping the same
+prefab stores its hash). Before, every such command was stored as the
+whole match state (J14). A command that reads a prefab changed in the
+middle of it (the batch saves `imps` again between two stamps) is still
+stored as its state. The prefab deleted and the server put back to
+empty, the replay stamps from the recorded copies: the same four imps
+where they were, the passive's name list as it was.
+
+
+SCENARIO 948 — A player's unknown subcommand is refused at once
+---------------------------------------------------------------
+
+!match new u948 Lab 6 6
+!match use u948
+!func def dmg a "a * 7 + 3"
+!as player bob
+!func show dmg
+?? ❌ `!func show` isn't a valid command (unknown subcommand, or arguments missing).
+?! needs host approval
+!func info dmg
+?? a * 7 + 3
+!func def dmg2 a "a"
+?? needs host approval
+!as owner
+!pending
+?? r1
+?! show
+
+Expected: HARNESS-ALLOWS-ERRORS. A player's command whose first word is
+none of the command's subcommands is refused with the handler's reply:
+it used to wait in the approval queue, and approving it only produced
+that refusal. A known subcommand that changes the match still waits for
+a host (`r1`, the only request).

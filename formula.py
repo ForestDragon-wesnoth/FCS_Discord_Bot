@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names
 
 
 class FormulaError(VTTError):
@@ -6781,7 +6781,8 @@ class FormulaEngine:
 
         def _tile_facing(x: Any, y: Any) -> str:
             """tile_facing(x, y, map=None): the facing of the tile at (x, y):
-            its `facing` data, else its template's, else 'up'."""
+            its `facing` data (copied from its template when placed), else
+            'up'."""
             x, y = _tile_xy("tile_facing", x, y)
             return match.tile_facing(x, y, _cur_map())
         ns["tile_facing"] = _tile_facing
@@ -7508,22 +7509,16 @@ class FormulaEngine:
         ns["has_template"]         = _has_template
         ns["template_names"]       = _template_names
 
-        def _prefab_read() -> None:
-            # Journals don't carry the prefab library, so a replay couldn't
-            # read what this command read: journal the state it left.
-            jstate = JOURNAL_AS_STATE.get()
-            if jstate is not None:
-                jstate[0] = True
-
         def _prefab_get(fn: str, name: Any) -> Tuple[Any, str, Dict[str, Any]]:
-            _prefab_read()
+            # Read through prefab_read: the command's journal entry records
+            # what it read (journals don't carry the library).
             ws = CURRENT_WORKSPACE.get()
-            lib = getattr(ws, "prefabs", None) or {}
-            if not isinstance(name, str) or name.strip().lower() not in lib:
+            pf = (prefab_read(ws, name.strip().lower())
+                  if isinstance(name, str) else None)
+            if pf is None:
                 raise FormulaError(f"{fn}: this server has no prefab "
                                    f"`{name}` (`!prefab list`).")
-            key_name = name.strip().lower()
-            return ws, key_name, lib[key_name]
+            return ws, name.strip().lower(), pf
 
         def _stamp_prefab(name: Any, x: Any, y: Any, map: Any = None,
                           mode: Any = None, rotate: Any = 0, flip: Any = None,
@@ -7563,9 +7558,7 @@ class FormulaEngine:
         def _prefab_names() -> list:
             """prefab_names(): the server's saved prefab names, sorted.
             Loopable."""
-            _prefab_read()
-            ws = CURRENT_WORKSPACE.get()
-            return sorted(getattr(ws, "prefabs", None) or {})
+            return prefab_read_names(CURRENT_WORKSPACE.get())
 
         def _prefab_size(name: Any) -> list:
             """prefab_size(name): the prefab's [width, height] (before any

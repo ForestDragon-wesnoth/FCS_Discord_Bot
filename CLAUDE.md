@@ -297,7 +297,9 @@ Each of these was learned from a shipped bug.
 - **A command whose effect on a match depends on more than that match**
   (its undo history, a file, another match, a runtime queue): add it to
   `_JOURNAL_STATE_ROOTS` / `_JOURNAL_STATE_SUBS`, so the command journal
-  stores the state it left instead of a command a replay can't redo.
+  stores the state it left instead of a command a replay can't redo; a
+  read of a server library journals don't carry goes through a recorded
+  read instead (`logic.prefab_read`, §7.16).
   Anything a match state names (a generated name, an id) comes from the
   match RNG or a saved counter, never `uuid` / the clock, or every replay
   of it diverges (`sched_<n>` came from uuid). Re-run the replay
@@ -1986,10 +1988,11 @@ hardcodes**.
   `data` overrides fields; mutating) and read it back with
   `tile_template_of(x, y)` (892). `!tile def rename` takes the placed tiles
   along (`Match.rename_tile_template`).
-- **Facing** (#257, 928-931): a tile's facing is its `facing` data (else
-  its template's, read live; data is copied at placement), a zone's its
-  `facing` field (else its definition's, a ZONE_LOOK_FIELDS entry), else
-  `up`; most never set one. `Match.checked_facing` (shared with units:
+- **Facing** (#257, 928-931): a tile's facing is its `facing` data, else
+  `up`: MATERIALIZED (user call), a placement copies the template's facing
+  with its data and a later `!tile def face` reaches placed tiles only
+  through reapply. A zone's is its `facing` field (else its definition's,
+  a ZONE_LOOK_FIELDS entry), else `up`; most never set one. `Match.checked_facing` (shared with units:
   cw / ccw, diagonals need allow_diagonal_facing) behind `!tile face` /
   `face_area`, `!tile def face`, `!system tile face`, `!zone face`, `!zone
   def face`, placement `facing=`, `!tile set ... facing` and tile_set
@@ -2009,8 +2012,8 @@ hardcodes**.
   for a teleport, swap or placement), so a one-way door is `move_dir !=
   tile_facing(tile_x, tile_y)`; `!map cell ... for= dir=` and
   `cell_blocked(..., dir=)` judge a step. A rotated / flipped prefab stamp
-  turns each stamped tile's and zone's facing, own or inherited, written
-  as its own (`prefab._turn_facing`).
+  turns each stamped tile's and zone's facing (a zone's own or its
+  definition's, written as its own; `prefab._turn_facing`).
 - **Reapply** (#258, 932): `!tile def reapply <t> [reset] [map=]`
   (`Match.reapply_tile_template`, every map by default) and `!zone def
   reapply <d> [reset]` (`reapply_zone_definition`): the template's /
@@ -2040,8 +2043,10 @@ hardcodes**.
   (`zone_data_spec`, as a tile reads its template's). A zone without a
   name taken from a definition gets one minted like unit ids
   (`Match.mint_zone_name`: `poison_cloud`, `poison_cloud2`). Rename takes
-  the zones along; deleting a used definition needs `confirm` and orphans
-  them silently (their own data stays). `!zone info` shows what a zone
+  the zones along; deleting a used definition needs `confirm` (the
+  warning names the zones and `!undo command`) and detaches them (`def`
+  cleared, their own data stays), so a later definition of the name takes
+  none of them over (user call, Z1, 904). `!zone info` shows what a zone
   takes from its definition (`from_def`) (904-906).
 - **Tags** on zones and tiles (`normalize_tags`, `check_tag`): a zone's are
   its definition's plus its own (`!zone tags`, `!zone def tags`), a
@@ -2455,12 +2460,18 @@ hardcodes**.
   command is recorded as the command that ran, not the wrapper, via
   `_JOURNALED_IN`; interactive choice answers become `answer=` tokens; the
   author's admin / owner flags as `auth`, and a replay runs the entry with
-  the lower of those and the replayer's),
+  the lower of those and the replayer's; the prefab library reads it
+  made as `prefabs`: `logic.prefab_read` / `prefab_read_names` record
+  into `PREFAB_READS`, which `_run` keeps set through the watcher poll,
+  each prefab stored once per segment and then by hash,
+  `journal.prefab_reads`; a replay reads them through `PREFAB_REPLAY`,
+  947),
   `state` (undo, history restore, `!run`, `!ent transfer`, `!match resume`,
   a command one of whose batch / macro / foreach lines or action `cmd()`
   lines is one of those (`_JOURNAL_AS_STATE`, set in
-  `dispatch_no_snapshot`), or a change made from a channel showing another
-  match, found from the
+  `dispatch_no_snapshot`), a command that read one prefab twice and
+  found it changed between, or a change made from a channel showing
+  another match, found from the
   storage commit's `last_changed`), `systems` (the chain after a
   server-wide edit, when it differs from the last recorded), `template`
   (every library save / rename / delete). A journal starts before a
@@ -2699,9 +2710,9 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
   context var `logic.PLACEMENT_IGNORE`; the saved facing is set after the
   spawn (the spawn-facing rule would replace it). Then a `prefab_stamped`
   event (prefab, x, y, map, units, zones).
-- **Journal:** a stamp, and any formula reading the library
-  (`prefab_names`, `prefab_size`), journals as the state it left
-  (`JOURNAL_AS_STATE`): journals carry no prefab library.
+- **Journal:** journals carry no prefab library; a command reading it
+  (a stamp, `!map new from=`, `prefab_names`, `prefab_size`) is a `cmd`
+  entry carrying what it read (§7.16, 947).
 - **Library** (`MatchManager.prefabs`, `templates/prefabs/<name>.json`,
   its own namespace and trash; `storage.library_dir`, the template file
   helpers' `lib=`): `show <name> [text|image]` (rendered through a scratch
@@ -2848,6 +2859,12 @@ rejected already. Update this section in the PR that resolves an item.
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
   limitation, left as is (user: note it).
+- **Formula text and players** (user: discuss later): every read that
+  prints formula text is open to players today (`!func list` / `info`,
+  `!help function`, `!status info`, `!passive list` / `info`, ...), so a
+  hidden trap passive or a boss's damage `!func` is readable. Raised
+  option: a rule (e.g. `formula_text_visibility` all / host) showing
+  players the name and signature with the body hidden.
 - **Corpse targets and immunity:** `corpse` / `corpse_list` action
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known

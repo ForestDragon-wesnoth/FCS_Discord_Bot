@@ -16,11 +16,11 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, VAR_TRACE
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
-from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
+from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
 from logic import check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
@@ -1023,6 +1023,12 @@ class CommandRegistry:
                 await ctx.send(_INLINE_ARGS_HOST_ONLY)
                 return
         if gate == "queue":
+            # A word the command doesn't take as its subcommand is refused
+            # now: queued, the host would approve only the refusal.
+            unknown = _unknown_subcommand(self, name, args)
+            if unknown:
+                await ctx.send(unknown)
+                return
             return await self._queue_request(name, args, ctx, mgr)
         # gate == "allow" -> fall through and run normally.
 
@@ -1109,6 +1115,8 @@ class CommandRegistry:
         jtoken = _JOURNALED_IN.set(jmine)
         jstate = [False]
         jstate_token = _JOURNAL_AS_STATE.set(jstate)
+        preads: Dict[str, Any] = {}
+        preads_token = PREFAB_READS.set(preads)
         sent_token = MATCHES_SENT_UNITS.set(set())
         _INTERACTIVE_ANSWERS.set([])
         result = None
@@ -1132,6 +1140,7 @@ class CommandRegistry:
                 revealed = []
             _JOURNALED_IN.reset(jtoken)
             _JOURNAL_AS_STATE.reset(jstate_token)
+            PREFAB_READS.reset(preads_token)
             sent = MATCHES_SENT_UNITS.get() or set()
             MATCHES_SENT_UNITS.reset(sent_token)
         if revealed:
@@ -1205,8 +1214,17 @@ class CommandRegistry:
         if poll and mid_now is not None and mid_now in mgr.matches:
             if mgr.matches[mid_now].watchers:
                 post_state = None       # a watcher may change it after
-            for line in mgr.matches[mid_now].fire_watchers():
-                await ctx.send(line)
+            # A watcher's effect is part of this command's journal entry:
+            # what it can't replay (transfer_entity) or the prefabs it
+            # reads go on the entry too.
+            jstate_token = _JOURNAL_AS_STATE.set(jstate)
+            preads_token = PREFAB_READS.set(preads)
+            try:
+                for line in mgr.matches[mid_now].fire_watchers():
+                    await ctx.send(line)
+            finally:
+                _JOURNAL_AS_STATE.reset(jstate_token)
+                PREFAB_READS.reset(preads_token)
             # Nested maps: a wreck marked __delete_when_empty goes once its
             # last unit has left.
             m_now = mgr.matches.get(mid_now)
@@ -1221,7 +1239,8 @@ class CommandRegistry:
             _journal_command(mgr, ctx, jm, pre_active_mid, name, typed,
                              typed_args, jpre, jrng, jmine,
                              str(args[0]).lower() if args else "",
-                             post_state, as_state=jstate[0])
+                             post_state, as_state=jstate[0],
+                             prefab_reads=preads)
         if jparent is not None:
             jparent.update(jmine)
         return result
@@ -1258,10 +1277,11 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
                      jpre: Dict[str, Any], jrng: Tuple[str, int],
                      done: set, sub: str,
                      post: Optional[Dict[str, Any]] = None,
-                     as_state: bool = False) -> None:
+                     as_state: bool = False,
+                     prefab_reads: Optional[Dict[str, Any]] = None) -> None:
     """Journal a command that changed the channel's match `jm`: as the
-    command (replayable from the match) or, for an undo / history restore /
-    `!run` file, as the state it left."""
+    command (replayable from the match, with the prefabs it read) or, for
+    an undo / history restore / `!run` file, as the state it left."""
     post_m = mgr.matches.get(mid)
     if post_m is None:
         # Renamed by the command: the same object under another id.
@@ -1298,6 +1318,8 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
         entry["state"] = journal_state(post)
         if effective_seed(post_m) != jrng[0]:
             entry["rng"][0] = effective_seed(post_m)
+    elif prefab_reads:
+        entry["prefabs"] = journal_prefab_reads(j, prefab_reads)
     j.add(entry)
     done.add(post_m.id)
     handled = getattr(mgr, "_journal_handled", None)
@@ -2042,6 +2064,37 @@ def _stray_words_error(registry: "CommandRegistry", name: str,
                 f"`!help {name}`)")
     return (f"❌ Unexpected `{' '.join(extra)}` — usage: `{shown}`{hint}. "
             f"Quote a value that contains spaces.")
+
+
+def _unknown_subcommand(registry: "CommandRegistry", name: str,
+                        args: List[str]) -> Optional[str]:
+    """The handler's refusal (_help_fallback) for a first word that names
+    none of the command's subcommands, when every form of its usage starts
+    with one; None otherwise."""
+    words = [w for w in args if not _OPTION_WORD.match(w)]
+    if not words:
+        return None
+    meta = registry._help.get(name) or {}
+    subs = meta.get("subs") or {}
+    sub = words[0].lower()
+    if sub in subs or (name, sub) in _SUB_ALIASES:
+        return None
+    tails = _usage_tails(meta.get("usage") or "", name)
+    if not tails:
+        return None
+    for t in tails:
+        toks = _usage_tokens(t)
+        first = toks[0] if toks else ""
+        choice = (first[1:-1].lower().split("|")
+                  if re.fullmatch(r"<\w+(\|\w+)+>", first) else [])
+        if choice and all(w in subs for w in choice):
+            # `<def|del|list|info>`: a choice of the subcommands.
+            continue
+        if _leading_word(t) in (None, sub):
+            return None
+    title, body = registry.help_for([name])
+    return (f"❌ `!{name} {words[0]}` isn't a valid command (unknown "
+            f"subcommand, or arguments missing).\n**{title}**\n{body}")
 
 
 def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
@@ -2894,7 +2947,7 @@ async def _fan_out(ctx: ReplyContext, handler, mgr: "MatchManager",
 
 
 def _map_word_note(m: "Match", *words: Any) -> str:
-    """` \`x\` is a map: a map goes in \`map=x\`.` when a word that didn't
+    """The note " `x` is a map: a map goes in `map=x`." when a word that didn't
     fit a coordinate command's slot names one of the match's maps (a map
     typed after `<x> <y>` the way `!ent tp` takes it)."""
     for w in words:
@@ -6288,14 +6341,17 @@ for _subs, _usage, _desc in (
 
 def _prefab_changed(mgr: MatchManager, name: str, what: str) -> None:
     """A prefab was saved, replaced, renamed or deleted: an audit line.
-    (Journals don't follow the prefab library: a stamp is journaled as the
-    state it left, prefab.stamp_prefab.)"""
+    (Journals don't follow the prefab library: a command's journal entry
+    records the prefabs it read, logic.prefab_read.)"""
     audit_note(f"prefab `{name}` {what}")
 
 
-def _get_prefab(mgr: MatchManager, raw: str) -> Tuple[str, Dict[str, Any]]:
+def _get_prefab(mgr: MatchManager, raw: str,
+                read: bool = False) -> Tuple[str, Dict[str, Any]]:
+    """The prefab `raw` names. `read`: a command putting it into a match
+    reads it through prefab_read, so its journal entry records it."""
     name = check_prefab_name(raw)
-    pf = mgr.prefabs.get(name)
+    pf = prefab_read(mgr, name) if read else mgr.prefabs.get(name)
     if pf is None:
         raise VTTError(f"No prefab `{name}` (`!prefab list`).")
     return name, pf
@@ -6597,7 +6653,7 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                        "prefab stamp")
         m = active_match(mgr, ctx)
         smp = _one_map(ctx, m, opts.get("map"), strict=True)
-        name, pf = _get_prefab(mgr, args[1])
+        name, pf = _get_prefab(mgr, args[1], read=True)
         try:
             x, y = int(args[2]), int(args[3])
             rotate = int(opts.get("rotate", 0))
@@ -7170,6 +7226,7 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
     """Run a journal's entries on match `mid` (see _match_replay)."""
     ran = 0
     first_off: Optional[str] = None
+    prefabs_seen: Dict[str, Any] = {}
     for seg in segs:
         for e in seg.get("entries") or []:
             n = e.get("n")
@@ -7203,11 +7260,15 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                 # Each entry was a top-level command with its own partial
                 # cache, whose template_data budget it spent alone.
                 cache_token = PARTIAL_CACHE.set({})
+                # The prefabs it read, as it read them.
+                pf_token = PREFAB_REPLAY.set(
+                    journal_replay_prefabs(e, prefabs_seen))
                 try:
                     with _channel_pointed_at(mgr, rctx.channel_key, mid):
                         await registry.run(toks[0], toks[1:], rctx, mgr)
                 finally:
                     PARTIAL_CACHE.reset(cache_token)
+                    PREFAB_REPLAY.reset(pf_token)
                 if verbose:
                     out.append(f"#{n} `!{' '.join(toks)}`")
                     out += [f"  {r}" for r in rctx.replies]
@@ -12289,7 +12350,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
             raise VTTError(f"Usage: `{usage}`.")
         opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
                 for a in args[2:]}
-        name, pf = _get_prefab(mgr, opts["from"])
+        name, pf = _get_prefab(mgr, opts["from"], read=True)
         try:
             rotate = int(opts.get("rotate", 0))
         except ValueError:
@@ -16858,8 +16919,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if FACING_FIELD in (mp.tiles.get((x, y)) or {}):
                 mp.tile_del_path(x, y, FACING_FIELD)
             return await ctx.send(
-                f"tile ({x},{y}) faces {m.tile_facing(x, y, mp)} (its "
-                f"template's, else up){_on_map(m, mp)}.")
+                f"tile ({x},{y}) has no facing of its own: it faces up"
+                f"{_on_map(m, mp)}.")
         f = m.tile_face(x, y, args[3], mp)
         return await ctx.send(f"tile ({x},{y}) faces {f}{_on_map(m, mp)}.")
     if sub == "face_area":
@@ -17164,7 +17225,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         if dsub == "face":
             # !tile def face <name> <dir|->  (#257): the template's facing
-            # data, read live by tiles without their own.
+            # data, copied into tiles placed from it.
             if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
                 return
             _check_tail(args, 4, (), "!tile def face <name> <dir|->")
@@ -17175,13 +17236,13 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if args[3] in _FACING_CLEAR:
                 data.pop(FACING_FIELD, None)
                 return await ctx.send(f"Cleared template `{name}`'s facing "
-                                      f"(its tiles without their own face "
-                                      f"up).")
+                                      f"(new placements face up; placed "
+                                      f"tiles keep theirs).")
             data[FACING_FIELD] = m.checked_facing(args[3])
             return await ctx.send(
                 f"template `{name}` faces {data[FACING_FIELD]} (new placements "
-                f"copy it; placed tiles without their own facing read it; "
-                f"`!tile def reapply {name}` pushes it to the rest).")
+                f"copy it; `!tile def reapply {name}` pushes it to the tiles "
+                f"placed already).")
 
         if dsub == "reapply":
             # !tile def reapply <name> [reset] [map=<map>|all]  (#258)
@@ -17804,8 +17865,8 @@ registry.annotate_sub(
         "hook edits propagate to all placed instances); so are its "
         "`tags` (`tags <name> <tag ...>`, `-` clears), which a placed "
         "tile carries with its own `tags` data (tile_has_tag, "
-        "tiles_with_tag). `face` sets the template's facing, read by placed "
-        "tiles without their own (#257). `reapply` pushes the template's "
+        "tiles_with_tag). `face` sets the template's facing, copied into the "
+        "tiles placed from it like its data (#257). `reapply` pushes the template's "
         "data to its placed tiles on every map (or map=): its keys "
         "overwrite theirs, their other keys stay; `reset` makes each tile's "
         "data a copy of the template's again (corpses stay). `rename` "
@@ -17821,7 +17882,8 @@ registry.annotate_sub(
     desc=(
         "Turn the tile at (x, y) to a direction, or one step with cw / ccw "
         "(diagonals need allow_diagonal_facing): its `facing` data. `-` "
-        "drops it, so the tile faces as its template does, else up. Most "
+        "drops it, so the tile faces up. A tile placed from a template "
+        "copies the template's facing with its data. Most "
         "tiles never need one; it is for directional terrain (a conveyor, "
         "an arrow trap, a one-way door): tile_facing reads it, "
         "`glyphs.<facing>` / `sprites.<facing>` data draws it, block "
@@ -18741,13 +18803,22 @@ async def _zone_def_cmd(ctx: ReplyContext, args: List[str], m: Match):
         if used and not extra:
             return await ctx.send(
                 f"⚠️ zone definition `{name}` is used by {len(used)} "
-                f"zone(s). Deleting it leaves them orphaned: they keep their "
-                f"own data and settings, and lose the definition's hooks, "
-                f"look and tags. To proceed: `!zone def {dsub} {name} "
-                f"confirm`.")
+                f"zone(s): " + ", ".join(f"`{z}`" for z in used[:10])
+                + (" ..." if len(used) > 10 else "")
+                + f". Deleting it detaches them: they keep their own data "
+                f"and settings, lose the definition's hooks, look and tags, "
+                f"and no longer name it (a later definition of that name "
+                f"won't take them over). `!undo command` after the delete "
+                f"brings the definition and the links back. To proceed: "
+                f"`!zone def {dsub} {name} confirm`.")
         del m.zone_definitions[name]
+        # Detached: a zone still naming it would take over whatever
+        # definition is next made under the name.
+        for z in used:
+            m.set_zone_def(z, None)
         return await ctx.send(f"Deleted zone definition `{name}`"
-                              + (f" ({len(used)} zone(s) now orphaned)."
+                              + (f" ({len(used)} zone(s) detached; "
+                                 f"`!undo command` brings it back)."
                                  if used else "."))
     reply = await _zone_def_sub(ctx, args[1:], m, "!zone def {sub}",
                                 _match_program_check(m))
@@ -19891,8 +19962,9 @@ registry.annotate_sub(
         "`reapply` pushes its data to its zones (its keys overwrite theirs, "
         "their other keys stay; `reset` makes their data a copy of it). "
         "Deleting a definition zones use "
-        "needs `confirm` and leaves them orphaned (they keep their own data "
-        "and settings). `rename` takes its zones along. A system holds "
+        "needs `confirm` and detaches them (they keep their own data and "
+        "settings and stop naming it; `!undo command` brings it back). "
+        "`rename` takes its zones along. A system holds "
         "definitions too (`!system zone`), copied into new matches; `!match "
         "sync zones` brings a live match up to date."
     ),

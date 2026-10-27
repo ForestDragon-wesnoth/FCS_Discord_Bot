@@ -37,6 +37,59 @@ COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
 JOURNAL_AS_STATE: "contextvars.ContextVar[Optional[list]]" = (
     contextvars.ContextVar("vtt_journal_as_state", default=None))
 
+# The prefab library reads of the running command (CommandRegistry._run
+# sets a dict): `names` the name list it read, `data` each prefab it read
+# by name (None = the library had none). Journals don't carry the library,
+# so the command's journal entry carries these, and a replay of the entry
+# sets PREFAB_REPLAY to them, read in place of the library.
+PREFAB_READS: "contextvars.ContextVar[Optional[dict]]" = (
+    contextvars.ContextVar("vtt_prefab_reads", default=None))
+PREFAB_REPLAY: "contextvars.ContextVar[Optional[dict]]" = (
+    contextvars.ContextVar("vtt_prefab_replay", default=None))
+
+
+def prefab_read(ws: Any, name: str) -> Optional[Dict[str, Any]]:
+    """The server's prefab `name` (None when it has none) as the running
+    command reads it: recorded for its journal entry, the recorded copy
+    while a replay runs the entry. A command that reads one prefab twice
+    and finds it changed between is journaled as the state it left."""
+    rep = PREFAB_REPLAY.get()
+    if rep is not None and name in (rep.get("data") or {}):
+        pf = rep["data"][name]
+    else:
+        pf = (getattr(ws, "prefabs", None) or {}).get(name)
+    reads = PREFAB_READS.get()
+    if reads is not None:
+        data = reads.setdefault("data", {})
+        if name not in data:
+            data[name] = pf
+        elif data[name] is not pf:
+            _journal_as_state()
+    return pf
+
+
+def prefab_read_names(ws: Any) -> List[str]:
+    """The server's prefab names, sorted, read like prefab_read."""
+    rep = PREFAB_REPLAY.get()
+    if rep is not None and "names" in rep:
+        names = list(rep["names"])
+    else:
+        names = sorted(getattr(ws, "prefabs", None) or {})
+    reads = PREFAB_READS.get()
+    if reads is not None:
+        if "names" not in reads:
+            reads["names"] = list(names)
+        elif reads["names"] != names:
+            _journal_as_state()
+    return names
+
+
+def _journal_as_state() -> None:
+    jstate = JOURNAL_AS_STATE.get()
+    if jstate is not None:
+        jstate[0] = True
+
+
 # Ids of the matches the running command sent units out of with
 # transfer_entity: their undo step says it only undoes their side.
 MATCHES_SENT_UNITS: "contextvars.ContextVar[Optional[set]]" = (
@@ -22423,12 +22476,11 @@ class Match:
 
     def tile_facing(self, x: int, y: int, mp: "Map") -> Direction:
         """The facing of the tile at (x, y) of map `mp`: its `facing` data,
-        else its template's, else `up`."""
-        for src in self._tile_look_sources(x, y, mp):
-            f = src.get(FACING_FIELD)
-            if isinstance(f, str) and f in ALLOWED_DIRECTIONS:
-                return f
-        return "up"
+        else `up`. Materialized (user call): placement copies a template's
+        facing with its data, and a later template facing reaches placed
+        tiles only through `!tile def reapply`."""
+        f = (mp.tiles.get((x, y)) or {}).get(FACING_FIELD)
+        return f if isinstance(f, str) and f in ALLOWED_DIRECTIONS else "up"
 
     def tile_data_value(self, path: str, value: Any) -> Any:
         """`value` for tile data `path` as a command or formula stores it: a
