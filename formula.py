@@ -6799,8 +6799,8 @@ class FormulaEngine:
         ns["tile_face"] = _tile_face
 
         def _zone_facing(name: Any) -> str:
-            """zone_facing(zone): the zone's facing: its own, else its zone
-            definition's, else 'up'."""
+            """zone_facing(zone): the zone's facing (copied from its zone
+            definition when made), else 'up'."""
             if not isinstance(name, str) or match.find_zone(name) is None:
                 raise FormulaError(f"zone_facing: no zone {name!r}.")
             return match.zone_facing(name)

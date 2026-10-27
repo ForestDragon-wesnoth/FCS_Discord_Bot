@@ -6064,9 +6064,10 @@ class SpecialTileTemplate:
 # Zone DEFINITIONS describe a kind of zone once (`poison_cloud`), the way a
 # tile template describes a kind of tile. A zone naming one (its `def`
 # field) reads the definition's hooks, look fields (ZONE_LOOK_FIELDS) and
-# tags LIVE, its own value winning; the definition's `data` is copied into
-# the zone when it is made (and read through for `block` / `opaque` when the
-# zone's data lacks them, as a tile reads its template's). The tile-template
+# tags LIVE, its own value winning; the definition's `data` and `facing` are
+# copied into the zone when it is made (data read through for `block` /
+# `opaque` when the zone's data lacks them, as a tile reads its template's;
+# facing materialized like a unit's, user call). The tile-template
 # pattern, so the two map features with definitions behave alike. Stored as
 # plain dicts in Match.zone_definitions (and a system library), in the
 # shape normalize_zone_def gives.
@@ -9488,10 +9489,12 @@ class Match:
 
     def zone_look(self, z: Any, key: str) -> Any:
         """Zone dict `z`'s look field `key` (ZONE_LOOK_FIELDS): its own, else
-        its definition's, else None."""
+        its definition's, else None. `facing` is the zone's own only: it is
+        copied from the definition when the zone is made."""
         if not isinstance(z, dict):
             return None
-        for src in (z, self.zone_def_dict(z) or {}):
+        srcs = (z,) if key == FACING_FIELD else (z, self.zone_def_dict(z) or {})
+        for src in srcs:
             if zone_look_value(key, src.get(key)):
                 return src[key]
         return None
@@ -9561,12 +9564,14 @@ class Match:
         z = self.create_zone(name, mp)
         z["def"] = definition
         z["data"] = copy.deepcopy(d.get("data") or {})
+        if zone_look_value(FACING_FIELD, d.get(FACING_FIELD)):
+            z[FACING_FIELD] = d[FACING_FIELD]
         return name
 
     def set_zone_def(self, name: str, definition: Optional[str]) -> int:
         """Attach zone definition `definition` to zone `name` (its data keys
-        the zone lacks are copied in) or, with None, detach it. Returns the
-        number of data keys copied."""
+        the zone lacks are copied in, and its facing when the zone has none)
+        or, with None, detach it. Returns the number of data keys copied."""
         z = self.find_zone(name)
         if z is None:
             raise NotFound(f"Zone '{name}' not found.")
@@ -9577,6 +9582,9 @@ class Match:
         if d is None:
             raise NotFound(f"No zone definition `{definition}`.")
         z["def"] = definition
+        if (FACING_FIELD not in z
+                and zone_look_value(FACING_FIELD, d.get(FACING_FIELD))):
+            z[FACING_FIELD] = d[FACING_FIELD]
         data = z.setdefault("data", {})
         n = 0
         for k, v in (d.get("data") or {}).items():
@@ -9595,11 +9603,12 @@ class Match:
 
     def reapply_zone_definition(self, definition: str,
                                 reset: bool = False) -> List[str]:
-        """Push zone definition `definition`'s data to every zone naming it
-        (#258): its keys overwrite the zone's same keys, the zone's other
-        keys stay; with `reset` the zone's data becomes a copy of the
-        definition's. Hooks, look fields and tags are read live already.
-        Returns the zones whose data changed."""
+        """Push zone definition `definition`'s data and facing to every zone
+        naming it (#258): its keys overwrite the zone's same keys, the
+        zone's other keys stay; with `reset` the zone's data becomes a copy
+        of the definition's and its facing the definition's (none when it
+        has none). Hooks, the other look fields and tags are read live
+        already. Returns the zones that changed."""
         d = self.zone_definitions.get(definition)
         if d is None:
             raise NotFound(f"No zone definition `{definition}`.")
@@ -9613,9 +9622,17 @@ class Match:
             else:
                 new = copy.deepcopy(old)
                 new.update(copy.deepcopy(ddata))
-            if new != old:
+            dface = d.get(FACING_FIELD)
+            dface = dface if zone_look_value(FACING_FIELD, dface) else None
+            face = dface if dface is not None or reset \
+                else z.get(FACING_FIELD)
+            if new != old or face != z.get(FACING_FIELD):
                 note_stored_tags(self.system_name, old, new)
                 z["data"] = new
+                if face is None:
+                    z.pop(FACING_FIELD, None)
+                else:
+                    z[FACING_FIELD] = face
                 changed.append(name)
         return changed
 
@@ -13447,19 +13464,20 @@ class Match:
         return tpl
 
     def undefine_tile_template(self, name: str) -> int:
-        """Remove a template. Returns the number of placed instances
-        that referenced it (now orphaned — they still exist as tiles
-        with a `_template` field pointing at a missing definition;
-        fire_tile_hook finds no template hook for them and no-ops)."""
+        """Remove a template and detach its placed tiles (user call): each
+        keeps its own data and loses `_template`, so a later template of
+        the same name takes none of them over. Returns how many were
+        detached."""
         if name not in self.tile_templates:
             raise NotFound(f"tile template '{name}' not found.")
         del self.tile_templates[name]
-        orphan_count = 0
+        detached = 0
         for mp in self.maps.values():
-            for tile in mp.tiles.values():
+            for (x, y), tile in list(mp.tiles.items()):
                 if isinstance(tile, dict) and tile.get("_template") == name:
-                    orphan_count += 1
-        return orphan_count
+                    mp.tile_del_path(x, y, "_template")
+                    detached += 1
+        return detached
 
     def place_tile_template(
         self, name: str, x: int, y: int,
@@ -22499,8 +22517,8 @@ class Match:
 
     def zone_facing(self, name: str, mp: Optional["Map"] = None
                     ) -> Direction:
-        """The facing of zone `name`: its own, else its definition's, else
-        `up`."""
+        """The facing of zone `name`: its own (copied from its definition
+        when made), else `up`."""
         z = (mp.zones.get(name) if mp is not None else self.find_zone(name))
         f = self.zone_look(z, FACING_FIELD)
         return f if isinstance(f, str) else "up"

@@ -4164,8 +4164,8 @@ per-firing-tile so the formula doesn't need to know which member
 triggered it.
 
 
-SCENARIO 188 — Orphaned instances after template deletion no-op silently
--------------------------------------------------------------------------
+SCENARIO 188 — Deleting a used tile template detaches its placed tiles
+-----------------------------------------------------------------------
 
 !match new mtpl7 Orphans 8 8
 !match use mtpl7
@@ -4175,24 +4175,31 @@ SCENARIO 188 — Orphaned instances after template deletion no-op silently
 !tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
 !tile place flame 3 3
 !tile def del flame
+?? still has 1 placed instance(s)
+?? `!undo command` after the delete brings the template and the links back.
 !tile def del flame confirm
+?? Deleted template `flame` (1 placed tile(s) detached; `!undo command` brings it back).
 !tile info 3 3
+?! _template
+?? burn_damage
+!undo command
+!assert "tile_template_of(3, 3) == 'flame'"
+!tile def list
+?? flame
+!tile def del flame confirm
+!tile def new flame
+!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - 40'
 !ent tp hero 3 3
-!ent info hero
+!assert "entity[hero].hp == 50 and tile_template_of(3, 3) == None"
 
 Expected: `!tile def del flame` without `confirm` warns the GM
-that 1 placed instance still exists. With `confirm` it deletes
-the template, leaving the placed instance as an "orphan" — the
-tile dict still has `_template: "flame"` and its data fields,
-but the template definition is gone.
-
-Stepping onto an orphaned tile silently no-ops the hook lookup.
-No warning spam (a 4-step move through 4 orphan tiles would
-otherwise produce 8+ warning lines; the GM was already warned
-once at delete-confirm time so we don't re-warn per-fire). Hero
-hp stays at 50. `!tile info 3 3` still shows the dangling
-`_template` field so the GM can audit and either redefine the
-template or `!tile del 3 3` to clean up.
+that 1 placed instance still exists, naming `!undo command`. With
+`confirm` it deletes the template and detaches the placed tile: it
+keeps its data (burn_damage) and loses `_template` (user call, the
+zone-definition rule). The undo brings the template and the link
+back. After a second delete, a new `flame` template with a harsher
+hook takes none of the old tiles over: the hero steps on (3,3) and
+keeps 50 hp.
 
 
 SCENARIO 189 — Tile templates persist through save/load
@@ -30683,11 +30690,19 @@ SCENARIO 930 — Zone facing: !zone face, definitions, per-facing looks, one-way
 !zone info gust
 ?? "facing": "right"
 !zone face gust -
-?? faces left again
+?? Zone `gust` has no facing of its own: it faces up.
 !zone def face wind up_right
 ?? ❌ Diagonal facing
 !eval "zone_face('gust', 'ccw')"
-?? = `'down'`
+?? = `'left'`
+!zone def face wind down
+?? new zones of it copy it
+!assert "zone_facing('gust') == 'left'"
+!zone info gust
+?! "facing": "down"
+!zone def reapply wind
+?? 1 of 1 zone(s) changed
+!assert "zone_facing('gust') == 'down'"
 !eval "zone_facing('nope')"
 ?? ❌
 !zone sprite gust breeze_up up
@@ -30721,8 +30736,10 @@ SCENARIO 930 — Zone facing: !zone face, definitions, per-facing looks, one-way
 ?? "glyphs"
 
 Expected: HARNESS-ALLOWS-ERRORS. A zone's facing is its own `facing`, else
-its definition's (live), else up; `!zone face` / `!zone def face` set it,
-`-` drops a zone's own. `!zone glyph` / `!zone sprite` (and the definition
+up; a zone made from a definition copies the definition's facing (gust
+starts facing left), `!zone face` sets it, `-` drops it (up). Turning the
+definition down later leaves gust facing left; `!zone def reapply` pushes
+the definition's facing with its data. `!zone glyph` / `!zone sprite` (and the definition
 forms) take a facing for a per-facing look, before the plain one; a
 missing facing borrows another mirrored per the `sprite_mirror` data (zone,
 definition) or rule: facing down, the up sprite shows only once the zone's

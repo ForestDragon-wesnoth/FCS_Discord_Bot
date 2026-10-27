@@ -937,17 +937,12 @@ def _merge_definitions(m: Match, pf: Dict[str, Any],
                        "kept.")
 
 
-def _turn_facing(d: Dict[str, Any], turn: Turn,
-                 inherited: Optional[Dict[str, Any]]) -> None:
-    """Turn a stamped tile's / zone's facing (#257): its own `facing`, or
-    for a zone the one it reads from its definition (`inherited`), written
-    as its own. One with no facing stays without one (it has no direction
-    to turn)."""
+def _turn_facing(d: Dict[str, Any], turn: Turn) -> None:
+    """Turn a stamped tile's / zone's `facing` (#257). One with no facing
+    stays without one (it has no direction to turn)."""
     if turn.steps == 0 and turn.flip is None:
         return
     f = d.get(logic.FACING_FIELD)
-    if not (isinstance(f, str) and f in logic.ALLOWED_DIRECTIONS):
-        f = (inherited or {}).get(logic.FACING_FIELD)
     if isinstance(f, str) and f in logic.ALLOWED_DIRECTIONS:
         d[logic.FACING_FIELD] = turn.facing(f)
 
@@ -962,7 +957,7 @@ def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
         if mode == "keep" and has_data:
             continue
         new = copy.deepcopy(tdata)
-        _turn_facing(new, turn, None)
+        _turn_facing(new, turn)
         if isinstance(old, dict) and old.get("corpses"):
             new["corpses"] = old["corpses"]
         mp.tiles[(cx, cy)] = new
@@ -1087,7 +1082,7 @@ def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
             if mp.in_bounds(x + nx, y + ny):
                 cells.add((x + nx, y + ny))
         z["cells"] = cells
-        _turn_facing(z, turn, m.zone_def_dict(z))
+        _turn_facing(z, turn)
         new = m.mint_zone_name(zname)
         if new != zname:
             renamed[zname] = new

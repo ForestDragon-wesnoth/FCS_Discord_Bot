@@ -2466,5 +2466,7 @@ over 40 forms of every root opened to players (0 differences).
     player's unknown subcommand was queued for approval, now refused at
     once (948). Tile facing became materialized (user call): a tile
     reads only its own `facing`, copied from its template when placed
-    (928, 931). A watcher's effect now journals with its command
+    (928, 931), and so did zone facing, copied from the definition when
+    a zone is made (930); deleting a used tile template detaches its
+    tiles like Z1 (188). A watcher's effect now journals with its command
     (`transfer_entity` in a watcher left a replayable-looking `cmd`).

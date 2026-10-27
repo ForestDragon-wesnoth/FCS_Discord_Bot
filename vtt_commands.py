@@ -17327,14 +17327,18 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if instance_count and not confirmed:
                 return await ctx.send(
                     f"⚠️ template `{name}` still has {instance_count} "
-                    f"placed instance(s). Deleting it leaves them "
-                    f"orphaned (hooks will warn at fire time). "
-                    f"To proceed: `!tile def del {name} confirm`."
+                    f"placed instance(s). Deleting it detaches them: they "
+                    f"keep their own data, lose the template's hooks, look, "
+                    f"block / opaque and tags, and no longer name it (a "
+                    f"later template of that name won't take them over). "
+                    f"`!undo command` after the delete brings the template "
+                    f"and the links back. To proceed: "
+                    f"`!tile def del {name} confirm`."
                 )
-            orphaned = m.undefine_tile_template(name)
+            detached = m.undefine_tile_template(name)
             extra = (
-                f" ({orphaned} placed instance(s) now orphaned)"
-                if orphaned else ""
+                f" ({detached} placed tile(s) detached; `!undo command` "
+                f"brings it back)" if detached else ""
             )
             return await ctx.send(f"Deleted template `{name}`{extra}.")
 
@@ -17872,8 +17876,9 @@ registry.annotate_sub(
         "data a copy of the template's again (corpses stay). `rename` "
         "takes the placed tiles along. Deleting a "
         "template that still has placed instances requires the "
-        "trailing `confirm` token — orphaned instances keep their data "
-        "and lose the template's hooks and tags."
+        "trailing `confirm` token and detaches them: they keep their data, "
+        "lose the template's hooks, look and tags, and stop naming it "
+        "(`!undo command` brings it back)."
     ),
 )
 registry.annotate_sub(
@@ -18301,8 +18306,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if args[2] in _FACING_CLEAR:
             z.pop(FACING_FIELD, None)
             return await ctx.send(
-                f"Zone `{name}` faces {m.zone_facing(name)} again (its "
-                f"definition's, else up).")
+                f"Zone `{name}` has no facing of its own: it faces up.")
         return await ctx.send(f"Zone `{name}` faces "
                               f"{m.zone_face(name, args[2])}.")
 
@@ -18421,7 +18425,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if hk:
                     inh["hooks"] = hk
                 for key in ZONE_LOOK_FIELDS:
-                    if key in d and key not in view:
+                    if key in d and key not in view and key != FACING_FIELD:
                         inh[key] = d[key]
                 if d.get("tags"):
                     inh["tags"] = list(d["tags"])
@@ -18647,7 +18651,8 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         raise NotFound(f"No zone definition `{name}`. Make it with "
                        f"`{prefix.format(sub='new')} {name}`.")
     if sub == "reapply":
-        # #258: the definition's data pushed to its zones. Not in `!system
+        # #258: the definition's data and facing pushed to its zones. Not
+        # in `!system
         # zone`'s usage: a system's definitions have no zones (`!match sync
         # zones ... reapply`).
         _check_tail(args, 3, ("reset",), prefix.format(sub="reapply")
@@ -18655,7 +18660,7 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         reset = len(args) > 2
         changed = m.reapply_zone_definition(name, reset=reset)
         n_all = len(m.zones_using_def(name))
-        return (f"Reapplied zone definition `{name}`'s data"
+        return (f"Reapplied zone definition `{name}`'s data and facing"
                 + (" (reset)" if reset else "") + f": {len(changed)} of "
                 f"{n_all} zone(s) changed"
                 + (": " + ", ".join(f"`{c}`" for c in changed)
@@ -18665,12 +18670,12 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
                     + " <name> <dir|->")
         if args[2] in _FACING_CLEAR:
             d.pop(FACING_FIELD, None)
-            return (f"Cleared zone definition `{name}`'s facing (its zones "
-                    f"without their own face up).")
+            return (f"Cleared zone definition `{name}`'s facing (new zones "
+                    f"of it face up; its zones keep theirs).")
         canon = m.checked_facing(args[2])
         d[FACING_FIELD] = canon
-        return (f"zone definition `{name}` faces {canon} (zones of it "
-                f"without their own facing face {canon}).")
+        return (f"zone definition `{name}` faces {canon} (new zones of it "
+                f"copy it; `reapply` pushes it to its zones).")
     if sub in ("glyph", "sprite"):
         _check_tail(args, 4, (), prefix.format(sub=sub)
                     + f" <name> <{'char' if sub == 'glyph' else 'key'}|-> "
@@ -19957,10 +19962,12 @@ registry.annotate_sub(
         "data edit reaches only zones made afterwards), and its `block` / "
         "`opaque` data is read when the zone's data lacks them. Checks that "
         "care about the kind of zone read the tags or zone_def_of(zone); "
-        "only \"which zone\" needs its name. `face` gives its zones a facing "
-        "(and `glyph` / `sprite` take a facing for a per-facing look); "
-        "`reapply` pushes its data to its zones (its keys overwrite theirs, "
-        "their other keys stay; `reset` makes their data a copy of it). "
+        "only \"which zone\" needs its name. `face` gives NEW zones of it "
+        "a facing, copied like its data (and `glyph` / `sprite` take a "
+        "facing for a per-facing look); `reapply` pushes its data and "
+        "facing to its zones (its keys overwrite theirs, their other keys "
+        "stay; `reset` makes their data a copy of it and their facing "
+        "its). "
         "Deleting a definition zones use "
         "needs `confirm` and detaches them (they keep their own data and "
         "settings and stop naming it; `!undo command` brings it back). "
@@ -20054,8 +20061,9 @@ registry.annotate_sub(
     usage="!zone face <name> <dir|cw|ccw|->",
     desc=(
         "Turn a zone to a direction, or one step with cw / ccw (diagonals "
-        "need allow_diagonal_facing); `-` drops its own facing, so it "
-        "faces as its definition does, else up. Read with zone_facing; "
+        "need allow_diagonal_facing); `-` drops its facing, so it faces "
+        "up. A zone made from a definition copies the definition's facing. "
+        "Read with zone_facing; "
         "picks the zone's per-facing glyph / sprite; turned by a rotated "
         "prefab stamp."
     ),

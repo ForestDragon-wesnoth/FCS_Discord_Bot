@@ -1987,12 +1987,19 @@ hardcodes**.
   x, y, data=None)` (`!tile place`: replaces the cell's data, corpses stay,
   `data` overrides fields; mutating) and read it back with
   `tile_template_of(x, y)` (892). `!tile def rename` takes the placed tiles
-  along (`Match.rename_tile_template`).
+  along (`Match.rename_tile_template`); deleting a used template needs
+  `confirm` and detaches them (`_template` cleared, their data stays, so
+  a later template of the name takes none of them over;
+  `undefine_tile_template`, user call, 188).
 - **Facing** (#257, 928-931): a tile's facing is its `facing` data, else
-  `up`: MATERIALIZED (user call), a placement copies the template's facing
-  with its data and a later `!tile def face` reaches placed tiles only
-  through reapply. A zone's is its `facing` field (else its definition's,
-  a ZONE_LOOK_FIELDS entry), else `up`; most never set one. `Match.checked_facing` (shared with units:
+  `up`, a zone's its `facing` field, else `up`; most never set one.
+  MATERIALIZED (user call: facing is a default or a value of the thing
+  itself, like a unit's hp / x / y / facing): a placement copies the
+  template's facing with its data, a zone made from a definition
+  (`create_zone_from_def`, `setdef` when it has none) copies the
+  definition's, and a later `!tile def face` / `!zone def face` reaches
+  existing ones only through reapply (`Match.zone_look` never reads a
+  definition's facing). `Match.checked_facing` (shared with units:
   cw / ccw, diagonals need allow_diagonal_facing) behind `!tile face` /
   `face_area`, `!tile def face`, `!system tile face`, `!zone face`, `!zone
   def face`, placement `facing=`, `!tile set ... facing` and tile_set
@@ -2012,14 +2019,14 @@ hardcodes**.
   for a teleport, swap or placement), so a one-way door is `move_dir !=
   tile_facing(tile_x, tile_y)`; `!map cell ... for= dir=` and
   `cell_blocked(..., dir=)` judge a step. A rotated / flipped prefab stamp
-  turns each stamped tile's and zone's facing (a zone's own or its
-  definition's, written as its own; `prefab._turn_facing`).
+  turns each stamped tile's and zone's facing (`prefab._turn_facing`).
 - **Reapply** (#258, 932): `!tile def reapply <t> [reset] [map=]`
   (`Match.reapply_tile_template`, every map by default) and `!zone def
   reapply <d> [reset]` (`reapply_zone_definition`): the template's /
   definition's data keys overwrite the tile's / zone's same keys, the
   others stay; `reset` makes the data a copy (a tile keeps its corpses
-  only). Hooks, look fields and tags are live already. `!match sync
+  only). A zone definition pushes its facing too (a tile's is data).
+  Hooks, the other look fields and tags are live already. `!match sync
   tiles|zones|all [name] reapply` syncs then reapplies; `!system zone` has
   no reapply (a system's definitions have no zones).
 - **Zones:** named cell sets (`!zone ...`; names and definition names
