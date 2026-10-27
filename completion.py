@@ -428,7 +428,7 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return _teams(mgr, ctx)
     if slot in ("when", "hook_name"):
         return sorted(logic.HOOK_NAMES) + ["event:"]
-    if slot == "dir":
+    if slot in ("dir", "facing"):
         return _DIRECTIONS
     if slot == "region":
         return _REGIONS
@@ -519,7 +519,7 @@ _KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
                "dest_match", "rule", "function", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
                "slot", "corpse_id", "key", "path", "sub", "definition",
-               "prefab", "tag", "filter"}
+               "prefab", "tag", "filter", "facing"}
 
 
 # ---- the entry point -------------------------------------------------------

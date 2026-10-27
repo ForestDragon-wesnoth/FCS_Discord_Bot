@@ -7,7 +7,8 @@ ENTRIES after it, numbered on across segments (`n`):
 
   cmd       a command that changed the match: its tokens as typed, who ran
             it (`by`, `uid`), the channel, when, the RNG [seed, position
-            before, position after] and a hash of the state after it
+            before, position after], a hash of the state after it and the
+            prefab library reads it made (`prefabs`, prefab_reads)
   state     a stored state, for a change a command can't replay from the
             match alone: an undo or history restore, a `!run` file, a change
             made from a channel showing another match
@@ -197,3 +198,59 @@ def entry_text(e: Dict[str, Any]) -> str:
         what = e.get("what") or "changed"
         return head + f"template `{e.get('name')}` {what}"
     return head + str(kind)
+
+
+def prefab_hash(pf: Any) -> str:
+    text = json.dumps(pf, sort_keys=True, default=str)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def prefab_reads(j: Journal, reads: Dict[str, Any]) -> Dict[str, Any]:
+    """A command's prefab library reads (logic.PREFAB_READS) as its `cmd`
+    entry stores them: `names` the name list it read, `data` per prefab
+    name None (none in the library) or {hash, data}. A prefab the
+    newest segment already holds is stored as its hash alone, so a
+    passive stamping one prefab every turn stores it once per segment."""
+    import copy
+    held = {d["hash"] for e in j.segments[-1]["entries"]
+            for d in ((e.get("prefabs") or {}).get("data") or {}).values()
+            if isinstance(d, dict) and "data" in d}
+    out: Dict[str, Any] = {}
+    if "names" in reads:
+        out["names"] = list(reads["names"])
+    data: Dict[str, Any] = {}
+    for name, pf in (reads.get("data") or {}).items():
+        if pf is None:
+            data[name] = None
+            continue
+        h = prefab_hash(pf)
+        data[name] = ({"hash": h} if h in held
+                      else {"hash": h, "data": copy.deepcopy(pf)})
+        held.add(h)
+    if data:
+        out["data"] = data
+    return out
+
+
+def replay_prefabs(e: Dict[str, Any], seen: Dict[str, Any]
+                   ) -> Optional[Dict[str, Any]]:
+    """An entry's recorded prefab reads as a replay reads them
+    (logic.PREFAB_REPLAY), resolving hashes through `seen` (hash ->
+    prefab, filled as the replay goes); None when it recorded none. A
+    hash the replay never saw (a hand-edited export) is left out, so that
+    prefab reads the library."""
+    rec = e.get("prefabs")
+    if not isinstance(rec, dict):
+        return None
+    out: Dict[str, Any] = {"data": {}}
+    if isinstance(rec.get("names"), list):
+        out["names"] = [str(n) for n in rec["names"]]
+    for name, d in (rec.get("data") or {}).items():
+        if d is None:
+            out["data"][name] = None
+        elif isinstance(d, dict) and isinstance(d.get("data"), dict):
+            seen[str(d.get("hash"))] = d["data"]
+            out["data"][name] = d["data"]
+        elif isinstance(d, dict) and d.get("hash") in seen:
+            out["data"][name] = seen[d["hash"]]
+    return out

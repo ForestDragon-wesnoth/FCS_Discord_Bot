@@ -2403,3 +2403,70 @@ fix on a 2x2 vehicle with a hidden rider.
     shows secret ones (903).
   - Smaller: `!owner errors clear` let a disk error escape, and a hand-
     edited errors.json entry without `user_name` crashed the listing.
+
+## Pass 48 (document 2, passes 26-34 of the external read-only audit)
+
+The findings of the external audit's passes 26-34 (main at `c93355e`),
+each reproduced on the #257 / #258 branch before fixing. Scenarios
+933-945; verified after: 945/945, the replay differential (1015 journals,
+0 diverged), usage drift 0 of 949 servers, and a hidden-vs-missing oracle
+over 40 forms of every root opened to players (0 differences).
+  - **Area searches** (K7): rectangles, cones and lines returned glued
+    parts and riders hidden in a vehicle, which bursts and distances skip;
+    `entities_in_zone` kept hidden riders. All of them, and `!find near:`
+    / `within:` (L22), now leave both out.
+  - **Region parts** (K8) were measured as a 1x1 body at the parent's
+    anchor: distance, `occupies`, `entity_center`, `aoe_origin`. They are
+    measured by their region's cells (`Match.body_rects`, `body_center`).
+  - **Two line walks** (F24): `cells_in_line`, `!map preview line` and
+    `!reveal_fog line` walked Bresenham, everything else the sight walk;
+    one walk now (`logic.line_cells`). `!map preview` and `!map ent_sight`
+    listed every unit twice before a turn order existed.
+  - **Cross-map cells** (F23) raised in distance / has_los / occupies /
+    cell_in_zone; they answer no relation now
+    (`_CROSS_MAP_NO_RELATION`); the `cells_in_*` builders take coordinate
+    lists and are listed as match readers.
+  - **Ghost firing** (T6): global and team passives kept running on a
+    unit an earlier passive of the hook removed.
+  - **Namespace cost** (X8): 1.65 → 0.80 ms per evaluation (the
+    per-function wrapper is a slotted object, coordinate parameters are
+    cached by name).
+  - **Tag filters** (X9, X9+): bounded nesting (32) and length (256); a
+    stored deep filter reads as one that doesn't parse.
+  - **Views** (V9): only `!ent` named units through the view for a
+    non-host; `_resolve_eid` now does for every root (`_TYPED_UNIT_VIEW`);
+    a glued part shows with its body (L22). Disguises (V5, V5+) present
+    their own statuses; var-name renames move a disguise's decoys (V8).
+    A secret reminder's text and RNG seeds stay out of command labels
+    (V6). The vocabulary warning stays out of team-view channels (V7).
+  - **Authority** (G6): promoting a player's macro needs `trust`.
+  - **Prefabs** (S7, S8): import checks corpses, loops and definitions;
+    a prefab carries the statuses its strings and definitions name.
+  - **Crash log** (W6, W7): paths redacted, a per-server cap, repeated
+    save failures counted in one entry, a bad `next_ref` handled.
+  - Smaller: locals read before assignment (P3), rolls past one message
+    (L16), huge priorities, rule values (`*_sources`,
+    `active_unit_outline_color`), numeric action bodies, `map=` on
+    functions without a map slot (L19), `--trace` after `--as`, `!prefab
+    show` through the viewport, a nested `use_action` refusal surfaced,
+    zone names (L18), `!undo command` naming the turn it takes back
+    (L20), the wipe warning naming prefabs (L21), `tiles_with_tag`
+    charged to formula_cell_limit (X10), tags with brackets / quotes and
+    `!turn set`'s "set by a host" to players (L17, V9).
+  - Not reproduced as written: L17's "no units" stamp reply came from the
+    loops S7 now refuses; W7's `user_name` crash was fixed in pass 47.
+    Left as questions: J14, Z1, `!func` bodies for players (L16).
+    Answered after the pass: a host's commands keep reaching hidden units
+    in a team-view channel, with an optional ⚠️ (`host_reveal_warning`,
+    default off); missing-zone reads answer empty with a ⚠️ (946); a
+    command reading the prefab library journals what it read (J14,
+    947); deleting a used zone definition detaches its zones (Z1, 904);
+    formula text for players is deferred (§8). L16's premise didn't
+    hold: `!func` has no `show`, and `!func info` was open to players; a
+    player's unknown subcommand was queued for approval, now refused at
+    once (948). Tile facing became materialized (user call): a tile
+    reads only its own `facing`, copied from its template when placed
+    (928, 931), and so did zone facing, copied from the definition when
+    a zone is made (930); deleting a used tile template detaches its
+    tiles like Z1 (188). A watcher's effect now journals with its command
+    (`transfer_entity` in a watcher left a replayable-looking `cmd`).

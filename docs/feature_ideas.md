@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #234, #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #234, #257, #258, #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -331,12 +331,9 @@ or rejects one, it moves to "Off the list".
     - A `!ent control` listing for hosts; a spectator role that can read and never act (#190).
 - **#30 ASCII map import.** A pasted text block plus a glyph → tile template (or unit template) legend builds a board.
 - **#32 Procedural generation.** `noise(x, y, seed)` plus room and cave helpers that write tiles.
-- **#257 Tile and zone facing.** A `facing` field on tiles, tile templates, zones and zone definitions, per-facing glyphs and sprites (`glyphs.<facing>` / `sprites.<facing>`, as units have), and facing reads in formulas, for directional terrain (arrow traps, conveyors, one-way doors).
-  - Prefab rotation (#31) should turn tile and zone facing once this exists.
 - **#259 Per-level status data.** (To discuss, user.) A status definition holds entries per level, exact (`3`) or from a level up (`3+`), each carrying its own data that applies while the instance is at that level: the action restriction lists of #234 (Solis freeze forbids sprint and rest, and dodge from level 3), modifiers, a tick, a display.
   - Open: how entries combine with the definition's own fields and with each other (merge or replace, and which entry wins when `2+` and `3` both match), how an instance's own keys override them, and how `!status` edits them.
   - The #234 checks read every list through `Match.status_field`, the one place a level entry would merge in.
-- **#258 Reapply a definition's data.** `!zone def <d> reapply` / `!tile def <t> reapply` push the definition's or template's data to the zones and tiles made from it (data is copied at creation, so a later data edit reaches only new ones).
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
 - **#34 Session recap export.** The event log as markdown, filtered by POV, for posting a session summary.

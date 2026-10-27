@@ -283,20 +283,52 @@ def _collect_definitions(mgr: Any, m: Match, data: Dict[str, Any],
     for b in bodies:
         if isinstance(b, dict) and isinstance(b.get("status"), dict):
             snames |= set(b["status"])
-    for sn in sorted(snames):
-        sd = m.status_definitions.get(sn)
-        if sd is None:
-            continue
-        if every or sys_lib("status_definitions").get(sn) != sd:
-            out["status_definitions"][sn] = copy.deepcopy(sd)
-    texts: List[str] = []
-    _strings({k: v for k, v in data.items() if k != "definitions"}, texts)
-    _strings(out, texts)
-    for fname in sorted(_used_funcs(m, texts)):
-        mine = m.formula_functions[fname].to_dict()
-        if every or sys_lib("formula_functions").get(fname) != mine:
-            out["formula_functions"][fname] = mine
-    return out
+    # Statuses the units hold, and those the saved formulas and carried
+    # definitions name: a quoted name in a hook, tick or function body (a
+    # lava tile's status_apply(self, 'burn', ...)), a removes / blocked_by
+    # token. What these carry can name more, so the scan repeats until
+    # nothing new turns up; so do the `!func`s called.
+    seen_s: Set[str] = set()
+    seen_f: Set[str] = set()
+    pending = set(snames)
+    while True:
+        for sn in sorted(pending - seen_s):
+            seen_s.add(sn)
+            sd = m.status_definitions.get(sn)
+            if sd is None:
+                continue
+            if every or sys_lib("status_definitions").get(sn) != sd:
+                out["status_definitions"][sn] = copy.deepcopy(sd)
+        texts: List[str] = []
+        _strings({k: v for k, v in data.items() if k != "definitions"},
+                 texts)
+        _strings(out, texts)
+        for fname in sorted(_used_funcs(m, texts) - seen_f):
+            seen_f.add(fname)
+            fn = m.formula_functions[fname]
+            texts.append(fn.body)
+            mine = fn.to_dict()
+            if every or sys_lib("formula_functions").get(fname) != mine:
+                out["formula_functions"][fname] = mine
+        pending = {sn for sn in m.status_definitions if sn not in seen_s
+                   and any(_names_status(t, sn) for t in texts)}
+        for sn in list(seen_s):
+            sd = m.status_definitions.get(sn) or {}
+            for k in ("removes", "blocked_by"):
+                v = sd.get(k)
+                toks = v if isinstance(v, list) \
+                    else str(v).split(",") if v else []
+                pending |= {str(t).strip() for t in toks
+                            if str(t).strip() in m.status_definitions
+                            and str(t).strip() not in seen_s}
+        if not pending:
+            return out
+
+
+def _names_status(text: str, sname: str) -> bool:
+    """Whether `text` names status `sname` as a quoted word (how formulas
+    pass a status name to status_apply and the other status functions)."""
+    return f"'{sname}'" in text or f'"{sname}"' in text
 
 
 # ---- validation (import / load) ----------------------------------------------
@@ -357,6 +389,14 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
             raise VTTError(f"Prefab `{name}`: a corpse entry is [dx, dy, "
                            f"id, {{\"entity\": ...}}].")
         cell(c[0], c[1], f"corpse `{c[2]}`")
+        # A corpse is read by the roster and rebuilt by a revive: its body
+        # and parts must be units (a malformed one crashed `!list`).
+        parts = c[3].get("parts", [])
+        if not isinstance(parts, list):
+            raise VTTError(f"Prefab `{name}`: corpse `{c[2]}`'s `parts` "
+                           f"must be a list of units.")
+        for u in [c[3]["entity"]] + parts:
+            _check_unit_dict(u, name, f"corpse `{c[2]}`")
     ids: Set[str] = set()
     for u in d["units"]:
         if not isinstance(u, dict) or not isinstance(u.get("id"), str) \
@@ -368,17 +408,33 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                            f"twice.")
         ids.add(u["id"])
         cell(u.get("x"), u.get("y"), f"unit `{u['id']}`")
-        try:
-            Entity.from_dict(dict(u, map=None))
-        except Exception as ex:  # noqa: BLE001 - any shape error
-            raise VTTError(f"Prefab `{name}`: unit `{u['id']}` isn't a "
-                           f"unit: {ex}")
+        _check_unit_dict(u, name, "the prefab")
+    by_id = {u["id"]: u for u in d["units"]}
     for u in d["units"]:
         for link in ("part_of", "mounted_on"):
             if u.get(link) and u[link] not in ids:
                 raise VTTError(f"Prefab `{name}`: unit `{u['id']}`'s "
                                f"{link} `{u[link]}` isn't a unit of the "
                                f"prefab.")
+    # A part, mount or snake link that leads back to its unit (a unit that
+    # is its own part, two riding each other) stamps a body nothing can
+    # move or take apart.
+    for link in ("part_of", "mounted_on", "__follows"):
+        for u in d["units"]:
+            seen = [u["id"]]
+            cur = u
+            while True:
+                nxt = (cur.get("vars") or {}).get(link) \
+                    if link.startswith("__") else cur.get(link)
+                if not isinstance(nxt, str) or nxt not in by_id:
+                    break
+                if nxt in seen:
+                    raise VTTError(
+                        f"Prefab `{name}`: the `{link}` links of "
+                        + " -> ".join(f"`{i}`" for i in seen + [nxt])
+                        + " form a loop.")
+                seen.append(nxt)
+                cur = by_id[nxt]
     for zname, z in d["zones"].items():
         if not isinstance(z, dict):
             raise VTTError(f"Prefab `{name}`: zone `{zname}` must be an "
@@ -409,7 +465,88 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                 logic.SpecialTileTemplate.from_dict(dict(entry, name=ename))
             elif lib == "formula_functions":
                 logic.FormulaFunction.from_dict(entry)
+            elif lib == "status_definitions":
+                _check_status_definition(entry, name, ename)
+            elif lib == "zone_definitions":
+                logic.check_zone_def_name(ename)
+                entries[ename] = logic.normalize_zone_def(entry)
     return d
+
+
+def _check_unit_dict(u: Any, name: str, where: str) -> None:
+    """A saved unit (a prefab unit, a corpse's body or part) the engine can
+    read back: an id, a name, numeric x / y, vars and statuses as objects,
+    and Entity.from_dict accepting it."""
+    if not isinstance(u, dict) or not isinstance(u.get("id"), str) \
+            or not u["id"]:
+        raise VTTError(f"Prefab `{name}`: every unit of {where} is an "
+                       f"entity object with an `id`.")
+    who = f"Prefab `{name}`: unit `{u['id']}` of {where}"
+    if not isinstance(u.get("name"), str):
+        raise VTTError(f"{who} has no `name`.")
+    for k in ("x", "y"):
+        if isinstance(u.get(k), bool) or not isinstance(u.get(k), int):
+            raise VTTError(f"{who}: `{k}` must be a whole number.")
+    for k in ("vars", "status", "passives", "clamps"):
+        if k in u and not isinstance(u[k], dict):
+            raise VTTError(f"{who}: `{k}` must be an object.")
+    try:
+        Entity.from_dict(dict(u, map=None))
+    except Exception as ex:  # noqa: BLE001 - any shape error
+        raise VTTError(f"{who} isn't a unit: {ex}")
+
+
+# The values a status definition's fields take (`!status stack|when|...`).
+_STATUS_STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
+_STATUS_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
+                      "never")
+
+
+def _check_status_definition(entry: Dict[str, Any], name: str,
+                             sname: str) -> None:
+    """A carried status definition holds what `!status` would store: a
+    stack mode and tick time it knows, a whole max_level, formulas and
+    hooks as text, tags and tag filters that parse."""
+    who = f"Prefab `{name}`: status definition `{sname}`"
+    logic.check_status_name(sname)
+    if entry.get("stack") not in (None, "", *_STATUS_STACK_MODES):
+        raise VTTError(f"{who}: stack must be one of "
+                       f"{', '.join(_STATUS_STACK_MODES)}.")
+    if entry.get("tick_when") not in (None, "", *_STATUS_TICK_WHENS):
+        raise VTTError(f"{who}: tick_when must be one of "
+                       f"{', '.join(_STATUS_TICK_WHENS)}.")
+    ml = entry.get("max_level")
+    if ml is not None and (isinstance(ml, bool) or not isinstance(ml, int)
+                           or ml < 0):
+        raise VTTError(f"{who}: max_level must be a whole number >= 0.")
+    for k in ("tick", "display"):
+        if entry.get(k) is not None and not isinstance(entry[k], str):
+            raise VTTError(f"{who}: `{k}` must be text.")
+    hooks = entry.get("hooks", {})
+    if not isinstance(hooks, dict) or any(
+            k not in logic.STATUS_DEF_HOOKS.values() or not isinstance(v, str)
+            for k, v in hooks.items()):
+        raise VTTError(f"{who}: `hooks` maps "
+                       + ", ".join(logic.STATUS_DEF_HOOKS.values())
+                       + " to formula text.")
+    if "data" in entry and not isinstance(entry["data"], dict):
+        raise VTTError(f"{who}: `data` must be an object.")
+    try:
+        if "tags" in entry:
+            entry["tags"] = logic.normalize_tags(entry["tags"])
+        for k in ("removes", "blocked_by"):
+            v = entry.get(k)
+            toks = (v if isinstance(v, list)
+                    else str(v).split(",") if v else [])
+            for t in toks:
+                t = str(t).strip()
+                if t.startswith("tag:"):
+                    logic.check_tag_filter(t[4:])
+        for k in logic.ACTION_RESTRICTION_FIELDS:
+            if k in entry and k.endswith("_tag"):
+                logic.check_tag_filter(entry[k])
+    except VTTError as ex:
+        raise VTTError(f"{who}: {ex}")
 
 
 # ---- geometry -----------------------------------------------------------------
@@ -733,11 +870,6 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
     except Exception:
         _rollback_match(m, None, pre)
         raise
-    # A replay of the command can't redo this without the library's copy
-    # of the prefab as it was: the journal stores the state it left.
-    jstate = logic.JOURNAL_AS_STATE.get()
-    if jstate is not None:
-        jstate[0] = True
     return {"units": roots, "all_units": all_units, "zones": new_zones,
             "renamed": renamed, "log": log, "notes": notes,
             "removed": victims, "size": (W, H)}
@@ -805,6 +937,16 @@ def _merge_definitions(m: Match, pf: Dict[str, Any],
                        "kept.")
 
 
+def _turn_facing(d: Dict[str, Any], turn: Turn) -> None:
+    """Turn a stamped tile's / zone's `facing` (#257). One with no facing
+    stays without one (it has no direction to turn)."""
+    if turn.steps == 0 and turn.flip is None:
+        return
+    f = d.get(logic.FACING_FIELD)
+    if isinstance(f, str) and f in logic.ALLOWED_DIRECTIONS:
+        d[logic.FACING_FIELD] = turn.facing(f)
+
+
 def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                  x: int, y: int, mode: str) -> None:
     for dx, dy, tdata in pf.get("tiles") or []:
@@ -815,6 +957,7 @@ def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
         if mode == "keep" and has_data:
             continue
         new = copy.deepcopy(tdata)
+        _turn_facing(new, turn)
         if isinstance(old, dict) and old.get("corpses"):
             new["corpses"] = old["corpses"]
         mp.tiles[(cx, cy)] = new
@@ -939,6 +1082,7 @@ def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
             if mp.in_bounds(x + nx, y + ny):
                 cells.add((x + nx, y + ny))
         z["cells"] = cells
+        _turn_facing(z, turn)
         new = m.mint_zone_name(zname)
         if new != zname:
             renamed[zname] = new

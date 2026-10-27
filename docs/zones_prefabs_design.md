@@ -67,10 +67,12 @@ zone's own name.
   keys the zone lacks) or detaches it.
 - `!zone tags <zone> <tag ...>` (own tags).
 - `!zone info` marks each value as the zone's own or inherited.
-- **Deleting a definition in use** needs `confirm` and orphans the zones
-  (they keep their own data and settings; the definition's hooks, look and
-  tags stop applying, silently, as for a tile whose template was deleted),
-  as `!tile def del` does.
+- **Deleting a definition in use** needs `confirm` and detaches the zones
+  (they keep their own data and settings and stop naming it, so the
+  definition's hooks, look and tags stop applying and a later definition
+  of the same name takes none of them over; `!undo command` restores the
+  links). Changed after the build (user call, audit Z1); `!tile def del`
+  detaches placed tiles the same way.
 - **Rename** for zone definitions AND tile templates (tile templates have
   none today): updates every zone / tile naming it and the match's other
   references, the way `!status rename` does.

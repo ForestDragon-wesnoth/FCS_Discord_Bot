@@ -37,6 +37,59 @@ COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
 JOURNAL_AS_STATE: "contextvars.ContextVar[Optional[list]]" = (
     contextvars.ContextVar("vtt_journal_as_state", default=None))
 
+# The prefab library reads of the running command (CommandRegistry._run
+# sets a dict): `names` the name list it read, `data` each prefab it read
+# by name (None = the library had none). Journals don't carry the library,
+# so the command's journal entry carries these, and a replay of the entry
+# sets PREFAB_REPLAY to them, read in place of the library.
+PREFAB_READS: "contextvars.ContextVar[Optional[dict]]" = (
+    contextvars.ContextVar("vtt_prefab_reads", default=None))
+PREFAB_REPLAY: "contextvars.ContextVar[Optional[dict]]" = (
+    contextvars.ContextVar("vtt_prefab_replay", default=None))
+
+
+def prefab_read(ws: Any, name: str) -> Optional[Dict[str, Any]]:
+    """The server's prefab `name` (None when it has none) as the running
+    command reads it: recorded for its journal entry, the recorded copy
+    while a replay runs the entry. A command that reads one prefab twice
+    and finds it changed between is journaled as the state it left."""
+    rep = PREFAB_REPLAY.get()
+    if rep is not None and name in (rep.get("data") or {}):
+        pf = rep["data"][name]
+    else:
+        pf = (getattr(ws, "prefabs", None) or {}).get(name)
+    reads = PREFAB_READS.get()
+    if reads is not None:
+        data = reads.setdefault("data", {})
+        if name not in data:
+            data[name] = pf
+        elif data[name] is not pf:
+            _journal_as_state()
+    return pf
+
+
+def prefab_read_names(ws: Any) -> List[str]:
+    """The server's prefab names, sorted, read like prefab_read."""
+    rep = PREFAB_REPLAY.get()
+    if rep is not None and "names" in rep:
+        names = list(rep["names"])
+    else:
+        names = sorted(getattr(ws, "prefabs", None) or {})
+    reads = PREFAB_READS.get()
+    if reads is not None:
+        if "names" not in reads:
+            reads["names"] = list(names)
+        elif reads["names"] != names:
+            _journal_as_state()
+    return names
+
+
+def _journal_as_state() -> None:
+    jstate = JOURNAL_AS_STATE.get()
+    if jstate is not None:
+        jstate[0] = True
+
+
 # Ids of the matches the running command sent units out of with
 # transfer_entity: their undo step says it only undoes their side.
 MATCHES_SENT_UNITS: "contextvars.ContextVar[Optional[set]]" = (
@@ -688,7 +741,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "unit_tag_sources": {
         "default": "equipped",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars roots walked for `grants_unit_tags` lists: "
             "a container under one of them (an equipped item) gives its "
@@ -966,7 +1019,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # may be formulas (eval'd with self=owner + the call's context names).
     "modifier_sources": {
         "default": "equipped",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars roots walked for `modifiers` bundles when "
             "computing effective stats — so an item under one of these "
@@ -980,7 +1033,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "temp_hp_sources": {
         "default": "shields",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars roots scanned for temporary-HP / shield "
             "POOLS by absorb_damage / shield_total. Each root is a dict of "
@@ -1325,7 +1378,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "status_resist_sources": {
         "default": "equipped",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "var_roots": True},
         "desc": (
             "Comma-separated vars subtree roots scanned for status "
             "resistance/immunity records (like modifier_sources). A nested "
@@ -1423,7 +1476,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "<y> block \"<formula>\"`. Empty = tiles never block. Malformed "
             "formula = treated as not blocking. Which MOVEMENT kinds honor "
             "blocking is set by the block_walk / block_tp / block_push / "
-            "block_swap rules (all default True)."
+            "block_swap rules (all default True). A step also binds "
+            "move_dir (the direction it moves in) and from_x / from_y (the "
+            "cell it comes from); a teleport, swap or placement binds them "
+            "to None. A one-way door: `move_dir != tile_facing(tile_x, "
+            "tile_y)`."
         ),
     },
     "zone_block_condition": {
@@ -1435,7 +1492,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "= the moving entity. Truthy = blocked. A zone's own `block` "
             "data field overrides it (`!zone set <name> block \"<formula>\"`). "
             "Empty = zones never block. Malformed = not blocking. A cell is "
-            "blocked if its tile OR any covering zone blocks the mover."
+            "blocked if its tile OR any covering zone blocks the mover. Also "
+            "bound: tile_x / tile_y (the cell entered), and for a step "
+            "move_dir / from_x / from_y (None for a teleport, swap or "
+            "placement), so `move_dir != zone_facing(zone_name)` makes a "
+            "one-way zone."
         ),
     },
     "corpse_block_condition": {
@@ -2412,6 +2473,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "changes). Your own team's units are never hidden from you. Off "
             "= queries stay omniscient (lock them down per match with `!host "
             "access` instead). Omniscient channels are unaffected either way."
+        ),
+    },
+    "host_reveal_warning": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a host's command in a channel with a team POV (one "
+            "players read) ends with a ⚠️ when it names a unit that view "
+            "hides: `!ent dump`, `!ent diff`, `!part info`, `!status`, "
+            "`!turn set` and the other commands taking a unit id still run "
+            "for a host (to reveal something on purpose), and their reply "
+            "may show the unit to the players there. Off (default) = no "
+            "warning. A player's command refuses a hidden unit like a "
+            "missing one either way."
         ),
     },
     "team_data_visibility": {
@@ -3860,7 +3935,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "active_unit_outline_color": {
         "default": "white",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "color": True},
         "desc": (
             "Graphics: the active unit's outline colour for a unit without "
             "a team colour (a colour name or #rrggbb)."
@@ -4145,6 +4220,25 @@ def _coerce_rule_value(key: str, raw_value: str):
             return check_var_name_rule(key, raw_value)
         if key in MAP_VAR_NAME_RULES:
             return check_map_var_name_rule(key, raw_value)
+        if spec.get("var_roots"):
+            # Comma-separated var roots (`equipped,worn`): a root read as a
+            # var path, so a typo is said now rather than walking nothing.
+            got = [w.strip() for w in raw_value.split(",")]
+            if raw_value.strip() and any(
+                    not w or w.startswith("__") or any(c.isspace() for c in w)
+                    or "" in w.split(".") for w in got):
+                raise VTTError(f"Setting '{key}' takes a comma list of var "
+                               f"roots (`equipped,worn`): no empty word, "
+                               f"spaces, empty path segment or `__` name.")
+            return ",".join(got) if raw_value.strip() else ""
+        if spec.get("color"):
+            v = raw_value.strip()
+            if v.lower() not in TEXT_COLORS and not re.fullmatch(
+                    r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", v):
+                raise VTTError(f"Setting '{key}' takes a colour name ("
+                               f"{', '.join(sorted(TEXT_COLORS))}) or "
+                               f"#rrggbb, got `{raw_value}`.")
+            return v
         words = spec.get("word_list")
         if words is not None:
             # A comma list of known words; a typo'd one used to be ignored.
@@ -4276,6 +4370,15 @@ def check_map_name(name: Any) -> None:
             f"characters); `{name}` can't be one.")
     if name.lower() in MAP_RESERVED_NAMES:
         raise VTTError(f"`{name}` is a reserved word, so it can't name a map.")
+
+
+def check_zone_name(name: Any) -> None:
+    """Raise unless `name` can name a zone: id characters, as a map name
+    (a backtick or a space broke every reply quoting it)."""
+    if not isinstance(name, str) or not ID_RE.fullmatch(name):
+        raise VTTError(
+            f"A zone name can use letters, digits, `_` and `-` only (1-40 "
+            f"characters); `{name}` can't be one.")
 
 
 def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
@@ -4887,7 +4990,9 @@ def checked_priority(v: Any, what: str = "priority") -> Any:
     if isinstance(v, bool) or not isinstance(v, (int, float)) \
             or not math.isfinite(v):
         raise VTTError(f"{what} must be a finite number, got {v!r}.")
-    return int(v) if float(v).is_integer() else v
+    # A huge whole number stays a float, so a listing prints 1e+308, not
+    # its 309 digits.
+    return int(v) if float(v).is_integer() and abs(v) < 1e15 else v
 
 
 @dataclass
@@ -5565,14 +5670,16 @@ def normalize_tags(raw: Any) -> List[str]:
 
 
 def check_tag(tag: Any) -> str:
-    """`tag` when it can be a tag (one word: no spaces, commas or
-    parentheses, and not `and` / `or` / `not`, which tag filters read as
-    words of an expression), else a VTTError."""
+    """`tag` when it can be a tag (one word: no spaces, commas,
+    parentheses, brackets or double quotes, and not `and` / `or` / `not`,
+    which tag filters read as words of an expression), else a VTTError.
+    (`!ent set_var a tags ["fire"]` stored the one tag `[fire]`.)"""
     if not isinstance(tag, str) or not tag.strip() or \
             any(c.isspace() for c in tag.strip()) or \
-            any(c in tag for c in ",()"):
+            any(c in tag for c in ',()[]"'):
         raise VTTError(f"`{tag}` can't be a tag: one word, no spaces, "
-                       f"commas or parentheses.")
+                       f"commas, parentheses, brackets or double quotes "
+                       f"(several tags: `fire,ice`).")
     if tag.strip() in TAG_FILTER_WORDS:
         raise VTTError(f"`{tag}` can't be a tag: and / or / not join the "
                        f"words of a tag filter.")
@@ -5719,15 +5826,30 @@ def _is_tag_expression(text: str) -> bool:
         w in TAG_FILTER_WORDS for w in text.replace(",", " ").split())
 
 
+# A tag expression's bounds: parentheses and `not`s nested at most this
+# deep, at most this many words and parentheses. Parsing and matching
+# recurse per nesting level, and a filter is text a player types (`!find
+# tag:`) or stores in a var; 400 parentheses reached Python's stack limit.
+TAG_EXPRESSION_DEPTH = 32
+TAG_EXPRESSION_TOKENS = 256
+
+
 @functools.lru_cache(maxsize=512)
 def _parse_tag_expression(text: str) -> Tuple[Any, ...]:
-    """The tree of a tag expression: ('tag', t), ('not', a), ('and', a, b),
-    ('or', a, b). VTTError when it doesn't parse."""
+    """The tree of a tag expression: ('tag', t), ('not', a), ('and', [a,
+    b, ...]), ('or', [a, b, ...]) (a chain is one flat node, so only
+    nesting deepens it). VTTError when it doesn't parse or passes the
+    TAG_EXPRESSION_* bounds."""
     toks = _TAG_TOKEN_RE.findall(text)
     pos = 0
+    depth = 0
 
     def bad(why: str) -> VTTError:
-        return VTTError(f"Tag filter `{text}`: {why}.")
+        shown = text if len(text) <= 80 else text[:77] + "..."
+        return VTTError(f"Tag filter `{shown}`: {why}.")
+
+    if len(toks) > TAG_EXPRESSION_TOKENS:
+        raise bad(f"over {TAG_EXPRESSION_TOKENS} words and parentheses")
 
     def peek() -> Optional[str]:
         return toks[pos] if pos < len(toks) else None
@@ -5737,36 +5859,50 @@ def _parse_tag_expression(text: str) -> Tuple[Any, ...]:
         pos += 1
         return toks[pos - 1]
 
+    def deeper() -> None:
+        nonlocal depth
+        depth += 1
+        if depth > TAG_EXPRESSION_DEPTH:
+            raise bad(f"parentheses and `not`s nest over "
+                      f"{TAG_EXPRESSION_DEPTH} deep")
+
     def p_or() -> Tuple[Any, ...]:
-        left = p_and()
+        items = [p_and()]
         while peek() == "or":
             take()
-            left = ("or", left, p_and())
-        return left
+            items.append(p_and())
+        return items[0] if len(items) == 1 else ("or", items)
 
     def p_and() -> Tuple[Any, ...]:
-        left = p_not()
+        items = [p_not()]
         while peek() == "and":
             take()
-            left = ("and", left, p_not())
-        return left
+            items.append(p_not())
+        return items[0] if len(items) == 1 else ("and", items)
 
     def p_not() -> Tuple[Any, ...]:
+        nonlocal depth
         if peek() == "not":
             take()
-            return ("not", p_not())
+            deeper()
+            inner = p_not()
+            depth -= 1
+            return ("not", inner)
         return p_atom()
 
     def p_atom() -> Tuple[Any, ...]:
+        nonlocal depth
         t = peek()
         if t is None:
             raise bad("it ends where a tag or `(` should come")
         if t == "(":
             take()
+            deeper()
             inner = p_or()
             if peek() != ")":
                 raise bad("a `(` is never closed")
             take()
+            depth -= 1
             return inner
         if t in (")", "and", "or"):
             raise bad(f"`{t}` where a tag should come")
@@ -5791,8 +5927,8 @@ def _eval_tag_tree(tree: Tuple[Any, ...], tags: Set[str]) -> bool:
     if op == "not":
         return not _eval_tag_tree(tree[1], tags)
     if op == "and":
-        return _eval_tag_tree(tree[1], tags) and _eval_tag_tree(tree[2], tags)
-    return _eval_tag_tree(tree[1], tags) or _eval_tag_tree(tree[2], tags)
+        return all(_eval_tag_tree(t, tags) for t in tree[1])
+    return any(_eval_tag_tree(t, tags) for t in tree[1])
 
 
 def tag_filter_empty(raw: Any) -> bool:
@@ -5928,31 +6064,71 @@ class SpecialTileTemplate:
 # Zone DEFINITIONS describe a kind of zone once (`poison_cloud`), the way a
 # tile template describes a kind of tile. A zone naming one (its `def`
 # field) reads the definition's hooks, look fields (ZONE_LOOK_FIELDS) and
-# tags LIVE, its own value winning; the definition's `data` is copied into
-# the zone when it is made (and read through for `block` / `opaque` when the
-# zone's data lacks them, as a tile reads its template's). The tile-template
+# tags LIVE, its own value winning; the definition's `data` and `facing` are
+# copied into the zone when it is made (data read through for `block` /
+# `opaque` when the zone's data lacks them, as a tile reads its template's;
+# facing materialized like a unit's, user call). The tile-template
 # pattern, so the two map features with definitions behave alike. Stored as
 # plain dicts in Match.zone_definitions (and a system library), in the
 # shape normalize_zone_def gives.
-ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend")
+ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend",
+                                     "facing", "glyphs", "sprites")
+# The per-facing look fields (#257) and the plain field each stands in for:
+# `glyphs.<facing>` / `sprites.<facing>` on units, tiles (data, template
+# data), zones and zone definitions.
+FACING_LOOK_FIELDS: Dict[str, str] = {"glyphs": "glyph", "sprites": "sprite"}
+# The tile data key / zone field holding a facing (#257).
+FACING_FIELD = "facing"
+
+
+def checked_facing_data(path: str, value: Any) -> Any:
+    """`value` about to be stored at tile data `path`: a write at `facing`
+    must name a direction (stored as its canonical name), and nothing
+    nests under it. Other paths pass unchanged."""
+    segs = str(path).split(".")
+    if segs[0] != FACING_FIELD:
+        return value
+    if len(segs) > 1:
+        raise VTTError("`facing` holds one direction; nothing nests under "
+                       "it.")
+    canon = normalize_direction(value) if isinstance(value, str) else None
+    if canon is None:
+        raise VTTError(f"`facing` must be a direction (up, down, left, "
+                       f"right, or a diagonal), not {value!r}.")
+    return canon
+
+
+def facing_look_entry(kind: str, facing: Any, value: Any) -> bool:
+    """Whether `value` is a usable `glyphs` / `sprites` entry for `facing`."""
+    if not isinstance(facing, str) or facing not in ALLOWED_DIRECTIONS:
+        return False
+    if kind == "glyphs":
+        return isinstance(value, str) and len(value) == 1
+    return isinstance(value, str) and bool(value)
 
 
 def zone_look_value(key: str, value: Any) -> bool:
     """Whether `value` is a usable zone look field `key` (a one-character
-    glyph, a non-empty color / sprite text, a legend text or False)."""
+    glyph, a non-empty color / sprite text, a legend text or False, a
+    direction, a {facing: glyph / sprite} dict with a usable entry)."""
     if key == "glyph":
         return isinstance(value, str) and len(value) == 1
     if key == "legend":
         return value is False or (isinstance(value, str) and bool(value))
+    if key == "facing":
+        return isinstance(value, str) and value in ALLOWED_DIRECTIONS
+    if key in FACING_LOOK_FIELDS:
+        return isinstance(value, dict) and any(
+            facing_look_entry(key, f, v) for f, v in value.items())
     return isinstance(value, str) and bool(value)
 
 
 def check_zone_def_name(name: Any) -> None:
-    """Raise unless `name` can name a zone definition: one word."""
-    if not isinstance(name, str) or not name or \
-            any(c.isspace() for c in name):
-        raise VTTError(f"`{name}` can't be a zone definition name: one "
-                       f"word, no spaces.")
+    """Raise unless `name` can name a zone definition: id characters, as a
+    zone name (a zone made from it takes its name)."""
+    if not isinstance(name, str) or not ID_RE.fullmatch(name):
+        raise VTTError(f"`{name}` can't be a zone definition name: letters, "
+                       f"digits, `_` and `-` only (1-40 characters).")
 
 
 def normalize_zone_def(raw: Any) -> Dict[str, Any]:
@@ -5971,7 +6147,7 @@ def normalize_zone_def(raw: Any) -> Dict[str, Any]:
     }
     for key in ZONE_LOOK_FIELDS:
         if zone_look_value(key, raw.get(key)):
-            out[key] = raw[key]
+            out[key] = copy.deepcopy(raw[key])
     return out
 
 
@@ -6161,6 +6337,13 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many crashes (an `Unexpected error (ref N)` reply, "
                 "a passive or hook that CRASHED) the bot keeps in its error log for `!owner "
                 "errors` / `!server errors` (0 = no log).",
+    },
+    "error_log_server_entries": {
+        "default": 50, "min": 0, "max": 2000,
+        "desc": "How many of the error log's entries one server may hold "
+                "(its oldest go first), so one server's crashes can't push "
+                "every other server's out of the bot-wide log (0 = no "
+                "per-server cap).",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -7271,7 +7454,8 @@ class Entity:
                         raise OutOfBounds(f"({cx},{cy}) outside {mp.size_text()}")
                 if block_mode is not None:
                     for cx, cy in m.entity_cells(self, nx, ny):
-                        if m._check_block(self.id, cx, cy, block_mode):
+                        if m._check_block(self.id, cx, cy, block_mode,
+                                          step=(canon, dx, dy)):
                             raise Blocked(f"Cell ({cx},{cy}) blocks `{self.id}`")
                 step_path.append((nx, ny, step_facing))
                 x, y = nx, ny
@@ -8014,6 +8198,105 @@ DEFAULT_MAP_NAME = "main"
 AURA_METRICS = ("square_radius", "manhattan", "euclidean")
 
 
+def line_span(x1: int, y1: int, x2: int, y2: int, width: int, height: int
+              ) -> Optional[Tuple[int, int, int, int]]:
+    """The part of the segment between the centres of cells (x1,y1) and
+    (x2,y2) that crosses a width x height map, in line-walk steps: (nx0,
+    ny0, nx1, ny1), where the walk's x / y boundary crossings numbered
+    nx0..nx1-1 / ny0..ny1-1 are the ones on or inside the map's edge.
+    Starting the walk at crossing (nx0, ny0) puts it on the cell just before
+    the line enters the map, so a corner check at the edge still runs; after
+    crossing (nx1, ny1) it has left the map for good. None if the line never
+    touches the map. Off-map cells hold nothing and are never opaque, so the
+    sight / line walks skip them: their cost follows the map, not
+    coordinates a formula made up."""
+    from fractions import Fraction
+    dx, dy = x2 - x1, y2 - y1
+    t0, t1 = Fraction(0), Fraction(1)
+    # Liang-Barsky against the closed rectangle [0.5, W+0.5] x [0.5, H+0.5]
+    # (cell (x, y) spans x-0.5..x+0.5).
+    for p, q in ((-dx, Fraction(x1) - Fraction(1, 2)),
+                 (dx, Fraction(width) + Fraction(1, 2) - x1),
+                 (-dy, Fraction(y1) - Fraction(1, 2)),
+                 (dy, Fraction(height) + Fraction(1, 2) - y1)):
+        if p == 0:
+            if q < 0:
+                return None
+            continue
+        r = q / p
+        if p < 0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+        if t0 > t1:
+            return None
+
+    def crossings(a: int, t: Fraction, strict: bool) -> int:
+        # Boundary k is crossed at t = (2k+1)/(2a): count those < t
+        # (strict) or <= t.
+        if a == 0:
+            return 0
+        v = a * t - Fraction(1, 2)
+        if strict:
+            n = -((-v.numerator) // v.denominator)        # ceil(v)
+        else:
+            n = v.numerator // v.denominator + 1          # floor(v) + 1
+        return max(0, min(a, n))
+
+    adx, ady = abs(dx), abs(dy)
+    return (crossings(adx, t0, True), crossings(ady, t0, True),
+            crossings(adx, t1, False), crossings(ady, t1, False))
+
+
+def line_cells(x1: int, y1: int, x2: int, y2: int,
+               bounds: Optional[Tuple[int, int]] = None
+               ) -> List[Tuple[int, int]]:
+    """The ordered cells the segment between the centres of (x1,y1) and
+    (x2,y2) passes through, near->far: every cell it crosses, with one
+    diagonal step where it passes exactly through a corner (the line every
+    sight check walks, Match._line_cells). With `bounds` (width, height)
+    only the cells on that map are listed and only the map's part of the
+    line is walked; without, every cell (the caller bounds the length)."""
+    def inside(cx: int, cy: int) -> bool:
+        return bounds is None or (1 <= cx <= bounds[0] and 1 <= cy <= bounds[1])
+
+    if (x1, y1) == (x2, y2):
+        return [(x1, y1)] if inside(x1, y1) else []
+    dx, dy = x2 - x1, y2 - y1
+    sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
+    sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
+    adx, ady = abs(dx), abs(dy)
+    if bounds is not None:
+        span = line_span(x1, y1, x2, y2, bounds[0], bounds[1])
+        if span is None:
+            return []
+        nx, ny, nx1, ny1 = span
+    else:
+        nx, ny, nx1, ny1 = 0, 0, adx, ady
+    cx, cy = x1 + sx * nx, y1 + sy * ny
+    cells = [(cx, cy)]
+    guard = (nx1 - nx) + (ny1 - ny) + 2
+    while (cx, cy) != (x2, y2) and guard > 0 and (nx < nx1 or ny < ny1):
+        guard -= 1
+        if adx == 0:
+            cy += sy; ny += 1
+        elif ady == 0:
+            cx += sx; nx += 1
+        else:
+            a = (2 * nx + 1) * ady
+            b = (2 * ny + 1) * adx
+            if a == b:
+                cx += sx; cy += sy; nx += 1; ny += 1
+            elif a < b:
+                cx += sx; nx += 1
+            else:
+                cy += sy; ny += 1
+        cells.append((cx, cy))
+    if bounds is not None:
+        cells = [c for c in cells if inside(*c)]
+    return cells
+
+
 @dataclass
 class Map:
     """One grid of a match: its size, the tiles and zones on it, and the fog
@@ -8141,6 +8424,7 @@ class Map:
         check_store_path(path, "tile path")
         if path.split(".")[0] == "corpses":
             raise VTTError(_CORPSES_RESERVED)
+        value = checked_facing_data(path, value)
         d = self.tiles.setdefault((x, y), {})
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
@@ -8219,18 +8503,9 @@ class Map:
             "data": copy.deepcopy(z.get("data") or {}),
             "hooks": copy.deepcopy(z.get("hooks") or {}),
         }
-        g = z.get("glyph")
-        if isinstance(g, str) and len(g) == 1:
-            out["glyph"] = g
-        c = z.get("color")
-        if isinstance(c, str) and c:
-            out["color"] = c
-        sp = z.get("sprite")
-        if isinstance(sp, str) and sp:
-            out["sprite"] = sp
-        lg = z.get("legend")
-        if lg is False or (isinstance(lg, str) and lg):
-            out["legend"] = lg
+        for key in ZONE_LOOK_FIELDS:
+            if zone_look_value(key, z.get(key)):
+                out[key] = copy.deepcopy(z[key])
         if isinstance(z.get("def"), str) and z["def"]:
             out["def"] = z["def"]
         if z.get("tags"):
@@ -8266,18 +8541,9 @@ class Map:
                 if isinstance(k, str) and isinstance(v, str)
             } if isinstance(hooks, dict) else {},
         }
-        g = zdef.get("glyph")
-        if isinstance(g, str) and len(g) == 1:
-            z["glyph"] = g
-        c = zdef.get("color")
-        if isinstance(c, str) and c:
-            z["color"] = c
-        sp = zdef.get("sprite")
-        if isinstance(sp, str) and sp:
-            z["sprite"] = sp
-        lg = zdef.get("legend")
-        if lg is False or (isinstance(lg, str) and lg):
-            z["legend"] = lg
+        for key in ZONE_LOOK_FIELDS:
+            if zone_look_value(key, zdef.get(key)):
+                z[key] = copy.deepcopy(zdef[key])
         # The zone definition it names (Match.zone_definitions; a name
         # without a definition is an orphan, as a tile's `_template`) and
         # its own tags.
@@ -9125,6 +9391,7 @@ class Match:
         """Create an empty zone on map `mp`. Refused when a zone of that
         name exists on any map (unless overwrite, and only on the same
         map)."""
+        check_zone_name(name)
         mp = mp or self.get_map()
         other = self.zone_map(name)
         if other is not None and other is not mp:
@@ -9222,10 +9489,12 @@ class Match:
 
     def zone_look(self, z: Any, key: str) -> Any:
         """Zone dict `z`'s look field `key` (ZONE_LOOK_FIELDS): its own, else
-        its definition's, else None."""
+        its definition's, else None. `facing` is the zone's own only: it is
+        copied from the definition when the zone is made."""
         if not isinstance(z, dict):
             return None
-        for src in (z, self.zone_def_dict(z) or {}):
+        srcs = (z,) if key == FACING_FIELD else (z, self.zone_def_dict(z) or {})
+        for src in srcs:
             if zone_look_value(key, src.get(key)):
                 return src[key]
         return None
@@ -9295,12 +9564,14 @@ class Match:
         z = self.create_zone(name, mp)
         z["def"] = definition
         z["data"] = copy.deepcopy(d.get("data") or {})
+        if zone_look_value(FACING_FIELD, d.get(FACING_FIELD)):
+            z[FACING_FIELD] = d[FACING_FIELD]
         return name
 
     def set_zone_def(self, name: str, definition: Optional[str]) -> int:
         """Attach zone definition `definition` to zone `name` (its data keys
-        the zone lacks are copied in) or, with None, detach it. Returns the
-        number of data keys copied."""
+        the zone lacks are copied in, and its facing when the zone has none)
+        or, with None, detach it. Returns the number of data keys copied."""
         z = self.find_zone(name)
         if z is None:
             raise NotFound(f"Zone '{name}' not found.")
@@ -9311,6 +9582,9 @@ class Match:
         if d is None:
             raise NotFound(f"No zone definition `{definition}`.")
         z["def"] = definition
+        if (FACING_FIELD not in z
+                and zone_look_value(FACING_FIELD, d.get(FACING_FIELD))):
+            z[FACING_FIELD] = d[FACING_FIELD]
         data = z.setdefault("data", {})
         n = 0
         for k, v in (d.get("data") or {}).items():
@@ -9326,6 +9600,41 @@ class Match:
             raise DuplicateId(f"Zone definition `{name}` already exists.")
         self.zone_definitions[name] = normalize_zone_def({})
         return self.zone_definitions[name]
+
+    def reapply_zone_definition(self, definition: str,
+                                reset: bool = False) -> List[str]:
+        """Push zone definition `definition`'s data and facing to every zone
+        naming it (#258): its keys overwrite the zone's same keys, the
+        zone's other keys stay; with `reset` the zone's data becomes a copy
+        of the definition's and its facing the definition's (none when it
+        has none). Hooks, the other look fields and tags are read live
+        already. Returns the zones that changed."""
+        d = self.zone_definitions.get(definition)
+        if d is None:
+            raise NotFound(f"No zone definition `{definition}`.")
+        ddata = d.get("data") or {}
+        changed: List[str] = []
+        for name in self.zones_using_def(definition):
+            z = self.find_zone(name)
+            old = z.get("data") or {}
+            if reset:
+                new = copy.deepcopy(ddata)
+            else:
+                new = copy.deepcopy(old)
+                new.update(copy.deepcopy(ddata))
+            dface = d.get(FACING_FIELD)
+            dface = dface if zone_look_value(FACING_FIELD, dface) else None
+            face = dface if dface is not None or reset \
+                else z.get(FACING_FIELD)
+            if new != old or face != z.get(FACING_FIELD):
+                note_stored_tags(self.system_name, old, new)
+                z["data"] = new
+                if face is None:
+                    z.pop(FACING_FIELD, None)
+                else:
+                    z[FACING_FIELD] = face
+                changed.append(name)
+        return changed
 
     def zones_using_def(self, definition: str) -> List[str]:
         """The zones (any map, sorted) naming zone definition `definition`."""
@@ -12184,6 +12493,7 @@ class Match:
             eid for eid, e in self.entities.items()
             if e.map == mp.name
             and getattr(e, "is_alive", True) and not e.is_glued_part
+            and not e.is_hidden_rider
             and any(c in cells for c in self.entity_cells(e))
         ]
 
@@ -12527,52 +12837,8 @@ class Match:
 
     def _line_span(self, x1: int, y1: int, x2: int, y2: int, mp: "Map"
                    ) -> Optional[Tuple[int, int, int, int]]:
-        """The part of the segment between the centres of cells (x1,y1) and
-        (x2,y2) that crosses map `mp`, in line-walk steps: (nx0, ny0, nx1,
-        ny1), where the walk's x / y boundary crossings numbered nx0..nx1-1 /
-        ny0..ny1-1 are the ones on or inside the map's edge. Starting the walk
-        at crossing (nx0, ny0) puts it on the cell just before the line enters
-        the map, so a corner check at the edge still runs; after crossing
-        (nx1, ny1) it has left the map for good. None if the line never
-        touches the map. Off-map cells hold nothing and are never opaque, so
-        the sight / line walks skip them: their cost follows the map, not
-        coordinates a formula made up."""
-        from fractions import Fraction
-        dx, dy = x2 - x1, y2 - y1
-        t0, t1 = Fraction(0), Fraction(1)
-        # Liang-Barsky against the closed rectangle [0.5, W+0.5] x [0.5, H+0.5]
-        # (cell (x, y) spans x-0.5..x+0.5).
-        for p, q in ((-dx, Fraction(x1) - Fraction(1, 2)),
-                     (dx, Fraction(mp.grid_width) + Fraction(1, 2) - x1),
-                     (-dy, Fraction(y1) - Fraction(1, 2)),
-                     (dy, Fraction(mp.grid_height) + Fraction(1, 2) - y1)):
-            if p == 0:
-                if q < 0:
-                    return None
-                continue
-            r = q / p
-            if p < 0:
-                t0 = max(t0, r)
-            else:
-                t1 = min(t1, r)
-            if t0 > t1:
-                return None
-
-        def crossings(a: int, t: Fraction, strict: bool) -> int:
-            # Boundary k is crossed at t = (2k+1)/(2a): count those < t
-            # (strict) or <= t.
-            if a == 0:
-                return 0
-            v = a * t - Fraction(1, 2)
-            if strict:
-                n = -((-v.numerator) // v.denominator)        # ceil(v)
-            else:
-                n = v.numerator // v.denominator + 1          # floor(v) + 1
-            return max(0, min(a, n))
-
-        adx, ady = abs(dx), abs(dy)
-        return (crossings(adx, t0, True), crossings(ady, t0, True),
-                crossings(adx, t1, False), crossings(ady, t1, False))
+        """line_span on map `mp`'s size (see there)."""
+        return line_span(x1, y1, x2, y2, mp.grid_width, mp.grid_height)
 
     def _line_cells(self, x1: int, y1: int, x2: int, y2: int, *,
                     clip: bool = True,
@@ -12580,49 +12846,18 @@ class Match:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
         near->far — the same thin line the LOS walk uses (a diagonal step at
         an exact corner). Geometry only, no opacity. The shared path behind
-        first_opaque / entities_on_los / entities_in_line_ignorelos. With
-        `clip` (default) only cells ON the map are listed (endpoints included
-        when on the map) and the walk covers only the map's part of the line
-        (_line_span); without it, every cell of the line, endpoints included.
-        `mp`: the map clipped to (None = the only map)."""
+        first_opaque / entities_on_los / entities_in_line_ignorelos /
+        cells_in_line. With `clip` (default) only cells ON the map are
+        listed (endpoints included when on the map) and the walk covers
+        only the map's part of the line (line_span); without it, every cell
+        of the line, endpoints included. `mp`: the map clipped to (None =
+        the only map)."""
         if clip:
             mp = mp or self.get_map()
-        if (x1, y1) == (x2, y2):
-            return [(x1, y1)] if (not clip or mp.in_bounds(x1, y1)) else []
-        dx, dy = x2 - x1, y2 - y1
-        sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
-        sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
-        adx, ady = abs(dx), abs(dy)
-        if clip:
-            span = self._line_span(x1, y1, x2, y2, mp)
-            if span is None:
-                return []
-            nx, ny, nx1, ny1 = span
-        else:
-            self._check_line_budget(x1, y1, x2, y2)
-            nx, ny, nx1, ny1 = 0, 0, adx, ady
-        cx, cy = x1 + sx * nx, y1 + sy * ny
-        cells = [(cx, cy)]
-        guard = (nx1 - nx) + (ny1 - ny) + 2
-        while (cx, cy) != (x2, y2) and guard > 0 and (nx < nx1 or ny < ny1):
-            guard -= 1
-            if adx == 0:
-                cy += sy; ny += 1
-            elif ady == 0:
-                cx += sx; nx += 1
-            else:
-                a = (2 * nx + 1) * ady
-                b = (2 * ny + 1) * adx
-                if a == b:
-                    cx += sx; cy += sy; nx += 1; ny += 1
-                elif a < b:
-                    cx += sx; nx += 1
-                else:
-                    cy += sy; ny += 1
-            cells.append((cx, cy))
-        if clip:
-            cells = [c for c in cells if mp.in_bounds(*c)]
-        return cells
+            return line_cells(x1, y1, x2, y2,
+                              (mp.grid_width, mp.grid_height))
+        self._check_line_budget(x1, y1, x2, y2)
+        return line_cells(x1, y1, x2, y2, None)
 
     def first_opaque(self, viewer_id: Optional[str], x1: int, y1: int,
                      x2: int, y2: int,
@@ -13229,19 +13464,20 @@ class Match:
         return tpl
 
     def undefine_tile_template(self, name: str) -> int:
-        """Remove a template. Returns the number of placed instances
-        that referenced it (now orphaned — they still exist as tiles
-        with a `_template` field pointing at a missing definition;
-        fire_tile_hook finds no template hook for them and no-ops)."""
+        """Remove a template and detach its placed tiles (user call): each
+        keeps its own data and loses `_template`, so a later template of
+        the same name takes none of them over. Returns how many were
+        detached."""
         if name not in self.tile_templates:
             raise NotFound(f"tile template '{name}' not found.")
         del self.tile_templates[name]
-        orphan_count = 0
+        detached = 0
         for mp in self.maps.values():
-            for tile in mp.tiles.values():
+            for (x, y), tile in list(mp.tiles.items()):
                 if isinstance(tile, dict) and tile.get("_template") == name:
-                    orphan_count += 1
-        return orphan_count
+                    mp.tile_del_path(x, y, "_template")
+                    detached += 1
+        return detached
 
     def place_tile_template(
         self, name: str, x: int, y: int,
@@ -13283,6 +13519,9 @@ class Match:
                     f"placement overrides may not use reserved keys: "
                     f"{', '.join(sorted(bad))}."
                 )
+            if FACING_FIELD in overrides:
+                overrides = dict(overrides, **{FACING_FIELD: self.checked_facing(
+                    overrides[FACING_FIELD])})
             tile.update(copy.deepcopy(overrides))
         tile["_template"] = name
         # Placing terrain keeps the corpses lying on the cell.
@@ -13291,6 +13530,36 @@ class Match:
             tile["corpses"] = old["corpses"]
         mp.tiles[(x, y)] = tile
         return tile
+
+    def reapply_tile_template(self, name: str, maps: List["Map"],
+                              reset: bool = False) -> int:
+        """Push tile template `name`'s data to the tiles placed from it on
+        `maps` (#258): its keys overwrite the tile's same keys, the tile's
+        other keys stay; with `reset` the tile's data becomes a copy of the
+        template's (its own hooks and tags data go too). Corpses always
+        stay. Hooks and tags of the template are read live already.
+        Returns the number of tiles whose data changed."""
+        tpl = self.tile_templates.get(name)
+        if tpl is None:
+            raise NotFound(f"tile template '{name}' not found.")
+        n = 0
+        for mp in maps:
+            for cell, old in list(mp.tiles.items()):
+                if not isinstance(old, dict) or old.get("_template") != name:
+                    continue
+                if reset:
+                    new = copy.deepcopy(tpl.data)
+                    new["_template"] = name
+                    if old.get("corpses"):
+                        new["corpses"] = old["corpses"]
+                else:
+                    new = dict(old)
+                    new.update(copy.deepcopy(tpl.data))
+                if new != old:
+                    note_stored_tags(None, old, new)
+                    mp.tiles[cell] = new
+                    n += 1
+        return n
 
     def tile_template_for(self, x: int, y: int, mp: Optional["Map"] = None
                           ) -> Optional[SpecialTileTemplate]:
@@ -13412,9 +13681,46 @@ class Match:
 
     def entity_occupies(self, e: "Entity", x: int, y: int) -> bool:
         """True iff (x, y) lies within `e`'s footprint at its current
-        anchor — the membership test behind cell_occupant."""
+        anchor — the membership test behind cell_occupant. A region part
+        covers its region's cells."""
+        if e.is_region_part:
+            return (x, y) in self.part_region_cells(e)
         w, h = self.entity_footprint(e)
         return e.x <= x < e.x + w and e.y <= y < e.y + h
+
+    def body_rects(self, e: "Entity") -> List[Tuple[int, int, int, int]]:
+        """`e`'s body as (x, y, w, h) rectangles: its footprint, or for a
+        region part one rectangle per horizontal run of its region's cells
+        (at most one per row), so distances measure a region by its own
+        cells, `corners` included."""
+        if not e.is_region_part:
+            w, h = self.entity_footprint(e)
+            return [(e.x, e.y, w, h)]
+        rects: List[Tuple[int, int, int, int]] = []
+        for cx, cy in sorted(set(self.part_region_cells(e) or [(e.x, e.y)]),
+                             key=lambda c: (c[1], c[0])):
+            if rects and rects[-1][1] == cy and \
+                    rects[-1][0] + rects[-1][2] == cx:
+                rx, ry, rw, rh = rects[-1]
+                rects[-1] = (rx, ry, rw + 1, rh)
+            else:
+                rects.append((cx, cy, 1, 1))
+        return rects
+
+    def body_center(self, e: "Entity") -> Tuple[int, int]:
+        """The centre cell of `e`'s body, rounded down for an even size; for
+        a region part the region cell nearest its bounding box's centre
+        (ties in row order), so the result is always a covered cell."""
+        if not e.is_region_part:
+            w, h = self.entity_footprint(e)
+            return (e.x + (w - 1) // 2, e.y + (h - 1) // 2)
+        cells = self.part_region_cells(e) or [(e.x, e.y)]
+        xs = [c[0] for c in cells]
+        ys = [c[1] for c in cells]
+        mx2, my2 = min(xs) + max(xs), min(ys) + max(ys)   # doubled centre
+        return min(cells, key=lambda c: ((2 * c[0] - mx2) ** 2
+                                         + (2 * c[1] - my2) ** 2,
+                                         c[1], c[0]))
 
     def _rect_gap(self, ax: int, ay: int, aw: int, ah: int,
                   bx: int, by: int, bw: int, bh: int,
@@ -13447,18 +13753,17 @@ class Match:
         the gap between their footprint rectangles. The single source of
         truth for entity-to-entity distance (entities_within/nearest_entity
         and the `near:` find predicate both route through here)."""
-        rw, rh = self.entity_footprint(e_ref)
-        ow, oh = self.entity_footprint(e_other)
-        return self._rect_gap(e_ref.x, e_ref.y, rw, rh,
-                              e_other.x, e_other.y, ow, oh, mode)
+        return min(self._rect_gap(ax, ay, aw, ah, bx, by, bw, bh, mode)
+                   for ax, ay, aw, ah in self.body_rects(e_ref)
+                   for bx, by, bw, bh in self.body_rects(e_other))
 
     def cell_entity_distance(self, x: int, y: int, e: "Entity",
                              mode: str = "square_radius") -> float:
         """Footprint-aware nearest-cell distance from a single cell (x, y)
         to entity `e` — the point-vs-footprint gap behind the `within:`
         find predicate."""
-        ow, oh = self.entity_footprint(e)
-        return self._rect_gap(x, y, 1, 1, e.x, e.y, ow, oh, mode)
+        return min(self._rect_gap(x, y, 1, 1, bx, by, bw, bh, mode)
+                   for bx, by, bw, bh in self.body_rects(e))
 
     def cell_occupant(self, x: int, y: int,
                       ignore: Tuple[str, ...] = (),
@@ -13475,8 +13780,8 @@ class Match:
             # Glued body parts ride on the parent's cell and never block —
             # the parent is the occupant. A LOCATED part has its own cell
             # and occupies it normally.
-            if e.is_glued_part:
-                continue
+            if e.is_glued_part or e.is_region_part:
+                continue    # a region lies on its parent, the occupant
             # Mounted riders are aboard the vehicle, not on the ground — they
             # never block (the vehicle's own footprint is the occupant). This
             # holds for visible riders too (a gunner shares the tank's cell).
@@ -13669,15 +13974,22 @@ class Match:
             return False
 
     def cell_blocks(self, mover_id: str, x: int, y: int,
-                    mp: Optional["Map"] = None) -> bool:
+                    mp: Optional["Map"] = None,
+                    step: Optional[Tuple[str, int, int]] = None) -> bool:
         """True iff the tile or any zone covering (x, y) of map `mp` (None:
         the mover's map, else the only map) blocks `mover_id` from entering.
         The raw geometry query — does NOT consult the block_* movement-mode
-        rules (use _check_block for that)."""
+        rules (use _check_block for that). `step` = (direction, dx, dy) of
+        a stepwise move: the conditions bind move_dir and from_x / from_y
+        (the cell the body's cell steps from); None (a teleport, swap,
+        placement) binds all three to None (#257: one-way doors)."""
         mp = self._map_for(mp, self.entities.get(mover_id))
+        move = ({"move_dir": step[0], "from_x": x - step[1],
+                 "from_y": y - step[2]} if step is not None else
+                {"move_dir": None, "from_x": None, "from_y": None})
         if self._eval_block_spec(
                 self._tile_block_spec(x, y, mp), mover_id,
-                {"tile_x": x, "tile_y": y, "tile_map": mp.name}):
+                {"tile_x": x, "tile_y": y, "tile_map": mp.name, **move}):
             return True
         for name, z in mp.zones.items():
             cells = z.get("cells", ())
@@ -13686,8 +13998,9 @@ class Match:
             zspec = self.zone_data_spec(z, "block")
             if zspec is None:
                 zspec = self.rules.get("zone_block_condition", "")
-            if self._eval_block_spec(zspec, mover_id, {"zone_name": name,
-                                                       "zone_map": mp.name}):
+            if self._eval_block_spec(zspec, mover_id, {
+                    "zone_name": name, "zone_map": mp.name, "tile_x": x,
+                    "tile_y": y, **move}):
                 return True
         # Corpses can block, per corpse_block_condition (off by default).
         # Gated on the rule being set so there's zero cost when corpses are
@@ -13707,19 +14020,20 @@ class Match:
                 if self._eval_block_spec(
                         cspec, mover_id,
                         {"tile_x": x, "tile_y": y, "tile_map": mp.name,
-                         "corpse_id": cid, "corpse_team": ct}):
+                         "corpse_id": cid, "corpse_team": ct, **move}):
                     return True
         return False
 
     def _check_block(self, mover_id: str, x: int, y: int, mode: str,
-                     mp: Optional["Map"] = None) -> bool:
+                     mp: Optional["Map"] = None,
+                     step: Optional[Tuple[str, int, int]] = None) -> bool:
         """Whether a movement of kind `mode` ('walk'/'tp'/'push'/'swap')
         onto (x, y) of map `mp` (None: the mover's) is blocked for
         `mover_id` — i.e. the matching block_<mode> rule is on AND the cell
-        blocks the mover."""
+        blocks the mover. `step`: see cell_blocks."""
         if not self.rules.get(f"block_{mode}", True):
             return False
-        return self.cell_blocks(mover_id, x, y, mp)
+        return self.cell_blocks(mover_id, x, y, mp, step)
 
     def push_entity(self, eid: str, direction: str, n: int = 1) -> Tuple[int, List[str]]:
         """Forced movement: step `eid` up to `n` cells in `direction`,
@@ -13785,7 +14099,8 @@ class Match:
             # A blocked cell stops the push at the cell before it (knockback
             # into a wall) — same "stops at the first blocker" rule as
             # occupancy above.
-            if any(self._check_block(e.id, cx, cy, "push")
+            if any(self._check_block(e.id, cx, cy, "push",
+                                     step=(canon, dx, dy))
                    for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             x, y = nx, ny
@@ -13868,7 +14183,9 @@ class Match:
                 break
             # Blocking stops the drag at the cell before a blocked one,
             # mirroring push_entity's "stops at the first blocker" rule.
-            if any(self._check_block(e.id, cx, cy, "push")
+            if any(self._check_block(
+                    e.id, cx, cy, "push",
+                    step=(_VECTOR_TO_DIRECTION[(sx, sy)], sx, sy))
                    for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             moves.append((_VECTOR_TO_DIRECTION[(sx, sy)], 1))
@@ -15664,10 +15981,12 @@ class Match:
         vars_ = self.presented_vars(e, pov_team) if pov_team is not None \
             else e.vars
         team = e.team
+        status = e.status
         if vars_ is not e.vars:
             t = team_text(vars_.get(str(self.rules.get("team_var", "team"))))
             team = t if t not in (None, "") else None
-        pairs = self._own_and_granted_tags(vars_, e.status, team)
+            status = self.presented_statuses(e, pov_team)
+        pairs = self._own_and_granted_tags(vars_, status, team)
         if e.part_of:
             root = self.body_root(e)
             if root is not e:
@@ -19629,9 +19948,16 @@ class Match:
     def _run_ordered(self, engine: Any, ctx: Any, target_eid: str,
                      pred, log: List[str], **kinds: bool) -> None:
         """Run `_ordered_passives(target_eid, pred)` into `log`: self =
-        the target; an own passive is skipped once its unit is gone."""
+        the target; an own passive is skipped once its unit is gone. When
+        a passive removes or kills the target, the rest of the hook's
+        passives (global and team too) don't run on it (ghost firing); a
+        hook fired for a unit already gone (on_death, a despawn) still
+        reaches its global and team passives."""
+        present = target_eid in self.entities
         for p, kind in self._ordered_passives(target_eid, pred, **kinds):
-            if kind == "own" and target_eid not in self.entities:
+            if target_eid not in self.entities and (present or kind == "own"):
+                if present:
+                    break
                 continue
             log.append(_run_passive_safely(
                 engine, p, ctx, target_id=target_eid,
@@ -20784,6 +21110,19 @@ class Match:
             out.update(dvars)
         return out
 
+    def presented_statuses(self, e: "Entity",
+                           pov_team: Optional[str] = None) -> Dict[str, Any]:
+        """The statuses `e` presents to `pov_team`: the real ones, or under a
+        disguise its `status` dict (name -> instance data), none when it has
+        no such key (the image hides status overlays under a disguise too).
+        Read-only."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is None:
+            return e.status
+        st = dis.get("status")
+        return {str(k): v for k, v in st.items()} \
+            if isinstance(st, dict) else {}
+
     def entity_display_name(self, e: "Entity",
                             pov_team: Optional[str] = None) -> str:
         """`e`'s presented name: the disguise's `name` when disguised to
@@ -20922,23 +21261,35 @@ class Match:
                  "up_left": "down_left", "down_left": "up_left",
                  "up_right": "down_right", "down_right": "up_right"}
 
-    def _sprite_mirror_axes(self, e: "Entity") -> frozenset:
-        """Which mirror axes ('h'/'v') are allowed when filling a missing
-        facing sprite for `e`: the `sprite_mirror` var > the rule."""
-        val = e.vars.get("sprite_mirror")
-        if not (isinstance(val, str) and val.strip()):
+    def _mirror_axes(self, *vals: Any) -> frozenset:
+        """Which mirror axes ('h'/'v') fill a missing facing sprite: the
+        first usable `sprite_mirror` value of `vals` (the thing's own, then
+        its template's ...) > the sprite_mirror rule."""
+        val = next((v for v in vals if isinstance(v, str) and v.strip()),
+                   None)
+        if val is None:
             val = str(self.rules.get("sprite_mirror", "horizontal"))
         val = val.strip().lower()
         return {"none": frozenset(), "horizontal": frozenset({"h"}),
                 "vertical": frozenset({"v"}),
                 "both": frozenset({"h", "v"})}.get(val, frozenset({"h"}))
 
+    def _sprite_mirror_axes(self, e: "Entity") -> frozenset:
+        """Which mirror axes ('h'/'v') are allowed when filling a missing
+        facing sprite for `e`: the `sprite_mirror` var > the rule."""
+        return self._mirror_axes(e.vars.get("sprite_mirror"))
+
     def _mirror_sprite(self, e: "Entity", sprites: Dict[str, Any],
                        facing: str) -> Optional[Tuple[str, bool, bool]]:
         """Find a mirror of an existing facing in `sprites` to stand in for
         the missing `facing`, per the entity's allowed mirror axes. Returns
         (key, flip_h, flip_v) or None."""
-        axes = self._sprite_mirror_axes(e)
+        return self._mirror_in(sprites, facing, self._sprite_mirror_axes(e))
+
+    def _mirror_in(self, sprites: Dict[str, Any], facing: str,
+                   axes: frozenset) -> Optional[Tuple[str, bool, bool]]:
+        """A mirror of an existing facing in `sprites` standing in for the
+        missing `facing` along `axes`: (key, flip_h, flip_v) or None."""
         if "h" in axes:
             p = self._MIRROR_H.get(facing)
             k = sprites.get(p) if p else None
@@ -20949,6 +21300,42 @@ class Match:
             k = sprites.get(p) if p else None
             if isinstance(k, str) and k:
                 return (k, False, True)
+        return None
+
+    def _facing_sprite(self, sources: List[Dict[str, Any]], facing: str,
+                       axes: frozenset) -> Optional[Tuple[str, bool, bool]]:
+        """A tile's / zone's sprite from its look `sources` (own first):
+        within each, `sprites.<facing>`, then a mirror of another facing,
+        then the plain `sprite`. (key, flip_h, flip_v) or None."""
+        for src in sources:
+            sprites = src.get("sprites")
+            if isinstance(sprites, dict):
+                k = sprites.get(facing)
+                if isinstance(k, str) and k:
+                    return (k, False, False)
+                mir = self._mirror_in(sprites, facing, axes)
+                if mir is not None:
+                    return mir
+            k = src.get("sprite")
+            if isinstance(k, str) and k:
+                return (k, False, False)
+        return None
+
+    @staticmethod
+    def _facing_glyph(sources: List[Dict[str, Any]], facing: str
+                      ) -> Optional[str]:
+        """A tile's / zone's glyph from its look `sources` (own first):
+        within each, `glyphs.<facing>`, then the plain `glyph`. No facing
+        arrow: a tile or zone without a glyph shows none."""
+        for src in sources:
+            glyphs = src.get("glyphs")
+            if isinstance(glyphs, dict):
+                g = glyph_of(glyphs.get(facing))
+                if isinstance(g, str) and len(g) == 1:
+                    return g
+            g = glyph_of(src.get("glyph"))
+            if isinstance(g, str) and len(g) == 1:
+                return g
         return None
 
     def entity_sprite(self, e: "Entity", pov_team: Optional[str] = None
@@ -21069,28 +21456,70 @@ class Match:
                     out.append(rec)
         return out
 
-    def tile_sprite(self, x: int, y: int, mp: "Map") -> Optional[str]:
-        """The sprite key for the tile at (x, y) of map `mp`: instance
-        `sprite` data > the template's `sprite`. None when unset."""
+    def _tile_look_sources(self, x: int, y: int, mp: "Map"
+                           ) -> List[Dict[str, Any]]:
+        """The dicts a tile's look reads, own first: its data, then its
+        template's data. Empty when the cell has no tile data."""
         cell = mp.tiles.get((x, y))
         if not isinstance(cell, dict):
-            return None
-        k = cell.get("sprite")
-        if isinstance(k, str) and k:
-            return k
+            return []
+        out = [cell]
         tpl_name = cell.get("_template")
         if isinstance(tpl_name, str):
             tpl = self.tile_templates.get(tpl_name)
             if tpl is not None:
-                tk = tpl.data.get("sprite")
-                if isinstance(tk, str) and tk:
-                    return tk
-        return None
+                out.append(tpl.data)
+        return out
+
+    def _zone_look_sources(self, z: Any) -> List[Dict[str, Any]]:
+        """The dicts a zone's look reads, own first: the zone, then its
+        definition."""
+        if not isinstance(z, dict):
+            return []
+        d = self.zone_def_dict(z)
+        return [z] + ([d] if d is not None else [])
+
+    def tile_sprite_info(self, x: int, y: int, mp: "Map"
+                         ) -> Optional[Tuple[str, bool, bool]]:
+        """The sprite for the tile at (x, y) of map `mp` as (key, flip_h,
+        flip_v): `sprites.<facing>` / a mirror of another facing /
+        `sprite`, the instance's data before the template's. None when
+        unset."""
+        src = self._tile_look_sources(x, y, mp)
+        if not src:
+            return None
+        axes = self._mirror_axes(*(d.get("sprite_mirror") for d in src))
+        return self._facing_sprite(src, self.tile_facing(x, y, mp), axes)
+
+    def tile_sprite(self, x: int, y: int, mp: "Map") -> Optional[str]:
+        """The sprite key for the tile at (x, y) of map `mp` (see
+        tile_sprite_info). None when unset."""
+        info = self.tile_sprite_info(x, y, mp)
+        return info[0] if info else None
+
+    def zone_sprite_info(self, name: str, mp: "Map"
+                         ) -> Optional[Tuple[str, bool, bool]]:
+        """The sprite for zone `name` of map `mp` as (key, flip_h, flip_v),
+        from the zone's then its definition's look fields; the mirror axes
+        from the `sprite_mirror` data (zone, definition) > the rule."""
+        z = mp.zones.get(name)
+        src = self._zone_look_sources(z)
+        if not src:
+            return None
+        axes = self._mirror_axes(self.zone_data_spec(z, "sprite_mirror"))
+        return self._facing_sprite(src, self.zone_facing(name, mp), axes)
 
     def zone_sprite(self, name: str, mp: "Map") -> Optional[str]:
-        """The sprite key for zone `name` of map `mp` (its `sprite` field),
-        or None."""
-        return self.zone_look(mp.zones.get(name), "sprite")
+        """The sprite key for zone `name` of map `mp`, or None."""
+        info = self.zone_sprite_info(name, mp)
+        return info[0] if info else None
+
+    def zone_glyph(self, name: str, mp: "Map") -> Optional[str]:
+        """The glyph for zone `name` of map `mp`: `glyphs.<facing>` then
+        `glyph`, the zone's before its definition's. None when unset."""
+        z = mp.zones.get(name)
+        return self._facing_glyph(self._zone_look_sources(z),
+                                  self.zone_facing(name, mp))
 
     def background_layer(self, mp: Optional["Map"] = None
                          ) -> Optional[Dict[str, Any]]:
@@ -21107,23 +21536,11 @@ class Match:
                 else "stretch"}
 
     def tile_glyph(self, x: int, y: int, mp: "Map") -> Optional[str]:
-        """The glyph for the tile at (x, y) of map `mp`: instance > template
-        (mirrors the inline resolution in _render_ascii_impl). None when
-        unset."""
-        cell = mp.tiles.get((x, y))
-        if not isinstance(cell, dict):
-            return None
-        g = glyph_of(cell.get("glyph"))
-        if isinstance(g, str) and len(g) == 1:
-            return g
-        tpl_name = cell.get("_template")
-        if isinstance(tpl_name, str):
-            tpl = self.tile_templates.get(tpl_name)
-            if tpl is not None:
-                tg = glyph_of(tpl.data.get("glyph"))
-                if isinstance(tg, str) and len(tg) == 1:
-                    return tg
-        return None
+        """The glyph for the tile at (x, y) of map `mp`: `glyphs.<facing>`
+        then `glyph`, the instance's data before the template's (both
+        renderers read it). None when unset."""
+        return self._facing_glyph(self._tile_look_sources(x, y, mp),
+                                  self.tile_facing(x, y, mp))
 
     def entity_has_custom_sprite(self, e: "Entity") -> bool:
         """True when `e` has a custom sprite (per-facing `sprites` or the base
@@ -21370,7 +21787,7 @@ class Match:
         for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
             if not self.zone_visible_to(zname, pov_team, mp):
                 continue
-            g = self.zone_look(z, "glyph")
+            g = self.zone_glyph(zname, mp)
             has_glyph = g is not None
             zc = self.zone_color(zname, mp)
             if not has_glyph and zc is None:
@@ -21394,16 +21811,8 @@ class Match:
                 continue
             if not self.tile_visible_to(tx, ty, pov_team, mp):
                 continue
-            glyph = glyph_of(data.get("glyph"))
-            if not (isinstance(glyph, str) and len(glyph) == 1):
-                tpl_name = data.get("_template")
-                if isinstance(tpl_name, str):
-                    tpl = self.tile_templates.get(tpl_name)
-                    if tpl is not None:
-                        cand = glyph_of(tpl.data.get("glyph"))
-                        if isinstance(cand, str) and len(cand) == 1:
-                            glyph = cand
-            has_glyph = isinstance(glyph, str) and len(glyph) == 1
+            glyph = self.tile_glyph(tx, ty, mp)
+            has_glyph = glyph is not None
             tc = self.tile_color(tx, ty, mp)
             if has_glyph:
                 grid[ty][tx] = glyph
@@ -21872,8 +22281,9 @@ class Match:
         for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
             if not self.zone_visible_to(zname, pov_team, mp):
                 continue
-            spr = self.zone_sprite(zname, mp)
-            g = self.zone_look(z, "glyph")
+            sinfo = self.zone_sprite_info(zname, mp)
+            spr, fh, fv = sinfo if sinfo else (None, False, False)
+            g = self.zone_glyph(zname, mp)
             tint = self.zone_color(zname, mp)
             if spr is None and g is None and tint is None:
                 continue
@@ -21884,14 +22294,15 @@ class Match:
                     "kind": "zone", "ref": zname, "x": zx, "y": zy,
                     "w": 1, "h": 1, "mode": "single", "sprite": spr,
                     "glyph": g, "tint": tint, "opacity": 100,
-                    "flip_h": False, "flip_v": False, "layer": zone_layer})
+                    "flip_h": fh, "flip_v": fv, "layer": zone_layer})
 
         # Tile layer (20).
         for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
             if not mp.in_bounds(tx, ty) or not self.tile_visible_to(
                     tx, ty, pov_team, mp):
                 continue
-            spr = self.tile_sprite(tx, ty, mp)
+            sinfo = self.tile_sprite_info(tx, ty, mp)
+            spr, fh, fv = sinfo if sinfo else (None, False, False)
             g = self.tile_glyph(tx, ty, mp)
             tint = self.tile_color(tx, ty, mp)
             if spr is None and g is None and tint is None:
@@ -21904,7 +22315,7 @@ class Match:
                 "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
                 "glyph": g, "tint": tint, "opacity": 100,
-                "flip_h": False, "flip_v": False, "layer": t_layer})
+                "flip_h": fh, "flip_v": fv, "layer": t_layer})
 
         # Corpse layer (25): the dead entity's stored sprite, tinted +
         # semi-transparent (corpse_sprite_tint / corpse_sprite_opacity).
@@ -22044,10 +22455,20 @@ class Match:
         unknown direction, or a diagonal while allow_diagonal_facing is off.
         Riders in a facing-relative slot region are re-seated, since the
         region turns with the vehicle. Returns the new facing."""
+        canon = self.checked_facing(raw, e.facing)
+        e.facing = canon
+        self._restamp_riders_for(e.id)
+        return canon
+
+    def checked_facing(self, raw: Any, current: str = "up") -> Direction:
+        """The facing `raw` names (any normalize_direction alias), or
+        `current` turned one step with cw / ccw. VTTError on an unknown
+        word, or a diagonal while allow_diagonal_facing is off. Shared by
+        units, tiles and zones (#257)."""
         tok = str(raw).strip().lower() if isinstance(raw, str) else ""
         eight_way = bool(self.rules.get("allow_diagonal_facing", False))
         if tok in self._FACING_CW or tok in self._FACING_CCW:
-            canon = rotate_direction(e.facing, clockwise=tok in self._FACING_CW,
+            canon = rotate_direction(current, clockwise=tok in self._FACING_CW,
                                      eight_way=eight_way)
         else:
             canon = normalize_direction(tok)
@@ -22061,8 +22482,55 @@ class Match:
                     f"Diagonal facing '{raw}' is not allowed by the active "
                     "game system. Enable rule 'allow_diagonal_facing' to "
                     "permit it.")
-        e.facing = canon
-        self._restamp_riders_for(e.id)
+        return canon
+
+    # ---- tile and zone facing (#257) ---------------------------------
+    # A tile's facing is its `facing` data (else its template's), a zone's
+    # its `facing` field (else its definition's); `up` when none is set.
+    # Most tiles never set one: it is there for directional terrain
+    # (conveyors, arrow traps, one-way doors), read by formulas
+    # (tile_facing / zone_facing), the per-facing looks and block
+    # conditions (move_dir).
+
+    def tile_facing(self, x: int, y: int, mp: "Map") -> Direction:
+        """The facing of the tile at (x, y) of map `mp`: its `facing` data,
+        else `up`. Materialized (user call): placement copies a template's
+        facing with its data, and a later template facing reaches placed
+        tiles only through `!tile def reapply`."""
+        f = (mp.tiles.get((x, y)) or {}).get(FACING_FIELD)
+        return f if isinstance(f, str) and f in ALLOWED_DIRECTIONS else "up"
+
+    def tile_data_value(self, path: str, value: Any) -> Any:
+        """`value` for tile data `path` as a command or formula stores it: a
+        `facing` passes checked_facing (a diagonal needs
+        allow_diagonal_facing)."""
+        if str(path).split(".")[0] == FACING_FIELD and "." not in str(path):
+            return self.checked_facing(value)
+        return value
+
+    def tile_face(self, x: int, y: int, raw: Any, mp: "Map") -> Direction:
+        """Turn the tile at (x, y) of map `mp` to `raw` (a direction, or
+        cw / ccw from its current facing): writes its `facing` data."""
+        canon = self.checked_facing(raw, self.tile_facing(x, y, mp))
+        mp.tile_set_path(x, y, FACING_FIELD, canon)
+        return canon
+
+    def zone_facing(self, name: str, mp: Optional["Map"] = None
+                    ) -> Direction:
+        """The facing of zone `name`: its own (copied from its definition
+        when made), else `up`."""
+        z = (mp.zones.get(name) if mp is not None else self.find_zone(name))
+        f = self.zone_look(z, FACING_FIELD)
+        return f if isinstance(f, str) else "up"
+
+    def zone_face(self, name: str, raw: Any) -> Direction:
+        """Turn zone `name` to `raw` (a direction, or cw / ccw from its
+        current facing): sets its own `facing` field."""
+        z = self.find_zone(name)
+        if z is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        canon = self.checked_facing(raw, self.zone_facing(name))
+        z[FACING_FIELD] = canon
         return canon
 
     def facing_toward(self, e: "Entity", tx: float, ty: float) -> Optional[Direction]:
@@ -22290,7 +22758,8 @@ class Match:
                                 f"Group '{group_name}' move aborted: member "
                                 f"'{eid}' would leave the grid at ({cx},{cy})."
                             )
-                        if self._check_block(eid, cx, cy, "walk"):
+                        if self._check_block(eid, cx, cy, "walk",
+                                             step=(canon, dx, dy)):
                             raise Blocked(
                                 f"Group '{group_name}' move aborted: member "
                                 f"'{eid}' is blocked at ({cx},{cy})."
@@ -23274,6 +23743,19 @@ def rename_unit_vars(vars_: Dict[str, Any], clamps: Dict[str, Dict[str, Any]],
         _rel_del(vars_, o)
     for _o, n, v in plan:
         _rel_set(vars_, n, v)
+    moved = [(o, n) for o, n, _v in plan]
+    # A disguise's decoy `vars` follow too, or they'd stop covering the
+    # real values (a decoy team under the old name shows the real one).
+    dname = want.get("disguise_var") or ""
+    found, dis = _rel_get(vars_, dname) if dname else (False, None)
+    dvars = dis.get("vars") if found and isinstance(dis, dict) else None
+    if isinstance(dvars, dict):
+        dplan = [(o, n) for k, o, n in moves if k != "disguise_var"
+                 and o in dvars and (n not in dvars or n in leaving)]
+        values = {o: dvars.pop(o) for o, _n in dplan}
+        for o, n in dplan:
+            dvars[n] = values[o]
+            moved.append((f"{dname}.vars.{o}", f"{dname}.vars.{n}"))
     names = {o: n for _k, o, n in moves}
     new_clamps: Dict[str, Dict[str, Any]] = {}
     for path, cd in clamps.items():
@@ -23282,7 +23764,7 @@ def rename_unit_vars(vars_: Dict[str, Any], clamps: Dict[str, Dict[str, Any]],
             if isinstance(cd.get(f), str) and cd[f] in names:
                 cd[f] = names[cd[f]]
         new_clamps[names.get(path, path)] = cd
-    return want, new_clamps, notes, [(o, n) for o, n, _v in plan]
+    return want, new_clamps, notes, moved
 
 
 def strip_markers(value: Any) -> Any:
@@ -24308,6 +24790,16 @@ class MatchManager:
 _CRASH_TRACE_MAX = 6000
 _CRASH_TEXT_MAX = 1000
 _TRACE_FILE_RE = re.compile(r'File "([^"]+)"')
+# An absolute path in an error message (an OSError names the file it
+# failed on): an admin reading the log mustn't learn the host's folders, so
+# only its last part stays (`…/history`).
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s'\"]*")
+
+
+def _redact_paths(text: str) -> str:
+    return _ABS_PATH_RE.sub(
+        lambda mt: "…/" + os.path.basename(mt.group(0).rstrip("/\\"))
+        if len(mt.group(0)) > 1 else mt.group(0), text)
 
 
 class CrashLog:
@@ -24329,11 +24821,17 @@ class CrashLog:
                 "entries": copy.deepcopy(self.entries)}
 
     def load(self, data: Dict[str, Any]) -> None:
-        self.entries = [e for e in (data.get("entries") or [])
-                        if isinstance(e, dict)
-                        and isinstance(e.get("ref"), int)]
-        self.next_ref = max([int(data.get("next_ref") or 1)]
-                            + [e["ref"] + 1 for e in self.entries])
+        """Read a saved log. A bad `next_ref` counts on from the highest
+        ref kept (refs must stay unique: a player quotes one)."""
+        entries = [e for e in (data.get("entries") or [])
+                   if isinstance(e, dict) and isinstance(e.get("ref"), int)
+                   and not isinstance(e.get("ref"), bool)]
+        try:
+            stored = int(data.get("next_ref") or 1)
+        except (TypeError, ValueError):
+            stored = 1
+        self.entries = entries
+        self.next_ref = max([stored] + [e["ref"] + 1 for e in entries])
 
     def find(self, ref: int) -> Optional[Dict[str, Any]]:
         for e in self.entries:
@@ -24342,44 +24840,65 @@ class CrashLog:
         return None
 
     def record(self, where: str, exc: BaseException,
-               server: Optional[str] = None) -> Optional[int]:
+               server: Optional[str] = None,
+               repeat_of: Optional[int] = None) -> Optional[int]:
         """Record the exception being handled (call from its except block)
         with the running command's context (`server` names the server when
         no command is running); return its ref, or None when the log keeps
-        nothing."""
+        nothing. `repeat_of`: the ref of the entry this failure repeats (a
+        disk that keeps failing): that entry counts it instead of a new one,
+        while it is still in the log. A server keeps at most
+        error_log_server_entries of the bot-wide error_log_entries."""
         import traceback
         limit = owner_limit("error_log_entries")
         if limit <= 0:
             return None
         c = CRASH_CONTEXT.get() or {}
+        srv = c.get("server") or server
+        old = self.find(repeat_of) if repeat_of is not None else None
+        if old is not None and old.get("server") == srv:
+            old["repeats"] = int(old.get("repeats") or 0) + 1
+            old["last_at"] = _utc_now()
+            self._save()
+            return repeat_of
         trace = "".join(traceback.format_exception(
             type(exc), exc, exc.__traceback__))
         # File names only: an admin reading the log mustn't learn the
         # host's folders.
-        trace = _TRACE_FILE_RE.sub(
-            lambda mt: f'File "{os.path.basename(mt.group(1))}"', trace)
+        trace = _redact_paths(_TRACE_FILE_RE.sub(
+            lambda mt: f'File "{os.path.basename(mt.group(1))}"', trace))
         if len(trace) > _CRASH_TRACE_MAX:
             trace = "...\n" + trace[-_CRASH_TRACE_MAX:]
         ref = self.next_ref
         self.next_ref += 1
         self.entries.append({
             "ref": ref, "at": _utc_now(),
-            "server": c.get("server") or server,
+            "server": srv,
             "server_name": c.get("server_name"),
             "match": c.get("match"), "user": c.get("user"),
             "user_name": c.get("user_name"),
             "command": (c.get("command") or "")[:_CRASH_TEXT_MAX],
             "where": where[:_CRASH_TEXT_MAX],
-            "error": f"{type(exc).__name__}: {exc}"[:_CRASH_TEXT_MAX],
+            "error": _redact_paths(
+                f"{type(exc).__name__}: {exc}")[:_CRASH_TEXT_MAX],
             "trace": trace,
         })
+        # One server's stream of crashes can't push the others' out.
+        per = owner_limit("error_log_server_entries")
+        mine = [e for e in self.entries if e.get("server") == srv]
+        if per > 0 and len(mine) > per:
+            drop = {id(e) for e in mine[:len(mine) - per]}
+            self.entries = [e for e in self.entries if id(e) not in drop]
         del self.entries[:-limit]
+        self._save()
+        return ref
+
+    def _save(self) -> None:
         if self.save is not None:
             try:
                 self.save(self)
             except Exception as ex:  # noqa: BLE001 - logging must not crash
                 print(f"⚠️ The error log couldn't be saved ({ex}).")
-        return ref
 
 
 def crash_ref(where: str, exc: BaseException) -> str:
