@@ -292,6 +292,11 @@ Each of these was learned from a shipped bug.
   that includes ids inside arguments (`near:<eid>` matched the visible units
   near a hidden one); re-run the POV leak detector and the existence-oracle
   detector (§5).
+- **A read that prints formula text the GM wrote** (a body, hook,
+  condition, passive, formula rule): print it through `logic.formula_text`
+  (one text) or `_hide_formula_fields` (a dict / list view), so
+  formula_text_visibility hides it (§7.14); re-run the formula-text leak
+  probe (§5).
 - **Anything iterating units and firing hooks:** re-check
   `eid in m.entities` after each hook (§5 "ghost firing").
 - **A command whose effect on a match depends on more than that match**
@@ -896,6 +901,14 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   pool run as a red-POV player; replies grepped for the hidden names, values
   and cells after stripping echoes of the typed args. Include list KINDS
   (`commands`, `turns`) in the pool.
+- **Formula-text leak probe** (950): a board with a marker string in
+  every place a GM stores a formula (functions, unit / global / team /
+  default passives, status ticks / hooks / `_unless`, watchers, actions,
+  tile and zone hooks and block / opaque, macros, schedules, formula
+  rules, system libraries, templates, prefabs, aliases); every root x
+  read subcommand x an argument pool run as a player under
+  `formula_text_visibility host`; any marker in a reply is a leak (alias
+  expansions excepted, by design).
 - **Existence-oracle detector** (41): the same board; each command run twice
   as the player, once naming a hidden unit (as an arg, `near:<id>:60`,
   `for=<id>`, `to=<id>`, `<id>.hp`) and once naming a nonexistent id; any
@@ -2165,7 +2178,20 @@ hardcodes**.
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`). `team_data_visibility` (own / all / host)
-  filters `!team list/get`. `inline_args_access` closes the `$()` route
+  filters `!team list/get`. `formula_text_visibility` (all / host, user
+  call): under `host` a caller who is neither an administrator nor a host
+  of the channel's match reads every GM formula as `(hidden)` (names,
+  triggers and signatures stay): `_run` sets `logic.FORMULA_TEXT_HIDDEN`
+  (`_formula_text_hidden`; the rule from the channel's match, else its
+  default system; also around the `$()` resolution) and the reads print
+  through `formula_text` / `_hide_formula_fields` (`_FORMULA_FIELD_KEYS`,
+  `hooks` entries, `<field>_unless`): `!func`, `!help function`, passive
+  lists / info, `!state`, `!status info`, `!action info`, `!schedule
+  list`, `!tile info`, `!zone info`, tile / zone hook lists, `!template
+  show` / `diff`, and the FORMULA_RULES (`!help rule`, `!system info` /
+  `diff`, a history diff, `rule_get` in `$()`). Alias expansions and macro
+  bodies are command lines, left readable (949-950).
+  `inline_args_access` closes the `$()` route
   (579-580, 593). Map names a view may not know stay out of `!match info`,
   `!match fog`, the "name a map" refusals (`Match.maps_text` through the
   `COMMAND_POV` context) and the tagged map lines (855).
@@ -2866,12 +2892,6 @@ rejected already. Update this section in the PR that resolves an item.
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
   limitation, left as is (user: note it).
-- **Formula text and players** (user: discuss later): every read that
-  prints formula text is open to players today (`!func list` / `info`,
-  `!help function`, `!status info`, `!passive list` / `info`, ...), so a
-  hidden trap passive or a boss's damage `!func` is readable. Raised
-  option: a rule (e.g. `formula_text_visibility` all / host) showing
-  players the name and signature with the body hidden.
 - **Corpse targets and immunity:** `corpse` / `corpse_list` action
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
@@ -2880,18 +2900,33 @@ rejected already. Update this section in the PR that resolves an item.
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
   tile, zone or corpse blocks it. Known issue (user: list it).
 
-- **Pass 43, deferred by the user ("decide later"):** T3 (a mid-round
-  initiative change under `immediate` can cost a unit its turn or give it
-  a second; options: remember who acted this round, keep as is, or make
-  `deferred` the default) and the J2 follow-up (compact journal `state`
-  entries and one template library per segment; options: diffs now, leave
-  it, or fold into the large-match-state discussion).
 - **Large match state, per-command cost** (user: discuss later): after a
   whole-map tile fill on 500x500 every command costs ~3.5 s (three full
   serializations per command; numbers under "Undo history disk growth"
   below). Options raised: a cap on what a match can hold, cheaper undo
   snapshots (diffs / copy-on-write, reusing the post-command state for the
-  commit), or leaving it deferred.
+  commit), or leaving it deferred. The command journal has the same cost
+  and goes into the same design (user call, pass 43's J2 follow-up): a
+  `state` entry (undo, history restore, `!run`, transfers, ...) stores the
+  whole match (~650 KB on a filled 150x150), and every segment's header
+  copies the whole template library.
+
+### Ask between tasks
+
+Design questions the user wants raised when no other task is in flight
+(not in the middle of a feature or a bugfix pass). Raise one, with its
+options and a recommendation, when a task has just finished and the user
+hasn't named the next.
+
+- **T3, initiative changes mid-round** (pass 43): under
+  `turnorder_change_policy: immediate` the order re-sorts at once and the
+  pointer follows the acting unit, so a unit crossing the pointer gains or
+  loses a turn that round. Measured: A 10 / B 5 / C 1, A acts, B acts, A's
+  initiative drops to 0 -> round 1 runs A, B, C, A (A twice); A acts and
+  C's rises to 20 -> round 1 runs A, B and C waits for round 2. Options:
+  remember who has acted this round (each unit exactly one turn a round,
+  a saved set undo restores; recommended), keep it as the documented
+  meaning of `immediate`, or make `deferred` the default.
 
 ### Deferred (the user wants these tracked)
 

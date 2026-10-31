@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -1099,6 +1099,8 @@ class CommandRegistry:
         # Done AFTER the access gate so a $() can't alter the gated subcommand.
         if not self._raw_args.get(name, False) and pre_active_mid in mgr.matches:
             m_arg = mgr.matches[pre_active_mid]
+            ftoken = FORMULA_TEXT_HIDDEN.set(
+                _formula_text_hidden(ctx, mgr, pre_active_mid))
             try:
                 args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
             except Exception as e:
@@ -1107,6 +1109,8 @@ class CommandRegistry:
                 # and anything uncaught here escaped run() with no reply at all.
                 await ctx.send(f"❌ inline $() argument: {e}")
                 return
+            finally:
+                FORMULA_TEXT_HIDDEN.reset(ftoken)
 
         # The runs this one nests (an approval, `!again`) report the
         # matches they journaled here; the parent run's set gets ours.
@@ -1122,6 +1126,8 @@ class CommandRegistry:
         result = None
         vtoken = _TYPED_UNIT_VIEW.set(
             _typed_unit_view(ctx, mgr, pre_active_mid))
+        ftoken = FORMULA_TEXT_HIDDEN.set(
+            _formula_text_hidden(ctx, mgr, pre_active_mid))
         reveals_token = (_HOST_REVEALS.set([])
                          if _HOST_REVEALS.get() is None else None)
         try:
@@ -1133,6 +1139,7 @@ class CommandRegistry:
             await ctx.send(f"💥 Unexpected error{ref}: {e}")
         finally:
             _TYPED_UNIT_VIEW.reset(vtoken)
+            FORMULA_TEXT_HIDDEN.reset(ftoken)
             if reveals_token is not None:
                 revealed = _HOST_REVEALS.get() or []
                 _HOST_REVEALS.reset(reveals_token)
@@ -2537,7 +2544,7 @@ def _entity_dump(e: Entity) -> str:
     if e.passives:
         parts.append("**passives:**")
         for pid, p in e.passives.items():
-            parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
+            parts.append(f"- `{pid}` ({p.when}): `{formula_text(p.formula)}`")
     else:
         parts.append("**passives:** (none)")
     # Body parts attached to this entity (locational damage).
@@ -2624,6 +2631,56 @@ def _typed_unit_view(ctx: ReplyContext, mgr: MatchManager,
         return None
     pov = _query_pov(ctx, m)
     return (m.id, pov, host) if pov is not None else None
+
+
+# Keys whose text values are formulas wherever the GM stores them: hooks
+# (every entry), block / opaque conditions, status ticks, passive formulas,
+# action bodies, watcher and slot conditions / effects / costs, and the
+# `<field>_unless` restriction formulas.
+_FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
+                                 "condition", "effect", "cost",
+                                 "death_effect"})
+
+
+def _hide_formula_fields(value: Any) -> Any:
+    """`value` (a dict / list a read prints) with the formulas in it shown
+    as formula_text gives them: a copy with each formula-valued text
+    replaced while formula_text_visibility hides them from this caller,
+    else `value` itself."""
+    if not FORMULA_TEXT_HIDDEN.get():
+        return value
+
+    def walk(v: Any, key: Optional[str] = None) -> Any:
+        if isinstance(v, dict):
+            if key == "hooks":
+                return {k: formula_text(x) if isinstance(x, str) else walk(x)
+                        for k, x in v.items()}
+            return {k: walk(x, k) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, str) and key is not None and (
+                key in _FORMULA_FIELD_KEYS or key.endswith(UNLESS_SUFFIX)):
+            return formula_text(v)
+        return v
+    return walk(value)
+
+
+def _formula_text_hidden(ctx: ReplyContext, mgr: MatchManager,
+                         mid: Optional[str]) -> bool:
+    """Whether formula_text_visibility hides the GM's formula text from
+    this caller: the rule (the channel's match's, else the channel's
+    default system's) is `host` and the caller is neither an administrator
+    nor a host of the channel's match."""
+    if ctx_is_admin(ctx):
+        return False
+    m = mgr.matches.get(mid) if mid else None
+    if m is not None:
+        rule = m.rules.get("formula_text_visibility", "all")
+    else:
+        s = mgr.systems.get(mgr.effective_system_name(ctx.channel_key))
+        rule = (mgr.system_value(s, "formula_text_visibility")
+                if s is not None else "all")
+    return rule == "host" and (m is None or not _acts_as_host(ctx, m))
 
 
 def _resolve_eid(m, token: str, view: bool = True) -> str:
@@ -2786,8 +2843,10 @@ def _format_passive_line(label: str, p) -> str:
     from logic import VAR_HOOKS
     if p.when in VAR_HOOKS:
         return (f"- `{label}` ({p.when} on `{p.target or '(root)'}` "
-                f"scope=`{p.scope}`{_priority_text(p)}): `{p.formula}`")
-    return f"- `{label}` ({p.when}{_priority_text(p)}): `{p.formula}`"
+                f"scope=`{p.scope}`{_priority_text(p)}): "
+                f"`{formula_text(p.formula)}`")
+    return (f"- `{label}` ({p.when}{_priority_text(p)}): "
+            f"`{formula_text(p.formula)}`")
 
 
 def _parse_clamp_bound(raw: str) -> Any:
@@ -5657,7 +5716,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             oname, otpl = _get_template(mgr, words[1])
             other = f"`{oname}`"
             b = resolver.expand_template(otpl)
-        rows = _template_diff_lines(a, b, f"`{name}`", other)
+        rows = _template_diff_lines(_hide_formula_fields(a),
+                                    _hide_formula_fields(b), f"`{name}`",
+                                    other)
         if not rows:
             return await ctx.send(f"`{name}` and {other} are the same "
                                   f"(partials resolved).")
@@ -5690,6 +5751,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         label = f"**template `{name}`**"
         out = []
         for tag, body in views:
+            body = _hide_formula_fields(body)
             if part is not None:
                 if _is_partial(tpl):
                     raise VTTError(f"`{name}` is a partial template; it has "
@@ -7801,7 +7863,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             hide = (f" (removes inherited: {', '.join(map(str, gone))})"
                     if gone else "")
             groups.setdefault(src, []).append(
-                f"- `{k}` = {_rule_value_text(ctx, mgr, k, val) if k in SECRET_RULES else repr(val)}{hide}"
+                f"- `{k}` = {_rule_value_text(ctx, mgr, k, val) if k in SECRET_RULES or k in FORMULA_RULES else repr(_hide_formula_fields(val))}{hide}"
                 f" — {desc} (type: {t}{extra})")
         parts = [f"**{name}**{default_badge} — rule breakdown"]
         if s.description:
@@ -8880,7 +8942,8 @@ async def _system_func(ctx: ReplyContext, args: List[str],
         lines = [f"**Formula functions on `{sys_name}`:**"]
         for fname in sorted(lib):
             fn = FormulaFunction.from_dict(lib[fname])
-            snippet = fn.body if len(fn.body) <= 60 else fn.body[:57] + "..."
+            body = formula_text(fn.body)
+            snippet = body if len(body) <= 60 else body[:57] + "..."
             src = "" if fname in s.formula_functions else " (inherited)"
             lines.append(f"- `{fn.signature()}` → {snippet}{src}")
         hidden = s.removed.get("formula_functions") or []
@@ -8932,7 +8995,7 @@ async def _system_func(ctx: ReplyContext, args: List[str],
     if action == "info":
         src = "" if name in s.formula_functions else " (inherited)"
         return await ctx.send(f"**`{fn.signature()}`** on `{sys_name}`{src}"
-                              f"\n```\n{fn.body}\n```")
+                              f"\n```\n{formula_text(fn.body)}\n```")
     del lib[name]                                   # del / delete / ...
     mgr.system_library_write(s, "formula_functions", lib)
     hid = name in (s.removed.get("formula_functions") or [])
@@ -9045,7 +9108,7 @@ async def _system_status(ctx: ReplyContext, args: List[str],
         src = "" if name in s.status_definitions else " (inherited)"
         return await ctx.send(
             f"**status def `{name}`** on `{sys_name}`{src}\n"
-            f"```{json.dumps(d, indent=2, sort_keys=True)}\n```")
+            f"```{json.dumps(_hide_formula_fields(d), indent=2, sort_keys=True)}\n```")
     if action in _SYSTEM_LIB_DELETES:
         _check_tail(args, 4, (), f"!system status {action} <system> <name>")
         _system_lib_entry(mgr, s, kind, name, sys_name, "status definition")
@@ -11475,7 +11538,7 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         parts.append("")
         parts.append("**Global passives:**")
         for pid, p in m.global_passives.items():
-            parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
+            parts.append(f"- `{pid}` ({p.when}): `{formula_text(p.formula)}`")
     return await ctx.send("\n".join(parts))
 
 
@@ -15135,10 +15198,14 @@ def _diff_rule_text(ctx: ReplyContext, m: Match) -> Callable[[str, Any], str]:
     rule's (logic.SECRET_RULES) as `(hidden)` unless they are an
     administrator or a host of `m` (as _rule_value_text)."""
     hide = not ctx_is_admin(ctx) and not _acts_as_host(ctx, m)
+    hide_formulas = FORMULA_TEXT_HIDDEN.get()
 
     def text(k: str, v: Any) -> str:
         if hide and k in SECRET_RULES and v not in (None, ""):
             return "(hidden)"
+        if hide_formulas and k in FORMULA_RULES and v not in (None, ""):
+            return HIDDEN_FORMULA_TEXT
+        v = _hide_formula_fields(v)
         return repr(v)
     return text
 
@@ -15737,7 +15804,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             + (f"Priority: {p.priority}\n" if p.priority else "") +
             f""
             f"{scope_block}"
-            f"Formula:\n```\n{p.formula}\n```"
+            f"Formula:\n```\n{formula_text(p.formula)}\n```"
         )
 
     return await _help_fallback(ctx, ["passive"], args[0] if args else None)
@@ -15894,7 +15961,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             + (f"Priority: {p.priority}\n" if p.priority else "") +
             f""
             f"{scope_block}"
-            f"Formula:\n```\n{p.formula}\n```"
+            f"Formula:\n```\n{formula_text(p.formula)}\n```"
         )
 
     return await _help_fallback(ctx, ["gpassive"], args[0] if args else None)
@@ -16543,7 +16610,7 @@ registry.annotate_sub(
 # for creating, inspecting, and cancelling them by hand.
 def _schedule_line(s: Dict[str, Any]) -> str:
     name = s.get("name", "?")
-    body = s.get("body", "")
+    body = formula_text(s.get("body", ""))
     if s.get("kind") == "round":
         return f"- `{name}` (match) @ round {s.get('fire_round')}: `{body}`"
     return (
@@ -17065,6 +17132,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if data is None:
             return await ctx.send(f"tile ({x},{y}): no data.")
         tags = m.tile_tags(x, y, mp)
+        data = _hide_formula_fields(data)
         return await ctx.send(
             f"**tile ({x},{y})**\n```{json.dumps(data, indent=2, sort_keys=True)}\n```"
             + (f"\nTags (its template's and its own): {', '.join(tags)}"
@@ -17174,7 +17242,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"tile ({x},{y}): no hooks.")
             lines = [f"**tile ({x},{y}) hooks:**"]
             for when in sorted(hooks.keys()):
-                src = hooks[when]
+                src = formula_text(hooks[when])
                 # Truncate long formulas in the listing — the GM can
                 # use !tile info to see the full source if needed.
                 snippet = src if len(src) <= 80 else src[:77] + "..."
@@ -17421,7 +17489,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             view = {"data": tpl.data, "hooks": tpl.hooks}
             if tpl.tags:
                 view["tags"] = tpl.tags
-            body = _json.dumps(view, indent=2, default=str)
+            body = _json.dumps(_hide_formula_fields(view), indent=2,
+                               default=str)
             return await ctx.send(
                 f"**template `{name}`** ({placed} placed)\n```{body}\n```"
             )
@@ -18441,7 +18510,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             }
         return await ctx.send(
             f"**zone `{name}`** ({len(cells)} cell(s))\n"
-            f"```{json.dumps(view, indent=2, sort_keys=True)}\n```"
+            f"```{json.dumps(_hide_formula_fields(view), indent=2, sort_keys=True)}\n```"
         )
 
     # ---- list [tag=<tag>] [def=<definition>] ----
@@ -18565,7 +18634,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"zone `{name}`: no hooks.")
             lines = [f"**zone `{name}` hooks:**"]
             for when in sorted(set(own) | set(inherited)):
-                src = own.get(when) or inherited[when]
+                src = formula_text(own.get(when) or inherited[when])
                 snippet = src if len(src) <= 80 else src[:77] + "..."
                 tag = "" if when in own else f" (from `{z['def']}`)"
                 lines.append(f"- `{when}`{tag}: {snippet}")
@@ -18595,7 +18664,7 @@ def _zone_def_dict_view(d: Dict[str, Any]) -> Dict[str, Any]:
     for key in ZONE_LOOK_FIELDS:
         if key in d:
             view[key] = d[key]
-    return view
+    return _hide_formula_fields(view)
 
 
 async def _zone_def_sub(ctx: ReplyContext, args: List[str], m: Match,
@@ -19424,7 +19493,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if d is None:
             return await ctx.send(f"No status definition `{name}`.")
         return await ctx.send(
-            f"**status def `{name}`**\n```{json.dumps(d, indent=2, sort_keys=True)}\n```"
+            f"**status def `{name}`**\n```{json.dumps(_hide_formula_fields(d), indent=2, sort_keys=True)}\n```"
         )
 
     if sub in ("apply", "force"):
@@ -19887,7 +19956,8 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines = ["**Formula functions:**"]
         for fname in sorted(m.formula_functions.keys()):
             fn = m.formula_functions[fname]
-            snippet = fn.body if len(fn.body) <= 60 else fn.body[:57] + "..."
+            body = formula_text(fn.body)
+            snippet = body if len(body) <= 60 else body[:57] + "..."
             lines.append(f"- `{fn.signature()}`"
                          f"{_author_text(m, 'func', fname)} → {snippet}")
         return await ctx.send("\n".join(lines))
@@ -19902,7 +19972,7 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ formula function `{name}` not found.")
         return await ctx.send(
             f"**`{fn.signature()}`**{_author_text(m, 'func', name)}"
-            f"\n```\n{fn.body}\n```"
+            f"\n```\n{formula_text(fn.body)}\n```"
         )
 
     return await _help_fallback(ctx, ["func"], args[0] if args else None)
@@ -22246,7 +22316,7 @@ async def _action_info(
     lines += [
         "Body:",
         "```",
-        act.body,
+        formula_text(act.body),
         "```",
     ]
     await ctx.send("\n".join(lines))
@@ -22431,14 +22501,18 @@ def _rule_value_text(ctx: ReplyContext, mgr: MatchManager, name: str,
                      value: Any, width: int = 80) -> str:
     """A rule's value as replies print it: `(hidden)` for a secret rule
     (logic.SECRET_RULES) with a value, unless the caller is an administrator
-    or a host of the channel's match."""
+    or a host of the channel's match, and for a formula-valued rule while
+    formula_text_visibility hides formulas from the caller."""
+    if name in FORMULA_RULES and value not in (None, "") \
+            and FORMULA_TEXT_HIDDEN.get():
+        return HIDDEN_FORMULA_TEXT
     if name in SECRET_RULES and value not in (None, "") \
             and not ctx_is_admin(ctx):
         mid = mgr.active_by_channel.get(ctx.channel_key)
         m = mgr.matches.get(mid) if mid is not None else None
         if m is None or not _acts_as_host(ctx, m):
             return "(hidden)"
-    return _clip(repr(value), width)
+    return _clip(repr(_hide_formula_fields(value)), width)
 
 
 def _help_rule(ctx: ReplyContext, mgr: MatchManager, name: str) -> str:
@@ -22581,7 +22655,7 @@ def _help_function(m: Optional[Match], name: str) -> str:
         fdef = (m.formula_functions.get(name) if m is not None else None)
         if fdef is not None:
             return (f"**`{fdef.signature()}`** — a function of this match "
-                    f"(`!func`):\n```\n{fdef.body}\n```")
+                    f"(`!func`):\n```\n{formula_text(fdef.body)}\n```")
         import difflib
         near = difflib.get_close_matches(name, list(function_reference()),
                                          n=3, cutoff=0.6)
