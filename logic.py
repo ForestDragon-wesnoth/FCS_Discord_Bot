@@ -4526,6 +4526,29 @@ def _own_value(value: Any, _budget: Optional[List[int]] = None,
                    f"None, lists and dicts can be stored.")
 
 
+def same_value(a: Any, b: Any) -> bool:
+    """Whether two stored values are the same, types included: Python's ==
+    takes 1, 1.0 and True (0, 0.0, False) for one value, and the engine
+    reads them differently (vitals refuse a bool, a layer reads True as
+    junk), so every "did it change" decision on stored data uses this
+    (J17). A walk at C-like speed for the shapes the engine stores."""
+    if a is b:
+        return True
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        if len(a) != len(b):
+            return False
+        for k, v in a.items():
+            if k not in b or not same_value(v, b[k]):
+                return False
+        return True
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(
+            same_value(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def json_text(data: Any) -> str:
     """The JSON text a save file holds (raises VTTError on a value JSON
     can't hold)."""
@@ -5595,7 +5618,8 @@ def _diff_subtree(prefix: str, old: Any, new: Any) -> List[VarEvent]:
         return events
 
     # Structural mismatch (e.g. dict <-> scalar) or scalar inequality
-    if old != new:
+    # (types included: 1 -> true is a change, J17)
+    if not same_value(old, new):
         return [VarEvent(
             kind="changed", key=prefix,
             old_value=_deepcopy_value(old), new_value=new,
@@ -6522,6 +6546,14 @@ def merge_rule_value(rule: str, base: Any, own: Any,
     return list(items.values())
 
 
+def same_entry(a: Any, b: Any) -> bool:
+    """same_value for library entries too (a tile template, a function, a
+    passive object compare by their saved form)."""
+    da = a.to_dict() if hasattr(a, "to_dict") else a
+    db = b.to_dict() if hasattr(b, "to_dict") else b
+    return same_value(da, db)
+
+
 def diff_rule_value(rule: str, base: Any, new: Any
                     ) -> Tuple[Any, List[str]]:
     """The child layer (own entries, removed keys) that turns the inherited
@@ -6532,14 +6564,14 @@ def diff_rule_value(rule: str, base: Any, new: Any
         base = base if isinstance(base, dict) else {}
         new = new if isinstance(new, dict) else {}
         own = {k: copy.deepcopy(v) for k, v in new.items()
-               if k not in base or base[k] != v}
+               if k not in base or not same_entry(base[k], v)}
         return own, sorted(str(k) for k in base if k not in new)
     bmap = {_entry_key(e, field_name): e
             for e in (base if isinstance(base, list) else [])}
     nmap = {_entry_key(e, field_name): e
             for e in (new if isinstance(new, list) else [])}
     own_l = [copy.deepcopy(e) for k, e in nmap.items()
-             if k not in bmap or bmap[k] != e]
+             if k not in bmap or not same_entry(bmap[k], e)]
     return own_l, sorted(k for k in bmap if k not in nmap)
 
 
@@ -9671,7 +9703,7 @@ class Match:
             dface = dface if zone_look_value(FACING_FIELD, dface) else None
             face = dface if dface is not None or reset \
                 else z.get(FACING_FIELD)
-            if new != old or face != z.get(FACING_FIELD):
+            if not same_value(new, old) or face != z.get(FACING_FIELD):
                 note_stored_tags(self.system_name, old, new)
                 z["data"] = new
                 if face is None:
@@ -13612,7 +13644,7 @@ class Match:
                 else:
                     new = dict(old)
                     new.update(copy.deepcopy(tpl.data))
-                if new != old:
+                if not same_value(new, old):
                     note_stored_tags(None, old, new)
                     mp.tiles[cell] = new
                     n += 1
@@ -16947,7 +16979,7 @@ class Match:
                 "on_status_removed", entity_id, status_name,
                 old_value=before, new_value=None, removed_by=removed_by,
             )
-        elif before != after:
+        elif not same_value(before, after):
             log = self.fire_status_event(
                 "on_status_changed", entity_id, status_name,
                 old_value=before, new_value=after,
@@ -17773,7 +17805,7 @@ class Match:
             cf, cv = _rel_get(container, p)
             if not bf and not cf:
                 return True
-            return bf and cf and strip_markers(bv) == strip_markers(cv)
+            return bf and cf and same_value(strip_markers(bv), strip_markers(cv))
 
         if not deleted:
             # Writing under a removed key brings that key back: treat the
@@ -24299,7 +24331,7 @@ class MatchManager:
         chain = self.system_chain(s)
         base = self.system_library(chain[-2], kind) if len(chain) > 1 else {}
         setattr(s, kind, {k: copy.deepcopy(v) for k, v in new.items()
-                          if k not in base or base[k] != v})
+                          if k not in base or not same_entry(base[k], v)})
         gone = sorted(k for k in base if k not in new)
         if gone:
             s.removed[kind] = gone

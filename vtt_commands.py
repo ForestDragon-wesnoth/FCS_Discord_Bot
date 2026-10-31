@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
-from logic import STORE_DEPTH_LIMIT, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
+from logic import STORE_DEPTH_LIMIT, same_value, same_entry, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -1136,7 +1136,10 @@ class CommandRegistry:
             await ctx.send(f"❌ {e}")
         except Exception as e:
             ref = crash_ref(f"command `{name}`", e)
-            await ctx.send(f"💥 Unexpected error{ref}: {e}")
+            note = _crash_rollback(mgr, pre_active_mid,
+                                   pre_state if pre_state is not None
+                                   else jpre)
+            await ctx.send(f"💥 Unexpected error{ref}: {e}{note}")
         finally:
             _TYPED_UNIT_VIEW.reset(vtoken)
             FORMULA_TEXT_HIDDEN.reset(ftoken)
@@ -2125,12 +2128,13 @@ def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any],
                            ignored: Tuple[str, ...] = _NOT_UNDO_STATE) -> bool:
     """Whether two match snapshots differ in anything an undo restores (or,
     with `ignored=JOURNAL_IGNORED`, anything a replay must redo)."""
-    if pre == post:
+    if same_value(pre, post):
         return False
-    if all(pre.get(k) == post.get(k) for k in ignored):
+    if all(same_value(pre.get(k), post.get(k)) for k in ignored):
         return True
-    return ({k: v for k, v in pre.items() if k not in ignored}
-            != {k: v for k, v in post.items() if k not in ignored})
+    return not same_value(
+        {k: v for k, v in pre.items() if k not in ignored},
+        {k: v for k, v in post.items() if k not in ignored})
 
 
 # Host-only READS: gated to hosts (they show hidden data) but they change
@@ -3568,18 +3572,18 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if lib_name == "tile_templates":
                     new = SpecialTileTemplate.from_dict(entry)
                     old = mine[n].to_dict() if n in mine else None
-                    differs = old != new.to_dict()
+                    differs = not same_value(old, new.to_dict())
                 elif lib_name == "formula_functions":
                     new = FormulaFunction.from_dict(entry)
                     old = mine[n].to_dict() if n in mine else None
-                    differs = old != new.to_dict()
+                    differs = not same_value(old, new.to_dict())
                 elif lib_name == "zone_definitions":
                     new = normalize_zone_def(entry)
                     old = mine.get(n)
-                    differs = old != new
+                    differs = not same_value(old, new)
                 else:
                     new, old = entry, mine.get(n)
-                    differs = old != new
+                    differs = not same_value(old, new)
                 if not differs:
                     same += 1
                     continue
@@ -5439,6 +5443,26 @@ _TEMPLATE_EDIT_FIELDS = ("name", "vars", "status", "passives", "clamps",
 _IMPORT_JSON_DEPTH = STORE_DEPTH_LIMIT + 8
 
 
+def _crash_rollback(mgr: MatchManager, mid: Optional[str],
+                    pre: Optional[Dict[str, Any]]) -> str:
+    """After a command crashed: put the channel's match back to `pre`, its
+    state before the command, so a half-done change (a transform without
+    its old parts, a half-revived unit) isn't kept and saved (W8). Returns
+    the note for the reply ("" when there was nothing to put back)."""
+    if pre is None or not mid or mid not in mgr.matches:
+        return ""
+    m = mgr.matches[mid]
+    try:
+        if not _differs_in_undo_state(pre, m.to_dict(include_history=False)):
+            return ""
+        from action import _rollback_match
+        _rollback_match(m, mgr, pre)
+    except Exception:   # noqa: BLE001 - the crash is already reported
+        return ""
+    return (f"\nNothing was changed: match `{mid}` is back as it was "
+            f"before the command.")
+
+
 def _stored_var(e: Entity, path: str, default: Any) -> Any:
     """The value `e` holds at the dotted var `path`, else `default` (the
     unit was removed, or a hook deleted the var)."""
@@ -5675,7 +5699,7 @@ def _template_diff_lines(a: Any, b: Any, la: str, lb: str) -> List[str]:
     out = []
     for k in sorted(set(fa) | set(fb)):
         if k in fa and k in fb:
-            if fa[k] != fb[k]:
+            if not same_value(fa[k], fb[k]):
                 out.append(f"- `{k}`: {_clip(repr(fa[k]), 40)} → "
                            f"{_clip(repr(fb[k]), 40)}")
         elif k in fa:
@@ -8414,7 +8438,7 @@ def _system_diff(ctx: ReplyContext, mgr: MatchManager, a: Any,
     rules = []
     for k in sorted(RULES_REGISTRY):
         va, vb = mgr.system_value(a, k), mgr.system_value(b, k)
-        if va != vb:
+        if not same_value(va, vb):
             rules.append(
                 f"- `{k}`: `{a.name}` = `{_rule_value_text(ctx, mgr, k, va, 40)}` "
                 f"({_source_label(mgr, a, k)}), `{b.name}` = "
@@ -8425,7 +8449,8 @@ def _system_diff(ctx: ReplyContext, mgr: MatchManager, a: Any,
         la, lb = mgr.system_library(a, kind), mgr.system_library(b, kind)
         only_a = sorted(set(la) - set(lb))
         only_b = sorted(set(lb) - set(la))
-        differ = sorted(n for n in set(la) & set(lb) if la[n] != lb[n])
+        differ = sorted(n for n in set(la) & set(lb)
+                        if not same_entry(la[n], lb[n]))
         for names, what in ((only_a, f"only in `{a.name}`"),
                             (only_b, f"only in `{b.name}`"),
                             (differ, "different")):
@@ -15179,7 +15204,7 @@ def _diff_flat(prefix: str, a: Any, b: Any, indent: str) -> List[str]:
             out.append(f"{indent}{path}: (unset) -> {fb[k]!r}")
         elif k not in fb:
             out.append(f"{indent}{path}: {fa[k]!r} -> (unset)")
-        elif fa[k] != fb[k]:
+        elif not same_value(fa[k], fb[k]):
             out.append(f"{indent}{path}: {fa[k]!r} -> {fb[k]!r}")
     return out
 
@@ -15192,7 +15217,7 @@ def _diff_named(label: str, a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
             out.append(f"  + {label} `{k}`")
         elif k not in b:
             out.append(f"  - {label} `{k}`")
-        elif a[k] != b[k]:
+        elif not same_value(a[k], b[k]):
             out.append(f"  ~ {label} `{k}` changed")
     return out
 
@@ -15205,18 +15230,18 @@ def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
     passive / clamp present only on the first / only on the second side."""
     gone, new = words
     lines: List[str] = []
-    if ea.get("name") != eb.get("name"):
+    if not same_value(ea.get("name"), eb.get("name")):
         lines.append(f"    name: {ea.get('name')!r} -> {eb.get('name')!r}")
     pa, pb = (ea.get("x"), ea.get("y")), (eb.get("x"), eb.get("y"))
     ma, mb = ea.get("map"), eb.get("map")
-    if ma != mb:
+    if not same_value(ma, mb):
         lines.append(f"    position: ({pa[0]},{pa[1]}) on `{ma}` -> "
                      f"({pb[0]},{pb[1]}) on `{mb}`")
-    elif pa != pb:
+    elif not same_value(pa, pb):
         lines.append(f"    position: ({pa[0]},{pa[1]}) -> ({pb[0]},{pb[1]})")
     for field_name in ("facing", "part_of", "mounted_on", "mount_slot"):
         va, vb = ea.get(field_name), eb.get(field_name)
-        if va != vb:
+        if not same_value(va, vb):
             lines.append(f"    {field_name}: {va!r} -> {vb!r}")
     lines.extend(_diff_flat("vars", ea.get("vars") or {}, eb.get("vars") or {},
                             "    "))
@@ -15237,7 +15262,7 @@ def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
                 lines.append(f"    {label}.{pid}: {new}")
             elif pid not in b:
                 lines.append(f"    {label}.{pid}: {gone}")
-            elif a[pid] != b[pid]:
+            elif not same_value(a[pid], b[pid]):
                 lines.append(f"    {label}.{pid}: changed")
     return lines
 
@@ -15290,21 +15315,21 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     sa = snap_a.state
     sb = snap_b.state
     lines = [f"**Diff `{sel_a}` -> `{sel_b}`**"]
-    if sa.get("round_number") != sb.get("round_number"):
+    if not same_value(sa.get("round_number"), sb.get("round_number")):
         lines.append(
             f"- round_number: {sa.get('round_number')} -> "
             f"{sb.get('round_number')}"
         )
-    if sa.get("turns_elapsed") != sb.get("turns_elapsed"):
+    if not same_value(sa.get("turns_elapsed"), sb.get("turns_elapsed")):
         lines.append(f"- turns_elapsed: {sa.get('turns_elapsed')} -> "
                      f"{sb.get('turns_elapsed')}")
     act_a, act_b = _active_id(sa), _active_id(sb)
-    if act_a != act_b:
+    if not same_value(act_a, act_b):
         lines.append(f"- current turn: {act_a!r} -> {act_b!r}")
-    elif sa.get("turn_order") != sb.get("turn_order"):
+    elif not same_value(sa.get("turn_order"), sb.get("turn_order")):
         lines.append(f"- turn order: {sa.get('turn_order')} -> "
                      f"{sb.get('turn_order')}")
-    if sa.get("outcome") != sb.get("outcome"):
+    if not same_value(sa.get("outcome"), sb.get("outcome")):
         lines.append(f"- outcome: {sa.get('outcome')!r} -> {sb.get('outcome')!r}")
     # Rule changes: report at the key level (one line per changed rule).
     # A snapshot read back from disk has no rules (storage leaves them out:
@@ -15322,7 +15347,7 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
             rule_changes.append(f"  + rule `{rk}` = {rt(rk, rb[rk])}")
         elif rk not in rb:
             rule_changes.append(f"  - rule `{rk}` (was {rt(rk, ra[rk])})")
-        elif ra[rk] != rb[rk]:
+        elif not same_value(ra[rk], rb[rk]):
             rule_changes.append(f"  ~ rule `{rk}`: {rt(rk, ra[rk])} -> "
                                 f"{rt(rk, rb[rk])}")
     if rule_changes:
@@ -15383,14 +15408,14 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
                 zone_lines.append(f"  + zone `{name}`{at} ({len(zb[name].get('cells') or [])} cell(s))")
             elif name not in zb:
                 zone_lines.append(f"  - zone `{name}`{at}")
-            elif za[name] != zb[name]:
+            elif not same_value(za[name], zb[name]):
                 ca, cb = len(za[name].get("cells") or []), len(zb[name].get("cells") or [])
                 what = (f"{ca} -> {cb} cell(s)" if ca != cb
                         else "cells moved" if za[name].get("cells") != zb[name].get("cells")
                         else "changed")
                 zone_lines.append(f"  ~ zone `{name}`{at}: {what}")
         for k in sorted(set(ma) | set(mb)):
-            if k not in ("tiles", "zones") and ma.get(k) != mb.get(k):
+            if k not in ("tiles", "zones") and not same_value(ma.get(k), mb.get(k)):
                 map_other.append(f"`{mname}.{k}`" if many else f"`{k}`")
     if tile_lines:
         lines.append("- Tiles:")
@@ -15401,7 +15426,7 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     ga, gb = sa.get("groups") or {}, sb.get("groups") or {}
     group_lines = []
     for name in sorted(set(ga) | set(gb), key=str):
-        if ga.get(name) != gb.get(name):
+        if not same_value(ga.get(name), gb.get(name)):
             group_lines.append(f"  group `{name}`: {ga.get(name)!r} -> {gb.get(name)!r}")
     if group_lines:
         lines.append("- Groups:")
@@ -15422,7 +15447,7 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
         lines.append("- Global passives:")
         lines.extend(gp_changes)
     other = sorted([f"`{k}`" for k in set(sa) | set(sb)
-                    if k not in _DIFF_SKIP_KEYS and sa.get(k) != sb.get(k)]
+                    if k not in _DIFF_SKIP_KEYS and not same_value(sa.get(k), sb.get(k))]
                    + map_other)
     if other:
         lines.append("- Other changes: " + ", ".join(other))
