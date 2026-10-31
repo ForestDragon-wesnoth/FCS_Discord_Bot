@@ -20070,7 +20070,7 @@ SCENARIO 720 — Template JSON: show, import, refusals
 ?? "motto": "it's \"fine\""
 ?! "zz"
 !template show guard compact
-?? {"name":"Guard","vars":
+?? "vars":{"hp":12,"initiative":3
 !template spawn guard 2 2
 !assert "entity[guard].hp == 12 and endswith(var_get('guard', 'motto'), 's \"fine\"')"
 !assert "len(var_get('guard', 'motto')) == 11"

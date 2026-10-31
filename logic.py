@@ -4232,6 +4232,93 @@ def rule_max(key: str) -> Optional[int]:
     return spec.get("max")
 
 
+def _finite_text(t: str) -> bool:
+    try:
+        return math.isfinite(float(t))
+    except ValueError:
+        return False
+
+
+def _check_stat_caps(key: str, raw: str) -> str:
+    out = []
+    for tok in (t.strip() for t in raw.split(",")):
+        if not tok:
+            continue
+        parts = tok.split(":")
+        if not (2 <= len(parts) <= 3) or not parts[0].strip() or any(
+                p.strip() and not _finite_text(p) for p in parts[1:]):
+            raise VTTError(f"Setting '{key}' takes `stat:lo:hi` entries, "
+                           f"comma-separated (lo / hi numbers, either one "
+                           f"blank), got `{tok}`.")
+        out.append(tok)
+    return ",".join(out)
+
+
+def _check_op_priority(key: str, raw: str) -> str:
+    out = []
+    for tok in (t.strip() for t in raw.split(",")):
+        if not tok:
+            continue
+        op, sep, num = tok.partition(":")
+        if not sep or op.strip() not in MODIFIER_OPS or not _finite_text(num):
+            raise VTTError(f"Setting '{key}' takes `op:number` entries for "
+                           f"the ops {', '.join(MODIFIER_OPS)}, got `{tok}`.")
+        out.append(f"{op.strip()}:{num.strip()}")
+    return ",".join(out)
+
+
+def _check_rgb_rule(key: str, raw: str) -> str:
+    v = raw.strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+        return v
+    parts = v.split(",")
+    if len(parts) == 3 and all(p.strip().isdigit() and 0 <= int(p) <= 255
+                               for p in parts):
+        return ",".join(p.strip() for p in parts)
+    raise VTTError(f"Setting '{key}' takes `r,g,b` (0-255 each) or "
+                   f"#rrggbb, got `{raw}`.")
+
+
+_PLAIN_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _check_plain_key(key: str, raw: str) -> str:
+    v = raw.strip()
+    if not _PLAIN_KEY_RE.fullmatch(v) or v.startswith("__"):
+        raise VTTError(f"Setting '{key}' names one field: letters, digits "
+                       f"and _ (no dots, not starting with __), got `{raw}`.")
+    return v
+
+
+def _check_var_path_rule(key: str, raw: str) -> str:
+    v = raw.strip()
+    if v and (any(not seg or not _PLAIN_KEY_RE.fullmatch(seg)
+                  for seg in v.split(".")) or v.startswith("__")):
+        raise VTTError(f"Setting '{key}' names a var path (`dex`, "
+                       f"`stats.agi`): words of letters, digits and _ "
+                       f"joined by dots, got `{raw}`.")
+    return v
+
+
+def _check_top_vars(key: str, raw: str) -> str:
+    got = [w.strip() for w in raw.split(",") if w.strip()]
+    bad = [w for w in got if not _PLAIN_KEY_RE.fullmatch(w)]
+    if bad:
+        raise VTTError(f"Setting '{key}' takes a comma list of top-level "
+                       f"var names, not {', '.join(bad)}.")
+    return ",".join(got)
+
+
+_FORMAT_RULE_CHECKS = {
+    "modifier_stat_caps": _check_stat_caps,
+    "modifier_op_priority": _check_op_priority,
+    "preview_color": _check_rgb_rule,
+    "amount_field": _check_plain_key,
+    "turnorder_tiebreak_var": _check_var_path_rule,
+    "action_container_paths": _check_top_vars,
+}
+
+
 def _coerce_rule_value(key: str, raw_value: str):
     # Unknown key? block (prevents typos or unimplemented settings).
     # When the rule schema gets large the bare "Allowed: ..." dump is
@@ -4315,6 +4402,10 @@ def _coerce_rule_value(key: str, raw_value: str):
                                f"{', '.join(sorted(TEXT_COLORS))}) or "
                                f"#rrggbb, got `{raw_value}`.")
             return v
+        if key in _FORMAT_RULE_CHECKS:
+            # Rules holding a small format: a typo used to be stored and
+            # then read as nothing (`hp::l5` dropped the cap, L25).
+            return _FORMAT_RULE_CHECKS[key](key, raw_value)
         words = spec.get("word_list")
         if words is not None:
             # A comma list of known words; a typo'd one used to be ignored.
@@ -18012,9 +18103,15 @@ class Match:
                     a = ".".join(bits[:i])
                     if _rel_get(base, a)[0]:
                         continue
-                    if _rel_get(container, a)[0] and not any(
-                            _covers(a, o) or _covers(o, a) for o in ov):
-                        ov.append(a)
+                    if not _rel_get(container, a)[0] or any(
+                            _covers(o, a) for o in ov):
+                        break           # gone, or saved whole already
+                    if any(_covers(a, o) for o in ov):
+                        # Only part of it is recorded (`loot.blade` after a
+                        # var_move out of `loot.pack.bag`): the leftover
+                        # below needs its own record (L27).
+                        continue
+                    ov.append(a)
                     break
         m["overrides"] = sorted(set(ov))
         m["removed"] = sorted(set(rm))

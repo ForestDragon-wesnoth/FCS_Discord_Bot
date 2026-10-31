@@ -435,13 +435,23 @@ class CommandRegistry:
         [root, sub] => specific subcommand
         """
         if not path:
-            # All commands
-            lines = ["**Commands**"]
+            # An index: each command and the first sentence of what it
+            # does. Every command's full usage and description ran to
+            # 39,000 characters, and Discord's reply cap cut it after
+            # `!foreach` (D10); `!help <command>` has the rest.
+            lines = ["**Commands** — `!help <command>` for a command's "
+                     "usage and subcommands, `!help find <words>` to "
+                     "search."]
             for root in sorted(self._handlers.keys()):
-                m = self._help.get(root, {})
-                usage = m.get("usage") or f"!{root}"
-                desc = m.get("desc") or ""
-                lines.append(f"`{usage}`" + (f" — {desc}" if desc else ""))
+                desc = " ".join(str(self._help.get(root, {}).get("desc")
+                                    or "").split())
+                masked = desc.replace("e.g.", "e\x00g\x00").replace(
+                    "i.e.", "i\x00e\x00")
+                first = re.split(r"(?<=[.!?])\s+(?=[A-Z`(])", masked,
+                                 maxsplit=1)[0].replace("\x00", ".")
+                if len(first) > 90:
+                    first = first[:89].rstrip() + "…"
+                lines.append(f"`!{root}`" + (f" — {first}" if first else ""))
             return ("Help", "\n".join(lines))
         root = path[0]
         if root not in self._handlers:
@@ -5555,6 +5565,22 @@ def _parse_import_json(raw: str, strict: bool = True) -> Any:
                        f"exports it.")
 
 
+def _channel_var_names(ctx: ReplyContext, mgr: MatchManager
+                       ) -> Dict[str, str]:
+    """The var-name rules the channel's match (else its default system)
+    gives, as a template records them."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid else None
+    if m is not None:
+        rules = m.rules
+        return {k: str(rules.get(k, RULES_REGISTRY[k]["default"]))
+                for k in VAR_NAME_RULES}
+    s = mgr.systems.get(mgr.effective_system_name(ctx.channel_key))
+    return {k: str(mgr.system_value(s, k) if s is not None
+                   else RULES_REGISTRY[k]["default"])
+            for k in VAR_NAME_RULES}
+
+
 def _template_summary(name: str, tpl: Dict[str, Any],
                       tags: Optional[List[str]] = None) -> str:
     by = tpl.get("saved_by_name") or tpl.get("saved_by")
@@ -5970,6 +5996,11 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         raw = " ".join(args[2:])
         data = _parse_import_json(raw, strict=False)
         data, checks = check_template(data, name, mgr.templates)
+        if not _is_partial(data) and "var_names" not in data:
+            # The var names it is written in: the channel's, as a save
+            # records the unit's, so a later var-name rename moves its vars
+            # at spawn (S9).
+            data["var_names"] = _channel_var_names(ctx, mgr)
         verb, notes = _store_template(ctx, mgr, name, data)
         msg = (f"💾 {verb} template `{name}` from JSON "
                f"({_template_summary(name, data)}).")
@@ -14962,10 +14993,15 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return
             notes = []
             _restore_snapshot(mgr, mid, snap, bmode, notes)
+            # Under ATB the round number is frozen: name the turn count
+            # (turns_elapsed), which formulas can read (L30).
+            rm = mgr.matches.get(mid)
+            when = (f"turn {rm.turns_elapsed}"
+                    if rm is not None and rm.rules.get("atb_enabled")
+                    else f"round {snap.round_at_snapshot}")
             return await ctx.send(
                 f"Undid {n} turn(s). Now at start of "
-                f"{snap.active_entity_id or 'no-active'}'s turn "
-                f"(round {snap.round_at_snapshot})."
+                f"{snap.active_entity_id or 'no-active'}'s turn ({when})."
                 + _bindings_suffix(notes)
             )
 
