@@ -1717,6 +1717,9 @@ def _target_tag_lines(action: Action, actor_id: str, tid: str,
         if e is None:
             return []
         tags = match.unit_tags(e)
+    # The refusal names the tags the caller's view sees (a disguise's
+    # decoys, V5++); the filters judge the real ones.
+    seen = tags if corpse else match.unit_tags(e, match.command_pov())
     out: List[str] = []
     for key, want in (("target_requires_tags", True),
                       ("target_refuses_tags", False)):
@@ -1732,11 +1735,14 @@ def _target_tag_lines(action: Action, actor_id: str, tid: str,
             continue
         shown = (", ".join(f"`{t}`" for t in filt) if isinstance(filt, list)
                  else f"`{filt}`")
+        if len(shown) > 80:
+            # A stored filter can run to a thousand characters (L23).
+            shown = shown[:77] + "..."
         fmt = str(match.rules.get("action_target_tags_message_format") or "") \
             or RULES_REGISTRY["action_target_tags_message_format"]["default"]
         fixed = {"target": tid, "actor": actor_id, "action": action.name,
                  "field": key, "filter": shown,
-                 "target_tags": ", ".join(tags) or "none",
+                 "target_tags": ", ".join(seen) or "none",
                  "fails": (f"don't match {shown}" if want
                            else f"match {shown}")}
         text = match._MSG_FMT_RE.sub(

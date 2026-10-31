@@ -5439,6 +5439,26 @@ _TEMPLATE_EDIT_FIELDS = ("name", "vars", "status", "passives", "clamps",
 _IMPORT_JSON_DEPTH = STORE_DEPTH_LIMIT + 8
 
 
+def _stored_var(e: Entity, path: str, default: Any) -> Any:
+    """The value `e` holds at the dotted var `path`, else `default` (the
+    unit was removed, or a hook deleted the var)."""
+    cur: Any = e.vars
+    for seg in str(path).split("."):
+        if not isinstance(cur, dict) or seg not in cur:
+            return default
+        cur = cur[seg]
+    return cur
+
+
+def _differs(a: Any, b: Any) -> bool:
+    """Whether two stored values differ, types included (`1`, `1.0` and
+    `true` are three values; Python's == takes them for one)."""
+    try:
+        return json.dumps(a, sort_keys=True) != json.dumps(b, sort_keys=True)
+    except (TypeError, ValueError):
+        return a != b
+
+
 def _parse_import_json(raw: str, strict: bool = True) -> Any:
     """`raw` parsed as JSON for an import, or a VTTError: malformed text,
     or nesting deeper than _IMPORT_JSON_DEPTH."""
@@ -10552,8 +10572,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if t.map != e.map:
                     return await ctx.send(
                         f"❌ `{eid}` and `{tid}` are on different maps.")
-                tw, th = m.entity_footprint(t)
-                tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
+                bx, by, tw, th = m.body_box(t)
+                tx, ty = bx + (tw - 1) / 2, by + (th - 1) / 2
                 what = f"`{tid}`"
             elif len(tail) == 2:
                 try:
@@ -10817,10 +10837,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # to the resulting var events. We append them to the ack message so
         # the GM can see chain effects from a single write.
         hook_log = e.write_var(key_path, value, bypass_clamp=bypass_clamp)
-        if eid in m.entities and key_path.split(".", 1)[0] == m.rules.get("team_var", "team"):
-            # The team var is stored as text (logic.team_text).
-            value = e.vars.get(key_path, value)
+        typed = value
+        # The value stored: a clamp, the team var's text form (team_text)
+        # or a hook may have changed what was typed (L35).
+        value = _stored_var(e, key_path, value)
         ack = f"`{eid}` vars.{key_path} = {value!r}"
+        if _differs(value, typed):
+            ack += f" (typed {typed!r})"
         if bypass_clamp:
             ack += " (clamp bypassed)"
         # Advisory (non-blocking): the render `color` var is the top-level
@@ -10886,7 +10909,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         f"`{key}` was set.")
                 hook_log += m.entities[eid].write_var(
                     key, value, bypass_clamp=bypass_clamp) or []
-                shown.append(f"{key} = {value!r}")
+                stored = (_stored_var(m.entities[eid], key, value)
+                          if eid in m.entities else value)
+                shown.append(f"{key} = {stored!r}"
+                             + (f" (typed {value!r})"
+                                if _differs(stored, value) else ""))
                 warn = _engine_var_warning(key, value)
                 if warn:
                     notes.append(warn.strip())
@@ -10991,12 +11018,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Destination entity '{dest_id}' not found.")
         dest_path = args[3]
         template = m.capture_statblock(m.entities[src_id])
-        m.entities[dest_id].write_var(dest_path, template)
-        return await ctx.send(
-            f"Stored a template of `{src_id}` into `{dest_id}` "
-            f"vars.{dest_path} (id/position stripped — ready to "
-            f"`summon_from('{dest_path}', x, y)`)."
-        )
+        hook_log = m.entities[dest_id].write_var(dest_path, template) or []
+        return await ctx.send("\n".join(
+            [f"Stored a template of `{src_id}` into `{dest_id}` "
+             f"vars.{dest_path} (id/position stripped — ready to "
+             f"`summon_from('{dest_path}', x, y)`)."] + list(hook_log)))
 
     # ---- transform <id> <template_ref> [stash_path] ----
     # Polymorph/transform (115): swap an entity's statblock for a template
@@ -12131,10 +12157,12 @@ def _preview_point(ctx, m, toks: List[str], i: int, what: str,
         if e.map != mp.name:
             raise VTTError(f"`{toks[i]}` is on map `{e.map}`, not "
                            f"`{mp.name}`.")
+        # The cell aoe_origin gives (a region part's own cells, K8+).
         if str(m.rules.get("aoe_origin_mode", "center")) == "anchor":
-            return e.x, e.y, i + 1
-        w, h = m.entity_footprint(e)
-        return e.x + (w - 1) // 2, e.y + (h - 1) // 2, i + 1
+            ox, oy = m.entity_cells(e)[0]
+        else:
+            ox, oy = m.body_center(e)
+        return ox, oy, i + 1
     if i + 1 >= len(toks):
         raise VTTError(f"`!map preview`: {what} needs both x and y.")
     try:

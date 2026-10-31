@@ -8466,6 +8466,9 @@ class Map:
         if path.split(".")[0] == "corpses":
             raise VTTError(_CORPSES_RESERVED)
         value = checked_facing_data(path, value)
+        # Checked before any container on the path is made: a refused
+        # value left an empty `{}` tile behind (L35).
+        owned = _own_value(value)
         d = self.tiles.setdefault((x, y), {})
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
@@ -8481,7 +8484,7 @@ class Map:
                 d[key] = {}
             d = d[key]
         note_stored_tags(None, d.get(parts[-1]), value, parts[-1])
-        d[parts[-1]] = _own_value(value)
+        d[parts[-1]] = owned
 
     def tile_del_path(self, x: int, y: int, path: Optional[str]) -> None:
         """Delete a dotted-path key from a tile's data, OR (when
@@ -8741,6 +8744,7 @@ class Map:
     def zone_set_path(self, name: str, path: str, value: Any,
                       *, create: bool = True) -> None:
         check_store_path(path, "zone path")
+        owned = _own_value(value)
         z = self.zones.get(name)
         if z is None:
             if not create:
@@ -8761,7 +8765,7 @@ class Map:
                 d[key] = {}
             d = d[key]
         note_stored_tags(None, d.get(parts[-1]), value, parts[-1])
-        d[parts[-1]] = _own_value(value)
+        d[parts[-1]] = owned
 
     def zone_del_path(self, name: str, path: str) -> None:
         """Delete a dotted key from a zone's data, pruning emptied
@@ -9826,6 +9830,17 @@ class Match:
             return str(self.rules.get("unseen_map_unnamed_label",
                                       "Unexplored map"))
         return f"`{mp.name}`"
+
+    def command_pov(self) -> Optional[str]:
+        """The team view of the running command's channel on this match
+        (COMMAND_POV), None for an omniscient view or outside a command."""
+        fn = COMMAND_POV.get()
+        return fn(self) if fn is not None else None
+
+    def presents_status(self, e: "Entity", status: str) -> bool:
+        """Whether the running command's view sees `e` holding `status`
+        (a disguise presents its own statuses, V5++)."""
+        return status in self.presented_statuses(e, self.command_pov())
 
     def maps_text(self, pov: Any = ...) -> str:
         """"This match has N maps (`a`, `b`, Unexplored map)" as team `pov`
@@ -12300,6 +12315,7 @@ class Match:
                                f"nothing nests under it.")
             value = checked_tag_list(value, f"team `{team}` {path}",
                                      engine_ok=(seg0 == "tags"))
+        owned = _own_value(value)
         cur = self.team_data.setdefault(str(team), {})
         segs = str(path).split(".")
         for seg in segs[:-1]:
@@ -12309,7 +12325,7 @@ class Match:
                 cur[seg] = nxt
             cur = nxt
         note_stored_tags(self.system_name, cur.get(segs[-1]), value, segs[-1])
-        cur[segs[-1]] = _own_value(value)
+        cur[segs[-1]] = owned
 
     def team_add(self, team: str, path: str, delta: float) -> Any:
         """Add `delta` to a numeric team value (0 if absent). Returns the new
@@ -13747,6 +13763,20 @@ class Match:
             else:
                 rects.append((cx, cy, 1, 1))
         return rects
+
+    def body_box(self, e: "Entity") -> Tuple[int, int, int, int]:
+        """`e`'s body as one bounding rectangle (x, y, w, h): its footprint,
+        or for a region part the box around its region's cells. What a
+        shape-corrected bearing (side_hit, flanking) and a facing toward
+        the body measure, so a tail is judged where it lies (K8+)."""
+        if not e.is_region_part:
+            w, h = self.entity_footprint(e)
+            return (e.x, e.y, w, h)
+        cells = self.part_region_cells(e) or [(e.x, e.y)]
+        xs = [c[0] for c in cells]
+        ys = [c[1] for c in cells]
+        return (min(xs), min(ys), max(xs) - min(xs) + 1,
+                max(ys) - min(ys) + 1)
 
     def body_center(self, e: "Entity") -> Tuple[int, int]:
         """The centre cell of `e`'s body, rounded down for an even size; for
@@ -16252,8 +16282,13 @@ class Match:
             what = ", ".join(f"`{t}`" for t in matched) + " actions"
         else:
             what = f"`{matched[0]}`"
+        status = hit["status"]
+        u = self.entities.get(hit["unit"])
+        if u is not None and not self.presents_status(u, status):
+            # The view sees a disguise without this status: name none.
+            status = "a status"
         fixed = {"actor": actor_id or "", "action": action_name,
-                 "status": hit["status"], "unit": hit["unit"],
+                 "status": status, "unit": hit["unit"],
                  "target": target_id or "", "matched": what,
                  "tags": ", ".join(action_tags), "field": hit["field"]}
         text = self._MSG_FMT_RE.sub(
@@ -16446,8 +16481,10 @@ class Match:
             return (f"`{name}`'s {STATUS_UNIT_TAG_BLOCK} doesn't parse: {ex}")
         shown = (", ".join(f"`{t}`" for t in filt) if isinstance(filt, list)
                  else f"`{filt}`")
+        # The tags the running command's view sees (a disguise's decoys).
+        seen = self.unit_tags(e, self.command_pov())
         return (f"`{name}` can't affect units with tags {shown} "
-                f"(`{e.id}`: {', '.join(tags)})")
+                f"(`{e.id}`: {', '.join(seen) or 'none'})")
 
     def status_apply_block_reason(self, eid: str, name: str,
                                   level: Optional[int] = None) -> Optional[str]:
@@ -16467,6 +16504,8 @@ class Match:
         blockers = self._statuses_matching_tokens(
             e, self._token_list(sdef.get("blocked_by")))
         if blockers:
+            if not self.presents_status(e, blockers[0]):
+                return f"`{name}` blocked by a status on `{eid}`"
             return f"`{name}` blocked by `{blockers[0]}`"
         if reduction and self._resistance_applies(e, name, sdef, level is not None):
             base = int(level) if level is not None else 1
@@ -18867,17 +18906,22 @@ class Match:
         w = p.vars.get("aoe_weight")
         if w is not None:
             try:
-                return max(0.0, float(w))
+                w = float(w)
             except (TypeError, ValueError):
                 return 0.0
+            # An infinite weight (the text `inf`) divides infinity by
+            # infinity in the split (L33): read it as no weight.
+            return max(0.0, w) if math.isfinite(w) else 0.0
         hw = p.vars.get("hit_weights")
         if isinstance(hw, dict):
             total = 0.0
             for v in hw.values():
                 try:
-                    total += float(v)
+                    fv = float(v)
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                if math.isfinite(fv):
+                    total += fv
             if total > 0:
                 return total
         try:
@@ -21428,11 +21472,11 @@ class Match:
         if isinstance(v, bool) or v is None:
             return None
         if isinstance(v, (int, float)):
-            return int(v)
+            return int(v) if math.isfinite(v) else None
         if isinstance(v, str):
             try:
                 return int(float(v.strip()))
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError, OverflowError):
                 return None
         return None
 
@@ -22143,11 +22187,11 @@ class Match:
         if isinstance(raw, bool) or raw is None:
             return default
         if isinstance(raw, (int, float)):
-            return int(raw)
+            return int(raw) if math.isfinite(raw) else default
         if isinstance(raw, str):
             try:
                 return int(float(raw.strip()))
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError, OverflowError):
                 return default
         return default
 
@@ -22581,9 +22625,9 @@ class Match:
         the nearest of the 8 directions to the true bearing, or the dominant
         axis (ties go vertical, like direction_to) when allow_diagonal_facing
         is off. None when the point is the body's own centre."""
-        w, h = self.entity_footprint(e)
-        dx = tx - (e.x + (w - 1) / 2)
-        dy = ty - (e.y + (h - 1) / 2)
+        bx, by, w, h = self.body_box(e)
+        dx = tx - (bx + (w - 1) / 2)
+        dy = ty - (by + (h - 1) / 2)
         if dx == 0 and dy == 0:
             return None
         if not bool(self.rules.get("allow_diagonal_facing", False)):
@@ -23096,6 +23140,10 @@ def _check_template_passives_clamps(spec: Dict[str, Any], what: str) -> None:
             if not isinstance(formula, str) or not formula.strip():
                 raise VTTError(f"{what}: passive `{k}` needs `formula`: the "
                                f"program it runs.")
+            for fk in ("target", "scope", "id"):
+                if v.get(fk) is not None and not isinstance(v[fk], str):
+                    raise VTTError(f"{what}: passive `{k}` `{fk}` must be "
+                                   f"text.")
 
 
 def check_unit_form(spec: Dict[str, Any], what: str) -> None:
@@ -23120,6 +23168,28 @@ def check_unit_form(spec: Dict[str, Any], what: str) -> None:
     nm = spec.get("name")
     if nm is not None and (not isinstance(nm, str) or not nm.strip()):
         raise VTTError(f"{what}: `name` must be text, got {nm!r}.")
+    if spec.get("vars") is not None and not isinstance(spec["vars"], dict):
+        raise VTTError(f"{what}: `vars` must be an object.")
+    f = spec.get("facing")
+    if f is not None and (not isinstance(f, str) or f not in FACING_VECTORS):
+        raise VTTError(f"{what}: facing `{f}` isn't a direction.")
+    for k in ("id", "part_of"):
+        if spec.get(k) is not None and not isinstance(spec[k], str):
+            raise VTTError(f"{what}: `{k}` must be text.")
+    # The body it carries, each part checked the same way before anything
+    # is applied: a malformed part crashed a transform half-way (W8, L32).
+    parts = spec.get("parts")
+    if parts is not None:
+        if isinstance(parts, dict):
+            items = list(parts.items())
+        elif isinstance(parts, list):
+            items = [(str(i + 1), p) for i, p in enumerate(parts)]
+        else:
+            raise VTTError(f"{what}: `parts` must be a list or an object.")
+        for key, part in items:
+            if not isinstance(part, dict):
+                raise VTTError(f"{what}: part `{key}` must be an object.")
+            check_unit_form(part, f"{what} part `{part.get('id', key)}`")
 
 
 def legacy_template_fixes(data: Any, name: str) -> List[str]:
