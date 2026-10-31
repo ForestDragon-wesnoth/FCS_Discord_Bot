@@ -90,6 +90,22 @@ def _journal_as_state() -> None:
         jstate[0] = True
 
 
+# True while the running command's caller reads formula text as (hidden)
+# (formula_text_visibility = host, and the caller is neither an
+# administrator nor a host of the channel's match); set by
+# CommandRegistry._run.
+FORMULA_TEXT_HIDDEN: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_formula_text_hidden", default=False))
+HIDDEN_FORMULA_TEXT = "(hidden)"
+
+
+def formula_text(text: Any) -> Any:
+    """`text` (a formula the GM wrote) as the running command may print
+    it: HIDDEN_FORMULA_TEXT for a caller formula_text_visibility hides it
+    from."""
+    return HIDDEN_FORMULA_TEXT if FORMULA_TEXT_HIDDEN.get() else text
+
+
 # Ids of the matches the running command sent units out of with
 # transfer_entity: their undo step says it only undoes their side.
 MATCHES_SENT_UNITS: "contextvars.ContextVar[Optional[set]]" = (
@@ -2487,6 +2503,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "may show the unit to the players there. Off (default) = no "
             "warning. A player's command refuses a hidden unit like a "
             "missing one either way."
+        ),
+    },
+    "formula_text_visibility": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "host"]},
+        "desc": (
+            "Who reads the formula text the GM wrote: function bodies "
+            "(`!func`, `!help function`), passives (`!passive`, `!gpassive`, "
+            "`!defpassive`, `!state`), status ticks, hooks and `_unless` "
+            "formulas (`!status info`), action bodies (`!action info`), "
+            "schedules, tile and zone hooks and block / opaque conditions "
+            "(`!tile info`, `!zone info`), the formulas inside templates "
+            "(`!template show` / `diff`) and the formula-valued rules "
+            "(`!help rule`, `!system info` / `diff`, a history diff, "
+            "`rule_get` in `$()`). 'all' (default) = everyone. 'host' = a "
+            "caller who is neither an administrator nor a host of the "
+            "channel's match sees names, triggers and signatures with each "
+            "formula shown as `(hidden)`, so a trap passive or a boss's "
+            "damage function stays the GM's. Read from the channel's match, "
+            "else the channel's default system. Alias expansions and macro "
+            "bodies are command lines and stay readable where they are now."
         ),
     },
     "team_data_visibility": {
@@ -23565,6 +23602,10 @@ def _rel_del(d: Any, path: str) -> bool:
 # match, and a `$()` argument can't read them with rule_get.
 SECRET_RULES = frozenset(n for n, spec in RULES_REGISTRY.items()
                          if spec.get("secret"))
+# Rules whose value is a formula: their value reads as (hidden) where the
+# GM's formula text does (formula_text_visibility, FORMULA_TEXT_HIDDEN).
+FORMULA_RULES = frozenset(n for n, spec in RULES_REGISTRY.items()
+                          if spec["schema"].get("formula"))
 
 VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "part_name_var", "footprint_width_var", "footprint_height_var",

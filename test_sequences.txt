@@ -31489,3 +31489,129 @@ none of the command's subcommands is refused with the handler's reply:
 it used to wait in the approval queue, and approving it only produced
 that refusal. A known subcommand that changes the match still waits for
 a host (`r1`, the only request).
+
+
+SCENARIO 949 — formula_text_visibility host: players see names, hosts see formulas
+----------------------------------------------------------------------------------
+
+!match new fv949 Vault 8 8
+!match use fv949
+!ent add orc Orc 20 2 2 5
+!func def dmg a "a * 7 + 3"
+!passive add orc trap on_turn_start "entity[self].hp = entity[self].hp - 99"
+!gpassive add pit on_turn_end "entity[self].hp = entity[self].hp - 5"
+!status def burn
+!status tick burn "entity[self].hp = entity[self].hp - 3"
+!ent set_var orc actions.zap.target none
+!ent set_var orc actions.zap.body "entity[self].hp = entity[self].hp + 1"
+!tile hook add 4 4 on_enter "entity[self].hp = entity[self].hp - 40"
+!host add alice
+!as player bob
+!func info dmg
+?? a * 7 + 3
+!system set default formula_text_visibility host
+?? ❌
+!as owner
+!system set default formula_text_visibility host
+!as player bob
+!func info dmg
+?? **`dmg(a)`**
+?? (hidden)
+?! a * 7
+!func list
+?? `dmg(a)`
+?! a * 7
+!help function dmg
+?? (hidden)
+!passive list orc
+?? `trap` (on_turn_start): `(hidden)`
+!passive info orc trap
+?? Hook: `on_turn_start`
+?! - 99
+!state
+?? `pit` (on_turn_end): `(hidden)`
+!status info burn
+?? "tick": "(hidden)"
+!action info orc zap
+?? (hidden)
+?! + 1
+!tile info 4 4
+?? "on_enter": "(hidden)"
+!help rule death_condition
+?? (hidden)
+!func info "$(rule_get('death_condition'))"
+?? can't be read in a `$()` argument
+!as player alice
+!func info dmg
+?? a * 7 + 3
+!passive list orc
+?? - 99
+!as owner
+!status info burn
+?? entity[self].hp - 3
+!system set default formula_text_visibility all
+!as player bob
+!passive list orc
+?? - 99
+
+Expected: HARNESS-ALLOWS-ERRORS. With formula_text_visibility `all` (the
+default) a player reads a function's body. A player can't change the
+rule (a server-wide edit); the owner sets it to `host`. Then the player
+`bob` sees names, signatures, triggers and keys with every formula as
+`(hidden)`: `!func info` / `list`, `!help function`, `!passive list` /
+`info`, the global passives in `!state`, a status's tick in `!status
+info`, an action's body, a tile hook, a formula-valued rule in `!help
+rule`, and `rule_get` of a formula rule in a `$()` argument is refused.
+The co-host `alice` (a host, not an administrator) and the owner read
+everything. Back on `all`, the player reads the passive again.
+
+
+SCENARIO 950 — formula_text_visibility: templates, systems, schedules and a channel without a match
+-----------------------------------------------------------------------------------------------------
+
+!match new fv950 Vault 8 8
+!match use fv950
+!ent add orc Orc 20 2 2 5
+!passive add orc trap on_turn_start "entity[self].hp = entity[self].hp - 99"
+!ent set_var orc actions.zap.target none
+!ent set_var orc actions.zap.body "entity[self].hp = entity[self].hp + 1"
+!template save orc orcT
+!defpassive add d1 on_turn_start "entity[self].hp = entity[self].hp - 2"
+!zone new gas
+!zone add gas 6 6
+!zone set gas block "entity[self].hp < 10"
+!schedule round 3 "entity[orc].hp = 1"
+!system set default formula_text_visibility host
+!as player bob
+!template show orcT
+?? "formula": "(hidden)"
+?? "body": "(hidden)"
+?! - 99
+!template show orcT vars.actions.zap.body
+?? (hidden)
+!system info default
+?? `formula_text_visibility` = 'host'
+?! hp - 2
+!zone info gas
+?? "block": "(hidden)"
+!schedule list
+?? @ round 4: `(hidden)`
+!as owner
+!match unbind
+!as player bob
+!help rule death_condition
+?? (hidden)
+!as owner
+!template show orcT vars.actions.zap.body
+?? entity[self].hp + 1
+!system info default
+?? hp - 2
+
+Expected: HARNESS-ALLOWS-ERRORS. Under `host` a player reads a
+template's passive formula and action body as `(hidden)`, also when
+`!template show` names the path itself; `!system info` hides the
+formulas inside the default_entity_passives rule; a zone's block
+condition and a scheduled body are hidden too. In a channel bound to no
+match the rule is read from the channel's default system, and with no
+match to be a host of the player still reads `(hidden)`. The owner (an
+administrator) reads every formula.

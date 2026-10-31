@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN
 
 
 class FormulaError(VTTError):
@@ -8378,7 +8378,8 @@ class FormulaEngine:
             existence)."""
             if not isinstance(name, str):
                 raise FormulaError("rule_get(name): name must be a string.")
-            if name in SECRET_RULES and _IN_ARG_TOKEN.get():
+            if _IN_ARG_TOKEN.get() and (name in SECRET_RULES or (
+                    name in FORMULA_RULES and FORMULA_TEXT_HIDDEN.get())):
                 raise FormulaError(
                     f"rule_get('{name}') can't be read in a `$()` argument "
                     f"(its value is for hosts: `!help rule {name}`).")
