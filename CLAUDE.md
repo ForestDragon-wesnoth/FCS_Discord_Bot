@@ -835,6 +835,11 @@ Every class below shipped at least once and was fixed in an audit pass
   what a fogged team shouldn't see: listings, `!ent info`, `!dist`, `!find`,
   diffs, logs, camera centering, corpses inside tile data. See §7 "Access,
   POV".
+- **Type-blind equality.** Python's `==` takes 1, 1.0 and True (0, 0.0,
+  False) for one value, and the engine reads them differently: a type
+  change compared with `==` was no undo step, no journal entry, no var
+  hook and no diff line (J17). Decide "did it change" on stored data with
+  `logic.same_value` (library entries: `same_entry`).
 - **Non-string joins.** `", ".join(...)` / an `re.sub` replacement fed a
   number from a var (a numeric team, an int dict key) 💥'd. `str()` values
   from vars before joining.
@@ -1956,7 +1961,8 @@ hardcodes**.
   way; turn-flow lines name no unit (769).
 - **Death** (`_process_death`): `death_result` (corpse / delete, per-unit
   `__death_result`); a corpse is the unit's snapshot in its cell's tile data
-  (`corpses.<id>`, mount links stripped; `corpses` is a reserved tile key
+  (`corpses.<id>`, mount links stripped; under `corpse_id_uniqueness` the
+  ids of the parts it holds are taken too, 955; `corpses` is a reserved tile key
   no tile write sets, and every tile edit keeps it: place, fill, del,
   clear, `tile_clear`); `corpse_id_uniqueness`. A revive puts the corpse
   back when the unit can't be placed (`revive_blocked_mode`: refuse,
@@ -2003,7 +2009,10 @@ hardcodes**.
   along (`Match.rename_tile_template`); deleting a used template needs
   `confirm` and detaches them (`_template` cleared, their data stays, so
   a later template of the name takes none of them over;
-  `undefine_tile_template`, user call, 188).
+  `undefine_tile_template`, user call, 188). A stamp detaches the same
+  way a tile or zone naming a template / definition the match lacks, with
+  a note, and `_template` tile data names only a template the match holds
+  (Z1+, 955).
 - **Facing** (#257, 928-931): a tile's facing is its `facing` data, else
   `up`, a zone's its `facing` field, else `up`; most never set one.
   MATERIALIZED (user call: facing is a default or a value of the thing
@@ -2189,8 +2198,15 @@ hardcodes**.
   lists / info, `!state`, `!status info`, `!action info`, `!schedule
   list`, `!tile info`, `!zone info`, tile / zone hook lists, `!template
   show` / `diff`, and the FORMULA_RULES (`!help rule`, `!system info` /
-  `diff`, a history diff, `rule_get` in `$()`). Alias expansions and macro
-  bodies are command lines, left readable (949-950).
+  `diff`, a history diff, `rule_get` in `$()`), the raw reads (`!ent
+  dump`, `!find ... show:`, `!team get`, `!defvar list`, `!map cell`,
+  `!mount info`, match / map var lists; `_hide_formula_at` for one value,
+  a modifier record's `value` included), the history list (a formula
+  command's label cut after its subcommand, `logic.formula_label`) and
+  an action's or modifier's formula error. A `$()` argument still reads
+  any stored value; `inline_args_access host` closes it. Alias
+  expansions and macro bodies are command lines, left readable
+  (949-950, 953).
   `inline_args_access` closes the `$()` route
   (579-580, 593). Map names a view may not know stay out of `!match info`,
   `!match fog`, the "name a map" refusals (`Match.maps_text` through the
@@ -2496,7 +2512,8 @@ hardcodes**.
   the lower of those and the replayer's; the prefab library reads it
   made as `prefabs`: `logic.prefab_read` / `prefab_read_names` record
   into `PREFAB_READS`, which `_run` keeps set through the watcher poll,
-  each prefab stored once per segment and then by hash,
+  each prefab and the name list stored once per segment and then by
+  hash, a replay skipping a replayed `!prefab` library write (J15),
   `journal.prefab_reads`; a replay reads them through `PREFAB_REPLAY`,
   947),
   `state` (undo, history restore, `!run`, `!ent transfer`, `!match resume`,
@@ -2946,8 +2963,9 @@ hasn't named the next.
   or a diff-based snapshot format. Measured (pass 40): after a whole-map
   `!tile fill` on 500x500 every command costs ~3.5 s (the match is
   serialized three times per command: undo pre / post state and the
-  commit); `cell_occupant` scans every unit per cell, so cell searches cost
-  cells x units.
+  commit). Cell searches read one occupancy table per search
+  (`Match.occupancy_pass`), fogged reads one team vision index per pass
+  (`Match.vision_pass`), so neither costs cells x units (pass 49).
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /

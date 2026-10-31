@@ -31615,3 +31615,357 @@ condition and a scheduled body are hidden too. In a channel bound to no
 match the rule is read from the channel's default system, and with no
 match to be a host of the player still reads `(hidden)`. The owner (an
 administrator) reads every formula.
+
+
+SCENARIO 951 — Prefab and template imports refuse malformed shapes before storing
+--------------------------------------------------------------------------------
+
+!match new im951 Imports 8 8
+!match use im951
+!prefab import pa {"kind": "prefab", "width": 2, "height": 2, "system": "default", "tiles": [[0, 0, {"_template": "pit"}]], "definitions": {"tile_templates": {"pit": {"name": "pit", "data": 5, "hooks": {}}}}}
+?? tile template `pit`: `data` must be an object
+!prefab import pb {"kind": "prefab", "width": 2, "height": 2, "system": "default", "definitions": {"tile_templates": {"pit": {"name": "pit", "data": {}, "hooks": "x"}}}}
+?? `hooks` maps hook names to formula text
+!prefab import pc {"kind": "prefab", "width": 2, "height": 2, "system": "default", "corpses": [[0, 0, "dead", {"entity": {"id": "dead", "name": "Dead", "x": 0, "y": 0, "vars": {"hp": 0, "max_hp": 5}, "var_names": {"team_var": []}}}]]}
+?? `var_names.team_var` must be text
+!prefab import pd {"kind": "prefab", "width": 2, "height": 2, "system": "default", "corpses": [[0, 0, "dead", {"entity": {"id": "dead", "name": "Dead", "x": 0, "y": 0, "vars": {"hp": 0, "max_hp": 5}, "part_of": ["x"]}}]]}
+?? `part_of` must be text
+!prefab import pe {"kind": "prefab", "width": 2, "height": 2, "system": "default", "tiles": [[0, 0, {"facing": "sideways"}]]}
+?? `facing` must be a direction
+!prefab import pf {"kind": "prefab", "width": 2, "height": 2, "system": "default", "zones": {"z": {"cells": 5}}}
+?? cells are a list
+!prefab import pg {"kind": "prefab", "width": 2, "height": 2, "system": "default", "definitions": {"formula_functions": {"ff": {"name": "zz", "params": ["a"], "body": "a"}}}}
+?? its `name` must be `ff`
+!prefab import ph {"kind": "prefab", "width": 2, "height": 2, "system": "default", "definitions": {"formula_functions": {"ff": {"name": "ff", "params": ["__read"], "body": "1"}}}}
+?? reserved
+!prefab import pi {"kind": "prefab", "width": 2, "height": 2, "system": "default", "tiles": [[0, 0, {"x": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}]]}
+?? nests more than 108 levels deep
+!template import tb {"name": "B", "vars": {"hp": 3}, "var_names": {"tags_var": ["tags"]}}
+?? `var_names.tags_var` must be text
+!template import tc {"name": "B", "vars": {"hp": 3}, "parts": [{"id": [1], "vars": {"hp": 1}}]}
+?? `id` must be text
+!prefab import ok {"kind": "prefab", "width": 2, "height": 2, "system": "default", "tiles": [[0, 0, {"_template": "pit", "facing": "left"}]], "definitions": {"tile_templates": {"pit": {"name": "pit", "data": {"glyph": "o"}, "hooks": {}}}}}
+?? Saved prefab `ok`
+!prefab stamp ok 3 3
+!map
+!prefab list
+?! `pa`
+!template list
+?! `tb`
+!assert "tile_template_of(3, 3) == 'pit' and tile_facing(3, 3) == 'left'"
+
+Expected: HARNESS-ALLOWS-ERRORS. Each malformed import is refused
+before anything is stored, naming the field: a carried tile template's
+`data` that isn't an object (it crashed every `!map` once stamped) or
+`hooks` that isn't an object of formula text, a corpse's `var_names`
+holding a list (the next load quarantined the match) or a list
+`part_of` (its revive crashed every render), a tile facing that isn't a
+direction, zone cells that aren't a list, a carried function whose key
+and `name` differ or whose parameter is reserved, JSON nested past the
+store limit, and a template whose `var_names` or part id isn't text (a
+list in `tags_var` broke `!template list` for everyone). A well-formed
+prefab carrying a tile template still imports and stamps, the map
+renders, and neither library lists a refused entry.
+
+
+SCENARIO 952 — A change of type alone is a change: undo, hooks and diffs
+-----------------------------------------------------------------------
+
+!match new ty952 Types 8 8
+!match use ty952
+!ent add a A 10 2 2 1
+!ent set_var a flag 1
+!passive add a pf on_var_changed target=flag "match.n = match_var_get('n', 0) + 1"
+!ent move a 1 down
+!ent set_var a flag true
+?? fired on `a`
+!assert "match_var_get('n') == 1"
+!history list command
+?? !ent set_var a flag true
+!undo command
+?? Reverted past `!ent set_var a flag true`
+!assert "entity[a].flag == 1 and entity[a].y == 3"
+!ent add b B 10 5 5 1
+!ent set_var b flag true
+!ent diff a b
+?? vars.flag: 1 -> True
+!ent status a set burn duration 3
+!passive add a ps on_status_changed "match.m = match_var_get('m', 0) + 1"
+!ent status a set burn duration 3.0
+?? fired on `a`
+!assert "match_var_get('m') == 1"
+
+Expected: Python's == takes 1, 1.0 and True for one value; the engine
+now tells them apart wherever it decides whether something changed.
+Writing `true` over a flag of 1 fires its on_var_changed passive, is its
+own undo step (the history lists it, and `!undo command` reverts only
+it, leaving the move before), `!ent diff` reports the two flags, and a
+status duration going from 3 to 3.0 fires on_status_changed.
+
+
+SCENARIO 953 — formula_text_visibility covers the raw reads and the history
+-----------------------------------------------------------------------------
+
+!match new fv953 Vault 10 10
+!match use fv953
+!ent add hero Hero 10 2 2 1
+!ent set_var hero team red
+!passive add hero trap on_turn_start "match.zqx_passive = 1"
+!ent set_var hero actions.hit.target none
+!ent set_var hero actions.hit.body "match.zqx_body1 = 1"
+!ent set_var hero __death_condition "'zqx_udeath' == ''"
+!history save before
+!ent set_var hero actions.hit.body "match.zqx_body2 = 2"
+!tile hook add 5 5 on_enter "match.zqx_tilehook = 1"
+!tile set 5 5 block "'zqx_tileblock' == ''"
+!defvar add actions.zap.body "match.zqx_defvar = 1"
+!template save hero t1
+!system set default formula_text_visibility host
+!as player bob
+!history list command
+?? !passive add (hidden)
+?! zqx
+!history diff manual:before latest:command
+?? vars.actions.hit.body: '(hidden)' -> '(hidden)'
+?! zqx
+!map cell 5 5 for=hero
+?? Blocks movement: tile: `(hidden)`
+?! zqx
+!find hp>0 show:actions
+?? 'body': '(hidden)'
+?! zqx
+!defvar list
+?? `actions.zap.body` = '(hidden)'
+!template show t1 vars
+?? "__death_condition": "(hidden)"
+?! zqx
+!as owner
+!history list command
+?? zqx_passive
+
+Expected: HARNESS-ALLOWS-ERRORS. Under `host` the player `bob` reads no
+formula text: the command history shows a formula command's root and
+subcommand only, a history diff prints a changed body as `(hidden) ->
+(hidden)`, `!map cell` shows the tile's data and block condition hidden,
+`!find ... show:` hides an action body, `!defvar list` a default body
+and `!template show` a unit's `__death_condition`. The owner reads the
+history in full.
+
+
+SCENARIO 954 — Views: a fogless match with a hidden rider, a missing zone, a group move
+----------------------------------------------------------------------------------------
+
+!match new pv954 Views 10 10
+!match use pv954
+!ent add hero Hero 10 2 2 5
+!ent set_var hero team red
+!ent add cart Cart 10 6 6 3
+!ent set_var cart team blue
+!ent set_var cart slots.inside.capacity 1
+!ent add zqxthief Thief 10 8 8 1
+!ent set_var zqxthief team blue
+!mount zqxthief cart inside
+!host access set "ent" all
+!match bind pov=red
+!watch add peek "len(entities_in_zone('zqxambush')) > 0" "match.p = 1"
+!as player bob
+!log 5
+?? host-only
+!roll 1d6
+?! zqxambush
+!as owner
+!match unbind
+!match use pv954
+!mount dismount zqxthief
+!ent tp zqxthief 3 2
+!match fog on
+!ent set_var hero fog_vision_radius 0
+!ent group add squad hero
+!match bind pov=red
+!as player bob
+!ent move group:squad 1 right
+?? occupied.
+?! zqxthief
+
+Expected: HARNESS-ALLOWS-ERRORS. On a match without fog, a rider hidden
+in a vehicle (another team's) keeps the whole-board reads host-only:
+the player's `!log` is refused, since its entries name the rider. A
+watcher reading a deleted zone says nothing in the team-view channel
+(the zone's name comes from the GM's setup). With fog on and the hero
+seeing only its own cell, the player's group move is refused as
+"occupied" without naming the fogged unit in the way.
+
+
+SCENARIO 955 — Corpse part ids, stamped corpses and stamped links
+-----------------------------------------------------------------
+
+!match new kc955 Camp 12 12
+!match use kc955
+!ent add orc Orc 20 2 2 5
+!part add orc head Head 5 5
+!ent kill orc
+!prefab save camp 1 1 3 3
+!ent add head Imp 5 9 9 1
+?? already exists
+!prefab stamp camp 6 6
+!ent revive orc2
+!ent revive orc
+?! couldn't be restored
+!assert "has_part('orc', 'head') and len(parts('orc2')) == 1"
+!system set default hp_var health
+!prefab stamp camp 9 1
+!assert "corpse_var('orc3', 'health') == 0"
+!prefab import hot {"kind": "prefab", "width": 1, "height": 1, "system": "default", "tiles": [[0, 0, {"_template": "spikes", "dmg": 3}]]}
+!prefab stamp hot 1 11
+?? aren't in this match
+!tile def new spikes
+!assert "tile_template_of(1, 11) == None and tile_get(1, 11, 'dmg') == 3"
+!tile set 2 11 _template nosuch
+?? names one of this match's tile templates
+
+Expected: HARNESS-ALLOWS-ERRORS. With corpse_id_uniqueness on, the id
+of a part inside a corpse is taken too: `!ent add head` is refused, and
+a stamp of the dead orc mints a new id for its part, so both corpses
+revive with their heads. A corpse stamped after `hp_var health` lists
+its hp under `health`, as a live corpse does. A stamped tile naming a
+template the match no longer holds keeps its data and names none (a
+note says so), so a later `lava` takes nothing over, and `!tile set ...
+_template` refuses a template the match lacks.
+
+
+SCENARIO 956 — Optional words, the help index, stored values in replies
+------------------------------------------------------------------------
+
+!match new ow956 Words 8 8
+!match use ow956
+!tile def new trap
+!tile place trap 2 2
+!tile set 2 2 note mine
+!tile def reapply trap rset
+?? Unexpected `rset`
+!assert "tile_get(2, 2, 'note') == 'mine'"
+!store save campaign typo
+?? Unexpected `typo`
+!help
+?? `!zone`
+?? `!help <command>`
+!ent add a A 10 2 2 1
+!clamp add a armor max=2 mode=hard
+!ent set_var a armor 3
+?? vars.armor = 2 (typed 3)
+!eval "max([])"
+?? there are no values to compare
+!eval "min([1, 'x'])"
+?? all be numbers or all be text
+!system set default modifier_stat_caps hp::l5
+?? takes `stat:lo:hi` entries
+!system set default preview_color "a b"
+?? takes `r,g,b`
+
+Expected: HARNESS-ALLOWS-ERRORS. A typo in `!tile def reapply`'s
+`reset` slot is refused (it used to reset every tile, dropping the
+tile's own `note`), and so is a stray word after a saves file name.
+Bare `!help` is an index that reaches `!zone` and points at
+`!help <command>`. A clamped `!ent set_var` reports what was stored and
+what was typed. `max` / `min` refuse an empty or mixed list in their
+own words, and `!system set` refuses rule values whose format the
+engine would drop.
+
+
+SCENARIO 957 — ATB: a skipped turn after a restart, a reveal from before ATB
+----------------------------------------------------------------------------
+
+!match new at957 Clock 10 10
+!match use at957
+!ent add a A 10 2 2 5
+!ent add b B 10 9 9 3
+!ent set_var a team red
+!ent set_var b team blue
+!gpassive add te on_turn_end "match.ends = match_var_get('ends', '') + entity[self].name"
+!match fog on
+!reveal_fog red at 9 9 0 turns=1
+!match bind pov=red
+!as player bob
+!list
+?? B (b)
+!as owner
+!system set default atb_enabled true
+!ent status a set stun skips_turn true
+!turn next
+?? `a`'s turn skipped
+!as restart
+!match use at957
+!turn next
+?! fired on `a`
+!assert "match_var_get('ends', '') == ''"
+!turn next
+!turn next
+!turn next
+!turn next
+!as player bob
+!list
+?! B (b)
+
+Expected: HARNESS-ALLOWS-ERRORS. A one-round reveal at (9,9) shows red
+the blue unit there. When ATB comes on, the reveal moves to the turn
+clock (a round = one turn per unit). Under ATB, `a`'s stunned turn is
+skipped; after a restart the next `!turn next` still ends it as a
+skipped turn, so the global on_turn_end passive doesn't run on `a` (the
+latch is saved with the match). A few turns later the reveal has
+expired and red's list no longer shows `b`.
+
+
+SCENARIO 958 — A replay leaves the prefab library alone
+--------------------------------------------------------
+
+!match new rp958 Replay 8 8
+!match use rp958
+!ent add hero Hero 10 2 2 1
+!batch prefab save mine 1 1 2 2 ; prefab stamp mine 5 5
+!match journal export rp958.json
+!prefab save mine 1 1 4 4
+!match replay rp958.json as=rp958b
+?? skipped `!prefab save mine`
+?? The state matched the recording
+!prefab list
+?? `mine` — 4x4
+
+Expected: HARNESS-ALLOWS-ERRORS. A batch that saved a prefab and
+stamped it is replayed with its save skipped (the report names it), so
+the server's newer 4x4 `mine` is still the library's; the stamp reads
+the copy its journal entry recorded and the replay matches.
+
+
+SCENARIO 959 — Region parts are judged where they lie: flanking, facing, side
+------------------------------------------------------------------------------
+
+!match new rg959 Tail 12 12
+!match use rg959
+!ent add ogre Ogre 30 5 5 1
+!ent set_vars ogre footprint_w=3 footprint_h=3
+!ent face ogre up
+!part add ogre tail Tail 5 5
+!ent set_var tail __part_region back
+!ent add w1 W1 5 2 7 1
+!ent add w2 W2 5 10 7 1
+!ent add knight K 5 8 4 1
+!assert "footprint_cells('tail') == [[5, 7], [6, 7], [7, 7]]"
+!assert "flanking_angle('tail', 'w1', 'w2') and flanking_line('tail', 'w1', 'w2')"
+!ent face knight toward tail
+?? now faces down
+!map preview burst tail 0
+?? at (6,7)
+!ent set_var w1 sprite_layer inf
+!map scene list
+?? entity `w1`
+!ent set_var w2 shields.s 'inf'
+!eval "absorb_damage('w2', 3)"
+?? = `3`
+
+Expected: HARNESS-ALLOWS-ERRORS. A region part (the ogre's back row) is
+measured by its own cells: two units on either side of the tail's row
+flank it by angle and by line, a knight above-right faces down toward
+it, and a preview centred on it starts at its middle cell (6,7). Text
+such as `inf` in a sprite layer falls back like other junk (it crashed
+every scene render), and an `inf` shield pool is no pool (every
+absorb_damage failed), so the whole hit goes through.
