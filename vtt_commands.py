@@ -5469,6 +5469,18 @@ _TEMPLATE_EDIT_FIELDS = ("name", "vars", "status", "passives", "clamps",
 _IMPORT_JSON_DEPTH = STORE_DEPTH_LIMIT + 8
 
 
+async def _in_vision_pass(ctx: ReplyContext, mgr: MatchManager, fn: Any,
+                          args: List[str]) -> Any:
+    """Run read-only handler `fn` with the channel's match in one vision
+    pass, so its view filter works team sight out once (X11)."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid else None
+    if m is None:
+        return await fn(ctx, args, mgr)
+    with m.vision_pass():
+        return await fn(ctx, args, mgr)
+
+
 def _crash_rollback(mgr: MatchManager, mid: Optional[str],
                     pre: Optional[Dict[str, Any]]) -> str:
     """After a command crashed: put the channel's match back to `pre`, its
@@ -13295,6 +13307,11 @@ def _roster_groups(m: "Match", units: List["Entity"], pov: Optional[str],
 
 @registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    return await _in_vision_pass(ctx, mgr, _list_cmd_impl, args)
+
+
+async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
+                    mgr: MatchManager):
     m = active_match(mgr, ctx)
     _check_options(args, {"as"}, "!list")
     for i, a in enumerate(args):
@@ -13738,6 +13755,11 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
     snapshot=False,
 )
 async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    return await _in_vision_pass(ctx, mgr, _find_cmd_impl, args)
+
+
+async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
+                    mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["find"])
         return await ctx.send(f"**{title}**\n{body}")
@@ -13771,9 +13793,10 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         predicates = _bind_find_maps(
             ctx, m, [_parse_find_selector(t) for t in pred_tokens])
         pov = _query_pov(ctx, m)
-        hits = [e for e in m.entities_in_turn_order()
-                if not _pov_hides(m, pov, e.id)
-                and _find_match_entity(m, e, predicates, pov)]
+        with m.vision_pass():
+            hits = [e for e in m.entities_in_turn_order()
+                    if not _pov_hides(m, pov, e.id)
+                    and _find_match_entity(m, e, predicates, pov)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
     if output == "count":

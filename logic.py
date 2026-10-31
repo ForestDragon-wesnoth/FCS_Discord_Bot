@@ -3,7 +3,7 @@
 # logic.py
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Literal, Any, Dict, Iterable, List, Optional, Tuple, Set
+from typing import Literal, Any, Callable, Dict, Iterable, List, Optional, Tuple, Set
 import os
 import uuid
 import json
@@ -4563,6 +4563,16 @@ def _own_value(value: Any, _budget: Optional[List[int]] = None,
             else f"a {type(value).__name__}")
     raise VTTError(f"Can't store {what}: only numbers, text, true/false, "
                    f"None, lists and dicts can be stored.")
+
+
+def _window_bounds(viewport: Any, gw: int, gh: int
+                   ) -> Tuple[int, int, int, int]:
+    """(x0, y0, x1, y1): the grid cells a render window (vx, vy, vw, vh)
+    shows, clamped to the grid; the whole grid without one."""
+    if viewport is None:
+        return 1, 1, gw, gh
+    vx, vy, vw, vh = viewport
+    return max(1, vx), max(1, vy), min(gw, vx + vw - 1), min(gh, vy + vh - 1)
 
 
 def same_value(a: Any, b: Any) -> bool:
@@ -9406,6 +9416,11 @@ class Match:
     # Never held across a mutation, so it cannot go stale. None = inactive.
     _vision_memo: Optional[Dict[Any, bool]] = field(
         default=None, repr=False, compare=False)
+    # Transient occupancy index for cell_occupant, active (a dict of
+    # (map, ignore) -> {cell: occupant}) only around one search that tests
+    # many cells and changes nothing (occupancy_pass). None = inactive.
+    _occ_memo: Optional[Dict[Any, Dict[Tuple[int, int], str]]] = field(
+        default=None, repr=False, compare=False)
     # Custom event bus: re-entry guard + the current-event payload stack
     # (read by event_get / event_has during handler firing). Transient — an
     # event is a transient broadcast, nothing about it is serialized.
@@ -13110,16 +13125,67 @@ class Match:
         otherwise recomputes the same (team, cell) sight — looping every team
         member with a per-member LOS walk — once per layer per cell."""
         memo = self._vision_memo
+        los = bool(self.rules.get("fog_los", False))
         if memo is None:
-            return self._team_sees(
-                pov_team, x, y, mp, los=bool(self.rules.get("fog_los", False)))
+            return self._team_sees(pov_team, x, y, mp, los=los)
+        if not pov_team:
+            return True
         key = (pov_team, mp.name, x, y)
         cached = memo.get(key)
         if cached is None:
-            cached = self._team_sees(
-                pov_team, x, y, mp, los=bool(self.rules.get("fog_los", False)))
+            cached = self._team_vision_index(pov_team, mp, los, memo)(x, y)
             memo[key] = cached
         return cached
+
+    @contextlib.contextmanager
+    def vision_pass(self):
+        """A read pass that asks about many units or cells: team sight is
+        worked out once for it (the _fog_team_sees memo). Only around code
+        that changes nothing: the memo would go stale across a change."""
+        prev = self._vision_memo
+        if prev is None:
+            self._vision_memo = {}
+        try:
+            yield
+        finally:
+            self._vision_memo = prev
+
+    def _team_vision_index(self, pov_team: str, mp: "Map", los: bool,
+                           memo: Dict[Any, Any]) -> Callable[[int, int], bool]:
+        """`pov_team`'s sight on map `mp` for one read pass, as a cell test
+        built once (kept in the pass's memo): the team's members are found
+        once and filed by the 16x16 blocks their sight boxes touch, so a
+        cell is tested against the few members that could see it. A pass
+        costs the cells it asks about plus the members, never cells x every
+        unit (X11). Answers exactly as _team_sees."""
+        key = ("__vision__", pov_team, mp.name, los)
+        test = memo.get(key)
+        if test is not None:
+            return test
+        gw, gh = mp.grid_width, mp.grid_height
+        B = 16
+        blocks: Dict[Tuple[int, int], List[Any]] = {}
+        for e in self.entities.values():
+            if e.map != mp.name or not self._vision_member_ok(e, pov_team):
+                continue
+            r = self._vision_radius_of(e)
+            bx, by, w, h = self.body_box(e)
+            x0, y0 = max(1, bx - r), max(1, by - r)
+            x1, y1 = min(gw, bx + w - 1 + r), min(gh, by + h - 1 + r)
+            if x0 > x1 or y0 > y1:
+                continue
+            box = (e, x0, y0, x1, y1)
+            for qy in range(y0 // B, y1 // B + 1):
+                for qx in range(x0 // B, x1 // B + 1):
+                    blocks.setdefault((qx, qy), []).append(box)
+
+        def test(x: int, y: int) -> bool:
+            return any(x0 <= x <= x1 and y0 <= y <= y1
+                       and self._member_sees(e, x, y, mp, los=los)
+                       for e, x0, y0, x1, y1
+                       in blocks.get((x // B, y // B), ()))
+        memo[key] = test
+        return test
 
     def _cell_remembered(self, pov_team: Optional[str], x: int, y: int,
                          mp: "Map") -> bool:
@@ -13924,6 +13990,13 @@ class Match:
         footprint-aware core behind is_occupied — a large entity blocks
         every cell it spans."""
         on = (mp or self.get_map()).name
+        memo = self._occ_memo
+        if memo is not None:
+            key = (on, tuple(ignore))
+            table = memo.get(key)
+            if table is None:
+                table = memo[key] = self._occupancy_table(on, ignore)
+            return table.get((x, y))
         for eid, e in self.entities.items():
             if eid in ignore or e.map != on:
                 continue
@@ -13940,6 +14013,38 @@ class Match:
             if e.is_alive and not e.is_cell_stackable and self.entity_occupies(e, x, y):
                 return eid
         return None
+
+    def _occupancy_table(self, on: str, ignore: Tuple[str, ...]
+                         ) -> Dict[Tuple[int, int], str]:
+        """cell -> the unit cell_occupant names there, for map `on`: one
+        pass over the units (the first in order wins a cell, as the scan
+        does)."""
+        table: Dict[Tuple[int, int], str] = {}
+        for eid, e in self.entities.items():
+            if eid in ignore or e.map != on or e.is_glued_part \
+                    or e.is_region_part or e.is_mounted:
+                continue
+            if not e.is_alive or e.is_cell_stackable:
+                continue
+            w, h = self.entity_footprint(e)
+            for yy in range(e.y, e.y + h):
+                for xx in range(e.x, e.x + w):
+                    table.setdefault((xx, yy), eid)
+        return table
+
+    @contextlib.contextmanager
+    def occupancy_pass(self):
+        """A search that tests many cells for occupancy and changes nothing
+        meanwhile: cell_occupant reads one index per (map, ignore) built in
+        a pass over the units, so the search costs cells plus units, never
+        cells x units (X12)."""
+        prev = self._occ_memo
+        if prev is None:
+            self._occ_memo = {}
+        try:
+            yield
+        finally:
+            self._occ_memo = prev
 
     def _occupancy_ignore(self, e: "Entity",
                           extra: Tuple[str, ...] = ()) -> Tuple[str, ...]:
@@ -14028,8 +14133,10 @@ class Match:
         if e.is_cell_stackable:
             return
         ignore = self._occupancy_ignore(e, extra_ignore)
-        for cx, cy in grown:
-            other = self.cell_occupant(cx, cy, ignore, mp)
+        with self.occupancy_pass():
+            taken = [(c, self.cell_occupant(c[0], c[1], ignore, mp))
+                     for c in grown]
+        for (cx, cy), other in taken:
             if other is not None:
                 raise Occupied(
                     f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
@@ -18357,10 +18464,11 @@ class Match:
         the map searched (None: `e`'s map, else the only map)."""
         mp = self._map_for(mp, e)
         ignore = self._stand_ignore(e)
-        for r in self._ring_radii(x, y, radius, mp):
-            for cx, cy in self._ring_cells(x, y, r, mp):
-                if self._can_stand_at(e, cx, cy, ignore, mp):
-                    return (cx, cy)
+        with self.occupancy_pass():
+            for r in self._ring_radii(x, y, radius, mp):
+                for cx, cy in self._ring_cells(x, y, r, mp):
+                    if self._can_stand_at(e, cx, cy, ignore, mp):
+                        return (cx, cy)
         return None
 
     def _stand_ignore(self, e: Optional["Entity"]) -> Tuple[str, ...]:
@@ -18424,12 +18532,14 @@ class Match:
                 f"checking {len(cand)} spots for a {w}x{h} body covers more "
                 f"than the formula_cell_limit of {limit} cells.")
         out = []
-        for ax, ay in sorted(cand, key=lambda c: (c[1], c[0])):
-            if (e is not None and fit == "body"
-                    and any(c not in area for c in self.entity_cells(e, ax, ay))):
-                continue
-            if self._can_stand_at(e, ax, ay, ignore, mp):
-                out.append((ax, ay))
+        with self.occupancy_pass():
+            for ax, ay in sorted(cand, key=lambda c: (c[1], c[0])):
+                if (e is not None and fit == "body"
+                        and any(c not in area
+                                for c in self.entity_cells(e, ax, ay))):
+                    continue
+                if self._can_stand_at(e, ax, ay, ignore, mp):
+                    out.append((ax, ay))
         return out
 
     # ---- death / corpse machinery ----------------------------------------
@@ -22065,8 +22175,11 @@ class Match:
         if pov_team is not None and self.fog_on(mp) and "fog" not in hidden:
             fog_glyph = str(self.rules.get("fog_glyph", "?"))
             fg = fog_glyph[0] if fog_glyph else "."
-            for yy in range(1, gh + 1):
-                for xx in range(1, gw + 1):
+            # Only the cells the window shows: a fogged read costs the
+            # window, never the whole map (X11).
+            fx0, fy0, fx1, fy1 = _window_bounds(viewport, gw, gh)
+            for yy in range(fy0, fy1 + 1):
+                for xx in range(fx0, fx1 + 1):
                     if not self._fog_terrain_visible(pov_team, xx, yy, mp):
                         grid[yy][xx] = fg
                         colors[yy][xx] = None
@@ -22564,8 +22677,10 @@ class Match:
             except (TypeError, ValueError):
                 fog_op = 60
             fog_op = max(0, min(100, fog_op))
-            for yy in range(1, mp.grid_height + 1):
-                for xx in range(1, mp.grid_width + 1):
+            fx0, fy0, fx1, fy1 = _window_bounds(viewport, mp.grid_width,
+                                                mp.grid_height)
+            for yy in range(fy0, fy1 + 1):
+                for xx in range(fx0, fx1 + 1):
                     if not self._fog_terrain_visible(pov_team, xx, yy, mp):
                         fog.append({"x": xx, "y": yy,
                                     "sprite": fog_sprite, "opacity": fog_op})
