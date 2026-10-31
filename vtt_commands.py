@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
-from logic import check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
+from logic import STORE_DEPTH_LIMIT, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -5432,6 +5432,47 @@ _TEMPLATE_EDIT_FIELDS = ("name", "vars", "status", "passives", "clamps",
                          "facing")
 
 
+# How deep an imported JSON text may nest: a value the store accepts
+# (STORE_DEPTH_LIMIT) plus the few levels a template / prefab wraps it in.
+# Measured on the text before parsing, since Python's decoder and the
+# checks after it recurse once per level (500 levels crashed both, L31).
+_IMPORT_JSON_DEPTH = STORE_DEPTH_LIMIT + 8
+
+
+def _parse_import_json(raw: str, strict: bool = True) -> Any:
+    """`raw` parsed as JSON for an import, or a VTTError: malformed text,
+    or nesting deeper than _IMPORT_JSON_DEPTH."""
+    depth = deepest = 0
+    in_str = esc = False
+    for ch in raw:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+            if depth > deepest:
+                deepest = depth
+                if deepest > _IMPORT_JSON_DEPTH:
+                    raise VTTError(
+                        f"That JSON nests more than {_IMPORT_JSON_DEPTH} "
+                        f"levels deep; a stored value holds at most "
+                        f"{STORE_DEPTH_LIMIT}.")
+        elif ch in "]}":
+            depth -= 1
+    try:
+        return json.loads(raw, strict=strict)
+    except ValueError as ex:
+        raise VTTError(f"That isn't valid JSON ({ex}). Paste it after the "
+                       f"name, e.g. as `!template show` / `!prefab show` "
+                       f"exports it.")
+
+
 def _template_summary(name: str, tpl: Dict[str, Any],
                       tags: Optional[List[str]] = None) -> str:
     by = tpl.get("saved_by_name") or tpl.get("saved_by")
@@ -5454,8 +5495,12 @@ def _template_summary(name: str, tpl: Dict[str, Any],
     if tags is None:
         # Unresolved (no partial expanded): the partial's own field, or
         # the tags var as saved.
-        raw = (tpl.get("tags") if _is_partial(tpl) else (tpl.get("vars") or {})
-               .get((tpl.get("var_names") or {}).get("tags_var") or "tags"))
+        vn = tpl.get("var_names")
+        tv = vn.get("tags_var") if isinstance(vn, dict) else None
+        tvars = tpl.get("vars")
+        raw = (tpl.get("tags") if _is_partial(tpl) else
+               (tvars if isinstance(tvars, dict) else {}).get(
+                   tv if isinstance(tv, str) and tv else "tags"))
         tags = [str(t) for t in raw] if isinstance(raw, list) else []
     if tags:
         bits.append("tags " + ", ".join(tags))
@@ -5467,8 +5512,10 @@ def _template_summary(name: str, tpl: Dict[str, Any],
 def _template_tags_var(tpl: Dict[str, Any], resolver: Match) -> str:
     """The var holding an entity template's tags: the name it was saved
     with, else the tags_var rule of `resolver`'s system."""
-    return ((tpl.get("var_names") or {}).get("tags_var")
-            or str(resolver.rules.get("tags_var", "tags")))
+    vn = tpl.get("var_names")
+    tv = vn.get("tags_var") if isinstance(vn, dict) else None
+    return (tv if isinstance(tv, str) and tv
+            else str(resolver.rules.get("tags_var", "tags")))
 
 
 def _template_tags(tpl: Dict[str, Any], resolver: Match) -> List[str]:
@@ -5839,11 +5886,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         _template_may_save(ctx, mgr)
         name = check_template_name(args[1])
         raw = " ".join(args[2:])
-        try:
-            data = json.loads(raw, strict=False)
-        except ValueError as ex:
-            raise VTTError(f"That isn't valid JSON ({ex}). Paste it after the "
-                           f"name, e.g. as `!template show` prints it.")
+        data = _parse_import_json(raw, strict=False)
         data, checks = check_template(data, name, mgr.templates)
         verb, notes = _store_template(ctx, mgr, name, data)
         msg = (f"💾 {verb} template `{name}` from JSON "
@@ -6747,10 +6790,7 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if ctx_user(ctx) is None:
             raise VTTError("Prefabs can only be imported with an identity to "
                            "record as the saver.")
-        try:
-            parsed = json.loads(raw)
-        except ValueError as ex:
-            raise VTTError(f"That isn't JSON: {ex}.")
+        parsed = _parse_import_json(raw)
         data = check_prefab(parsed, name)
         verb, notes = _store_prefab(ctx, mgr, name, data)
         return await ctx.send("\n".join(

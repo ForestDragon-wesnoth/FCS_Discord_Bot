@@ -6088,10 +6088,14 @@ class SpecialTileTemplate:
     def from_dict(d: Dict[str, Any]) -> "SpecialTileTemplate":
         return SpecialTileTemplate(
             name=str(d["name"]),
-            data=copy.deepcopy(d.get("data", {}) or {}),
+            # Only an object is tile data (a number there crashed every
+            # reader of the template's look, S13).
+            data=(copy.deepcopy(d["data"])
+                  if isinstance(d.get("data"), dict) else {}),
             hooks={
                 str(k): str(v)
-                for k, v in (d.get("hooks", {}) or {}).items()
+                for k, v in (d["hooks"] if isinstance(d.get("hooks"), dict)
+                             else {}).items()
                 if isinstance(v, str)
             },
             tags=normalize_tags(d.get("tags")),
@@ -20781,6 +20785,8 @@ class Match:
                 return
             tv = (names or {}).get("team_var", "team") \
                 if isinstance(names, dict) else "team"
+            if not isinstance(tv, str):
+                tv = "team"
             if tv in vars_ and not isinstance(vars_[tv], (str, dict, list)) \
                     and vars_[tv] is not None:
                 vars_[tv] = team_text(vars_[tv])
@@ -23227,6 +23233,8 @@ def check_template(data: Any, name: str,
 
     def probe(spec: Dict[str, Any], what: str) -> None:
         check_unit_form(spec, what)
+        if "var_names" in spec:
+            spec["var_names"] = check_var_names_field(spec["var_names"], what)
         trial = copy.deepcopy(spec)
         trial.pop("parts", None)
         trial.pop("segments", None)
@@ -23274,6 +23282,15 @@ def check_template(data: Any, name: str,
                             f"a whole-number offset.")
                 probe(pt, f"Template `{name}` part `{role}`")
         elif isinstance(parts, list):
+            for i, pt in enumerate(parts):
+                if isinstance(pt, dict) and pt.get("id") is not None \
+                        and not isinstance(pt["id"], str):
+                    raise VTTError(f"Template `{name}`: part #{i + 1}'s `id` "
+                                   f"must be text.")
+                if isinstance(pt, dict) and pt.get("part_of") is not None \
+                        and not isinstance(pt["part_of"], str):
+                    raise VTTError(f"Template `{name}`: part #{i + 1}'s "
+                                   f"`part_of` must be text.")
             ids = [p.get("id") for p in parts if isinstance(p, dict)]
             for i, pt in enumerate(parts):
                 if not isinstance(pt, dict):
@@ -23722,6 +23739,32 @@ def check_var_name_rule(key: str, value: Any) -> str:
                if v in RESERVED_VAR_PATHS else
                "names starting with __ belong to the engine."))
     return v
+
+
+def check_var_names_field(raw: Any, what: str) -> Dict[str, str]:
+    """A saved unit's `var_names` (a template, a prefab unit or corpse) as
+    an import must hold it: an object mapping VAR_NAME_RULES keys to names
+    `check_var_name_rule` accepts. Refuses anything else, naming `what`
+    (a list there crashed `!template list` and made a stamped corpse's
+    match unloadable, S10 / S11)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise VTTError(f"{what}: `var_names` must be an object of var-name "
+                       f"rules, got {type(raw).__name__}.")
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        if k not in VAR_NAME_RULES:
+            raise VTTError(f"{what}: `var_names` key `{k}` isn't a var-name "
+                           f"rule ({', '.join(sorted(VAR_NAME_RULES))}).")
+        if not isinstance(v, str):
+            raise VTTError(f"{what}: `var_names.{k}` must be text, got "
+                           f"{type(v).__name__}.")
+        try:
+            out[k] = check_var_name_rule(k, v)
+        except VTTError as ex:
+            raise VTTError(f"{what}: {ex}")
+    return out
 
 
 def checked_var_names(raw: Any) -> Dict[str, str]:
