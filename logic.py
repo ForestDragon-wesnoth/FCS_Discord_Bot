@@ -105,6 +105,38 @@ def formula_text(text: Any) -> Any:
     from."""
     return HIDDEN_FORMULA_TEXT if FORMULA_TEXT_HIDDEN.get() else text
 
+# Command roots whose arguments can hold formula text (a passive, a hook, a
+# body, a condition, a function, `!eval`): under formula_text_visibility a
+# history label of one keeps only its root and subcommand (V13).
+FORMULA_LABEL_ROOTS = frozenset({
+    "passive", "gpassive", "defpassive", "func", "status", "tile", "zone",
+    "watch", "eval", "assert", "macro", "schedule", "system", "team",
+    "defvar", "batch", "foreach", "dry", "run", "mount", "clamp", "gclamp",
+    "action", "template", "prefab", "match", "remind", "store"})
+_LABEL_FORMULA_SUBS = {"ent": frozenset({"set_var", "set_vars", "status",
+                                         "store_entity_into_var",
+                                         "transform"})}
+
+
+def formula_label(label: str) -> str:
+    """A command label (`!passive add hero trap on_turn_start ...`) as the
+    running command's caller may read it: whole, or, while
+    formula_text_visibility hides formulas from them, cut after the
+    subcommand of a command that can carry formula text (and of any
+    command holding a `$()`), as `!passive add (hidden)`."""
+    if not FORMULA_TEXT_HIDDEN.get():
+        return label
+    words = str(label).split()
+    if not words:
+        return label
+    root = words[0].lstrip("!").lower()
+    sub = words[1].lower() if len(words) > 1 else ""
+    if (root in FORMULA_LABEL_ROOTS or "$(" in label
+            or sub in _LABEL_FORMULA_SUBS.get(root, ())):
+        keep = " ".join(words[:2])
+        return keep + (f" {HIDDEN_FORMULA_TEXT}" if len(words) > 2 else "")
+    return label
+
 
 # Ids of the matches the running command sent units out of with
 # transfer_entity: their undo step says it only undoes their side.
@@ -2522,8 +2554,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "channel's match sees names, triggers and signatures with each "
             "formula shown as `(hidden)`, so a trap passive or a boss's "
             "damage function stays the GM's. Read from the channel's match, "
-            "else the channel's default system. Alias expansions and macro "
-            "bodies are command lines and stay readable where they are now."
+            "else the channel's default system. It covers the raw reads "
+            "too (`!ent dump`, `!find ... show:`, `!team get`, `!defvar "
+            "list`, `!map cell`, `!mount info`), the command history (a "
+            "formula command's label shows its root and subcommand) and the "
+            "errors a hidden formula raises. Alias expansions and macro "
+            "bodies are command lines and stay readable where they are now. "
+            "A `$()` argument reads any stored value, formula text "
+            "included: `inline_args_access host` closes that route, as it "
+            "does for fog."
         ),
     },
     "team_data_visibility": {
@@ -9869,6 +9908,14 @@ class Match:
         fn = COMMAND_POV.get()
         return fn(self) if fn is not None else None
 
+    def occupied_text(self, occ: str) -> str:
+        """"occupied by `<id>`" for a refusal, or just "occupied" when the
+        running command's view can't see the occupant (V11)."""
+        pov = self.command_pov()
+        if pov is not None and not self.entity_visible_to(occ, pov):
+            return "occupied"
+        return f"occupied by `{occ}`"
+
     def presents_status(self, e: "Entity", status: str) -> bool:
         """Whether the running command's view sees `e` holding `status`
         (a disguise presents its own statuses, V5++)."""
@@ -11053,7 +11100,7 @@ class Match:
                 if occ is not None:
                     raise Occupied(
                         f"Segment `{sg.id}` of `{head.id}` would end on "
-                        f"({cx},{cy}), occupied by `{occ}`.")
+                        f"({cx},{cy}), {self.occupied_text(occ)}.")
 
     def _advance_snake_path(self, head: "Entity", chain: List["Entity"],
                             prev_x: int, prev_y: int) -> None:
@@ -12123,7 +12170,7 @@ class Match:
             try:
                 return bool(_ev(cond))
             except FormulaError as ex:
-                _note(src, f"condition error ({ex})")
+                _note(src, f"condition error ({formula_text(str(ex))})")
                 return False          # malformed condition -> inactive (fail safe)
 
         records = self._raw_modifier_records(e)
@@ -12166,7 +12213,7 @@ class Match:
                 try:
                     raw_val = _ev(raw_val)
                 except FormulaError as ex:
-                    _note(src, f"value error ({ex})")
+                    _note(src, f"value error ({formula_text(str(ex))})")
                     continue          # malformed value -> skip this modifier
             try:
                 val = float(raw_val)
@@ -22899,8 +22946,8 @@ class Match:
                     if occ is not None:
                         raise Occupied(
                             f"Group '{group_name}' move aborted: member "
-                            f"'{eid}' would land on ({cx},{cy}), occupied by "
-                            f"'{occ}'."
+                            f"'{eid}' would land on ({cx},{cy}), "
+                            f"{self.occupied_text(occ)}."
                         )
             try:
                 self._check_snake_trail(e, path, tuple(member_set))

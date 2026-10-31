@@ -1260,6 +1260,10 @@ registry = CommandRegistry()
 
 # The match `!match replay` is rebuilding: it takes the replayed entries as
 # its journal, so they aren't journaled again as they run.
+# The library writes a replay skipped (`!prefab save` inside a replayed
+# batch), named in its report.
+_REPLAY_SKIPS: "contextvars.ContextVar[Optional[List[str]]]" = (
+    contextvars.ContextVar("vtt_replay_skips", default=None))
 _REPLAYING: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "vtt_replaying", default=None)
 
@@ -1778,7 +1782,11 @@ def _journal_systems(mgr: MatchManager, ctx: ReplyContext,
                        "by": COMMAND_USER.get() or "", "uid": ctx_user(ctx),
                        "cmd": [name] + list(args),
                        "system_name": m.system_name,
-                       "systems": now})
+                       "systems": now,
+                       # The match after the edit (a var-name rule moved
+                       # its units' vars), so a restart compares the load
+                       # with it (J16).
+                       "hash": state_hash(m.to_dict(include_history=False))})
         handled = getattr(mgr, "_journal_handled", None)
         if handled is not None:
             handled.add(mid)
@@ -2531,7 +2539,8 @@ def _entity_dump(e: Entity) -> str:
         for name in sorted(e.status.keys()):
             data = e.status[name]
             if isinstance(data, dict) and data:
-                fields = ", ".join(f"{k}={v!r}" for k, v in sorted(data.items()))
+                fields = ", ".join(f"{k}={v!r}" for k, v in sorted(
+                    _hide_formula_fields(data).items()))
                 status_parts.append(f"{name}({fields})")
             else:
                 status_parts.append(name)
@@ -2544,7 +2553,7 @@ def _entity_dump(e: Entity) -> str:
     )
     parts.append("")
     parts.append("**vars (full json):**")
-    parts.append(f"```{json.dumps(e.vars or {}, indent=2, sort_keys=True)}\n```")
+    parts.append(f"```{json.dumps(_hide_formula_fields(e.vars or {}), indent=2, sort_keys=True)}\n```")
     if e.passives:
         parts.append("**passives:**")
         for pid, p in e.passives.items():
@@ -2643,7 +2652,18 @@ def _typed_unit_view(ctx: ReplyContext, mgr: MatchManager,
 # `<field>_unless` restriction formulas.
 _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "condition", "effect", "cost",
-                                 "death_effect"})
+                                 "death_effect", "__death_condition",
+                                 "__map_vehicle_death_effect",
+                                 "__mount_death_effect"})
+
+
+def _hide_formula_at(path: str, value: Any) -> Any:
+    """`value`, read at the dotted `path`, as _hide_formula_fields shows it
+    (the last key decides for a text value: `actions.hit.body`)."""
+    if not FORMULA_TEXT_HIDDEN.get():
+        return value
+    key = str(path).split(".")[-1] if path else "_"
+    return _hide_formula_fields({key: value})[key]
 
 
 def _hide_formula_fields(value: Any) -> Any:
@@ -2659,7 +2679,12 @@ def _hide_formula_fields(value: Any) -> Any:
             if key == "hooks":
                 return {k: formula_text(x) if isinstance(x, str) else walk(x)
                         for k, x in v.items()}
-            return {k: walk(x, k) for k, x in v.items()}
+            # A modifier record's `value` may be a formula (`stat` + `op`
+            # mark one).
+            modifier = "stat" in v and "op" in v
+            return {k: (formula_text(x) if modifier and k == "value"
+                        and isinstance(x, str) else walk(x, k))
+                    for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x) for x in v]
         if isinstance(v, str) and key is not None and (
@@ -3722,7 +3747,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if vsub == "list":
             if not m.vars:
                 return await ctx.send("No match vars set.")
-            lines = [f"- `{k}` = {v!r}" for k, v in m.vars.items()]
+            lines = [f"- `{k}` = {_hide_formula_at(k, v)!r}"
+                     for k, v in m.vars.items()]
             return await ctx.send("**Match vars:**\n" + "\n".join(lines))
         raise VTTError(
             f"Unknown !match var subcommand '{vsub}'. "
@@ -6626,6 +6652,17 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub not in _PREFAB_USAGE:
         return await _help_fallback(ctx, ["prefab"], args[0])
     usage = _PREFAB_USAGE[sub]
+    if _REPLAYING.get() is not None and (
+            sub in ("save", "import", "rename", "copy", "delete", "restore")
+            or (sub == "tags" and len(args) > 2)):
+        # A journal carries no prefab library: a replayed write would act
+        # on this server's current prefabs (J15). The stamps after it read
+        # the copies their entries recorded.
+        skips = _REPLAY_SKIPS.get()
+        if skips is not None:
+            skips.append(f"`!prefab {sub} {' '.join(args[1:2])}`")
+        return await ctx.send(f"(replay: `!prefab {sub}` skipped; the "
+                              f"prefab library is left alone)")
 
     if sub == "list":
         words, opts = _template_options(args, 1, usage, allowed=("tag",))
@@ -7330,11 +7367,17 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
     first_off: Optional[str] = None
     out: List[str] = []
     replaying = _REPLAYING.set(mid)
+    skips: List[str] = []
+    skips_token = _REPLAY_SKIPS.set(skips)
     try:
         last_n = await _replay_entries(ctx, mgr, mid, segs, upto, checks,
                                        verbose, out)
     finally:
         _REPLAYING.reset(replaying)
+        _REPLAY_SKIPS.reset(skips_token)
+    if skips:
+        out.append("Left the prefab library alone: skipped "
+                   + ", ".join(dict.fromkeys(skips)) + ".")
     ran, first_off = last_n["ran"], last_n["off"]
     # The rebuilt match's journal is the recording's, up to where it stopped.
     m = mgr.matches.get(mid)
@@ -11799,10 +11842,18 @@ def _whole_board_read_blocked(ctx: ReplyContext, m: "Match") -> bool:
     pov_filters_queries on. Such a report can't be filtered line by line
     (an old entry may name a unit that is hidden now, or was then), so it
     is host-only while hiding is in play."""
-    if _query_pov(ctx, m) is None or _acts_as_host(ctx, m):
+    pov = _query_pov(ctx, m)
+    if pov is None or _acts_as_host(ctx, m):
         return False
-    return any(m.fog_on(mp) for mp in m.maps.values()) or any(
-        str(m.rules.get(r, "") or "").strip() for r in _VISIBILITY_RULES)
+    if any(m.fog_on(mp) for mp in m.maps.values()) or any(
+            str(m.rules.get(r, "") or "").strip() for r in _VISIBILITY_RULES):
+        return True
+    # Without fog, a rider hidden in a vehicle and a disguise still hide
+    # things from other teams, which the log and the command history name
+    # (V12).
+    return any(_pov_hides(m, pov, e.id)
+               or m._effective_disguise(e, pov) is not None
+               for e in m.entities.values())
 
 
 def _team_data_readable(ctx: ReplyContext, m: "Match", team: str) -> bool:
@@ -12004,7 +12055,7 @@ def _fmt_spec(spec: Any) -> str:
         return "always" if spec else "never"
     if isinstance(spec, (int, float)):
         return "always" if spec else "never"
-    return f"`{spec}`"
+    return f"`{formula_text(spec)}`"
 
 
 def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
@@ -12059,7 +12110,8 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
     data = _visible_tile_data(m, x, y, pov, mp)
     tile_data = {k: v for k, v in (data or {}).items() if k != "corpses"}
     if tile_data:
-        shown = json.dumps(tile_data, sort_keys=True, default=str)
+        shown = json.dumps(_hide_formula_fields(tile_data), sort_keys=True,
+                           default=str)
         if len(shown) > 300:
             shown = shown[:297] + "..."
         lines.append(f"Tile: `{shown}`")
@@ -12141,7 +12193,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
         for what, errs in (("movement", berr), ("sight", oerr)):
             for err in dict.fromkeys(errs):
                 lines.append(f"⚠️ a {what} condition failed for `{mover}` and "
-                             f"counts as no: {err}")
+                             f"counts as no: {formula_text(err)}")
     return "\n".join(lines)
 
 
@@ -12700,7 +12752,8 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
         if not mp.vars:
             return await ctx.send(f"No vars set on {where}.")
         return await ctx.send(f"**Vars of {where}:**\n" + "\n".join(
-            f"- `{k}` = {v!r}" for k, v in mp.vars.items()))
+            f"- `{k}` = {_hide_formula_at(k, v)!r}"
+            for k, v in mp.vars.items()))
     raise VTTError(f"Unknown `!map var` subcommand '{vsub}'. Use set / get / "
                    f"del / list.")
 
@@ -13762,6 +13815,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     cells.append(f"{col}={_fmt_status_names(e) or '—'}")
                     continue
                 found, v = _entity_path_value(m, e, col, pov)
+                v = _hide_formula_at(col, v) if found else v
                 cells.append(f"{col}={v if found else '—'}")
             row += "  [" + ", ".join(cells) + "]"
         lines.append(row)
@@ -15196,16 +15250,23 @@ def _diff_flat(prefix: str, a: Any, b: Any, indent: str) -> List[str]:
     for f in (fa, fb):
         if f.get("", None) == {}:
             del f[""]
+    # Printed as formula_text_visibility shows them (a changed formula
+    # reads `(hidden) -> (hidden)`); compared as stored.
+    ha: Dict[str, Any] = {}
+    hb: Dict[str, Any] = {}
+    _flatten_vars("", _hide_formula_fields(a if a is not None else {}), ha)
+    _flatten_vars("", _hide_formula_fields(b if b is not None else {}), hb)
     out: List[str] = []
     for k in sorted(set(fa) | set(fb), key=str):
         path = f"{prefix}.{k}" if prefix and k else (prefix or k)
         # "(unset)" for the missing side: a bare "- 5" read as minus five.
         if k not in fa:
-            out.append(f"{indent}{path}: (unset) -> {fb[k]!r}")
+            out.append(f"{indent}{path}: (unset) -> {hb.get(k, fb[k])!r}")
         elif k not in fb:
-            out.append(f"{indent}{path}: {fa[k]!r} -> (unset)")
+            out.append(f"{indent}{path}: {ha.get(k, fa[k])!r} -> (unset)")
         elif not same_value(fa[k], fb[k]):
-            out.append(f"{indent}{path}: {fa[k]!r} -> {fb[k]!r}")
+            out.append(f"{indent}{path}: {ha.get(k, fa[k])!r} -> "
+                       f"{hb.get(k, fb[k])!r}")
     return out
 
 
@@ -15396,7 +15457,7 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
         ta, tb = ma.get("tiles") or {}, mb.get("tiles") or {}
         for cell in sorted(set(ta) | set(tb), key=str):
             if cell not in ta:
-                tile_lines.append(f"  + tile ({cell}){at}: {tb[cell]!r}")
+                tile_lines.append(f"  + tile ({cell}){at}: {_hide_formula_fields(tb[cell])!r}")
             elif cell not in tb:
                 tile_lines.append(f"  - tile ({cell}){at}")
             else:
@@ -16650,7 +16711,7 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         lines = [f"**System `{sys_name}` default {kind} vars:**"]
         for k in sorted(existing.keys()):
-            lines.append(f"- `{k}` = {existing[k]!r}")
+            lines.append(f"- `{k}` = {_hide_formula_at(k, existing[k])!r}")
         return await ctx.send("\n".join(lines))
 
     raise VTTError(f"Unknown !defvar subcommand: {sub}")
@@ -21725,7 +21786,8 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         v = m.team_get(args[1], args[2], _sent)
         if v is _sent:
             return await ctx.send(f"team `{args[1]}`.{args[2]} is unset.")
-        return await ctx.send(f"team `{args[1]}`.{args[2]} = {v!r}")
+        return await ctx.send(
+            f"team `{args[1]}`.{args[2]} = {_hide_formula_at(args[2], v)!r}")
 
     if sub == "list":
         if len(args) >= 2:
@@ -21736,7 +21798,8 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if not d:
                 return await ctx.send(f"team `{args[1]}` has no data.")
             return await ctx.send(
-                f"**team `{args[1]}`**\n```{json.dumps(d, indent=2, sort_keys=True)}\n```")
+                f"**team `{args[1]}`**\n```"
+                f"{json.dumps(_hide_formula_fields(d), indent=2, sort_keys=True)}\n```")
         teams = [t for t in sorted(m.team_data)
                  if _team_data_readable(ctx, m, t)]
         if not teams:
@@ -22099,7 +22162,7 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             occ = m.slot_occupants(vid, name)
             return await ctx.send(
                 f"**slot `{name}` on `{vid}`**\n"
-                f"```{json.dumps(sd, indent=2, sort_keys=True)}\n```\n"
+                f"```{json.dumps(_hide_formula_fields(sd), indent=2, sort_keys=True)}\n```\n"
                 f"capacity {m.slot_used_capacity(vid, name):g}/"
                 f"{m.slot_capacity(vid, name):g}; occupants: "
                 + (", ".join(f"`{e.id}`" if not _pov_hides(m, pov, e.id)
@@ -22564,6 +22627,14 @@ async def _run_action_dispatch(
         # clean ❌ so the user doesn't see the dispatcher's generic
         # `💥 Unexpected error` path.
         return await ctx.send(f"❌ action `{action.name}`: {ef.message}")
+    except FormulaError:
+        if not FORMULA_TEXT_HIDDEN.get():
+            raise
+        # The message names what the GM's hidden formula holds (an
+        # identifier, a value): the caller learns only that it failed (L29).
+        return await ctx.send(f"❌ action `{action.name}`: its formula "
+                              f"failed (formula text is {HIDDEN_FORMULA_TEXT} "
+                              f"here); nothing was changed.")
     finally:
         m._runtime_ctx = prev_ctx
         m._runtime_mgr = prev_mgr

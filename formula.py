@@ -7948,7 +7948,11 @@ class FormulaEngine:
             passive gave no sign at all (zone_exists is the silent test)."""
             if match.has_zone(name):
                 return True
-            if (fname, name) not in warned_zones:
+            # Not in a team-view channel: players read it, the zone name
+            # comes from the GM's setup and they can't fix it (V10, as the
+            # tag-vocabulary warning).
+            if (fname, name) not in warned_zones \
+                    and match.command_pov() is None:
                 warned_zones.add((fname, name))
                 line = (f"⚠️ {fname}: no zone named `{name}` (answered as "
                         f"an empty zone).")
