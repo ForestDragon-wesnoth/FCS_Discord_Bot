@@ -937,10 +937,11 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
         if mode == "replace":
             _clear_rect(m, mp, x, y, W, H, victims, log)
         _merge_definitions(m, pf, notes)
-        _stamp_tiles(m, mp, pf, turn, x, y, mode)
+        _stamp_tiles(m, mp, pf, turn, x, y, mode, notes)
         _stamp_corpses(m, mp, pf, turn, x, y, idmap, notes)
         roots = _spawn_units(m, mp, pf, units, idmap, x, y, team, log)
-        new_zones = _stamp_zones(m, mp, pf, turn, x, y, idmap, renamed)
+        new_zones = _stamp_zones(m, mp, pf, turn, x, y, idmap, renamed,
+                                 notes)
         for g, members in (pf.get("groups") or {}).items():
             for oid in members:
                 if idmap.get(oid) in m.entities:
@@ -1031,7 +1032,8 @@ def _turn_facing(d: Dict[str, Any], turn: Turn) -> None:
 
 
 def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
-                 x: int, y: int, mode: str) -> None:
+                 x: int, y: int, mode: str, notes: List[str]) -> None:
+    missing: Set[str] = set()
     for dx, dy, tdata in pf.get("tiles") or []:
         nx, ny = turn.point(dx, dy)
         cx, cy = x + nx, y + ny
@@ -1041,9 +1043,21 @@ def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
             continue
         new = copy.deepcopy(tdata)
         _turn_facing(new, turn)
+        tn = new.get("_template")
+        if tn is not None and tn not in m.tile_templates:
+            # A template the match lacks (a child system hides it, an
+            # import names one it doesn't carry): the tile keeps its data
+            # and names nothing, as after `!tile def del`, so a later
+            # template of the name takes it over (Z1+).
+            del new["_template"]
+            missing.add(str(tn))
         if isinstance(old, dict) and old.get("corpses"):
             new["corpses"] = old["corpses"]
         mp.tiles[(cx, cy)] = new
+    if missing:
+        notes.append("Tile template(s) " + ", ".join(
+            f"`{t}`" for t in sorted(missing)) + " aren't in this match: "
+            "those tiles keep their data and name no template.")
 
 
 def _stamp_corpses(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
@@ -1087,6 +1101,13 @@ def _stamp_corpses(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                 Match._shift_snake_path_vars(bv, x, y)
         if isinstance(c.get("groups"), dict):
             c["groups"] = {cmap.get(k, k): v for k, v in c["groups"].items()}
+        # The var names the match's rules give, as its live corpses have
+        # (a corpse saved under `hp` listed as `HP: ?` after hp_var health,
+        # K9).
+        for body in [ent] + [p for p in c.get("parts") or []
+                             if isinstance(p, dict)]:
+            notes += m._sync_unit_dict(body, m.rules,
+                                       f"corpse `{body.get('id', nid)}`")
         mp.tile_data(ent["x"], ent["y"]).setdefault("corpses", {})[nid] = c
 
 
@@ -1153,8 +1174,9 @@ def _spawn_units(m: Match, mp: Map, pf: Dict[str, Any],
 
 def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                  x: int, y: int, idmap: Dict[str, str],
-                 renamed: Dict[str, str]) -> List[str]:
+                 renamed: Dict[str, str], notes: List[str]) -> List[str]:
     made: List[str] = []
+    missing: Set[str] = set()
     for zname, zd in sorted((pf.get("zones") or {}).items()):
         z = mp._zone_from_dict(dict(zd, cells=[]))
         if z is None:
@@ -1166,6 +1188,9 @@ def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                 cells.add((x + nx, y + ny))
         z["cells"] = cells
         _turn_facing(z, turn)
+        if z.get("def") is not None and z["def"] not in m.zone_definitions:
+            missing.add(str(z["def"]))          # Z1+, as for tiles
+            z.pop("def", None)
         new = m.mint_zone_name(zname)
         if new != zname:
             renamed[zname] = new
@@ -1178,4 +1203,8 @@ def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
         if anchor:
             m._stamp_anchored_zone(new, mp)
         made.append(new)
+    if missing:
+        notes.append("Zone definition(s) " + ", ".join(
+            f"`{d}`" for d in sorted(missing)) + " aren't in this match: "
+            "those zones keep their data and name no definition.")
     return made

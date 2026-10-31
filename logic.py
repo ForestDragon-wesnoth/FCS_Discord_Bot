@@ -13221,6 +13221,26 @@ class Match:
                 mp.fog_reveals.pop(team, None)
         return live
 
+    def reveals_to_turn_clock(self) -> int:
+        """ATB was switched on: round_number stops, so each temporary reveal
+        keyed to rounds moves to the turn clock, each round left counting
+        one turn per unit in the turn order (less the turns this round has
+        had). Without it such a reveal never expired (T8). Returns how many
+        records moved."""
+        n = max(1, len(self.turn_order))
+        done = 0
+        for mp in self.maps.values():
+            for recs in mp.fog_reveals.values():
+                for r in recs:
+                    if r.get("until") is None or r.get("clock") == "turn":
+                        continue
+                    left = (int(r["until"]) - self.round_number + 1) * n \
+                        - (self.active_index if self.turn_order else 0)
+                    r["clock"] = "turn"
+                    r["until"] = self.turns_elapsed + max(0, left - 1)
+                    done += 1
+        return done
+
     def _cell_revealed(self, pov_team: Optional[str], x: int, y: int,
                        mp: "Map") -> bool:
         """True iff `pov_team` has an active reveal covering (x, y) of map
@@ -18159,8 +18179,14 @@ class Match:
         mint_entity_id and Entity.spawn so the two stay consistent."""
         taken: set = set(self.entities.keys())
         if bool(self.rules.get("corpse_id_uniqueness", True)):
-            for (_mp, _x, _y, eid, _c) in self.every_corpse():
+            for (_mp, _x, _y, eid, c) in self.every_corpse():
                 taken.add(eid)
+                # The body parts the corpse holds come back with its revive
+                # under their ids (K9): a new unit can't take one.
+                for pd in (c.get("parts") or ()) if isinstance(c, dict) \
+                        and isinstance(c.get("parts"), list) else ():
+                    if isinstance(pd, dict) and isinstance(pd.get("id"), str):
+                        taken.add(pd["id"])
         return taken
 
     def mint_entity_id(self, prefix: str,
@@ -20883,6 +20909,11 @@ class Match:
             "rng_pos": self.rng_position(),
             "round_started": self.round_started,
             "turn_vacated": self.turn_vacated,
+            # Saved only while set: whether the current ATB turn is a
+            # skipped one (its end fires no action surface, T7), and a
+            # watcher chain waiting for a change (L28).
+            **({"atb_turn_skipped": True} if self._atb_last_skipped else {}),
+            **({"watcher_backlog": True} if self._watcher_backlog else {}),
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
             "tile_templates": {
@@ -21078,6 +21109,8 @@ class Match:
         m.round_started = bool(d.get("round_started", False))
         m.turn_vacated = d.get("turn_vacated") if d.get("turn_vacated") in (
             "same", "wrap") else None
+        m._atb_last_skipped = d.get("atb_turn_skipped") is True
+        m._watcher_backlog = d.get("watcher_backlog") is True
         m.global_passives = {
             pid: Passive.from_dict(pd)
             for pid, pd in (d.get("global_passives", {}) or {}).items()
@@ -22787,6 +22820,16 @@ class Match:
         allow_diagonal_facing)."""
         if str(path).split(".")[0] == FACING_FIELD and "." not in str(path):
             return self.checked_facing(value)
+        if str(path).split(".")[0] == "_template":
+            # The template link: a template the match holds, as `!zone
+            # setdef` takes only a definition it holds (Z1+). `!tile place`
+            # makes the link with the template's data.
+            if "." in str(path) or not isinstance(value, str) \
+                    or value not in self.tile_templates:
+                raise VTTError(
+                    f"`_template` names one of this match's tile templates "
+                    f"(`!tile def list`), got {value!r}; `!tile place` "
+                    f"places one.")
         return value
 
     def tile_face(self, x: int, y: int, raw: Any, mp: "Map") -> Direction:
@@ -24935,6 +24978,8 @@ class MatchManager:
         if old and any(old.get(k) != m.rules.get(k) for k in m.rules
                        if k.startswith("turnorder_")):
             m._mark_turn_order_dirty("turn-order rules changed")
+        if old and not old.get("atb_enabled") and m.rules.get("atb_enabled"):
+            m.reveals_to_turn_clock()
         return notes
 
     def refresh_match_rules(self, system_name: str,

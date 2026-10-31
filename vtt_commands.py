@@ -14674,12 +14674,17 @@ def _take_overwrite(args: List[str], first_opt: int = 3) -> bool:
     is refused, so `!store save overwrite` doesn't save a file named
     `overwrite` and `!history export <sel> overwrite` doesn't crash."""
     at = [i for i, a in enumerate(args) if str(a).lower() == "overwrite"]
-    if not at:
-        return False
     if any(i < first_opt for i in at):
         raise VTTError("Name the file first, then add `overwrite`.")
     args[:] = [a for i, a in enumerate(args) if i not in at]
-    return True
+    # Any other word there is a typo (`ovewrite`), not the option: it was
+    # dropped, and an existing file refused without saying why (L27).
+    stray = [a for a in args[first_opt:] if "=" not in str(a)]
+    if stray:
+        raise VTTError(f"Unexpected `{' '.join(map(str, stray))}`: only "
+                       f"`overwrite` (or a key=value option) follows the "
+                       f"file name.")
+    return bool(at)
 
 
 def _check_overwrite(full: str, shown: str, overwrite: bool) -> None:
@@ -17494,14 +17499,15 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             rest, mapspec = _pop_map_opt(args)
             if await return_help_if_not_enough_args(ctx, rest, 3, "tile", "def"):
                 return
-            _check_tail(rest, 4, ("reset",),
+            # `reset` is the word itself: a typo there reset every tile (L26).
+            reset = len(rest) > 3 and rest[3].lower() == "reset"
+            _check_tail(rest, 4 if reset else 3, ("reset",),
                         "!tile def reapply <name> [reset] [map=<map>]")
             name = rest[2]
             if name not in m.tile_templates:
                 return await ctx.send(f"❌ template `{name}` not found.")
             maps = (list(m.maps.values()) if mapspec is None
                     else _resolve_maps(ctx, m, mapspec, many=True))
-            reset = len(rest) > 3
             n = m.reapply_tile_template(name, maps, reset=reset)
             placed = sum(1 for mp_ in maps for d in mp_.tiles.values()
                          if isinstance(d, dict) and d.get("_template") == name)
@@ -18901,9 +18907,9 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         # in `!system
         # zone`'s usage: a system's definitions have no zones (`!match sync
         # zones ... reapply`).
-        _check_tail(args, 3, ("reset",), prefix.format(sub="reapply")
-                    + " <name> [reset]")
-        reset = len(args) > 2
+        reset = len(args) > 2 and args[2].lower() == "reset"
+        _check_tail(args, 3 if reset else 2, ("reset",),
+                    prefix.format(sub="reapply") + " <name> [reset]")
         changed = m.reapply_zone_definition(name, reset=reset)
         n_all = len(m.zones_using_def(name))
         return (f"Reapplied zone definition `{name}`'s data and facing"
@@ -20679,9 +20685,9 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
             if m is None:
                 m = Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
-            if m.to_dict(include_history=False) != state:
+            if not same_value(m.to_dict(include_history=False), state):
                 _rollback_match(m, mgr, state)
-        elif m.to_dict(include_history=False) != state:
+        elif not same_value(m.to_dict(include_history=False), state):
             _rollback_match(m, mgr, state)
         mark = snap.get("hist", {}).get(mid)
         if mark is not None:
@@ -20757,6 +20763,7 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     rngs = {k: (x._rng.getstate() if x._rng is not None else None,
                 x._rng_seed, x.rng_position())
             for k, x in mgr.matches.items()}
+    seqs = {k: x.history._seq for k, x in mgr.matches.items()}
     await ctx.send(f"🧪 Dry run of `!{' '.join([name] + rest)}` — none of "
                    f"this is kept:")
     token = _DRY_ACTIVE.set(True)
@@ -20768,6 +20775,11 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         post = after.to_dict(include_history=False) if after is not None \
             else None
         _restore_all_matches(mgr, snap)
+        # A dry run leaves no trace on disk: the snapshot numbers it used
+        # are free again (its snapshots never reached a commit; L27).
+        for k, sq in seqs.items():
+            if k in mgr.matches:
+                mgr.matches[k].history._seq = sq
         for k, (state, gen_seed, pos) in rngs.items():
             x = mgr.matches.get(k)
             if x is None:

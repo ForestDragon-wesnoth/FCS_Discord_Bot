@@ -51,7 +51,7 @@ import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import (VTTError, NotFound, CROSS_MATCH_GUARD, normalize_tags,
+from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, normalize_tags,
                    check_tag_filter, tag_filter_matches, tag_filter_empty,
                    RULES_REGISTRY)
 
@@ -1806,9 +1806,9 @@ def _restore_other_matches(mgr: Any, match: "Match",
         if m is None:
             m = snap["objs"].get(mid) or _Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
-            if m.to_dict(include_history=False) != state:
+            if not same_value(m.to_dict(include_history=False), state):
                 _rollback_match(m, mgr, state)
-        elif m.to_dict(include_history=False) != state:
+        elif not same_value(m.to_dict(include_history=False), state):
             _rollback_match(m, mgr, state)
         if mid in snap["hist"]:
             m.history.rewind(snap["hist"][mid])
