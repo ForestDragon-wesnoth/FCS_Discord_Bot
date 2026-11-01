@@ -2513,8 +2513,10 @@ cells.
     in replies (L35), max / min refusals, infinite text in layers,
     weights and shields (E5, L33), `!help` as an index and fenced long
     lines on Discord (D10, L30).
-  - Left as questions: whether a partial records var names (S9's
-    partial half), whether a refused `!eval` program keeps its earlier
-    writes (L35), team grouping and the tiebreak var (L27), `extend` on
-    a permanent status (§8's counter question). Not changed: a size read
-    still records the whole prefab once per segment (L28).
+  - Answered after the pass (user calls, 960): partials record their var
+    names and are renamed when used as a unit's whole vars (S9, 742); a
+    refused `!eval` takes back its writes (L35, 247); team slots tied on
+    initiative go by the tiebreak var on their leading member (L27); a
+    permanent status stays permanent under `extend` and counters (L27,
+    §8's counter question). Not changed: a size read still records the
+    whole prefab once per segment (L28).

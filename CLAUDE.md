@@ -1238,7 +1238,9 @@ hardcodes**.
   (direction, `turnorder_tiebreak_var` / `_direction` (a GM var such as
   `dex` or `stats.agi`; a unit without a number there goes after), then
   tiebreaker incl. `random_stable`, team grouping, change policy
-  immediate / deferred). A write to the tiebreak var and a changed
+  immediate / deferred; under team grouping the tiebreak var also orders
+  tied team slots, read on each team's leading member, and a slot against
+  a teamless unit, user call, 960). A write to the tiebreak var and a changed
   `turnorder_*` rule (`apply_system_rules`) re-sort it like an initiative
   write (770). Before the first `!turn next` the pointer sits at
   the top of the order.
@@ -1355,7 +1357,10 @@ hardcodes**.
   `__status_immune` / `__status_redirect`) run first in apply_status.
 - **Counters:** `status_counter_add/set` (`!status counter`) on any numeric
   field; the status is removed at ≤ 0 (durations and charges alike). A
-  counter on a text field is refused.
+  counter on a text field is refused. A status with no `duration` is
+  permanent (shown as ∞, user call): `status_counter_add` on its duration
+  and a `stack extend` application leave it so (the add returns None);
+  `status_counter_set` gives it one (960).
 - **Dispel / transfer:** `status_dispel(eid, token, max)` (token-only, no
   undispellable guard, user call); `status_transfer(from, to, name)` removes
   from the source unconditionally and re-applies on the destination through
@@ -1561,7 +1566,9 @@ hardcodes**.
   resolve BEFORE the access gate; an alias can't take a command's name
   (refused at def / promote, ignored if saved). Command roots and aliases
   are case-insensitive (`!Ent`, on Discord too). `!func` defines formula functions
-  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula;
+  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula,
+  all or nothing like an action (user call): refused part-way, its writes
+  are taken back, other matches too (`_eval_all_or_nothing`, 247, 960);
   `!eval --trace ...` lists, in order, the formula's own `entity[x]` /
   `match.` reads (`FormulaEngine.trace_reads`, so engine-side checks such
   as the death condition stay out) and every var write / delete the eval
@@ -2642,7 +2649,11 @@ same library and namespace as entity templates: `{"kind": "partial",
   `"__template": {"name", "overrides", "removed"}`. A partial may reference
   another (`axe_common` extends `weapon_base`); an entity template's `vars`
   may (`vars.__template` = whole-unit inheritance), and so may its parts'
-  vars. Refs must name partials; self-references and cycles are refused at
+  vars. A partial records the var names its data was written in
+  (`var_names`, at save and import); used as a unit's whole vars its
+  top-level keys move to the unit's names (`Match._rename_root_partial`,
+  in materialization and `_container_base` at the root; user call, S9,
+  742). Refs must name partials; self-references and cycles are refused at
   save / import (`check_template_refs`); resolution charges
   `partial_template_depth_limit` and `partial_template_size_limit` (a node
   budget per materialization, owner ceiling: nested references multiply).
@@ -2884,9 +2895,6 @@ rejected already. Update this section in the PR that resolves an item.
 - **Partial references in status instances and passives** (user: discuss
   after partial templates shipped): today only var subtrees reference
   partials; statuses and passives stay template-owned.
-- **Status counter on a missing duration:** a status with no `duration` shows
-  as ∞, but `status_counter_add(eid, name, -1)` reads it as 0 and removes the
-  status. Whether ∞ should stay ∞ is open (user: decide later).
 - **Approved commands and POV:** an approved player command runs in the
   requester's channel, so its output (including hook lines naming units that
   POV can't see) shows there. On hold at the user's request.

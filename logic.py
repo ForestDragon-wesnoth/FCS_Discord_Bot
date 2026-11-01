@@ -1232,9 +1232,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "A unit var (`dex`, or a dotted path like `stats.agi`) that breaks "
             "a tie in turnorder_var BEFORE turnorder_tiebreaker does: the "
             "higher value goes first (turnorder_tiebreak_direction). A unit "
-            "without a number there goes after those with one. It names a "
-            "var the GM already keeps, so changing it renames nothing. "
-            "Empty (default) = off."
+            "without a number there goes after those with one. Under "
+            "turnorder_team_grouping it also breaks a tie between team "
+            "slots (read on each team's leading member) and between a slot "
+            "and a teamless unit. It names a var the GM already keeps, so "
+            "changing it renames nothing. Empty (default) = off."
         ),
     },
     "turnorder_tiebreak_direction": {
@@ -7370,7 +7372,8 @@ class Entity:
         # footprint-aware bounds/occupancy check below must see the
         # defaults. Fill-only, so an explicitly-provided value wins.
         if has_file_refs(self.vars):
-            self.vars = match.template_materialize(self.vars)
+            self.vars = match.template_materialize(
+                self.vars, names=match.unit_names_for(self.var_names))
         # Vars kept under another system's names (a template, a corpse or a
         # unit copied from elsewhere) move to this match's names first.
         rename_notes = match.sync_var_names(self)
@@ -14843,9 +14846,14 @@ class Match:
             teamed_entries: List[Tuple[float, Tuple, List["Entity"], str]] = []
             for tname, members in teamed_groups.items():
                 score = group_score(members)
+                ranked = sort_group(members)
                 teamed_entries.append((
-                    init_dir * score, team_group_key(tname, members),
-                    sort_group(members), tname,
+                    init_dir * score,
+                    # A tie between slots goes to turnorder_tiebreak_var
+                    # first, read on the team's leading member (user call,
+                    # L27), then the tiebreaker.
+                    tiebreak_value(ranked[0]) + team_group_key(tname, members),
+                    ranked, tname,
                 ))
 
             # Sort teams by (score, tiebreak). Stable Python sort plus
@@ -14871,10 +14879,11 @@ class Match:
                     interleaved_entries.append((
                         init_dir * e.initiative,
                         # Synthetic team key — use the entity's own
-                        # tie_key so a teamless entity with init==team
-                        # score sorts where its own tiebreaker would
-                        # place it, not where its arbitrary id would.
-                        tie_key(e),
+                        # tiebreak value and tie_key so a teamless entity
+                        # with init==team score sorts where its own
+                        # tiebreakers would place it, not where its
+                        # arbitrary id would.
+                        tiebreak_value(e) + tie_key(e),
                         [e],
                         f"__teamless_{e.id}",
                     ))
@@ -16898,7 +16907,9 @@ class Match:
                 if new_duration is not None:
                     inst["duration"] = new_duration
             elif mode == "extend":
-                if new_duration is not None:
+                # A status with no duration is permanent (∞): extending it
+                # leaves it permanent (user call).
+                if new_duration is not None and inst.get("duration") is not None:
                     inst["duration"] = (_coerce_number(inst.get("duration", 0)) or 0) + new_duration
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1
@@ -17683,11 +17694,14 @@ class Match:
         out = {k: copy.deepcopy(v) for k, v in tpl.items()
                if k not in ("saved_by", "saved_by_name")}
         out["vars"] = strip_markers(self.template_materialize(
-            out.get("vars") or {}))
+            out.get("vars") or {},
+            names=self.unit_names_for(out.get("var_names"))))
         parts = out.get("parts")
         for p in (parts.values() if isinstance(parts, dict) else parts or []):
             if isinstance(p, dict) and "vars" in p:
-                p["vars"] = strip_markers(self.template_materialize(p["vars"]))
+                p["vars"] = strip_markers(self.template_materialize(
+                    p["vars"], names=self.unit_names_for(
+                        p.get("var_names") or out.get("var_names"))))
         return out
 
     def spawn_template(self, name: str, template: Dict[str, Any], x: int, y: int,
@@ -17823,19 +17837,53 @@ class Match:
                            f"inside references multiply.")
 
     def template_materialize(self, node: Any, *, root: bool = False,
-                             _chain: Tuple[str, ...] = ()) -> Any:
+                             _chain: Tuple[str, ...] = (),
+                             names: Optional[Dict[str, Any]] = None) -> Any:
         """FILE form -> LIVE form (a new value). A dict naming a partial
         becomes the partial's data with its changes applied (removals first,
         then the changed values: nested plain dicts merge key by key,
         anything else replaces) and a live marker listing them; `root`
         flattens a reference at the top (a partial extending another)
         without a marker. Live markers already present are kept. Bounded by
-        partial_template_size_limit."""
+        partial_template_size_limit. `names`: `node` is a unit's whole
+        vars kept under these var names (a unit's or a template's
+        var_names); a partial referenced there is renamed from the names
+        it records to them (unit_names_for)."""
         with self._materialize_budget():
-            return self._materialize(node, root, _chain)
+            return self._materialize(node, root, _chain, names)
+
+    def unit_names_for(self, var_names: Any) -> Dict[str, str]:
+        """Every var-name rule's name for a unit or template remembering
+        `var_names` (missing ones: this match's rules)."""
+        own = var_names if isinstance(var_names, dict) else {}
+        return {k: str(own.get(k) or self.rules.get(
+                    k, RULES_REGISTRY[k]["default"]))
+                for k in VAR_NAME_RULES}
+
+    def _rename_root_partial(self, name: str, base: Dict[str, Any],
+                             names: Dict[str, Any]) -> None:
+        """Partial `name`'s resolved data, used as a unit's whole vars, in
+        place: each top-level var it keeps under a var-name rule's name it
+        records (`var_names`, saved with it) moves to the unit's name for
+        that rule, so a partial written under `hp` gives a unit on
+        `health` its `health` (user call, S9)."""
+        t = self._template_library().get(name)
+        own = t.get("var_names") if isinstance(t, dict) else None
+        if not isinstance(own, dict):
+            return
+        moves = [(own[k], names[k]) for k in VAR_NAME_RULES
+                 if isinstance(own.get(k), str) and isinstance(
+                     names.get(k), str) and own[k] != names[k]]
+        held = {old: base[old] for old, _new in moves if old in base}
+        for old, _new in moves:
+            base.pop(old, None)
+        for old, new in moves:
+            if old in held and new not in base:
+                base[new] = held[old]
 
     def _materialize(self, node: Any, root: bool,
-                     _chain: Tuple[str, ...]) -> Any:
+                     _chain: Tuple[str, ...],
+                     names: Optional[Dict[str, Any]] = None) -> Any:
         self._charge(1)
         if isinstance(node, list):
             return [self._materialize(v, False, _chain) for v in node]
@@ -17847,6 +17895,8 @@ class Match:
                         self._materialize(v, False, _chain))
                     for k, v in node.items() if k != TEMPLATE_REMOVED}
         base = self._resolve(ref, _chain, True)
+        if names is not None:
+            self._rename_root_partial(ref, base, names)
         over = {k: self._materialize(v, False, _chain)
                 for k, v in node.items()
                 if k not in (TEMPLATE_MARKER, TEMPLATE_REMOVED)}
@@ -17952,7 +18002,8 @@ class Match:
             out[TEMPLATE_REMOVED] = sorted(removed)
         return out
 
-    def _container_base(self, root: Dict[str, Any], path: str
+    def _container_base(self, root: Dict[str, Any], path: str,
+                        names: Optional[Dict[str, Any]] = None
                         ) -> Dict[str, Any]:
         """The base of the marked container at `path` in `root` ('' = root
         itself), read-only: its partial resolved, or for an INHERITED one,
@@ -17980,6 +18031,11 @@ class Match:
                     base, at = sub, p
                     continue
             base, at = self.resolve_partial(mk["name"], fresh=False), p
+            if p == "" and names is not None:
+                # The unit's whole vars: its partial under the unit's var
+                # names, as it was materialized (S9).
+                base = copy.deepcopy(base)
+                self._rename_root_partial(mk["name"], base, names)
         if base is None:
             raise VTTError("not built from a partial template")
         return base
@@ -18057,7 +18113,8 @@ class Match:
         m = container[TEMPLATE_MARKER]
         try:
             base: Optional[Dict[str, Any]] = self._container_base(
-                e.vars, ".".join(keys[:best]))
+                e.vars, ".".join(keys[:best]),
+                self.unit_names_for(e.var_names))
         except VTTError:
             base = None
         ov = list(m.get("overrides") or [])
@@ -18168,7 +18225,8 @@ class Match:
         path = "" if path in ("", ".") else path
         node = self._marked_container_at(e, path)
         mk = node[TEMPLATE_MARKER]
-        live = copy.deepcopy(self._container_base(e.vars, path))
+        live = copy.deepcopy(self._container_base(
+            e.vars, path, self.unit_names_for(e.var_names)))
         file = self._dematerialize(node, None)
         with self._materialize_budget():
             self._charge(_node_count(live))
@@ -18381,7 +18439,8 @@ class Match:
         # Partial-template references in the vars are materialized now, so
         # the footprint they carry is known before placement.
         if has_file_refs(d.get("vars")):
-            d["vars"] = self.template_materialize(d["vars"])
+            d["vars"] = self.template_materialize(
+                d["vars"], names=self.unit_names_for(d.get("var_names")))
         d["id"] = new_id
         # A template has its position STRIPPED (that's the point of a template),
         # but Entity.from_dict requires x/y (int(data["x"])) to build the probe.
@@ -20101,7 +20160,8 @@ class Match:
         sb_vars = sb.get("vars")
         new_vars = copy.deepcopy(sb_vars if sb_vars is not None else {})
         if has_file_refs(new_vars):
-            new_vars = self.template_materialize(new_vars)
+            new_vars = self.template_materialize(
+                new_vars, names=self.unit_names_for(sb.get("var_names")))
         if not isinstance(new_vars, dict):
             raise VTTError("transform: the statblock's vars must be a dict.")
         # A form captured under other var names (another system, an older
@@ -23383,7 +23443,8 @@ def check_template_name(name: Any, legacy: bool = False) -> str:
     return n
 
 
-_PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags")
+_PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags",
+                 "var_names")
 
 
 def _check_file_markers(value: Any, where: str) -> None:
@@ -23602,11 +23663,16 @@ def check_template(data: Any, name: str,
         d = {k: copy.deepcopy(v) for k, v in data.items() if k in _PARTIAL_KEYS}
         extra = sorted(k for k in data if k not in _PARTIAL_KEYS)
         notes = [f"Dropped {', '.join(f'`{k}`' for k in extra)}: a partial "
-                 f"template is `kind`, `data`, `tags`."] if extra else []
+                 f"template is `kind`, `data`, `tags`, `var_names`."] if extra else []
         if not isinstance(d.get("data"), dict):
             raise VTTError(f"Partial template `{name}` needs `data`: an object "
                            f"(the container it describes).")
         _check_file_markers(d["data"], f"Partial template `{name}`")
+        if "var_names" in d:
+            # The var names its data was written in: used as a unit's whole
+            # vars, it is renamed to the unit's names (S9).
+            d["var_names"] = check_var_names_field(
+                d["var_names"], f"Partial template `{name}`")
         if "tags" in d:
             # Library tags (`!template tags`, `list tag=`): the partial's,
             # never copied into the units built from it.

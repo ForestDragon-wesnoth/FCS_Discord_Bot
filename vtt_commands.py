@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
-from logic import STORE_DEPTH_LIMIT, same_value, same_entry, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
+from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -5953,7 +5953,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             default = e.id if path in ("", ".") else path.split(".")[-1]
             name = check_template_name(words[1] if len(words) > 1 else default)
             data = {"kind": "partial",
-                    "data": m.capture_partial(e, path, notes)}
+                    "data": m.capture_partial(e, path, notes),
+                    # The names its data is written in, as an entity
+                    # template records them (S9).
+                    "var_names": m.unit_names_for(e.var_names)}
             old = mgr.templates.get(name)
             if isinstance(old, dict) and _is_partial(old) and old.get("tags"):
                 # A re-save keeps the partial's library tags.
@@ -5996,7 +5999,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         raw = " ".join(args[2:])
         data = _parse_import_json(raw, strict=False)
         data, checks = check_template(data, name, mgr.templates)
-        if not _is_partial(data) and "var_names" not in data:
+        if "var_names" not in data:
             # The var names it is written in: the channel's, as a save
             # records the unit's, so a later var-name rename moves its vars
             # at spawn (S9).
@@ -19646,6 +19649,10 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e = m.entities.get(eid)
         gone = e is None or sname not in e.status
         tail = " (status removed at <=0)" if gone else ""
+        if new is None:
+            return await ctx.send(f"`{eid}.{sname}` has no {field}: it is "
+                                  f"permanent (∞) and stays so; `set` gives "
+                                  f"it one.")
         return await ctx.send(f"`{eid}.{sname}.{field}` = {new}{tail}")
 
     if sub == "dispel":
@@ -22043,13 +22050,13 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         engine.trace_reads = True
         token = VAR_TRACE.set(trace)
         try:
-            val = engine.eval_program(src, eval_ctx)
+            val = _eval_all_or_nothing(m, mgr, engine, src, eval_ctx)
         except FormulaError as ex:
             return await ctx.send(f"❌ {ex}\n" + _trace_text(trace))
         finally:
             VAR_TRACE.reset(token)
         return await ctx.send(f"= `{val!r}`\n" + _trace_text(trace))
-    val = engine.eval_program(src, eval_ctx)
+    val = _eval_all_or_nothing(m, mgr, engine, src, eval_ctx)
     # For side-effect-only formulas (e.g. `for eid in entities_within(...):
     # entity[eid].hp = entity[eid].hp - 7`) the trailing assignment makes
     # the return value None, which prints as a confusing "= `None`".
@@ -22059,6 +22066,42 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ids = ", ".join(f"`{eid}`" for eid in engine.affected_entities)
         return await ctx.send(f"Affected {len(engine.affected_entities)} entit{'y' if len(engine.affected_entities) == 1 else 'ies'}: {ids}")
     return await ctx.send(f"= `{val!r}`")
+
+
+def _eval_all_or_nothing(m: Match, mgr: MatchManager, engine: Any,
+                         src: str, eval_ctx: Any) -> Any:
+    """Run `!eval`'s formula all or nothing, as an action body runs (user
+    call, L35): a formula refused part-way (a limit, a refused write)
+    puts the match back as it was, the other matches too when it sent a
+    unit to one (transfer_entity), and drops the lines its writes
+    surfaced. Raises the refusal with a note that nothing changed."""
+    from action import (_rollback_match, _snapshot_other_matches,
+                        _restore_other_matches, _CROSS_LEVELS)
+    pre = m.to_dict(include_history=False)
+    mark = m.history.mark()
+    cross: Dict[str, Any] = {"snap": None}
+
+    def guard() -> None:
+        if cross["snap"] is None:
+            cross["snap"] = _snapshot_other_matches(mgr, m)
+    sink = FORMULA_LOG_SINK.get()
+    sink_mark = len(sink) if sink is not None else 0
+    gtoken = CROSS_MATCH_GUARD.set(guard)
+    ltoken = _CROSS_LEVELS.set((cross,))
+    try:
+        return engine.eval_program(src, eval_ctx)
+    except FormulaError as ex:
+        live = mgr.matches.get(m.id, m)
+        _rollback_match(live, mgr, pre)
+        live.history.rewind(mark)
+        if cross["snap"] is not None:
+            _restore_other_matches(mgr, live, cross["snap"])
+        if sink is not None:
+            del sink[sink_mark:]
+        raise FormulaError(f"{ex} Nothing was changed.")
+    finally:
+        _CROSS_LEVELS.reset(ltoken)
+        CROSS_MATCH_GUARD.reset(gtoken)
 
 
 # `!eval --trace` prints at most this many entries (the trace keeps 1000).

@@ -6061,6 +6061,8 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 !tile def new mark
 !system set default formula_loop_limit 5
 !eval "for (cx, cy) in cells_in_burst(5, 5, 3): tile_set(cx, cy, 'foo', 1)"
+?? Nothing was changed.
+!assert "not tile_has(2, 2, 'foo')"
 !system set default formula_loop_limit 10000
 
 Expected: For-loops are validated up front. The iterable MUST be
@@ -6076,7 +6078,9 @@ The formula_loop_limit rule caps TOTAL iterations across all
 loops in one evaluation. With it set to 5, looping a 7x7=49-cell
 square-radius burst would tick 49 times — the runtime raises
 "formula for-loop iteration limit (5) exceeded" once the 6th
-iteration runs. The default 10000 is restored at the end so
+iteration runs. An `!eval` runs all or nothing, like an action: the
+tiles its first five iterations wrote are taken back, and the reply
+says nothing was changed. The default 10000 is restored at the end so
 later scenarios run with the normal cap.
 
 
@@ -20453,11 +20457,11 @@ SCENARIO 728 — Partial templates: whole-unit inheritance, save writes only the
 !template save orc_archer axe_kit path=inventory.axe
 ?? Saved partial template `axe_kit` from `orc_archer` `inventory.axe`
 !template show axe_kit compact
-?? {"data":{"__template":"axe_common","damage":8},"kind":"partial"}
+?? {"data":{"__template":"axe_common","damage":8},"kind":"partial"
 !template save orc_archer orc_line path=.
 ?? Saved partial template `orc_line` from `orc_archer`'s vars
 !template show orc_line compact
-?? {"data":{"__template":"orc_base","hp":20,"inventory":{"axe":{"damage":8},"bow":{"damage":4}},"max_hp":24},"kind":"partial"}
+?? {"data":{"__template":"orc_base","hp":20,"inventory":{"axe":{"damage":8},"bow":{"damage":4}},"max_hp":24},"kind":"partial"
 !template import loop_a {"kind": "partial", "data": {"__template": "loop_b"}}
 ?? isn't a partial template
 !template import loop_a {"kind": "partial", "data": {"x": 1}}
@@ -20555,7 +20559,7 @@ SCENARIO 729 — Partial templates: resync after a library edit, detach, forced 
 !template import l2 {"kind": "partial", "data": {"__template": "l1", "c": 1}}
 !template delete l1 force
 !template show l2 compact
-?? {"data":{"__removed":["z"],"__template":"l0","b":1,"c":1},"kind":"partial"}
+?? {"data":{"__removed":["z"],"__template":"l0","b":1,"c":1},"kind":"partial"
 
 Expected: HARNESS-ALLOWS-ERRORS. A library edit (damage 10, a new `edge`)
 doesn't reach units already built from `axe_common`. `!template resync`
@@ -20898,11 +20902,11 @@ SCENARIO 735 — Templates: file-safe names, multi-template changes all or nothi
 !macro run mkpart 4
 !assert "has_template('ring')"
 !template show ring compact
-?? {"data":{"bonus":4},"kind":"partial"}
+?? {"data":{"bonus":4},"kind":"partial"
 !alias def mkgem 'template import gem {"kind":"partial","data":{"cut":"rose ; star"}}'
 !mkgem
 !template show gem compact
-?? {"data":{"cut":"rose ; star"},"kind":"partial"}
+?? {"data":{"cut":"rose ; star"},"kind":"partial"
 
 Expected: HARNESS-ALLOWS-ERRORS. Match ids, template names and server keys
 become file and folder names, so Windows device names (CON, NUL, COM3,
@@ -21277,7 +21281,9 @@ SCENARIO 742 — Var-name rules: collisions, shared names, other systems
 !system set default hp_var health
 !template save orc orc3
 !template show orc3 vars compact
-?? {"__removed":["hp"],"__template":"base","health":7}
+?? {"__template":"base"}
+!template spawn orc3 6 6
+!assert "entity[orc3].health == 7 and not var_has('orc3', 'hp')"
 
 Expected: HARNESS-ALLOWS-ERRORS. var_name_collision decides what happens
 when a unit already has a var under the new name: `refuse` refuses the rule
@@ -21286,8 +21292,10 @@ own `health` (99) and leaves `hp` as plain data; `tracked` (the default)
 moves the var the unit used and replaces the one there, with a note. Two
 var rules can't name the same var. A unit copied into a match whose system
 calls hp `hull`, and a template saved under `hp` spawned there, take the
-`hull` name. A unit built from a partial holding `hp` records the rename in
-its marker (removed `hp`, set `health`), so its save spawns right.
+`hull` name. The partial `base` holding `hp` records the var names it was
+imported under, so for a unit on `health` its `hp` reads as `health`: the
+unit's save holds only the reference, and it spawns with `health` 7 and no
+`hp`.
 
 SCENARIO 743 — Var-name rules: only plain var names; undo preview after a rename
 ----------------------------------------------------------------------
@@ -31969,3 +31977,48 @@ it, and a preview centred on it starts at its middle cell (6,7). Text
 such as `inf` in a sprite layer falls back like other junk (it crashed
 every scene render), and an `inf` shield pool is no pool (every
 absorb_damage failed), so the whole hit goes through.
+
+
+SCENARIO 960 — Permanent statuses stay permanent, team slots use the tiebreak var, !eval all or nothing
+--------------------------------------------------------------------------------------------------------
+
+!match new pc960 Calls 8 8
+!match use pc960
+!status def ward
+!status stack ward extend
+!ent add a Ann 10 1 1 5
+!ent add b Bob 10 3 3 5
+!status apply a ward
+!status apply a ward 1 3
+!ent status a list
+?! duration
+!status counter a ward add -1
+?? permanent (∞) and stays so
+!assert "status_has('a', 'ward')"
+!status counter a ward set 2
+!status counter a ward add -2
+?? status removed at <=0
+!system set default turnorder_team_grouping highest_per_team
+!system set default turnorder_tiebreak_var dex
+!ent set_vars a team=red dex=9
+!ent set_vars b team=blue dex=1
+!turn
+?? ➡️ `a`
+!ent set_vars a dex=1
+!ent set_vars b dex=9
+!turn
+?? ➡️ `b`
+!system set default formula_loop_limit 3
+!eval "entity[a].note = 1\nfor i in range(10): entity[b].note = i"
+?? Nothing was changed.
+!assert "not var_has('a', 'note') and not var_has('b', 'note')"
+!system set default formula_loop_limit 10000
+
+Expected: HARNESS-ALLOWS-ERRORS. A status with no duration is permanent
+(∞): under `stack extend` a new application with a duration leaves it
+permanent, and `!status counter ... add` leaves it too; `set` gives it a
+duration, after which the counter counts it down and removes it. With
+team grouping, two team slots tied on initiative go by
+turnorder_tiebreak_var read on each team's leading member (red's dex 9
+first, then blue's once the values swap). An `!eval` refused part-way
+(past formula_loop_limit) takes back the writes it made before.

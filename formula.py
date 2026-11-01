@@ -5926,6 +5926,11 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
+            if (not absolute and field == "duration"
+                    and e.status[name].get(field) is None):
+                # No duration = permanent (shown as ∞): adding to it leaves
+                # it permanent (user call); status_counter_set gives one.
+                return None
             raw = e.status[name].get(field, 0)
             cur = _coerce_number(raw)
             if cur is None:
@@ -5947,7 +5952,9 @@ class FormulaEngine:
             """status_counter_add(eid, name, delta[, field="duration"]):
             add `delta` (negative to subtract) to a status's counter field;
             removes the status if the result is <=0. Returns the new value.
-            The universal duration/charge adjuster."""
+            A status with no duration is permanent: adding to its duration
+            changes nothing and returns None. The universal duration/charge
+            adjuster."""
             if isinstance(delta, bool) or not isinstance(delta, (int, float)):
                 raise FormulaError("status_counter_add(...): delta must be a number.")
             return _status_counter(eid_t, name, field, delta, False)
