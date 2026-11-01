@@ -382,6 +382,16 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
             raise VTTError(f"Prefab `{name}`: tile data can't hold "
                            f"`corpses` (corpses are listed under "
                            f"`corpses`).")
+        # What a tile write would store: a value the store limits accept
+        # (depth, size), and a `facing` that names a direction (L31, L25).
+        try:
+            t[2] = logic._own_value(t[2])
+            if logic.FACING_FIELD in t[2]:
+                t[2][logic.FACING_FIELD] = logic.checked_facing_data(
+                    logic.FACING_FIELD, t[2][logic.FACING_FIELD])
+        except VTTError as ex:
+            raise VTTError(f"Prefab `{name}`: the tile at ({t[0]},{t[1]}): "
+                           f"{ex}")
     for c in d["corpses"]:
         if not (isinstance(c, list) and len(c) == 4 and isinstance(c[2], str)
                 and isinstance(c[3], dict)
@@ -439,6 +449,9 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
         if not isinstance(z, dict):
             raise VTTError(f"Prefab `{name}`: zone `{zname}` must be an "
                            f"object.")
+        if not isinstance(z.get("cells", []), list):
+            raise VTTError(f"Prefab `{name}`: zone `{zname}` cells are a "
+                           f"list of [dx, dy] pairs.")
         for c in z.get("cells") or []:
             if not (isinstance(c, list) and len(c) == 2):
                 raise VTTError(f"Prefab `{name}`: zone `{zname}` cells are "
@@ -462,9 +475,9 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                 raise VTTError(f"Prefab `{name}`: definition "
                                f"`{lib}:{ename}` must be an object.")
             if lib == "tile_templates":
-                logic.SpecialTileTemplate.from_dict(dict(entry, name=ename))
+                entries[ename] = _check_tile_template(entry, name, ename)
             elif lib == "formula_functions":
-                logic.FormulaFunction.from_dict(entry)
+                entries[ename] = _check_formula_function(entry, name, ename)
             elif lib == "status_definitions":
                 _check_status_definition(entry, name, ename)
             elif lib == "zone_definitions":
@@ -490,10 +503,80 @@ def _check_unit_dict(u: Any, name: str, where: str) -> None:
     for k in ("vars", "status", "passives", "clamps"):
         if k in u and not isinstance(u[k], dict):
             raise VTTError(f"{who}: `{k}` must be an object.")
+    # Links name a unit by id, and a unit or corpse remembers its var names
+    # as text: a list there crashed a revive, a render or the next load
+    # (S10, S12, L31).
+    for k in ("part_of", "mounted_on", "mount_slot"):
+        if u.get(k) is not None and not isinstance(u[k], str):
+            raise VTTError(f"{who}: `{k}` must be text (an id) or absent.")
+    if "var_names" in u:
+        u["var_names"] = logic.check_var_names_field(u["var_names"], who)
+    f = u.get("facing")
+    if f is not None and (not isinstance(f, str)
+                          or f not in logic.FACING_VECTORS):
+        raise VTTError(f"{who}: facing `{f}` isn't a direction.")
     try:
         Entity.from_dict(dict(u, map=None))
     except Exception as ex:  # noqa: BLE001 - any shape error
         raise VTTError(f"{who} isn't a unit: {ex}")
+
+
+def _check_tile_template(entry: Dict[str, Any], name: str,
+                         tname: str) -> Dict[str, Any]:
+    """A carried tile template as `!tile def` would hold it: `data` an
+    object the store accepts (its facing a direction), `hooks` tile hook
+    names mapped to formula text, tags that parse. A number as `data`
+    crashed every `!map` of the match it was stamped into (S13)."""
+    who = f"Prefab `{name}`: tile template `{tname}`"
+    data = entry.get("data", {})
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise VTTError(f"{who}: `data` must be an object.")
+    hooks = entry.get("hooks", {})
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict) or any(
+            not isinstance(k, str) or not isinstance(v, str)
+            for k, v in hooks.items()):
+        raise VTTError(f"{who}: `hooks` maps hook names to formula text.")
+    unknown = sorted(k for k in hooks if k not in logic.TILE_HOOK_NAMES)
+    if unknown:
+        raise VTTError(f"{who}: unknown hook(s) {', '.join(unknown)}.")
+    try:
+        data = logic._own_value(data)
+        if logic.FACING_FIELD in data:
+            data[logic.FACING_FIELD] = logic.checked_facing_data(
+                logic.FACING_FIELD, data[logic.FACING_FIELD])
+        out = logic.SpecialTileTemplate.from_dict(
+            dict(entry, name=tname, data=data, hooks=hooks)).to_dict()
+    except VTTError as ex:
+        raise VTTError(f"{who}: {ex}")
+    return out
+
+
+def _check_formula_function(entry: Dict[str, Any], name: str,
+                            fname: str) -> Dict[str, Any]:
+    """A carried formula function as `!func def` would hold it: named by
+    its key, a list of parameter names `check_formula_function` accepts,
+    a body of text (L34)."""
+    who = f"Prefab `{name}`: function `{fname}`"
+    if entry.get("name", fname) != fname:
+        raise VTTError(f"{who}: its `name` must be `{fname}`, the key it "
+                       f"is stored under.")
+    params = entry.get("params", [])
+    if params is None:
+        params = []
+    if not isinstance(params, list):
+        raise VTTError(f"{who}: `params` must be a list of names.")
+    body = entry.get("body", "")
+    if not isinstance(body, str):
+        raise VTTError(f"{who}: `body` must be formula text.")
+    try:
+        logic.check_formula_function(fname, params)
+    except VTTError as ex:
+        raise VTTError(f"{who}: {ex}")
+    return {"name": fname, "params": list(params), "body": body}
 
 
 # The values a status definition's fields take (`!status stack|when|...`).
@@ -854,10 +937,11 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
         if mode == "replace":
             _clear_rect(m, mp, x, y, W, H, victims, log)
         _merge_definitions(m, pf, notes)
-        _stamp_tiles(m, mp, pf, turn, x, y, mode)
+        _stamp_tiles(m, mp, pf, turn, x, y, mode, notes)
         _stamp_corpses(m, mp, pf, turn, x, y, idmap, notes)
         roots = _spawn_units(m, mp, pf, units, idmap, x, y, team, log)
-        new_zones = _stamp_zones(m, mp, pf, turn, x, y, idmap, renamed)
+        new_zones = _stamp_zones(m, mp, pf, turn, x, y, idmap, renamed,
+                                 notes)
         for g, members in (pf.get("groups") or {}).items():
             for oid in members:
                 if idmap.get(oid) in m.entities:
@@ -948,7 +1032,8 @@ def _turn_facing(d: Dict[str, Any], turn: Turn) -> None:
 
 
 def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
-                 x: int, y: int, mode: str) -> None:
+                 x: int, y: int, mode: str, notes: List[str]) -> None:
+    missing: Set[str] = set()
     for dx, dy, tdata in pf.get("tiles") or []:
         nx, ny = turn.point(dx, dy)
         cx, cy = x + nx, y + ny
@@ -958,9 +1043,21 @@ def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
             continue
         new = copy.deepcopy(tdata)
         _turn_facing(new, turn)
+        tn = new.get("_template")
+        if tn is not None and tn not in m.tile_templates:
+            # A template the match lacks (a child system hides it, an
+            # import names one it doesn't carry): the tile keeps its data
+            # and names nothing, as after `!tile def del`, so a later
+            # template of the name takes it over (Z1+).
+            del new["_template"]
+            missing.add(str(tn))
         if isinstance(old, dict) and old.get("corpses"):
             new["corpses"] = old["corpses"]
         mp.tiles[(cx, cy)] = new
+    if missing:
+        notes.append("Tile template(s) " + ", ".join(
+            f"`{t}`" for t in sorted(missing)) + " aren't in this match: "
+            "those tiles keep their data and name no template.")
 
 
 def _stamp_corpses(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
@@ -1004,6 +1101,13 @@ def _stamp_corpses(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                 Match._shift_snake_path_vars(bv, x, y)
         if isinstance(c.get("groups"), dict):
             c["groups"] = {cmap.get(k, k): v for k, v in c["groups"].items()}
+        # The var names the match's rules give, as its live corpses have
+        # (a corpse saved under `hp` listed as `HP: ?` after hp_var health,
+        # K9).
+        for body in [ent] + [p for p in c.get("parts") or []
+                             if isinstance(p, dict)]:
+            notes += m._sync_unit_dict(body, m.rules,
+                                       f"corpse `{body.get('id', nid)}`")
         mp.tile_data(ent["x"], ent["y"]).setdefault("corpses", {})[nid] = c
 
 
@@ -1070,8 +1174,9 @@ def _spawn_units(m: Match, mp: Map, pf: Dict[str, Any],
 
 def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                  x: int, y: int, idmap: Dict[str, str],
-                 renamed: Dict[str, str]) -> List[str]:
+                 renamed: Dict[str, str], notes: List[str]) -> List[str]:
     made: List[str] = []
+    missing: Set[str] = set()
     for zname, zd in sorted((pf.get("zones") or {}).items()):
         z = mp._zone_from_dict(dict(zd, cells=[]))
         if z is None:
@@ -1083,6 +1188,9 @@ def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                 cells.add((x + nx, y + ny))
         z["cells"] = cells
         _turn_facing(z, turn)
+        if z.get("def") is not None and z["def"] not in m.zone_definitions:
+            missing.add(str(z["def"]))          # Z1+, as for tiles
+            z.pop("def", None)
         new = m.mint_zone_name(zname)
         if new != zname:
             renamed[zname] = new
@@ -1095,4 +1203,8 @@ def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
         if anchor:
             m._stamp_anchored_zone(new, mp)
         made.append(new)
+    if missing:
+        notes.append("Zone definition(s) " + ", ".join(
+            f"`{d}`" for d in sorted(missing)) + " aren't in this match: "
+            "those zones keep their data and name no definition.")
     return made

@@ -740,6 +740,13 @@ class Storage:
                 except Exception as ex:  # noqa: BLE001
                     notes.append(self._quarantine(key, path,
                                                   type(ex).__name__))
+        # The journals as read from disk: the entries the load adds after
+        # this (a template updated at load, a changed match's state) are
+        # not on disk yet, so the next write_journals writes them (J16).
+        on_disk = {mid: {seg["no"]: len(seg["entries"])
+                         for seg in m.journal.segments}
+                   for mid, m in mgr.matches.items()
+                   if m.journal is not None}
         notes.extend(self.load_templates(mgr))
         notes.extend(self.load_prefabs(mgr))
         self._journal_load_changes(mgr)
@@ -748,6 +755,9 @@ class Storage:
         notes.extend(self._settle_lost_systems(mgr, backups, sys_failed,
                                                pointers))
         self._remember(mgr, w)
+        self._jwritten[mgr.guild_key] = {
+            mid: dict(on_disk.get(mid, {})) for mid in mgr.matches
+            if mgr.matches[mid].journal is not None}
         if sys_failed or lost:
             # systems.json on disk isn't what the server holds: the next
             # commit (once any lock is lifted) writes it and the workspace.

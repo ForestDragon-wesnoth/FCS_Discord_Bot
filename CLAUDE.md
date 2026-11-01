@@ -292,6 +292,11 @@ Each of these was learned from a shipped bug.
   that includes ids inside arguments (`near:<eid>` matched the visible units
   near a hidden one); re-run the POV leak detector and the existence-oracle
   detector (§5).
+- **A read that prints formula text the GM wrote** (a body, hook,
+  condition, passive, formula rule): print it through `logic.formula_text`
+  (one text) or `_hide_formula_fields` (a dict / list view), so
+  formula_text_visibility hides it (§7.14); re-run the formula-text leak
+  probe (§5).
 - **Anything iterating units and firing hooks:** re-check
   `eid in m.entities` after each hook (§5 "ghost firing").
 - **A command whose effect on a match depends on more than that match**
@@ -830,6 +835,11 @@ Every class below shipped at least once and was fixed in an audit pass
   what a fogged team shouldn't see: listings, `!ent info`, `!dist`, `!find`,
   diffs, logs, camera centering, corpses inside tile data. See §7 "Access,
   POV".
+- **Type-blind equality.** Python's `==` takes 1, 1.0 and True (0, 0.0,
+  False) for one value, and the engine reads them differently: a type
+  change compared with `==` was no undo step, no journal entry, no var
+  hook and no diff line (J17). Decide "did it change" on stored data with
+  `logic.same_value` (library entries: `same_entry`).
 - **Non-string joins.** `", ".join(...)` / an `re.sub` replacement fed a
   number from a var (a numeric team, an int dict key) 💥'd. `str()` values
   from vars before joining.
@@ -896,6 +906,14 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   pool run as a red-POV player; replies grepped for the hidden names, values
   and cells after stripping echoes of the typed args. Include list KINDS
   (`commands`, `turns`) in the pool.
+- **Formula-text leak probe** (950): a board with a marker string in
+  every place a GM stores a formula (functions, unit / global / team /
+  default passives, status ticks / hooks / `_unless`, watchers, actions,
+  tile and zone hooks and block / opaque, macros, schedules, formula
+  rules, system libraries, templates, prefabs, aliases); every root x
+  read subcommand x an argument pool run as a player under
+  `formula_text_visibility host`; any marker in a reply is a leak (alias
+  expansions excepted, by design).
 - **Existence-oracle detector** (41): the same board; each command run twice
   as the player, once naming a hidden unit (as an arg, `near:<id>:60`,
   `for=<id>`, `to=<id>`, `<id>.hp`) and once naming a nonexistent id; any
@@ -1220,7 +1238,9 @@ hardcodes**.
   (direction, `turnorder_tiebreak_var` / `_direction` (a GM var such as
   `dex` or `stats.agi`; a unit without a number there goes after), then
   tiebreaker incl. `random_stable`, team grouping, change policy
-  immediate / deferred). A write to the tiebreak var and a changed
+  immediate / deferred; under team grouping the tiebreak var also orders
+  tied team slots, read on each team's leading member, and a slot against
+  a teamless unit, user call, 960). A write to the tiebreak var and a changed
   `turnorder_*` rule (`apply_system_rules`) re-sort it like an initiative
   write (770). Before the first `!turn next` the pointer sits at
   the top of the order.
@@ -1337,7 +1357,10 @@ hardcodes**.
   `__status_immune` / `__status_redirect`) run first in apply_status.
 - **Counters:** `status_counter_add/set` (`!status counter`) on any numeric
   field; the status is removed at ≤ 0 (durations and charges alike). A
-  counter on a text field is refused.
+  counter on a text field is refused. A status with no `duration` is
+  permanent (shown as ∞, user call): `status_counter_add` on its duration
+  and a `stack extend` application leave it so (the add returns None);
+  `status_counter_set` gives it one (960).
 - **Dispel / transfer:** `status_dispel(eid, token, max)` (token-only, no
   undispellable guard, user call); `status_transfer(from, to, name)` removes
   from the source unconditionally and re-applies on the destination through
@@ -1543,7 +1566,9 @@ hardcodes**.
   resolve BEFORE the access gate; an alias can't take a command's name
   (refused at def / promote, ignored if saved). Command roots and aliases
   are case-insensitive (`!Ent`, on Discord too). `!func` defines formula functions
-  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula;
+  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula,
+  all or nothing like an action (user call): refused part-way, its writes
+  are taken back, other matches too (`_eval_all_or_nothing`, 247, 960);
   `!eval --trace ...` lists, in order, the formula's own `entity[x]` /
   `match.` reads (`FormulaEngine.trace_reads`, so engine-side checks such
   as the death condition stay out) and every var write / delete the eval
@@ -1943,7 +1968,8 @@ hardcodes**.
   way; turn-flow lines name no unit (769).
 - **Death** (`_process_death`): `death_result` (corpse / delete, per-unit
   `__death_result`); a corpse is the unit's snapshot in its cell's tile data
-  (`corpses.<id>`, mount links stripped; `corpses` is a reserved tile key
+  (`corpses.<id>`, mount links stripped; under `corpse_id_uniqueness` the
+  ids of the parts it holds are taken too, 955; `corpses` is a reserved tile key
   no tile write sets, and every tile edit keeps it: place, fill, del,
   clear, `tile_clear`); `corpse_id_uniqueness`. A revive puts the corpse
   back when the unit can't be placed (`revive_blocked_mode`: refuse,
@@ -1990,7 +2016,10 @@ hardcodes**.
   along (`Match.rename_tile_template`); deleting a used template needs
   `confirm` and detaches them (`_template` cleared, their data stays, so
   a later template of the name takes none of them over;
-  `undefine_tile_template`, user call, 188).
+  `undefine_tile_template`, user call, 188). A stamp detaches the same
+  way a tile or zone naming a template / definition the match lacks, with
+  a note, and `_template` tile data names only a template the match holds
+  (Z1+, 955).
 - **Facing** (#257, 928-931): a tile's facing is its `facing` data, else
   `up`, a zone's its `facing` field, else `up`; most never set one.
   MATERIALIZED (user call: facing is a default or a value of the thing
@@ -2165,7 +2194,27 @@ hardcodes**.
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`). `team_data_visibility` (own / all / host)
-  filters `!team list/get`. `inline_args_access` closes the `$()` route
+  filters `!team list/get`. `formula_text_visibility` (all / host, user
+  call): under `host` a caller who is neither an administrator nor a host
+  of the channel's match reads every GM formula as `(hidden)` (names,
+  triggers and signatures stay): `_run` sets `logic.FORMULA_TEXT_HIDDEN`
+  (`_formula_text_hidden`; the rule from the channel's match, else its
+  default system; also around the `$()` resolution) and the reads print
+  through `formula_text` / `_hide_formula_fields` (`_FORMULA_FIELD_KEYS`,
+  `hooks` entries, `<field>_unless`): `!func`, `!help function`, passive
+  lists / info, `!state`, `!status info`, `!action info`, `!schedule
+  list`, `!tile info`, `!zone info`, tile / zone hook lists, `!template
+  show` / `diff`, and the FORMULA_RULES (`!help rule`, `!system info` /
+  `diff`, a history diff, `rule_get` in `$()`), the raw reads (`!ent
+  dump`, `!find ... show:`, `!team get`, `!defvar list`, `!map cell`,
+  `!mount info`, match / map var lists; `_hide_formula_at` for one value,
+  a modifier record's `value` included), the history list (a formula
+  command's label cut after its subcommand, `logic.formula_label`) and
+  an action's or modifier's formula error. A `$()` argument still reads
+  any stored value; `inline_args_access host` closes it. Alias
+  expansions and macro bodies are command lines, left readable
+  (949-950, 953).
+  `inline_args_access` closes the `$()` route
   (579-580, 593). Map names a view may not know stay out of `!match info`,
   `!match fog`, the "name a map" refusals (`Match.maps_text` through the
   `COMMAND_POV` context) and the tagged map lines (855).
@@ -2470,7 +2519,8 @@ hardcodes**.
   the lower of those and the replayer's; the prefab library reads it
   made as `prefabs`: `logic.prefab_read` / `prefab_read_names` record
   into `PREFAB_READS`, which `_run` keeps set through the watcher poll,
-  each prefab stored once per segment and then by hash,
+  each prefab and the name list stored once per segment and then by
+  hash, a replay skipping a replayed `!prefab` library write (J15),
   `journal.prefab_reads`; a replay reads them through `PREFAB_REPLAY`,
   947),
   `state` (undo, history restore, `!run`, `!ent transfer`, `!match resume`,
@@ -2599,7 +2649,11 @@ same library and namespace as entity templates: `{"kind": "partial",
   `"__template": {"name", "overrides", "removed"}`. A partial may reference
   another (`axe_common` extends `weapon_base`); an entity template's `vars`
   may (`vars.__template` = whole-unit inheritance), and so may its parts'
-  vars. Refs must name partials; self-references and cycles are refused at
+  vars. A partial records the var names its data was written in
+  (`var_names`, at save and import); used as a unit's whole vars its
+  top-level keys move to the unit's names (`Match._rename_root_partial`,
+  in materialization and `_container_base` at the root; user call, S9,
+  742). Refs must name partials; self-references and cycles are refused at
   save / import (`check_template_refs`); resolution charges
   `partial_template_depth_limit` and `partial_template_size_limit` (a node
   budget per materialization, owner ceiling: nested references multiply).
@@ -2841,9 +2895,6 @@ rejected already. Update this section in the PR that resolves an item.
 - **Partial references in status instances and passives** (user: discuss
   after partial templates shipped): today only var subtrees reference
   partials; statuses and passives stay template-owned.
-- **Status counter on a missing duration:** a status with no `duration` shows
-  as ∞, but `status_counter_add(eid, name, -1)` reads it as 0 and removes the
-  status. Whether ∞ should stay ∞ is open (user: decide later).
 - **Approved commands and POV:** an approved player command runs in the
   requester's channel, so its output (including hook lines naming units that
   POV can't see) shows there. On hold at the user's request.
@@ -2866,12 +2917,6 @@ rejected already. Update this section in the PR that resolves an item.
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
   limitation, left as is (user: note it).
-- **Formula text and players** (user: discuss later): every read that
-  prints formula text is open to players today (`!func list` / `info`,
-  `!help function`, `!status info`, `!passive list` / `info`, ...), so a
-  hidden trap passive or a boss's damage `!func` is readable. Raised
-  option: a rule (e.g. `formula_text_visibility` all / host) showing
-  players the name and signature with the body hidden.
 - **Corpse targets and immunity:** `corpse` / `corpse_list` action
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
@@ -2880,18 +2925,33 @@ rejected already. Update this section in the PR that resolves an item.
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
   tile, zone or corpse blocks it. Known issue (user: list it).
 
-- **Pass 43, deferred by the user ("decide later"):** T3 (a mid-round
-  initiative change under `immediate` can cost a unit its turn or give it
-  a second; options: remember who acted this round, keep as is, or make
-  `deferred` the default) and the J2 follow-up (compact journal `state`
-  entries and one template library per segment; options: diffs now, leave
-  it, or fold into the large-match-state discussion).
 - **Large match state, per-command cost** (user: discuss later): after a
   whole-map tile fill on 500x500 every command costs ~3.5 s (three full
   serializations per command; numbers under "Undo history disk growth"
   below). Options raised: a cap on what a match can hold, cheaper undo
   snapshots (diffs / copy-on-write, reusing the post-command state for the
-  commit), or leaving it deferred.
+  commit), or leaving it deferred. The command journal has the same cost
+  and goes into the same design (user call, pass 43's J2 follow-up): a
+  `state` entry (undo, history restore, `!run`, transfers, ...) stores the
+  whole match (~650 KB on a filled 150x150), and every segment's header
+  copies the whole template library.
+
+### Ask between tasks
+
+Design questions the user wants raised when no other task is in flight
+(not in the middle of a feature or a bugfix pass). Raise one, with its
+options and a recommendation, when a task has just finished and the user
+hasn't named the next.
+
+- **T3, initiative changes mid-round** (pass 43): under
+  `turnorder_change_policy: immediate` the order re-sorts at once and the
+  pointer follows the acting unit, so a unit crossing the pointer gains or
+  loses a turn that round. Measured: A 10 / B 5 / C 1, A acts, B acts, A's
+  initiative drops to 0 -> round 1 runs A, B, C, A (A twice); A acts and
+  C's rises to 20 -> round 1 runs A, B and C waits for round 2. Options:
+  remember who has acted this round (each unit exactly one turn a round,
+  a saved set undo restores; recommended), keep it as the documented
+  meaning of `immediate`, or make `deferred` the default.
 
 ### Deferred (the user wants these tracked)
 
@@ -2911,8 +2971,9 @@ rejected already. Update this section in the PR that resolves an item.
   or a diff-based snapshot format. Measured (pass 40): after a whole-map
   `!tile fill` on 500x500 every command costs ~3.5 s (the match is
   serialized three times per command: undo pre / post state and the
-  commit); `cell_occupant` scans every unit per cell, so cell searches cost
-  cells x units.
+  commit). Cell searches read one occupancy table per search
+  (`Match.occupancy_pass`), fogged reads one team vision index per pass
+  (`Match.vision_pass`), so neither costs cells x units (pass 49).
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /

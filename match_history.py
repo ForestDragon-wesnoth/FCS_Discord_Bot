@@ -46,7 +46,7 @@ import json
 # Import VTTError eagerly so HistoryError can subclass it. This works
 # because logic.py imports us AFTER its exception classes are defined
 # (see the late import comment in logic.py).
-from logic import VTTError
+from logic import VTTError, formula_label
 
 if TYPE_CHECKING:
     from logic import Match
@@ -196,7 +196,8 @@ class Snapshot:
         if self.kind == "turn":
             return f"turn-start of round {self.round_at_snapshot}{who}"
         if self.kind == "command":
-            return f"before {self.label!r} (round {self.round_at_snapshot}{who})"
+            return (f"before {formula_label(self.label)!r} "
+                    f"(round {self.round_at_snapshot}{who})")
         return f"manual '{self.label}' (round {self.round_at_snapshot}{who})"
 
 

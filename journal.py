@@ -190,7 +190,11 @@ def entry_text(e: Dict[str, Any]) -> str:
     if kind == "cmd":
         return head + "`!" + _short(e.get("cmd")) + "`"
     if kind == "state":
-        return head + "stored state after `!" + _short(e.get("cmd")) + "`"
+        cmd = _short(e.get("cmd"))
+        if cmd.startswith("("):
+            # No command: what the load or the storage commit found.
+            return head + "stored state " + cmd
+        return head + "stored state after `!" + cmd + "`"
     if kind == "systems":
         return head + "systems " + ", ".join(
             f"`{n}`" for n in (e.get("systems") or {})) + " changed"
@@ -215,9 +219,19 @@ def prefab_reads(j: Journal, reads: Dict[str, Any]) -> Dict[str, Any]:
     held = {d["hash"] for e in j.segments[-1]["entries"]
             for d in ((e.get("prefabs") or {}).get("data") or {}).values()
             if isinstance(d, dict) and "data" in d}
+    held_names = {(e.get("prefabs") or {})["names"]["hash"]
+                  for e in j.segments[-1]["entries"]
+                  if isinstance((e.get("prefabs") or {}).get("names"), dict)
+                  and "list" in e["prefabs"]["names"]}
     out: Dict[str, Any] = {}
     if "names" in reads:
-        out["names"] = list(reads["names"])
+        # The name list the same way: whole once per segment, then its
+        # hash (a watcher calling prefab_names() stored it every entry,
+        # J14+).
+        names = list(reads["names"])
+        h = prefab_hash(names)
+        out["names"] = ({"hash": h} if h in held_names
+                        else {"hash": h, "list": names})
     data: Dict[str, Any] = {}
     for name, pf in (reads.get("data") or {}).items():
         if pf is None:
@@ -243,8 +257,16 @@ def replay_prefabs(e: Dict[str, Any], seen: Dict[str, Any]
     if not isinstance(rec, dict):
         return None
     out: Dict[str, Any] = {"data": {}}
-    if isinstance(rec.get("names"), list):
-        out["names"] = [str(n) for n in rec["names"]]
+    names = rec.get("names")
+    if isinstance(names, list):
+        out["names"] = [str(n) for n in names]
+    elif isinstance(names, dict):
+        if isinstance(names.get("list"), list):
+            seen["names:" + str(names.get("hash"))] = [
+                str(n) for n in names["list"]]
+        key = "names:" + str(names.get("hash"))
+        if key in seen:
+            out["names"] = list(seen[key])
     for name, d in (rec.get("data") or {}).items():
         if d is None:
             out["data"][name] = None

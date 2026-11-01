@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN
 
 
 class FormulaError(VTTError):
@@ -1624,6 +1624,9 @@ def _runtime_msg(e: BaseException) -> str:
     if mt is not None:
         # map= on a function with no map slot (it works on its unit's or
         # zone's map), said as L15's hint says a map word.
+        if mt.group(1) in _ALLOWED_FUNCS:
+            # A pure helper works on the values it is given (L24).
+            return f"{mt.group(1)} takes no map=."
         return (f"{mt.group(1)} takes no map= (it works on one map: its "
                 f"unit's, its zone's or the formula's).")
     return msg
@@ -2061,6 +2064,28 @@ def _sorted(v: Any, desc: Any = False) -> list:
     return sorted(items, reverse=bool(desc))
 
 
+def _extreme(fname: str, pick: Any, args: tuple) -> Any:
+    items = (list(args[0]) if len(args) == 1
+             and isinstance(args[0], (list, tuple)) else list(args))
+    if not items:
+        raise FormulaError(f"{fname}(...): there are no values to compare.")
+    if not (all(_is_num(x) for x in items)
+            or all(isinstance(x, str) for x in items)):
+        raise FormulaError(
+            f"{fname}(...): the values must all be numbers or all be text.")
+    return pick(items)
+
+
+def _max(*args: Any) -> Any:
+    """max(a, b, ...) or max(list): the largest value."""
+    return _extreme("max", max, args)
+
+
+def _min(*args: Any) -> Any:
+    """min(a, b, ...) or min(list): the smallest value."""
+    return _extreme("min", min, args)
+
+
 def _any(v: Any) -> bool:
     """any(list): True if at least one item is truthy (False when empty)."""
     return any(_list_arg(v, "any"))
@@ -2451,7 +2476,7 @@ def _tags_match(tags: Any, filt: Any) -> bool:
 
 
 _ALLOWED_FUNCS: Dict[str, Any] = {
-    "min": min, "max": max, "abs": abs, "round": _round,
+    "min": _min, "max": _max, "abs": abs, "round": _round,
     "tags_match": _tags_match,
     "int": int, "float": float, "str": lambda *a: _text_of(a[0]) if len(a) == 1 else str(*a),
     "len": _len,
@@ -5616,9 +5641,25 @@ class FormulaEngine:
                 value = checked_status_value(path, value, f"status '{eid}.{name}'")
             except VTTError as ex:
                 raise FormulaError(str(ex))
+            try:
+                owned = _own_value(value)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            keys = path.split(".")
+            # The path is checked before anything is made on it: a refused
+            # write left an empty status or `{}` field behind (L35).
+            node0: Any = e.status.get(name, {})
+            for i, k in enumerate(keys[:-1]):
+                node0 = node0.get(k) if isinstance(node0, dict) else None
+                if node0 is not None and not isinstance(node0, dict):
+                    raise FormulaError(
+                        f"status '{eid}.{name}' value at "
+                        f"'{'.'.join(keys[:i + 1])}' is "
+                        f"{type(node0).__name__}, not a dict.")
+                if node0 is None:
+                    break
             before = copy.deepcopy(e.status[name]) if name in e.status else None
             data = e.status.setdefault(name, {})
-            keys = path.split(".")
             cur = data
             for i, k in enumerate(keys[:-1]):
                 existing = cur.get(k)
@@ -5631,7 +5672,7 @@ class FormulaEngine:
                 if k not in cur:
                     cur[k] = {}
                 cur = cur[k]
-            cur[keys[-1]] = _own_value(value)
+            cur[keys[-1]] = owned
             after = copy.deepcopy(e.status[name])
             match.surface_log(match._emit_status_diff(eid, name, before,
                                                       after))
@@ -5885,6 +5926,11 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
+            if (not absolute and field == "duration"
+                    and e.status[name].get(field) is None):
+                # No duration = permanent (shown as ∞): adding to it leaves
+                # it permanent (user call); status_counter_set gives one.
+                return None
             raw = e.status[name].get(field, 0)
             cur = _coerce_number(raw)
             if cur is None:
@@ -5906,7 +5952,9 @@ class FormulaEngine:
             """status_counter_add(eid, name, delta[, field="duration"]):
             add `delta` (negative to subtract) to a status's counter field;
             removes the status if the result is <=0. Returns the new value.
-            The universal duration/charge adjuster."""
+            A status with no duration is permanent: adding to its duration
+            changes nothing and returns None. The universal duration/charge
+            adjuster."""
             if isinstance(delta, bool) or not isinstance(delta, (int, float)):
                 raise FormulaError("status_counter_add(...): delta must be a number.")
             return _status_counter(eid_t, name, field, delta, False)
@@ -7907,7 +7955,11 @@ class FormulaEngine:
             passive gave no sign at all (zone_exists is the silent test)."""
             if match.has_zone(name):
                 return True
-            if (fname, name) not in warned_zones:
+            # Not in a team-view channel: players read it, the zone name
+            # comes from the GM's setup and they can't fix it (V10, as the
+            # tag-vocabulary warning).
+            if (fname, name) not in warned_zones \
+                    and match.command_pov() is None:
                 warned_zones.add((fname, name))
                 line = (f"⚠️ {fname}: no zone named `{name}` (answered as "
                         f"an empty zone).")
@@ -8378,7 +8430,8 @@ class FormulaEngine:
             existence)."""
             if not isinstance(name, str):
                 raise FormulaError("rule_get(name): name must be a string.")
-            if name in SECRET_RULES and _IN_ARG_TOKEN.get():
+            if _IN_ARG_TOKEN.get() and (name in SECRET_RULES or (
+                    name in FORMULA_RULES and FORMULA_TEXT_HIDDEN.get())):
                 raise FormulaError(
                     f"rule_get('{name}') can't be read in a `$()` argument "
                     f"(its value is for hosts: `!help rule {name}`).")
@@ -8592,16 +8645,20 @@ class FormulaEngine:
             else:
                 v = pool
             try:
-                return float(v or 0)
+                f = float(v or 0)
             except (TypeError, ValueError):
                 return 0.0
+            # Text such as `inf` is no amount: an infinite pool drained to
+            # inf less the hit couldn't be stored, failing every hit (L33).
+            return f if math.isfinite(f) else 0.0
 
         def _pool_priority(pool: Any) -> float:
             if isinstance(pool, dict):
                 try:
-                    return float(pool.get("priority", 0) or 0)
+                    f = float(pool.get("priority", 0) or 0)
                 except (TypeError, ValueError):
                     return 0.0
+                return f if math.isfinite(f) else 0.0
             return 0.0
 
         def _pool_matches(pool: Any, hit_tags: set) -> bool:
@@ -9137,9 +9194,11 @@ class FormulaEngine:
             # Footprint center (true, possibly-fractional center for even
             # sizes; 1×1 -> the anchor) so a hit's side is judged against the
             # body's middle, not its top-left anchor.
-            w, h = match.entity_footprint(e)
-            cxf = e.x + (w - 1) / 2.0
-            cyf = e.y + (h - 1) / 2.0
+            bx, by, w, h = match.body_box(e)
+            cxf = bx + (w - 1) / 2.0
+            cyf = by + (h - 1) / 2.0
+            fx = _num_arg(from_x, "side_hit", "from_x")
+            fy = _num_arg(from_y, "side_hit", "from_y")
             if _hitbox_mode(hitbox) == "box" and (w != 1 or h != 1):
                 # Box-face: aspect-correct the center->source vector by the
                 # footprint half-extents, then take the bearing of the
@@ -9149,8 +9208,8 @@ class FormulaEngine:
                 # width-vs-depth, not just the raw angle. Feeding the corrected
                 # bearing through the same relative_angle + relative_side_name
                 # pipeline keeps 4/8-way + corner_arc + any facing working.
-                dx = float(from_x) - cxf
-                dy = float(from_y) - cyf
+                dx = fx - cxf
+                dy = fy - cyf
                 hx = w / 2.0
                 hy = h / 2.0
                 if dx == 0 and dy == 0:
@@ -9160,7 +9219,7 @@ class FormulaEngine:
                                 "up", "cw", False, False)
             else:
                 # Full precision (as_int=False) so corner boundaries are exact.
-                ab = _angle(cxf, cyf, from_x, from_y, "up", "cw", False, False)
+                ab = _angle(cxf, cyf, fx, fy, "up", "cw", False, False)
             rel = _relative_angle(getattr(e, "facing", "up"), ab)
             return _relative_side_name(rel, sides, _arc_default(corner_arc))
 
@@ -9217,8 +9276,8 @@ class FormulaEngine:
                     raise FormulaError(
                         f"face_toward: `{e.id}` and `{t.id}` are on "
                         f"different maps.")
-                tw, th = match.entity_footprint(t)
-                tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
+                bx, by, tw, th = match.body_box(t)
+                tx, ty = bx + (tw - 1) / 2, by + (th - 1) / 2
             elif b is None:
                 cm = _coord_map(a)
                 if cm is not None and cm != e.map:
@@ -9391,8 +9450,8 @@ class FormulaEngine:
         def _body_center2(e) -> Tuple[int, int]:
             """A unit's body centre in DOUBLED cell coordinates (whole
             numbers even for an even-sized body)."""
-            w, h = match.entity_footprint(e)
-            return 2 * e.x + (w - 1), 2 * e.y + (h - 1)
+            bx, by, w, h = match.body_box(e)
+            return 2 * bx + (w - 1), 2 * by + (h - 1)
 
         def _flank_units(fname: str, target_t: Any, a_t: Any, b_t: Any):
             _, t = _resolve_entity(target_t, fname)
@@ -9420,7 +9479,7 @@ class FormulaEngine:
             if ea.id == eb.id or t.id in (ea.id, eb.id):
                 return False
             tcx, tcy = _body_center2(t)
-            w, h = match.entity_footprint(t)
+            _bx, _by, w, h = match.body_box(t)
             box = _hitbox_mode(None) == "box"
             bearings = []
             for e in (ea, eb):
@@ -9446,10 +9505,10 @@ class FormulaEngine:
             t, ea, eb = _flank_units("flanking_line", target_t, a_t, b_t)
             if ea.id == eb.id or t.id in (ea.id, eb.id):
                 return False
-            w, h = match.entity_footprint(t)
+            tx0, ty0, w, h = match.body_box(t)
             # Doubled coordinates: cell centres are even, cell edges odd.
-            xmin, xmax = 2 * t.x - 1, 2 * (t.x + w) - 1
-            ymin, ymax = 2 * t.y - 1, 2 * (t.y + h) - 1
+            xmin, xmax = 2 * tx0 - 1, 2 * (tx0 + w) - 1
+            ymin, ymax = 2 * ty0 - 1, 2 * (ty0 + h) - 1
             (ax, ay), (bx, by) = _body_center2(ea), _body_center2(eb)
             for px, py in ((ax, ay), (bx, by)):
                 if xmin < px < xmax and ymin < py < ymax:

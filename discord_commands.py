@@ -96,8 +96,15 @@ def _split_for_discord(message: str, limit: int = DISCORD_MAX_CONTENT) -> List[s
             # open fence), then hard-split the line itself.
             if _has_content(cur):
                 _flush(cur)
-            for i in range(0, len(line), limit):
-                chunks.append(line[i:i + limit])
+            if opener is not None and not is_fence:
+                # Inside a code block each piece keeps the block (opener
+                # + piece + close): a bare piece rendered as markdown (L30).
+                step = max(1, limit - len(opener) - 1 - len(close))
+                for i in range(0, len(line), step):
+                    chunks.append(opener + "\n" + line[i:i + step] + close)
+            else:
+                for i in range(0, len(line), limit):
+                    chunks.append(line[i:i + limit])
             if is_fence:
                 opener = None if opener is not None else line.lstrip()
             # Still inside a fence: the next chunk re-opens it.
@@ -285,7 +292,8 @@ class DiscordCtxWrapper:
             chunks = chunks[:cap] + [
                 f"✂️ … {cut} more characters left out (reply_message_cap "
                 f"{cap}): narrow the command (a viewport, a page, fewer "
-                f"dice)."]
+                f"dice; for rules and help, `!help rule <rule>` or "
+                f"`!help find <words>`)."]
         # And one command at most command_message_cap messages in all (a
         # sweep, batch or macro posts one reply per line): the rest are
         # counted and named in one note, sent once the command ends.
@@ -544,7 +552,9 @@ class _ApprovalView(discord.ui.View):
         req = self._pop_own(m)
         if req is None:
             await interaction.response.send_message(
-                "Already resolved.", ephemeral=True
+                "This request is no longer pending: it was approved, "
+                "denied or cancelled, or a `!store load` / restore "
+                "dropped it.", ephemeral=True
             )
             return self._finish()
         await interaction.response.defer()
@@ -575,7 +585,9 @@ class _ApprovalView(discord.ui.View):
         req = self._pop_own(m)
         if req is None:
             await interaction.response.send_message(
-                "Already resolved.", ephemeral=True
+                "This request is no longer pending: it was approved, "
+                "denied or cancelled, or a `!store load` / restore "
+                "dropped it.", ephemeral=True
             )
             return self._finish()
         cmd = _shown_cmd(req["name"], req["args"])

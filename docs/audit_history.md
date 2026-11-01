@@ -2470,3 +2470,53 @@ over 40 forms of every root opened to players (0 differences).
     a zone is made (930); deleting a used tile template detaches its
     tiles like Z1 (188). A watcher's effect now journals with its command
     (`transfer_entity` in a watcher left a replayable-looking `cmd`).
+
+## Pass 49 (document 2, passes 39-51 of the external read-only audit)
+
+Every finding of the external document's passes 39-51 (and the ones
+pass 39 listed as still open: K8+, V10, V11, L23, V12, L24, L25) checked
+against the fix branch and fixed where the intent was clear. Scenarios
+951-959; verified after: 959/959, the replay differential 1,030/1,030,
+the formula-text leak probe (aliases only, by design), fog parity
+(windowed scene fog = crop of the full one = ASCII fog cells, 20 random
+boards), the team vision index against `_team_sees` on 3,000 random
+cells.
+  - **Imports** (S10-S13, S13+, L31-L34, L25): a prefab's carried tile
+    template, function, units and corpses and a template's `var_names`
+    and parts are checked as the commands that make them check them; a
+    malformed one is refused before anything is stored. JSON nesting is
+    measured before parsing. `SpecialTileTemplate.from_dict` keeps only
+    an object as data (a system library held S13's template).
+  - **Crashes** (W8): a command that crashes puts the channel's match
+    back; `check_unit_form` checks a carried body's parts first.
+  - **Type-blind equality** (J17, J17+): `logic.same_value` decides every
+    "did it change" on stored data (undo steps, journal entries, var and
+    status hooks, diffs, sync, reapply, child-system layers, the partial
+    tracker, rollbacks).
+  - **Cost** (X11, X12): fog loops walk the render window; a vision pass
+    files the team's members by 16x16 block (`_team_vision_index`);
+    listings, `!foreach` selection and Tab run in one pass. Cell searches
+    read a per-search occupancy table (`occupancy_pass`).
+  - **Journal** (J14+, J15, J16): prefab name lists by hash, replayed
+    prefab writes skipped, load-added entries written, `systems` entries
+    hashed.
+  - **Views and formula text** (V5++, V10-V13, L29): the raw reads, the
+    history labels and a hidden formula's errors follow
+    formula_text_visibility; whole-board reads close with a hidden rider
+    or a disguise on a fogless match; refusals name what the view sees.
+  - Smaller: region parts in flanking / facing / side_hit (K8+), corpse
+    part ids reserved and stamped corpses renamed (K9), stamps detaching
+    missing links and `_template` writes checked (Z1+), template imports
+    recording var names (S9, entity templates), ATB latches saved (T7,
+    L28), reveals moved to the turn clock with ATB (T8), optional-word
+    typos refused (L26, L27), rule formats checked (L25), stored values
+    in replies (L35), max / min refusals, infinite text in layers,
+    weights and shields (E5, L33), `!help` as an index and fenced long
+    lines on Discord (D10, L30).
+  - Answered after the pass (user calls, 960): partials record their var
+    names and are renamed when used as a unit's whole vars (S9, 742); a
+    refused `!eval` takes back its writes (L35, 247); team slots tied on
+    initiative go by the tiebreak var on their leading member (L27); a
+    permanent status stays permanent under `extend` and counters (L27,
+    §8's counter question). Not changed: a size read still records the
+    whole prefab once per segment (L28).

@@ -51,7 +51,7 @@ import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import (VTTError, NotFound, CROSS_MATCH_GUARD, normalize_tags,
+from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, normalize_tags,
                    check_tag_filter, tag_filter_matches, tag_filter_empty,
                    RULES_REGISTRY)
 
@@ -1717,6 +1717,9 @@ def _target_tag_lines(action: Action, actor_id: str, tid: str,
         if e is None:
             return []
         tags = match.unit_tags(e)
+    # The refusal names the tags the caller's view sees (a disguise's
+    # decoys, V5++); the filters judge the real ones.
+    seen = tags if corpse else match.unit_tags(e, match.command_pov())
     out: List[str] = []
     for key, want in (("target_requires_tags", True),
                       ("target_refuses_tags", False)):
@@ -1732,11 +1735,14 @@ def _target_tag_lines(action: Action, actor_id: str, tid: str,
             continue
         shown = (", ".join(f"`{t}`" for t in filt) if isinstance(filt, list)
                  else f"`{filt}`")
+        if len(shown) > 80:
+            # A stored filter can run to a thousand characters (L23).
+            shown = shown[:77] + "..."
         fmt = str(match.rules.get("action_target_tags_message_format") or "") \
             or RULES_REGISTRY["action_target_tags_message_format"]["default"]
         fixed = {"target": tid, "actor": actor_id, "action": action.name,
                  "field": key, "filter": shown,
-                 "target_tags": ", ".join(tags) or "none",
+                 "target_tags": ", ".join(seen) or "none",
                  "fails": (f"don't match {shown}" if want
                            else f"match {shown}")}
         text = match._MSG_FMT_RE.sub(
@@ -1800,9 +1806,9 @@ def _restore_other_matches(mgr: Any, match: "Match",
         if m is None:
             m = snap["objs"].get(mid) or _Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
-            if m.to_dict(include_history=False) != state:
+            if not same_value(m.to_dict(include_history=False), state):
                 _rollback_match(m, mgr, state)
-        elif m.to_dict(include_history=False) != state:
+        elif not same_value(m.to_dict(include_history=False), state):
             _rollback_match(m, mgr, state)
         if mid in snap["hist"]:
             m.history.rewind(snap["hist"][mid])
@@ -1854,7 +1860,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
         "_death_check_deferred_ids", "_deleting_maps", "_watcher_backlog",
-        "_alive_eval_depth", "_vision_memo", "_turn_order_dirty",
+        "_alive_eval_depth", "_vision_memo", "_occ_memo", "_turn_order_dirty",
         "_request_seq", "pending_requests", "held_commands",
         # Event bus: the live emit stack/depth + warning latch. Resetting
         # these mid-emit corrupts the outer emit (the verified crash).

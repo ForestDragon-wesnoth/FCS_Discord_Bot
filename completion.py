@@ -224,7 +224,8 @@ def _entity_ids(mgr, ctx) -> List[str]:
         pov = _query_pov(ctx, m)
     except Exception:
         pov = None
-    return sorted(e for e in m.entities if not _pov_hides(m, pov, e))
+    with m.vision_pass():
+        return sorted(e for e in m.entities if not _pov_hides(m, pov, e))
 
 
 def _corpse_ids(mgr, ctx) -> List[str]:
