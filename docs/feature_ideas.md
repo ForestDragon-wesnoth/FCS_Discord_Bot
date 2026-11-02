@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -191,7 +191,7 @@ or rejects one, it moves to "Off the list".
   - Today the action takes a count argument (`hits=2` in `ncs.txt`) and loops itself.
 - **#238 Requirement previews for players.**
   - `!action hu1 melee ho1 check` reports what the action would refuse on (range, cost, cooldown, a forbidding status, not the unit's turn) and changes nothing.
-  - It never reports outcomes: `!dry` restores the RNG position, so a full preview would show the roll that will actually happen, and a player could preview until the crit comes up. Outcome previews stay with hosts (#230).
+  - It never reports outcomes: `!dry` restores the RNG position, so a full preview would show the roll that will actually happen, and a player could preview until the crit comes up. Outcome previews stay with hosts (`!simulate`).
 - **#241 Fleeing as a state.**
   - `flee(eid)` takes a unit out of play into the match's fled list (kept for the report, able to come back), and fires `on_entity_fled`.
   - A rule `off_map_moves: refuse | flee`: with `flee`, a walk off the map's edge makes the unit flee. FCS1: "units can move off the map to flee the match". Solis: a unit "can choose to flee from combat if they are standing next to an edge of the map".
@@ -449,16 +449,6 @@ or rejects one, it moves to "Off the list".
   - From the combat systems:
     - `source` feeds #239's kill credit for damage over time.
     - FCS1 "statuses from attacks only apply if the target takes at least 1 point of damage" as an `on_damage_only` flag that the GM's damage step reads.
-- **#230 Balance simulator.**
-  - `!sim <n> <command ...>` runs the command n times on throwaway copies of the match (the `!dry` machinery, each run from a different RNG position) and reports what changed:
-    - per var, mean / min / max and how often it changed (`ho1.hp: −15 ×80%, −23 ×10%, −30 ×10%; mean −17`);
-    - statuses applied;
-    - units killed.
-  - For designing combat systems: a spear against a machine's armor, a crit table's real rate, whether a boss survives three rounds of a party's best attacks.
-  - Cost follows n × the command; an owner limit caps n, and the #197 work counter applies per run. Hosts only, refused inside batches like `!dry`.
-  - From the combat systems:
-    - Scripted duels: each side runs a fixed GM macro every turn until a condition holds (`until="match_over()"`), n times, reporting win rates and turn counts. The macros decide everything and the engine picks nothing, so there is no AI.
-    - `seed=` for reproducible runs, to compare two versions of a weapon.
 - **#231 Rules handbook export.**
   - `!match handbook [file]` / `!system handbook <name> [file]` writes a Markdown file to the saves folder (or posts it in parts):
     - status definitions with a `description` data field, levels, ticks and stacking in words;
@@ -556,7 +546,7 @@ From the combat-systems review (docs/combat_systems_fit.md):
 - **After the battle:** #239 → #240, #241; #158 with #251
 - **Discord table comfort:** #247, #248, #254, #255, #244, #245
 - **Behaviour kept in its data:** #200, #208, #201
-- **GM tooling:** #202, #203, #207, #211, #204, #230, #231, #249, #250
+- **GM tooling:** #202, #203, #207, #211, #204, #231, #249, #250
 - **Formula ergonomics:** #89, #90, #194, #205, #210, #216, #217, #219, #228
 - **Integrity of GM data:** #209, #210, #223
 - **Before a public rollout:** #177, #178, #197 (+ lazy servers), #206, #214

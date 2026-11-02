@@ -111,7 +111,7 @@ def formula_text(text: Any) -> Any:
 FORMULA_LABEL_ROOTS = frozenset({
     "passive", "gpassive", "defpassive", "func", "status", "tile", "zone",
     "watch", "eval", "assert", "macro", "schedule", "system", "team",
-    "defvar", "batch", "foreach", "dry", "run", "mount", "clamp", "gclamp",
+    "defvar", "batch", "foreach", "dry", "simulate", "run", "mount", "clamp", "gclamp",
     "action", "template", "prefab", "match", "remind", "store"})
 _LABEL_FORMULA_SUBS = {"ent": frozenset({"set_var", "set_vars", "status",
                                          "store_entity_into_var",
@@ -6848,6 +6848,12 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
                 "(its oldest go first), so one server's crashes can't push "
                 "every other server's out of the bot-wide log (0 = no "
                 "per-server cap).",
+    },
+    "simulate_step_limit": {
+        "default": 1000, "min": 1, "max": 100000,
+        "desc": "How many times one `!simulate` may run its command, over "
+                "all its runs together (100 runs of 20 steps = 2000); runs "
+                "past it are left out with a warning.",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
