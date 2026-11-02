@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
-from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant
+from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -2330,9 +2330,16 @@ def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
     for name in sorted(status, key=str):
         inst = status[name]
         ctx: Dict[str, Any] = dict(inst) if isinstance(inst, dict) else {}
+        # The definition and its level entries at the instance's level
+        # (#259): the format, and the entries' fields as placeholders.
+        if m is not None and isinstance(inst, dict):
+            lv = m.status_level(inst)
+            ctx = merge_layer(m.status_level_data(name, lv)[0], ctx)
+            fmt = m.status_def_view(name, lv).get("display")
+        else:
+            sdef = defs.get(name)
+            fmt = sdef.get("display") if isinstance(sdef, dict) else None
         ctx["name"] = name
-        sdef = defs.get(name)
-        fmt = sdef.get("display") if isinstance(sdef, dict) else None
         out.append(_render_template(fmt if isinstance(fmt, str) and fmt
                                     else str(default), ctx))
     return ", ".join(out)
@@ -8633,6 +8640,8 @@ def _match_formula_slots(m: Match):
         for fld in ACTION_RESTRICTION_FIELDS:
             yield (f"status `{sname}` {fld}{UNLESS_SUFFIX}",
                    sdef.get(fld + UNLESS_SUFFIX), "eval", frozenset(), False)
+        for where, src, mode in _status_level_formulas(sdef):
+            yield (f"status `{sname}` {where}", src, mode, frozenset(), False)
     for tname, tpl in sorted(m.tile_templates.items()):
         for when, src in sorted(tpl.hooks.items()):
             yield (f"tile template `{tname}` hook `{when}`", src, "exec",
@@ -8792,6 +8801,10 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
                 n += 1
                 check(f"status `{sname}` {fld}{UNLESS_SUFFIX}", src, "eval",
                       sys_known, soft=True)
+        for where, src, mode in _status_level_formulas(sdef):
+            n += 1
+            check(f"status `{sname}` {where}", src, mode, sys_known,
+                  soft=True)
     for zname, zdef in sorted(
             mgr.system_library(s, "zone_definitions").items()):
         zdef = normalize_zone_def(zdef)
@@ -9298,6 +9311,8 @@ async def _system_status(ctx: ReplyContext, args: List[str],
                   for f in ACTION_RESTRICTION_FIELDS
                   if isinstance(sdef.get(f + UNLESS_SUFFIX), str)
                   and sdef[f + UNLESS_SUFFIX].strip()]
+        progs += [(f"its {where}", src)
+                  for where, src, _mode in _status_level_formulas(sdef)]
         warns = [_promote_warning(mgr, s, src, what) for what, src in progs]
         return await ctx.send("\n".join(
             [_promoted_line("status definition", f"`{name}`", m.id, sys_name,
@@ -9781,6 +9796,9 @@ registry.annotate_sub(
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
         "stack <system> <name> <refresh|add_level|extend|replace|none> | "
         "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
+        "level <system> <name> list | level <system> <name> <level> drop | "
+        "level <system> <name> <level> del <field> | "
+        "level <system> <name> <level> <field> <value ...> | "
         "tags <system> <name> <csv ...> | removes <system> <name> <tokens ...> | "
         "blockedby <system> <name> <tokens ...> | "
         "forbids_actions_with_tag <system> <name> [<tag ...>] | "
@@ -19351,7 +19369,156 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     **{f: 2 for f in ACTION_RESTRICTION_FIELDS},
                     **{f + UNLESS_SUFFIX: 2
                        for f in ACTION_RESTRICTION_FIELDS},
-                    GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2}
+                    GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2,
+                    "level": 3}
+
+# `!status level` (#259): a level entry's field -> the `!status`
+# subcommand that edits that field of a definition (run on a scratch
+# definition holding the entry, so it validates the same way).
+_LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
+                     "display": "display", "sprite": "sprite",
+                     GRANTS_UNIT_TAGS: GRANTS_UNIT_TAGS,
+                     STATUS_UNIT_TAG_BLOCK: STATUS_UNIT_TAG_BLOCK,
+                     **{f: f for f in ACTION_RESTRICTION_FIELDS},
+                     **{f + UNLESS_SUFFIX: f + UNLESS_SUFFIX
+                        for f in ACTION_RESTRICTION_FIELDS}}
+_STATUS_LEVEL_USAGE = ("!status level <name> list | "
+                       "!status level <name> <level> drop | "
+                       "!status level <name> <level> del <field> | "
+                       "!status level <name> <level> <field> <value ...>")
+
+
+def _status_level_formulas(sdef: Any) -> List[Tuple[str, str, str]]:
+    """(where, formula, mode) of every formula a status definition's level
+    entries hold (#259): ticks and `_unless` expressions."""
+    out: List[Tuple[str, str, str]] = []
+    levels = sdef.get(STATUS_LEVELS_FIELD) if isinstance(sdef, dict) else None
+    for spec, ent in sorted((levels or {}).items()):
+        if not isinstance(ent, dict):
+            continue
+        if isinstance(ent.get("tick"), str) and ent["tick"].strip():
+            out.append((f"level `{spec}` tick", ent["tick"], "exec"))
+        for fld in ACTION_RESTRICTION_FIELDS:
+            src = ent.get(fld + UNLESS_SUFFIX)
+            if isinstance(src, str) and src.strip():
+                out.append((f"level `{spec}` {fld}{UNLESS_SUFFIX}", src,
+                            "eval"))
+    return out
+
+
+def _status_levels_view(sdef: Dict[str, Any]) -> str:
+    """A definition's level entries as `list` prints them."""
+    levels = sdef.get(STATUS_LEVELS_FIELD) or {}
+    order = sorted(levels, key=lambda sp: (not sp.endswith("+"),
+                                           int(sp.rstrip("+"))))
+    return json.dumps(_hide_formula_fields({sp: levels[sp] for sp in order}),
+                      indent=2, default=str)
+
+
+async def _status_level_sub(ctx: ReplyContext, args: List[str], m: Any,
+                            prefix: str, check) -> str:
+    """`!status level <name> ...` (#259; args from `level`): a definition's
+    per-level entries, read live at each instance's level."""
+    usage = prefix.format(sub="level")
+    name = args[1]
+    sdef = m.status_definitions.get(name)
+    if sdef is None:
+        return f"❌ No status definition `{name}`."
+    if args[2].lower() == "list":
+        _check_tail(args, 3, (), f"{usage} <name> list")
+        if not sdef.get(STATUS_LEVELS_FIELD):
+            return (f"`{name}` has no level entries. Add one with `{usage} "
+                    f"{name} <level> <field> <value>` (`3` = level 3, "
+                    f"`3+` = level 3 and up).")
+        return (f"**`{name}` level entries** (`N+` by ascending N, then the "
+                f"exact level, each over the last; an instance's own key "
+                f"wins)\n```{_status_levels_view(sdef)}\n```")
+    spec = check_level_spec(args[2])
+    levels = sdef.setdefault(STATUS_LEVELS_FIELD, {})
+    if len(args) < 4:
+        raise VTTError(f"Usage: `{_STATUS_LEVEL_USAGE}`.")
+    word = args[3]
+    if word.lower() == "drop":
+        _check_tail(args, 4, (), f"{usage} <name> <level> drop")
+        if spec not in levels:
+            raise NotFound(f"`{name}` has no `{spec}` level entry.")
+        del levels[spec]
+        if not levels:
+            sdef.pop(STATUS_LEVELS_FIELD, None)
+        return f"Dropped `{name}`'s `{spec}` level entry."
+    if word.lower() == "del":
+        if len(args) < 5:
+            raise VTTError(f"Usage: `{usage} <name> <level> del <field>`.")
+        _check_tail(args, 5, (), f"{usage} <name> <level> del <field>")
+        entry = levels.get(spec)
+        if entry is None:
+            raise NotFound(f"`{name}` has no `{spec}` level entry.")
+        parts = args[4].split(".")
+        chain = [entry]
+        for k in parts[:-1]:
+            nxt = chain[-1].get(k)
+            if not isinstance(nxt, dict):
+                raise NotFound(f"`{name}` at `{spec}` has no `{args[4]}`.")
+            chain.append(nxt)
+        if parts[-1] not in chain[-1]:
+            raise NotFound(f"`{name}` at `{spec}` has no `{args[4]}`.")
+        del chain[-1][parts[-1]]
+        for i in range(len(chain) - 1, 0, -1):
+            if chain[i]:
+                break
+            del chain[i - 1][parts[i - 1]]
+        if not entry:
+            del levels[spec]
+        if not levels:
+            sdef.pop(STATUS_LEVELS_FIELD, None)
+        return (f"Removed `{args[4]}` from `{name}`'s `{spec}` entry"
+                + ("" if spec in levels else " (now empty, dropped)") + ".")
+    if len(args) < 5:
+        raise VTTError(f"Usage: `{_STATUS_LEVEL_USAGE}`.")
+    field = word
+    root = field.split(".")[0]
+    if root in STATUS_LEVEL_EXCLUDED or root.startswith("__"):
+        if not levels:
+            sdef.pop(STATUS_LEVELS_FIELD, None)
+        raise VTTError(
+            f"A level entry can't set `{root}`: stack, max_level, tags, "
+            f"removes, blocked_by, hooks and data decide how a status "
+            f"arrives or what kind it is, and stay on the definition.")
+    entry = copy.deepcopy(levels.get(spec) or {})
+    if root in _LEVEL_FIELD_SUBS:
+        if field != root:
+            raise VTTError(f"`{root}` is one value; set it whole.")
+        # The definition editor on a scratch definition holding the entry.
+        from types import SimpleNamespace
+        scratch = SimpleNamespace(status_definitions={name: entry})
+        reply = await _status_def_body(
+            ctx, [_LEVEL_FIELD_SUBS[root], name] + list(args[4:]), scratch,
+            prefix, check)
+        if not reply or reply.startswith("❌"):
+            if not levels:
+                sdef.pop(STATUS_LEVELS_FIELD, None)
+            return reply or ""
+        if entry:
+            levels[spec] = entry
+        else:
+            levels.pop(spec, None)
+        if not levels:
+            sdef.pop(STATUS_LEVELS_FIELD, None)
+        return f"At level `{spec}`: {reply}"
+    _check_tail(args, 5, (), f"{usage} <name> <level> <field> <value>")
+    check_store_path(field, "level entry field")
+    value = checked_status_value(field, _parse_scalar(args[4]),
+                                 f"`{name}` at `{spec}`")
+    try:
+        _set_path(entry, field, _own_value(value))
+    except (VTTError, KeyError, TypeError) as ex:
+        if not levels:
+            sdef.pop(STATUS_LEVELS_FIELD, None)
+        return f"❌ {ex}"
+    levels[spec] = entry
+    return (f"`{name}` at level `{spec}`: {field} = {value!r} (read live by "
+            f"every instance at that level that doesn't hold its own "
+            f"`{root}`).")
 
 
 def _match_program_check(m: Match):
@@ -19409,6 +19576,11 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
     `check(body, what)` validates a tick / hook program (raises, or returns
     a ⚠️ line)."""
     sub = args[0].lower()
+    if sub == "level":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status",
+                                                "level"):
+            return ""
+        return await _status_level_sub(ctx, args, m, prefix, check)
     if sub == "def":
         if await return_help_if_not_enough_args(ctx, args, 2, "status", "def"):
             return ""
@@ -19712,7 +19884,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
            "immune_to_actions_with_tag_unless|immune_to_actions_with_name_unless|"
            "grants_unit_tags|cannot_affect_units_with_tag|"
-           "resist|counter|dispel|transfer|sprite|list|info|"
+           "resist|counter|dispel|transfer|sprite|level|list|info|"
            "apply|force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
@@ -19864,6 +20036,11 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 bits.append(f"max_lvl={d['max_level']}")
             if not (isinstance(d.get("tick"), str) and d["tick"].strip()):
                 bits.append("no tick")
+            lv = d.get(STATUS_LEVELS_FIELD)
+            if isinstance(lv, dict) and lv:
+                bits.append("levels " + ", ".join(sorted(
+                    lv, key=lambda sp: (not sp.endswith("+"),
+                                        int(sp.rstrip("+"))))))
             lines.append(f"- `{name}` ({', '.join(bits)})")
         return await ctx.send("\n".join(lines))
 
@@ -20677,6 +20854,32 @@ registry.annotate_sub(
           "(equipped items too). No status hooks fire. Formulas naming it as "
           "text are listed with a ⚠️ and left as written; server templates "
           "keep the old name."))
+registry.annotate_sub(
+    "status", "level", usage=_STATUS_LEVEL_USAGE,
+    desc=(
+        "Per-level data (#259): an entry for an exact level (`3`) or a "
+        "level and up (`3+`) holding fields that apply while an instance is "
+        "at that level, read live: the definition's fields, then each "
+        "matching `N+` entry by ascending N, then the exact entry, a later "
+        "one's key replacing an earlier one's (a dict merges key by key, a "
+        "list replaces whole: restate a list to extend it), and an "
+        "instance's own key wins over all of them. Fields: tick, tick_when "
+        "(or when), display, sprite, the action restriction lists and "
+        "their `_unless`, grants_unit_tags, cannot_affect_units_with_tag "
+        "(each edited as its `!status` subcommand does), `modifiers.<key>."
+        "<field>` (records added under the instance's own; a record the "
+        "instance holds under the same key wins), and any other field as "
+        "data that status_get / status_has_path and `{statuses}` "
+        "placeholders read when the instance lacks it. Not stack, "
+        "max_level, tags, removes, blocked_by, hooks or data: they decide "
+        "how a status arrives or what kind it is. Example (a freeze that "
+        "forbids sprint and rest, and dodge too from level 3): `!status "
+        "level freeze 1+ forbids_actions_with_name sprint rest`, `!status "
+        "level freeze 3+ forbids_actions_with_name sprint rest dodge`. "
+        "`del <field>` removes a field (a dotted path), `drop` the entry, "
+        "`list` shows them; status_level_data(eid, name, level=None) reads "
+        "what the entries give."),
+)
 registry.annotate_sub(
     "status", "copy", usage="!status copy <name> <new_name>",
     desc="Copy a status definition under a new name, to make a variant.")

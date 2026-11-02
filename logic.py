@@ -201,6 +201,68 @@ ACTION_IMMUNE_FIELDS = ("immune_to_actions_with_tag",
 ACTION_RESTRICTION_FIELDS = ACTION_FORBID_FIELDS + ACTION_IMMUNE_FIELDS
 UNLESS_SUFFIX = "_unless"
 
+# Per-level status data (#259): a status definition's `levels` dict holds
+# entries keyed by a level spec, exact (`3`) or from a level up (`3+`).
+# Read LIVE (user call, "for now"): wherever a status field is read, the
+# definition's fields come first, then each matching `N+` entry in
+# ascending N, then the exact entry, a later layer's key replacing an
+# earlier one's (dicts merge key by key, lists replace whole), and an
+# instance's own key wins over all of them. Entries can't set the fields
+# that decide how a status arrives or what kind it is.
+STATUS_LEVELS_FIELD = "levels"
+STATUS_LEVEL_EXCLUDED = ("stack", "max_level", "tags", "removes",
+                         "blocked_by", "hooks", "data", STATUS_LEVELS_FIELD,
+                         "level")
+LEVEL_SPEC_RE = re.compile(r"^(0|[1-9][0-9]{0,8})(\+?)$")
+
+
+def check_level_spec(spec: Any) -> str:
+    """`spec` as a stored level spec (`3` or `3+`); raises VTTError."""
+    text = str(spec).strip() if isinstance(spec, (str, int)) \
+        and not isinstance(spec, bool) else ""
+    if not LEVEL_SPEC_RE.fullmatch(text):
+        raise VTTError(f"`{spec}` isn't a level: a whole number (`3`, the "
+                       f"exact level) or one with `+` (`3+`, that level and "
+                       f"up).")
+    return text
+
+
+def level_spec_matches(spec: str, level: Any) -> bool:
+    """Whether level spec `spec` (`3` / `3+`) covers `level`."""
+    mo = LEVEL_SPEC_RE.fullmatch(str(spec))
+    if mo is None or isinstance(level, bool) \
+            or not isinstance(level, (int, float)):
+        return False
+    n = int(mo.group(1))
+    return level >= n if mo.group(2) else level == n
+
+
+def matching_level_entries(sdef: Any, level: Any
+                           ) -> List[Tuple[str, Dict[str, Any]]]:
+    """(spec, entry) of definition `sdef`'s level entries covering
+    `level`, in layering order: the `N+` ones by ascending N, then the
+    exact one."""
+    levels = sdef.get(STATUS_LEVELS_FIELD) if isinstance(sdef, dict) else None
+    if not isinstance(levels, dict):
+        return []
+    hits = [(spec, entry) for spec, entry in levels.items()
+            if isinstance(entry, dict) and level_spec_matches(spec, level)]
+    return sorted(hits, key=lambda h: (not h[0].endswith("+"),
+                                       int(h[0].rstrip("+"))))
+
+
+def merge_layer(base: Dict[str, Any], layer: Dict[str, Any]) -> Dict[str, Any]:
+    """`base` with `layer` on top: a key in both whose two values are dicts
+    merges key by key, any other value of `layer` replaces (a list
+    whole). New dicts; neither argument changes."""
+    out = dict(base)
+    for k, v in layer.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge_layer(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
 # The channel map of the running command (tier 4 of the map hierarchy):
 # a function of a Match giving the map name the command's channel views
 # there. Formulas resolve `map='view'` through it; None outside a command
@@ -12646,7 +12708,24 @@ class Match:
         for the list_mods breakdown."""
         out: List[Tuple[dict, str]] = []
         for sname, sdata in e.status.items():
-            if isinstance(sdata, dict) and "modifiers" in sdata:
+            if not isinstance(sdata, dict):
+                continue
+            # A level entry's bundle (#259) adds records under the
+            # instance's own; a record of the same key is the instance's.
+            ldata, lsrc = self.status_level_data(sname,
+                                                 self.status_level(sdata))
+            lbundle = ldata.get("modifiers")
+            own = sdata.get("modifiers")
+            if lbundle is not None:
+                spec = lsrc.get("modifiers", "")
+                own_keys = ({k for k, _r in self._bundle_items(own)}
+                            if isinstance(own, dict) else set())
+                for key, rec in self._bundle_items(lbundle):
+                    if isinstance(lbundle, dict) and key in own_keys:
+                        continue
+                    out.append((rec, self._mod_source(
+                        f"status:{sname}@{spec}", key)))
+            if "modifiers" in sdata:
                 for key, rec in self._bundle_items(sdata["modifiers"]):
                     out.append((rec, self._mod_source(f"status:{sname}", key)))
         # Team-scoped modifiers: a `modifiers` bundle in the entity's team
@@ -15896,9 +15975,14 @@ class Match:
                 str(self.rules.get("status_tick_formula", "")).strip():
             return True
         for sdef in self.status_definitions.values():
-            if str(sdef.get("tick_when", "turn_end")) in rnames and \
-                    str(sdef.get("tick", "")).strip():
-                return True
+            # The definition or any of its level entries (#259).
+            for lay in [sdef] + [
+                    merge_layer(sdef, ent) for ent in (
+                        sdef.get(STATUS_LEVELS_FIELD) or {}).values()
+                    if isinstance(ent, dict)]:
+                if str(lay.get("tick_when", "turn_end")) in rnames and \
+                        str(lay.get("tick", "")).strip():
+                    return True
         if any(s.get("kind") == "round" for s in self.scheduled):
             return True
         for tpl in self.tile_templates.values():
@@ -16923,11 +17007,45 @@ class Match:
     def status_field(self, inst: Any, sname: str, key: str) -> Any:
         """Status `sname`'s `key`: the instance's own value when the
         instance holds the key (it replaces the definition's), else the
-        definition's (None without one)."""
+        definition's with its level entries on top (#259; None without
+        one)."""
         if isinstance(inst, dict) and key in inst:
             return inst[key]
+        return self.status_def_view(sname, self.status_level(inst)).get(key)
+
+    @staticmethod
+    def status_level(inst: Any) -> Any:
+        """A status instance's level (1 when it has none, as an application
+        gives it)."""
+        lv = inst.get("level", 1) if isinstance(inst, dict) else 1
+        return lv if isinstance(lv, (int, float)) \
+            and not isinstance(lv, bool) else 1
+
+    def status_def_view(self, sname: str, level: Any) -> Dict[str, Any]:
+        """Status definition `sname` as it reads at `level` (#259): its own
+        fields with the matching level entries layered on top (`levels`
+        left out). {} without a definition."""
         sdef = self.status_definitions.get(sname)
-        return sdef.get(key) if isinstance(sdef, dict) else None
+        if not isinstance(sdef, dict):
+            return {}
+        out = {k: v for k, v in sdef.items() if k != STATUS_LEVELS_FIELD}
+        for _spec, entry in matching_level_entries(sdef, level):
+            out = merge_layer(out, entry)
+        return out
+
+    def status_level_data(self, sname: str, level: Any
+                          ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """What status `sname`'s level entries give at `level`, layered
+        (#259), and for each of its top-level keys the spec of the last
+        entry that set it."""
+        out: Dict[str, Any] = {}
+        src: Dict[str, str] = {}
+        for spec, entry in matching_level_entries(
+                self.status_definitions.get(sname), level):
+            out = merge_layer(out, entry)
+            for k in entry:
+                src[k] = spec
+        return out, src
 
     def action_forbid_units(self, actor_id: str,
                             vehicle_id: Optional[str] = None,
@@ -17218,14 +17336,18 @@ class Match:
             return level_given
         return False  # refresh / extend / none — no level applied
 
-    def status_tag_block(self, e: "Entity", name: str) -> Optional[str]:
+    def status_tag_block(self, e: "Entity", name: str,
+                         level: Any = None) -> Optional[str]:
         """Why status `name` can't affect `e` by its tags (the definition's
         cannot_affect_units_with_tag filter matches them; a filter that
         doesn't parse blocks and names the error), or None. Skipped by a
         forced application, like immunity."""
-        sdef = self.status_definitions.get(name)
-        filt = sdef.get(STATUS_UNIT_TAG_BLOCK) if isinstance(sdef, dict) \
-            else None
+        # The level the status has there, or would arrive at (#259).
+        inst = e.status.get(name)
+        lv = self.status_level(inst) if inst is not None else (
+            level if isinstance(level, int) and not isinstance(level, bool)
+            else 1)
+        filt = self.status_def_view(name, lv).get(STATUS_UNIT_TAG_BLOCK)
         if filt is None or tag_filter_empty(filt):
             return None
         tags = self.unit_tags(e)
@@ -17252,7 +17374,7 @@ class Match:
         immune, reduction = self.status_resistance(eid, name)
         if immune:
             return f"immune to `{name}`"
-        tag_block = self.status_tag_block(e, name)
+        tag_block = self.status_tag_block(e, name, level)
         if tag_block:
             return tag_block
         sdef = self.status_definitions.get(name) or {}
@@ -17323,7 +17445,7 @@ class Match:
         # fully resisted (no-op).
         if not force:
             immune, reduction = self.status_resistance(eid, name)
-            if immune or self.status_tag_block(e, name):
+            if immune or self.status_tag_block(e, name, new_level):
                 return []
             if reduction and self._resistance_applies(
                     e, name, sdef, new_level is not None):
@@ -17533,6 +17655,10 @@ class Match:
                 # to the global status_tick_formula at the global when.
                 sdef = self.status_definitions.get(sname)
                 if sdef is not None:
+                    # The tick and its when as the instance's level reads
+                    # them (#259).
+                    sdef = self.status_def_view(
+                        sname, self.status_level(e.status.get(sname)))
                     body = sdef.get("tick")
                     if not (isinstance(body, str) and body.strip()):
                         continue
@@ -22367,7 +22493,7 @@ class Match:
         for sname in sorted(statuses):
             inst = statuses.get(sname)
             inst = inst if isinstance(inst, dict) else {}
-            sdef = self.status_definitions.get(sname) or {}
+            sdef = self.status_def_view(sname, self.status_level(inst))
 
             def pick(key: str):
                 v = inst.get(key)

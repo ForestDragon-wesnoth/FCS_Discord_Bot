@@ -594,12 +594,14 @@ _STATUS_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
 
 
 def _check_status_definition(entry: Dict[str, Any], name: str,
-                             sname: str) -> None:
+                             sname: str, level: Optional[str] = None) -> None:
     """A carried status definition holds what `!status` would store: a
     stack mode and tick time it knows, a whole max_level, formulas and
     hooks as text, tags and tag filters that parse."""
-    who = f"Prefab `{name}`: status definition `{sname}`"
-    logic.check_status_name(sname)
+    who = f"Prefab `{name}`: status definition `{sname}`" + (
+        f" level `{level}`" if level else "")
+    if level is None:
+        logic.check_status_name(sname)
     if entry.get("stack") not in (None, "", *_STATUS_STACK_MODES):
         raise VTTError(f"{who}: stack must be one of "
                        f"{', '.join(_STATUS_STACK_MODES)}.")
@@ -638,6 +640,25 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
                 logic.check_tag_filter(entry[k])
     except VTTError as ex:
         raise VTTError(f"{who}: {ex}")
+    # Per-level entries (#259): level specs, and the fields an entry may
+    # set, checked as the definition's own.
+    levels = entry.get(logic.STATUS_LEVELS_FIELD)
+    if levels is None or level is not None:
+        return
+    if not isinstance(levels, dict):
+        raise VTTError(f"{who}: `levels` must be an object.")
+    for spec, lent in levels.items():
+        try:
+            logic.check_level_spec(spec)
+        except VTTError as ex:
+            raise VTTError(f"{who}: {ex}")
+        if not isinstance(lent, dict):
+            raise VTTError(f"{who}: level `{spec}` must be an object.")
+        bad = sorted(k for k in lent if k in logic.STATUS_LEVEL_EXCLUDED)
+        if bad:
+            raise VTTError(f"{who}: level `{spec}` can't set "
+                           f"{', '.join(bad)}.")
+        _check_status_definition(lent, name, sname, spec)
 
 
 # ---- geometry -----------------------------------------------------------------

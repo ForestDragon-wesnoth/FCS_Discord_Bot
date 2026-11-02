@@ -32239,3 +32239,186 @@ in a `$()` argument zone_grants works and zone_grant is refused, with
 nothing changed. Renaming the zone keeps the grant's record pointing at
 it. Ungranting `warded` (linger 1) leaves it on the mage with a
 duration of 1; deleting the zone takes `hasted` off in the same formula.
+
+SCENARIO 965 — Per-level status data: layered restriction lists, an exact level over a band, read live
+--------------------------------------------------------------------------------------------------------
+
+!match new lv965 Freeze 10 10
+!match use lv965
+!status def freeze
+!status stack freeze replace
+!status level freeze 1+ forbids_actions_with_name sprint rest
+!status level freeze 3+ forbids_actions_with_name sprint rest dodge
+!status level freeze 5 forbids_actions_with_name sprint
+!status level freeze list
+?? "1+"
+!ent add a Ann 10 1 1
+!ent set_var a kit.actions.sprint.target none
+!ent set_var a kit.actions.sprint.body "entity[self].ran = 1"
+!ent set_var a kit.actions.dodge.target none
+!ent set_var a kit.actions.dodge.body "entity[self].dodged = 1"
+!ent set_var a kit.actions.rest.target none
+!ent set_var a kit.actions.rest.body "entity[self].rested = 1"
+!status apply a freeze 1
+!action a sprint
+?? forbids
+!action a dodge
+!assert "entity[a].dodged == 1 and not var_has('a', 'ran')"
+!status apply a freeze 3
+!action a dodge
+?? forbids
+!assert "status_level_data('a', 'freeze') == {'forbids_actions_with_name': ['sprint', 'rest', 'dodge']}"
+!assert "status_level_data('a', 'freeze', level=2) == {'forbids_actions_with_name': ['sprint', 'rest']}"
+!status apply a freeze 5
+!action a rest
+!action a dodge
+!assert "entity[a].rested == 1 and entity[a].dodged == 1"
+!action a sprint
+?? forbids
+!status level freeze 5 drop
+!action a rest
+?? forbids
+!ent status a set freeze forbids_actions_with_name "[]"
+!action a sprint
+!assert "entity[a].ran == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. Freeze (Solis) forbids sprint and rest
+from level 1, and from level 3 dodge too: the `3+` entry restates the
+list, since a later layer's list replaces the earlier one whole. At level
+1 sprint is refused and dodge runs; at level 3 dodge is refused;
+status_level_data shows what the entries give at the instance's level,
+or at another one with `level=`. The exact `5` entry layers over `3+`,
+so at level 5 only sprint is forbidden (a higher level lifting a
+restriction). Dropping the `5` entry reaches the live instance at once
+(read live): rest is refused again. An instance's own key wins over
+every entry: an empty list on the instance lifts them all.
+
+SCENARIO 966 — Per-level status data: data, modifiers, ticks and display by level; the instance wins
+------------------------------------------------------------------------------------------------------
+
+!match new lv966 Chill 10 10
+!match use lv966
+!status def chill
+!status stack chill replace
+!status level chill 1+ cold 1
+!status level chill 2+ cold 2
+!status level chill 2+ modifiers.slow.stat speed
+!status level chill 2+ modifiers.slow.op add
+!status level chill 2+ modifiers.slow.value -1
+!status level chill 3+ modifiers.slow.value -3
+!status level chill 3+ tick "entity[self].hp = entity[self].hp - status_get(self, 'chill', 'cold')"
+!status level chill 3 display "{name} (deep, cold {cold})"
+!ent add a Ann 10 1 1 5
+!ent set_var a speed 6
+!status apply a chill 1
+!assert "status_get('a', 'chill', 'cold') == 1 and apply_mods('a', 'speed', 6) == 6"
+!status apply a chill 2
+!assert "status_get('a', 'chill', 'cold') == 2 and apply_mods('a', 'speed', 6) == 5"
+!mod show a speed 6
+?? status:chill@2+.slow
+!status apply a chill 3
+!assert "apply_mods('a', 'speed', 6) == 3"
+!mod show a speed 6
+?? status:chill@3+.slow
+!ent info a
+?? chill (deep, cold 2)
+!turn next
+!turn next
+!assert "entity[a].hp == 8"
+!ent status a set chill cold 5
+!assert "status_get('a', 'chill', 'cold') == 5"
+!turn next
+!assert "entity[a].hp == 3"
+!ent status a set chill modifiers.slow.stat speed
+!ent status a set chill modifiers.slow.op add
+!ent status a set chill modifiers.slow.value 2
+!assert "apply_mods('a', 'speed', 6) == 8"
+!status apply a chill 1
+!ent status a del chill modifiers
+!ent status a del chill cold
+!assert "status_get('a', 'chill', 'cold') == 1 and apply_mods('a', 'speed', 6) == 6"
+!ent info a
+?! deep
+
+Expected: per-level data is read live at the instance's level. `cold`
+reads 1 at level 1 and 2 from the `2+` entry (status_get falls back to
+the entries for a field the instance lacks). The `2+` entry's slow
+modifier (-1 speed) is added to the unit's modifiers, sourced
+`status:chill@2+.slow`; at level 3 the `3+` entry's `modifiers.slow.value`
+-3 merges key by key into the `2+` record (stat and op stay), so speed 6
+becomes 3. The exact `3` entry gives the `{statuses}` display, its
+placeholders read through the entries (cold 2). The `3+` tick takes cold
+(2) hp at the end of Ann's turn: 10 → 8. An instance's own key wins: cold 5 on
+the instance makes the next tick take 5 (8 → 3), and an own `slow`
+record (+2) replaces the entry's record of the same key (speed 8). Back
+at level 1 with those keys gone, the instance reads the `1+` entry
+again and the display is the plain name.
+
+SCENARIO 967 — Per-level status data: refusals, editing, systems, tags by level, a prefab, a restart
+-----------------------------------------------------------------------------------------------------
+
+!system status def default burn
+!system status level default burn 2+ grants_unit_tags blazing
+!system status level default burn 3+ cannot_affect_units_with_tag fireproof
+!system status level default burn 4 tick "nosuchfn(self)"
+?? isn't a built-in
+!system status info default burn
+?? "levels"
+!match new lv967 Burn 10 10
+!match use lv967
+!status list
+?? levels 2+, 3+, 4
+!status level burn 2+ stack none
+?? can't set `stack`
+!status level burn 2+ data 5
+?? can't set `data`
+!status level burn x2 tick "1"
+?? isn't a level
+!status level burn 2+ tick "nosuch_fn(self)"
+?? Invalid tick formula
+!status level burn 9 drop
+?? has no `9` level entry
+!status level burn 4 del tick
+?? now empty, dropped
+!ent add a Ann 10 1 1
+!ent add f Fay 10 3 3
+!ent set_var f tags fireproof
+!status apply a burn 1
+!assert "not unit_has_tag('a', 'blazing')"
+!ent status a set burn level 2
+!assert "unit_has_tag('a', 'blazing')"
+!status apply f burn 2
+!assert "status_has('f', 'burn')"
+!ent status f remove burn
+!status apply f burn 3
+?? can't affect units with tags
+!assert "not status_has('f', 'burn')"
+!ent hp a "$(len(status_level_data('a', 'burn')))"
+!assert "entity[a].hp == 1"
+!system lint default
+?? status `burn` level `4` tick: calls `nosuchfn`
+!prefab save corner 1 1 2 2
+!match new lv967b Copy 10 10
+!match use lv967b
+!status drop burn
+!prefab stamp corner 1 1
+!status level burn list
+?? "2+"
+!assert "unit_has_tag('a', 'blazing')"
+!as restart
+!assert "unit_has_tag('a', 'blazing')"
+
+Expected: HARNESS-ALLOWS-ERRORS. A system's status definition takes
+level entries with `!system status level` (an unknown function in a
+level tick is stored with a ⚠️, as for a definition's own tick) and a
+new match copies them (`!status list` names the levels). An entry can't
+set stack or data, a level must be a whole number with an optional `+`,
+a tick calling an unknown function is refused on a match, and `del` / `drop` take a field or a whole
+entry away (the emptied `4` entry is dropped). grants_unit_tags at `2+`
+tags the unit once its level reaches 2. cannot_affect_units_with_tag at
+`3+` refuses the fireproof unit at level 3 while level 2 lands.
+status_level_data works in a `$()` argument. `!system lint` checks the
+level formulas (the system's `4` tick still calls an unknown function).
+A prefab carries the
+definition with its levels into a match that lacks it, and a restart
+keeps them.

@@ -1377,9 +1377,38 @@ hardcodes**.
   and the refusal names the error). `!status <field> <name> [words]`
   (`-` clears), `!status <field>_unless <name> [formula]`; an instance
   holding the key replaces the definition's (`Match.status_field`, the
-  one read path, where per-level data, idea #259, would merge in).
+  one read path, level entries included).
   Innate or equipment restrictions are a permanent status. Checked in
   `run_action` (§7.6); `!system lint` covers the formulas.
+- **Per-level data** (#259, 965-967): a definition's `levels` dict holds
+  entries keyed `3` (that level) or `3+` (that level and up), read LIVE
+  (user call, "for now") at the instance's level (`Match.status_level`,
+  1 when unset): `status_def_view(name, level)` is the definition's fields
+  with the matching entries layered on (`logic.matching_level_entries`:
+  `N+` by ascending N, then the exact entry; `merge_layer`: dicts merge
+  key by key, anything else, lists included, replaces), and an
+  instance's own key wins over all of it (user call: a GM who wants the
+  level to win doesn't set the instance key; definition `data` is copied
+  into instances, so per-level values go in entries). Reads through it:
+  `status_field` (the #234 lists and `_unless`, grants_unit_tags), the
+  tick and tick_when, `display` (its placeholders read the entries too,
+  `vtt_commands._statuses_text`), the overlay sprite, the
+  cannot_affect_units_with_tag check (at the existing level, else the
+  applied one), modifiers (`status_level_data(name, level)` gives the
+  layered entries and which spec last set each key; an entry's bundle
+  adds records sourced `status:<name>@<spec>.<key>`, a record the
+  instance holds under the same key wins), and status_get /
+  status_has_path for a field the instance lacks. Entries can't set
+  `STATUS_LEVEL_EXCLUDED` (stack, max_level, tags, removes, blocked_by,
+  hooks, data, level: how a status arrives or what kind it is). `!status
+  level <name> list | <level> drop | <level> del <field> | <level>
+  <field> <value ...>` (and `!system status level`): a known field runs
+  its own `!status` subcommand on a scratch definition holding the entry
+  (`_LEVEL_FIELD_SUBS`, same validation), anything else is a data path.
+  `status_level_data(eid, name, level=None)` reads what the entries give.
+  Lint, promote warnings and the formula-text hiding cover level ticks
+  and `_unless`; prefabs check carried entries
+  (`prefab._check_status_definition`).
 - **Display:** status sprite overlays (§7.13); the `{statuses}` roster
   placeholder (`vtt_commands._statuses_text`, in the default
   entity_info_format): each status through its definition's `display`
@@ -2994,8 +3023,10 @@ hasn't named the next.
   live, but later we should discuss what is live and materialized"): a
   zone reads its definition's hooks, look fields, tags and grants live,
   while data and facing are copied in when the zone is made (`reapply`
-  pushes them later); tile templates split the same way. Discuss which
-  fields belong on which side, and whether a GM should choose per field.
+  pushes them later); tile templates split the same way, and a status
+  definition copies its `data` while its level entries (#259, also
+  "live for now") are read live. Discuss which fields belong on which
+  side, and whether a GM should choose per field.
 
 ### Deferred (the user wants these tracked)
 
