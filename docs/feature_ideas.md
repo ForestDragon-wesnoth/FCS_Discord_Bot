@@ -28,7 +28,9 @@ or rejects one, it moves to "Off the list".
   crossing, `zone_anchor_of` naming the standing unit).
 - Struck by the user: #7, #44, #45, #156, #145 (deployment phase: a player
   asks the host to place their unit, or the host opens `!ent tp` to them with
-  a per-player access override).
+  a per-player access override), #163 and #199 (web viewer,
+  networked GUI: the CLI / GUI test locally and Discord boards show the live
+  map; a separate client matters only if Discord became unavailable).
 
 ## Small (a primitive, a rule, or a command)
 
@@ -521,7 +523,6 @@ or rejects one, it moves to "Off the list".
   - A versioned file bundling a system (with its parent chain), its status definitions, templates, partials, macros and tables.
   - Servers can share a ruleset and upgrade it.
   - Per-server storage (#41) and system status definitions, tables and macros (#140) have shipped.
-- **#163 Read-only web viewer.** A browser page showing a match's live map from the scene model, with per-team views behind a link token. Needs a web server and real security design.
 
 ### New
 
@@ -534,10 +535,6 @@ or rejects one, it moves to "Off the list".
   - A digest of what happened since your last turn (#146).
   - A deadline rule that skips the turn when time runs out; the unit does nothing, so this stays clear of AI.
   - For Discord tables that play over days.
-- **#199 Networked GUI client.**
-  - The tkinter GUI connects to the running bot and shows a Discord match with that channel's POV, as a richer client for players.
-  - Today it only sees the local workspace.
-  - Needs an auth token per user and the same security design as #163.
 - **#252 Derived vars.**
   - A var declared as a formula (`max_hp := round(apply_mods(self, 'max_hp', 50 * level))`) whose value is computed when it is read.
   - The game need: NCS multiplies HP bonuses from class, armor and items, and Solis Endurance raises max hp by a percentage. A derived max hp would need no recomputation when gear changes.
