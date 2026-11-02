@@ -167,6 +167,10 @@ or rejects one, it moves to "Off the list".
     - FCS1 Insulating Potion: the same for burn and freeze.
     - NCS "<status name> Immunity": "immunity to a certain status, but only while this status is active".
   - Today resistance and immunity are gathered only from var roots, the innate vars plus `status_resist_sources` (logic.py:14493-14545), while modifiers already come from status instances too. A GM has to copy the record into a var when the status arrives and delete it when it leaves.
+  - Two kinds of resistance, from any source (innate vars, `status_resist_sources` roots, a granting status):
+    - flat: subtract N from the incoming level (what `status_resist` does today, combined per `status_resist_stack`: sum / max / first);
+    - percentile: multiply or divide the incoming level (×0.5 halves a poison, ÷3 a thirds-resistant hide, ×2 a weakness that doubles it), rounded per a rule or per record.
+  - Open (user): the order when a unit has both (flat then percentile, or GM-ordered like modifier ops; reusing the modifier record shape and fold is one option), how several percentile sources combine (multiply, or best one), the rounding and whether a result below 1 means fully resisted, and whether a percentile resistance also scales durations (ties to #227's `resist_mode`).
 - **#233 Opt-in automatic durations.**
   - A definition field `duration_mode: manual | auto`. With `auto`, the engine lowers `duration` by one at the definition's tick time, after its tick formula runs, and removes the status at 0. `manual` stays the default, as the user decided when status ticks shipped (scenarios 390-391).
   - `expires: next_turn_start`, for effects that last "until your next turn":
