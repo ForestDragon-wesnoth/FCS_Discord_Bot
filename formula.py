@@ -2665,7 +2665,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_del(eid, name, "path")       -> bool (True iff existed)
     #   status_add(eid, name)               -> bool (True iff newly added)
     #   status_remove(eid, name)            -> bool (True iff removed)
-    "status_has", "status_has_path", "status_get",
+    "status_has", "status_has_path", "status_get", "status_level_data",
     "status_set", "status_del", "status_add", "status_remove",
     # status_apply(eid, name[, level, duration]) -> apply a status via its
     # definition + stack mode (the host-friendly "inflict burn" call),
@@ -3078,7 +3078,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'zone_distance', 'entities_at',
     'relative_side', 'riders', 'roll_table', 'round_number', 'rule_get',
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
-    'slot_of', 'slot_riders', 'status_get', 'status_has',
+    'slot_of', 'slot_riders', 'status_get', 'status_level_data',
+    'status_has',
     'status_has_path', 'status_has_tag', 'status_names',
     'status_resist_of', 'status_tags', 'statuses_with_tag',
     'table_roll', 'team_get', 'team_has', 'team_sees_cell',
@@ -5601,6 +5602,19 @@ class FormulaEngine:
                 return None, e
             return data, e
 
+        def _status_read_view(name: str, data: Any) -> Any:
+            """The instance `data` of status `name` read through its level
+            entries (#259): what they give at its level, the instance's own
+            keys on top."""
+            if not isinstance(data, dict):
+                return data
+            ldata, _src = match.status_level_data(
+                name, match.status_level(data))
+            if not ldata:
+                return data
+            from logic import merge_layer
+            return merge_layer(ldata, data)
+
         def _status_has(eid_t: Any, name: Any) -> bool:
             """status_has(eid, name): whether the unit has status `name`."""
             eid = _eid(eid_t)
@@ -5623,7 +5637,7 @@ class FormulaEngine:
             data, _ = _status_data(eid, name, must_exist=False)
             if data is None:
                 return False
-            cur = data
+            cur = _status_read_view(name, data)
             for k in path.split("."):
                 if not isinstance(cur, dict) or k not in cur:
                     return False
@@ -5633,14 +5647,15 @@ class FormulaEngine:
         def _status_get(eid_t: Any, name: Any, path: Any) -> Any:
             """status_get(eid, name, path): read a field of the unit's status
             instance (a dotted path such as 'level' or 'duration'); the unit
-            must have the status."""
+            must have the status. A field the instance lacks is read from
+            the definition's level entries matching its level (#259)."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_get(eid, name, path): name must be a string.")
             if not isinstance(path, str) or not path:
                 raise FormulaError("status_get(eid, name, path): path must be a non-empty string.")
             data, _ = _status_data(eid, name, must_exist=True)
-            cur = data
+            cur = _status_read_view(name, data)
             keys = path.split(".")
             for i, k in enumerate(keys):
                 if not isinstance(cur, dict) or k not in cur:
@@ -5649,7 +5664,7 @@ class FormulaEngine:
                         f"status '{eid}.{name}' has no value at '{where}'."
                     )
                 cur = cur[k]
-            return cur
+            return copy.deepcopy(cur)
 
         def _status_set(eid_t: Any, name: Any, path: Any, value: Any) -> Any:
             """status_set(eid, name, path, value): set a field of the unit's
@@ -5873,6 +5888,25 @@ class FormulaEngine:
         ns["status_has"]      = _status_has
         ns["status_has_path"] = _status_has_path
         ns["status_get"]      = _status_get
+
+        def _status_level_data(eid_t: Any, name: Any, level: Any = None) -> dict:
+            """status_level_data(eid, name, level=None): what status `name`'s
+            level entries (#259, `!status level`) give the unit's instance
+            at its level, layered (`N+` by ascending N, then the exact
+            level); `level=` reads them at another level. The instance's
+            own keys win over these where it holds them."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_level_data(eid, name): name must be a string.")
+            if level is None:
+                data, _ = _status_data(eid, name, must_exist=True)
+                level = match.status_level(data)
+            elif isinstance(level, bool) or not isinstance(level, (int, float)):
+                raise FormulaError("status_level_data(...): level= must be a number.")
+            elif eid not in match.entities:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            return copy.deepcopy(match.status_level_data(name, level)[0])
+        ns["status_level_data"] = _status_level_data
         ns["status_set"]      = _status_set
         ns["status_del"]      = _status_del
         ns["status_add"]      = _status_add
