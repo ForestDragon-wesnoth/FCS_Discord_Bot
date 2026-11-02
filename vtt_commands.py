@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
-from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant
+from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -9796,6 +9796,8 @@ registry.annotate_sub(
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
         "stack <system> <name> <refresh|add_level|extend|replace|none> | "
         "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
+        "resist_affects <system> <name> <level|duration|both|-> | "
+        "resist_rounding <system> <name> <floor|ceil|round|-> | "
         "level <system> <name> list | level <system> <name> <level> drop | "
         "level <system> <name> <level> del <field> | "
         "level <system> <name> <level> <field> <value ...> | "
@@ -10411,6 +10413,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 value = _parse_scalar(args[5])
                 check_store_path(path, "status path")
                 value = checked_status_value(path, value, f"`{eid}.{name}`")
+                check_status_self_grant(name, path, value)
                 # Snapshot for the diff-based event firing. Use None for
                 # the "status didn't exist" case so set acts as an
                 # implicit add when applied to a fresh status.
@@ -19310,16 +19313,51 @@ for _sub, _usage in (
         ("tags", "!status tags <name> <csv ...>"),
         ("removes", "!status removes <name> <tokens ...>"),
         ("blockedby", "!status blockedby <name> <tokens ...>"),
-        ("resist", "!status resist <eid> <name>"),
+        ("resist", "!status resist <eid> <name> [level] [duration=<n>] [rounding=<floor|ceil|round>]"),
         ("counter", "!status counter <eid> <name> <add|set> <value> [field]"),
         ("dispel", "!status dispel <eid> <token> [max]"),
         ("transfer", "!status transfer <from> <to> <name>"),
         ("sprite", "!status sprite <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>]"),
         ("list", "!status list"),
         ("info", "!status info <name>"),
-        ("apply", "!status apply <eid> <name> [level] [duration]"),
+        ("apply", "!status apply <eid> <name> [level] [duration] [rounding=<floor|ceil|round>]"),
         ("force", "!status force <eid> <name> [level] [duration]")):
     registry.annotate_sub("status", _sub, usage=_usage)
+registry.annotate_sub(
+    "status", "resist_affects",
+    usage="!status resist_affects <name> <level|duration|both|->",
+    desc=("What resistance and weakness change on this status (#232): its "
+          "level (default), its duration (for a status whose level doesn't "
+          "matter: flat resistance takes turns off, a factor scales it) or "
+          "both. A result below 1 doesn't apply; a status with no duration "
+          "has none to change. Level entries (`!status level`) can set it "
+          "per level."),
+)
+registry.annotate_sub(
+    "status", "resist_rounding",
+    usage="!status resist_rounding <name> <floor|ceil|round|->",
+    desc=("How this status's resisted level or duration rounds, over the "
+          "status_resist_rounding rule (#232); an application's `rounding=` "
+          "overrides it in turn. `-` goes back to the rule."),
+)
+registry.annotate_sub(
+    "status", "resist",
+    usage=("!status resist <eid> <name> [level] [duration=<n>] "
+           "[rounding=<floor|ceil|round>]"),
+    desc=("Show what an application of `<name>` at `[level]` (default 1) "
+          "would land at on the unit, step by step (#232): each matching "
+          "status_resist record (flat `sub`, percentile `mul` / `div`, "
+          "weakness as a negative flat or a factor above 1) with its token, "
+          "priority and source (innate, an equipped root, a status the unit "
+          "holds), in the order they fold (status_resist_op_priority), "
+          "then the rounding. Immunity says so. Records: `status_resist: "
+          "{freeze: 1}` is flat 1; `{freeze: {op: mul, value: 0.5}}` halves; "
+          "a list holds several. They come from the unit's own "
+          "status_resist / status_immune vars, those under the "
+          "status_resist_sources roots, and every status it holds (its "
+          "instance data, else its definition at its level; never to "
+          "itself). status_resisted(...) reads the same in a formula."),
+)
 registry.annotate_sub(
     "status", GRANTS_UNIT_TAGS,
     usage=f"!status {GRANTS_UNIT_TAGS} <name> [<tag ...>]",
@@ -19370,7 +19408,7 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     **{f + UNLESS_SUFFIX: 2
                        for f in ACTION_RESTRICTION_FIELDS},
                     GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2,
-                    "level": 3}
+                    "level": 3, "resist_affects": 3, "resist_rounding": 3}
 
 # `!status level` (#259): a level entry's field -> the `!status`
 # subcommand that edits that field of a definition (run on a scratch
@@ -19379,6 +19417,8 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "display": "display", "sprite": "sprite",
                      GRANTS_UNIT_TAGS: GRANTS_UNIT_TAGS,
                      STATUS_UNIT_TAG_BLOCK: STATUS_UNIT_TAG_BLOCK,
+                     "resist_affects": "resist_affects",
+                     "resist_rounding": "resist_rounding",
                      **{f: f for f in ACTION_RESTRICTION_FIELDS},
                      **{f + UNLESS_SUFFIX: f + UNLESS_SUFFIX
                         for f in ACTION_RESTRICTION_FIELDS}}
@@ -19509,6 +19549,7 @@ async def _status_level_sub(ctx: ReplyContext, args: List[str], m: Any,
     check_store_path(field, "level entry field")
     value = checked_status_value(field, _parse_scalar(args[4]),
                                  f"`{name}` at `{spec}`")
+    check_status_self_grant(name, field, value)
     try:
         _set_path(entry, field, _own_value(value))
     except (VTTError, KeyError, TypeError) as ex:
@@ -19742,6 +19783,28 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
             f"Set overlay sprite `{val}` for status `{name}` (drawn over "
             f"afflicted entities on the graphics surface).{extra}")
 
+    if sub in ("resist_affects", "resist_rounding"):
+        # #232: what resistance changes on this status, and how its result
+        # rounds (over the status_resist_rounding rule); `-` clears.
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
+            return ""
+        name, val = args[1], args[2].lower()
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->")
+        choices = RESIST_AFFECTS if sub == "resist_affects" \
+            else RESIST_ROUNDINGS
+        if val in ("-", "default", "clear"):
+            m.status_definitions[name].pop(sub, None)
+            return (f"`{name}` {sub} cleared ("
+                    + ("resistance changes its level)."
+                       if sub == "resist_affects" else
+                       "the status_resist_rounding rule rounds it)."))
+        if val not in choices:
+            return f"❌ {sub} must be one of: {', '.join(choices)} (or `-`)."
+        m.status_definitions[name][sub] = val
+        return f"`{name}` {sub} = {val}."
+
     if sub == "stack":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "stack"):
             return ""
@@ -19779,6 +19842,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         value = _parse_scalar(args[3])
         check_store_path(path, "status data path")
         value = checked_status_value(path, value, f"status def `{name}` data")
+        check_status_self_grant(name, path, value)
         d = m.status_definitions[name].setdefault("data", {})
         try:
             _set_path(d, path, value)
@@ -19884,7 +19948,8 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
            "immune_to_actions_with_tag_unless|immune_to_actions_with_name_unless|"
            "grants_unit_tags|cannot_affect_units_with_tag|"
-           "resist|counter|dispel|transfer|sprite|level|list|info|"
+           "resist|resist_affects|resist_rounding|"
+           "counter|dispel|transfer|sprite|level|list|info|"
            "apply|force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
@@ -19946,13 +20011,57 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             return await ctx.send(f"❌ No entity `{args[1]}`.")
         sname = args[2]
-        immune, reduction = m.status_resistance(eid, sname)
-        if immune:
-            return await ctx.send(f"`{eid}` is IMMUNE to `{sname}`.")
-        if reduction:
-            return await ctx.send(
-                f"`{eid}` resists `{sname}`: applied level reduced by {reduction}.")
-        return await ctx.send(f"`{eid}` has no resistance to `{sname}`.")
+        opts: Dict[str, str] = {}
+        pos: List[str] = []
+        for a in args[3:]:
+            k, eq, v = a.partition("=")
+            if eq and k.lower() in ("duration", "rounding"):
+                opts[k.lower()] = v
+            else:
+                pos.append(a)
+        if len(pos) > 1:
+            raise VTTError("Usage: `!status resist <eid> <name> [level] "
+                           "[duration=<n>] [rounding=<floor|ceil|round>]`.")
+        rounding = opts.get("rounding")
+        if rounding is not None and rounding not in RESIST_ROUNDINGS:
+            raise VTTError(f"rounding= takes {', '.join(RESIST_ROUNDINGS)}.")
+        try:
+            level = int(pos[0]) if pos else 1
+            dur = int(opts["duration"]) if "duration" in opts else None
+        except ValueError:
+            raise VTTError("level and duration= must be whole numbers.")
+        e = m.entities[eid]
+        inst = e.status.get(sname)
+        at = m.status_level(inst) if inst is not None else level
+        affects = m.resist_affects(sname, at)
+        lines = []
+        folds = []
+        if affects in ("level", "both"):
+            folds.append(("level", level))
+        if affects in ("duration", "both") and dur is not None:
+            folds.append(("duration", dur))
+        if not folds:
+            folds.append(("level", level))
+        for what, base in folds:
+            f = m.resist_fold(eid, sname, base, rounding=rounding, level=at)
+            if f["immune"]:
+                lines = [f"`{eid}` is IMMUNE to `{sname}`."]
+                break
+            if not f["steps"]:
+                lines.append(f"`{eid}` has no resistance or weakness to "
+                             f"`{sname}`: {what} {base} lands as given.")
+                continue
+            lines.append(f"`{eid}` against `{sname}` ({what} {base}, "
+                         f"resistance changes its {affects}):")
+            for op, val, pr, src, tok, running in f["steps"]:
+                sym = {"sub": "-", "mul": "x", "div": "/"}[op]
+                lines.append(f"  {sym}{val:g} (`{tok}`, priority {pr:g}) "
+                             f"[{src}] → {running:g}")
+            lines.append(f"  → {f['rounding']}: {what} {f['value']}"
+                         + ("" if f["applies"] else
+                            " (below 1: it doesn't apply)"))
+        warns = m.resist_fold(eid, sname, level, level=at)["warnings"]
+        return await ctx.send("\n".join(lines + warns))
 
     if sub == "counter":
         # !status counter <eid> <name> <add|set> <value> [field]
@@ -20062,6 +20171,18 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         force = (sub == "force")
         if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
             return
+        rounding = None
+        rest_args = []
+        for a in args:
+            k, eq, v = a.partition("=")
+            if eq and k.lower() == "rounding":
+                if v not in RESIST_ROUNDINGS:
+                    return await ctx.send(
+                        f"❌ rounding= takes {', '.join(RESIST_ROUNDINGS)}.")
+                rounding = v
+            else:
+                rest_args.append(a)
+        args = rest_args
         eid = _resolve_eid(m, args[1])
         name = args[2]
         level = duration = None
@@ -20079,8 +20200,16 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for label, v in (("level", level), ("duration", duration)):
             if v is not None and v < 0:
                 return await ctx.send(f"❌ {label} can't be negative, got {v}.")
+        # Why an application to a unit already holding the status changes
+        # nothing (fully resisted; #232), judged before it runs.
+        pre_reason = None
+        if not force and eid in m.entities and name in m.entities[eid].status:
+            pre_reason = m.status_apply_block_reason(eid, name, level,
+                                                     duration, rounding)
+            pre_inst = copy.deepcopy(m.entities[eid].status[name])
         try:
-            event_log = m.apply_status(eid, name, level, duration, force=force)
+            event_log = m.apply_status(eid, name, level, duration, force=force,
+                                       rounding=rounding)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
@@ -20115,9 +20244,12 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     e, m._token_list(sdef.get("blocked_by")))
                 reason = f"`{name}` blocked by `{blockers[0]}`" if blockers else None
             else:
-                reason = m.status_apply_block_reason(eid, name, level)
+                reason = m.status_apply_block_reason(eid, name, level,
+                                                     duration, rounding)
             if reason:
                 return await ctx.send(f"`{eid}`: {reason} — no effect.{tail}")
+        if pre_reason and same_value(e.status.get(name), pre_inst):
+            return await ctx.send(f"`{eid}`: {pre_reason} — no effect.{tail}")
         inst = e.status.get(name, {})
         return await ctx.send(
             f"{verb} `{name}` to `{eid}` "

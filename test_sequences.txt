@@ -32422,3 +32422,194 @@ level formulas (the system's `4` tick still calls an unknown function).
 A prefab carries the
 definition with its levels into a match that lacks it, and a restart
 keeps them.
+
+SCENARIO 968 — Status resistance: statuses that grant resistance and immunity, never to themselves
+--------------------------------------------------------------------------------------------------
+
+!match new rs968 Antidote 10 10
+!match use rs968
+!status def poison
+!status stack poison replace
+!status def antidote
+!status stack antidote replace
+!status level antidote 1+ status_resist.poison 1
+!status level antidote 2+ status_resist.poison 2
+!status def ward
+!status data ward status_immune poison
+!ent add u Ulf 10 1 1
+!status apply u antidote 1
+!status apply u poison 3
+!assert "status_get('u', 'poison', 'level') == 2"
+!status apply u antidote 2
+!status apply u poison 3
+!assert "status_get('u', 'poison', 'level') == 1"
+!status resist u poison 3
+?? [status:antidote]
+!ent status u remove poison
+!status apply u ward
+!status apply u poison 3
+?? immune to `poison`
+!assert "not status_has('u', 'poison') and is_status_immune('u', 'poison')"
+!ent status u remove ward
+!status apply u poison 3
+!assert "status_has('u', 'poison')"
+!status data ward status_immune ward
+?? can't grant immunity to itself
+!status level antidote 3 status_resist.antidote 1
+?? can't grant resistance to itself
+!ent status u set antidote status_resist.antidote 1
+?? can't grant resistance to itself
+!eval "status_set('u', 'antidote', 'status_resist.antidote', 1)"
+?? can't grant resistance to itself
+!zone fill spring 5 5 6 6
+!zone grant spring ward status_immune=ward
+?? can't grant immunity to itself
+!status def chill
+!status tags chill cold
+!status stack chill add_level
+!status apply u chill 1
+!ent status u set chill status_immune tag:cold
+!status apply u chill 1
+?? grants itself immunity through `tag:cold`; skipped
+!assert "status_get('u', 'chill', 'level') == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. A status the unit holds grants
+resistance and immunity (#232): the antidote's level entries give flat
+1 poison resistance at level 1 and 2 from level 2 (poison 3 lands at 2,
+then 1), and `!status resist` names the antidote as the source. A ward
+whose data holds `status_immune: poison` makes the unit immune while it
+holds the ward; without it poison lands again. A status can't grant
+resistance or immunity to itself by name: the definition's data, a
+level entry, an instance key (`!ent status set`, status_set) and a
+zone grant's data are all refused. A `tag:` token that matches the
+status itself (chill tagged `cold`, holding `status_immune: tag:cold`)
+is skipped with a ⚠️ when chill is applied again, so the second chill
+still adds its level.
+
+SCENARIO 969 — Status resistance: flat and percentile records, stacking, GM-set order, rounding
+-------------------------------------------------------------------------------------------------
+
+!match new rs969 Yeti 10 10
+!match use rs969
+!status def freeze
+!status stack freeze replace
+!status def curse
+!status data curse status_resist.freeze.op mul
+!status data curse status_resist.freeze.value 2
+!ent add y Yeti 10 1 1
+!ent set_var y status_resist.freeze.op mul
+!ent set_var y status_resist.freeze.value 0.5
+!ent set_var y equipped.coat.status_resist.freeze.op mul
+!ent set_var y equipped.coat.status_resist.freeze.value 0.5
+!status apply y curse
+!status apply y freeze 8
+!assert "status_get('y', 'freeze', 'level') == 4"
+!ent set_var y equipped.ring.status_resist.freeze 1
+!assert "get(status_resisted('y', 'freeze', 8), 'level') == 3"
+!status resist y freeze 8
+?? -1 (`freeze`, priority 0) [equipped.ring] → 7
+?? → floor: level 3
+!system set default status_resist_op_priority mul:100,sub:0,div:0
+!status resist y freeze 8
+?? -1 (`freeze`, priority 0) [equipped.ring] → 3
+!system set default status_resist_op_priority sub:100,mul:0,div:0
+!ent delete_var y equipped.ring.status_resist.freeze
+!ent set_var y equipped.ring.status_resist.freeze.op sub
+!ent set_var y equipped.ring.status_resist.freeze.value 1
+!ent set_var y equipped.ring.status_resist.freeze.priority -200
+!assert "get(status_resisted('y', 'freeze', 8), 'level') == 3"
+!system set default status_resist_stack max
+!assert "get(status_resisted('y', 'freeze', 8), 'level') == 3"
+!system set default status_resist_stack first
+!assert "get(status_resisted('y', 'freeze', 8), 'level') == 3"
+!system set default status_resist_stack sum
+!ent set_var y equipped.ring.status_resist.freeze -2
+!assert "get(status_resisted('y', 'freeze', 8), 'level') == 5"
+!ent delete_var y equipped.ring
+!ent set_var y equipped.hide.status_resist.freeze.op div
+!ent set_var y equipped.hide.status_resist.freeze.value 3
+!assert "get(status_resisted('y', 'freeze', 9), 'level') == 1"
+!assert "get(status_resisted('y', 'freeze', 9, rounding='ceil'), 'level') == 2"
+!system set default status_resist_rounding round
+!assert "get(status_resisted('y', 'freeze', 9), 'level') == 2"
+!status resist_rounding freeze floor
+!assert "get(status_resisted('y', 'freeze', 9), 'level') == 1"
+!status apply y freeze 2
+?? fully resisted (level 2 -> 0)
+!assert "status_get('y', 'freeze', 'level') == 4"
+!status apply y freeze 3 rounding=ceil
+!assert "status_get('y', 'freeze', 'level') == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. Percentile resistance stacks by
+multiplying: the yeti's innate x0.5, its coat's x0.5 and the curse's x2
+weakness turn a level 8 freeze into 4. A flat ring (1) folds first by
+default (status_resist_op_priority `sub:100,...`): (8 - 1) x 0.5 x 0.5
+x 2 = 3.5, floored to 3, and `!status resist` lists each step with its
+source. Ordering the factors first gives 8 x 0.5 x 0.5 x 2 - 1 = 3; a
+record's own priority (-200) moves it after the factors the same way.
+status_resist_stack `max` keeps the strongest record of each op (x0.5,
+then -1: 3) and `first` the first of each. A negative flat value is a
+weakness: (8 + 2) x 0.5 x 0.5 x 2 = 5. A `div` 3 hide on top of x0.5 x0.5 x2
+turns 9 into 1.5: floor 1 by default, `rounding=` ceil 2, the
+status_resist_rounding rule `round` 2, and the definition's own
+`resist_rounding floor` wins over the rule (1). An application whose
+result is below 1 doesn't apply (freeze 2 → 0: the level 4 freeze
+stays), and an application's `rounding=ceil` lands freeze 3 at level 1.
+
+SCENARIO 970 — Status resistance on durations, forced applications, formulas and zone grants
+----------------------------------------------------------------------------------------------
+
+!match new rs970 Burn 10 10
+!match use rs970
+!status def burn
+!status stack burn replace
+!status resist_affects burn duration
+!ent add f Fay 10 1 1
+!ent set_var f status_resist.burn 2
+!status apply f burn 3 5
+!assert "status_get('f', 'burn', 'level') == 3 and status_get('f', 'burn', 'duration') == 3"
+!status apply f burn 3 2
+?? fully resisted (duration 2 -> 0)
+!assert "status_get('f', 'burn', 'duration') == 3"
+!status apply f burn 4
+!assert "status_get('f', 'burn', 'level') == 4"
+!status resist_affects burn both
+!status apply f burn 4 6
+!assert "status_get('f', 'burn', 'level') == 2 and status_get('f', 'burn', 'duration') == 4"
+!assert "status_resisted('f', 'burn', 4, 6) == {'immune': False, 'applies': True, 'level': 2, 'duration': 4}"
+!status force f burn 5
+!assert "status_get('f', 'burn', 'level') == 5"
+!ent delete_var f status_resist.burn
+!ent set_var f status_resist.burn.op mul
+!ent set_var f status_resist.burn.value 2
+!status force f burn 3 3
+!assert "status_get('f', 'burn', 'level') == 3 and status_get('f', 'burn', 'duration') == 3"
+!assert "status_resist_of('f', 'burn') == 0"
+!ent set_var f hp "$(get(status_resisted('f', 'burn', 2, 3), 'level'))"
+!assert "entity[f].hp == 4"
+!ent set_var f hp "$(status_apply('f', 'burn', 9))"
+?? banned in a $() inline argument
+!assert "status_get('f', 'burn', 'level') == 3"
+!eval "status_apply('f', 'burn', 3, 3, rounding='ceil') and status_get('f', 'burn', 'level')"
+?? = `6`
+!status def frost
+!ent add g Golem 10 4 4
+!ent set_vars g footprint_w=2 footprint_h=2
+!ent set_var g status_resist.frost.op mul
+!ent set_var g status_resist.frost.value 0.5
+!zone fill cold 4 4 4 4
+!zone grant cold frost level=4
+!assert "status_get('g', 'frost', 'level') == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. A burn set to `resist_affects
+duration` keeps its level and loses turns to flat resistance 2 (level 3
+for 5 turns lands as level 3 for 3); a duration of 2 resists down to 0
+and doesn't apply; an application without a duration leaves the level
+alone. With `both`, level 4 for 6 lands as level 2 for 4, and
+status_resisted reports the same without applying. A forced
+application ignores resistance and a x2 weakness alike (level 5, then
+3 for 3). status_resisted works in a `$()` argument (level 2 against
+x2 = 4), status_apply there is refused and changes nothing, and
+status_apply's `rounding=` reaches the fold (3 x 2 = 6). A zone grant
+goes through the same resistance: a level 4 frost on a 2x2 golem with
+x0.5 frost resistance lands at 2.

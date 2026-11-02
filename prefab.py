@@ -615,6 +615,11 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
     for k in ("tick", "display"):
         if entry.get(k) is not None and not isinstance(entry[k], str):
             raise VTTError(f"{who}: `{k}` must be text.")
+    for k, choices in (("resist_affects", logic.RESIST_AFFECTS),
+                       ("resist_rounding", logic.RESIST_ROUNDINGS)):
+        if entry.get(k) is not None and entry[k] not in choices:
+            raise VTTError(f"{who}: `{k}` must be one of "
+                           f"{', '.join(choices)}.")
     hooks = entry.get("hooks", {})
     if not isinstance(hooks, dict) or any(
             k not in logic.STATUS_DEF_HOOKS.values() or not isinstance(v, str)
