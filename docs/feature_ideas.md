@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #234, #257, #258, #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #257, #258, #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -337,10 +337,6 @@ or rejects one, it moves to "Off the list".
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
 - **#34 Session recap export.** The event log as markdown, filtered by POV, for posting a session summary.
-- **#136 Status-granting zones (auras).**
-  - A zone field `grants_status` puts the status on units inside the zone and removes it when they leave.
-  - It follows moves, zone shifts and growth, anchored auras and footprints.
-  - "Allies within 2 of the banner get +1 armor" becomes one zone setting; no enter/exit hook pair to write.
 - **#137 Zone-of-control events.**
   - A hook fires on a standing unit when a hostile enters or leaves its reach (a `reach` var, footprint-aware, checked per step).
   - The GM's passive decides what happens: opportunity attacks, engagement penalties.
@@ -533,7 +529,7 @@ or rejects one, it moves to "Off the list".
 
 - **Formula ergonomics:** #89, #90, #194
 - **Status bundle:** #56, #114, #115, #116, #150
-- **Zone bundle:** #117, #118, #119, #136
+- **Zone bundle:** #117, #118, #119
 - **Discord table play:** #128, #148, #182, then #28 and #198
 - **Tactical combat:** #16 → #24 → #137 → #36
 - **Scaling before a public rollout:** #177, #178, #197

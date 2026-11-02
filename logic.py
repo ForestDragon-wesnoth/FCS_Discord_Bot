@@ -181,7 +181,7 @@ STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
 # The causes the on_status_removed bindings and a definition's on_removed
 # hook read as `removed_by`.
 STATUS_REMOVAL_CAUSES = ("expired", "dispel", "transfer", "removes",
-                         "removed")
+                         "zone", "removed")
 # A status definition's own hooks (`!status hook`), by the passive hook
 # each one follows.
 STATUS_DEF_HOOKS = {"on_status_added": "on_added",
@@ -1588,6 +1588,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entity the first time it moves (ids are the only entity identity "
             "the engine has). Avoid reusing the id of a despawned anchor, or "
             "use 'delete'/'freeze' instead."
+        ),
+    },
+    "zone_status_grant_bodies": {
+        "default": "root",
+        "schema": {"type": "enum", "choices": ["root", "all"]},
+        "desc": (
+            "Which units of a body a status-granting zone (#136, `!zone "
+            "grant`) puts its statuses on. 'root' (default): the body's root "
+            "unit only, once, while any cell of the body (its footprint, a "
+            "located part's or a region part's cells) is inside the zone. "
+            "'all': every unit with a cell inside, located and region parts "
+            "included; a glued part follows the unit it is glued to. A zone "
+            "or zone definition overrides it with `!zone grant_bodies` / "
+            "`!zone def grant_bodies`. Hidden riders (off the ground) and "
+            "dead units never receive grants."
         ),
     },
     # ---- mounts / vehicles ----
@@ -6355,6 +6370,103 @@ def normalize_zone_def(raw: Any) -> Dict[str, Any]:
     for key in ZONE_LOOK_FIELDS:
         if zone_look_value(key, raw.get(key)):
             out[key] = copy.deepcopy(raw[key])
+    out.update(zone_grant_fields(raw))
+    return out
+
+
+# ---- status-granting zones (#136) ----------------------------------------
+# A zone (or zone definition) may carry `grants` (status name -> {level,
+# data, linger}), `grant_condition` (an expression, self = the unit, which
+# must hold for the unit to receive the grants) and `grant_bodies` (root /
+# all, else the zone_status_grant_bodies rule). Match.sync_zone_grants puts
+# the statuses on the units inside and takes them off once no granting zone
+# covers them. A granted status instance carries ZONE_GRANT_KEY (the zones
+# holding it) and ZONE_LINGER_KEY (the turns it lingers once they all let
+# go); a lingering one carries ZONE_LINGERING_KEY until a zone takes it
+# back. A status a unit got some other way never carries the key, so a
+# zone never takes it over or removes it.
+ZONE_GRANT_FIELDS: Tuple[str, ...] = ("grants", "grant_condition",
+                                      "grant_bodies")
+ZONE_GRANT_BODIES = ("root", "all")
+ZONE_GRANT_KEY = "__zone_grant"
+ZONE_LINGER_KEY = "__zone_linger"
+ZONE_LINGERING_KEY = "__zone_lingering"
+# Passes one sync makes at most when the status hooks it fires move units
+# (each move asks for another pass).
+ZONE_GRANT_PASSES = 8
+
+
+def check_zone_grant(status: Any, entry: Any) -> Dict[str, Any]:
+    """Grant `entry` for status `status` in its stored shape ({level, data,
+    linger}, each only when set); raises VTTError on a malformed one."""
+    check_status_name(status)
+    if not isinstance(entry, dict):
+        raise VTTError(f"grant `{status}` must be a dict of level / data / "
+                       f"linger.")
+    unknown = sorted(set(entry) - {"level", "data", "linger"})
+    if unknown:
+        raise VTTError(f"grant `{status}`: unknown field(s) "
+                       f"{', '.join(unknown)} (level, data, linger).")
+    out: Dict[str, Any] = {}
+    for key in ("level", "linger"):
+        v = entry.get(key)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or v != v or v in (float("inf"), float("-inf")) \
+                or int(v) != v:
+            raise VTTError(f"grant `{status}`: {key} must be a whole number, "
+                           f"not {v!r}.")
+        if key == "linger" and v < 0:
+            raise VTTError(f"grant `{status}`: linger can't be negative.")
+        out[key] = int(v)
+    data = entry.get("data")
+    if data is not None:
+        if not isinstance(data, dict):
+            raise VTTError(f"grant `{status}`: data must be a dict.")
+        bad = sorted(k for k in data if str(k) in (
+            "level", ZONE_GRANT_KEY, ZONE_LINGER_KEY, ZONE_LINGERING_KEY))
+        if bad:
+            raise VTTError(f"grant `{status}`: data can't set "
+                           f"{', '.join(bad)} (`level` is its own field).")
+        if data:
+            out["data"] = _own_value(data)
+    return out
+
+
+def without_zone_grants(status: Any) -> Any:
+    """A unit dict's `status` without the statuses a zone holds (a lingering
+    one stays: it is the unit's own now). Library saves and snapshots leave
+    them out: the zone holds them, and it gives them back where it covers
+    the unit."""
+    if not isinstance(status, dict):
+        return status
+    return {k: v for k, v in status.items()
+            if not (isinstance(v, dict) and ZONE_GRANT_KEY in v)}
+
+
+def zone_grant_fields(raw: Any) -> Dict[str, Any]:
+    """The usable #136 grant fields of zone / definition dict `raw`, in
+    their stored shape; malformed ones are dropped (a file from an older
+    build or edited by hand loads)."""
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, dict):
+        return out
+    grants = raw.get("grants")
+    if isinstance(grants, dict):
+        kept = {}
+        for sname, entry in grants.items():
+            try:
+                kept[sname] = check_zone_grant(sname, entry)
+            except VTTError:
+                continue
+        if kept:
+            out["grants"] = kept
+    cond = raw.get("grant_condition")
+    if isinstance(cond, str) and cond.strip():
+        out["grant_condition"] = cond
+    if raw.get("grant_bodies") in ZONE_GRANT_BODIES:
+        out["grant_bodies"] = raw["grant_bodies"]
     return out
 
 
@@ -8729,6 +8841,7 @@ class Map:
             out["def"] = z["def"]
         if z.get("tags"):
             out["tags"] = list(z["tags"])
+        out.update(copy.deepcopy(zone_grant_fields(z)))
         # Aura binding (entity-anchored zone), if present.
         if z.get("anchor"):
             out["anchor"] = z["anchor"]
@@ -8771,6 +8884,7 @@ class Map:
         tags = normalize_tags(zdef.get("tags"))
         if tags:
             z["tags"] = tags
+        z.update(zone_grant_fields(zdef))
         # Restore an aura binding. The cells were serialized at their
         # last-stamped positions (and re-stamp on the next anchor move),
         # so no recompute is needed at load time.
@@ -9423,6 +9537,18 @@ class Match:
     # passives and a definition's own hooks), status_hook_recursion_limit.
     _status_event_depth: int = field(default=0, repr=False)
     _status_event_warned: bool = field(default=False, repr=False)
+    # Status-granting zones (#136): a sync is running (a move its status
+    # hooks make asks for another pass instead of nesting one) / a pass was
+    # asked for while it ran.
+    _grant_syncing: bool = field(default=False, repr=False)
+    _grant_dirty: bool = field(default=False, repr=False)
+    # Counts the changes syncs made (the command layer tells from it whether
+    # its end-of-command sync changed the match).
+    _grant_changes: int = field(default=0, repr=False)
+    # The condition errors shown during the running command (its log sink's
+    # id, the lines).
+    _grant_warned: Tuple[Any, Set[str]] = field(
+        default_factory=lambda: (None, set()), repr=False)
     # Buffer of warning log lines accumulated during a var-event chain.
     # The chain can fire nested writes whose warnings emerge deep in the
     # call stack — they need to bubble up to the top-level caller for
@@ -9884,6 +10010,321 @@ class Match:
                     z["def"] = new
                     n += 1
         return n
+
+    # ---- status-granting zones (#136) ------------------------------------
+    def zone_grants_of(self, z: Any) -> Dict[str, Dict[str, Any]]:
+        """Zone dict `z`'s grants (status -> {level, data, linger}): its
+        definition's, each replaced by the zone's own grant of that status
+        (read live, like hooks)."""
+        out: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(z, dict):
+            return out
+        for src in (self.zone_def_dict(z) or {}, z):
+            g = src.get("grants")
+            if isinstance(g, dict):
+                for sname, entry in g.items():
+                    if isinstance(entry, dict):
+                        out[sname] = entry
+        return out
+
+    def zone_grant_setting(self, z: Any, key: str) -> Any:
+        """Zone dict `z`'s `grant_condition` (None when unset) or
+        `grant_bodies` (else the zone_status_grant_bodies rule): its own,
+        else its definition's."""
+        srcs = (z, self.zone_def_dict(z) or {}) if isinstance(z, dict) else ()
+        for src in srcs:
+            v = src.get(key)
+            if key == "grant_bodies" and v in ZONE_GRANT_BODIES:
+                return v
+            if key == "grant_condition" and isinstance(v, str) and v.strip():
+                return v
+        if key == "grant_bodies":
+            v = self.rules.get("zone_status_grant_bodies", "root")
+            return v if v in ZONE_GRANT_BODIES else "root"
+        return None
+
+    def _grant_eligible(self, e: Optional["Entity"]) -> bool:
+        """Whether unit `e` can hold a zone's grant: alive and on the
+        ground (a hidden rider is inside its vehicle)."""
+        return (e is not None and e.id in self.entities and e.is_alive
+                and not e.is_hidden_rider)
+
+    def _zone_grant_targets(self, mp: "Map", cells: Any, mode: str,
+                            scope: Optional[Set[str]] = None) -> List[str]:
+        """The units zone cells `cells` of map `mp` grant to: per `mode`
+        the body roots with any covered cell (`root`), or every unit with a
+        covered cell plus the glued parts of those (`all`). `scope` (whole
+        bodies) limits the units looked at."""
+        units = [e for e in self.entities.values() if e.map == mp.name
+                 and (scope is None or e.id in scope)]
+        hit: Set[str] = set()
+        for e in units:
+            if e.is_glued_part or not self._grant_eligible(e):
+                continue
+            if not any(c in cells for c in self.entity_cells(e)):
+                continue
+            if mode == "root":
+                r = self.body_root(e)
+                if self._grant_eligible(r):
+                    hit.add(r.id)
+            else:
+                hit.add(e.id)
+        if mode == "all":
+            for e in units:
+                if not e.is_glued_part or not self._grant_eligible(e):
+                    continue
+                p, seen = e, {e.id}
+                while p.is_glued_part and p.part_of in self.entities \
+                        and p.part_of not in seen:
+                    p = self.entities[p.part_of]
+                    seen.add(p.id)
+                if p.id in hit:
+                    hit.add(e.id)
+        return sorted(hit)
+
+    def _grant_condition_holds(self, cond: str, eid: str, zname: str,
+                               mp: "Map", errors: Dict[str, Any]) -> bool:
+        """Grant condition `cond` for unit `eid` and zone `zname` (self =
+        the unit; zone_name and zone_map bound). One that fails reads as
+        not met; `errors` keeps, per zone, its first error and the units
+        it failed for."""
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        ctx = EvalCtx(this=self.current_entity_id(), target=eid,
+                      extras={"zone_name": zname, "zone_map": mp.name})
+        engine = errors.get(None)
+        if engine is None:
+            engine = errors[None] = FormulaEngine(self)
+        try:
+            return bool(engine.eval_expression(cond, ctx))
+        except FormulaError as ex:
+            first, units = errors.setdefault(zname, (str(ex), []))
+            if eid not in units:
+                units.append(eid)
+            return False
+
+    def _desired_zone_grants(self, errors: Dict[str, Any],
+                             scope: Optional[Set[str]] = None
+                             ) -> Dict[str, Dict[str, List[str]]]:
+        """unit id -> status -> the zones granting it now (sorted), for the
+        units in `scope` (None = all)."""
+        want: Dict[str, Dict[str, List[str]]] = {}
+        for mp in self.maps.values():
+            for zname in sorted(mp.zones):
+                z = mp.zones.get(zname)
+                grants = self.zone_grants_of(z)
+                if not grants or not z.get("cells"):
+                    continue
+                cond = self.zone_grant_setting(z, "grant_condition")
+                for eid in self._zone_grant_targets(
+                        mp, z["cells"], self.zone_grant_setting(
+                            z, "grant_bodies"), scope):
+                    if scope is not None and eid not in scope:
+                        continue
+                    if cond is not None and not self._grant_condition_holds(
+                            cond, eid, zname, mp, errors):
+                        continue
+                    per = want.setdefault(eid, {})
+                    for sname in grants:
+                        per.setdefault(sname, []).append(zname)
+        return want
+
+    def _grant_linger(self, zones: List[str], status: str) -> int:
+        """The longest linger the grants of `status` in `zones` give."""
+        best = 0
+        for zn in zones:
+            g = self.zone_grants_of(self.find_zone(zn)).get(status) or {}
+            lv = g.get("linger")
+            if isinstance(lv, int) and not isinstance(lv, bool):
+                best = max(best, lv)
+        return best
+
+    def grant_scope(self, eid: str) -> Optional[Set[str]]:
+        """The units a move of `eid` can change the zone grants of: its
+        whole carried body; None (every unit) when that body anchors an
+        aura. A per-step sync looks at these only (a condition costs a
+        formula per unit); the end-of-command sync looks at everyone."""
+        e = self.entities.get(eid)
+        if e is None:
+            return set()
+        ids = {u.id for u in self.carried_body(self.body_root(e))}
+        for mp in self.maps.values():
+            for z in mp.zones.values():
+                if isinstance(z, dict) and z.get("anchor") in ids:
+                    return None
+        return ids
+
+    def sync_zone_grants(self, scope: Optional[Set[str]] = None
+                         ) -> List[str]:
+        """Put every status-granting zone's statuses on the units it covers
+        now and take them off the units no granting zone covers (#136).
+        Runs per step of a move, after a zone's cells or grants change, on
+        spawn, death and revive, and after each command that changed the
+        match. Returns the log (status hook output, warnings). A move its
+        hooks make asks for another pass instead of nesting one; at most
+        ZONE_GRANT_PASSES passes. `scope` limits it to those units (None =
+        every unit); a pass a nested move asked for looks at every unit."""
+        if self._grant_syncing:
+            self._grant_dirty = True
+            return []
+        if not self._grants_present():
+            return []
+        log: List[str] = []
+        errors: Dict[str, Any] = {}
+        self._grant_syncing = True
+        try:
+            for i in range(ZONE_GRANT_PASSES):
+                self._grant_dirty = False
+                log += self._sync_zone_grants_pass(
+                    errors, scope if i == 0 else None)
+                if not self._grant_dirty:
+                    break
+            else:
+                log.append(f"⚠️ Zone grants didn't settle after "
+                           f"{ZONE_GRANT_PASSES} passes (status hooks keep "
+                           f"moving units); the next command tries again.")
+        finally:
+            self._grant_syncing = False
+            self._grant_dirty = False
+        # Not in a team-view channel: a condition's error names units. Once
+        # per command (a walk syncs per step). (errors[None] is the pass's
+        # formula engine.)
+        errors.pop(None, None)
+        if errors and self.command_pov() is None:
+            sink = FORMULA_LOG_SINK.get()
+            key = id(sink) if sink is not None else None
+            if self._grant_warned[0] != key or key is None:
+                self._grant_warned = (key, set())
+            for zname, (first, units) in sorted(
+                    (k, v) for k, v in errors.items() if k is not None):
+                line = (f"⚠️ zone `{zname}`: its grant_condition failed for "
+                        + ", ".join(f"`{u}`" for u in sorted(units))
+                        + f" ({first}); no grant.")
+                if line not in self._grant_warned[1]:
+                    self._grant_warned[1].add(line)
+                    log.append(line)
+        return log
+
+    def _grants_present(self) -> bool:
+        """Whether any zone grants or any unit holds a zone's grant: the
+        fast path of sync_zone_grants."""
+        for mp in self.maps.values():
+            for z in mp.zones.values():
+                if self.zone_grants_of(z):
+                    return True
+        for e in self.entities.values():
+            for inst in e.status.values():
+                if isinstance(inst, dict) and (ZONE_GRANT_KEY in inst):
+                    return True
+        return False
+
+    def _sync_zone_grants_pass(self, errors: Dict[str, Any],
+                               scope: Optional[Set[str]]) -> List[str]:
+        want = self._desired_zone_grants(errors, scope)
+        holders = {e.id for e in self.entities.values()
+                   if (scope is None or e.id in scope)
+                   and any(isinstance(i, dict) and ZONE_GRANT_KEY in i
+                           for i in e.status.values())}
+        log: List[str] = []
+        for eid in sorted(holders | set(want)):
+            e = self.entities.get(eid)
+            if e is None:
+                continue
+            per = want.get(eid, {})
+            # What a zone holds and none covers any more: removed, or left
+            # lingering for its zones' longest linger.
+            for sname in sorted(e.status):
+                if eid not in self.entities:
+                    break
+                inst = e.status.get(sname)
+                if not isinstance(inst, dict) or ZONE_GRANT_KEY not in inst:
+                    continue
+                zones = per.get(sname, [])
+                if zones:
+                    linger = self._grant_linger(zones, sname)
+                    if inst.get(ZONE_GRANT_KEY) != zones:
+                        inst[ZONE_GRANT_KEY] = list(zones)
+                        self._grant_changes += 1
+                    if inst.get(ZONE_LINGER_KEY, 0) != linger:
+                        self._grant_changes += 1
+                        if linger:
+                            inst[ZONE_LINGER_KEY] = linger
+                        else:
+                            inst.pop(ZONE_LINGER_KEY, None)
+                    continue
+                before = copy.deepcopy(inst)
+                self._grant_changes += 1
+                linger = inst.get(ZONE_LINGER_KEY)
+                if isinstance(linger, int) and not isinstance(linger, bool) \
+                        and linger > 0:
+                    after = {k: v for k, v in inst.items()
+                             if k not in (ZONE_GRANT_KEY, ZONE_LINGER_KEY)}
+                    after["duration"] = linger
+                    after[ZONE_LINGERING_KEY] = True
+                    e.status[sname] = after
+                    log += self._emit_status_diff(eid, sname, before,
+                                                  copy.deepcopy(after))
+                else:
+                    del e.status[sname]
+                    log += self._emit_status_diff(eid, sname, before, None,
+                                                  removed_by="zone")
+            # What a covering zone grants and the unit lacks.
+            for sname in sorted(per):
+                e = self.entities.get(eid)
+                if e is None or not self._grant_eligible(e):
+                    break
+                zones = per[sname]
+                inst = e.status.get(sname)
+                linger = self._grant_linger(zones, sname)
+                if isinstance(inst, dict) and ZONE_GRANT_KEY in inst:
+                    continue
+                if isinstance(inst, dict) and inst.get(ZONE_LINGERING_KEY):
+                    # A lingering grant is the zone's again.
+                    before = copy.deepcopy(inst)
+                    self._grant_changes += 1
+                    inst.pop(ZONE_LINGERING_KEY, None)
+                    inst.pop("duration", None)
+                    inst[ZONE_GRANT_KEY] = list(zones)
+                    if linger:
+                        inst[ZONE_LINGER_KEY] = linger
+                    log += self._emit_status_diff(eid, sname, before,
+                                                  copy.deepcopy(inst))
+                    continue
+                if inst is not None:
+                    continue    # its own status: never taken over
+                if e.is_part and sname in self._part_status_names(
+                        e, "__status_redirect", "part_status_redirect"):
+                    continue    # it would land on the parent
+                grant = self.zone_grants_of(self.find_zone(zones[0])).get(
+                    sname) or {}
+                sdef = self.status_definitions.get(sname) or {}
+                seed = (copy.deepcopy(sdef.get("data"))
+                        if isinstance(sdef.get("data"), dict) else {})
+                seed.update(copy.deepcopy(grant.get("data") or {}))
+                seed[ZONE_GRANT_KEY] = list(zones)
+                if linger:
+                    seed[ZONE_LINGER_KEY] = linger
+                log += self.apply_status(eid, sname, grant.get("level"),
+                                         seed_data=seed)
+                if e.status.get(sname) is not None:
+                    self._grant_changes += 1
+        return log
+
+    def strip_zone_grants(self, e: "Entity") -> None:
+        """Drop the statuses a zone holds on `e` without hooks (a dying
+        unit: its corpse doesn't keep them)."""
+        for sname in [n for n, i in e.status.items()
+                      if isinstance(i, dict) and ZONE_GRANT_KEY in i]:
+            del e.status[sname]
+
+    def rename_zone_in_grants(self, old: str, new: str) -> None:
+        """A renamed zone's name in the grant markers of every unit."""
+        for e in self.entities.values():
+            for inst in e.status.values():
+                zs = inst.get(ZONE_GRANT_KEY) if isinstance(inst, dict) \
+                    else None
+                if isinstance(zs, list) and old in zs:
+                    inst[ZONE_GRANT_KEY] = sorted(
+                        {new if z == old else z for z in zs})
 
     def rename_tile_template(self, old: str, new: str) -> int:
         """Rename tile template `old` to `new`, and every tile placed from
@@ -16207,6 +16648,14 @@ class Match:
                 if self._rename_status_refs(body.get("vars"), old, new, ""):
                     hit = True
             counts["corpses"] += hit
+        # The zones and zone definitions granting it (#136).
+        counts["zone grants"] = 0
+        for z in ([z for mp in self.maps.values() for z in mp.zones.values()]
+                  + list(self.zone_definitions.values())):
+            g = z.get("grants") if isinstance(z, dict) else None
+            if isinstance(g, dict) and old in g and new not in g:
+                z["grants"] = rename_key(g)
+                counts["zone grants"] += 1
         return counts
 
     def _rename_status_refs(self, node: Any, old: str, new: str,
@@ -17421,6 +17870,11 @@ class Match:
         self._restamp_riders_for(entity_id)
         if snake:
             self._restamp_segments(entity_id)
+        # Status-granting zones (#136) follow the move and the auras it
+        # carried, before the passives observe it.
+        log: List[str] = self.sync_zone_grants(self.grant_scope(entity_id))
+        if entity_id not in self.entities:
+            return log
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -17438,7 +17892,6 @@ class Match:
         else:
             self.log_event("move", entity=entity_id, name=e.name,
                            from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
-        log: List[str] = []
         # The passives are bounded by move_hook_recursion_limit (one moving
         # its unit again fires the next move inside itself) and by
         # move_hook_event_limit (this move counts); the re-stamps above
@@ -17488,6 +17941,10 @@ class Match:
             self._advance_snake(entity_id, from_x, from_y)
             self._restamp_parts_for(entity_id)
             self._restamp_segments(entity_id)
+        # Status-granting zones (#136): per step, as on_enter / on_exit.
+        log: List[str] = self.sync_zone_grants(self.grant_scope(entity_id))
+        if entity_id not in self.entities:
+            return log
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -17497,7 +17954,6 @@ class Match:
             "hook_name": "on_entity_step",
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
-        log: List[str] = []
         with move_hook_level(self.rules, log, self.id) as fire:
             if fire:
                 self._run_ordered(engine, ctx, entity_id,
@@ -18842,6 +19298,10 @@ class Match:
                                dead_x, dead_y, dead_vars, map_name=dead_map)
                 return log
             result = self._effective_death_result(e)
+            # What a zone held on the body goes with its life (#136): the
+            # corpse doesn't keep it.
+            for u in [e] + self.entity_part_subtree(entity_id):
+                self.strip_zone_grants(u)
             if result == "corpse":
                 self._store_corpse(e)   # also snapshots the parts
             # A part that carries riders (a howdah, a train car) dies with
@@ -18883,6 +19343,8 @@ class Match:
             log.extend(self._mount_vehicle_died(pid, pvars, pbox, pmap))
         log.extend(self._map_vehicle_died(entity_id, dead_vars, dead_box,
                                           dead_map))
+        # An aura it anchored went with it or froze (#136).
+        log.extend(self.sync_zone_grants())
         return log
 
     _MSG_FMT_RE = re.compile(r"\{([\w.]+)\}")
@@ -19859,6 +20321,7 @@ class Match:
         d = e.to_dict()
         for k in ("id", "x", "y", "map", "part_of", "mounted_on", "mount_slot"):
             d.pop(k, None)
+        d["status"] = without_zone_grants(d.get("status"))
         ax, ay = e.x, e.y
 
         def local(i: Any) -> Any:
@@ -19880,6 +20343,7 @@ class Match:
             # its offset from the parent's anchor.
             p = {k: v for k, v in part.to_dict().items()
                  if k not in ("map", "mounted_on", "mount_slot")}
+            p["status"] = without_zone_grants(p.get("status"))
             p["id"] = local(p.get("id"))
             p["part_of"] = local(p.get("part_of"))
             pv = p.get("vars")
@@ -25143,6 +25607,12 @@ class MatchManager:
             m._mark_turn_order_dirty("turn-order rules changed")
         if old and not old.get("atb_enabled") and m.rules.get("atb_enabled"):
             m.reveals_to_turn_clock()
+        # Which units of a body hold zone grants changed (#136): they settle
+        # now, in every match on the system (a replay of the edit's journal
+        # entry settles the same way).
+        if old and old.get("zone_status_grant_bodies") != m.rules.get(
+                "zone_status_grant_bodies"):
+            m.surface_log(m.sync_zone_grants())
         return notes
 
     def refresh_match_rules(self, system_name: str,

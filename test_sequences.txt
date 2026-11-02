@@ -32022,3 +32022,220 @@ team grouping, two team slots tied on initiative go by
 turnorder_tiebreak_var read on each team's leading member (red's dex 9
 first, then blue's once the values swap). An `!eval` refused part-way
 (past formula_loop_limit) takes back the writes it made before.
+
+SCENARIO 961 — Status-granting zones: entering, leaving, per step, linger, a status of its own
+-----------------------------------------------------------------------------------------------
+
+!match new gz961 Grants 12 8
+!match use gz961
+!status def bless
+!status hook bless on_removed "entity[self].why = removed_by"
+!ent add a Ann 10 1 2
+!ent add b Bob 10 8 6
+!ent add c Cid 10 4 6
+!ent add d Dee 10 10 6
+!zone fill shrine 4 1 5 6
+!zone grant shrine bless level=2 power=3
+?? grants `bless` (level 2, data {"power": 3})
+!assert "status_has('c', 'bless') and status_get('c', 'bless', 'level') == 2 and status_get('c', 'bless', 'power') == 3"
+!assert "not status_has('a', 'bless') and not status_has('b', 'bless')"
+!ent set_var a trail 0
+!passive add a step on_entity_step "entity[self].trail = entity[self].trail * 10 + status_has(self, 'bless')"
+!ent move a 6 right
+!assert "entity[a].trail == 1100 and entity[a].why == 'zone' and not status_has('a', 'bless')"
+!ent tp b 5 5
+!assert "status_has('b', 'bless')"
+!zone shift shrine 3 0
+!assert "status_has('a', 'bless') and not status_has('b', 'bless') and not status_has('c', 'bless') and entity[b].why == 'zone'"
+!zone grant shrine bless level=2 linger=2
+!zone shift shrine -3 0
+!assert "status_get('a', 'bless', 'duration') == 2 and status_has('b', 'bless') and status_has('c', 'bless')"
+!zone shift shrine 3 0
+!ent status a info bless
+?! "duration"
+?? "__zone_grant"
+!assert "status_get('b', 'bless', 'duration') == 2"
+!ent status d add bless
+!ent tp d 8 5
+!ent status d info bless
+?! __zone_grant
+!ent tp d 10 6
+!assert "status_has('d', 'bless')"
+!zone ungrant shrine bless
+?? no longer grants `bless`
+!assert "status_get('a', 'bless', 'duration') == 2"
+!undo command
+!ent status a info bless
+?! "duration"
+
+Expected: `!zone grant` makes the zone put `bless` (level 2, power 3)
+on every unit inside: Cid, standing in it, has it at once. Ann's walk
+through the zone's two columns holds it on exactly those two steps (the
+on_entity_step trail reads 1100), and leaving removes it with
+removed_by `zone`. Teleporting in and a zone shift onto or off units
+move the grant with them. With `linger=2` a unit the zone leaves keeps
+the status with a duration of 2 (counted down by its own tick), and a
+zone covering it again takes it back (no duration). A status the unit
+got itself (Dee's `!ent status add`) is never taken over, and leaving
+the zone leaves it. Ungranting takes it off the units it held it on
+(lingering per the grant); `!undo command` brings the grant back.
+
+SCENARIO 962 — Status-granting zones: whole bodies, root or every unit, definitions read live
+--------------------------------------------------------------------------------------------
+
+!match new gz962 Bodies 12 10
+!match use gz962
+!status def bless
+!ent add mech Mech 50 2 2
+!ent set_vars mech footprint_w=2 footprint_h=2
+!part add mech turret turret 30 30
+!part locate turret 7 2
+!part add mech core core 10 10
+!zone fill aura 5 1 10 6
+!zone grant aura bless
+!assert "status_has('mech', 'bless') and not status_has('turret', 'bless') and not status_has('core', 'bless')"
+!zone grant_bodies aura all
+?? every unit with a cell inside
+!assert "status_has('turret', 'bless') and not status_has('mech', 'bless') and not status_has('core', 'bless')"
+!ent move mech 2 right
+!assert "status_has('mech', 'bless') and status_has('core', 'bless') and status_has('turret', 'bless')"
+!zone grant_bodies aura -
+!system set default zone_status_grant_bodies all
+!assert "status_has('mech', 'bless') and status_has('core', 'bless') and status_has('turret', 'bless')"
+!system set default zone_status_grant_bodies root
+!assert "status_has('mech', 'bless') and not status_has('core', 'bless') and not status_has('turret', 'bless')"
+!zone def new banner
+!zone def grant banner bless level=3
+!zone def grant banner ward
+!zone def grant_bodies banner all
+!status def ward
+!ent add pawn Pawn 10 9 9
+!zone new flag def=banner
+!zone fill flag 8 8 10 10
+!assert "status_get('pawn', 'bless', 'level') == 3 and status_has('pawn', 'ward')"
+!zone grant flag bless level=5
+!zone info flag
+?? "grants"
+?? "from_def"
+!eval "zone_grants('flag')"
+?? 'bless': {'level': 5}
+?? 'ward': {}
+!zone def ungrant banner ward
+!assert "not status_has('pawn', 'ward') and status_has('pawn', 'bless')"
+!zone ungrant flag bless
+!assert "status_has('pawn', 'bless')"
+!zone def grant_bodies banner -
+!zone def info banner
+?! grant_bodies
+!prefab save flagroom 8 8 10 10
+!match new gz962b Copy 12 10
+!match use gz962b
+!prefab stamp flagroom 2 2
+!status list
+?? `bless`
+!assert "status_get('pawn', 'bless', 'level') == 3 and status_get('pawn', 'bless', '__zone_grant') == ['flag']"
+
+Expected: under the default (`root`) a two-by-two mech gets the grant
+once, on its root, because its located turret stands in the aura,
+though its own cells don't. `grant_bodies all` grants every unit with a
+cell inside instead: the turret alone, then after the mech steps in
+the mech, its glued core (which follows the mech) and the turret. The
+zone_status_grant_bodies rule does the same for a zone without its own
+setting. A zone definition's grants and bodies setting are read live by
+its zones; a zone's own grant of a status replaces the definition's
+(`zone_grants` shows level 5 from the zone and ward from the
+definition), and ungranting on the definition takes ward off the
+pawn. The pawn keeps bless (granted at level 3 while the zone's own
+level-5 grant came later: a held grant isn't re-applied). A prefab of
+the flag's corner carries the zone, its definition and the `bless`
+definition it grants; the stamped pawn arrives without the zone's
+status (a prefab leaves it out) and the stamped zone grants it again.
+
+SCENARIO 963 — Status-granting zones: an aura's condition, deaths, spawns, revives, a restart
+---------------------------------------------------------------------------------------------
+
+!match new gz963 Banner 12 10
+!match use gz963
+!status def inspired
+!ent add knight Knight 20 5 5
+!ent add ally Ally 10 6 5
+!ent add foe Foe 10 5 6
+!ent set_vars knight team=red
+!ent set_vars ally team=red
+!ent set_vars foe team=blue
+!zone new banner
+!zone anchor banner knight 1
+!zone grant banner inspired
+!zone grant_condition banner "not is_hostile(self, zone_anchor_of(zone_name))"
+!assert "status_has('knight', 'inspired') and status_has('ally', 'inspired') and not status_has('foe', 'inspired')"
+!ent move knight 3 up
+!assert "status_has('knight', 'inspired') and not status_has('ally', 'inspired')"
+!ent move knight 3 down
+!ent add late Late 10 4 4
+!ent set_var late team red
+!assert "status_has('late', 'inspired')"
+!ent kill ally
+!assert "not corpse_status_has('ally', 'inspired')"
+!ent revive ally
+!assert "status_has('ally', 'inspired')"
+!ent set_var foe team red
+!assert "status_has('foe', 'inspired')"
+!as restart
+!assert "status_has('foe', 'inspired') and status_has('ally', 'inspired')"
+!zone grant_condition banner "entity[self].nope"
+?? its grant_condition failed for `ally`
+!zone grant_condition banner -
+!ent kill knight
+!assert "not zone_exists('banner') and not status_has('ally', 'inspired') and not status_has('late', 'inspired')"
+
+Expected: HARNESS-ALLOWS-ERRORS. An aura (`!zone anchor`, radius 1)
+granting `inspired` under a condition that reads the anchor through
+zone_anchor_of(zone_name): the knight and its ally have it, the foe
+doesn't. The grant follows the aura as the knight walks away and back;
+a unit spawned inside receives it; a dying unit's corpse doesn't keep
+it and its revive brings it back; a team change makes the foe meet the
+condition. A restart keeps the grants. A condition that fails reads as
+not met, with one ⚠️ per zone naming the units. When the knight dies the aura goes
+(anchored_zone_on_anchor_loss delete) and so does every grant it held.
+
+SCENARIO 964 — Status-granting zones in formulas: zone_grant, zone_spawn, $(), immunity, rename
+-----------------------------------------------------------------------------------------------
+
+!match new gz964 Spells 10 10
+!match use gz964
+!status def hasted
+!zone def new haste_field
+!zone def grant haste_field hasted level=2
+!ent add mage Mage 10 2 2
+!ent add golem Golem 10 3 2
+!ent set_var golem status_immune hasted
+!eval "zone_spawn('haste_field', [[2, 2], [3, 2]]) and status_has('mage', 'hasted')"
+?? = `True`
+!assert "not status_has('golem', 'hasted')"
+!eval "zone_grant('nowhere', 'x')"
+?? zone_grant: no zone `nowhere`
+!eval "zone_ungrant('haste_field', 'hasted')"
+?? = `False`
+!eval "zone_grant('haste_field', 'warded', linger=1) and zone_grants('haste_field')"
+?? 'warded': {'linger': 1}
+!ent hp mage "$(len(zone_grants('haste_field')))"
+!assert "entity[mage].hp == 2"
+!ent hp mage "$(zone_grant('haste_field', 'slow'))"
+?? banned in a $() inline argument
+!assert "'slow' not in zone_grants('haste_field') and entity[mage].hp == 2"
+!zone rename haste_field speedy
+!assert "status_get('mage', 'hasted', '__zone_grant') == ['speedy']"
+!eval "zone_ungrant('speedy', 'warded')"
+!assert "status_get('mage', 'warded', 'duration') == 1 and status_has('mage', 'hasted')"
+!eval "delete_zone('speedy') and status_has('mage', 'hasted')"
+?? = `False`
+
+Expected: HARNESS-ALLOWS-ERRORS. zone_spawn of a definition that grants
+`hasted` puts it on the mage inside within the same formula (the
+formula reads it back as True); the golem, immune to it, is left alone.
+zone_grant / zone_ungrant change a zone's own grants (zone_ungrant is
+False for a grant only its definition holds), zone_grants reads them;
+in a `$()` argument zone_grants works and zone_grant is refused, with
+nothing changed. Renaming the zone keeps the grant's record pointing at
+it. Ungranting `warded` (linger 1) leaves it on the mage with a
+duration of 1; deleting the zone takes `hasted` off in the same formula.
