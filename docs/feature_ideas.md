@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #257, #258, #259, #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -160,13 +160,6 @@ or rejects one, it moves to "Off the list".
 - **#229 Shared turn for a rider and its mount.**
   - A slot option `shared_turn`: the rider runs on the vehicle's turn the way an attached body part does (`_attached_tick_parts`), so its statuses tick and its turn passives run on the vehicle's turn, and the vehicle sorts at the pair's higher initiative.
   - The game need: FCS1's mount rules (the rider and mount "share turns" and use "the highest awareness between the units"). Removes D13.
-- **#232 Statuses that grant status resistance and immunity.**
-  - A status instance's data may carry `status_resist` and `status_immune`, read the way its `modifiers` already are.
-  - The game need: temporary protection given by a potion or spell.
-    - FCS1 Antidote: "removes 2 levels of poison, and applies lvl1 poison resistance for 2 turns".
-    - FCS1 Insulating Potion: the same for burn and freeze.
-    - NCS "<status name> Immunity": "immunity to a certain status, but only while this status is active".
-  - Today resistance and immunity are gathered only from var roots, the innate vars plus `status_resist_sources` (logic.py:14493-14545), while modifiers already come from status instances too. A GM has to copy the record into a var when the status arrives and delete it when it leaves.
 - **#233 Opt-in automatic durations.**
   - A definition field `duration_mode: manual | auto`. With `auto`, the engine lowers `duration` by one at the definition's tick time, after its tick formula runs, and removes the status at 0. `manual` stays the default, as the user decided when status ticks shipped (scenarios 390-391).
   - `expires: next_turn_start`, for effects that last "until your next turn":
@@ -421,7 +414,6 @@ or rejects one, it moves to "Off the list".
     - `cap` limits the resulting level for this application only (FCS1 weapons: "inflicts lvl 1 burn, can stack up to lvl 2"; the attack scales the cap by the attacker's damage buffs).
   - Definition fields:
     - `cancels: <token>` with `cancel_mode: remove_both | subtract` (Solis: a burn on a frozen unit removes the freeze and doesn't apply; FCS1: burn and freeze subtract levels and the remainder lands);
-    - `resist_mode: level | duration | both` (FCS1: resistance shortens statuses that have no levels).
   - Removes D7 and most of D16. FCS1's "only on ≥ 1 damage" stays in the GM's attack, where the damage is known.
   - From the combat systems:
     - `source` feeds #239's kill credit for damage over time.

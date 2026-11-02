@@ -2666,6 +2666,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_add(eid, name)               -> bool (True iff newly added)
     #   status_remove(eid, name)            -> bool (True iff removed)
     "status_has", "status_has_path", "status_get", "status_level_data",
+    "status_resisted",
     "status_set", "status_del", "status_add", "status_remove",
     # status_apply(eid, name[, level, duration]) -> apply a status via its
     # definition + stack mode (the host-friendly "inflict burn" call),
@@ -3079,6 +3080,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'relative_side', 'riders', 'roll_table', 'round_number', 'rule_get',
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
     'slot_of', 'slot_riders', 'status_get', 'status_level_data',
+    'status_resisted',
     'status_has',
     'status_has_path', 'status_has_tag', 'status_names',
     'status_resist_of', 'status_tags', 'statuses_with_tag',
@@ -5682,6 +5684,8 @@ class FormulaEngine:
             try:
                 check_store_path(path, "status path")
                 value = checked_status_value(path, value, f"status '{eid}.{name}'")
+                from logic import check_status_self_grant
+                check_status_self_grant(name, path, value)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             try:
@@ -5802,7 +5806,8 @@ class FormulaEngine:
             return True
 
         def _do_status_apply(fname: str, eid_t: Any, name: Any,
-                             level: Any, duration: Any, force: bool) -> bool:
+                             level: Any, duration: Any, force: bool,
+                             rounding: Any = None) -> bool:
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError(f"{fname}(eid, name, ...): name must be a string.")
@@ -5815,22 +5820,77 @@ class FormulaEngine:
                 if v is not None and v < 0:
                     raise FormulaError(f"{fname}(...): {label} can't be "
                                        f"negative, got {v}.")
+            from logic import RESIST_ROUNDINGS
+            if rounding is not None and rounding not in RESIST_ROUNDINGS:
+                raise FormulaError(f"{fname}(...): rounding= takes "
+                                   f"{', '.join(RESIST_ROUNDINGS)}.")
             try:
-                match.surface_log(match.apply_status(eid, name, lv, du, force=force))
+                match.surface_log(match.apply_status(eid, name, lv, du,
+                                                     force=force,
+                                                     rounding=rounding))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
             return True
 
         def _status_apply(eid_t: Any, name: Any,
-                          level: Any = None, duration: Any = None) -> bool:
-            """status_apply(eid, name, level=None, duration=None): apply a
-            status, honoring its definition's stack mode (else the
+                          level: Any = None, duration: Any = None,
+                          rounding: Any = None) -> bool:
+            """status_apply(eid, name, level=None, duration=None, rounding=None):
+            apply a status, honoring its definition's stack mode (else the
             status_default_stack rule) when already present AND the target's
-            resistance/immunity (an immune or fully-resisted application is a
-            silent no-op; resistance reduces the applied level). Seeds the
+            resistance / weakness / immunity (an immune or fully-resisted
+            application is a silent no-op; flat and percentile resistance
+            change the applied level, or the duration per the status's
+            resist_affects, rounded per `rounding=`, else the definition's
+            resist_rounding, else the status_resist_rounding rule). Seeds the
             definition's default data on a first application. Returns True."""
-            return _do_status_apply("status_apply", eid_t, name, level, duration, False)
+            return _do_status_apply("status_apply", eid_t, name, level,
+                                    duration, False, rounding)
+
+        def _status_resisted(eid_t: Any, name: Any, level: Any = 1,
+                             duration: Any = None,
+                             rounding: Any = None) -> dict:
+            """status_resisted(eid, name, level=1, duration=None, rounding=None):
+            what an application of status `name` at `level` (and
+            `duration`) would land at on the unit after its resistance and
+            weakness (#232), changing nothing: {immune, applies, level,
+            duration}. The level / duration the status's resist_affects
+            leaves alone come back as given."""
+            from logic import RESIST_ROUNDINGS
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_resisted(eid, name): name must be a string.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            for label, v in (("level", level), ("duration", duration)):
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                    raise FormulaError(f"status_resisted(...): {label} must be a number.")
+            if rounding is not None and rounding not in RESIST_ROUNDINGS:
+                raise FormulaError("status_resisted(...): rounding= takes "
+                                   + ", ".join(RESIST_ROUNDINGS) + ".")
+            lv = 1 if level is None else int(level)
+            du = None if duration is None else int(duration)
+            inst = e.status.get(name)
+            at = match.status_level(inst) if inst is not None else lv
+            affects = match.resist_affects(name, at)
+            out = {"immune": False, "applies": True, "level": lv,
+                   "duration": du}
+            for key, base, on in (("level", lv, affects in ("level", "both")),
+                                  ("duration", du,
+                                   affects in ("duration", "both")
+                                   and du is not None)):
+                f = match.resist_fold(eid, name, base if on else lv,
+                                      rounding=rounding, level=at)
+                if f["immune"]:
+                    out.update(immune=True, applies=False)
+                    return out
+                if on and f["steps"]:
+                    out[key] = f["value"]
+                    if not f["applies"]:
+                        out["applies"] = False
+            return out
 
         def _status_dispel(eid_t: Any, token: Any, max: Any = 0) -> int:
             """status_dispel(eid, token, max=0): remove every status on `eid`
@@ -5888,6 +5948,7 @@ class FormulaEngine:
         ns["status_has"]      = _status_has
         ns["status_has_path"] = _status_has_path
         ns["status_get"]      = _status_get
+        ns["status_resisted"] = _status_resisted
 
         def _status_level_data(eid_t: Any, name: Any, level: Any = None) -> dict:
             """status_level_data(eid, name, level=None): what status `name`'s

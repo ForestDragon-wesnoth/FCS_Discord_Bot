@@ -1347,13 +1347,33 @@ hardcodes**.
   (checked before stacking), immunity, resistance and dispel.
 - **Resistance / immunity** are source-gated like modifiers:
   `status_resist_sources` (default `equipped`, per-unit replace / add vars)
-  plus innate `status_immune` / `status_resist` vars; `status_resist_stack`
-  (sum / max / first). Resistance reduces the applied LEVEL only, and only
-  when a level is set (first application, add_level, replace with a level —
-  `_resistance_applies`); ≤ 0 = fully resisted. `status_force` / `!status
-  force` ignores resistance and immunity (blocked_by and the part rules
-  still apply). `status_apply_block_reason` explains a refusal (449-452,
-  496-497).
+  plus innate `status_immune` / `status_resist` vars, plus every status
+  the unit holds (#232: its `status_resist` / `status_immune` through
+  `status_field`, so instance data, the definition and its level entries;
+  `_gather_resist_records` tags each with its source). A `status_resist`
+  entry is a number (flat `sub`; negative = a flat weakness), a record
+  `{op: sub|mul|div, value, priority}` or a list (`logic.resist_records`;
+  unusable ones skipped). `Match.resist_fold(eid, name, base)`:
+  `status_resist_stack` picks per op (sum: everything stacks, factors
+  multiply; max: strongest per op; first), records fold highest
+  `priority` + `status_resist_op_priority` offset first (default flat
+  before percentile), rounded ONCE at the end (application `rounding=` >
+  the definition's `resist_rounding` > `status_resist_rounding`, default
+  floor); a result below 1 doesn't apply. It changes the LEVEL (only when
+  an application sets one, `_resistance_applies`) or the DURATION (when
+  one is given) per the definition's `resist_affects` (level default /
+  duration / both). A status never grants itself resistance or immunity
+  (user call): naming itself is refused at every write
+  (`check_status_self_grant`: `!status data`, `!status level`, `!ent
+  status set`, status_set, zone grant data), a matching `tag:` token or
+  loaded data is skipped with a ⚠️. `status_force` / `!status force`
+  ignores resistance, weakness and immunity (blocked_by and the part
+  rules still apply). `status_apply_block_reason` explains a refusal,
+  also for a unit already holding the status; `!status resist <eid>
+  <name> [level] [duration=] [rounding=]` shows the fold step by step;
+  reads `status_resisted(eid, name, level=1, duration=None, rounding=None)`,
+  `status_resist_of` (the flat total), `is_status_immune` (449-452,
+  496-497, 968-970).
 - **Body parts:** `part_status_immune` / `part_status_redirect` rules (per-part
   `__status_immune` / `__status_redirect`) run first in apply_status.
 - **Counters:** `status_counter_add/set` (`!status counter`) on any numeric

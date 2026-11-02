@@ -209,6 +209,80 @@ UNLESS_SUFFIX = "_unless"
 # earlier one's (dicts merge key by key, lists replace whole), and an
 # instance's own key wins over all of them. Entries can't set the fields
 # that decide how a status arrives or what kind it is.
+# Status resistance (#232): a `status_resist` record's ops, the roundings
+# and what a status lets resistance change (its `resist_affects`).
+RESIST_OPS = ("sub", "mul", "div")
+RESIST_ROUNDINGS = ("floor", "ceil", "round")
+RESIST_AFFECTS = ("level", "duration", "both")
+
+
+def resist_records(val: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The records a `status_resist` entry holds: a number is flat (`sub`,
+    negative = a flat weakness), a dict `{op, value, priority}` one record,
+    a list several. Returns (records, why each unusable one was left out)."""
+    out: List[Dict[str, Any]] = []
+    bad: List[str] = []
+    items = val if isinstance(val, list) else [val]
+    for it in items:
+        if isinstance(it, bool):
+            bad.append(f"{it!r} isn't a number or a record")
+            continue
+        if isinstance(it, (int, float)):
+            if math.isfinite(it):
+                out.append({"op": "sub", "value": it, "priority": 0})
+            else:
+                bad.append(f"{it!r} isn't finite")
+            continue
+        if not isinstance(it, dict):
+            bad.append(f"{it!r} isn't a number or a record")
+            continue
+        op = it.get("op", "sub")
+        v = it.get("value")
+        pr = it.get("priority", 0)
+        if op not in RESIST_OPS:
+            bad.append(f"op {op!r} isn't one of {', '.join(RESIST_OPS)}")
+        elif isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v):
+            bad.append(f"value {v!r} isn't a finite number")
+        elif op in ("mul", "div") and v <= 0:
+            bad.append(f"a {op} value must be above 0, got {v!r}")
+        elif isinstance(pr, bool) or not isinstance(pr, (int, float)) \
+                or not math.isfinite(pr):
+            bad.append(f"priority {pr!r} isn't a finite number")
+        else:
+            out.append({"op": op, "value": v, "priority": pr})
+    return out, bad
+
+
+def _grant_tokens(val: Any) -> List[str]:
+    """The tokens a status_immune value names (a list or a CSV text)."""
+    if isinstance(val, list):
+        return [str(t).strip() for t in val if str(t).strip()]
+    if isinstance(val, str):
+        return [t.strip() for t in val.split(",") if t.strip()]
+    return []
+
+
+def check_status_self_grant(sname: str, path: str, value: Any) -> None:
+    """Refuse writing, at `path` of status `sname`'s data (an instance, its
+    definition's data or a level entry), resistance or immunity to `sname`
+    itself named outright (#232, user call). A `tag:` token that happens to
+    match it is skipped when resistance is read, with a warning."""
+    parts = str(path).split(".")
+    if parts[0] not in ("status_resist", "status_immune"):
+        return
+    node: Any = value
+    for k in reversed(parts[1:]):
+        node = {k: node}
+    if parts[0] == "status_resist":
+        names = [str(k) for k in node] if isinstance(node, dict) else []
+    else:
+        names = _grant_tokens(node)
+    if sname in names:
+        what = ("resistance" if parts[0] == "status_resist" else "immunity")
+        raise VTTError(f"`{sname}` can't grant {what} to itself.")
+
+
 STATUS_LEVELS_FIELD = "levels"
 STATUS_LEVEL_EXCLUDED = ("stack", "max_level", "tags", "removes",
                          "blocked_by", "hooks", "data", STATUS_LEVELS_FIELD,
@@ -1494,14 +1568,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Comma-separated vars subtree roots scanned for status "
             "resistance/immunity records (like modifier_sources). A nested "
-            "`status_resist` (map of status-name-or-`tag:<x>` -> integer "
-            "level reduction) and/or `status_immune` (list / CSV of names + "
+            "`status_resist` (map of status-name-or-`tag:<x>` -> a number, "
+            "a flat level reduction (negative = a flat weakness), or a record "
+            "`{op: sub|mul|div, value, priority}`, or a list of those) "
+            "and/or `status_immune` (list / CSV of names + "
             "`tag:<x>`) found under a scanned root contributes to the bearer "
             "— so an EQUIPPED resistance ring works while one sitting in the "
             "inventory does nothing. A DIRECT `status_immune` / `status_resist` "
             "var on the entity (innate) always counts. Per-entity overrides: "
             "`__status_resist_sources` var (replaces this list) and/or "
-            "`__status_resist_sources_add` var (extends it)."
+            "`__status_resist_sources_add` var (extends it). A status the "
+            "unit holds contributes its own `status_resist` / "
+            "`status_immune` too (instance data, else its definition at the "
+            "instance's level), but never to itself."
         ),
     },
     "status_resist_stack": {
@@ -1511,11 +1590,39 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "choices": ["sum", "max", "first"],
         },
         "desc": (
-            "How multiple matching status_resist reductions combine for one "
-            "incoming status: 'sum' (add them — two +1 rings = +2), 'max' "
-            "(take the single strongest), 'first' (the first record found "
-            "wins). Immunity is independent — any matching status_immune "
-            "entry blocks the application outright regardless of this."
+            "How several matching status_resist records of one op combine "
+            "for one incoming status (#232): 'sum' (default: everything "
+            "stacks; flat `sub` values add up, two +1 rings = 2, and `mul` / "
+            "`div` factors multiply, a natural x0.5, a x0.5 coat and a x2 "
+            "curse = x0.5), 'max' (the strongest record of each op: the "
+            "largest reduction, the smallest factor), 'first' (the first "
+            "record of each op found). Immunity is independent: any "
+            "matching status_immune entry blocks the application outright."
+        ),
+    },
+    "status_resist_op_priority": {
+        "default": "sub:100,mul:0,div:0",
+        "schema": {"type": "str"},
+        "desc": (
+            "The order status resistance folds in (#232), like "
+            "modifier_op_priority: per-op priority OFFSETS added to each "
+            "record's own `priority`; records fold highest first, the ops of "
+            "one tier in the order listed here. The default subtracts flat "
+            "resistance before percentile factors (a level 5 freeze against "
+            "flat 1 and x0.5 lands at (5 - 1) x 0.5 = 2). Format "
+            "`op:offset,...` for the ops sub, mul, div."
+        ),
+    },
+    "status_resist_rounding": {
+        "default": "floor",
+        "schema": {"type": "enum", "choices": ["floor", "ceil", "round"]},
+        "desc": (
+            "How a resisted level (or duration) is rounded, once, after the "
+            "whole fold (#232): 'floor' (default: 3 x 0.5 = 1), 'ceil', "
+            "'round' (halves up). A status definition's `resist_rounding` "
+            "(`!status resist_rounding`) overrides it for that status, and "
+            "an application's `rounding=` overrides both. A result of 0 or "
+            "below means the status doesn't apply."
         ),
     },
     # Spawning / facing
@@ -4346,6 +4453,19 @@ def _check_op_priority(key: str, raw: str) -> str:
     return ",".join(out)
 
 
+def _check_resist_op_priority(key: str, raw: str) -> str:
+    out = []
+    for tok in (t.strip() for t in raw.split(",")):
+        if not tok:
+            continue
+        op, sep, num = tok.partition(":")
+        if not sep or op.strip() not in RESIST_OPS or not _finite_text(num):
+            raise VTTError(f"Setting '{key}' takes `op:number` entries for "
+                           f"the ops {', '.join(RESIST_OPS)}, got `{tok}`.")
+        out.append(f"{op.strip()}:{num.strip()}")
+    return ",".join(out)
+
+
 def _check_rgb_rule(key: str, raw: str) -> str:
     v = raw.strip()
     if re.fullmatch(r"#[0-9a-fA-F]{6}", v):
@@ -4391,6 +4511,7 @@ def _check_top_vars(key: str, raw: str) -> str:
 _FORMAT_RULE_CHECKS = {
     "modifier_stat_caps": _check_stat_caps,
     "modifier_op_priority": _check_op_priority,
+    "status_resist_op_priority": _check_resist_op_priority,
     "preview_color": _check_rgb_rule,
     "amount_field": _check_plain_key,
     "turnorder_tiebreak_var": _check_var_path_rule,
@@ -6491,6 +6612,8 @@ def check_zone_grant(status: Any, entry: Any) -> Dict[str, Any]:
         if bad:
             raise VTTError(f"grant `{status}`: data can't set "
                            f"{', '.join(bad)} (`level` is its own field).")
+        for k, v in data.items():
+            check_status_self_grant(status, str(k), v)
         if data:
             out["data"] = _own_value(data)
     return out
@@ -17197,30 +17320,34 @@ class Match:
             roots = roots + [str(r) for r in add]
         return roots
 
-    def _gather_resist_records(self, e: "Entity") -> Tuple[List[Any], List[dict]]:
-        """Collect (immune-token-lists, resist-maps) contributing to `e`:
-        the direct innate `status_immune`/`status_resist` vars, plus every
-        nested `status_immune`/`status_resist` found anywhere under a scanned
-        source root (so an equipped item grants, an inventoried one doesn't)."""
-        immune: List[Any] = []
-        resist: List[dict] = []
+    def _gather_resist_records(self, e: "Entity"
+                               ) -> Tuple[List[Tuple[Any, str, Optional[str]]],
+                                          List[Tuple[dict, str, Optional[str]]]]:
+        """Collect the immune-token lists and resist maps contributing to
+        `e`, each as (value, source, granting status or None): the direct
+        innate `status_immune` / `status_resist` vars, every nested one
+        under a scanned source root (an equipped item grants, an
+        inventoried one doesn't), and each status the unit holds (#232:
+        its instance's key, else its definition at the instance's level)."""
+        immune: List[Tuple[Any, str, Optional[str]]] = []
+        resist: List[Tuple[dict, str, Optional[str]]] = []
         di = e.vars.get("status_immune")
         if di is not None:
-            immune.append(di)
+            immune.append((di, "innate", None))
         dr = e.vars.get("status_resist")
         if isinstance(dr, dict):
-            resist.append(dr)
+            resist.append((dr, "innate", None))
 
-        def _walk(node: Any) -> None:
+        def _walk(node: Any, path: str) -> None:
             if not isinstance(node, dict):
                 return
             for key, val in node.items():
                 if key == "status_immune" and val is not None:
-                    immune.append(val)
+                    immune.append((val, path or "vars", None))
                 elif key == "status_resist" and isinstance(val, dict):
-                    resist.append(val)
+                    resist.append((val, path or "vars", None))
                 elif isinstance(val, dict):
-                    _walk(val)
+                    _walk(val, f"{path}.{key}" if path else str(key))
 
         for root in self._effective_status_resist_sources(e):
             node: Any = e.vars
@@ -17232,41 +17359,168 @@ class Match:
                     ok = False
                     break
             if ok:
-                _walk(node)
+                _walk(node, root)
+        for sname in sorted(e.status):
+            inst = e.status.get(sname)
+            si = self.status_field(inst, sname, "status_immune")
+            if si is not None:
+                immune.append((si, f"status:{sname}", sname))
+            sr = self.status_field(inst, sname, "status_resist")
+            if isinstance(sr, dict):
+                resist.append((sr, f"status:{sname}", sname))
         return immune, resist
 
-    def status_resistance(self, eid: str, name: str) -> Tuple[bool, int]:
-        """(is_immune, level_reduction) for status `name` applied to `eid`,
-        aggregated from the entity's innate + source-gated resistance
-        records per the status_resist_stack rule. Immunity if any matching
-        immune token; reduction combines matching resist values."""
-        e = self.entities.get(eid)
-        if e is None:
-            return (False, 0)
+    def _resist_inputs(self, e: "Entity", name: str
+                       ) -> Tuple[bool, List[Dict[str, Any]], List[str]]:
+        """(immune, the matching resist records with their `source`, the
+        warnings) for status `name` on `e`. A status never grants itself
+        resistance or immunity: a token naming it or a tag matching it on
+        its own grant is skipped with a warning (#232, user call)."""
         immune_lists, resist_maps = self._gather_resist_records(e)
-        for lst in immune_lists:
+        warns: List[str] = []
+        immune = False
+        for lst, _src, owner in immune_lists:
             for tok in self._token_list(lst):
                 if self._status_token_matches(tok, name):
-                    return (True, 0)
-        stack = str(self.rules.get("status_resist_stack", "sum"))
-        amounts: List[int] = []
-        for rmap in resist_maps:
+                    if owner == name:
+                        warns.append(f"⚠️ `{name}` grants itself immunity "
+                                     f"through `{tok}`; skipped.")
+                        continue
+                    immune = True
+        recs: List[Dict[str, Any]] = []
+        for rmap, src, owner in resist_maps:
             for key, val in rmap.items():
                 if not self._status_token_matches(str(key), name):
                     continue
-                try:
-                    amounts.append(int(val))
-                except (TypeError, ValueError):
+                if owner == name:
+                    warns.append(f"⚠️ `{name}` grants itself resistance "
+                                 f"through `{key}`; skipped.")
                     continue
-        if not amounts:
+                good, _bad = resist_records(val)
+                for r in good:
+                    recs.append(dict(r, source=src, token=str(key)))
+        return immune, recs, warns
+
+    def _stacked_resist(self, recs: List[Dict[str, Any]]
+                        ) -> List[Dict[str, Any]]:
+        """`recs` per the status_resist_stack rule: all of them (sum), the
+        strongest of each op (max) or the first of each op (first)."""
+        stack = str(self.rules.get("status_resist_stack", "sum"))
+        if stack not in ("max", "first"):
+            return list(recs)
+        out: List[Dict[str, Any]] = []
+        for op in RESIST_OPS:
+            mine = [r for r in recs if r["op"] == op]
+            if not mine:
+                continue
+            if stack == "first":
+                out.append(mine[0])
+            elif op == "sub":
+                out.append(max(mine, key=lambda r: r["value"]))
+            elif op == "mul":
+                out.append(min(mine, key=lambda r: r["value"]))
+            else:   # div: the largest divisor is the strongest
+                out.append(max(mine, key=lambda r: r["value"]))
+        return out
+
+    def _resist_op_offsets(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for tok in str(self.rules.get("status_resist_op_priority",
+                                      "sub:100,mul:0,div:0")).split(","):
+            op, sep, num = tok.strip().partition(":")
+            if sep:
+                try:
+                    out[op.strip()] = float(num)
+                except ValueError:
+                    continue
+        return out
+
+    def resist_fold(self, eid: str, name: str, base: Any, *,
+                    rounding: Optional[str] = None,
+                    level: Any = None) -> Dict[str, Any]:
+        """Status resistance (#232) folded onto `base` (an incoming level or
+        duration) for status `name` on `eid`: {immune, value (rounded),
+        applies (value >= 1), steps [(op, value, priority, source)],
+        rounding, warnings}. Records fold highest effective priority first
+        (their `priority` + the op's status_resist_op_priority offset; the
+        ops of one tier in that rule's order), after status_resist_stack
+        picks them; rounding once at the end: `rounding`, else the
+        definition's `resist_rounding` at `level`, else the rule."""
+        e = self.entities.get(eid)
+        out: Dict[str, Any] = {"immune": False, "value": base,
+                               "applies": True, "steps": [],
+                               "rounding": None, "warnings": []}
+        if e is None:
+            return out
+        immune, recs, warns = self._resist_inputs(e, name)
+        out["warnings"] = warns
+        if immune:
+            out.update(immune=True, applies=False)
+            return out
+        recs = self._stacked_resist(recs)
+        if not recs:
+            return out
+        offsets = self._resist_op_offsets()
+        order = [t.strip().partition(":")[0] for t in str(self.rules.get(
+            "status_resist_op_priority", "sub:100,mul:0,div:0")).split(",")
+            if t.strip()]
+
+        def op_rank(op: str) -> int:
+            return order.index(op) if op in order else len(order)
+        for r in recs:
+            r["_eff"] = r["priority"] + offsets.get(r["op"], 0.0)
+        running = float(base)
+        steps = []
+        for tier in sorted({r["_eff"] for r in recs}, reverse=True):
+            for op in sorted(dict.fromkeys(r["op"] for r in recs
+                                           if r["_eff"] == tier), key=op_rank):
+                for r in [r for r in recs
+                          if r["_eff"] == tier and r["op"] == op]:
+                    if op == "sub":
+                        running -= r["value"]
+                    elif op == "mul":
+                        running *= r["value"]
+                    else:
+                        running /= r["value"]
+                    steps.append((op, r["value"], r["priority"], r["source"],
+                                  r["token"], running))
+        mode = rounding
+        if mode is None:
+            mode = self.status_def_view(
+                name, level if level is not None else base).get(
+                    "resist_rounding")
+        if mode not in RESIST_ROUNDINGS:
+            mode = str(self.rules.get("status_resist_rounding", "floor"))
+        if mode == "ceil":
+            val = math.ceil(running - 1e-9)
+        elif mode == "round":
+            val = math.floor(running + 0.5 + 1e-9)
+        else:
+            val = math.floor(running + 1e-9)
+        out.update(value=int(val), applies=val >= 1, steps=steps,
+                   rounding=mode)
+        return out
+
+    def status_resistance(self, eid: str, name: str) -> Tuple[bool, int]:
+        """(is_immune, flat level reduction) for status `name` on `eid`:
+        the `sub` records after status_resist_stack (the percentile ones
+        are in resist_fold)."""
+        e = self.entities.get(eid)
+        if e is None:
             return (False, 0)
-        if stack == "max":
-            reduction = max(amounts)
-        elif stack == "first":
-            reduction = amounts[0]
-        else:  # sum
-            reduction = sum(amounts)
-        return (False, max(0, reduction))
+        immune, recs, _w = self._resist_inputs(e, name)
+        if immune:
+            return (True, 0)
+        flat = [r for r in self._stacked_resist(recs) if r["op"] == "sub"]
+        total = sum(r["value"] for r in flat)
+        return (False, int(total) if float(total).is_integer() else total)
+
+    def resist_affects(self, name: str, level: Any) -> str:
+        """What resistance changes on status `name` (#232): its
+        definition's `resist_affects` at `level` (level, duration or
+        both), level by default."""
+        v = self.status_def_view(name, level).get("resist_affects")
+        return v if v in RESIST_AFFECTS else "level"
 
     @staticmethod
     def _cap_status_level(sdef: Dict[str, Any], lvl: int) -> int:
@@ -17364,7 +17618,10 @@ class Match:
                 f"(`{e.id}`: {', '.join(seen) or 'none'})")
 
     def status_apply_block_reason(self, eid: str, name: str,
-                                  level: Optional[int] = None) -> Optional[str]:
+                                  level: Optional[int] = None,
+                                  duration: Optional[int] = None,
+                                  rounding: Optional[str] = None
+                                  ) -> Optional[str]:
         """A human reason the status would NOT apply to `eid` (immunity,
         a blocking status, or full resistance), or None if it would. Used
         for command feedback; recomputes the same checks apply_status runs."""
@@ -17384,17 +17641,33 @@ class Match:
             if not self.presents_status(e, blockers[0]):
                 return f"`{name}` blocked by a status on `{eid}`"
             return f"`{name}` blocked by `{blockers[0]}`"
-        if reduction and self._resistance_applies(e, name, sdef, level is not None):
-            base = int(level) if level is not None else 1
-            if base - reduction <= 0:
-                return f"`{name}` fully resisted (reduction {reduction})"
+        cur = e.status.get(name)
+        at = (self.status_level(cur) if cur is not None else
+              (int(level) if level is not None else 1))
+        affects = self.resist_affects(name, at)
+        if affects in ("level", "both") and self._resistance_applies(
+                e, name, sdef, level is not None):
+            fold = self.resist_fold(
+                eid, name, int(level) if level is not None else 1,
+                rounding=rounding, level=at)
+            if not fold["applies"]:
+                return (f"`{name}` fully resisted (level "
+                        f"{int(level) if level is not None else 1} -> "
+                        f"{fold['value']})")
+        if affects in ("duration", "both") and duration is not None:
+            fold = self.resist_fold(eid, name, int(duration),
+                                    rounding=rounding, level=at)
+            if not fold["applies"]:
+                return (f"`{name}` fully resisted (duration {int(duration)} "
+                        f"-> {fold['value']})")
         return None
 
     def apply_status(self, eid: str, name: str,
                      level: Optional[int] = None,
                      duration: Optional[int] = None,
                      *, force: bool = False,
-                     seed_data: Optional[Dict[str, Any]] = None) -> List[str]:
+                     seed_data: Optional[Dict[str, Any]] = None,
+                     rounding: Optional[str] = None) -> List[str]:
         """Apply status `name` to entity `eid`, honoring the definition's
         `stack` mode (else the status_default_stack rule) when the status
         is already present. A FIRST application seeds the definition's
@@ -17443,17 +17716,43 @@ class Match:
         # like an explicit level while a duration-only refresh/extend is
         # never blocked; if the reduced level drops to <=0 the application is
         # fully resisted (no-op).
+        # Resistance and weakness (#232): flat and percentile records fold
+        # onto the level (an application that sets one) and / or the
+        # duration, per the definition's resist_affects; a result below 1
+        # doesn't apply. A forced application skips all of it.
+        warns: List[str] = []
         if not force:
-            immune, reduction = self.status_resistance(eid, name)
-            if immune or self.status_tag_block(e, name, new_level):
+            if self.status_tag_block(e, name, new_level):
                 return []
-            if reduction and self._resistance_applies(
+            cur = e.status.get(name)
+            at = (self.status_level(cur) if cur is not None else
+                  (new_level if new_level is not None else 1))
+            affects = self.resist_affects(name, at)
+            lv_fold = None
+            if affects in ("level", "both") and self._resistance_applies(
                     e, name, sdef, new_level is not None):
-                base = new_level if new_level is not None else 1
-                eff = base - reduction
-                if eff <= 0:
+                lv_fold = self.resist_fold(
+                    eid, name, new_level if new_level is not None else 1,
+                    rounding=rounding, level=at)
+            du_fold = None
+            if affects in ("duration", "both") and new_duration is not None:
+                du_fold = self.resist_fold(eid, name, new_duration,
+                                           rounding=rounding, level=at)
+            if lv_fold is None and du_fold is None:
+                imm, _r = self.status_resistance(eid, name)
+                if imm:
                     return []
-                new_level = eff
+                warns = self._resist_inputs(e, name)[2]
+            for fold in (lv_fold, du_fold):
+                if fold is None:
+                    continue
+                warns = fold["warnings"]
+                if not fold["applies"]:
+                    return warns
+            if lv_fold is not None and lv_fold["steps"]:
+                new_level = lv_fold["value"]
+            if du_fold is not None and du_fold["steps"]:
+                new_duration = du_fold["value"]
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
             if isinstance(seed_data, dict):
@@ -17506,7 +17805,7 @@ class Match:
             del e.status[other]
             log = log + self._emit_status_diff(eid, other, ob, None,
                                                removed_by="removes")
-        return log
+        return warns + log
 
     def dispel_statuses(self, eid: str, token: Any,
                         max_count: int = 0) -> Tuple[int, List[str]]:
