@@ -170,7 +170,12 @@ or rejects one, it moves to "Off the list".
   - Two kinds of resistance, from any source (innate vars, `status_resist_sources` roots, a granting status):
     - flat: subtract N from the incoming level (what `status_resist` does today, combined per `status_resist_stack`: sum / max / first);
     - percentile: multiply or divide the incoming level (×0.5 halves a poison, ÷3 a thirds-resistant hide, ×2 a weakness that doubles it), rounded per a rule or per record.
-  - Open (user): the order when a unit has both (flat then percentile, or GM-ordered like modifier ops; reusing the modifier record shape and fold is one option), how several percentile sources combine (multiply, or best one), the rounding and whether a result below 1 means fully resisted, and whether a percentile resistance also scales durations (ties to #227's `resist_mode`).
+  - Decided (user):
+    - Order: GM-set, the way modifier ops are ordered (the user expects it to vary between systems), with flat then percentile as the default order a system can change. Reusing the modifier record shape and its fold is the likely shape.
+    - Several sources stack. Percentile ones multiply: a unit naturally ×0.5 to freeze, wearing a fur coat (×0.5), then cursed with a ×2 weakness gets ×0.5 × 0.5 × 2 = ×0.5. Flat ones keep combining per `status_resist_stack` (default sum).
+    - Rounding: a gamerule, overridable at narrower steps (per status definition, and further down where it makes sense: per resistance record or per application).
+    - A resulting level of 0 or below means the status doesn't apply (as flat resistance works today).
+    - Resistance and weakness change the level by default. A status whose level doesn't matter can be set to have them change its duration instead (a definition field; #227's `resist_mode: level | duration | both` is the same field).
 - **#233 Opt-in automatic durations.**
   - A definition field `duration_mode: manual | auto`. With `auto`, the engine lowers `duration` by one at the definition's tick time, after its tick formula runs, and removes the status at 0. `manual` stays the default, as the user decided when status ticks shipped (scenarios 390-391).
   - `expires: next_turn_start`, for effects that last "until your next turn":
