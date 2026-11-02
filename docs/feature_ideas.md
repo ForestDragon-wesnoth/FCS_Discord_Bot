@@ -260,7 +260,24 @@ or rejects one, it moves to "Off the list".
   - All of these are footprint-aware.
 - **#17 `!ent move <id> to <x> <y>`.** Walks the route #16 computes step by step, firing every per-step hook. The GM or player invokes it; the engine only finds the path.
 - **#18 Team relations matrix.** Allied / neutral / hostile between pairs of teams, feeding `is_hostile`, the relation filters and disguise checks.
+  - Raised and parked by the user: the topic may need a proper team object (a `Team` class holding a team's data, stances and vision settings); today a team is the bare `team` var text plus `team_data`. Settle that first. Today: `is_hostile` = different teams, `ally` filter = `same_team`, `is_attackable` = hostile unless `friendlyfire`; fog vision, fog memory, reveals, `pov_own_team_visible`, disguises and `team_data_visibility own` compare one team name.
+  - Open questions (my recommendation after each):
+    1. Where a stance lives: each team's data under a checked key (`!team set red relations.blue ally`, checked in `team_set` like `tags`), or its own match field. Rec: team data.
+    2. One-way or mutual: one-way (`is_hostile(a, b)` reads a's team's stance toward b's; allows a betrayal), plus `!team relation <a> <b> [<stance>] [mutual]`. Rec: one-way.
+    3. Which stances: a fixed `ally` / `neutral` / `hostile`, a team's stance toward itself always "same team". Rec: fixed.
+    4. Pairs with no entry: rule `team_default_relation` (default hostile, today's behaviour) and `teamless_relation` (default hostile).
+    5. Predicates: `is_same_team` unchanged, `is_hostile` = stance hostile, new `is_ally` (same team or ally) and `team_relation(a, b)` (same / ally / neutral / hostile); the `ally` filter widens to allied teams, `same_team` stays strict, a new `neutral` filter. Open: should `ally` widen?
+    6. Attackable: replace `friendlyfire` with a word-list rule `attackable_relations` (default `neutral,hostile`; friendly fire on = `same,ally,neutral,hostile`).
+    7. Disguises: a word-list rule `disguise_seen_by` (default `same`, today's behaviour; `same,ally` widens it).
+    8. `team_data_visibility` gains an `allies` mode; under `own` a team can't read another's stance toward it (a secret betrayal stays secret). Rec: yes.
+    9. A `team_relation_changed` event on the bus (team, other, old, new)? A watcher composes it. Rec: no, unless wanted.
+    10. Per-unit stances (a charmed unit hostile to its own team): left out, a charm changes the team var. Rec: defer.
 - **#19 Shared vision between allied teams.** Allies see what each other sees under fog. Needs #18.
+  - Parked with #18 (same note on a team object). Open questions:
+    1. Who shares: a per-team list in team data, `shares_vision_with: [blue]` (red shows blue what red sees), plus a rule `allied_vision` (default on) sharing wherever the stance is ally. One-way, direct only (red -> blue -> green doesn't give green red's view).
+    2. What's shared: current sight and active reveals. Fog memory: the receiver remembers what it sees through the shared view from then on, without inheriting the ally's older explored cells.
+    3. Allied units and stealth: a sharing team's units show to the receiver like its own units, past `entity_visibility_condition`; a word-list rule `pov_always_visible` (default `same,vision`) replacing `pov_own_team_visible`.
+    4. Formula reads: `team_sees_cell`, `team_sees_entity` and `map_seen_by` include shared vision, with `shared=False` for a team's own units only; `can_see` and `visible_entities` stay per unit.
 - **#20 Vision cones.** A `fog_vision_arc` var combined with facing limits what a unit sees.
 - **#21 Cover primitive.** `cover_between(a, b)` gives the fraction of the line between two units that is obstructed, footprint-aware.
 - **#22 Action cooldowns and charges.** Fields on an action that count uses and turns; the engine refuses the action while on cooldown or out of charges.
