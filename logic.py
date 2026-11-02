@@ -1215,6 +1215,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`__modifier_sources_add` var (extends it)."
         ),
     },
+    "watcher_sources": {
+        "default": "equipped",
+        "schema": {"type": "str", "var_roots": True},
+        "desc": (
+            "Comma-separated vars roots walked for `watchers` bundles a unit "
+            "holds (#149): an item under one of these containers brings its "
+            "watchers (name -> {condition, effect, once}, read with self = "
+            "the holder and `watcher_source` = the item's path), while the "
+            "same item in `inventory` doesn't. The unit's own `watchers` "
+            "var, its statuses' `watchers` (instance, definition, level "
+            "entries) and its team data's `watchers` are always read on top. "
+            "Per-unit override: `__watcher_sources` (replaces this list) and "
+            "/ or `__watcher_sources_add` (extends it)."
+        ),
+    },
     "temp_hp_sources": {
         "default": "shields",
         "schema": {"type": "str", "var_roots": True},
@@ -6361,6 +6376,53 @@ def check_tag_filter(raw: Any) -> Any:
     return out
 
 
+# The key a watcher bundle sits under: a unit's own var, a container under
+# its watcher_sources roots, a status, team data (Match.held_watchers).
+WATCHERS_KEY = "watchers"
+
+
+# The fields that define a match watcher (the rest is its edge state).
+WATCHER_DEF_FIELDS = ("condition", "effect", "once", "once_each", "each",
+                      "tag")
+
+
+def watcher_definition(w: Dict[str, Any]) -> Dict[str, Any]:
+    """A match watcher's (or a system library entry's) definition without
+    its edge state: condition and effect as text, the flags only when set,
+    `tag` when given."""
+    out: Dict[str, Any] = {"condition": str(w.get("condition") or ""),
+                           "effect": str(w.get("effect") or "")}
+    for k in ("once", "once_each", "each"):
+        if w.get(k):
+            out[k] = True
+    if w.get("tag") not in (None, ""):
+        out["tag"] = copy.deepcopy(w["tag"])
+    return out
+
+
+def watcher_add_args(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Match.add_watcher's keyword arguments for definition `d`."""
+    d = watcher_definition(d)
+    return {"condition": d["condition"], "effect": d["effect"],
+            "once": bool(d.get("once")), "once_each": bool(d.get("once_each")),
+            "each": bool(d.get("each")), "tag": d.get("tag")}
+
+
+def watcher_spec_problem(spec: Any) -> Optional[str]:
+    """Why a held watcher entry can't be read, or None: a dict with a
+    `condition` (text), an optional `effect` (text) and `once` (bool)."""
+    if not isinstance(spec, dict):
+        return "isn't a dict {condition, effect, once}"
+    cond = spec.get("condition")
+    if not isinstance(cond, str) or not cond.strip():
+        return "has no `condition`"
+    if not isinstance(spec.get("effect", ""), str):
+        return "`effect` isn't a formula text"
+    if not isinstance(spec.get("once", False), bool):
+        return "`once` isn't true / false"
+    return None
+
+
 def tag_filter_matches(tags: Any, raw: Any) -> bool:
     """Whether the tags `tags` match the filter `raw` (a list: any of them;
     an expression). VTTError for a filter that doesn't parse."""
@@ -6795,7 +6857,7 @@ SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
                                      "formula_functions",
                                      "status_definitions", "tables",
                                      "macros", "zone_definitions",
-                                     "tag_vocabulary")
+                                     "tag_vocabulary", "watchers")
 
 # Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
 # it can't bound the system chain itself). Set with `!owner ceiling <key>
@@ -6854,6 +6916,13 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many times one `!simulate` may run its command, over "
                 "all its runs together (100 runs of 20 steps = 2000); runs "
                 "past it are left out with a warning.",
+    },
+    "watcher_unit_checks": {
+        "default": 2000, "min": 1, "max": 1000000,
+        "desc": "How many per-unit watcher readings one poll may make, a "
+                "per-unit (`each`) watcher's units and every watcher units "
+                "hold counted together (~1 ms each); past it the rest keep "
+                "their state until the next command, with a warning.",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -7061,6 +7130,11 @@ class GameSystem:
     # description. Read live from the system (never copied into a match):
     # it only explains tags and, under tag_vocabulary_mode warn, warns.
     tag_vocabulary: Dict[str, str] = field(default_factory=dict)
+    # Watchers (`!system watch`, #149): name -> a watcher definition
+    # (watcher_definition: condition, effect, once / once_each / each /
+    # tag), added to a new match armed (Match.add_watcher) like the other
+    # libraries.
+    watchers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # The system this one inherits from (live: MatchManager resolves the
     # chain on every read), or None for a root. `settings` and the
     # libraries above then hold only this system's OWN overrides.
@@ -7127,6 +7201,8 @@ class GameSystem:
             },
             "tag_vocabulary": {t: str(d) for t, d
                                in sorted(self.tag_vocabulary.items())},
+            "watchers": {n: watcher_definition(w)
+                         for n, w in sorted(self.watchers.items())},
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
@@ -7213,6 +7289,9 @@ class GameSystem:
             tables=sys_tables, macros=sys_macros,
             zone_definitions=sys_zone_defs,
             tag_vocabulary=vocab,
+            watchers={str(k): watcher_definition(v) for k, v in
+                      (d.get("watchers") or {}).items()
+                      if isinstance(k, str) and k and isinstance(v, dict)},
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
             description=str(d.get("description") or ""),
@@ -9659,6 +9738,15 @@ class Match:
     # round boundaries; the effect fires when condition goes false->true.
     # `last` is runtime edge-state (serialized so a reload doesn't re-fire).
     watchers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # A per-unit watcher (`each`, #149) keeps its edge state per unit in
+    # the watcher itself: `units` (eid -> last reading) and, for
+    # `once_each`, `spent` (eids that fired). Watchers HELD by units (a
+    # `watchers` dict on the unit, under its watcher_sources roots, in a
+    # status it holds or in its team's data) keep theirs here, keyed by
+    # json [holder id, source, name] -> {"last": bool, "spent": bool}, so a
+    # reading never writes the holder's vars. Match state: serialized and
+    # undone; a holder or source that is gone drops its entry.
+    watcher_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # Coordinate rulers: None = the map_coords rule, else this match's
     # override (`!map coords on|off|clear`). Serialized.
@@ -13179,6 +13267,159 @@ class Match:
         return new
 
     # ---------- condition-watchers (edge-triggered) ----------
+    # Three kinds share one pass: a match watcher (one condition, one edge
+    # state), a per-unit match watcher (`each`: the condition read once
+    # per living unit with self = that unit, an edge state per unit, #149)
+    # and the watchers units HOLD (a `watchers` dict of name -> {condition,
+    # effect, once} on the unit itself, in containers under its
+    # watcher_sources roots, in a status it holds, in its team's data),
+    # read with self = the holder. A unit read for the first time records
+    # its reading without firing, as `!watch add` does.
+
+    def add_watcher(self, name: str, condition: str, effect: str, *,
+                    once: bool = False, once_each: bool = False,
+                    each: bool = False, tag: Any = None) -> bool:
+        """Add or replace match watcher `name`, armed from now: its
+        condition is read once (per unit for `each`) and recorded, so one
+        that holds already fires the next time it turns true. Returns
+        whether the condition holds now (any unit for `each`)."""
+        name = str(name)
+        if not name.strip():
+            raise VTTError("A watcher needs a name.")
+        cond, eff = str(condition or ""), str(effect or "")
+        if not cond.strip():
+            raise VTTError(f"watcher `{name}`: the condition is empty.")
+        if once_each and not each:
+            raise VTTError(f"watcher `{name}`: `once_each` needs `each` "
+                           f"(a watcher read per unit).")
+        if tag not in (None, "") and not each:
+            raise VTTError(f"watcher `{name}`: `tag=` needs `each` (it "
+                           f"picks the units read).")
+        if tag not in (None, ""):
+            try:
+                tag = check_tag_filter(tag)
+            except VTTError as ex:
+                raise VTTError(f"watcher `{name}` tag=: {ex}")
+        w: Dict[str, Any] = {"condition": cond, "effect": eff,
+                             "once": bool(once)}
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        holds = False
+        if each:
+            w["each"] = True
+            if tag not in (None, ""):
+                w["tag"] = tag
+            if once_each:
+                w["once_each"] = True
+            units: Dict[str, bool] = {}
+            for e in self._watched_units(w):
+                try:
+                    now = bool(engine.eval_expression(cond, EvalCtx(
+                        this=this_id, target=e.id,
+                        extras={"watcher_name": name})))
+                except FormulaError:
+                    now = False
+                units[e.id] = now
+                holds = holds or now
+            w["units"] = units
+        else:
+            try:
+                holds = bool(engine.eval_expression(cond, EvalCtx(
+                    this=this_id, extras={"watcher_name": name})))
+            except FormulaError:
+                holds = False
+            w["last"] = holds
+        self.watchers[name] = w
+        return holds
+
+    def _watched_units(self, w: Dict[str, Any]) -> List["Entity"]:
+        """The units a per-unit watcher reads, in turn order: every living
+        unit (body parts too) whose tags pass its `tag` filter."""
+        tagf = w.get("tag")
+        out = []
+        for e in self.entities_in_turn_order():
+            if not e.is_alive:
+                continue
+            if tagf not in (None, ""):
+                try:
+                    if not tag_filter_matches(self.unit_tags(e), tagf):
+                        continue
+                except VTTError:
+                    continue
+            out.append(e)
+        return out
+
+    def _effective_watcher_sources(self, e: "Entity") -> List[str]:
+        """The vars roots scanned for held `watchers` on `e`: the per-unit
+        `__watcher_sources` var (replaces the rule) or the watcher_sources
+        rule, plus `__watcher_sources_add` (as for modifiers)."""
+        override = e.vars.get("__watcher_sources")
+        if isinstance(override, list):
+            roots = [str(r) for r in override]
+        else:
+            roots = [r.strip() for r in
+                     str(self.rules.get("watcher_sources", "equipped")
+                         ).split(",") if r.strip()]
+        add = e.vars.get("__watcher_sources_add")
+        if isinstance(add, list):
+            roots = roots + [str(r) for r in add]
+        return roots
+
+    def held_watchers(self, e: "Entity"
+                      ) -> List[Tuple[str, str, Any, Optional[str]]]:
+        """Every watcher `e` holds as (source, name, spec, problem): its
+        own `watchers` var (source `unit`), each `watchers` dict found
+        under its watcher_sources roots (source = the container's path,
+        `equipped.ring`), each status's `watchers` (instance, definition
+        and level entries, `status:<name>`) and its team's (`team:<t>`).
+        `problem` names why an entry can't be read (None = usable)."""
+        out: List[Tuple[str, str, Any, Optional[str]]] = []
+
+        def _bundle(node: Any, src: str) -> None:
+            if not isinstance(node, dict):
+                out.append((src, "", node, "`watchers` isn't a dict of "
+                            "name -> {condition, effect, once}"))
+                return
+            for k, spec in node.items():
+                out.append((src, str(k), spec, watcher_spec_problem(spec)))
+
+        def _walk(node: Any, base: str) -> None:
+            if isinstance(node, dict):
+                if WATCHERS_KEY in node:
+                    _bundle(node[WATCHERS_KEY], base)
+                for k, v in node.items():
+                    if k == WATCHERS_KEY or str(k).startswith("__"):
+                        continue
+                    _walk(v, f"{base}.{k}" if base else str(k))
+
+        if WATCHERS_KEY in e.vars:
+            _bundle(e.vars[WATCHERS_KEY], "unit")
+        for root in self._effective_watcher_sources(e):
+            node: Any = e.vars
+            for seg in root.split("."):
+                node = node.get(seg) if isinstance(node, dict) else None
+            if node is not None:
+                _walk(node, root)
+        for sname, inst in e.status.items():
+            b = self.status_field(inst, sname, WATCHERS_KEY)
+            if b is not None:
+                _bundle(b, f"status:{sname}")
+        if e.team is not None:
+            td = self.team_data.get(str(e.team))
+            if isinstance(td, dict) and WATCHERS_KEY in td:
+                _bundle(td[WATCHERS_KEY], f"team:{e.team}")
+        return out
+
+    def has_watchers(self) -> bool:
+        """Whether a watcher poll has anything to read or settle: match
+        watchers, held watchers' stored state, or a living unit holding
+        one."""
+        if self.watchers or self.watcher_state:
+            return True
+        return any(e.is_alive and self.held_watchers(e)
+                   for e in self.entities.values())
+
     def fire_watchers(self) -> List[str]:
         """Re-check the watchers until a pass fires nothing new (at most
         watcher_chain_limit passes), so a watcher made true by another's
@@ -13188,10 +13429,10 @@ class Match:
         self._watcher_backlog = False
         for _ in range(limit):
             fired, notes = self._watcher_pass()
-            log += notes
+            log += [n for n in notes if n not in log]
             if not fired:
                 return log
-        if self.watchers and self._watcher_pass(peek=True)[0]:
+        if self.has_watchers() and self._watcher_pass(peek=True)[0]:
             self._watcher_backlog = True
             log.append(f"⚠ watchers still firing after {limit} passes "
                        f"(watcher_chain_limit); the rest wait for the next "
@@ -13203,45 +13444,147 @@ class Match:
         (the condition newly becoming true). All edges are recorded BEFORE
         any effect runs, so one effect can't perturb another watcher's
         reading this pass. A `once` watcher is removed after firing. A
-        malformed condition reads as not-met (fail-safe). `peek` only
-        reports which would fire. Returns (fired names, effect notes)."""
-        if not self.watchers:
+        malformed condition reads as not-met (fail-safe). The per-unit
+        readings (each, held) share the owner limit watcher_unit_checks;
+        past it the rest keep their state for the next poll. `peek` only
+        reports which would fire. Returns (fired labels, notes)."""
+        if not self.has_watchers():
             return [], []
         from formula import FormulaEngine, EvalCtx, FormulaError
         this_id = self.current_entity_id()
         engine = FormulaEngine(self)
-        fired: List[str] = []
+        budget = owner_limit("watcher_unit_checks")
+        cut = False
+        notes: List[str] = []
+
+        def _read(cond: str, eid: Optional[str], extras: Dict[str, Any]
+                  ) -> bool:
+            if not cond:
+                return False
+            try:
+                return bool(engine.eval_expression(
+                    cond, EvalCtx(this=this_id, target=eid, extras=extras)))
+            except FormulaError:
+                return False
+
+        # (kind, watcher name / state key, unit, effect, once, extras)
+        fires: List[Tuple[str, str, Optional[str], str, bool,
+                          Dict[str, Any]]] = []
+        alive = [e for e in self.entities_in_turn_order() if e.is_alive]
+        new_units: Dict[str, Dict[str, bool]] = {}
         for name, w in list(self.watchers.items()):
             cond = str(w.get("condition", "") or "")
-            now = False
-            if cond:
-                try:
-                    now = bool(engine.eval_expression(cond, EvalCtx(this=this_id)))
-                except FormulaError:
-                    now = False
-            was = bool(w.get("last", False))
-            if not peek:
-                w["last"] = now
-            if now and not was:
-                fired.append(name)
-        if peek:
-            return fired, []
-        log: List[str] = []
-        for name in fired:
-            w = self.watchers.get(name)
-            if w is None:
-                continue
             eff = str(w.get("effect", "") or "")
+            if not w.get("each"):
+                now = _read(cond, None, {"watcher_name": name})
+                was = bool(w.get("last", False))
+                if not peek:
+                    w["last"] = now
+                if now and not was:
+                    fires.append(("match", name, None, eff,
+                                  bool(w.get("once")),
+                                  {"watcher_name": name}))
+                continue
+            old = w.get("units") if isinstance(w.get("units"), dict) else {}
+            spent = set(w.get("spent") or [])
+            units: Dict[str, bool] = {}
+            for e in self._watched_units(w):
+                if budget <= 0:
+                    cut = True
+                    if e.id in old:
+                        units[e.id] = bool(old[e.id])
+                    continue
+                budget -= 1
+                now = _read(cond, e.id, {"watcher_name": name})
+                units[e.id] = now
+                was = old.get(e.id)
+                if was is None or e.id in spent:
+                    continue            # first seen / already spent
+                if now and not was:
+                    fires.append(("each", name, e.id, eff,
+                                  bool(w.get("once")),
+                                  {"watcher_name": name}))
+            new_units[name] = units
+        new_state: Dict[str, Dict[str, Any]] = {}
+        for e in alive:
+            for src, wname, spec, problem in self.held_watchers(e):
+                if problem is not None:
+                    continue
+                key = json.dumps([e.id, src, wname])
+                prev = self.watcher_state.get(key)
+                if budget <= 0:
+                    cut = True
+                    if prev is not None:
+                        new_state[key] = copy.deepcopy(prev)
+                    continue
+                budget -= 1
+                extras = {"watcher_name": wname, "watcher_source": src}
+                now = _read(str(spec.get("condition") or ""), e.id, extras)
+                spent = bool(prev.get("spent")) if prev else False
+                new_state[key] = {"last": now, "spent": spent}
+                if prev is None or spent:
+                    continue
+                if now and not prev.get("last"):
+                    fires.append(("held", key, e.id,
+                                  str(spec.get("effect") or ""),
+                                  bool(spec.get("once")), extras))
+        if cut:
+            notes.append(f"⚠ watchers: the per-unit readings reached the "
+                         f"owner limit watcher_unit_checks "
+                         f"({owner_limit('watcher_unit_checks')}); the rest "
+                         f"wait for the next command.")
+        labels = [k if kind == "match" else f"{k}@{eid}"
+                  for kind, k, eid, *_r in fires]
+        if peek:
+            return labels, []
+        for name, units in new_units.items():
+            w = self.watchers.get(name)
+            if w is not None:
+                w["units"] = units
+                if w.get("spent"):
+                    w["spent"] = [u for u in w["spent"] if u in units]
+        self.watcher_state = new_state
+        for kind, key, eid, eff, once, extras in fires:
+            if kind == "match":
+                w = self.watchers.get(key)
+                if w is None:
+                    continue
+            elif eid not in self.entities or not self.entities[eid].is_alive:
+                continue                # gone or dead since its reading
+            if kind == "each":
+                w = self.watchers.get(key)
+                if w is None:
+                    continue            # removed by an earlier effect
+            if kind == "held" and key not in self.watcher_state:
+                continue
+            what = extras.get("watcher_name", key)
             if eff:
                 try:
-                    FormulaEngine(self).eval_program(
-                        eff, EvalCtx(this=self.current_entity_id()))
+                    FormulaEngine(self).eval_program(eff, EvalCtx(
+                        this=self.current_entity_id(), target=eid,
+                        extras=dict(extras)))
                 except FormulaError as ex:
-                    log.append(f"⚠ watcher `{name}` effect error: {ex}")
-            self.log_event("watcher_fired", name=name)
-            if w.get("once"):
-                self.watchers.pop(name, None)
-        return fired, log
+                    where = f" on `{eid}`" if eid else ""
+                    notes.append(f"⚠ watcher `{what}`{where} effect error: "
+                                 f"{ex}")
+            if eid is None:
+                self.log_event("watcher_fired", name=what)
+            else:
+                self.log_event("watcher_fired", name=what, unit=eid)
+            if kind == "held":
+                if once and key in self.watcher_state:
+                    self.watcher_state[key]["spent"] = True
+                continue
+            w = self.watchers.get(key)
+            if w is None:
+                continue
+            if once:
+                self.watchers.pop(key, None)
+            elif kind == "each" and w.get("once_each"):
+                sp = w.setdefault("spent", [])
+                if eid not in sp:
+                    sp.append(eid)
+        return labels, notes
 
     # ---- match outcome / victory (100) -------------------------------
     # No built-in objective evaluator: a win CONDITION is composed by the
@@ -21995,6 +22338,7 @@ class Match:
             "tables": dict(self.tables),
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
+            "watcher_state": copy.deepcopy(self.watcher_state),
             "outcome": copy.deepcopy(self.outcome),
             "team_data": copy.deepcopy(self.team_data),
             "team_passives": {
@@ -22249,6 +22593,11 @@ class Match:
             str(k): copy.deepcopy(v) for k, v in raw_watch.items()
             if isinstance(k, str) and isinstance(v, dict)
         } if isinstance(raw_watch, dict) else {}
+        raw_ws = d.get("watcher_state", {}) or {}
+        m.watcher_state = {
+            str(k): copy.deepcopy(v) for k, v in raw_ws.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        } if isinstance(raw_ws, dict) else {}
         raw_outcome = d.get("outcome")
         m.outcome = copy.deepcopy(raw_outcome) if isinstance(raw_outcome, dict) else None
         raw_td = d.get("team_data", {}) or {}
@@ -25881,6 +26230,14 @@ class MatchManager:
         for kind in ("status_definitions", "tables", "macros",
                      "zone_definitions"):
             setattr(m, kind, copy.deepcopy(self.system_library(sysobj, kind)))
+        # Watchers arrive armed: each reads its condition once now.
+        for wname, wdef in sorted(
+                self.system_library(sysobj, "watchers").items()):
+            try:
+                m.add_watcher(wname, **watcher_add_args(wdef))
+            except VTTError as ex:
+                print(f"[systems] watcher `{wname}` of `{sysobj.name}` not "
+                      f"added to `{m.id}`: {ex}")
         self.matches[m.id] = m
         return m.id
 

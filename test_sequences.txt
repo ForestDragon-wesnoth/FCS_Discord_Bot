@@ -18488,7 +18488,7 @@ SCENARIO 676 — words past the end of a command's usage are refused
 !ent copy a s676 4
 ?? Give both x and y, or neither
 !watch add w "1 == 1" "1" onec
-?? is `once` or nothing
+?? after the condition and effect a watcher takes `once` or `once_each`
 !map scene bogus
 ?? Unexpected `bogus`
 !assert "len(all_entities()) == 2" "nothing was removed"
@@ -22067,7 +22067,7 @@ SCENARIO 759 — System libraries: promote from a match, !match sync, undo, rest
 !match sync funcs nothere
 ?? ❌ system `default` has no formula function `nothere`
 !match sync spells
-?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, zones, all.
+?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, zones, watchers, all.
 !match sync all calc
 ?? ❌
 ?tab "!system func info default ca"
@@ -32773,3 +32773,312 @@ counted as a run with a ❌ reply; the rule stays as it was. With the
 owner limit simulate_step_limit at 10, five runs of three steps stop
 after three runs (nine steps; a fourth wouldn't finish), and 11 runs are
 refused. Players can't run it.
+
+SCENARIO 975 — Per-unit watchers (each): bloodied below 30%, one edge per unit
+----------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add knight Knight 30 2 2 10
+!ent add ogre Ogre 40 5 5 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!status def bloodied
+!watch add bloodied "entity[self].hp < 0.3 * entity[self].max_hp" "status_apply(self, 'bloodied')\nvar_add(self, 'times_bloodied', 1)" each
+?? read for each of 2 unit(s)
+!ent hp ogre 11
+!assert "status_has('ogre', 'bloodied') and not status_has('knight', 'bloodied')"
+!ent hp ogre 5
+!assert "entity[ogre].times_bloodied == 1"
+!ent hp knight 8
+!assert "status_has('knight', 'bloodied') and entity[knight].times_bloodied == 1"
+!watch show bloodied
+?? true now for: `knight`, `ogre`
+!ent hp knight 30
+!ent hp knight 2
+!assert "entity[knight].times_bloodied == 2 and entity[ogre].times_bloodied == 1"
+!eval "summon_near({'name': 'Imp', 'vars': {'hp': 1, 'max_hp': 10}}, 8, 8, 2)"
+!assert "not var_has('imp', 'times_bloodied')"
+!ent hp imp 10
+!ent hp imp 1
+!assert "entity[imp].times_bloodied == 1"
+
+Expected: One watcher reads its condition for every living unit with
+`self` = that unit, each unit with its own edge. The 2x2 ogre dropping
+to 11 of 40 fires for the ogre only; dropping further while already
+below doesn't fire again (times_bloodied stays 1). The knight crossing
+later fires for the knight. Healed above 30% and dropping again fires
+again for the knight. An imp summoned already at 1 of 10 hp is first
+seen there: its reading is recorded without firing, and it fires after
+it heals and drops.
+
+SCENARIO 976 — Per-unit watchers: once, once_each, tag= and body parts
+----------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add a Hero 20 2 2 10
+!ent add b Hero 20 4 2 9
+!ent add c Villain 20 6 2 8
+!ent set_var a tags hero
+!ent set_var b tags hero
+!part add c arm Arm 10 10
+!watch add first_blood "entity[self].hp < 20" "match_var_set('first_blood', self)" once each
+!watch add last_stand "entity[self].hp <= 5" "var_add(self, 'stands', 1)" once_each each tag=hero
+!watch add limbs "entity[self].hp <= 5" "var_add(self, 'low', 1)" each tag="not part"
+!batch ent hp b 15 ; ent hp a 15
+!assert "match_var_get('first_blood') == 'a'"
+!assert "not watch_exists('first_blood')"
+!ent hp a 4
+!ent hp c 4
+!assert "entity[a].stands == 1 and not var_has('c', 'stands')"
+!ent hp a 20
+!ent hp a 3
+!assert "entity[a].stands == 1"
+!ent hp arm 2
+!assert "not var_has('arm', 'low') and entity[c].low == 1 and entity[a].low == 2"
+!watch list
+?? `last_stand` (each tag=hero, once_each)
+!watch show last_stand
+?? spent (fired once): `a`
+
+Expected: `once` with `each` fires for the first unit to cross (a batch
+drops b then a in one command; the effects run in turn order, so `a`,
+the first in the order, fires) and removes the watcher. `once_each`
+lets each unit fire once: the hero a fires at 4 hp, and again healed
+and dropped it stays spent; `tag=hero` leaves the villain c out.
+`tag="not part"` leaves c's arm out while c itself and a are read.
+
+SCENARIO 977 — Watchers a unit holds: boss phases carried by a template
+----------------------------------------------------------
+!match new m1 demo 12 12
+!match use m1
+!ent add boss Warlord 100 3 3 10
+!ent set_vars boss footprint_w=2 footprint_h=2
+!ent set_var boss watchers.phase2.condition "entity[self].hp <= 50"
+!ent set_var boss watchers.phase2.effect "summon_near({'name': 'Guard', 'vars': {'hp': 5}}, entity[self].x, entity[self].y, 3)\nentity[self].phase = 2"
+!ent set_var boss watchers.phase2.once true
+!ent set_var boss watchers.phase3.condition "entity[self].hp <= 20"
+!ent set_var boss watchers.phase3.effect "entity[self].phase = 3"
+!template save boss warlord
+!ent remove boss
+!template spawn warlord 2 2
+!template spawn warlord 8 8
+!watch held warlord
+?? `phase2` from `unit` (once), armed
+!ent hp warlord 40
+!assert "entity[warlord].phase == 2 and not var_has('warlord2', 'phase')"
+!assert "len(units_with_tag('nonexistent')) == 0 and len(entities_with_var('hp')) == 3"
+!ent hp warlord 100
+!ent hp warlord 45
+!assert "len(entities_with_var('hp')) == 3"
+!watch held warlord
+?? `phase2` from `unit` (once), spent
+!ent hp warlord2 15
+!assert "entity[warlord2].phase == 3"
+!eval "watchers_of('warlord2')"
+?? 'name': 'phase2', 'source': 'unit', 'once': True, 'state': 'spent'
+
+Expected: A boss carries its phase triggers in its own `watchers` var,
+read with self = the boss; saved as a template and spawned twice, each
+copy watches for itself. The first warlord at 40 hp enters phase 2 and
+summons a guard; the second is untouched. `once` is per holder:
+healing and dropping the first warlord again summons nothing more (still
+four units). The second warlord dropping straight to 15 crosses both
+lines in one command: phase2 and phase3 fire in that order (phase 3
+last), and phase2 is true for it but not yet spent? (see the reply).
+
+SCENARIO 978 — Watchers on items: a second-wind charm under watcher_sources
+----------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add hero Hero 30 2 2 10
+!ent set_var hero inventory.charm.watchers.second_wind.condition "entity[self].hp < 10"
+!ent set_var hero inventory.charm.watchers.second_wind.effect "entity[self].shield = 8\nitem_consume(self, watcher_source)"
+!ent hp hero 5
+!assert "not var_has('hero', 'shield') and var_has('hero', 'inventory.charm')"
+!watch held hero
+?? holds no watchers
+!eval "var_move('hero', 'inventory.charm', 'hero', 'equipped.charm')"
+!watch held hero
+?? `second_wind` from `equipped.charm`, true now
+!ent hp hero 20
+!ent hp hero 6
+!assert "entity[hero].shield == 8 and not var_has('hero', 'equipped.charm')"
+!ent set_var hero belt.flask.watchers.sip.condition "entity[self].hp < 4"
+!ent set_var hero belt.flask.watchers.sip.effect "entity[self].hp = entity[self].hp + 10"
+!ent hp hero 3
+!assert "entity[hero].hp == 3"
+!eval "entity[hero].__watcher_sources_add = ['belt']"
+!ent hp hero 20
+!ent hp hero 2
+!assert "entity[hero].hp == 12"
+!eval "watchers_of('hero')"
+?? 'source': 'belt.flask'
+
+Expected: A charm in `inventory` brings nothing: watcher_sources
+(default `equipped`) decides which containers count, so dropping to 5
+hp fires nothing. Moved under `equipped`, the charm's watcher is first
+seen while its condition already holds (hp 5, "true now"), so it waits
+for the next crossing: healed to 20 and dropped to 6, it gives an 8 hp
+shield and consumes its own item through `watcher_source` (the charm's
+path, `equipped.charm`). A flask on the belt does nothing until the
+hero's `__watcher_sources_add` adds `belt`; then dropping to 2 heals 10.
+
+SCENARIO 979 — Watchers in statuses (with level entries) and team data
+----------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add a Scout 30 2 2 10
+!ent add b Guard 30 4 2 8
+!ent set_var a team red
+!ent set_var b team red
+!status def poison
+!status data poison watchers.purge.condition "entity[self].hp > 25"
+!status data poison watchers.purge.effect "status_remove(self, 'poison')"
+!status def venom
+!status level venom 3+ watchers.spread.condition "entity[self].hp < 15"
+!status level venom 3+ watchers.spread.effect "status_apply('b', 'venom', 1)"
+!status apply a poison 1
+!ent hp a 20
+!ent hp a 28
+!assert "not status_has('a', 'poison')"
+!status apply a venom 1
+!ent hp a 10
+!assert "not status_has('b', 'venom')"
+!ent hp a 20
+!ent status a set venom level 3
+!watch held a
+?? `spread` from `status:venom`
+!ent hp a 10
+!assert "status_has('b', 'venom')"
+!team set red watchers.rally.condition "entity[self].hp < 8"
+!team set red watchers.rally.effect "var_add(self, 'rallied', 1)"
+!ent hp b 5
+!assert "entity[b].rallied == 1 and not var_has('a', 'rallied')"
+!eval "len(watchers_of('a'))"
+?? = `2`
+
+Expected: A poison whose definition data holds a `purge` watcher
+copies it into each instance: the bearer climbing above 25 hp cleanses
+itself. A venom whose level entry `3+` holds `spread` gives the watcher
+only from level 3: at level 1 dropping to 10 spreads nothing; raised to
+level 3, the next drop applies venom to b. A watcher in the red team's
+data reaches each member: b dropping to 5 rallies b alone. watchers_of
+lists a's two (venom's spread and the team's rally).
+
+SCENARIO 980 — System watchers: a win condition every new match starts with
+----------------------------------------------------------
+!system new skirmish
+!system watch add skirmish rout "len(team_members('blue')) == 0" "declare_winner('red', 'rout')" once
+!system watch add skirmish bloodied "entity[self].hp < 10" "var_add(self, 'bloodied', 1)" each tag="not part"
+!system new skirmish_night parent=skirmish
+!system watch remove skirmish_night bloodied
+!system watch list skirmish_night
+?? `rout` (once) (inherited)
+?? Hidden here: `bloodied`
+!match new m1 demo 10 10 skirmish
+!match use m1
+!watch list
+?? `bloodied` (each tag=not part)
+?? `rout` (once)
+!ent add r Red 30 2 2 10
+!ent add b Blue 20 5 5 5
+!ent set_var r team red
+!ent set_var b team blue
+!ent hp b 5
+!assert "entity[b].bloodied == 1"
+!ent kill b
+!assert "match_winner() == 'red'"
+!match new m2 night 10 10 skirmish_night
+!match use m2
+!watch list
+?! bloodied
+!system watch add skirmish rout "len(team_members('blue')) == 0" "declare_winner('red', 'rout by sync')" once
+!match sync watchers diff
+?? `rout`: when
+!match sync watchers
+?? replaced `rout`
+!watch add mine "entity[r2].hp < 5" "entity[r2].hp = 5"
+!system watch promote skirmish mine
+?? Promoted watcher `mine`
+!system watch show skirmish mine
+?? when: `entity[r2].hp < 5`
+
+Expected: A system's watchers arrive in each new match armed:
+`skirmish` holds a rout check (a win condition) and a per-unit bloodied
+watcher. Its child `skirmish_night` inherits the rout and hides
+bloodied. In a skirmish match, blue's unit dropping to 5 is bloodied,
+and killing it declares red the winner. A night match has the rout only.
+Editing the parent's rout reaches a live match through `!match sync
+watchers` (`diff` first lists what would change); `promote` copies a
+match's watcher into the system.
+
+SCENARIO 981 — watch_add / watch_remove in formulas: a ritual arms its own watcher
+----------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add mage Mage 20 2 2 10
+!ent add altar Altar 30 6 6 1
+!ent set_var mage ritual.actions.begin.target none
+!ent set_var mage ritual.actions.begin.body "watch_add('altar_falls', 'has_corpse(\"altar\")', 'declare_winner(\"mage\", \"ritual\")', once=True)\nentity[self].chanting = 1"
+!ent set_var mage ritual.actions.stop.target none
+!ent set_var mage ritual.actions.stop.body "watch_remove('altar_falls')\nentity[self].chanting = 0"
+!action mage begin
+!assert "watch_exists('altar_falls')"
+!action mage stop
+!assert "not watch_exists('altar_falls')"
+!action mage begin
+!ent kill altar
+!assert "match_winner() == 'mage' and not watch_exists('altar_falls')"
+!ent set_var mage probe "$(watch_add('x', '1 == 1', 'entity[mage].hp = 1'))"
+?? banned in a $() inline argument
+!assert "not watch_exists('x') and entity[mage].hp == 20"
+!ent set_var mage held "$(len(watchers_of('mage')))"
+!assert "entity[mage].held == 0"
+!eval "watch_add('bad', 5)"
+?? the condition is a formula text, not int
+
+Expected: HARNESS-ALLOWS-ERRORS. An action arms a watcher at runtime
+(watch_add) and another disarms it (watch_remove): begun, stopped, begun
+again, the altar's death declares the mage the winner and the `once`
+watcher goes. watch_add is refused inside a `$()` argument and changes
+nothing; watchers_of reads in one. A condition that isn't a formula text is refused.
+
+SCENARIO 982 — Watchers: the per-poll limit, broken entries, undo and restart
+----------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add a A 20 2 2 10
+!ent add b B 20 4 2 9
+!ent add c C 20 6 2 8
+!watch add low "entity[self].hp < 10" "var_add(self, 'low', 1)" each
+!ent set_var a watchers.bad 5
+!ent set_var b watchers.nocond.effect "entity[self].hp = 1"
+!watch held a
+?? isn't a dict {condition, effect, once}; it is never read
+!watch held b
+?? has no `condition`
+!ent hp a 5
+!assert "entity[a].low == 1"
+!undo command
+!assert "not var_has('a', 'low')"
+!ent hp a 5
+!assert "entity[a].low == 1"
+!as restart
+!match use m1
+!ent hp a 15
+!ent hp a 4
+!assert "entity[a].low == 2"
+!owner ceiling watcher_unit_checks 2
+!batch ent hp b 3 ; ent hp c 3
+?? ⚠ watchers: the per-unit readings reached the owner limit watcher_unit_checks (2)
+!owner ceiling watcher_unit_checks reset
+!ent hp a 3
+!assert "entity[b].low == 1 and entity[c].low == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. An entry under a unit's `watchers`
+that isn't a watcher (a number, a dict without a condition) is listed by
+`!watch held` with what is wrong and never read. Undo takes back a
+firing with its edge state: undone, a's crossing fires again. The edge
+state survives a restart (a heals and drops: its second firing). With
+the owner limit watcher_unit_checks at 2, a poll reads two units and the
+third waits, with a warning; once the limit is back, the next command
+reads it and fires (c drops to 3 below 10).

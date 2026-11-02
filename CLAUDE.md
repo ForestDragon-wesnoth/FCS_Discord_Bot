@@ -1223,7 +1223,37 @@ hardcodes**.
   loop; the rest of the chain waits for the next command that CHANGES the
   match, `_watcher_backlog`: a read doesn't run it, and `!match replay`
   doesn't poll); `once` removes after firing; `last` serialized; a malformed
-  condition reads as not met (427-428, 826).
+  condition reads as not met (427-428, 826). `Match.add_watcher` arms one
+  (its condition read and recorded, so one already true fires next time).
+  **Per-unit** (#149, `each`, 975-976): the condition is read for every
+  living unit (body parts too; `tag=<filter>` narrows, checked before the
+  formula) with self = the unit, each unit's edge in the watcher's `units`;
+  a unit read for the first time (a summon, a revive, present at add) is
+  recorded without firing, a dead or removed one drops out; `once` removes
+  the watcher after its first unit (effects run in turn order), `once_each`
+  lets each unit fire once (`spent`). **Held** (977-979): a `watchers` dict
+  (`logic.WATCHERS_KEY`, name -> {condition, effect, once}) on the unit,
+  in containers under the `watcher_sources` roots (default `equipped`,
+  per-unit `__watcher_sources` / `_add`, as modifiers), in a status
+  (`status_field`: instance data, definition, level entries) or in its
+  team's data (`Match.held_watchers`, each with its source label and
+  `watcher_spec_problem`); read with self = the holder, `watcher_name` /
+  `watcher_source` bound (an item's path: `item_consume(self,
+  watcher_source)`); edge state in `Match.watcher_state` (json [holder,
+  source, name] -> last / spent; serialized, undone), never in the vars,
+  so a reading writes nothing on the unit; `once` = once per holder. One
+  pass records every edge first, then runs effects (match watchers, then
+  held, units in turn order, skipping a unit gone or dead since its
+  reading). The per-unit readings share the owner limit
+  `watcher_unit_checks` (2000, ~1 ms each); past it the rest keep their
+  state with a ⚠️ (a replay under another limit can differ). Polled when
+  `Match.has_watchers()` (any watcher, stored state or a unit holding
+  one). A system's `watchers` library (`!system watch`, 980) arms its
+  entries in each new match (`watcher_definition` / `watcher_add_args`);
+  `!match sync watchers` re-arms changed ones. Formulas `watch_add` /
+  `watch_remove` (mutating), `watch_exists`, `watchers_of(eid)` (981).
+  `!watch held <eid>` lists a unit's watchers, broken entries named (982);
+  `!system lint` reads held, team, status and library watchers.
 - **Output:** every formula-driven change hands its log to
   `Match.surface_log` (action buffer, else the command's `FORMULA_LOG_SINK`),
   shown at the end of the command in order (651).
@@ -2472,7 +2502,7 @@ hardcodes**.
   formula equal to its parent's after a rename is dropped (753-756).
 - **System libraries** (`SYSTEM_LIBRARIES`: aliases, tile templates,
   formula functions, status definitions, tables, macros, zone
-  definitions):
+  definitions, watchers):
   `!system alias|tile|func|status|table|macro|zone <action> <system> ...` edit
   them with the grammar of `!alias` / `!tile def` / `!func` / `!status` /
   `!table` / `!macro` (action first, like alias), through the effective
