@@ -1312,7 +1312,8 @@ hardcodes**.
   [formula]`, the definition's `hooks`; `logic.STATUS_DEF_HOOKS`): run by
   `fire_status_event` after the on_status_* passives, self = the bearer,
   while the unit exists. Removal hooks (passives too) bind `removed_by`:
-  `dispel`, `transfer`, `removes` (another status's `removes`), `expired`
+  `dispel`, `transfer`, `removes` (another status's `removes`), `zone`
+  (a granting zone let go, §7.12), `expired`
   (a counter reached 0, or the status's own tick removed it:
   `logic.STATUS_TICKING`) or `removed`; `_emit_status_diff(removed_by=)`
   carries a caller's cause (884). The formula status functions surface
@@ -2102,6 +2103,43 @@ hardcodes**.
   binding kept, resumes on revive or a part heal). The binding is by id, so
   a suspended aura also resumes around a LATER unit that reuses the id
   (left as-is) (388-389, 519-520).
+- **Status-granting zones** (#136, 961-964): a zone's / definition's
+  `grants` (status -> {level, data, linger}; `!zone grant | ungrant |
+  grant_condition | grant_bodies`, the same under `!zone def` and `!system
+  zone`; `zone_grant` / `zone_ungrant` / `zone_grants`), read live from the
+  definition (a zone's own grant of a status replaces it; its own
+  condition / bodies setting win; `zone_grants_of`, `zone_grant_setting`).
+  `Match.sync_zone_grants` computes who should hold what and diffs it
+  against the instances' `__zone_grant` marker (the zones holding it;
+  `__zone_linger` the turns it lingers): it applies through `apply_status`
+  (definition data + grant data as `seed_data`; stacking, immunity,
+  resistance, blocked_by, hooks; a part's redirected status skipped),
+  removes with removed_by `zone`, or with linger leaves the status with a
+  `duration` and `__zone_lingering` (counted down by the GM's tick; a zone
+  covering it again takes it back). A status without the marker is the
+  unit's own: never taken over or removed. A held grant isn't re-applied
+  when another zone takes over (its first level / data stay). Who:
+  `grant_bodies` / `zone_status_grant_bodies` (root: the body root once
+  when any cell of the body, located / region parts included, is inside;
+  all: every unit with a cell inside, glued parts following their unit),
+  alive and not a hidden rider, then `grant_condition` (expression, self
+  = the unit, zone_name / zone_map bound; failing = not met, one ⚠️ per
+  zone per command, not in a team-view channel). When: `fire_entity_step`
+  and `fire_entity_moved` (after the re-stamps, before the passives; for
+  the moved body only, `grant_scope`, or every unit when the body anchors
+  an aura: a condition costs a formula namespace, ~2 ms, per unit), the
+  formula functions in `formula._GRANT_SETTLE_FUNCS` (zone edits, summons,
+  kill / revive, mounts, ...), the end of `_process_death`, a change of
+  the bodies rule (`apply_system_rules`, so a replayed systems entry
+  settles too), and after each top-level command that changed the match
+  (`CommandRegistry._run`, before the undo step is recorded; a read
+  doesn't settle, so it never becomes an undo step). A sync running asks
+  nested ones for another pass (`_grant_syncing` / `_grant_dirty`), at
+  most `ZONE_GRANT_PASSES` (8), then a ⚠️. A death strips the zone's
+  statuses before the corpse snapshot; statblocks, templates and prefabs
+  leave them out (`without_zone_grants`); `!zone rename` and `!status
+  rename` follow. When to use one over enter / exit hooks is in `!help
+  zone grant`.
 
 ### 7.13 Vision, fog and line of sight
 
@@ -2737,7 +2775,7 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
   definitions and `!func`s (called anywhere in the saved strings) its
   contents use that the system lacks or holds differently; all of them
   with `definitions=all`. Statuses count as used when a unit holds one, a
-  saved string quotes its name (a lava tile's `status_apply(self,
+  zone grants one (#136), a saved string quotes its name (a lava tile's `status_apply(self,
   'burn', ...)`) or a carried status's removes / blocked_by names it,
   repeated until nothing new turns up (944). `check_prefab` (import and
   load) reads corpse bodies and parts as units, refuses part_of /
@@ -2952,6 +2990,12 @@ hasn't named the next.
   remember who has acted this round (each unit exactly one turn a round,
   a saved set undo restores; recommended), keep it as the documented
   meaning of `immediate`, or make `deferred` the default.
+- **Live vs materialized definition fields** (user, at #136: "for now
+  live, but later we should discuss what is live and materialized"): a
+  zone reads its definition's hooks, look fields, tags and grants live,
+  while data and facing are copied in when the zone is made (`reapply`
+  pushes them later); tile templates split the same way. Discuss which
+  fields belong on which side, and whether a GM should choose per field.
 
 ### Deferred (the user wants these tracked)
 

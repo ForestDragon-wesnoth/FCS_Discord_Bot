@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
-from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD
+from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -1197,9 +1197,28 @@ class CommandRegistry:
         # snapshot represents "the state to roll back to if you undo
         # this command".
         post_state = None
+        # Status-granting zones (#136) settle after a command that changed
+        # the match (a read leaves them as they are): what it changed may be
+        # a zone's cells or grants, or what a condition reads. (A change of
+        # the zone_status_grant_bodies rule settles in apply_system_rules.)
+        if pre_active_mid in mgr.matches:
+            m_post = mgr.matches[pre_active_mid]
+            if (getattr(m_post, "_action_depth", 0) == 0
+                    and m_post._grants_present()):
+                if pre_state is not None:
+                    post_state = m_post.to_dict(include_history=False)
+                    due = _differs_in_undo_state(pre_state, post_state)
+                else:
+                    due = name not in _JOURNAL_READS
+                if due:
+                    before = m_post._grant_changes
+                    m_post.surface_log(m_post.sync_zone_grants())
+                    if m_post._grant_changes != before:
+                        post_state = None
         if pre_state is not None and pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
-            post_state = m_post.to_dict(include_history=False)
+            if post_state is None:
+                post_state = m_post.to_dict(include_history=False)
             # Pausing and the system's rules are things an undo leaves alone
             # (see _restore_snapshot), so a change to them alone is not an
             # undo step.
@@ -2662,6 +2681,7 @@ def _typed_unit_view(ctx: ReplyContext, mgr: MatchManager,
 # `<field>_unless` restriction formulas.
 _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "condition", "effect", "cost",
+                                 "grant_condition",
                                  "death_effect", "__death_condition",
                                  "__map_vehicle_death_effect",
                                  "__mount_death_effect"})
@@ -8640,6 +8660,8 @@ def _match_formula_slots(m: Match):
         for key in ("block", "opaque"):
             yield (f"zone `{zname}` {key}", (z.get("data") or {}).get(key),
                    "eval", frozenset(), False)
+        yield (f"zone `{zname}` grant_condition", z.get("grant_condition"),
+               "eval", frozenset(), False)
     for dname, zdef in sorted(m.zone_definitions.items()):
         for when, src in sorted((zdef.get("hooks") or {}).items()):
             yield (f"zone definition `{dname}` hook `{when}`", src, "exec",
@@ -8648,6 +8670,8 @@ def _match_formula_slots(m: Match):
             yield (f"zone definition `{dname}` {key}",
                    (zdef.get("data") or {}).get(key), "eval", frozenset(),
                    False)
+        yield (f"zone definition `{dname}` grant_condition",
+               zdef.get("grant_condition"), "eval", frozenset(), False)
 
 
 def _rename_entry(d: Dict[str, Any], old: str, new: str, what: str) -> Dict[str, Any]:
@@ -8779,6 +8803,10 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             n += 1
             check(f"zone definition `{zname}` {key}", zdef["data"].get(key),
                   "eval", sys_known, soft=True)
+        if zdef.get("grant_condition"):
+            n += 1
+            check(f"zone definition `{zname}` grant_condition",
+                  zdef["grant_condition"], "eval", sys_known, soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
@@ -9370,9 +9398,9 @@ async def _system_zone(ctx: ReplyContext, args: List[str],
         return await ctx.send(_system_deleted_line(
             mgr, s, kind, "zone definition", name))
 
-    def check(body: str, what: str) -> Optional[str]:
+    def check(body: str, what: str, mode: str = "exec") -> Optional[str]:
         return _system_formula_warning(
-            mgr, s, body, "exec", f"Invalid {what} formula", "it fails")
+            mgr, s, body, mode, f"Invalid {what} formula", "it fails")
 
     scratch = _system_scratch(mgr, s)
     reply = await _zone_def_sub(ctx, [action] + args[3:], scratch,
@@ -9720,6 +9748,10 @@ registry.annotate_sub(
         "sprite <system> <name> <key|-> [<facing>] | "
         "face <system> <name> <dir|-> | "
         "legend <system> <name> <text ...> | tags <system> <name> <tag ...> | "
+        "grant <system> <name> <status> [level=<n>] [linger=<n>] "
+        "[<key>=<value> ...] | ungrant <system> <name> <status> | "
+        "grant_condition <system> <name> [<formula ...>] | "
+        "grant_bodies <system> <name> <root|all|-> | "
         "rename <system> <name> <new_name> | copy <system> <name> <new_name> | "
         "del <system> <name> | drop <system> <name> | "
         "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
@@ -18286,7 +18318,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|tags|face|setdef|def|info|list|cells|hook> ..."),
+    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|tags|face|setdef|grant|ungrant|grant_condition|grant_bodies|def|info|list|cells|hook> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -18299,7 +18331,9 @@ registry.annotate_sub(
         "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
         "new, drop, rename, add, remove, fill, shift, anchor, "
         "unanchor, set, del, clear, glyph, sprite (a graphics sprite key, "
-        "like glyph), color, legend, tags, setdef, def (zone definitions: "
+        "like glyph), color, legend, tags, setdef, grant / ungrant / "
+        "grant_condition / grant_bodies (statuses the units inside "
+        "have), def (zone definitions: "
         "a kind of zone described once), info, list, cells, hook."
     ),
 )
@@ -18325,6 +18359,18 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "def":
         return await _zone_def_cmd(ctx, args, m)
+
+    # ---- grant / ungrant / grant_condition / grant_bodies (#136) ----
+    if sub in _GRANT_SUBS:
+        if await return_help_if_not_enough_args(ctx, args, _GRANT_SUBS[sub],
+                                                "zone", sub):
+            return
+        z = m.find_zone(args[1])
+        if z is None:
+            raise NotFound(f"No zone `{args[1]}`.")
+        reply = _grant_edit(z, args, f"zone `{args[1]}`", "!zone {sub}",
+                            _match_program_check(m))
+        return await ctx.send(reply)
 
     # ---- new [<name>] [def=<definition>] ----
     if sub == "new":
@@ -18406,6 +18452,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"No zone `{args[1]}`.")
         check_zone_name(args[2])
         zmp.zones = _rename_entry(zmp.zones, args[1], args[2], "zone")
+        m.rename_zone_in_grants(args[1], args[2])
         note = _mentions_note(m, args[1], "zone")
         return await ctx.send(f"Renamed zone `{args[1]}` to `{args[2]}`."
                               + (f"\n{note}" if note else ""))
@@ -18703,8 +18750,9 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 view[key] = z[key]
         if z.get("tags"):
             view["tags"] = list(z["tags"])
+        view.update(_grant_view(z))
         # What the zone reads from its definition (live): the hooks, look
-        # fields and tags it doesn't set itself.
+        # fields, tags and grants it doesn't set itself.
         dname = z.get("def")
         if isinstance(dname, str) and dname:
             d = m.zone_def_dict(z)
@@ -18720,6 +18768,13 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         inh[key] = d[key]
                 if d.get("tags"):
                     inh["tags"] = list(d["tags"])
+                dg = {k: v for k, v in (d.get("grants") or {}).items()
+                      if k not in (z.get("grants") or {})}
+                if dg:
+                    inh["grants"] = dg
+                for key in ("grant_condition", "grant_bodies"):
+                    if key in d and key not in z:
+                        inh[key] = d[key]
                 if inh:
                     view["from_def"] = inh
         if len(m.maps) > 1:
@@ -18867,13 +18922,107 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["zone"], args[0] if args else None)
 
 
+# Status-granting zones (#136): the subcommands shared by `!zone`, `!zone
+# def` and `!system zone`, each by the words it needs (action included).
+_GRANT_SUBS = {"grant": 3, "ungrant": 3, "grant_condition": 2,
+               "grant_bodies": 3}
+
+
+def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
+                usage: str, check) -> str:
+    """Run grant subcommand `args[0]` (args = <sub> <name> ...) on zone or
+    zone definition dict `target`, named `label` in the reply; `usage` is
+    the command the hints name (a format string over `sub`), `check(body,
+    what, mode)` validates the condition (raises, or returns a ⚠️ line)."""
+    sub = args[0].lower()
+    if sub == "grant":
+        status = args[2]
+        entry: Dict[str, Any] = {}
+        data: Dict[str, Any] = {}
+        for tok in args[3:]:
+            k, eq, v = tok.partition("=")
+            if not eq or not k:
+                raise VTTError(
+                    f"`{tok}` — usage: `{usage.format(sub='grant')} <name> "
+                    f"<status> [level=<n>] [linger=<n>] [<key>=<value> "
+                    f"...]`.")
+            val = _parse_scalar(v)
+            if k in ("level", "linger"):
+                entry[k] = val
+            else:
+                check_store_path(k, "grant data key")
+                if "." in k:
+                    raise VTTError(f"grant data key `{k}`: one word (nested "
+                                   f"data goes on the status definition).")
+                data[k] = val
+        if data:
+            entry["data"] = data
+        stored = check_zone_grant(status, entry)
+        target.setdefault("grants", {})[status] = stored
+        bits = [f"level {stored['level']}" if "level" in stored else None,
+                f"linger {stored['linger']} turn(s)"
+                if stored.get("linger") else None,
+                "data " + json.dumps(stored["data"], sort_keys=True)
+                if stored.get("data") else None]
+        bits = [b for b in bits if b]
+        return (f"{label} grants `{status}`"
+                + (f" ({', '.join(bits)})" if bits else "")
+                + " to the units inside it.")
+    if sub == "ungrant":
+        _check_tail(args, 3, (), usage.format(sub="ungrant")
+                    + " <name> <status>")
+        grants = target.get("grants") or {}
+        if args[2] not in grants:
+            raise NotFound(f"{label} has no `{args[2]}` grant of its own.")
+        del grants[args[2]]
+        if not grants:
+            target.pop("grants", None)
+        return (f"{label} no longer grants `{args[2]}` (units it held it on "
+                f"lose it).")
+    if sub == "grant_bodies":
+        _check_tail(args, 3, (), usage.format(sub="grant_bodies")
+                    + " <name> <root|all|->")
+        v = args[2].lower()
+        if v in ("-", "default", "clear"):
+            target.pop("grant_bodies", None)
+            return (f"{label} grants per its definition or the "
+                    f"zone_status_grant_bodies rule again.")
+        if v not in ZONE_GRANT_BODIES:
+            raise VTTError("grant_bodies is `root` (a body's root unit, "
+                           "once), `all` (every unit with a cell inside) or "
+                           "`-` (the default).")
+        target["grant_bodies"] = v
+        return f"{label} grants to " + (
+            "body roots." if v == "root" else "every unit with a cell inside.")
+    # grant_condition [<formula> | -]
+    body = normalize_body_source(" ".join(args[2:]).strip())
+    if not body:
+        cur = target.get("grant_condition")
+        return (f"{label} grant_condition: "
+                + (f"`{formula_text(cur)}`" if cur else "(none: every unit "
+                   "inside)"))
+    if body in ("-", "none", "clear"):
+        target.pop("grant_condition", None)
+        return f"Cleared {label}'s grant_condition."
+    warn = check(body, "grant_condition", mode="eval")
+    target["grant_condition"] = body
+    return (f"{label} grants only to units for which `{body}` holds (self = "
+            f"the unit, zone_name bound)." + (f"\n{warn}" if warn else ""))
+
+
+def _grant_view(z: Dict[str, Any]) -> Dict[str, Any]:
+    """The #136 fields dict `z` sets itself, for an info view."""
+    return {k: copy.deepcopy(z[k]) for k in ZONE_GRANT_FIELDS if k in z}
+
+
 # `!zone def <action> <name> ...` (and `!system zone <action> <system>
 # <name> ...`, which runs the same code on a scratch match): action -> the
 # words `!zone def` needs (action included).
 _ZONE_DEF_SUBS = {"new": 2, "data": 4, "del-data": 3, "hook": 4,
                   "del-hook": 3, "glyph": 3, "color": 3, "sprite": 3,
                   "face": 3, "reapply": 2,
-                  "legend": 3, "tags": 2, "rename": 3, "copy": 3}
+                  "legend": 3, "tags": 2, "rename": 3, "copy": 3,
+                  **_GRANT_SUBS}
 _ZONE_DEF_DELETES = ("del", "delete", "remove", "rm", "drop")
 
 
@@ -18886,6 +19035,7 @@ def _zone_def_dict_view(d: Dict[str, Any]) -> Dict[str, Any]:
     for key in ZONE_LOOK_FIELDS:
         if key in d:
             view[key] = d[key]
+    view.update(_grant_view(d))
     return _hide_formula_fields(view)
 
 
@@ -18941,6 +19091,11 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
     if d is None:
         raise NotFound(f"No zone definition `{name}`. Make it with "
                        f"`{prefix.format(sub='new')} {name}`.")
+    if sub in _GRANT_SUBS:
+        head, nl, warn = _grant_edit(d, args, f"zone definition `{name}`",
+                                     prefix, check).partition("\n")
+        return (head + " Its zones read it live; a zone's own grant of a "
+                "status replaces it." + nl + warn)
     if sub == "reapply":
         # #258: the definition's data and facing pushed to its zones. Not
         # in `!system
@@ -19276,7 +19431,8 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
             ("live instance(s)", n["instances"]),
             ("corpse(s)", n["corpses"]),
             ("other definition(s)' removes / blocked_by", n["definitions"]),
-            ("immunity / resistance var(s)", n["vars"])) if v]
+            ("immunity / resistance var(s)", n["vars"]),
+            ("zone grant(s)", n.get("zone grants", 0))) if v]
         note = _mentions_note(m, args[1], "status")
         return (
             f"Renamed status `{args[1]}` to `{args[2]}`"
@@ -19584,7 +19740,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         "what the status does when it arrives, leaves or changes on a unit "
         "(self = the bearer; status_name, old_value, new_value and, on "
         "removal, removed_by: expired / dispel / transfer / removes / "
-        "removed), run after the on_status_* passives; no formula clears "
+        "zone / removed), run after the on_status_* passives; no formula clears "
         "it. "
         "`display <name> <format>` sets how the status shows in the "
         "`{statuses}` roster placeholder (its fields are placeholders, as in "
@@ -20229,6 +20385,69 @@ registry.annotate_sub(
           "zones_with_tag and the tag= filters of zones_at, entity_zones and "
           "zone_names, and `!zone list tag=<tag>` lists them."),
 )
+registry.annotate_sub(
+    "zone", "grant",
+    usage=("!zone grant <name> <status> [level=<n>] [linger=<n>] "
+           "[<key>=<value> ...]"),
+    desc=(
+        "Make the zone grant a status (#136): every unit inside it has the "
+        "status, and loses it once no granting zone covers it. The grants "
+        "follow every step of a move for the moving body (as on_enter / "
+        "on_exit fire; everyone under an aura it carries), a zone's cells "
+        "changing (add / remove / fill / shift, an aura following its "
+        "anchor), spawns, deaths and revives, and settle for every unit "
+        "after each command that changed the match (a condition reading "
+        "other units catches up then). The status goes on through the normal "
+        "application (its definition's data, then the `<key>=<value>` data "
+        "given here, at `level=`; stacking, immunity, resistance, "
+        "blocked_by and the status hooks apply) and has no duration: it "
+        "lasts while the unit is inside. Leaving removes it (on_removed "
+        "binds removed_by `zone`), or with `linger=<n>` it stays with a "
+        "duration of n, counted down by the status's own tick like any "
+        "duration, and a zone takes it back if the unit returns first. A "
+        "status the unit got some other way is never taken over or "
+        "removed. Who receives it: `!zone grant_bodies` and the "
+        "zone_status_grant_bodies rule (a body's root once, or every unit "
+        "with a cell inside), `!zone grant_condition` (an expression with "
+        "self = the unit). USE A GRANT for a state that holds while a unit "
+        "is inside (a banner's +1 armor through a status modifier, a "
+        "silence field, a blessing, darkness): one setting replaces an "
+        "on_enter / on_exit pair, and it stays right through teleports, "
+        "shifting zones, moving auras, deaths and units spawned inside, "
+        "where a hook pair misses the cases no unit moved. USE HOOKS for an "
+        "event at the boundary (damage on entering, a trap, a counter, a "
+        "push back), for an effect each turn inside (on_turn_start, or the "
+        "status's own tick), or when what happens depends on the move "
+        "itself (direction, the cell it came from)."
+    ),
+)
+registry.annotate_sub(
+    "zone", "ungrant",
+    usage="!zone ungrant <name> <status>",
+    desc=("Stop the zone granting a status: the units it held it on lose it "
+          "(removed_by `zone`, or lingering per the grant)."),
+)
+registry.annotate_sub(
+    "zone", "grant_condition",
+    usage="!zone grant_condition <name> [<formula ...>]",
+    desc=(
+        "Grant only to units for which this expression holds (self = the "
+        "unit; zone_name bound, so zone_anchor_of(zone_name) names an aura's "
+        "anchor: `is_ally(self, zone_anchor_of(zone_name))`). Checked at "
+        "every sync, so a unit that stops meeting it loses the grant. A "
+        "condition that fails reads as not met, with one ⚠️. `-` clears it; "
+        "no formula shows it."),
+)
+registry.annotate_sub(
+    "zone", "grant_bodies",
+    usage="!zone grant_bodies <name> <root|all|->",
+    desc=("Which units of a body the zone grants to, over the "
+          "zone_status_grant_bodies rule: `root` (the body's root unit, "
+          "once, when any cell of the body is inside) or `all` (every unit "
+          "with a cell inside, located and region parts included; glued "
+          "parts follow their unit). `-` goes back to the definition's or "
+          "the rule."),
+)
 _ZONE_DEF_USAGE = (
     "!zone def new <name> | !zone def data <name> <path> <value> | "
     "!zone def del-data <name> <path> | "
@@ -20240,6 +20459,10 @@ _ZONE_DEF_USAGE = (
     "!zone def face <name> <dir|-> | !zone def reapply <name> [reset] | "
     "!zone def legend <name> <text ...> | "
     "!zone def tags <name> <tag ...> | "
+    "!zone def grant <name> <status> [level=<n>] [linger=<n>] "
+    "[<key>=<value> ...] | !zone def ungrant <name> <status> | "
+    "!zone def grant_condition <name> [<formula ...>] | "
+    "!zone def grant_bodies <name> <root|all|-> | "
     "!zone def rename <name> <new_name> | !zone def copy <name> <new_name> | "
     "!zone def del <name> [confirm] | !zone def drop <name> [confirm] | "
     "!zone def delete <name> [confirm] | !zone def remove <name> [confirm] | "
@@ -20269,7 +20492,11 @@ registry.annotate_sub(
         "settings and stop naming it; `!undo command` brings it back). "
         "`rename` takes its zones along. A system holds "
         "definitions too (`!system zone`), copied into new matches; `!match "
-        "sync zones` brings a live match up to date."
+        "sync zones` brings a live match up to date. `grant` / `ungrant` / "
+        "`grant_condition` / `grant_bodies` give every zone of it status "
+        "grants (`!help zone grant`), read live: a zone's own grant of a "
+        "status replaces the definition's, its own condition and bodies "
+        "setting win."
     ),
 )
 registry.annotate_sub(
@@ -20815,6 +21042,9 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     finally:
         _DRY_ACTIVE.reset(token)
         after = mgr.matches.get(mid)
+        # The zone grants it would settle (#136), as after a real command.
+        if after is not None and after._grants_present():
+            after.surface_log(after.sync_zone_grants())
         post = after.to_dict(include_history=False) if after is not None \
             else None
         _restore_all_matches(mgr, snap)

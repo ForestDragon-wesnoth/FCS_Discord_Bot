@@ -172,6 +172,8 @@ def capture_prefab(mgr: Any, m: Match, mp: Map, x1: int, y1: int, x2: int,
                 for u in tree:
                     d = u.to_dict()
                     d.pop("map", None)
+                    # A zone's grants come back from the zone (#136).
+                    d["status"] = logic.without_zone_grants(d.get("status"))
                     d["x"] = int(d.get("x", u.x)) - xa
                     d["y"] = int(d.get("y", u.y)) - ya
                     dv = d.get("vars")
@@ -283,6 +285,12 @@ def _collect_definitions(mgr: Any, m: Match, data: Dict[str, Any],
     for b in bodies:
         if isinstance(b, dict) and isinstance(b.get("status"), dict):
             snames |= set(b["status"])
+    # The statuses its zones grant (#136): their own grants and those of
+    # the zone definitions carried.
+    for z in list(data["zones"].values()) + [
+            m.zone_definitions.get(zn) or {} for zn in znames]:
+        if isinstance(z, dict) and isinstance(z.get("grants"), dict):
+            snames |= set(z["grants"])
     # Statuses the units hold, and those the saved formulas and carried
     # definitions name: a quoted name in a hook, tick or function body (a
     # lava tile's status_apply(self, 'burn', ...)), a removes / blocked_by

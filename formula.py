@@ -2849,6 +2849,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # minting its name), and tile tags.
     "zone_tags", "zone_has_tag", "zones_with_tag", "zone_def_of",
     "zone_spawn", "tile_tags", "tile_has_tag", "tiles_with_tag",
+    # Status-granting zones (#136): zone_grants(zone) reads, zone_grant /
+    # zone_ungrant change a zone's own grants.
+    "zone_grants", "zone_grant", "zone_ungrant",
     # Entity-anchored auras: bind a zone to an entity so its cells track
     # the entity's footprint (re-stamped on move). radius 0 = the
     # footprint itself.
@@ -3026,7 +3029,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "log",
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift", "zone_set", "zone_del", "zone_spawn",
-    "zone_anchor", "zone_unanchor",
+    "zone_anchor", "zone_unanchor", "zone_grant", "zone_ungrant",
     "mount", "dismount", "switch_slot",
     "damage_part", "damage_spread",
     "team_set", "team_add",
@@ -3090,6 +3093,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'zone_exists', 'zone_get', 'zone_has', 'zone_keys', 'zone_names',
     'zone_size', 'zones_at',
     'zone_tags', 'zone_has_tag', 'zones_with_tag', 'zone_def_of',
+    'zone_grants',
     'tile_tags', 'tile_has_tag', 'tiles_with_tag',
     'cells_in_burst', 'cells_in_line', 'cells_in_cone', 'cells_in_rect',
 })
@@ -3136,6 +3140,17 @@ _TAG_ARG_FUNCS: "frozenset[str]" = frozenset({
     "visible_entities",
 })
 
+# The changes after which a formula's zone grants settle (#136): a zone's
+# cells or grants, a unit arriving, leaving, dying or coming back.
+_GRANT_SETTLE_FUNCS: "frozenset[str]" = frozenset({
+    "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
+    "zone_fill", "zone_shift", "zone_spawn", "zone_anchor", "zone_unanchor",
+    "zone_grant", "zone_ungrant",
+    "summon", "summon_near", "summon_from", "summon_template",
+    "summon_template_near", "stamp_prefab", "remove_entity", "kill",
+    "revive", "transform", "revert", "mount", "dismount", "switch_slot",
+    "damage_part", "damage_spread",
+})
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
     "tile_place", "tile_template_of", "tile_tags", "tile_has_tag",
@@ -3364,7 +3379,8 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # and Match.fire_status_tick); None elsewhere.
     "removed_by",       # on_status_removed passives and a definition's
                         # on_removed hook: why the status left (expired,
-                        # dispel, transfer, removes, removed); None
+                        # dispel, transfer, removes, zone (a granting
+                        # zone let go, #136), removed); None
                         # elsewhere.
     "skip_status",      # on_turn_skipped: the status(es) whose skips_turn
                         # cost the unit its turn, sorted and comma-joined
@@ -4544,6 +4560,18 @@ class FormulaEngine:
                 ents = self._match.entities
                 return [i for i in res if i in ents and tag_filter_matches(
                     self._match.unit_tags(ents[i]), f)]
+            _call.__doc__ = getattr(fn, "__doc__", None)
+            _call.__wrapped__ = fn
+            return _call
+
+        def _settling(fn: Any) -> Any:
+            """`fn`, then the match's zone grants settled (#136)."""
+            def _call(*a: Any, **k: Any) -> Any:
+                res = fn(*a, **k)
+                m = self._match
+                if m is not None:
+                    m.surface_log(m.sync_zone_grants())
+                return res
             _call.__doc__ = getattr(fn, "__doc__", None)
             _call.__wrapped__ = fn
             return _call
@@ -8071,6 +8099,43 @@ class FormulaEngine:
             is of (`!zone new ... def=`, zone_spawn), or None."""
             return match.zone_def_name(_zone_name(name, "zone_def_of"))
 
+        def _zone_grants(name: Any) -> dict:
+            """zone_grants(zone): the statuses the zone grants (#136), status
+            -> {level, data, linger}: its definition's, each replaced by its
+            own grant of that status. {} for a zone that grants nothing."""
+            z = match.find_zone(_zone_name(name, "zone_grants"))
+            return copy.deepcopy(match.zone_grants_of(z)) if z else {}
+
+        def _zone_grant(name: Any, status: Any, level: Any = None,
+                        linger: Any = None, data: Any = None) -> bool:
+            """zone_grant(zone, status, level=None, linger=None, data=None):
+            make the zone grant `status` to the units inside it (#136; `!zone
+            grant`): replaces its own grant of that status. Returns True."""
+            from logic import check_zone_grant
+            z = match.find_zone(_zone_name(name, "zone_grant"))
+            if z is None:
+                raise FormulaError(f"zone_grant: no zone `{name}`.")
+            entry = {k: v for k, v in (("level", level), ("linger", linger),
+                                       ("data", data)) if v is not None}
+            try:
+                stored = check_zone_grant(status, entry)
+            except VTTError as ex:
+                raise FormulaError(f"zone_grant: {ex}")
+            z.setdefault("grants", {})[status] = stored
+            return True
+
+        def _zone_ungrant(name: Any, status: Any) -> bool:
+            """zone_ungrant(zone, status): stop the zone's own grant of
+            `status` (#136). Returns True iff it had one."""
+            z = match.find_zone(_zone_name(name, "zone_ungrant"))
+            grants = (z or {}).get("grants")
+            if not isinstance(grants, dict) or status not in grants:
+                return False
+            del grants[status]
+            if not grants:
+                z.pop("grants", None)
+            return True
+
         def _zone_spawn(definition: Any, cells: Any = None, map: Any = None,
                         name: Any = None) -> str:
             """zone_spawn(definition, cells=[], map=None, name=None): make a
@@ -8419,6 +8484,9 @@ class FormulaEngine:
         ns["zones_with_tag"]    = _zones_with_tag
         ns["zone_def_of"]       = _zone_def_of
         ns["zone_spawn"]        = _zone_spawn
+        ns["zone_grants"]       = _zone_grants
+        ns["zone_grant"]        = _zone_grant
+        ns["zone_ungrant"]      = _zone_ungrant
         ns["tile_tags"]         = _tile_tags
         ns["tile_has_tag"]      = _tile_has_tag
         ns["tiles_with_tag"]    = _tiles_with_tag
@@ -10016,6 +10084,12 @@ class FormulaEngine:
         # units whose tags match the filter.
         for fname in _TAG_ARG_FUNCS:
             ns[fname] = _with_tag(fname, ns[fname])
+        # Status-granting zones (#136): a function changing a zone's cells
+        # or grants, or which units stand where, settles the grants before
+        # the formula reads on (moves settle per step themselves).
+        for fname in _GRANT_SETTLE_FUNCS:
+            if fname in ns:
+                ns[fname] = _settling(ns[fname])
 
         # A coordinate where a function takes an x / y pair: [x, y] (or a
         # location target) fills both slots, and the map of an [x, y, map]
