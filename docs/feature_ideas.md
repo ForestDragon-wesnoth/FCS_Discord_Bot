@@ -370,6 +370,19 @@ or rejects one, it moves to "Off the list".
   - From the combat systems:
     - Showing the stacks in #222's status line, in Solis's own format: "(5 lvl1 burn, 2 lvl2 burn)".
     - Solis Plague and Steelmoss: damage that grows each turn while the stack lives, resets when it expires and is kept when the status is reapplied; a per-stack counter field holds the growth.
+  - Open questions raised, then parked by the user (my recommendation after each):
+    1. Storage: one instance per name holding a `stacks` list (each stack its own level, duration, fields); the top-level `level` is the engine-kept effective level, so everything keyed by name keeps working. Rec: this, over separate `burn#2` instances.
+    2. Top-level `duration` = the longest stack's; direct writes of level / duration on a stacked instance refused with a pointer to `stack=` (or: applied to every stack).
+    3. Two knobs: `stack_level` (highest / sum / newest) and `stack_tick` (once / each, binding `stack_level` / `stack_id`), each with a default rule; or the sketch's single `stack_effect`. Rec: two (sum ticking once, highest ticking per stack).
+    4. Decay stays in the GM's tick: a counter outside a per-stack tick changes every stack, inside one only that stack; a stack at 0 drops, the last one removes the status (`expired`).
+    5. Re-application: `stack_merge` none (a new stack, default) / same_level (refresh that stack to the longer duration; Solis).
+    6. Cap: `max_stacks` with a rule `status_stack_overflow` (replace_shortest default / replace_oldest / refuse); `max_level` caps each stack and the summed level.
+    7. Data: the application's level, duration and seed data go on the new stack; definition `data` is copied into the instance once and shared.
+    8. Surface: `status_stacks(eid, name)` (stack dicts with a stable `id`), `stack=<id>` on status_get / status_set / counters, `status_stack_remove`, a `stacks` view on `!ent status` / `!status`.
+    9. Hooks stay status-level (on_added: first stack, on_removed: last, on_changed: a stack added / dropped or the effective level changed, with `stack_id` / `stack_event`), or new on_stack_added / on_stack_removed.
+    10. Resistance folds each application into its stack; dispel removes all stacks; transfer moves all; a zone grant owns one stack (marker on the stack).
+    11. Display: a `{stacks}` placeholder from a `status_stack_format` rule (default `{duration} lvl{level}`, joined ", ").
+    12. Switching a live status's mode converts instances (one stack of its level and duration; back: the effective level and longest duration), firing on_changed.
 - **#151 Named selectors.** `!selector def enemies "team!=red hp>0"`, usable as `!foreach @enemies ; ...` and as `select('enemies')` in formulas.
 - **#152 Directional armor and coverage** (§8 combat layers). Per-part, per-side armor values and coverage %, with `armor_at(target, part, side)` and a mitigation helper the GM's damage formula calls. Primitives only.
 - **#153 Vehicle follow-ups** (§8). Cover for riders inside a vehicle, a footprint per rider, and shared fuel or initiative between nested vehicles.
