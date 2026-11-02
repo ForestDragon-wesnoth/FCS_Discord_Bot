@@ -1609,6 +1609,26 @@ hardcodes**.
   runs, what a match rollback can't undo (`_dry_refusal`): server-wide
   edits, files, template writes, undo / history (kept across a rollback),
   approvals, `!match delete/pause/resume`, a nested `!dry` (768).
+- **`!simulate <n> [seed=] [steps=] [until=] [tally= ...] [units=] [vars=]
+  <command ...>`** (#230, hosts only, 971-974) runs a command n times on
+  `!dry`'s machinery (`_DRY_ACTIVE` holds the root, `"dry"` or
+  `"simulate"`, so the same refusals apply and neither runs inside the
+  other) and reports the channel's match: per unit the vars that changed
+  as distributions (a number as its change, mean / min / max; a unit gone
+  without a corpse is its own bucket), deaths / revives / removals, the
+  cell it ended on, statuses gained (with level) and lost, units spawned,
+  and the runs with a ❌ reply (`_sim_report`). Each run rolls from its
+  own generator (`<seed>/<run>/<match>`; `seed=` reproduces, else a fresh
+  seed named in the report), replies go to `_SimCtx` (no prompts or
+  boards), its formula log is dropped, and after each step it settles
+  zone grants, fires watchers and resets the summon budget, as a top-level
+  command would; then every match is restored and, at the end, each
+  match's RNG and history numbering. `steps=k` repeats the command per
+  run; `until=` (read-only, after each step) ends a run, and a winner
+  `declare_winner` set is tallied: a scripted fight is a macro playing
+  one turn. `tally=` (read-only) records a value per run. The steps of all
+  runs share the owner limit `simulate_step_limit` (1000); a run it cuts
+  is left out with a ⚠️. Runs yield the event loop between them.
 - **`!again`** reruns the caller's last top-level command in the channel
   (runtime-only `mgr._last_commands`; never records `again` / `as` / clicks;
   refused inside dispatch_no_snapshot; always player-available) (639, 646).

@@ -1627,7 +1627,7 @@ _SNAPSHOT_SUBS = frozenset({("turn", "set")})
 # Commands that only read the match (no undo snapshot either): the journal
 # doesn't serialize it around them.
 _JOURNAL_READS = frozenset({"assert", "dist", "dry", "find", "pending",
-                            "roll", "whoami"})
+                            "roll", "simulate", "whoami"})
 
 
 def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
@@ -1694,9 +1694,10 @@ _RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
 # True while `!again` replays a command (see again_cmd).
 _AGAIN_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_again_active", default=False)
-# True while `!dry` runs a command (see dry_cmd and _dry_refusal).
-_DRY_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
-    "vtt_dry_active", default=False)
+# The root ("dry" / "simulate") while `!dry` or `!simulate` runs a command
+# it will roll back (see dry_cmd, simulate_cmd and _dry_refusal), else "".
+_DRY_ACTIVE: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "vtt_dry_active", default="")
 # Lines for the `!server audit` entry of the typed command running now (see
 # audit_note); None outside a top-level command.
 _AUDIT_NOTES: "contextvars.ContextVar[Optional[List[str]]]" = \
@@ -2204,7 +2205,7 @@ def _pause_control(name: str, args: List[str]) -> bool:
     sub = str(args[0]).lower() if args else None
     if root == "match" and sub in ("pause", "resume"):
         return True
-    if root == "dry":
+    if root in ("dry", "simulate"):
         return True
     if root in ("undo", "history") and any(
             str(a).lower() == "preview" for a in args):
@@ -21317,23 +21318,29 @@ _DRY_TEMPLATE_READS = frozenset({"spawn", "list", "show", "diff", "refs",
                                  "trash"})
 
 
-def _dry_refusal(name: str, args: List[str]) -> Optional[str]:
-    """Why `!dry` can't run `!name args`, or None."""
+def _dry_refusal(name: str, args: List[str],
+                 root: Optional[str] = None) -> Optional[str]:
+    """Why `!dry` (or `!simulate`: `root`, else the one running) can't run
+    `!name args`, or None."""
+    root = root or _DRY_ACTIVE.get() or "dry"
     sub = args[0].lower() if args else ""
-    if name == "dry":
-        return "❌ `!dry` can't run inside another `!dry`."
+    if name in ("dry", "simulate"):
+        return (f"❌ `!{name}` can't run inside "
+                f"{'another ' if name == root else ''}`!{root}`.")
     why = None
     if name in _DRY_REFUSED_ROOTS or _admin_required(name, args):
-        why = "its effect lives outside the match, which a dry run can't undo"
+        why = ("its effect lives outside the match, which a rollback "
+               "can't undo")
     elif name == "template" and sub not in _DRY_TEMPLATE_READS:
         why = "the template library is written straight to disk"
     elif name == "prefab" and sub not in ("stamp", "list", "show", "trash"):
         why = "the prefab library is written straight to disk"
     elif name == "match" and sub in ("delete", "pause", "resume", "rng"):
-        why = "a dry run can't put that back as it was"
+        why = "a rollback can't put that back as it was"
     if why is None:
         return None
-    return f"❌ `!dry` can't run `!{name}{' ' + sub if sub else ''}`: {why}."
+    return (f"❌ `!{root}` can't run `!{name}{' ' + sub if sub else ''}`: "
+            f"{why}.")
 
 
 @registry.command(
@@ -21356,7 +21363,7 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     name, rest = registry._resolve_alias(args[0].lower().lstrip("!"),
                                          list(args[1:]), mgr, ctx)
-    refusal = _dry_refusal(name, rest)
+    refusal = _dry_refusal(name, rest, "dry")
     if refusal:
         return await ctx.send(refusal)
     m = active_match(mgr, ctx)
@@ -21371,7 +21378,7 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     seqs = {k: x.history._seq for k, x in mgr.matches.items()}
     await ctx.send(f"🧪 Dry run of `!{' '.join([name] + rest)}` — none of "
                    f"this is kept:")
-    token = _DRY_ACTIVE.set(True)
+    token = _DRY_ACTIVE.set("dry")
     try:
         await registry.dispatch_no_snapshot(name, rest, ctx, mgr)
     finally:
@@ -21416,6 +21423,509 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                   _diff_rule_text(ctx, m))
     return await ctx.send("\n".join(["🧪 It would change:"] + lines[1:]
                                      + ["Rolled back."]))
+
+
+# ---- !simulate (#230) ------------------------------------------------
+# A command run many times on throwaway copies of the match, each run with
+# its own RNG sequence, reporting what the runs did: var changes as
+# distributions, deaths, statuses gained / lost, spawns, and for a scripted
+# fight (until=) how many steps it took and who won. Built on `!dry`'s
+# machinery (snapshot every match, run under _DRY_ACTIVE so the nested
+# refusals hold, roll back, put each match's RNG back).
+
+_SIM_OPTIONS = ("seed", "steps", "until", "tally", "units", "vars")
+_SIM_LIST_CAP = 8           # values shown per distribution
+_SIM_LINE_CAP = 40          # unit / var / status lines shown
+
+
+class _SimCtx:
+    """The caller's context for one simulated run: same identity and
+    channel, replies collected (only the ❌ ones are reported), no prompts
+    (a choice needs an `answer=` token), and no board, image or button
+    side effects on the real channel."""
+
+    def __init__(self, inner: ReplyContext):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "replies", [])
+        for k in ("prompt_choice", "offer_resume", "post_scene_image",
+                  "show_scene_view", "set_autoupdate",
+                  "retire_server_boards"):
+            object.__setattr__(self, k, None)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("replies",):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_inner"), name, value)
+
+    async def send(self, message: Any = None, *a: Any, **k: Any) -> None:
+        if message is not None:
+            self.replies.append(str(message))
+
+
+def _sim_flat(d: Any, prefix: str = "") -> Dict[str, Any]:
+    """A unit's vars as dotted leaf paths (engine `__` keys left out: they
+    are bookkeeping). A list is one leaf."""
+    out: Dict[str, Any] = {}
+    if not isinstance(d, dict):
+        return out
+    for k, v in d.items():
+        k = str(k)
+        if k.startswith("__"):
+            continue
+        p = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict) and v:
+            out.update(_sim_flat(v, p))
+        else:
+            out[p] = v
+    return out
+
+
+def _sim_is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _sim_num(v: float) -> str:
+    v = round(float(v), 2)
+    return str(int(v)) if v == int(v) else f"{v:g}"
+
+
+def _sim_delta(v: float) -> str:
+    if v == 0:
+        return "±0"
+    return ("+" if v > 0 else "") + _sim_num(v)
+
+
+def _sim_pct(k: int, n: int) -> str:
+    p = 100.0 * k / n
+    return f"{p:.0f}%" if abs(p - round(p)) < 1e-9 else f"{p:.1f}%"
+
+
+def _sim_dist(values: List[str], n: int) -> str:
+    """`a ×60%, b ×40%`: the values by how often they came up (most often
+    first), the rest counted past _SIM_LIST_CAP."""
+    from collections import Counter
+    c = Counter(values)
+    items = sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = [f"{v} ×{_sim_pct(k, n)}" for v, k in items[:_SIM_LIST_CAP]]
+    if len(items) > _SIM_LIST_CAP:
+        extra = len(items) - _SIM_LIST_CAP
+        shown.append(f"… {extra} more value{'s' if extra != 1 else ''}")
+    return ", ".join(shown)
+
+
+def _sim_value_text(v: Any) -> str:
+    if v is None:
+        return "None"
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, sort_keys=True) if isinstance(v, (list, dict)) \
+        else str(v)
+
+
+def _sim_unit_view(m: Match, eid: str) -> Optional[Tuple[Any, ...]]:
+    """(fate, flat vars, statuses, cell) of `eid` now: alive / dead (a
+    corpse or a destroyed part) with its vars and where it is (`(x,y)`, the
+    map named on a match with several), or None when it is gone without a
+    corpse."""
+    many = len(m.maps) > 1
+    e = m.entities.get(eid)
+    if e is not None:
+        cell = f"({e.x},{e.y})" + (f" on `{e.map}`" if many else "")
+        return ("alive" if e.is_alive else "dead", _sim_flat(e.vars),
+                dict(e.status), cell)
+    found = m.find_corpse(eid)
+    if found is None:
+        return None
+    x, y, corpse, mp = found
+    snap = corpse.get("entity") or {}
+    return ("dead", _sim_flat(snap.get("vars", {})),
+            dict(snap.get("status", {}) or {}),
+            f"({x},{y})" + (f" on `{mp.name}`" if many else ""))
+
+
+def _sim_status_level(inst: Any) -> Any:
+    return inst.get("level", 1) if isinstance(inst, dict) else 1
+
+
+@registry.command(
+    "simulate", raw_args=True, snapshot=False, access="host_only",
+    usage=("!simulate <n> [seed=<text>] [steps=<n>] [until=<formula>] "
+           "[tally=<formula> ...] [units=<ids>] [vars=<paths>] "
+           "<command ...>"),
+    desc=(
+        "Run a command n times, each time on a throwaway copy of every "
+        "match with its own random rolls, and report what the runs did on "
+        "this channel's match: each var that changed as a distribution "
+        "(`ogre.hp: -15 ×80%, -23 ×20%; mean -16.6 (min -23, max -15)`), "
+        "how often each unit died, the statuses gained and lost, the units "
+        "spawned, and the ❌ replies. Nothing is kept: every match and its "
+        "RNG are put back. `seed=` makes the runs reproducible (without it "
+        "a fresh seed is picked and named in the report). `steps=<k>` runs "
+        "the command k times per run (three rounds of attacks); "
+        "`until=<formula>` (read-only, checked after each step) ends a run "
+        "early and reports how many steps it took, for scripted fights "
+        "where the command is a macro playing one turn (`steps=` then "
+        "caps the run, default 100); a winner declared with "
+        "`declare_winner` is tallied. `tally=<formula>` (read-only, any "
+        "number of them) records a value at the end of each run. `units=` "
+        "/ `vars=` (comma lists) narrow the report. Status hooks, "
+        "passives and watchers run as in a real command; choices need "
+        "`answer=` tokens. Refused for what `!dry` refuses. The steps of "
+        "all runs together are capped by the owner limit "
+        "simulate_step_limit. Hosts only."),
+)
+async def simulate_cmd(ctx: ReplyContext, args: List[str],
+                       mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["simulate"])
+        return await ctx.send(f"**{title}**\n{body}")
+    usage = registry._help["simulate"]["usage"]
+    try:
+        n = int(args[0])
+    except ValueError:
+        return await ctx.send(
+            f"❌ `{args[0]}` isn't a number of runs — usage: `{usage}`")
+    limit = owner_limit("simulate_step_limit")
+    if n < 1 or n > limit:
+        return await ctx.send(
+            f"❌ The number of runs is 1 to {limit} (the owner limit "
+            f"simulate_step_limit).")
+    opts: Dict[str, Any] = {"tally": []}
+    i = 1
+    while i < len(args) and "=" in args[i]:
+        key, _, val = args[i].partition("=")
+        key = key.lower()
+        if key not in _SIM_OPTIONS:
+            return await ctx.send(
+                f"❌ Unknown option `{key}=` — `!simulate` takes "
+                f"{', '.join(k + '=' for k in _SIM_OPTIONS)} before the "
+                f"command.")
+        if key == "tally":
+            opts["tally"].append(normalize_body_source(val))
+        elif key in opts:
+            return await ctx.send(f"❌ `{key}=` is given twice.")
+        else:
+            opts[key] = val
+        i += 1
+    if i >= len(args):
+        return await ctx.send(
+            f"❌ `!simulate` needs a command to run — usage: `{usage}`")
+    m = active_match(mgr, ctx)
+    mid = m.id
+    until = normalize_body_source(opts["until"]) if opts.get("until") \
+        else None
+    try:
+        steps = int(opts.get("steps", 100 if until else 1))
+    except ValueError:
+        return await ctx.send(f"❌ `steps={opts['steps']}` isn't a number.")
+    if steps < 1:
+        return await ctx.send("❌ `steps=` is 1 or more.")
+    from formula import validate_arg_safe
+    for src in ([until] if until else []) + opts["tally"]:
+        try:
+            validate_arg_safe(src)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ `{src}`: {ex}")
+    units = [u for u in str(opts.get("units", "")).split(",") if u]
+    missing = [u for u in units if u not in m.entities
+               and m.find_corpse(u) is None]
+    if missing:
+        return await ctx.send(
+            f"❌ `units=` names no unit or corpse `{', '.join(missing)}`.")
+    var_filter = [v for v in str(opts.get("vars", "")).split(",") if v]
+    name, rest = registry._resolve_alias(args[i].lower().lstrip("!"),
+                                         list(args[i + 1:]), mgr, ctx)
+    if name not in registry._handlers:
+        return await ctx.send(registry._unknown_command_message(name, mgr,
+                                                                ctx))
+    refusal = _dry_refusal(name, rest, "simulate")
+    if refusal:
+        return await ctx.send(refusal)
+    seed = opts.get("seed") or new_rng_seed()[:8]
+
+    # The board before: units (alive / dead) with their vars and statuses.
+    pre: Dict[str, Tuple[str, Dict[str, Any], Dict[str, Any]]] = {}
+    for eid in list(m.entities):
+        v = _sim_unit_view(m, eid)
+        if v is not None:
+            pre[eid] = v
+    for (_mp, _x, _y, cid, _c) in m.every_corpse():
+        if str(cid) not in pre:
+            pre[str(cid)] = _sim_unit_view(m, str(cid)) or ("dead", {}, {},
+                                                           "")
+    pre_outcome = m.outcome
+
+    snap = _snapshot_all_matches(mgr)
+    rngs = {k: (x._rng.getstate() if x._rng is not None else None,
+                x._rng_seed, x.rng_position())
+            for k, x in mgr.matches.items()}
+    seqs = {k: x.history._seq for k, x in mgr.matches.items()}
+    runs: List[Dict[str, Any]] = []
+    dirty = False
+    budget = limit
+    stopped = False
+    errors: List[str] = []
+    error_runs = 0
+    token = _DRY_ACTIVE.set("simulate")
+    tags_token = STORED_TAGS.set(None)
+    try:
+        for run in range(n):
+            if budget <= 0:
+                stopped = True
+                break
+            for k, x in mgr.matches.items():
+                x._rng = CountingRandom(f"{seed}/{run}/{k}")
+                x._rng_seed = effective_seed(x)
+            sctx = _SimCtx(ctx)
+            dirty = True
+            rec: Dict[str, Any] = {"steps": 0, "met": False}
+            failed = None
+            for _step in range(steps):
+                if budget <= 0:
+                    stopped = True
+                    break
+                budget -= 1
+                rec["steps"] += 1
+                cur = mgr.matches.get(mid)
+                if cur is not None:
+                    cur._summon_count = 0
+                sink = FORMULA_LOG_SINK.set([])
+                try:
+                    await registry.dispatch_no_snapshot(name, rest, sctx, mgr)
+                    cur = mgr.matches.get(mid)
+                    if cur is not None:
+                        if cur._grants_present():
+                            cur.surface_log(cur.sync_zone_grants())
+                        if cur.watchers:
+                            for line in cur.fire_watchers():
+                                sctx.replies.append(str(line))
+                finally:
+                    FORMULA_LOG_SINK.reset(sink)
+                cur = mgr.matches.get(mid)
+                if cur is None:
+                    break
+                if until:
+                    try:
+                        hit = FormulaEngine(cur).eval_expression(
+                            until, EvalCtx(this=cur.current_entity_id()))
+                    except FormulaError as ex:
+                        failed = f"❌ `until={until}` couldn't be read: {ex}"
+                        break
+                    if hit:
+                        rec["met"] = True
+                        break
+            if stopped:
+                # Cut by the step limit part-way: the run isn't counted.
+                _restore_all_matches(mgr, snap)
+                dirty = False
+                break
+            cur = mgr.matches.get(mid)
+            if failed is None and cur is not None:
+                rec["units"] = {eid: _sim_unit_view(cur, eid) for eid in pre}
+                rec["new"] = [e.name or e.id for e in cur.entities.values()
+                              if e.id not in pre and not e.part_of]
+                out = cur.outcome
+                rec["winner"] = (str(out.get("winner")) if isinstance(
+                    out, dict) and out is not pre_outcome
+                    and out != pre_outcome else None)
+                rec["tally"] = []
+                for src in opts["tally"]:
+                    try:
+                        rec["tally"].append(_sim_value_text(
+                            FormulaEngine(cur).eval_expression(
+                                src, EvalCtx(this=cur.current_entity_id()))))
+                    except FormulaError as ex:
+                        failed = f"❌ `tally={src}` couldn't be read: {ex}"
+                        break
+            elif cur is None:
+                rec["deleted"] = True
+            bad = [ln for r in sctx.replies for ln in r.split("\n")
+                   if ln.lstrip().startswith("❌")]
+            if bad:
+                error_runs += 1
+                if len(errors) < 3 and bad[0] not in errors:
+                    errors.append(bad[0])
+            _restore_all_matches(mgr, snap)
+            dirty = False
+            if failed is not None:
+                return await ctx.send(failed + f" (run {run + 1}); nothing "
+                                      f"was kept.")
+            runs.append(rec)
+            # Other servers' commands get a turn between runs.
+            await asyncio.sleep(0)
+    finally:
+        STORED_TAGS.reset(tags_token)
+        _DRY_ACTIVE.reset(token)
+        if dirty:       # an exception left a run's changes in place
+            _restore_all_matches(mgr, snap)
+        for k, sq in seqs.items():
+            if k in mgr.matches:
+                mgr.matches[k].history._seq = sq
+        for k, (state, gen_seed, pos) in rngs.items():
+            x = mgr.matches.get(k)
+            if x is None:
+                continue
+            if state is None:
+                x._rng, x._rng_seed, x.rng_pos = None, None, pos
+            else:
+                x._rng = CountingRandom(gen_seed)
+                x._rng.setstate(state)
+                x._rng_seed = gen_seed
+    return await ctx.send(_sim_report(
+        name, rest, runs, n, seed, steps, until, opts["tally"], pre,
+        units, var_filter, errors, error_runs, stopped, limit))
+
+
+def _sim_report(name: str, rest: List[str], runs: List[Dict[str, Any]],
+                n: int, seed: str, steps: int, until: Optional[str],
+                tallies: List[str], pre: Dict[str, Any], units: List[str],
+                var_filter: List[str], errors: List[str], error_runs: int,
+                stopped: bool, limit: int) -> str:
+    done = len(runs)
+    cmd = " ".join([name] + rest)
+    lines = [f"🎲 Simulated `!{cmd}` {done} time(s) (seed `{seed}`; "
+             f"nothing kept):"]
+    if stopped:
+        lines.append(f"⚠️ Stopped after {done} of {n} runs: the runs' steps "
+                     f"reached the owner limit simulate_step_limit "
+                     f"({limit}).")
+    if not done:
+        return "\n".join(lines)
+    gone = sum(1 for r in runs if r.get("deleted"))
+    if gone:
+        lines.append(f"The match was deleted ×{_sim_pct(gone, done)}.")
+    live = [r for r in runs if not r.get("deleted")]
+    if until:
+        met = [r["steps"] for r in live if r["met"]]
+        if met:
+            lines.append(
+                f"`{until}` held ×{_sim_pct(len(met), done)} after "
+                f"{_sim_num(sum(met) / len(met))} steps on average (min "
+                f"{min(met)}, max {max(met)})"
+                + (f"; not within {steps} steps ×"
+                   f"{_sim_pct(done - len(met), done)}"
+                   if len(met) < done else "") + ".")
+        else:
+            lines.append(f"`{until}` never held within {steps} steps.")
+    elif steps > 1:
+        lines.append(f"Each run ran the command {steps} times.")
+    winners = [r.get("winner") for r in live]
+    if any(w is not None for w in winners):
+        lines.append("Winner: " + _sim_dist(
+            [w if w is not None else "(none)" for w in winners], done))
+    for k, src in enumerate(tallies):
+        vals = [r["tally"][k] for r in live if len(r.get("tally", [])) > k]
+        lines.append(f"`{src}`: " + _sim_dist(vals, done) + _sim_mean(vals))
+    body: List[str] = []
+    keep = [u for u in pre if not units or u in units]
+
+    def _var_ok(path: str) -> bool:
+        return not var_filter or any(path == v or path.startswith(v + ".")
+                                     for v in var_filter)
+    for eid in keep:
+        fate0, vars0, st0, cell0 = pre[eid]
+        views = [r["units"].get(eid) for r in live]
+        died = sum(1 for v in views if v is not None and v[0] == "dead"
+                   and fate0 == "alive")
+        revived = sum(1 for v in views if v is not None and v[0] == "alive"
+                      and fate0 == "dead")
+        removed = sum(1 for v in views if v is None)
+        fates = []
+        if died:
+            fates.append(f"died ×{_sim_pct(died, done)}")
+        if revived:
+            fates.append(f"revived ×{_sim_pct(revived, done)}")
+        if removed:
+            fates.append(f"removed ×{_sim_pct(removed, done)}")
+        if fates:
+            body.append(f"`{eid}`: " + ", ".join(fates))
+        if any(v is not None and v[3] != cell0 for v in views):
+            body.append(f"`{eid}` ends at " + _sim_dist(
+                ["(gone)" if v is None else "(where it was)" if v[3] == cell0
+                 else v[3] for v in views], done) + f" (was {cell0})")
+        paths = sorted({p for v in views if v is not None for p in v[1]
+                        if _var_ok(p) and not same_value(
+                            v[1].get(p), vars0.get(p))}
+                       | {p for v in views if v is not None for p in vars0
+                          if _var_ok(p) and p not in v[1]})
+        for p in paths:
+            olds = vars0.get(p)
+            news = [v[1].get(p, _SIM_GONE) if v is not None else _SIM_GONE
+                    for v in views]
+            here = [x for x in news if x is not _SIM_GONE]
+            if _sim_is_num(olds) and here and all(_sim_is_num(x)
+                                                  for x in here):
+                # A number: the change per run; a run where the unit (or
+                # the var) is gone is its own bucket, outside the mean.
+                deltas = [x - olds for x in here]
+                body.append(
+                    f"`{eid}.{p}`: "
+                    + _sim_dist([_sim_delta(x - olds) if x is not _SIM_GONE
+                                 else "(gone)" for x in news], done)
+                    + f"; mean {_sim_delta(sum(deltas) / len(deltas))} "
+                    f"(min {_sim_delta(min(deltas))}, max "
+                    f"{_sim_delta(max(deltas))})")
+            else:
+                body.append(
+                    f"`{eid}.{p}` (was {_sim_value_text(olds)}): "
+                    + _sim_dist(["(gone)" if x is _SIM_GONE else
+                                 "(unchanged)" if same_value(x, olds) else
+                                 _sim_value_text(x) for x in news], done))
+        gained: Dict[str, List[Any]] = {}
+        lost: Dict[str, int] = {}
+        for v in views:
+            if v is None:
+                continue
+            for s, inst in v[2].items():
+                if s not in st0:
+                    gained.setdefault(s, []).append(_sim_status_level(inst))
+            for s in st0:
+                if s not in v[2]:
+                    lost[s] = lost.get(s, 0) + 1
+        for s, lv in sorted(gained.items()):
+            body.append(f"`{eid}` gains `{s}` ×{_sim_pct(len(lv), done)} "
+                        f"(level " + _sim_dist([_sim_value_text(x)
+                                                for x in lv], len(lv)) + ")")
+        for s, k in sorted(lost.items()):
+            body.append(f"`{eid}` loses `{s}` ×{_sim_pct(k, done)}")
+    if not units:
+        spawned: Dict[str, List[int]] = {}
+        for r in live:
+            for nm in set(r.get("new", [])):
+                spawned.setdefault(nm, [])
+        for nm in spawned:
+            counts = [r.get("new", []).count(nm) for r in live]
+            body.append(f"Spawned `{nm}`: {_sim_num(sum(counts) / done)} per "
+                        f"run on average (max {max(counts)})")
+    if not body and not errors:
+        body.append("No unit changed in any run.")
+    if len(body) > _SIM_LINE_CAP:
+        cut = len(body) - _SIM_LINE_CAP
+        body = body[:_SIM_LINE_CAP] + [
+            f"… {cut} more lines (narrow with `units=` / `vars=`)."]
+    lines += body
+    if error_runs:
+        lines.append(f"❗ {error_runs} run(s) had a ❌ reply, e.g.: "
+                     + " / ".join(e.strip() for e in errors))
+    return "\n".join(lines)
+
+
+_SIM_GONE = object()
+
+
+def _sim_mean(vals: List[str]) -> str:
+    try:
+        nums = [float(v) for v in vals]
+    except (TypeError, ValueError):
+        return ""
+    if not nums or any(v in ("True", "False") for v in vals):
+        return ""
+    return (f"; mean {_sim_num(sum(nums) / len(nums))} (min "
+            f"{_sim_num(min(nums))}, max {_sim_num(max(nums))})")
 
 
 @registry.command(

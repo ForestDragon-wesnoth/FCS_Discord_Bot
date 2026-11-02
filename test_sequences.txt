@@ -32613,3 +32613,163 @@ x2 = 4), status_apply there is refused and changes nothing, and
 status_apply's `rounding=` reaches the fold (3 x 2 = 6). A zone grant
 goes through the same resistance: a level 4 frost on a 2x2 golem with
 x0.5 frost resistance lands at 2.
+
+SCENARIO 971 — !simulate: an attack's damage as a distribution, reproducible, nothing kept
+----------------------------------------------------------
+!match new m1 demo 8 8
+!match use m1
+!ent add knight Knight 30 2 2 10
+!ent add ogre Ogre 40 3 2 5
+!status def bleed
+!ent set_var knight spear.actions.thrust.target entity
+!ent set_var knight spear.actions.thrust.body "dmg = roll('2d6')\nentity[target].hp = entity[target].hp - dmg\nif dmg >= 10:\n    status_apply(target, 'bleed', 2)"
+!history list commands
+!simulate 200 seed=abc !action knight thrust ogre
+?? Simulated `!action knight thrust ogre` 200 time(s) (seed `abc`; nothing kept)
+?? `ogre.hp`: -8 ×16%, -7 ×15.5%
+?? mean -6.95 (min -12, max -2)
+?? `ogre` gains `bleed` ×15.5% (level 2 ×100%)
+?! `knight.
+?! `knight`
+!simulate 200 seed=abc !action knight thrust ogre
+?? `ogre.hp`: -8 ×16%, -7 ×15.5%
+?? mean -6.95 (min -12, max -2)
+!simulate 50 seed=other !action knight thrust ogre
+?! mean -6.95
+!assert "entity[ogre].hp == 40 and not status_has('ogre', 'bleed')"
+!match rng
+?? 0 word(s) in
+!history list commands
+!action knight thrust ogre
+!assert "entity[ogre].hp < 40"
+
+Expected: A spear thrust (2d6 damage, a level 2 bleed on 10 or more)
+simulated 200 times with `seed=abc`: the ogre's hp change as a
+distribution, most common first (-8 in 16% of runs, -7 in 15.5%, ...;
+11 values in all, so the last three are counted), mean -6.95 between
+-12 and -2, and the bleed gained in 15.5% of runs (2d6 >= 10 is 1/6).
+The knight never changes, so no line names it. The same seed gives the
+same report; another seed gives another. Nothing is kept: the ogre is
+at 40 hp without the bleed, the match's RNG is still 0 words in (each
+run rolled from its own sequence) and the command history lists the
+same snapshots before and after. A real thrust afterwards works as
+before.
+
+SCENARIO 972 — !simulate: a scripted duel against a 2x2 ogre, with a winner tally
+----------------------------------------------------------
+!match new m1 demo 8 8
+!match use m1
+!ent add knight Knight 30 2 2 10
+!ent add ogre Ogre 40 3 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var knight team red
+!ent set_var ogre team blue
+!ent set_var knight spear.actions.thrust.target entity
+!ent set_var knight spear.actions.thrust.body "entity[target].hp = entity[target].hp - roll('2d6')"
+!ent set_var ogre claws.actions.swipe.target entity
+!ent set_var ogre claws.actions.swipe.body "entity[target].hp = entity[target].hp - roll('1d10')"
+!macro set duel_turn "if current_id() == 'knight'\n!action knight thrust ogre\nelse\n!action ogre swipe knight\nend\n!turn next"
+!watch add win "has_corpse('knight') or has_corpse('ogre')" "declare_winner('blue' if has_corpse('knight') else 'red', 'ko')"
+!turn next
+!simulate 60 seed=duel until="match_over()" steps=40 tally="round_number()" !macro run duel_turn
+?? Simulated `!macro run duel_turn` 60 time(s)
+?? `match_over()` held ×100% after
+?? Winner: red ×
+?? blue ×
+?? `round_number()`:
+?? `ogre`: died ×
+?? `knight`: died ×
+?! ❗
+!assert "not match_over() and entity[knight].hp == 30 and entity[ogre].hp == 40"
+!assert "current_id() == 'knight' and round_number() == 1"
+!assert "not has_corpse('ogre') and not has_corpse('knight')"
+
+Expected: A duel scripted as a macro playing one turn (the acting unit
+attacks, then `!turn next`) and a watcher declaring the winner once
+either side has a corpse. Each of the 60 runs plays turns until
+`match_over()` holds (at most 40 steps): the report gives how many
+steps a fight took, who won how often (red and blue both win
+sometimes), the round each fight ended in, how often each side died
+and the hp lost. The watcher fires inside each run, as after a real
+command. No run had a ❌ reply. Nothing is kept: no winner, both units
+at full hp and alive, still the knight's turn of round 1. The ogre is
+a 2x2 body: the thrust and the corpse work on the whole body.
+
+SCENARIO 973 — !simulate: steps=, positions, spawns, statuses lost, units= / vars=
+----------------------------------------------------------
+!match new m1 demo 8 8
+!match use m1
+!ent add knight Knight 30 2 2 10
+!ent add wolf Wolf 12 7 7 5
+!status def stun
+!status apply knight stun 1
+!ent set_var knight horn.actions.call.target none
+!ent set_var knight horn.actions.call.body "summon_near({'name': 'Hound', 'vars': {'hp': 5}}, 2, 2, 3)"
+!simulate 10 seed=s steps=2 !action knight call
+?? Each run ran the command 2 times.
+?? Spawned `Hound`: 2 per run on average (max 2)
+!simulate 10 seed=s steps=3 !ent move knight 1 right
+?? `knight` ends at (5,2) ×100% (was (2,2))
+!simulate 10 seed=s !batch ent status knight remove stun ; ent hp knight -3
+?? `knight` loses `stun` ×100%
+?? `knight.hp`: -3 ×100%
+!simulate 10 seed=s units=wolf !ent hp knight -3
+?? No unit changed in any run.
+!simulate 10 seed=s vars=mana !batch ent hp knight -3 ; ent set_var knight mana 4
+?? `knight.mana` (was None): 4 ×100%
+?! `knight.hp`
+!assert "entity[knight].x == 2 and entity[knight].hp == 30 and status_has('knight', 'stun') and len(entities_within('knight', 7)) == 1"
+
+Expected: `steps=2` runs the command twice per run (two hounds spawned
+per run). A move run three times ends 3 cells right in every run (the
+position line names where it was). A batch removing the stun and taking
+3 hp reports both. `units=wolf` narrows the report to the wolf, who
+never changed; `vars=mana` keeps only the mana line (a var the knight
+didn't have, set to 4 in every run). Nothing is kept: the knight is back
+at (2,2) with 30 hp and its stun, and no hound is on the map.
+
+SCENARIO 974 — !simulate: refusals, the step limit, hosts only
+----------------------------------------------------------
+!match new m1 demo 8 8
+!match use m1
+!ent add ogre Ogre 40 3 2 5
+!simulate 3 !undo command
+?? `!simulate` can't run `!undo command`
+!simulate 3 !dry !ent hp ogre 1
+?? `!dry` can't run inside `!simulate`
+!dry !simulate 2 !ent hp ogre 1
+?? `!simulate` can't run inside `!dry`
+!simulate 2 bogus=1 !ent hp ogre 1
+?? Unknown option `bogus=`
+!simulate 2 tally="kill('ogre')" !ent hp ogre -1
+?? banned in a $() inline argument
+!simulate 2 steps=0 !ent hp ogre -1
+?? `steps=` is 1 or more
+!simulate 2 until="entity[zz].hp > 0" !ent hp ogre -1
+?? couldn't be read
+!simulate 2 !batch ent hp ogre -1 ; system set default friendlyfire true
+?? ❗ 2 run(s) had a ❌ reply
+?? can't run `!system set`
+!assert "rule_get('friendlyfire') == False and entity[ogre].hp == 40"
+!owner ceiling simulate_step_limit 10
+!simulate 5 steps=3 !ent hp ogre -1
+?? ⚠️ Stopped after 3 of 5 runs
+?? `ogre.hp`: -3 ×100%
+!simulate 11 !ent hp ogre -1
+?? 1 to 10
+!owner ceiling simulate_step_limit reset
+!as player bob
+!simulate 2 !ent hp ogre -1
+?? Only a host
+!as host
+!assert "entity[ogre].hp == 40"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!simulate` refuses what `!dry`
+refuses (`!undo`), `!dry` inside it and itself inside `!dry`, an unknown
+option, a formula that changes the match in `tally=` / `until=` (they
+are read-only), `steps=0` and an `until=` that can't be read. A line
+`!dry` would refuse inside a simulated batch is refused there too and
+counted as a run with a ❌ reply; the rule stays as it was. With the
+owner limit simulate_step_limit at 10, five runs of three steps stop
+after three runs (nine steps; a fourth wouldn't finish), and 11 runs are
+refused. Players can't run it.

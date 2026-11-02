@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -23,8 +23,14 @@ or rejects one, it moves to "Off the list".
 **Off the list:**
 - Rejected: edge-aware boarding.
 - Covered by what shipped: #35 (a preset is a parent system), #85 (`!history
-  export` + `!history import` into a new match).
-- Struck by the user: #7, #44, #45, #156.
+  export` + `!history import` into a new match), #137 (a reach aura: a zone
+  anchored to the unit, whose `on_enter` / `on_exit` hooks fire once per body
+  crossing, `zone_anchor_of` naming the standing unit).
+- Struck by the user: #7, #44, #45, #156, #145 (deployment phase: a player
+  asks the host to place their unit, or the host opens `!ent tp` to them with
+  a per-player access override), #163 and #199 (web viewer,
+  networked GUI: the CLI / GUI test locally and Discord boards show the live
+  map; a separate client matters only if Discord became unavailable).
 
 ## Small (a primitive, a rule, or a command)
 
@@ -185,7 +191,7 @@ or rejects one, it moves to "Off the list".
   - Today the action takes a count argument (`hits=2` in `ncs.txt`) and loops itself.
 - **#238 Requirement previews for players.**
   - `!action hu1 melee ho1 check` reports what the action would refuse on (range, cost, cooldown, a forbidding status, not the unit's turn) and changes nothing.
-  - It never reports outcomes: `!dry` restores the RNG position, so a full preview would show the roll that will actually happen, and a player could preview until the crit comes up. Outcome previews stay with hosts (#230).
+  - It never reports outcomes: `!dry` restores the RNG position, so a full preview would show the roll that will actually happen, and a player could preview until the crit comes up. Outcome previews stay with hosts (`!simulate`).
 - **#241 Fleeing as a state.**
   - `flee(eid)` takes a unit out of play into the match's fled list (kept for the report, able to come back), and fires `on_entity_fled`.
   - A rule `off_map_moves: refuse | flee`: with `flee`, a walk off the map's edge makes the unit flee. FCS1: "units can move off the map to flee the match". Solis: a unit "can choose to flee from combat if they are standing next to an edge of the map".
@@ -260,7 +266,24 @@ or rejects one, it moves to "Off the list".
   - All of these are footprint-aware.
 - **#17 `!ent move <id> to <x> <y>`.** Walks the route #16 computes step by step, firing every per-step hook. The GM or player invokes it; the engine only finds the path.
 - **#18 Team relations matrix.** Allied / neutral / hostile between pairs of teams, feeding `is_hostile`, the relation filters and disguise checks.
+  - Raised and parked by the user: the topic may need a proper team object (a `Team` class holding a team's data, stances and vision settings); today a team is the bare `team` var text plus `team_data`. Settle that first. Today: `is_hostile` = different teams, `ally` filter = `same_team`, `is_attackable` = hostile unless `friendlyfire`; fog vision, fog memory, reveals, `pov_own_team_visible`, disguises and `team_data_visibility own` compare one team name.
+  - Open questions (my recommendation after each):
+    1. Where a stance lives: each team's data under a checked key (`!team set red relations.blue ally`, checked in `team_set` like `tags`), or its own match field. Rec: team data.
+    2. One-way or mutual: one-way (`is_hostile(a, b)` reads a's team's stance toward b's; allows a betrayal), plus `!team relation <a> <b> [<stance>] [mutual]`. Rec: one-way.
+    3. Which stances: a fixed `ally` / `neutral` / `hostile`, a team's stance toward itself always "same team". Rec: fixed.
+    4. Pairs with no entry: rule `team_default_relation` (default hostile, today's behaviour) and `teamless_relation` (default hostile).
+    5. Predicates: `is_same_team` unchanged, `is_hostile` = stance hostile, new `is_ally` (same team or ally) and `team_relation(a, b)` (same / ally / neutral / hostile); the `ally` filter widens to allied teams, `same_team` stays strict, a new `neutral` filter. Open: should `ally` widen?
+    6. Attackable: replace `friendlyfire` with a word-list rule `attackable_relations` (default `neutral,hostile`; friendly fire on = `same,ally,neutral,hostile`).
+    7. Disguises: a word-list rule `disguise_seen_by` (default `same`, today's behaviour; `same,ally` widens it).
+    8. `team_data_visibility` gains an `allies` mode; under `own` a team can't read another's stance toward it (a secret betrayal stays secret). Rec: yes.
+    9. A `team_relation_changed` event on the bus (team, other, old, new)? A watcher composes it. Rec: no, unless wanted.
+    10. Per-unit stances (a charmed unit hostile to its own team): left out, a charm changes the team var. Rec: defer.
 - **#19 Shared vision between allied teams.** Allies see what each other sees under fog. Needs #18.
+  - Parked with #18 (same note on a team object). Open questions:
+    1. Who shares: a per-team list in team data, `shares_vision_with: [blue]` (red shows blue what red sees), plus a rule `allied_vision` (default on) sharing wherever the stance is ally. One-way, direct only (red -> blue -> green doesn't give green red's view).
+    2. What's shared: current sight and active reveals. Fog memory: the receiver remembers what it sees through the shared view from then on, without inheriting the ally's older explored cells.
+    3. Allied units and stealth: a sharing team's units show to the receiver like its own units, past `entity_visibility_condition`; a word-list rule `pov_always_visible` (default `same,vision`) replacing `pov_own_team_visible`.
+    4. Formula reads: `team_sees_cell`, `team_sees_entity` and `map_seen_by` include shared vision, with `shared=False` for a team's own units only; `can_see` and `visible_entities` stay per unit.
 - **#20 Vision cones.** A `fog_vision_arc` var combined with facing limits what a unit sees.
 - **#21 Cover primitive.** `cover_between(a, b)` gives the fraction of the line between two units that is obstructed, footprint-aware.
 - **#22 Action cooldowns and charges.** Fields on an action that count uses and turns; the engine refuses the action while on cooldown or out of charges.
@@ -327,10 +350,6 @@ or rejects one, it moves to "Off the list".
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
 - **#34 Session recap export.** The event log as markdown, filtered by POV, for posting a session summary.
-- **#137 Zone-of-control events.**
-  - A hook fires on a standing unit when a hostile enters or leaves its reach (a `reach` var, footprint-aware, checked per step).
-  - The GM's passive decides what happens: opportunity attacks, engagement penalties.
-  - The mover's turn keeps going, which keeps this lighter than #36.
 - **#138 Tethers.** `tether(a, b, max_dist, mode=drag|block)` keeps two units within a distance, either dragging the follower along or refusing the move. For grapples, leashes, chained prisoners and harpoons.
 - **#139 Movement layers.**
   - A per-unit `layer` (ground / air / burrow) with occupancy tracked per layer.
@@ -339,7 +358,6 @@ or rejects one, it moves to "Off the list".
 - **#141 User-defined commands.** `!cmd def <name> <usage> <body>` registers a command with named arguments, an access level and help text that runs an action or macro body. Players type `!attack goblin`, and the usage string feeds the stray-word check and Tab completion.
 - **#143 Team-based turns.** A `turn_mode` rule (`unit` | `team`). On a team's turn any of its units can act; `!turn next` passes to the next side, and hooks fire per side turn and per unit. Wesnoth / XCOM style.
 - **#144 Phase-based rounds.** A `round_phases` list (e.g. move, then act). `!turn next` cycles every unit through phase 1 before phase 2, with phase hooks.
-- **#145 Deployment phase.** Before round 1, players place their own units inside their team's deployment zone without host approval. It shares #28's gate change.
 - **#146 "What changed" view.** `!map changes` marks the units and cells that changed since the start of the current turn (or since you last looked), for players catching up on Discord.
 - **#147 Image-map labels.** Optional HP bars, name labels and a row of status icons on sprites, each toggled by a rule.
 - **#148 Live combat log channel.** Event-log lines posted as they happen to a channel bound as `log`, filtered by that channel's POV.
@@ -354,6 +372,19 @@ or rejects one, it moves to "Off the list".
   - From the combat systems:
     - Showing the stacks in #222's status line, in Solis's own format: "(5 lvl1 burn, 2 lvl2 burn)".
     - Solis Plague and Steelmoss: damage that grows each turn while the stack lives, resets when it expires and is kept when the status is reapplied; a per-stack counter field holds the growth.
+  - Open questions raised, then parked by the user (my recommendation after each):
+    1. Storage: one instance per name holding a `stacks` list (each stack its own level, duration, fields); the top-level `level` is the engine-kept effective level, so everything keyed by name keeps working. Rec: this, over separate `burn#2` instances.
+    2. Top-level `duration` = the longest stack's; direct writes of level / duration on a stacked instance refused with a pointer to `stack=` (or: applied to every stack).
+    3. Two knobs: `stack_level` (highest / sum / newest) and `stack_tick` (once / each, binding `stack_level` / `stack_id`), each with a default rule; or the sketch's single `stack_effect`. Rec: two (sum ticking once, highest ticking per stack).
+    4. Decay stays in the GM's tick: a counter outside a per-stack tick changes every stack, inside one only that stack; a stack at 0 drops, the last one removes the status (`expired`).
+    5. Re-application: `stack_merge` none (a new stack, default) / same_level (refresh that stack to the longer duration; Solis).
+    6. Cap: `max_stacks` with a rule `status_stack_overflow` (replace_shortest default / replace_oldest / refuse); `max_level` caps each stack and the summed level.
+    7. Data: the application's level, duration and seed data go on the new stack; definition `data` is copied into the instance once and shared.
+    8. Surface: `status_stacks(eid, name)` (stack dicts with a stable `id`), `stack=<id>` on status_get / status_set / counters, `status_stack_remove`, a `stacks` view on `!ent status` / `!status`.
+    9. Hooks stay status-level (on_added: first stack, on_removed: last, on_changed: a stack added / dropped or the effective level changed, with `stack_id` / `stack_event`), or new on_stack_added / on_stack_removed.
+    10. Resistance folds each application into its stack; dispel removes all stacks; transfer moves all; a zone grant owns one stack (marker on the stack).
+    11. Display: a `{stacks}` placeholder from a `status_stack_format` rule (default `{duration} lvl{level}`, joined ", ").
+    12. Switching a live status's mode converts instances (one stack of its level and duration; back: the effective level and longest duration), firing on_changed.
 - **#151 Named selectors.** `!selector def enemies "team!=red hp>0"`, usable as `!foreach @enemies ; ...` and as `select('enemies')` in formulas.
 - **#152 Directional armor and coverage** (§8 combat layers). Per-part, per-side armor values and coverage %, with `armor_at(target, part, side)` and a mitigation helper the GM's damage formula calls. Primitives only.
 - **#153 Vehicle follow-ups** (§8). Cover for riders inside a vehicle, a footprint per rider, and shared fuel or initiative between nested vehicles.
@@ -418,16 +449,6 @@ or rejects one, it moves to "Off the list".
   - From the combat systems:
     - `source` feeds #239's kill credit for damage over time.
     - FCS1 "statuses from attacks only apply if the target takes at least 1 point of damage" as an `on_damage_only` flag that the GM's damage step reads.
-- **#230 Balance simulator.**
-  - `!sim <n> <command ...>` runs the command n times on throwaway copies of the match (the `!dry` machinery, each run from a different RNG position) and reports what changed:
-    - per var, mean / min / max and how often it changed (`ho1.hp: −15 ×80%, −23 ×10%, −30 ×10%; mean −17`);
-    - statuses applied;
-    - units killed.
-  - For designing combat systems: a spear against a machine's armor, a crit table's real rate, whether a boss survives three rounds of a party's best attacks.
-  - Cost follows n × the command; an owner limit caps n, and the #197 work counter applies per run. Hosts only, refused inside batches like `!dry`.
-  - From the combat systems:
-    - Scripted duels: each side runs a fixed GM macro every turn until a condition holds (`until="match_over()"`), n times, reporting win rates and turn counts. The macros decide everything and the engine picks nothing, so there is no AI.
-    - `seed=` for reproducible runs, to compare two versions of a weapon.
 - **#231 Rules handbook export.**
   - `!match handbook [file]` / `!system handbook <name> [file]` writes a Markdown file to the saves folder (or posts it in parts):
     - status definitions with a `description` data field, levels, ticks and stacking in words;
@@ -456,7 +477,7 @@ or rejects one, it moves to "Off the list".
 
 ### Still open
 
-- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, opportunity attack), answered through `choose()`. The choice-replay machinery is the groundwork; #137 can trigger it.
+- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, opportunity attack), answered through `choose()`. The choice-replay machinery is the groundwork; a reach aura's `on_enter` hook can trigger it.
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
     - In an action body, `offer_reaction(target, payload)` ends the body and stores a pending event on the match: attacker, target, the action, and the payload (`{'damage': 15, 'type': 'blunt', 'kind': 'melee'}`). It is saved, so it survives restarts and follows undo.
     - Reaction actions carry `kind: reaction`, `reacts_to: [melee, ranged, spell, ...]` and an `available` condition (cooldown, stamina, not asleep). `reacts_for: adjacent_ally` covers FCS1 Protect, and a range covers Counterspell.
@@ -492,7 +513,6 @@ or rejects one, it moves to "Off the list".
   - A versioned file bundling a system (with its parent chain), its status definitions, templates, partials, macros and tables.
   - Servers can share a ruleset and upgrade it.
   - Per-server storage (#41) and system status definitions, tables and macros (#140) have shipped.
-- **#163 Read-only web viewer.** A browser page showing a match's live map from the scene model, with per-team views behind a link token. Needs a web server and real security design.
 
 ### New
 
@@ -505,10 +525,6 @@ or rejects one, it moves to "Off the list".
   - A digest of what happened since your last turn (#146).
   - A deadline rule that skips the turn when time runs out; the unit does nothing, so this stays clear of AI.
   - For Discord tables that play over days.
-- **#199 Networked GUI client.**
-  - The tkinter GUI connects to the running bot and shows a Discord match with that channel's POV, as a richer client for players.
-  - Today it only sees the local workspace.
-  - Needs an auth token per user and the same security design as #163.
 - **#252 Derived vars.**
   - A var declared as a formula (`max_hp := round(apply_mods(self, 'max_hp', 50 * level))`) whose value is computed when it is read.
   - The game need: NCS multiplies HP bonuses from class, armor and items, and Solis Endurance raises max hp by a percentage. A derived max hp would need no recomputation when gear changes.
@@ -520,7 +536,7 @@ or rejects one, it moves to "Off the list".
 - **Status bundle:** #56, #114, #115, #116, #150
 - **Zone bundle:** #117, #118, #119
 - **Discord table play:** #128, #148, #182, then #28 and #198
-- **Tactical combat:** #16 → #24 → #137 → #36
+- **Tactical combat:** #16 → #24 → #36
 - **Scaling before a public rollout:** #177, #178, #197
 
 From the combat-systems review (docs/combat_systems_fit.md):
@@ -530,7 +546,7 @@ From the combat-systems review (docs/combat_systems_fit.md):
 - **After the battle:** #239 → #240, #241; #158 with #251
 - **Discord table comfort:** #247, #248, #254, #255, #244, #245
 - **Behaviour kept in its data:** #200, #208, #201
-- **GM tooling:** #202, #203, #207, #211, #204, #230, #231, #249, #250
+- **GM tooling:** #202, #203, #207, #211, #204, #231, #249, #250
 - **Formula ergonomics:** #89, #90, #194, #205, #210, #216, #217, #219, #228
 - **Integrity of GM data:** #209, #210, #223
 - **Before a public rollout:** #177, #178, #197 (+ lazy servers), #206, #214
