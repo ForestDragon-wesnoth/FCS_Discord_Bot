@@ -23,8 +23,12 @@ or rejects one, it moves to "Off the list".
 **Off the list:**
 - Rejected: edge-aware boarding.
 - Covered by what shipped: #35 (a preset is a parent system), #85 (`!history
-  export` + `!history import` into a new match).
-- Struck by the user: #7, #44, #45, #156.
+  export` + `!history import` into a new match), #137 (a reach aura: a zone
+  anchored to the unit, whose `on_enter` / `on_exit` hooks fire once per body
+  crossing, `zone_anchor_of` naming the standing unit).
+- Struck by the user: #7, #44, #45, #156, #145 (deployment phase: a player
+  asks the host to place their unit, or the host opens `!ent tp` to them with
+  a per-player access override).
 
 ## Small (a primitive, a rule, or a command)
 
@@ -344,10 +348,6 @@ or rejects one, it moves to "Off the list".
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
   - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
 - **#34 Session recap export.** The event log as markdown, filtered by POV, for posting a session summary.
-- **#137 Zone-of-control events.**
-  - A hook fires on a standing unit when a hostile enters or leaves its reach (a `reach` var, footprint-aware, checked per step).
-  - The GM's passive decides what happens: opportunity attacks, engagement penalties.
-  - The mover's turn keeps going, which keeps this lighter than #36.
 - **#138 Tethers.** `tether(a, b, max_dist, mode=drag|block)` keeps two units within a distance, either dragging the follower along or refusing the move. For grapples, leashes, chained prisoners and harpoons.
 - **#139 Movement layers.**
   - A per-unit `layer` (ground / air / burrow) with occupancy tracked per layer.
@@ -356,7 +356,6 @@ or rejects one, it moves to "Off the list".
 - **#141 User-defined commands.** `!cmd def <name> <usage> <body>` registers a command with named arguments, an access level and help text that runs an action or macro body. Players type `!attack goblin`, and the usage string feeds the stray-word check and Tab completion.
 - **#143 Team-based turns.** A `turn_mode` rule (`unit` | `team`). On a team's turn any of its units can act; `!turn next` passes to the next side, and hooks fire per side turn and per unit. Wesnoth / XCOM style.
 - **#144 Phase-based rounds.** A `round_phases` list (e.g. move, then act). `!turn next` cycles every unit through phase 1 before phase 2, with phase hooks.
-- **#145 Deployment phase.** Before round 1, players place their own units inside their team's deployment zone without host approval. It shares #28's gate change.
 - **#146 "What changed" view.** `!map changes` marks the units and cells that changed since the start of the current turn (or since you last looked), for players catching up on Discord.
 - **#147 Image-map labels.** Optional HP bars, name labels and a row of status icons on sprites, each toggled by a rule.
 - **#148 Live combat log channel.** Event-log lines posted as they happen to a channel bound as `log`, filtered by that channel's POV.
@@ -473,7 +472,7 @@ or rejects one, it moves to "Off the list".
 
 ### Still open
 
-- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, opportunity attack), answered through `choose()`. The choice-replay machinery is the groundwork; #137 can trigger it.
+- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, opportunity attack), answered through `choose()`. The choice-replay machinery is the groundwork; a reach aura's `on_enter` hook can trigger it.
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
     - In an action body, `offer_reaction(target, payload)` ends the body and stores a pending event on the match: attacker, target, the action, and the payload (`{'damage': 15, 'type': 'blunt', 'kind': 'melee'}`). It is saved, so it survives restarts and follows undo.
     - Reaction actions carry `kind: reaction`, `reacts_to: [melee, ranged, spell, ...]` and an `available` condition (cooldown, stamina, not asleep). `reacts_for: adjacent_ally` covers FCS1 Protect, and a range covers Counterspell.
@@ -537,7 +536,7 @@ or rejects one, it moves to "Off the list".
 - **Status bundle:** #56, #114, #115, #116, #150
 - **Zone bundle:** #117, #118, #119
 - **Discord table play:** #128, #148, #182, then #28 and #198
-- **Tactical combat:** #16 → #24 → #137 → #36
+- **Tactical combat:** #16 → #24 → #36
 - **Scaling before a public rollout:** #177, #178, #197
 
 From the combat-systems review (docs/combat_systems_fit.md):
