@@ -34560,3 +34560,78 @@ Expected: under `used` each team records what it has seen. Fog is on; the
 shows green the orc but doesn't reveal
 the earlier roar; once green sees the orc roar again, its view lists it.
 `!ent dump` names who saw it: blue (the orc's own team), green and red.
+
+SCENARIO 1013 — Player-facing var labels: `!system labels`, path over key, the description and card, GM reads keep keys
+---------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS (bad label paths are refused)
+!match new vl Vl 8 4
+!match use vl
+!ent add hero Hero 20 2 2
+!ent set_var hero stats.str 5
+!ent set_var hero stats.dex 3
+!ent set_var hero inventory.sword.damage 8
+!ent set_var hero inventory.rope 1
+!ent set_var hero str 9
+!system labels set default str Brawn
+?? `str` reads **Brawn** to players on `default`. Labels show once `var_labels_enabled` is on.
+!system labels set default stats.str Strength
+!system labels set default stats Attributes
+!system labels set default damage Damage
+!system labels set default sword "Notched Sword"
+!ent info hero
+?? - stats: str 5, dex 3
+?! Strength
+!system set default var_labels_enabled true
+!ent info hero
+?? - Attributes: Strength 5, dex 3
+?? - Notched Sword: Damage 8
+?? - rope: 1
+?? - Brawn: 9
+!ent info hero short
+?? Inventory: {Notched Sword, rope}
+!list
+!ent dump hero
+?! Strength
+?! Notched
+!find hp>0 show:stats.str
+?? stats.str=5
+!assert "entity[hero].stats.str == 5"
+!system labels list default
+?? - `stats.str` (path): Strength
+?? - `damage` (key, any depth): Damage
+!system labels set default stats.__x Hidden
+?? ❌ Can't label `stats.__x`: `stats.__x` names a `__` key, which players never see.
+!system labels set default stats..str X
+?? ❌ Can't label `stats..str`: `stats..str` has an empty segment.
+?tab "!system labels remove default st"
+?? candidates: stats  stats.str  str
+!system new house parent=default
+!match new vl2 Vl2 8 4 house
+!match use vl2
+!ent add guard Guard 10 2 2
+!ent set_var guard stats.str 4
+!system labels remove house stats.str
+!ent info guard
+?? - Attributes: Brawn 4
+!system unset house var_labels:stats.str
+!ent info guard
+?? - Attributes: Strength 4
+!as restart
+!match use vl
+!ent info hero
+?? - Attributes: Strength 5, dex 3
+!system labels remove default sword
+!ent info hero short
+?? Inventory: {sword, rope}
+
+Expected: `!system labels set` maps a var path or a bare key to the label
+players read; until var_labels_enabled is on nothing changes. Once on, the
+description's Details read the labels: `stats` reads Attributes, its `str`
+Strength (the path label wins over the key label Brawn, which still names
+the top-level `str`), `damage` and `sword` take their key labels at any
+depth, and unlabelled keys stay as they are. The short card's `{inventory}`
+names the sword by its label. `!ent dump`, `!find show:` and formulas keep
+the keys. A label can't name a `__` key or a path with an empty segment.
+Tab offers the system's labelled paths for a removal. A child system
+inherits the labels; removing `stats.str` there hides it (the key label
+Brawn then names the guard's `str`) until `!system unset` brings it back. Labels persist across a restart.

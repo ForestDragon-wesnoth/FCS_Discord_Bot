@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -299,7 +299,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
         if sub in ("alias", "tile", "func", "status", "table", "macro",
-                   "zone", "tags"):
+                   "zone", "tags", "labels"):
             # !system alias <action> <sys> ...
             return len(args) < 2 or args[1].lower() not in ("list", "info",
                                                             "show")
@@ -1991,7 +1991,8 @@ def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
                           ("zone_definitions", "zone definitions"),
                           ("tables", "tables"), ("macros", "macros"),
                           ("tag_vocabulary", "tag vocabulary"),
-                          ("watchers", "watchers")):
+                          ("watchers", "watchers"),
+                          ("var_labels", "var labels")):
             la, lb = a.get(lib) or {}, b.get(lib) or {}
             names = sorted(k for k in set(la) | set(lb)
                            if la.get(k) != lb.get(k))
@@ -2358,8 +2359,11 @@ _TMPL_COND_RE = _re.compile(r"\{\?([a-zA-Z_][\w.]*)\?\}(.*?)\{/\?\}", _re.DOTALL
 _TMPL_PLACE_RE = _re.compile(r"\{([a-zA-Z_][\w.]*)\}")
 
 
-def _tmpl_fmt_value(v: Any) -> str:
-    """Format a value for placeholder substitution."""
+def _tmpl_fmt_value(v: Any, labels: Optional[Dict[str, str]] = None,
+                    at: str = "") -> str:
+    """Format a value for placeholder substitution. `labels` (a system's
+    var labels, var_labels_enabled) name a dict's keys, `at` being the
+    dict's var path."""
     if v is None:
         return ""
     if isinstance(v, bool):
@@ -2368,6 +2372,9 @@ def _tmpl_fmt_value(v: Any) -> str:
         if not v:
             return ""
         keys = list(v.keys())
+        if labels:
+            keys = [var_label_for(labels, f"{at}.{k}" if at else str(k))
+                    or k for k in keys]
         # str()-coerce keys: a formula can write a dict with non-string keys
         # (e.g. `entity[x].loot = {1: 'a'}`), and joining an int key raised
         # "expected str instance" (a 💥) when such a var fed a template
@@ -2406,8 +2413,11 @@ def _tmpl_truthy(found: bool, val: Any) -> bool:
     return bool(val)
 
 
-def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
-    """Render a template string with placeholders and conditionals."""
+def _render_template(tmpl: str, ctx: Dict[str, Any],
+                     labels: Optional[Dict[str, str]] = None) -> str:
+    """Render a template string with placeholders and conditionals.
+    `labels` (player-facing var labels, `_var_labels`) name the keys of a
+    dict a placeholder prints."""
     # Allow \n in the stored rule string to produce real newlines
     s = tmpl.replace("\\n", "\n").replace("\\t", "\t")
 
@@ -2431,8 +2441,22 @@ def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
         found, val = _tmpl_resolve(ctx, path)
         if not found:
             return f"<?{path}?>"
-        return _tmpl_fmt_value(val)
+        return _tmpl_fmt_value(val, labels, path)
     return _TMPL_PLACE_RE.sub(_place_sub, s)
+
+
+def _var_labels(m: Optional[Match]) -> Optional[Dict[str, str]]:
+    """The var labels players read on `m` (its system's `var_labels`
+    library, read live), or None while var_labels_enabled is off or there
+    are none. Only the player-facing reads take them: the description, the
+    short card and the roster lines."""
+    if m is None or not m.rules.get("var_labels_enabled", False):
+        return None
+    mgr = CURRENT_WORKSPACE.get()
+    s = getattr(mgr, "systems", {}).get(m.system_name) if mgr else None
+    if s is None:
+        return None
+    return mgr.system_library(s, "var_labels") or None
 
 
 def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
@@ -2557,7 +2581,9 @@ def _entity_line(e: Entity, pov_team: Optional[str] = None) -> str:
             "entity_line_format",
             "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
         )
-    line = _render_template(tmpl, _entity_template_context(e, pov_team))
+    labels = _var_labels(e._match)
+    line = _render_template(tmpl, _entity_template_context(e, pov_team),
+                            labels)
     # Sub-entity (body part / segment) suffix: append body_part_entity_line_suffix
     # with {parent} / {parent_name} bound, so a roster shows which body a part
     # belongs to. Only fires for an entity whose part_of points at a live parent.
@@ -2600,7 +2626,8 @@ def _entity_card(e: Entity, pov_team: Optional[str] = None) -> str:
         tmpl = e._match.rules.get("entity_info_format")
     if not tmpl:
         tmpl = DEFAULT_SYSTEM_SETTINGS.get("entity_info_format", "")
-    return _render_template(tmpl, _entity_template_context(e, pov_team))
+    return _render_template(tmpl, _entity_template_context(e, pov_team),
+                            _var_labels(e._match))
 
 
 # ---- the entity description (`!ent info <id>`) ----------------------------
@@ -2684,12 +2711,25 @@ def _description_value(v: Any) -> str:
 
 
 def _description_tree(node: Dict[str, Any], depth: int,
-                      out: List[str]) -> None:
+                      out: List[str],
+                      labels: Optional[Dict[str, str]] = None,
+                      at: str = "") -> None:
     """`node` as an indented bullet list: `key: value`; a dict of plain
     values on one line (`stats: str 5, dex 3`); a dict's `description` text
-    after its key; lists of plain values joined with `, `."""
+    after its key; lists of plain values joined with `, `. `labels` (the
+    var labels players read) name the keys, `at` being `node`'s var
+    path."""
     pad = "  " * depth + "- "
-    for k, v in node.items():
+
+    def name(key: Any) -> str:
+        if not labels:
+            return str(key)
+        return var_label_for(labels, f"{at}.{key}" if at else str(key)) \
+            or str(key)
+
+    for k0, v in node.items():
+        k = name(k0)
+        here = f"{at}.{k0}" if at else str(k0)
         if isinstance(v, dict):
             desc = v.get("description")
             desc = desc if isinstance(desc, str) and desc else None
@@ -2697,15 +2737,17 @@ def _description_tree(node: Dict[str, Any], depth: int,
                     if not (kk == "description" and desc is not None)}
             plain = all(not isinstance(x, (dict, list)) for x in rest.values())
             if plain and len(rest) <= 6:
-                inner = ", ".join(f"{kk} {_description_value(vv)}"
-                                  for kk, vv in rest.items() if vv is not None)
+                inner = ", ".join(
+                    f"{(var_label_for(labels, f'{here}.{kk}') if labels else None) or kk} "
+                    f"{_description_value(vv)}"
+                    for kk, vv in rest.items() if vv is not None)
                 if desc and inner:
                     out.append(f"{pad}{k}: {desc} ({inner})")
                 else:
                     out.append(f"{pad}{k}: {desc or inner}")
                 continue
             out.append(f"{pad}{k}" + (f": {desc}" if desc else ""))
-            _description_tree(rest, depth + 1, out)
+            _description_tree(rest, depth + 1, out, labels, here)
         elif isinstance(v, list):
             items = [x for x in v if x is not None]
             if not items:
@@ -2717,7 +2759,8 @@ def _description_tree(node: Dict[str, Any], depth: int,
             out.append(f"{pad}{k}")
             for i, x in enumerate(items, start=1):
                 if isinstance(x, dict):
-                    _description_tree({str(i): x}, depth + 1, out)
+                    _description_tree({str(i): x}, depth + 1, out, labels,
+                                      here)
                 elif isinstance(x, list):
                     out.append("  " * (depth + 1) + "- "
                                + ", ".join(_description_value(y) for y in x))
@@ -2824,6 +2867,7 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
         own = dv.get("description") if isinstance(dv, dict) else None
     ctx["description"] = own if isinstance(own, str) else ""
     sections = _description_paths(m.rules.get("entity_description_sections"))
+    labels = _var_labels(m)
     out: List[str] = []
 
     def fmt(sec: str) -> str:
@@ -2832,16 +2876,16 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
     for sec in sections:
         text = ""
         if sec in ("header", "vitals"):
-            text = _render_template(fmt(sec), ctx)
+            text = _render_template(fmt(sec), ctx, labels)
         elif sec == "size":
             if m.sizes_on() and ctx.get("size") not in (None, ""):
-                text = _render_template(fmt(sec), ctx)
+                text = _render_template(fmt(sec), ctx, labels)
         elif sec == "tags":
             if ctx.get("tags"):
-                text = _render_template(fmt(sec), ctx)
+                text = _render_template(fmt(sec), ctx, labels)
         elif sec == "passives":
             if ctx.get("passives_csv"):
-                text = _render_template(fmt(sec), ctx)
+                text = _render_template(fmt(sec), ctx, labels)
         elif sec == "statuses":
             status = (m.presented_statuses(e, pov_team)
                       if pov_team is not None else e.status)
@@ -2856,7 +2900,7 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
                 src = dv if isinstance(dv, dict) else {}
             tree = _hide_formula_fields(_description_vars(m, e, src, True))
             lines: List[str] = []
-            _description_tree(tree, 0, lines)
+            _description_tree(tree, 0, lines, labels)
             if lines:
                 cap = int(m.rules.get("entity_description_line_limit", 60))
                 if len(lines) > cap:
@@ -2977,7 +3021,7 @@ def _corpse_line(
     tctx["map"] = mp.name if mp is not None else ""
     tctx["map_shown"] = (mp.name if mp is not None and len(m.maps) > 1
                          else "")
-    return _render_template(tmpl, tctx)
+    return _render_template(tmpl, tctx, _var_labels(m))
 
 
 def _part_status_str(m, p: Entity) -> str:
@@ -9081,6 +9125,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_zone(ctx, args, mgr)
     if sub == "tags":
         return await _system_tags(ctx, args, mgr)
+    if sub == "labels":
+        return await _system_labels(ctx, args, mgr)
     if sub in ("table", "macro"):
         return await _system_text_lib(ctx, args, mgr, sub)
     if sub == "watch":
@@ -10384,6 +10430,73 @@ async def _system_tags(ctx: ReplyContext, args: List[str],
         _system_deleted_line(mgr, s, kind, "tag", t) for t in gone))
 
 
+_SYSTEM_LABELS_USAGE = ("!system labels <list <system> | "
+                        "set <system> <var_path> <label ...> | "
+                        + " | ".join(f"{d} <system> <var_path ...>"
+                                     for d in _SYSTEM_LIB_DELETES) + ">")
+
+
+async def _system_labels(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager):
+    """`!system labels <list|set|remove> <system> ...` — the player-facing
+    var labels: a var path or a bare key -> the label players read under
+    var_labels_enabled. Inherited entry by entry, read live (never copied
+    into a match)."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "labels"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    kind = "var_labels"
+    if action not in ("list", "set") + _SYSTEM_LIB_DELETES:
+        return await _help_fallback(ctx, ["system", "labels"], args[1])
+    lib = mgr.system_library(s, kind)
+    if action == "list":
+        _check_tail(args, 3, (), "!system labels list <system>")
+        on = mgr.system_value(s, "var_labels_enabled")
+        state = "on" if on else "off: `!system set <system> var_labels_enabled true`"
+        if not lib:
+            return await ctx.send("\n".join(
+                [f"No var labels on system `{sys_name}` (var_labels_enabled "
+                 f"{'on' if on else 'off'})."] + _system_hidden_line(s, kind)))
+        lines = [f"**Var labels of `{sys_name}`** ({len(lib)}; "
+                 f"var_labels_enabled {state}):"]
+        for k in sorted(lib):
+            src = "" if k in s.var_labels else " (inherited)"
+            where = "path" if "." in k else "key, any depth"
+            lines.append(f"- `{k}` ({where}): {lib[k]}{src}")
+        return await ctx.send("\n".join(lines + _system_hidden_line(s, kind)))
+    if await return_help_if_not_enough_args(ctx, args, 4, "system", "labels"):
+        return
+    if action == "set":
+        if len(args) < 5:
+            raise VTTError(f"Usage: `!system labels set <system> <var_path> "
+                           f"<label ...>`.")
+        path, label = args[3], " ".join(args[4:]).strip()
+        why = var_label_problem(path, label)
+        if why:
+            raise VTTError(f"Can't label `{path}`: {why}.")
+        prior = lib.get(path)
+        lib[path] = label
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(
+            f"🏷️ `{path}` reads **{label}** to players on `{sys_name}`"
+            + (f" (it was **{prior}**)"
+               if prior is not None and prior != label else "")
+            + "." + ("" if mgr.system_value(s, "var_labels_enabled") else
+                     " Labels show once `var_labels_enabled` is on."))
+    gone = []
+    for raw in args[3:]:
+        if raw not in lib:
+            raise VTTError(f"`{raw}` has no label on system `{sys_name}` "
+                           f"(`!system labels list {sys_name}`).")
+        gone.append(raw)
+    for k in gone:
+        del lib[k]
+    mgr.system_library_write(s, kind, lib)
+    return await ctx.send("\n".join(
+        _system_deleted_line(mgr, s, kind, "label", k) for k in gone))
+
+
 async def _system_text_lib(ctx: ReplyContext, args: List[str],
                            mgr: MatchManager, sub: str):
     """`!system table|macro <action> <system> ...` — the tables (`!table`
@@ -10788,6 +10901,23 @@ registry.annotate_sub(
         "(`!system unset <sys> tag_vocabulary:<tag>` brings it back). "
         "Engine tags (corpse, part, segment, rider, vehicle, map_carrier) "
         "are declared by the engine."),
+)
+registry.annotate_sub(
+    "system", "labels",
+    usage=_SYSTEM_LABELS_USAGE,
+    desc=(
+        "Player-facing var labels: `set <sys> <var_path> <label>` makes "
+        "players read the label in place of the var's key. A dotted path "
+        "(`stats.str`) labels that var; a bare key (`damage`) labels the key "
+        "at any depth, and a path label wins over a key label. Labels show "
+        "only while the var_labels_enabled rule is on, and only in player "
+        "reads: the description's data section (`!ent info`) and a dict's "
+        "keys printed by a placeholder of the short card or roster line; "
+        "`!ent dump`, `!find show:`, formulas and selectors keep the keys. "
+        "Values are shown as stored. Read live from the system (a match "
+        "takes no copy); a child system inherits its parent's labels, and "
+        "removing an inherited one hides it (`!system unset <sys> "
+        "var_labels:<path>` brings it back)."),
 )
 registry.annotate_sub("system", "default", usage="!system default <server|channel> <name>", desc="Set the GameSystem new matches use: this server's default, or this channel's own.")
 

@@ -869,6 +869,40 @@ UNIT_HISTORY_KEYS: Tuple[str, ...] = ("actions_seen",)
 # path once).
 ACTIONS_USED_MAX = 1000
 
+# The longest player-facing var label (`!system labels set`).
+VAR_LABEL_MAX = 100
+
+
+def var_label_problem(path: Any, label: Any) -> Optional[str]:
+    """Why `path` -> `label` can't be a var label, or None: the path is a
+    dotted var path (no empty segment, no `__` segment: engine keys never
+    show to players), the label one line of text of at most VAR_LABEL_MAX
+    characters."""
+    if not isinstance(path, str) or not path:
+        return "the var path is empty"
+    segs = path.split(".")
+    if any(not x for x in segs):
+        return f"`{path}` has an empty segment"
+    if any(x.startswith("__") for x in segs):
+        return f"`{path}` names a `__` key, which players never see"
+    if not isinstance(label, str) or not label.strip():
+        return "the label is empty"
+    if "\n" in label or len(label) > VAR_LABEL_MAX:
+        return (f"a label is one line of at most {VAR_LABEL_MAX} "
+                f"characters")
+    return None
+
+
+def var_label_for(labels: Dict[str, str], path: str) -> Optional[str]:
+    """The label of the var at dotted `path` from `labels` (a system's
+    var_labels): an entry for the whole path wins over one for its last
+    key, which names that key at any depth. None = no label."""
+    if path in labels:
+        return labels[path]
+    key = path.rsplit(".", 1)[-1]
+    return labels.get(key)
+
+
 def _checked_actions_seen(raw: Any) -> Dict[str, List[str]]:
     """A saved Entity.actions_seen read back: team -> distinct paths (text),
     at most ACTIONS_USED_MAX each; anything else dropped."""
@@ -2724,6 +2758,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": ("One rider of a vehicle in its description: the RIDER's "
                  "entity_info_format placeholders plus `{slot}`."),
+    },
+    "var_labels_enabled": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Show players the system's var labels (`!system labels`) in "
+            "place of var keys: in the description's data section and where "
+            "a placeholder of the short card or the roster line prints a "
+            "dict's keys. GM reads (`!ent dump`, `!find show:`, formulas, "
+            "selectors) always show the keys."
+        ),
     },
     "entity_description_part_format": {
         "default": "- {name} (`{id}`): HP {hp}/{max_hp}",
@@ -7462,7 +7507,8 @@ SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
                                      "formula_functions",
                                      "status_definitions", "tables",
                                      "macros", "zone_definitions",
-                                     "tag_vocabulary", "watchers")
+                                     "tag_vocabulary", "watchers",
+                                     "var_labels")
 
 # Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
 # it can't bound the system chain itself). Set with `!owner ceiling <key>
@@ -7740,6 +7786,11 @@ class GameSystem:
     # tag), added to a new match armed (Match.add_watcher) like the other
     # libraries.
     watchers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Player-facing var labels (`!system labels`): a var path (`stats.str`)
+    # or a bare key (`damage`, at any depth) -> the label players read in
+    # place of the key, under var_labels_enabled. Read live from the system
+    # (never copied into a match), like tag_vocabulary.
+    var_labels: Dict[str, str] = field(default_factory=dict)
     # The system this one inherits from (live: MatchManager resolves the
     # chain on every read), or None for a root. `settings` and the
     # libraries above then hold only this system's OWN overrides.
@@ -7808,6 +7859,8 @@ class GameSystem:
                                in sorted(self.tag_vocabulary.items())},
             "watchers": {n: watcher_definition(w)
                          for n, w in sorted(self.watchers.items())},
+            "var_labels": {k: str(v)
+                           for k, v in sorted(self.var_labels.items())},
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
@@ -7897,6 +7950,9 @@ class GameSystem:
             watchers={str(k): watcher_definition(v) for k, v in
                       (d.get("watchers") or {}).items()
                       if isinstance(k, str) and k and isinstance(v, dict)},
+            var_labels={k: v for k, v in (d.get("var_labels") or {}).items()
+                        if isinstance(k, str) and isinstance(v, str)
+                        and var_label_problem(k, v) is None},
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
             description=str(d.get("description") or ""),

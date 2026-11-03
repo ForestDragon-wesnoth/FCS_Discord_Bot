@@ -2567,7 +2567,8 @@ hardcodes**.
   formula equal to its parent's after a rename is dropped (753-756).
 - **System libraries** (`SYSTEM_LIBRARIES`: aliases, tile templates,
   formula functions, status definitions, tables, macros, zone
-  definitions, watchers):
+  definitions, watchers, plus `tag_vocabulary` and `var_labels`, read
+  live and never copied into a match):
   `!system alias|tile|func|status|table|macro|zone <action> <system> ...` edit
   them with the grammar of `!alias` / `!tile def` / `!func` / `!status` /
   `!table` / `!macro` (action first, like alias), through the effective
@@ -3181,7 +3182,7 @@ and a total per body.
 
 ### 7.22 Reading a unit: line, description, dump
 
-Three tiers (user design, 1008-1012): the info line (entity_line_format in
+Three tiers (user design, 1008-1013): the info line (entity_line_format in
 `!list` / `!state`; entity_info_format in `!ent info <id> short`) is the
 unit's state at a glance; the description (`!ent info <id>`,
 `vtt_commands._entity_description`) is what a player reads about it; `!ent
@@ -3227,6 +3228,17 @@ dump` is the raw data for the GM.
   Unit history (`logic.UNIT_HISTORY_KEYS`): templates, statblocks, summon
   snapshots, prefabs, clones and copies / transfers into another match
   strip it; a corpse keeps it. `!ent dump` lists it.
+- **Var labels** (user design, 1013): the system library `var_labels`
+  (`!system labels list|set|remove`; system-only, read live like
+  tag_vocabulary, `vtt_commands._var_labels`) maps a dotted var path or a
+  bare key (any depth) to a label; a path entry wins
+  (`logic.var_label_for`); no `__` key, one line of at most
+  `VAR_LABEL_MAX` characters (`var_label_problem`). Shown only while
+  `var_labels_enabled` (default off) and only in player-facing tiers: the
+  description's keys (`_description_tree`) and the dict keys a placeholder
+  prints in the card, roster and corpse lines (`_render_template(...,
+  labels)`). GM reads (`!ent dump`, `!find show:`, formulas, selectors)
+  keep the keys; values are never relabelled.
 - **Not yet:** #70's private vars (the data section must skip them when
   they ship).
 

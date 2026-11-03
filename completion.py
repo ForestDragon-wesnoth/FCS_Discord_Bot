@@ -413,6 +413,12 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(mgr.systems if slot == "system" else mgr.matches)
     if slot == "rule":
         return sorted(logic.RULES_REGISTRY)
+    if slot == "var_path" and root == "system" and sub == "labels":
+        # `set` names any path; the removals one the system labels.
+        if binds.get(_LAST_LIT) == "set":
+            return []
+        s = mgr.systems.get(binds.get("system", ""))
+        return sorted(mgr.system_library(s, "var_labels")) if s else []
     if slot in ("tag", "filter"):
         if root == "system" and sub == "tags":
             # `add` names a new tag; the others one the system declares.
