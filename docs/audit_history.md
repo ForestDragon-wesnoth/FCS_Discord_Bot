@@ -2520,3 +2520,51 @@ cells.
     permanent status stays permanent under `extend` and counters (L27,
     §8's counter question). Not changed: a size read still records the
     whole prefab once per segment (L28).
+
+## Pass 50 (document 2, passes 52-57 of the external read-only audit)
+
+Every open finding of the external document's passes 52-57 checked
+against the branch (on top of #90 / #108) and fixed where the intent was
+clear. Scenarios 986-991; verified after: 991/991, the replay
+differential on the whole suite.
+  - **Crash paths** (E6, W9): a status resistance fold skips a record
+    that would take its total past 1e15 or to infinity (two `mul` 1e200
+    records crashed every application, and inside a granting zone every
+    command died after its handler, skipping the undo step, the watcher
+    poll and the journal entry); the end-of-command grant sync reports
+    its own crash. A crash's reply names the other matches the command
+    reached and its server-wide edits, which stay; the restored match
+    takes its rules from its system as it stands.
+  - **Views** (V14): lines a zone grant or a watcher prints about a unit
+    are tagged as lines about it (`SURFACE_UNIT_TAG`), so a team view
+    that hides the unit drops them; `!watch show` filters its units.
+  - **Authority** (G7, L39): a held command runs at `!match resume` as
+    its holder; a pause no longer holds the commands that point the
+    channel at another match.
+  - **Cost** (X13-X17): a read-only `!eval` takes no rollback state; a
+    unit built from a partial copies its renamed base only when a var
+    moves, once per command; an aura carrier's per-step grant sync covers
+    the bodies the aura covers or held its grant; conditions of the shape
+    `entity[self].<path> <op> <number>` (the default death condition, most
+    grant and watcher conditions) are read without a formula namespace
+    (800 units under a conditioned 80x30 zone: a command 1.5 s -> 0.11 s,
+    a 20-step aura walk 20 s -> 0.33 s); `!simulate` restores per run only
+    the matches a run reached (39 s -> 7.5 s beside a filled 300x300);
+    past `watcher_unit_checks` a poll reads the window after the last
+    one's.
+  - **Partials** (S9+): a partial built on another resolves the inner one
+    in its own var names; pins keep theirs; a force delete inlines in the
+    dependent's names; collisions follow `var_name_collision`.
+  - Smaller: a consumed watcher item runs no effect (L41); transfers
+    leave zone-held statuses behind and the destination settles them; a
+    watcher's effect settles grants in the same command; reads don't
+    settle grants (L40); `summon` with `vars: null`, a builtin given a
+    keyword and None compared with a number are refused in words, JSON
+    replies open their fence as ```json, " Nothing was changed." gets its
+    own sentence (L36, L37).
+  - Answered after the pass (user calls, 683, 992): a permanent status
+    stays permanent under every stack mode (L38); a zone-held status
+    follows its zones' highest level and that zone's data, a grant edit
+    reaching the units inside (L40).
+  - Left open: the action half of X13 (every action serializes the
+    match) and formula namespaces at ~2 ms for other conditions.

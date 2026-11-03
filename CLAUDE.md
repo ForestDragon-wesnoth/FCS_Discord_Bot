@@ -1113,7 +1113,11 @@ hardcodes**.
   clamp caps hp at max_hp.
 - **Aliveness:** `alive_condition` rule (empty = hp > 0 or indestructible);
   the death PIPELINE uses `death_condition` (+ per-unit `__death_condition`,
-  `death_condition_mode`).
+  `death_condition_mode`). A condition of the shape `entity[self].<path>
+  <op> <number>` over a stored number (the default death condition,
+  typical grant and per-unit / held watcher conditions) is read natively
+  (`logic._simple_var_test`) instead of building a formula namespace,
+  which costs ~2 ms (X15); anything else runs the formula.
 - **Commands:** `!ent` add / remove / rename / info / dump / diff / set_var /
   set_vars / delete_var / hp / init / tp / move / push / pull / swap / face /
   kill / revive / clone / copy / transfer / transform / revert / status /
@@ -1244,9 +1248,18 @@ hardcodes**.
   so a reading writes nothing on the unit; `once` = once per holder. One
   pass records every edge first, then runs effects (match watchers, then
   held, units in turn order, skipping a unit gone or dead since its
-  reading). The per-unit readings share the owner limit
-  `watcher_unit_checks` (2000, ~1 ms each); past it the rest keep their
-  state with a ⚠️ (a replay under another limit can differ). Polled when
+  reading). The per-unit readings (one ordered list: each watchers' units,
+  then held) share the owner limit `watcher_unit_checks` (2000, ~1 ms
+  each); past it a poll reads the window after the last poll's
+  (`Match.watcher_cursor`, saved, undone) and the rest keep their state
+  with a ⚠️, so every reading comes round (X17; a replay under another
+  limit can differ). A held watcher whose item or status an earlier
+  effect of the poll removed doesn't run (L41). What a watcher held by or
+  read for a unit prints (its effect's lines, its error note) is tagged
+  as a line about that unit (`logic.SURFACE_UNIT_TAG`, applied by
+  `surface_log`; `Match.unit_tag` / `tag_lines`), so a channel whose view
+  hides it drops them, and `!watch show` lists only units the view shows
+  (V14, 986-987). Polled when
   `Match.has_watchers()` (any watcher, stored state or a unit holding
   one). A system's `watchers` library (`!system watch`, 980) arms its
   entries in each new match (`watcher_definition` / `watcher_add_args`);
@@ -1317,7 +1330,11 @@ hardcodes**.
   commands; `pause_affects_hosts` holds hosts' commands until `!match
   resume` runs them (`resume drop` discards); held commands are saved with
   the match (`paused.held`), so a restart keeps them; never an undo step;
-  `!dry` runs during a pause (637-638, 822).
+  `!dry` runs during a pause (637-638, 822). A held command records its
+  holder's admin / bot-owner flags and runs at the resume as the holder
+  (`_HolderCtx`, COMMAND_USER: handler checks and the log judge and name
+  the holder, G7); `!match use / new / bind / unbind / clone` and `!map
+  use` aren't held (`_pause_control`, L39) (988).
 - **Reminders** (`!remind [secret] <n> <text> | list | remove <id>`;
   `Match.reminders` / `reminder_seq` / `held_reminders`, saved, undo
   state): due at `turns_elapsed` + n, fired by `_begin_turn`
@@ -1368,7 +1385,10 @@ hardcodes**.
   and macros rename the same way (`_rename_entry`; `_mentions_note` scans
   `_match_formula_slots` and macro bodies for the old name); `!macro copy`,
   `!tile def copy`, `!passive copy <eid> <pid> <dest> [new_pid]` (767).
-- **Prims:** `status_apply` / `status_force` / `status_get` / `status_set` /
+- **Prims:** `status_level` / `status_duration` (#90, 983: 0 when the
+  unit lacks the status, so no guard; a level-less status reads 1, a
+  permanent one's duration None; read through the level entries),
+  `status_apply` / `status_force` / `status_get` / `status_set` /
   `status_has` / `status_tags` / `status_has_tag` / `statuses_with_tag` /
   `status_resist_of` / `is_status_immune` / counters / dispel / transfer.
 - **Tags and tokens:** a definition's `tags`; a token is a bare name or
@@ -1389,7 +1409,9 @@ hardcodes**.
   `priority` + `status_resist_op_priority` offset first (default flat
   before percentile), rounded ONCE at the end (application `rounding=` >
   the definition's `resist_rounding` > `status_resist_rounding`, default
-  floor); a result below 1 doesn't apply. It changes the LEVEL (only when
+  floor); a result below 1 doesn't apply. A record that would take the
+  running total past `RESIST_TOTAL_MAX` (1e15) or to infinity is skipped
+  with a warning (E6: two `mul` 1e200 records crashed every application). It changes the LEVEL (only when
   an application sets one, `_resistance_applies`) or the DURATION (when
   one is given) per the definition's `resist_affects` (level default /
   duration / both). A status never grants itself resistance or immunity
@@ -1410,8 +1432,9 @@ hardcodes**.
   field; the status is removed at ≤ 0 (durations and charges alike). A
   counter on a text field is refused. A status with no `duration` is
   permanent (shown as ∞, user call): `status_counter_add` on its duration
-  and a `stack extend` application leave it so (the add returns None);
-  `status_counter_set` gives it one (960).
+  and an application with a duration under every stack mode leave it so
+  (the add returns None; `add_level` still adds its level; L38, user
+  call, 683, 992); `status_counter_set` gives it one (960).
 - **Dispel / transfer:** `status_dispel(eid, token, max)` (token-only, no
   undispellable guard, user call); `status_transfer(from, to, name)` removes
   from the source unconditionally and re-applies on the destination through
@@ -1471,7 +1494,9 @@ hardcodes**.
   tags, not_tags, priority, condition, grants_tags}` aggregated live by
   `_raw_modifier_records` from status instances, a unit's `modifiers` var,
   scanned roots (`modifier_sources`, default `equipped`; per-unit
-  `__modifier_sources` / `__modifier_sources_add`) and team data (`team:<t>`).
+  `__modifier_sources` / `__modifier_sources_add`), team data (`team:<t>`),
+  the match vars (`match`, every unit) and the unit's map's vars
+  (`map:<name>`, the units on that map; #108, 984-985).
   A bundle is a list or a dict of named records.
 - `value` / `condition` may be formulas with `self` = owner plus the call's
   `target` / `attacker` / `defender` / `other`.
@@ -1658,7 +1683,10 @@ hardcodes**.
   `declare_winner` set is tallied: a scripted fight is a macro playing
   one turn. `tally=` (read-only) records a value per run. The steps of all
   runs share the owner limit `simulate_step_limit` (1000); a run it cuts
-  is left out with a ⚠️. Runs yield the event loop between them.
+  is left out with a ⚠️. Runs yield the event loop between them. A run
+  puts back only the matches it reached (`logic.MATCHES_TOUCHED`:
+  `MatchManager.get`, `copy_entity`, `require_target_host`) plus any
+  deleted or replaced; every match goes back once at the end (X16).
 - **`!again`** reruns the caller's last top-level command in the channel
   (runtime-only `mgr._last_commands`; never records `again` / `as` / clicks;
   refused inside dispatch_no_snapshot; always player-available) (639, 646).
@@ -1668,7 +1696,11 @@ hardcodes**.
   are case-insensitive (`!Ent`, on Discord too). `!func` defines formula functions
   (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula,
   all or nothing like an action (user call): refused part-way, its writes
-  are taken back, other matches too (`_eval_all_or_nothing`, 247, 960);
+  are taken back, other matches too (`_eval_all_or_nothing`, 247, 960;
+  a program `formula.program_is_read_only` passes, the `$()` test over
+  its calls with only bare-local assignments, runs without that
+  serialization and its refusal doesn't claim to have changed nothing,
+  X13);
   `!eval --trace ...` lists, in order, the formula's own `entity[x]` /
   `match.` reads (`FormulaEngine.trace_reads`, so engine-side checks such
   as the death condition stay out) and every var write / delete the eval
@@ -2216,8 +2248,12 @@ hardcodes**.
   removes with removed_by `zone`, or with linger leaves the status with a
   `duration` and `__zone_lingering` (counted down by the GM's tick; a zone
   covering it again takes it back). A status without the marker is the
-  unit's own: never taken over or removed. A held grant isn't re-applied
-  when another zone takes over (its first level / data stay). Who:
+  unit's own: never taken over or removed. A held grant follows its zones (L40, user call, 992): the instance
+  records what they give (`ZONE_SPEC_KEY`: the highest level among them
+  and that zone's data, `_grant_spec`), and when that changes (a walk
+  into a higher zone, a grant edit) `_update_zone_grant` sets the level
+  (resistance and max_level apply) and the data, dropping the keys the
+  last grant's data set, as one status change. Who:
   `grant_bodies` / `zone_status_grant_bodies` (root: the body root once
   when any cell of the body, located / region parts included, is inside;
   all: every unit with a cell inside, glued parts following their unit),
@@ -2234,7 +2270,16 @@ hardcodes**.
   (`CommandRegistry._run`, before the undo step is recorded; a read
   doesn't settle, so it never becomes an undo step). A sync running asks
   nested ones for another pass (`_grant_syncing` / `_grant_dirty`), at
-  most `ZONE_GRANT_PASSES` (8), then a ⚠️. A death strips the zone's
+  most `ZONE_GRANT_PASSES` (8), then a ⚠️. A body anchoring a granting
+  aura syncs per step the bodies the aura covers or held its grant
+  (`grant_scope`, X15). After a watcher poll that ran an effect the
+  grants settle again (a condition the effect changed lands in the same
+  command); a read without an undo pre-state (`_settles_nothing`) doesn't
+  settle; the end-of-command sync reports its own crash (E6). Lines a
+  grant settling on a unit prints are tagged as lines about it (V14). A
+  unit copied or transferred to another match leaves its zone-held
+  statuses behind and the destination's zones settle on it (L40, 991).
+  A death strips the zone's
   statuses before the corpse snapshot; statblocks, templates and prefabs
   leave them out (`without_zone_grants`); `!zone rename` and `!status
   rename` follow. When to use one over enter / exit hooks is in `!help
@@ -2701,7 +2746,10 @@ hardcodes**.
   `error_log_server_entries` (50) of them; a disk that keeps failing is
   one entry counting its repeats until a save works
   (`mgr._save_failure_ref`); a bad `next_ref` counts on from the highest
-  kept ref. `!owner errors [n] | show <ref> | clear`
+  kept ref. A crash rolls back the channel's match (its rules re-applied
+  from its system as it stands) and the reply names what stays: other
+  matches the command reached and server-wide edits (W9, 989). `!owner
+  errors [n] | show <ref> | clear`
   (every server), `!server errors [n] | show <ref>` (admin, own server). `!as
   crash [text]` (CLI / harness) raises one on purpose (890).
 - **Other:** `!help find <words>` (commands, subcommands, rules and formula functions),
@@ -2790,7 +2838,13 @@ same library and namespace as entity templates: `{"kind": "partial",
   (`var_names`, at save and import); used as a unit's whole vars its
   top-level keys move to the unit's names (`Match._rename_root_partial`,
   in materialization and `_container_base` at the root; user call, S9,
-  742). Refs must name partials; self-references and cycles are refused at
+  742). A partial built on another is resolved in its own names: the
+  inner layer moves from the inner partial's `var_names` to the outer's
+  before the outer layer goes on (`_resolve`), a pin keeps the names its
+  data was written in (`partial_var_names`), a force delete writes a
+  dependent whose whole vars referenced the partial in the dependent's
+  names, and a move onto a name the data already holds follows
+  `var_name_collision` (S9+, 990). Refs must name partials; self-references and cycles are refused at
   save / import (`check_template_refs`); resolution charges
   `partial_template_depth_limit` and `partial_template_size_limit` (a node
   budget per materialization, owner ceiling: nested references multiply).
@@ -3058,6 +3112,7 @@ rejected already. Update this section in the PR that resolves an item.
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
   topic of debate (user: write it down).
+
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
   tile, zone or corpse blocks it. Known issue (user: list it).
@@ -3071,7 +3126,11 @@ rejected already. Update this section in the PR that resolves an item.
   and goes into the same design (user call, pass 43's J2 follow-up): a
   `state` entry (undo, history restore, `!run`, transfers, ...) stores the
   whole match (~650 KB on a filled 150x150), and every segment's header
-  copies the whole template library.
+  copies the whole template library. Every action also serializes the
+  match before its body (its rollback state; X13's action half, open: a
+  200-unit `!foreach` of `!action` on a filled 300x300 takes ~57 s), and
+  every formula evaluation builds its namespace (~2 ms; only the
+  `entity[self].<path> <op> <number>` shape skips it).
 
 ### Ask between tasks
 

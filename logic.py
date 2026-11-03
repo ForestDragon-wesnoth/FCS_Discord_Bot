@@ -467,6 +467,27 @@ def _bounded_move_hooks(fn):
 UNIT_LINE_TAG = "\u2063"
 UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\\d+)\\|([^|\u2063]*)\u2063")
 
+# While the engine runs something on behalf of one unit outside a command
+# that names it (a zone grant settling on it, a watcher it holds or one read
+# for it), the unit tag (Match.unit_tag) surface_log puts on what it shows,
+# so a channel whose view can't see that unit drops the lines (V14).
+SURFACE_UNIT_TAG: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "vtt_surface_unit_tag", default="")
+
+# The ids of the matches a command reached (MatchManager.get, copy_entity,
+# vtt_commands.require_target_host), collected while `!simulate` runs, so a
+# run restores only those (X16). None = not collecting.
+MATCHES_TOUCHED: "contextvars.ContextVar[Optional[Set[str]]]" = (
+    contextvars.ContextVar("vtt_matches_touched", default=None))
+
+
+def touch_match(mid: Optional[str]) -> None:
+    """Note that the running command reached match `mid` (MATCHES_TOUCHED)."""
+    seen = MATCHES_TOUCHED.get()
+    if seen is not None and mid:
+        seen.add(mid)
+
+
 # The workspace (MatchManager) whose command is running: formulas reach the
 # server's saved entity templates through it (summon_template). Set by each
 # CommandRegistry.run; None outside a command.
@@ -5043,6 +5064,41 @@ def checked_status_value(path: str, value: Any, where: str) -> Any:
     return n
 
 
+# `entity[self].<var path> <op> <number>`, the shape of the default death
+# condition: read without building a formula namespace (~2 ms each), since
+# the death check runs after every var write and status change (X15).
+_SIMPLE_VAR_TEST_RE = re.compile(
+    r"^\s*entity\[self\]\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*"
+    r"(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")
+
+
+def _simple_var_test(cond: str, e: Any) -> Optional[bool]:
+    """The value of condition `cond` on unit `e` when it is a plain
+    `entity[self].<path> <op> <number>` over a stored number, the way the
+    formula reads it; None when it isn't (the caller runs the formula)."""
+    mo = _SIMPLE_VAR_TEST_RE.match(cond or "")
+    if mo is None:
+        return None
+    path, op, num = mo.group(1), mo.group(2), mo.group(3)
+    if path.split(".")[0] in RESERVED_VAR_PATHS or "__" in path:
+        return None
+    cur: Any = e.vars
+    for seg in path.split("."):
+        if not isinstance(cur, dict) or seg not in cur:
+            return None
+        cur = cur[seg]
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+        return None
+    n = float(num) if "." in num else int(num)
+    return {"<=": cur <= n, ">=": cur >= n, "==": cur == n, "!=": cur != n,
+            "<": cur < n, ">": cur > n}[op]
+
+
+# The largest total a status resistance fold may reach (E6): a level or a
+# duration past it means a record overflowed, so the record is skipped.
+RESIST_TOTAL_MAX = 1e15
+
+
 # Recognized modifier fold ops (see Match._apply_modifier_op). An op outside
 # this set still folds as a lenient add, but `!mod show` flags it as a likely
 # typo via Match.unknown_modifier_ops.
@@ -6636,6 +6692,11 @@ ZONE_GRANT_BODIES = ("root", "all")
 ZONE_GRANT_KEY = "__zone_grant"
 ZONE_LINGER_KEY = "__zone_linger"
 ZONE_LINGERING_KEY = "__zone_lingering"
+# What the zones holding a granted status give it now ({level, data}: the
+# highest level among them and that zone's data), so a later sync updates
+# the instance when it changes (L40: a unit walking from a level-1 zone into
+# a level-3 one, or a grant edit, reaches the units already inside).
+ZONE_SPEC_KEY = "__zone_spec"
 # Passes one sync makes at most when the status hooks it fires move units
 # (each move asks for another pass).
 ZONE_GRANT_PASSES = 8
@@ -6670,7 +6731,8 @@ def check_zone_grant(status: Any, entry: Any) -> Dict[str, Any]:
         if not isinstance(data, dict):
             raise VTTError(f"grant `{status}`: data must be a dict.")
         bad = sorted(k for k in data if str(k) in (
-            "level", ZONE_GRANT_KEY, ZONE_LINGER_KEY, ZONE_LINGERING_KEY))
+            "level", ZONE_GRANT_KEY, ZONE_LINGER_KEY, ZONE_LINGERING_KEY,
+            ZONE_SPEC_KEY))
         if bad:
             raise VTTError(f"grant `{status}`: data can't set "
                            f"{', '.join(bad)} (`level` is its own field).")
@@ -9747,6 +9809,11 @@ class Match:
     # reading never writes the holder's vars. Match state: serialized and
     # undone; a holder or source that is gone drops its entry.
     watcher_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Where the next poll's per-unit readings start once they number more
+    # than the owner limit watcher_unit_checks (X17): each poll reads the
+    # window after the last one's. Serialized and undone with
+    # the watcher state.
+    watcher_cursor: int = 0
 
     # Coordinate rulers: None = the map_coords rule, else this match's
     # override (`!map coords on|off|clear`). Serialized.
@@ -10367,6 +10434,10 @@ class Match:
         the unit; zone_name and zone_map bound). One that fails reads as
         not met; `errors` keeps, per zone, its first error and the units
         it failed for."""
+        e = self.entities.get(eid)
+        fast = _simple_var_test(cond, e) if e is not None else None
+        if fast is not None:
+            return fast
         from formula import FormulaEngine, EvalCtx, FormulaError
         ctx = EvalCtx(this=self.current_entity_id(), target=eid,
                       extras={"zone_name": zname, "zone_map": mp.name})
@@ -10419,18 +10490,35 @@ class Match:
 
     def grant_scope(self, eid: str) -> Optional[Set[str]]:
         """The units a move of `eid` can change the zone grants of: its
-        whole carried body; None (every unit) when that body anchors an
-        aura. A per-step sync looks at these only (a condition costs a
+        whole carried body, and when that body anchors a granting aura, the
+        bodies the aura covers or held its grant. A per-step sync looks at these only (a condition costs a
         formula per unit); the end-of-command sync looks at everyone."""
         e = self.entities.get(eid)
         if e is None:
             return set()
         ids = {u.id for u in self.carried_body(self.body_root(e))}
+        scope = set(ids)
         for mp in self.maps.values():
-            for z in mp.zones.values():
-                if isinstance(z, dict) and z.get("anchor") in ids:
-                    return None
-        return ids
+            for zname, z in mp.zones.items():
+                if not (isinstance(z, dict) and z.get("anchor") in ids
+                        and self.zone_grants_of(z)):
+                    continue
+                # A granting aura the body carries (X15: every unit and
+                # zone was re-synced per step): the units it covers now and
+                # those holding its grant from before the step.
+                hit = set(self._zone_grant_targets(
+                    mp, z.get("cells") or (), "all"))
+                for u in self.entities.values():
+                    if any(isinstance(i, dict) and zname in (
+                            i.get(ZONE_GRANT_KEY) or ())
+                           for i in u.status.values()):
+                        hit.add(u.id)
+                for uid in hit:
+                    u = self.entities.get(uid)
+                    if u is not None:
+                        scope |= {b.id for b in self.carried_body(
+                            self.body_root(u))}
+        return scope
 
     def sync_zone_grants(self, scope: Optional[Set[str]] = None
                          ) -> List[str]:
@@ -10477,7 +10565,7 @@ class Match:
                     (k, v) for k, v in errors.items() if k is not None):
                 line = (f"⚠️ zone `{zname}`: its grant_condition failed for "
                         + ", ".join(f"`{u}`" for u in sorted(units))
-                        + f" ({first}); no grant.")
+                        + f" ({formula_text(first)}); no grant.")
                 if line not in self._grant_warned[1]:
                     self._grant_warned[1].add(line)
                     log.append(line)
@@ -10508,85 +10596,166 @@ class Match:
             e = self.entities.get(eid)
             if e is None:
                 continue
-            per = want.get(eid, {})
-            # What a zone holds and none covers any more: removed, or left
-            # lingering for its zones' longest linger.
-            for sname in sorted(e.status):
-                if eid not in self.entities:
-                    break
-                inst = e.status.get(sname)
-                if not isinstance(inst, dict) or ZONE_GRANT_KEY not in inst:
-                    continue
-                zones = per.get(sname, [])
-                if zones:
-                    linger = self._grant_linger(zones, sname)
-                    if inst.get(ZONE_GRANT_KEY) != zones:
-                        inst[ZONE_GRANT_KEY] = list(zones)
-                        self._grant_changes += 1
-                    if inst.get(ZONE_LINGER_KEY, 0) != linger:
-                        self._grant_changes += 1
-                        if linger:
-                            inst[ZONE_LINGER_KEY] = linger
-                        else:
-                            inst.pop(ZONE_LINGER_KEY, None)
-                    continue
-                before = copy.deepcopy(inst)
-                self._grant_changes += 1
-                linger = inst.get(ZONE_LINGER_KEY)
-                if isinstance(linger, int) and not isinstance(linger, bool) \
-                        and linger > 0:
-                    after = {k: v for k, v in inst.items()
-                             if k not in (ZONE_GRANT_KEY, ZONE_LINGER_KEY)}
-                    after["duration"] = linger
-                    after[ZONE_LINGERING_KEY] = True
-                    e.status[sname] = after
-                    log += self._emit_status_diff(eid, sname, before,
-                                                  copy.deepcopy(after))
-                else:
-                    del e.status[sname]
-                    log += self._emit_status_diff(eid, sname, before, None,
-                                                  removed_by="zone")
-            # What a covering zone grants and the unit lacks.
-            for sname in sorted(per):
-                e = self.entities.get(eid)
-                if e is None or not self._grant_eligible(e):
-                    break
-                zones = per[sname]
-                inst = e.status.get(sname)
+            # What this unit's grant changes print (hook and passive lines)
+            # is tagged as a line about it (V14).
+            outer_log, log = log, []
+            utag = self.unit_tag(eid)
+            tok = SURFACE_UNIT_TAG.set(utag)
+            try:
+                self._sync_unit_grants(eid, e, want, log)
+            finally:
+                SURFACE_UNIT_TAG.reset(tok)
+            outer_log += self.tag_lines(utag, log)
+            log = outer_log
+        return log
+
+    def _sync_unit_grants(self, eid: str, e: "Entity",
+                          want: Dict[str, Any], log: List[str]) -> None:
+        """One unit's part of _sync_zone_grants_pass, its lines into `log`."""
+        per = want.get(eid, {})
+        # What a zone holds and none covers any more: removed, or left
+        # lingering for its zones' longest linger.
+        for sname in sorted(e.status):
+            if eid not in self.entities:
+                break
+            inst = e.status.get(sname)
+            if not isinstance(inst, dict) or ZONE_GRANT_KEY not in inst:
+                continue
+            zones = per.get(sname, [])
+            if zones:
                 linger = self._grant_linger(zones, sname)
-                if isinstance(inst, dict) and ZONE_GRANT_KEY in inst:
-                    continue
-                if isinstance(inst, dict) and inst.get(ZONE_LINGERING_KEY):
-                    # A lingering grant is the zone's again.
-                    before = copy.deepcopy(inst)
-                    self._grant_changes += 1
-                    inst.pop(ZONE_LINGERING_KEY, None)
-                    inst.pop("duration", None)
+                if inst.get(ZONE_GRANT_KEY) != zones:
                     inst[ZONE_GRANT_KEY] = list(zones)
+                    self._grant_changes += 1
+                if inst.get(ZONE_LINGER_KEY, 0) != linger:
+                    self._grant_changes += 1
                     if linger:
                         inst[ZONE_LINGER_KEY] = linger
-                    log += self._emit_status_diff(eid, sname, before,
-                                                  copy.deepcopy(inst))
-                    continue
-                if inst is not None:
-                    continue    # its own status: never taken over
-                if e.is_part and sname in self._part_status_names(
-                        e, "__status_redirect", "part_status_redirect"):
-                    continue    # it would land on the parent
-                grant = self.zone_grants_of(self.find_zone(zones[0])).get(
-                    sname) or {}
-                sdef = self.status_definitions.get(sname) or {}
-                seed = (copy.deepcopy(sdef.get("data"))
-                        if isinstance(sdef.get("data"), dict) else {})
-                seed.update(copy.deepcopy(grant.get("data") or {}))
-                seed[ZONE_GRANT_KEY] = list(zones)
+                    else:
+                        inst.pop(ZONE_LINGER_KEY, None)
+                log += self._update_zone_grant(e, sname, zones)
+                continue
+            before = copy.deepcopy(inst)
+            self._grant_changes += 1
+            linger = inst.get(ZONE_LINGER_KEY)
+            if isinstance(linger, int) and not isinstance(linger, bool) \
+                    and linger > 0:
+                after = {k: v for k, v in inst.items()
+                         if k not in (ZONE_GRANT_KEY, ZONE_LINGER_KEY,
+                                      ZONE_SPEC_KEY)}
+                after["duration"] = linger
+                after[ZONE_LINGERING_KEY] = True
+                e.status[sname] = after
+                log += self._emit_status_diff(eid, sname, before,
+                                              copy.deepcopy(after))
+            else:
+                del e.status[sname]
+                log += self._emit_status_diff(eid, sname, before, None,
+                                              removed_by="zone")
+        # What a covering zone grants and the unit lacks.
+        for sname in sorted(per):
+            e = self.entities.get(eid)
+            if e is None or not self._grant_eligible(e):
+                break
+            zones = per[sname]
+            inst = e.status.get(sname)
+            linger = self._grant_linger(zones, sname)
+            if isinstance(inst, dict) and ZONE_GRANT_KEY in inst:
+                continue
+            if isinstance(inst, dict) and inst.get(ZONE_LINGERING_KEY):
+                # A lingering grant is the zone's again.
+                before = copy.deepcopy(inst)
+                self._grant_changes += 1
+                inst.pop(ZONE_LINGERING_KEY, None)
+                inst.pop("duration", None)
+                inst[ZONE_GRANT_KEY] = list(zones)
                 if linger:
-                    seed[ZONE_LINGER_KEY] = linger
-                log += self.apply_status(eid, sname, grant.get("level"),
-                                         seed_data=seed)
-                if e.status.get(sname) is not None:
-                    self._grant_changes += 1
-        return log
+                    inst[ZONE_LINGER_KEY] = linger
+                log += self._emit_status_diff(eid, sname, before,
+                                              copy.deepcopy(inst))
+                if eid in self.entities and sname in e.status:
+                    log += self._update_zone_grant(e, sname, zones)
+                continue
+            if inst is not None:
+                continue    # its own status: never taken over
+            if e.is_part and sname in self._part_status_names(
+                    e, "__status_redirect", "part_status_redirect"):
+                continue    # it would land on the parent
+            spec = self._grant_spec(zones, sname)
+            sdef = self.status_definitions.get(sname) or {}
+            seed = (copy.deepcopy(sdef.get("data"))
+                    if isinstance(sdef.get("data"), dict) else {})
+            seed.update(copy.deepcopy(spec["data"]))
+            seed[ZONE_GRANT_KEY] = list(zones)
+            seed[ZONE_SPEC_KEY] = copy.deepcopy(spec)
+            if linger:
+                seed[ZONE_LINGER_KEY] = linger
+            log += self.apply_status(eid, sname, spec["level"],
+                                     seed_data=seed)
+            if e.status.get(sname) is not None:
+                self._grant_changes += 1
+
+    def _grant_spec(self, zones: List[str], sname: str) -> Dict[str, Any]:
+        """What `zones` (holding status `sname`) give it now: the highest
+        level any of them grants (None: none sets one) and the data of the
+        zone granting it (the first of those tied, else the first zone)."""
+        best_level = None
+        best_data: Any = None
+        for zn in zones:
+            g = self.zone_grants_of(self.find_zone(zn)).get(sname) or {}
+            lv = g.get("level")
+            if isinstance(lv, bool) or not isinstance(lv, (int, float)):
+                lv = None
+            if best_data is None or (lv is not None and (
+                    best_level is None or lv > best_level)):
+                if lv is not None or best_data is None:
+                    best_data = g.get("data") or {}
+                if lv is not None:
+                    best_level = lv
+        return {"level": best_level,
+                "data": copy.deepcopy(best_data)
+                if isinstance(best_data, dict) else {}}
+
+    def _update_zone_grant(self, e: "Entity", sname: str,
+                           zones: List[str]) -> List[str]:
+        """Bring a zone-held status in line with what its zones give now
+        (L40, user call): the level they grant (resistance and max_level
+        apply, as at the first application) and their data; the keys the
+        last grant's data set and this one's lacks go. A status change, so
+        on_status_changed fires. Nothing when it already matches."""
+        inst = e.status.get(sname)
+        if not isinstance(inst, dict):
+            return []
+        spec = self._grant_spec(zones, sname)
+        old = inst.get(ZONE_SPEC_KEY)
+        if same_value(old, spec):
+            return []
+        before = copy.deepcopy(inst)
+        old_data = (old.get("data") if isinstance(old, dict)
+                    and isinstance(old.get("data"), dict) else {})
+        for k in old_data:
+            if k not in spec["data"] and k not in ("level", "duration"):
+                inst.pop(k, None)
+        for k, v in spec["data"].items():
+            inst[k] = copy.deepcopy(v)
+        lv = spec["level"]
+        if lv is not None and not (isinstance(old, dict)
+                                   and old.get("level") == lv):
+            sdef = self.status_definitions.get(sname) or {}
+            new_lv = int(lv)
+            if self.resist_affects(sname, new_lv) in ("level", "both") \
+                    and self._resistance_applies(e, sname, sdef, True):
+                fold = self.resist_fold(e.id, sname, new_lv, level=new_lv)
+                new_lv = fold["value"] if fold["applies"] else \
+                    self.status_level(inst)
+            inst["level"] = self._cap_status_level(sdef, new_lv)
+        inst[ZONE_SPEC_KEY] = copy.deepcopy(spec)
+        self._grant_changes += 1
+        after = copy.deepcopy(inst)
+        strip = lambda d: {k: v for k, v in d.items() if k != ZONE_SPEC_KEY}
+        if same_value(strip(before), strip(after)):
+            return []
+        return self._emit_status_diff(e.id, sname, before, after)
 
     def strip_zone_grants(self, e: "Entity") -> None:
         """Drop the statuses a zone holds on `e` without hooks (a dying
@@ -12919,7 +13088,8 @@ class Match:
 
     def _raw_modifier_records(self, e: "Entity") -> List[Tuple[dict, str]]:
         """Every (record, source) contributing to `e`, aggregated live from
-        its sources: each status instance's `modifiers`, the direct
+        its sources: each status instance's `modifiers`, the match vars'
+        and its map's vars' bundles, its team data's, the direct
         `entity.modifiers` slot, and each scan-root subtree. Source is a
         readable label (e.g. `status:burning.fireboost`, `equipped.sword.0`)
         for the list_mods breakdown."""
@@ -12945,6 +13115,16 @@ class Match:
             if "modifiers" in sdata:
                 for key, rec in self._bundle_items(sdata["modifiers"]):
                     out.append((rec, self._mod_source(f"status:{sname}", key)))
+        # Match-wide and map-wide modifiers (#108): a `modifiers` bundle in
+        # the match vars applies to every unit, one in a map's vars to the
+        # units on that map (weather, darkness, an anti-magic field).
+        if "modifiers" in self.vars:
+            for key, rec in self._bundle_items(self.vars["modifiers"]):
+                out.append((rec, self._mod_source("match", key)))
+        mp = self.maps.get(e.map)
+        if mp is not None and "modifiers" in mp.vars:
+            for key, rec in self._bundle_items(mp.vars["modifiers"]):
+                out.append((rec, self._mod_source(f"map:{mp.name}", key)))
         # Team-scoped modifiers: a `modifiers` bundle in the entity's team
         # data applies to every member.
         team = e.team
@@ -13461,6 +13641,10 @@ class Match:
                   ) -> bool:
             if not cond:
                 return False
+            if eid is not None and eid in self.entities:
+                fast = _simple_var_test(cond, self.entities[eid])
+                if fast is not None:
+                    return fast
             try:
                 return bool(engine.eval_expression(
                     cond, EvalCtx(this=this_id, target=eid, extras=extras)))
@@ -13472,6 +13656,12 @@ class Match:
                           Dict[str, Any]]] = []
         alive = [e for e in self.entities_in_turn_order() if e.is_alive]
         new_units: Dict[str, Dict[str, bool]] = {}
+        # Every per-unit reading of this poll, in order: (kind, watcher or
+        # held key, unit, spec). Past watcher_unit_checks the poll reads a
+        # window of them that starts where the last poll stopped
+        # (`watcher_cursor`), so every reading is made within a bounded
+        # number of polls (X17).
+        slots: List[Tuple[str, str, "Entity", Any]] = []
         for name, w in list(self.watchers.items()):
             cond = str(w.get("condition", "") or "")
             eff = str(w.get("effect", "") or "")
@@ -13485,49 +13675,63 @@ class Match:
                                   bool(w.get("once")),
                                   {"watcher_name": name}))
                 continue
-            old = w.get("units") if isinstance(w.get("units"), dict) else {}
-            spent = set(w.get("spent") or [])
-            units: Dict[str, bool] = {}
+            new_units[name] = {}
             for e in self._watched_units(w):
-                if budget <= 0:
-                    cut = True
+                slots.append(("each", name, e, w))
+        for e in alive:
+            for src, wname, spec, problem in self.held_watchers(e):
+                if problem is None:
+                    slots.append(("held", json.dumps([e.id, src, wname]), e,
+                                  (src, wname, spec)))
+        n = len(slots)
+        if n > budget:
+            cut = True
+            start = self.watcher_cursor % n if n else 0
+            chosen = {(start + i) % n for i in range(max(0, budget))}
+            next_cursor = (start + max(0, budget)) % n
+        else:
+            chosen = set(range(n))
+            next_cursor = 0
+        new_state: Dict[str, Dict[str, Any]] = {}
+        for i, (kind, key, e, info) in enumerate(slots):
+            if kind == "each":
+                w = info
+                name = key
+                old = (w.get("units") if isinstance(w.get("units"), dict)
+                       else {})
+                units = new_units[name]
+                if i not in chosen:
                     if e.id in old:
                         units[e.id] = bool(old[e.id])
                     continue
-                budget -= 1
-                now = _read(cond, e.id, {"watcher_name": name})
+                now = _read(str(w.get("condition", "") or ""), e.id,
+                            {"watcher_name": name})
                 units[e.id] = now
                 was = old.get(e.id)
-                if was is None or e.id in spent:
+                if was is None or e.id in set(w.get("spent") or []):
                     continue            # first seen / already spent
                 if now and not was:
-                    fires.append(("each", name, e.id, eff,
+                    fires.append(("each", name, e.id,
+                                  str(w.get("effect", "") or ""),
                                   bool(w.get("once")),
                                   {"watcher_name": name}))
-            new_units[name] = units
-        new_state: Dict[str, Dict[str, Any]] = {}
-        for e in alive:
-            for src, wname, spec, problem in self.held_watchers(e):
-                if problem is not None:
-                    continue
-                key = json.dumps([e.id, src, wname])
-                prev = self.watcher_state.get(key)
-                if budget <= 0:
-                    cut = True
-                    if prev is not None:
-                        new_state[key] = copy.deepcopy(prev)
-                    continue
-                budget -= 1
-                extras = {"watcher_name": wname, "watcher_source": src}
-                now = _read(str(spec.get("condition") or ""), e.id, extras)
-                spent = bool(prev.get("spent")) if prev else False
-                new_state[key] = {"last": now, "spent": spent}
-                if prev is None or spent:
-                    continue
-                if now and not prev.get("last"):
-                    fires.append(("held", key, e.id,
-                                  str(spec.get("effect") or ""),
-                                  bool(spec.get("once")), extras))
+                continue
+            src, wname, spec = info
+            prev = self.watcher_state.get(key)
+            if i not in chosen:
+                if prev is not None:
+                    new_state[key] = copy.deepcopy(prev)
+                continue
+            extras = {"watcher_name": wname, "watcher_source": src}
+            now = _read(str(spec.get("condition") or ""), e.id, extras)
+            spent = bool(prev.get("spent")) if prev else False
+            new_state[key] = {"last": now, "spent": spent}
+            if prev is None or spent:
+                continue
+            if now and not prev.get("last"):
+                fires.append(("held", key, e.id,
+                              str(spec.get("effect") or ""),
+                              bool(spec.get("once")), extras))
         if cut:
             notes.append(f"⚠ watchers: the per-unit readings reached the "
                          f"owner limit watcher_unit_checks "
@@ -13537,6 +13741,7 @@ class Match:
                   for kind, k, eid, *_r in fires]
         if peek:
             return labels, []
+        self.watcher_cursor = next_cursor
         for name, units in new_units.items():
             w = self.watchers.get(name)
             if w is not None:
@@ -13555,18 +13760,31 @@ class Match:
                 w = self.watchers.get(key)
                 if w is None:
                     continue            # removed by an earlier effect
-            if kind == "held" and key not in self.watcher_state:
-                continue
+            if kind == "held" and (
+                    key not in self.watcher_state
+                    or key not in {json.dumps([eid, src, wn]) for src, wn, _s, pr
+                                   in self.held_watchers(self.entities[eid])
+                                   if pr is None}):
+                continue                # its item / status went (L41)
             what = extras.get("watcher_name", key)
+            # Runtime count of effects run (the command layer settles zone
+            # grants again after a poll that ran any).
+            self._watchers_fired = getattr(self, "_watchers_fired", 0) + 1
             if eff:
+                # A watcher read for a unit, or one it holds, shows its
+                # output as lines about that unit (V14).
+                utag = self.unit_tag(eid) if eid else ""
+                tok = SURFACE_UNIT_TAG.set(utag)
                 try:
                     FormulaEngine(self).eval_program(eff, EvalCtx(
                         this=self.current_entity_id(), target=eid,
                         extras=dict(extras)))
                 except FormulaError as ex:
                     where = f" on `{eid}`" if eid else ""
-                    notes.append(f"⚠ watcher `{what}`{where} effect error: "
-                                 f"{ex}")
+                    notes += self.tag_lines(utag, [
+                        f"⚠ watcher `{what}`{where} effect error: {ex}"])
+                finally:
+                    SURFACE_UNIT_TAG.reset(tok)
             if eid is None:
                 self.log_event("watcher_fired", name=what)
             else:
@@ -17819,6 +18037,9 @@ class Match:
         for r in recs:
             r["_eff"] = r["priority"] + offsets.get(r["op"], 0.0)
         running = float(base)
+        if not math.isfinite(running):
+            running = 0.0
+        running = max(-RESIST_TOTAL_MAX, min(RESIST_TOTAL_MAX, running))
         steps = []
         for tier in sorted({r["_eff"] for r in recs}, reverse=True):
             for op in sorted(dict.fromkeys(r["op"] for r in recs
@@ -17826,11 +18047,22 @@ class Match:
                 for r in [r for r in recs
                           if r["_eff"] == tier and r["op"] == op]:
                     if op == "sub":
-                        running -= r["value"]
+                        nxt = running - r["value"]
                     elif op == "mul":
-                        running *= r["value"]
+                        nxt = running * r["value"]
                     else:
-                        running /= r["value"]
+                        nxt = running / r["value"]
+                    # E6: a total past RESIST_TOTAL_MAX (or overflowing to
+                    # infinity) can't be a level or a duration; the record
+                    # that would push it there is skipped with a warning,
+                    # as resist_records skips unusable ones.
+                    if not math.isfinite(nxt) or abs(nxt) > RESIST_TOTAL_MAX:
+                        out["warnings"].append(
+                            f"resistance record `{op} {r['value']}` from "
+                            f"{r['source']} skipped: it would take `{name}`'s "
+                            f"total past {RESIST_TOTAL_MAX:.0e}.")
+                        continue
+                    running = nxt
                     steps.append((op, r["value"], r["priority"], r["source"],
                                   r["token"], running))
         mode = rounding
@@ -17862,6 +18094,7 @@ class Match:
             return (True, 0)
         flat = [r for r in self._stacked_resist(recs) if r["op"] == "sub"]
         total = sum(r["value"] for r in flat)
+        total = max(-RESIST_TOTAL_MAX, min(RESIST_TOTAL_MAX, total))
         return (False, int(total) if float(total).is_integer() else total)
 
     def resist_affects(self, name: str, level: Any) -> str:
@@ -18118,6 +18351,12 @@ class Match:
         else:
             mode = sdef.get("stack") or str(self.rules.get("status_default_stack", "refresh"))
             inst = e.status[name]
+            # A status with no duration is permanent (∞) and stays so under
+            # every stack mode: an application's duration doesn't start it
+            # counting down (user call, L38; `status_counter_set` gives it
+            # one on purpose).
+            if inst.get("duration") is None:
+                new_duration = None
             if mode == "none":
                 pass
             elif mode == "replace":
@@ -18126,9 +18365,7 @@ class Match:
                 if new_duration is not None:
                     inst["duration"] = new_duration
             elif mode == "extend":
-                # A status with no duration is permanent (∞): extending it
-                # leaves it permanent (user call).
-                if new_duration is not None and inst.get("duration") is not None:
+                if new_duration is not None:
                     inst["duration"] = (_coerce_number(inst.get("duration", 0)) or 0) + new_duration
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1
@@ -18995,7 +19232,24 @@ class Match:
         if pinning:
             self.template_pins[name] = {"data": copy.deepcopy(t.get("data")),
                                         "turn": self.turns_elapsed}
+            # A pin is read in the var names its data was written in, not
+            # in a later save's (S9+).
+            if isinstance(t.get("var_names"), dict):
+                self.template_pins[name]["var_names"] = copy.deepcopy(
+                    t["var_names"])
         return t.get("data")
+
+    def partial_var_names(self, name: str) -> Optional[Dict[str, Any]]:
+        """The var names partial `name`'s data was written in, as this
+        match reads it: its pin's when pinned (template_pinning), else the
+        library entry's. None when it records none."""
+        pinning = bool(self.rules.get("template_pinning", False))
+        if pinning and name in self.template_pins:
+            vn = self.template_pins[name].get("var_names")
+            return vn if isinstance(vn, dict) else None
+        t = self._template_library().get(name)
+        vn = t.get("var_names") if isinstance(t, dict) else None
+        return vn if isinstance(vn, dict) else None
 
     def resolve_partial(self, name: str, _chain: Tuple[str, ...] = (),
                         fresh: bool = True) -> Dict[str, Any]:
@@ -19033,7 +19287,12 @@ class Match:
         data = self.partial_data(name)
         if not isinstance(data, dict):
             raise VTTError(f"There is no partial template `{name}`.")
-        res = self._materialize(data, True, _chain + (name,))
+        # A partial built on another (`{"__template": "base", ...}`) reads
+        # the inner one in its own var names before its layer goes on, so a
+        # chain arrives in the outermost partial's names (S9+).
+        own = self.partial_var_names(name)
+        res = self._materialize(data, True, _chain + (name,),
+                                self.unit_names_for(own) if own else None)
         _inherit_nested(res)
         if cache is None:
             return res
@@ -19090,6 +19349,17 @@ class Match:
                     k, RULES_REGISTRY[k]["default"]))
                 for k in VAR_NAME_RULES}
 
+    def _root_partial_moves(self, name: str, names: Dict[str, Any]
+                            ) -> List[Tuple[str, str]]:
+        """The (old, new) var moves partial `name` needs as a unit's whole
+        vars under the var names `names` ([] when they match)."""
+        own = self.partial_var_names(name)
+        if not isinstance(own, dict):
+            return []
+        return [(own[k], names[k]) for k in VAR_NAME_RULES
+                if isinstance(own.get(k), str) and isinstance(
+                    names.get(k), str) and own[k] != names[k]]
+
     def _rename_root_partial(self, name: str, base: Dict[str, Any],
                              names: Dict[str, Any]) -> None:
         """Partial `name`'s resolved data, used as a unit's whole vars, in
@@ -19097,19 +19367,30 @@ class Match:
         records (`var_names`, saved with it) moves to the unit's name for
         that rule, so a partial written under `hp` gives a unit on
         `health` its `health` (user call, S9)."""
-        t = self._template_library().get(name)
-        own = t.get("var_names") if isinstance(t, dict) else None
-        if not isinstance(own, dict):
-            return
-        moves = [(own[k], names[k]) for k in VAR_NAME_RULES
-                 if isinstance(own.get(k), str) and isinstance(
-                     names.get(k), str) and own[k] != names[k]]
+        moves = self._root_partial_moves(name, names)
         held = {old: base[old] for old, _new in moves if old in base}
+        mode = str(self.rules.get("var_name_collision", "tracked"))
+        targets = {new for _old, new in moves}
+        clash = [(old, new) for old, new in moves
+                 if old in held and new in base and new not in held]
+        if clash and mode == "refuse":
+            old, new = clash[0]
+            raise VTTError(
+                f"Partial `{name}` holds both `{old}` and `{new}`, and its "
+                f"`{old}` would move to `{new}` (var_name_collision "
+                f"refuse).")
         for old, _new in moves:
-            base.pop(old, None)
+            if old in held and old not in targets:
+                base.pop(old, None)
         for old, new in moves:
-            if old in held and new not in base:
-                base[new] = held[old]
+            if old not in held:
+                continue
+            if new in base and new not in held and mode == "existing":
+                # The var already there stays; the moved one is kept as
+                # plain data under its old name.
+                base[old] = held[old]
+                continue
+            base[new] = held[old]
 
     def _materialize(self, node: Any, root: bool,
                      _chain: Tuple[str, ...],
@@ -19263,9 +19544,23 @@ class Match:
             base, at = self.resolve_partial(mk["name"], fresh=False), p
             if p == "" and names is not None:
                 # The unit's whole vars: its partial under the unit's var
-                # names, as it was materialized (S9).
-                base = copy.deepcopy(base)
-                self._rename_root_partial(mk["name"], base, names)
+                # names, as it was materialized (S9). Copied only when a
+                # var moves, and once per command (X14: every write on such
+                # a unit copied the whole partial).
+                moves = self._root_partial_moves(mk["name"], names)
+                if moves:
+                    cache = PARTIAL_CACHE.get()
+                    key = ("root", getattr(CURRENT_WORKSPACE.get(),
+                                           "guild_key", None), self.id,
+                           bool(self.rules.get("template_pinning", False)),
+                           mk["name"], tuple(moves))
+                    if cache is not None and key in cache:
+                        base = cache[key]
+                    else:
+                        base = copy.deepcopy(base)
+                        self._rename_root_partial(mk["name"], base, names)
+                        if cache is not None:
+                            cache[key] = base
         if base is None:
             raise VTTError("not built from a partial template")
         return base
@@ -19664,6 +19959,10 @@ class Match:
         for k in ("part_of", "mounted_on", "mount_slot"):
             d.pop(k, None)
         d["map"] = mp.name
+        if "vars" in d and not isinstance(d.get("vars"), dict):
+            # `vars: null` (L36) is refused like a list, not a raw error.
+            raise VTTError("summon: the template's `vars` must be an "
+                           "object.")
         if isinstance(d.get("vars"), dict):
             d["vars"].pop("__follows", None)   # a segment's link ahead
         # Partial-template references in the vars are materialized now, so
@@ -20022,6 +20321,11 @@ class Match:
         if e.is_part:
             return []
         condition, _mode = self._effective_death_condition(e)
+        fast = _simple_var_test(condition, e)
+        if fast is not None:
+            if not fast:
+                return []
+            return self._process_death(entity_id)
         from formula import FormulaEngine, EvalCtx, FormulaError
         engine = FormulaEngine(self)
         ctx = EvalCtx(this=self.current_entity_id(), target=entity_id)
@@ -20151,6 +20455,32 @@ class Match:
         text = self._MSG_FMT_RE.sub(sub, fmt)
         self.surface_log([f"{UNIT_LINE_TAG}{self.id}|{eid}|{x}|{y}|"
                           f"{map_name or ''}{UNIT_LINE_TAG}{text}"])
+
+    def unit_tag(self, eid: str) -> str:
+        """The UNIT_LINE_TAG prefix for unit `eid` where it stands now ("" for
+        a unit that isn't in the match)."""
+        e = self.entities.get(eid)
+        if e is None:
+            return ""
+        return (f"{UNIT_LINE_TAG}{self.id}|{eid}|{e.x}|{e.y}|{e.map or ''}"
+                f"{UNIT_LINE_TAG}")
+
+    @staticmethod
+    def tag_lines(tag: str, lines: List[str]) -> List[str]:
+        """Every line of `lines` (entries may hold several) prefixed with
+        the unit tag `tag`, so a channel whose view can't see that unit
+        drops them (V14); a line already tagged keeps its own tag."""
+        if not tag:
+            return list(lines)
+        out: List[str] = []
+        for entry in lines:
+            if not isinstance(entry, str):
+                out.append(entry)
+                continue
+            out.append("\n".join(
+                ln if (UNIT_LINE_TAG in ln or not ln.strip()) else tag + ln
+                for ln in entry.split("\n")))
+        return out
 
     def unit_line(self, eid: str, text: str) -> str:
         """`text` tagged as a line about unit `eid` (UNIT_LINE_TAG at its
@@ -22339,6 +22669,7 @@ class Match:
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
             "watcher_state": copy.deepcopy(self.watcher_state),
+            "watcher_cursor": self.watcher_cursor,
             "outcome": copy.deepcopy(self.outcome),
             "team_data": copy.deepcopy(self.team_data),
             "team_passives": {
@@ -22598,6 +22929,9 @@ class Match:
             str(k): copy.deepcopy(v) for k, v in raw_ws.items()
             if isinstance(k, str) and isinstance(v, dict)
         } if isinstance(raw_ws, dict) else {}
+        wc = d.get("watcher_cursor", 0)
+        m.watcher_cursor = (wc if isinstance(wc, int)
+                            and not isinstance(wc, bool) and wc >= 0 else 0)
         raw_outcome = d.get("outcome")
         m.outcome = copy.deepcopy(raw_outcome) if isinstance(raw_outcome, dict) else None
         raw_td = d.get("team_data", {}) or {}
@@ -24592,6 +24926,9 @@ class Match:
         lines = [str(ln) for ln in (lines or []) if ln]
         if not lines:
             return
+        tag = SURFACE_UNIT_TAG.get()
+        if tag:
+            lines = self.tag_lines(tag, lines)
         buf = self._runtime_buffer
         if buf is not None:
             buf.out.extend(lines)
@@ -26262,6 +26599,8 @@ class MatchManager:
         on_entity_spawned in the destination (the transfer routes through
         Entity.spawn, not a raw insert). The template-save-for-later flow is
         a separate feature; this is the direct match->match transfer."""
+        touch_match(src_mid)
+        touch_match(dest_mid)
         if src_mid not in self.matches:
             raise NotFound(f"Source match '{src_mid}' not found.")
         if dest_mid not in self.matches:
@@ -26333,6 +26672,9 @@ class MatchManager:
                 log.append(f"💀 `{eid}` died as it left **{src.name}**; "
                            f"it was not transferred.")
                 return None, log
+        new_ids = {idmap[o] for o in order if idmap.get(o) in dest.entities}
+        if new_ids:
+            log.extend(dest.sync_zone_grants(new_ids))
         return idmap[eid], log
 
     def _spawn_copies(self, src: "Match", dest: "Match", e: "Entity",
@@ -26356,6 +26698,9 @@ class MatchManager:
             # do; the copy arrives dismounted and can mount for real.
             ne.mounted_on = None
             ne.mount_slot = None
+            # A status a zone holds stays with that zone (L40): the
+            # destination's own zones give theirs below.
+            ne.status = without_zone_grants(ne.status)
             if ne.part_of:
                 ne.part_of = idmap.get(ne.part_of, ne.part_of)
             # Segment chains: remap the `__follows` back-pointer (an entity id)
@@ -26494,6 +26839,7 @@ class MatchManager:
         m = self.matches.get(match_id)
         if not m:
             raise NotFound("Match not found")
+        touch_match(match_id)
         return m
 
     def list(self) -> List[Tuple[str, str]]:

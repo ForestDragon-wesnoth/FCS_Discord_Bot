@@ -18739,14 +18739,15 @@ SCENARIO 683 — status_transfer keeps the moved instance's own fields
 !status apply c mark
 !ent status c set mark caster other
 !status transfer b c mark
-!assert "status_get('c', 'mark', 'caster') == 'other' and status_get('c', 'mark', 'duration') == 4"
+!assert "status_get('c', 'mark', 'caster') == 'other' and status_duration('c', 'mark') == None"
 
 Expected: A transferred status keeps every field of the moved instance
 (caster, notes): it used to re-seed them from the definition, losing
 `caster = hunter`. Level and duration still go through the destination's
 stacking, resistance and immunity. Onto a destination that already has the
-status, only the stacking applies (the default refresh sets duration 4) and
-the destination's own data stays (`caster = other`).
+status, only the stacking applies and the destination's own data stays
+(`caster = other`); its mark was applied without a duration, so it is
+permanent and stays permanent (the refresh would have set duration 4).
 
 
 SCENARIO 684 — !ent set_vars: several vars, one undo step, all-or-nothing
@@ -32742,7 +32743,7 @@ SCENARIO 974 — !simulate: refusals, the step limit, hosts only
 !simulate 2 bogus=1 !ent hp ogre 1
 ?? Unknown option `bogus=`
 !simulate 2 tally="kill('ogre')" !ent hp ogre -1
-?? banned in a $() inline argument
+?? is banned in `tally=`
 !simulate 2 steps=0 !ent hp ogre -1
 ?? `steps=` is 1 or more
 !simulate 2 until="entity[zz].hp > 0" !ent hp ogre -1
@@ -33082,3 +33083,441 @@ state survives a restart (a heals and drops: its second firing). With
 the owner limit watcher_unit_checks at 2, a poll reads two units and the
 third waits, with a warning; once the limit is back, the next command
 reads it and fires (c drops to 3 below 10).
+
+SCENARIO 983 — status_level / status_duration: 0 for a missing status, no guard needed
+---------------------------------------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add mage Mage 30 2 2 10
+!ent add orc Orc 40 4 2 5
+!status def burn
+!status def stun
+!status def ward
+!status level ward 3+ duration 9
+!ent set_var mage spells.actions.ignite.target entity
+!ent set_var mage spells.actions.ignite.body "entity[target].hp = entity[target].hp - (2 + 3 * status_level(target, 'burn'))\nstatus_apply(target, 'burn', 1, 2)"
+!action mage ignite orc
+!assert "entity[orc].hp == 38"
+!assert "status_level('orc', 'burn') == 1 and status_duration('orc', 'burn') == 2"
+!action mage ignite orc
+!assert "entity[orc].hp == 33"
+!status apply orc stun
+!assert "status_level('orc', 'stun') == 1 and status_duration('orc', 'stun') == None"
+!assert "status_level('mage', 'burn') == 0 and status_duration('mage', 'burn') == 0"
+!ent status orc set ward level 3
+!assert "status_duration('orc', 'ward') == 9"
+!ent set_var mage seen "$(status_level('orc', 'burn') + status_duration('orc', 'ward'))"
+!assert "entity[mage].seen == 10"
+!eval "status_level('ghost', 'burn')"
+?? ❌ unknown entity id 'ghost'
+!eval "status_duration('orc', 5)"
+?? ❌ status_duration(eid, name): name must be a string
+
+Expected: HARNESS-ALLOWS-ERRORS. `ignite` deals 2 plus 3 per level of
+burn the target already holds, then applies burn (default stack refresh,
+level 1, duration 2). The first cast reads level 0 with no `status_has`
+guard: 2 damage (40 -> 38). The second reads level 1: 5 damage (-> 33).
+A stun applied without a duration is permanent: level 1, duration None.
+A unit without the status reads 0 for both. A ward set to level 3 takes
+its duration 9 from the definition's `3+` level entry, as `status_get`
+reads it. Both are read-only and work in a `$()` argument (1 + 9 = 10).
+An unknown unit is refused, as `status_has` refuses it; so is a name
+that isn't text.
+
+SCENARIO 984 — Match-wide modifiers: rain lowers every unit's accuracy outside shelter
+--------------------------------------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add archer Archer 20 2 2 10
+!ent add orc Orc 20 6 6 5
+!ent set_var orc sheltered 1
+!ent set_var archer accuracy 12
+!ent set_var orc accuracy 9
+!ent set_var archer bow.actions.shoot.target entity
+!ent set_var archer bow.actions.shoot.body "entity[self].last_roll = apply_mods(self, 'accuracy', entity[self].accuracy)"
+!match var set modifiers.rain.stat accuracy
+!match var set modifiers.rain.op add
+!match var set modifiers.rain.value -3
+!match var set modifiers.rain.condition "not var_has(self, 'sheltered')"
+!mod show archer accuracy 12
+?? add -3 (pri 0) [match.rain]
+?? → base 12 becomes 9
+!mod show orc accuracy 9
+?! match.rain
+!action archer shoot orc
+!assert "entity[archer].last_roll == 9"
+!assert "apply_mods('orc', 'accuracy', 9) == 9"
+!team set red modifiers.drill.stat accuracy
+!team set red modifiers.drill.op add
+!team set red modifiers.drill.value 1
+!ent set_var archer team red
+!mod show archer accuracy 12
+?? [match.rain]
+?? [team:red.drill]
+?? → base 12 becomes 10
+!match var del modifiers.rain
+!assert "apply_mods('archer', 'accuracy', 12) == 13"
+!undo command
+!assert "apply_mods('archer', 'accuracy', 12) == 10"
+
+Expected: a `modifiers` bundle in the match vars reaches every unit,
+labelled `match.<key>`. Its `condition` reads with self = the unit
+judged, so the sheltered orc is left out. The archer's `shoot` action
+folds it end to end (12 - 3 = 9). A team bundle stacks with it (12 - 3
++ 1 = 10). Deleting the match var lifts the rain (13), and undo brings
+it back (10).
+
+SCENARIO 985 — Map-wide modifiers: darkness on one map, a multi-tile body, a map change
+---------------------------------------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!map new cave 8 8
+!ent add ogre Ogre 50 2 2 5 map=cave
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre ohead head 10 10
+!ent add scout Scout 20 2 2 10 map=main
+!map var set modifiers.dark.stat sight map=cave
+!map var set modifiers.dark.op add map=cave
+!map var set modifiers.dark.value "-2 - footprint_width(self)" map=cave
+!mod show ogre sight 6
+?? add -4 (pri 0) [map:cave.dark]
+?? → base 6 becomes 2
+!assert "apply_mods('ohead', 'sight', 6) == 3"
+!assert "apply_mods('scout', 'sight', 6) == 6"
+!ent tp ogre 5 5 main
+!assert "apply_mods('ogre', 'sight', 6) == 6"
+!assert "apply_mods('ohead', 'sight', 6) == 6"
+!ent tp scout 1 1 cave
+!assert "apply_mods('scout', 'sight', 6) == 3"
+!host access set "map var" all
+!system set default formula_text_visibility host
+!as player bob
+!map var list map=cave
+?? (hidden)
+?! footprint_width
+!as owner
+
+Expected: HARNESS-ALLOWS-ERRORS. A `modifiers` bundle in a map's vars
+reaches the units on that map, labelled `map:<name>.<key>`. Its value
+formula reads with self = the unit judged: the 2x2 ogre gets -2 - 2 = -4
+(6 -> 2), its 1x1 body part on the same map -3 (6 -> 3), and the scout on `main`
+none.
+Teleported to `main`, the ogre and the part it carries lose it; the scout
+moved into the cave gains it. With `!map var` opened to players and
+formula_text_visibility host, a player reads the record's value formula
+in `!map var list` as hidden.
+
+SCENARIO 986 — Resistance past its bound, the watcher limit's window, a consumed watcher item
+------------------------------------------------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add a A 20 1 1 30
+!ent add b B 20 2 2 20
+!ent add c C 20 3 3 10
+!status def burn
+!eval "entity[a].status_resist = {'burn': [{'op': 'mul', 'value': 1e200}, {'op': 'mul', 'value': 1e200}]}"
+!status apply a burn 2
+?? Applied `burn` to `a` (level=2
+?? resistance record `mul 1e+200` from innate skipped
+!assert "status_level('a', 'burn') == 2"
+!zone new fire
+!zone fill fire 1 1 1 1
+!zone grant fire burn level=1
+!ent hp a -1
+!history list command
+?? before '!ent hp a -1'
+!watch add low "entity[self].hp < 10" "entity[self].low = 1" each
+!owner ceiling watcher_unit_checks 2
+!ent hp c 3
+?? the per-unit readings reached the owner limit watcher_unit_checks (2)
+!ent set_var a k 1
+!ent set_var a k 2
+!assert "var_has('c', 'low') and not var_has('a', 'low') and not var_has('b', 'low')"
+!owner ceiling watcher_unit_checks reset
+!watch remove low
+!ent add p P 20 6 6 5
+!ent set_var p max_hp 50
+!eval "entity[p].equipped = {'potion': {'watchers': {'drink': {'condition': 'entity[self].hp < 3', 'effect': 'var_del(self, watcher_source); entity[self].hp = entity[self].hp + 10'}, 'echo': {'condition': 'entity[self].hp < 3', 'effect': 'entity[self].hp = entity[self].hp + 10'}}}}"
+!ent hp p 2
+!assert "entity[p].hp == 12 and not var_has('p', 'equipped.potion')"
+
+Expected: HARNESS-ALLOWS-ERRORS. Two `mul` records of 1e200 would take
+burn's level past 1e15 (they overflowed to infinity and crashed every
+application): each is skipped with a warning, and the level lands as
+given (2). Inside a zone granting burn, the end-of-command grant sync
+applies it again without raising, so `!ent hp a -1` keeps its undo step.
+With the owner limit watcher_unit_checks at 2, three per-unit readings
+don't fit one poll: each poll reads the window after the last one's, so
+`c` (cut by the first poll) is read by the next one and fires, where
+every poll used to cut it. A potion holds two watchers on hp < 3: `drink`
+deletes the potion and heals 10; `echo`, in the same potion, no longer
+runs once its item is gone (2 + 10 = 12, where it reached 22).
+
+SCENARIO 987 — Zone grants and watchers on a unit the channel's view hides stay out of its replies
+---------------------------------------------------------------------------------------------------
+!match new m1 demo 12 6
+!match use m1
+!ent add scout Scout 20 2 2 10
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 1
+!ent add zqxspy Spy 20 5 4 5
+!ent set_var zqxspy team blue
+!status def lit
+!status hook lit on_added "entity[self].litc = 1"
+!gpassive add seen on_status_added "entity[self].seenc = 1"
+!zone new glow
+!zone anchor glow scout 2
+!zone grant glow lit
+!eval "entity[zqxspy].watchers = {'alarm': {'condition': 'entity[scout].x > 4', 'effect': 'entity[nosuch].hp = 1'}}"
+!watch add near "entity[self].x > 3" "entity[self].nearc = 1" each
+!match fog on
+!match bind m1 pov=red
+!host access set ent all
+!host access set watch all
+!as player bob
+!ent info zqxspy
+?? Could not find a unit named `zqxspy`
+!ent move scout 3 right
+?? global passive `seen` fired on `scout`
+?! zqxspy
+!watch show near
+?? true now for: `scout`
+?! zqxspy
+!as owner
+!assert "entity[zqxspy].seenc == 1 and entity[zqxspy].litc == 1"
+!match unbind
+!match use m1
+!ent move scout 1 left
+!ent move scout 1 right
+?? ⚠ watcher `alarm` on `zqxspy` effect error
+
+Expected: bob's channel shows red's view, which hides the blue spy. His
+scout's aura grants `lit` to the spy and a watcher the spy holds turns
+true: the hook and passive lines of the spy's grant and the watcher's
+effect error are tagged as lines about the spy, so his reply drops them
+and shows only the scout's own lines. `!watch show` lists only the units
+the view shows. Everything still happened (the spy holds `seenc` and
+`litc`). In an unbound channel the same watcher error names the spy.
+
+SCENARIO 988 — Held commands run as their holder; a pause lets the channel point elsewhere
+--------------------------------------------------------------------------------------------
+!system set default pause_affects_hosts true
+!match new m M 10 10
+!match new m2 M2 10 10
+!match use m
+!ent add gob Gob 10 2 2 5
+!host add bob
+!match pause
+!as player bob
+!ent transfer gob m2 3 3
+?? is held
+!match rename m2 stolen
+!ent hp gob -1
+!as owner
+!match resume
+?? ❌ Only a host of `m2` can copy or transfer entities into it
+?? ❌ Only a host of `m2` can rename it
+?? Damaged `gob` by 1
+!assert "entity[gob].hp == 9"
+!log 2
+?? took 1 damage (hp 10→9). — by bob
+!match pause
+!match use m2
+?? Active match is now **M2**
+!match use m
+!match resume
+
+Expected: HARNESS-ALLOWS-ERRORS. bob co-hosts `m` only. His transfer
+into the owner's `m2` and his rename of it are held by the pause; at the
+resume they run as bob (the holder's identity and authority are recorded
+with the command), so the checks refuse them as they would have without
+the pause, where the resumer's authority used to let them through. His
+damage runs, and the log names him. During a pause a host can point the
+channel at another match (`!match use`), which used to be held too.
+
+SCENARIO 989 — A crashed command says what its rollback left in place
+-----------------------------------------------------------------------
+!match new m M 10 10
+!match new m2 M2 10 10
+!match link m
+!match use m
+!ent add a A 10 2 2 5
+!ent add c C 10 4 4 5
+!batch ent transfer a m2 2 2 ; as crash boom
+?? 💥 Unexpected error (ref 1): boom
+?? Match `m` is back as it was before the command.
+?? ⚠️ It also reached `m2`: what it changed there stays.
+!batch system set default hp_var health ; as crash boom
+?? ⚠️ Its server-wide edits stay (`!system undo` takes them back).
+!assert "entity[c].health == 10 and not var_has('c', 'hp')"
+!system undo confirm
+!assert "entity[c].hp == 10"
+
+Expected: HARNESS-ALLOWS-ERRORS. A crash puts the channel's match back
+(W8). A batch that transferred a unit into `m2` first now says the
+transfer stays there. A batch that renamed hp_var server-wide first says
+the server-wide edit stays (`!system undo` takes it back), and the
+restored match follows its system as it now is: `c` keeps `health` (it
+was left on `hp` while the system said `health`). `!system undo` moves
+it back.
+
+SCENARIO 990 — A partial built on another partial, pins and force deletes keep their var names
+------------------------------------------------------------------------------------------------
+!match new m M 10 10
+!match use m
+!ent add a A 10 2 2
+!ent set_var a armor 2
+!template save a base path=.
+!system set default hp_var health
+!template import orc {"name": "Orc", "vars": {"__template": "base"}}
+!template spawn orc 4 4
+!ent hp orc 7
+!template save orc mid path=.
+!template import orc2 {"name": "Orc2", "vars": {"__template": "mid"}}
+!template spawn orc2 6 6
+!assert "entity[orc2].health == 7 and not var_has('orc2', 'hp')"
+!system set default hp_var hp
+!template spawn orc2 8 8
+!assert "entity[orc22].hp == 7 and not var_has('orc22', 'health')"
+!template refs orc22
+?? ← `mid` (unchanged)
+!system set default hp_var health
+!template delete base force
+!template spawn orc 2 8
+!assert "entity[orc3].health == 10 and not var_has('orc3', 'hp')"
+!ent add b B 10 7 7
+!ent set_var b hp 99
+!template save b cb path=.
+!system set default hp_var hp
+!system set default var_name_collision existing
+!template import t1 {"name": "T1", "vars": {"__template": "cb"}}
+!template spawn t1 3 9
+!assert "entity[t1].hp == 99 and entity[t1].health == 10"
+!system set default var_name_collision refuse
+!template spawn t1 4 9
+?? (var_name_collision refuse)
+
+Expected: HARNESS-ALLOWS-ERRORS. `base` is written in `hp`; after the
+rename, `mid` is saved from a unit on `health` over it. A template over
+`mid` spawns with `health` 7 and no stray `hp` (it was refused for a
+missing `health`), and under `hp` again with `hp` 7 (the 7 used to be
+lost), `!template refs` reading unchanged. A force delete of `base`
+writes it into `orc` in `orc`'s names, which spawns. A partial whose data
+holds both `hp` and a GM `health` follows var_name_collision: existing
+keeps the `health` there and the moved value as plain `hp`; refuse
+refuses the spawn.
+
+SCENARIO 991 — Zone grants across a transfer, after a watcher, on reads; the costs this pass cut
+-------------------------------------------------------------------------------------------------
+!match new m M 10 10
+!match new m2 M2 10 10
+!match use m2
+!match link m
+!status def bless
+!match use m
+!status def bless
+!status def weak
+!zone new za
+!zone fill za 1 1 4 4
+!zone grant za bless
+!ent add t T 10 2 2 5
+!assert "status_has('t', 'bless')"
+!eval "transfer_entity('t', 'm2', 2, 2)"
+!match use m2
+!assert "not status_has('t', 'bless')"
+!match use m
+!ent add a A 10 6 6 5
+!zone new zw
+!zone fill zw 5 5 8 8
+!zone grant zw weak
+!zone grant_condition zw "entity[self].hp < 5"
+!watch add alarm "match_var_get('alarm', 0) == 1" "entity[a].hp = 2"
+!match var set alarm 1
+!assert "entity[a].hp == 2 and status_has('a', 'weak')"
+!ent add w W 20 1 8 1
+!zone new glow
+!zone anchor glow w 1
+!zone grant glow bless
+!ent add n N 10 3 9 1
+!ent move w 1 right
+!assert "status_has('n', 'bless')"
+!ent move w 3 right
+!assert "not status_has('n', 'bless') and status_has('w', 'bless')"
+!ent add k K 10 9 1 1
+!simulate 3 seed=s !ent transfer k m2 5 5
+?? Simulated `!ent transfer k m2 5 5` 3 time(s)
+?! ❌
+!assert "entity[k].hp == 10"
+!eval "entity[nosuch].hp + 1"
+?! Nothing was changed
+!eval "entity[nosuch].hp = 1"
+?? Entity 'nosuch' not found. Nothing was changed.
+!eval "summon({'name': 'Y', 'vars': None}, 9, 9)"
+?? ❌ summon: the template's `vars` must be an object.
+!eval "abs(1, map='m')"
+?? abs takes no keyword arguments (map= included).
+!eval "status_counter_add('a', 'weak', -1) <= 0"
+?? met None
+
+Expected: HARNESS-ALLOWS-ERRORS. A unit sent to `m2` leaves the `bless`
+its source zone held behind (it kept it until `m2`'s next change). A
+watcher fired by `!match var set` drops `a` to 2 hp, and the zone whose
+grant_condition reads hp < 5 grants `weak` in the same command (it used
+to land one command later). An aura of radius 1 on `w` grants `bless` to
+`n` when it walks next to it and takes it back when it walks away: the
+per-step sync of an aura carrier covers the bodies the aura covers or
+held its grant. `!simulate` of a transfer into `m2` runs the same each
+time (every run puts back the matches it reached) and `k` is home after
+it. A read-only formula's refusal doesn't claim it changed nothing, while a writing one does, in its own sentence. `summon`
+with `vars: null`, `abs(..., map=)` and a None compared with a number are
+refused in words.
+
+SCENARIO 992 — A zone-held status follows its zones; a permanent status stays permanent
+-----------------------------------------------------------------------------------------
+!match new m M 12 6
+!match use m
+!status def bless
+!status hook bless on_changed "entity[self].changed = entity[self].changed + 1"
+!ent add u U 10 1 1 5
+!ent set_var u footprint_w 2
+!ent set_var u changed 0
+!zone new za
+!zone fill za 1 1 3 3
+!zone grant za bless level=1
+!zone new zb
+!zone fill zb 4 1 6 3
+!zone grant zb bless level=3 power=9
+!assert "status_level('u', 'bless') == 1 and entity[u].changed == 0"
+!ent move u 2 right
+!assert "status_level('u', 'bless') == 3 and status_get('u', 'bless', 'power') == 9 and entity[u].changed == 1"
+!zone grant zb bless level=5
+!assert "status_level('u', 'bless') == 5 and not status_has_path('u', 'bless', 'power')"
+!ent move u 2 left
+!assert "status_level('u', 'bless') == 1"
+!ent info u
+?? bless ×1
+?! __zone
+!status def hex
+!status apply u hex
+!status apply u hex 2 3
+?? (level=1, duration=∞)
+!status def ward
+!status stack ward add_level
+!status apply u ward
+!status apply u ward 1 3
+!assert "status_level('u', 'ward') == 2 and status_duration('u', 'ward') == None"
+!status counter u ward set 2
+!status apply u ward 1 5
+!assert "status_duration('u', 'ward') == 5"
+
+Expected: a 2x2 unit standing in `za` (level 1) and then, with a cell, in
+`zb` (level 3, power 9) holds `bless` at the highest level its zones give
+and the data of the zone giving it: level 3 with power 9, through one
+status change (on_changed fires; it kept level 1). Editing `zb`'s grant
+to level 5 without data reaches the unit already inside (level 5, power
+gone). Back in `za` alone, level 1. The bookkeeping keys stay out of `!ent
+info`. A permanent status stays permanent under every stack mode: a timed
+application of `hex` (refresh) or `ward` (add_level, which still adds the
+level) leaves its duration at ∞; once `status_counter set` gives `ward` a
+duration, applications set it as before (5).

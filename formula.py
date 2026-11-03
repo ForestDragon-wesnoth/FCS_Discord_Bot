@@ -1620,6 +1620,18 @@ def _runtime_msg(e: BaseException) -> str:
     arguments`, not the private `FormulaEngine._namespace.<locals>.
     _slot_capacity()` it is implemented as."""
     msg = _IMPL_NAME_RE.sub(r"\1()", str(e))
+    mt = _NO_KW_RE.search(msg)
+    if mt is not None:
+        # A C builtin (abs) says it differently (L37).
+        return f"{mt.group(1)} takes no keyword arguments (map= included)."
+    mn = _NONE_CMP_RE.search(msg)
+    if mn is not None:
+        # A value that reads None compared with a number: a permanent
+        # status's duration (status_counter_add / status_duration), a
+        # schedule gone, a missing field (L37).
+        return (f"a comparison `{mn.group(1)}` met None: a value read as "
+                f"None (no duration on a permanent status, a missing field) "
+                f"was compared with a number; test it with `!= None` first.")
     mt = _MAP_KW_RE.search(msg)
     if mt is not None:
         # map= on a function with no map slot (it works on its unit's or
@@ -1633,6 +1645,10 @@ def _runtime_msg(e: BaseException) -> str:
 
 
 _MAP_KW_RE = re.compile(r"(\w+)\(\) got an unexpected keyword argument 'map'")
+_NO_KW_RE = re.compile(r"^(\w+)\(\) takes no keyword arguments$")
+_NONE_CMP_RE = re.compile(
+    r"'([<>]=?)' not supported between instances of '(?:NoneType'"
+    r" and '\w+|\w+' and 'NoneType)'")
 
 
 def _cell_arg(v: Any, fname: str, argname: str) -> int:
@@ -2667,6 +2683,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_remove(eid, name)            -> bool (True iff removed)
     "status_has", "status_has_path", "status_get", "status_level_data",
     "status_resisted",
+    # status_level(eid, name) / status_duration(eid, name) -> 0 when the
+    # unit lacks the status (#90); a level-less status reads 1, one
+    # without a duration (permanent) reads None.
+    "status_level", "status_duration",
     "status_set", "status_del", "status_add", "status_remove",
     # status_apply(eid, name[, level, duration]) -> apply a status via its
     # definition + stack mode (the host-friendly "inflict burn" call),
@@ -3086,7 +3106,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
     'slot_of', 'slot_riders', 'status_get', 'status_level_data',
     'status_resisted',
-    'status_has',
+    'status_has', 'status_level', 'status_duration',
     'status_has_path', 'status_has_tag', 'status_names',
     'status_resist_of', 'status_tags', 'statuses_with_tag',
     'table_roll', 'team_get', 'team_has', 'team_sees_cell',
@@ -3203,6 +3223,30 @@ def validate_arg_safe(src: str) -> None:
         # A call whose target is anything other than a bare Name (e.g. an
         # attribute call) is already rejected by the main expression validator;
         # nothing in expression mode produces one, so no extra check is needed.
+
+
+def program_is_read_only(src: str) -> bool:
+    """Whether the program `src` can't change the match: every assignment
+    binds a bare local and every call is a read-only function
+    (ARG_SAFE_FUNC_NAMES, the `$()` test; a `!func` or a lambda helper may
+    write). True when it doesn't parse (it can't run; the run reports
+    why). `!eval`
+    takes its rollback state only for a program that may write (X13)."""
+    try:
+        tree = ast.parse(normalize_body_source(src), mode="exec")
+    except SyntaxError:
+        return True     # it can't run, so it changes nothing
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if not all(isinstance(t, ast.Name) for t in node.targets):
+                return False
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            return False
+        elif isinstance(node, ast.Call):
+            if not (isinstance(node.func, ast.Name)
+                    and node.func.id in ARG_SAFE_FUNC_NAMES):
+                return False
+    return True
 
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -5636,6 +5680,35 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             return name in e.status
 
+        def _status_level_fn(eid_t: Any, name: Any) -> Any:
+            """status_level(eid, name): the level of the unit's status
+            `name` (1 when it holds no level), 0 when the unit lacks it, so
+            no status_has guard is needed."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_level(eid, name): name must be a string.")
+            data, _ = _status_data(eid, name, must_exist=False)
+            if data is None:
+                return 0
+            return match.status_level(data)
+
+        def _status_duration(eid_t: Any, name: Any) -> Any:
+            """status_duration(eid, name): the duration left on the unit's
+            status `name` (read through its level entries as status_get),
+            0 when the unit lacks it, None for a permanent status (one
+            without a duration)."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_duration(eid, name): name must be a string.")
+            data, _ = _status_data(eid, name, must_exist=False)
+            if data is None:
+                return 0
+            view = _status_read_view(name, data)
+            d = view.get("duration") if isinstance(view, dict) else None
+            if isinstance(d, bool) or not isinstance(d, (int, float)):
+                return None
+            return d
+
         def _status_has_path(eid_t: Any, name: Any, path: Any) -> bool:
             """status_has_path(eid, name, path): whether the unit's status
             `name` has the field at the dotted path (False when it lacks the
@@ -5955,6 +6028,8 @@ class FormulaEngine:
             return _do_status_apply("status_force", eid_t, name, level, duration, True)
 
         ns["status_has"]      = _status_has
+        ns["status_level"]    = _status_level_fn
+        ns["status_duration"] = _status_duration
         ns["status_has_path"] = _status_has_path
         ns["status_get"]      = _status_get
         ns["status_resisted"] = _status_resisted
