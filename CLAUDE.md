@@ -1125,7 +1125,9 @@ hardcodes**.
 - **Commands:** `!ent` add / remove / rename / info / dump / diff / set_var /
   set_vars / delete_var / hp / init / tp / move / push / pull / swap / face /
   kill / revive / clone / copy / transfer / transform / revert / status /
-  group / action / store_entity_into_var. `!ent hp` SETS by default (`5`, `=-3`, `max`, `$(...)`);
+  group / action / store_entity_into_var. `!ent info <id>` is the
+  player-facing description, `!ent info <id> short` the card (§7.22).
+  `!ent hp` SETS by default (`5`, `=-3`, `max`, `$(...)`);
   a leading sign changes (`+5` heals, `-5` damages); one `write_var`, hook
   output and deaths reported (633-634, 647). `!ent set_vars <id> k=v ...` is
   one all-or-nothing undo step (684); the unit's death check runs once,
@@ -2140,7 +2142,13 @@ hardcodes**.
   (`Match.presented_statuses`: roster, `!ent info`, `!find status:`, and
   the tags statuses grant; none without the key), and a var-name rule
   rename moves its `vars` decoys too (`rename_unit_vars`); `!ent info`'s
-  HP / Team read the decoy of the var behind them (940, 942).
+  HP / Team read the decoy of the var behind them (940, 942). A fooled
+  viewer's card and description read no real var past the fixed
+  placeholders and no passives; the description shows the disguise's
+  `description`, decoy vars and the decoy actions in its `vars` (also for
+  `!action list` / `info`, `!find action:`), never parts. Action discovery
+  skips the disguise var: a decoy's actions are no actions of the unit
+  (1011).
 - **Outcome:** `declare_winner` / `!match win`, `match_winner()`,
   `match_over()`; win conditions are composed (watchers, on_death passives),
   never configured.
@@ -3170,6 +3178,50 @@ and a total per body.
   `refuse`, user call), so the selector, `show:`, `size_text=`, the
   placeholders and `!help size` agree (V16, 1002, 1007). Templates save the derived vars (engine-kept, like the snake
   links) and a spawn derives them again.
+
+### 7.22 Reading a unit: line, description, dump
+
+Three tiers (user design, 1008-1011): the info line (entity_line_format in
+`!list` / `!state`; entity_info_format in `!ent info <id> short`) is the
+unit's state at a glance; the description (`!ent info <id>`,
+`vtt_commands._entity_description`) is what a player reads about it; `!ent
+dump` is the raw data for the GM.
+- **Sections:** `entity_description_sections` (a word list of
+  `logic.DESCRIPTION_SECTIONS`: header, vitals, size, statuses, tags, data,
+  actions, passives, parts) orders them, each rendered by its
+  `entity_description_<section>_format` rule (entity_info_format's
+  placeholders; the list sections take `{items}`, one
+  `entity_description_status_format` / `_action_format` / `_part_format`
+  line each). A section with nothing to show is left out. The header shows
+  the unit's `description` var, a status its definition's `description`
+  data (level entries layered), an action its `description`.
+- **Data:** the unit's vars as an indented list (`_description_vars` /
+  `_description_tree`: a dict of plain values on one line, a dict's
+  `description` after its key, plain lists joined, bools yes / no), cut at
+  `entity_description_line_limit`. `__` keys and `actions` dicts never
+  show; `entity_description_shown_vars` (paths, empty = all) is the
+  whitelist, `entity_description_hidden_vars` the blacklist (paths,
+  `*.<key>` at any depth, `@engine` = every var a VAR_NAME_RULES rule names
+  for the unit; its default also hides look and structure keys). Formula
+  fields go through `_hide_formula_fields`.
+- **Actions:** the unit's own and, for a rider, its seat's (`via`).
+  `entity_description_action_visibility` (all / allies / used) applies under
+  a team view (`_query_pov`) to the description, `!action list` / `info`,
+  `!find action:` and Tab (`_visible_actions`, `Match.action_visible`):
+  the view's own team's units (body root's team, `Match.body_team`) always
+  show theirs; `allies` shows other units none, `used` those in
+  `Entity.actions_used`. A restricted `!action list` answers "No actions
+  of `x` that this channel's view can see." whether the unit has any.
+- **`Entity.actions_used`:** full action paths, in order of first use (at
+  most `ACTIONS_USED_MAX`), recorded on the unit HOLDING the action
+  (`Action.holder`, set by discover_actions; a vehicle for a seat action)
+  after the body succeeds, before the hooks; a failed outer action or an
+  undo takes it back (it is serialized state). Saved only when non-empty.
+  Unit history (`logic.UNIT_HISTORY_KEYS`): templates, statblocks, summon
+  snapshots, prefabs, clones and copies / transfers into another match
+  strip it; a corpse keeps it. `!ent dump` lists it.
+- **Not yet:** #70's private vars (the data section must skip them when
+  they ship).
 
 ---
 
