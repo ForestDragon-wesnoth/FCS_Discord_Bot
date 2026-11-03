@@ -490,8 +490,27 @@ def touch_match(mid: Optional[str]) -> None:
 
 # Set while the engine writes the derived size vars (size_text_var /
 # size_total_var, #242), which refuse every other write.
+# How often one derivation re-reads a body whose var hooks keep changing
+# its size inputs, and how many unsized parts the `sum` warning names.
+SIZE_SYNC_PASSES = 8
+SIZE_WARN_NAMES = 10
 SIZE_DERIVING: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_size_deriving", default=False)
+
+
+@contextlib.contextmanager
+def _outside_derivation():
+    """Run the var hooks a derived size write fires as ordinary code: a
+    hook's own writes are tracked for partial templates, refused on the
+    derived vars and re-derive, like any other write (S15)."""
+    if not SIZE_DERIVING.get():
+        yield
+        return
+    tok = SIZE_DERIVING.set(False)
+    try:
+        yield
+    finally:
+        SIZE_DERIVING.reset(tok)
 
 # The workspace (MatchManager) whose command is running: formulas reach the
 # server's saved entity templates through it (summon_template). Set by each
@@ -838,6 +857,10 @@ EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
 # per-system overrides as Rule objects (key/value/schema/description).
 #
 # Schema types: "bool", "int", "enum"
+# The largest size a unit, a default or a corpse total may hold (#242, E8):
+# past the float range a size crashed the reads and the default's maths.
+SIZE_LIMIT = 10 ** 15
+
 RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # --- Vital variable names (what var keys map to HP / MaxHP / turn-order) ---
     "var_name_collision": {
@@ -968,7 +991,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "size_default": {
         "default": 100,
-        "schema": {"type": "number"},
+        "schema": {"type": "number", "min": -SIZE_LIMIT, "max": SIZE_LIMIT},
         "desc": (
             "The size of a unit (a body root) holding no size_num_var, read "
             "live, never written into the unit, plus "
@@ -979,7 +1002,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "size_default_per_extra_tile": {
         "default": 0,
-        "schema": {"type": "number"},
+        "schema": {"type": "number", "min": -SIZE_LIMIT, "max": SIZE_LIMIT},
         "desc": (
             "Added to size_default for each footprint cell past the first of "
             "a unit holding no size_num_var: at 100, an unsized 2x2 unit is "
@@ -4701,6 +4724,33 @@ SIZE_RULES = ("size_enabled", "size_categories", "size_default",
               "footprint_width_var", "footprint_height_var")
 
 
+_SIZE_NUMBER_RE = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
+
+
+def size_number_ok(v: Any) -> bool:
+    """Whether `v` is a size number: a finite int / float (not a bool) of
+    at most SIZE_LIMIT either way (an int past the float range made
+    math.isfinite raise, E8)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    if isinstance(v, float) and not math.isfinite(v):
+        return False
+    return abs(v) <= SIZE_LIMIT
+
+
+def check_size_var(vars_: Any, var_names: Any, where: str) -> None:
+    """Refuse a stored unit (a template, a prefab unit) whose size number
+    isn't one: each spawn would refuse it (L43). A category name is the
+    spawning system's, so a stored size is a number."""
+    vn = var_names if isinstance(var_names, dict) else {}
+    key = str(vn.get("size_num_var") or "size_num")
+    if isinstance(vars_, dict) and key in vars_ \
+            and not size_number_ok(vars_[key]):
+        raise VTTError(f"{where}: `{key}` is a size number (finite, at "
+                       f"most {SIZE_LIMIT} either way), got "
+                       f"{vars_[key]!r}.")
+
+
 def _corpse_vars(corpse: Any) -> Optional[Dict[str, Any]]:
     """The vars of a corpse's unit snapshot (None when malformed)."""
     ent = corpse.get("entity") if isinstance(corpse, dict) else None
@@ -4708,14 +4758,18 @@ def _corpse_vars(corpse: Any) -> Optional[Dict[str, Any]]:
     return cv if isinstance(cv, dict) else None
 
 
-def _size_trigger(match: Any, path: str) -> bool:
+def _size_trigger(match: Any, path: str, unit: Any = None) -> bool:
     """Whether a write / delete at `path` can change its body's size: the
     size number, the footprint vars (an unsized unit's default), the
-    per-body mode / inherit overrides."""
-    if SIZE_DERIVING.get():
+    per-body mode / inherit overrides, and a body part's hp (its death or
+    a heal changes what a `sum` / `max` body counts, S16)."""
+    if SIZE_DERIVING.get() or not match.sizes_on():
         return False
     seg0 = path.split(".", 1)[0]
     r = match.rules
+    if unit is not None and unit.part_of and "." not in path \
+            and path == str(r.get("hp_var", "hp")):
+        return True
     return seg0 in (str(r.get("size_num_var", "size_num")),
                     str(r.get("footprint_width_var", "footprint_w")),
                     str(r.get("footprint_height_var", "footprint_h")),
@@ -4839,6 +4893,10 @@ def _coerce_rule_value(key: str, raw_value: str):
             raise VTTError(f"Setting '{key}' expects a number.")
         if not math.isfinite(v):
             raise VTTError(f"Setting '{key}' expects a finite number.")
+        if "min" in spec and v < spec["min"]:
+            raise VTTError(f"Setting '{key}' must be at least {spec['min']}.")
+        if "max" in spec and v > spec["max"]:
+            raise VTTError(f"Setting '{key}' must be at most {spec['max']}.")
         return int(v) if v.is_integer() else v
 
     if t == "enum":
@@ -5304,9 +5362,11 @@ def checked_status_value(path: str, value: Any, where: str) -> Any:
 # `entity[self].<var path> <op> <number>`, the shape of the default death
 # condition: read without building a formula namespace (~2 ms each), since
 # the death check runs after every var write and status change (X15).
+# No leading whitespace and no leading zeros (`007`): the formula engine
+# refuses both, so they go to it and read as it reads them (L42).
 _SIMPLE_VAR_TEST_RE = re.compile(
-    r"^\s*entity\[self\]\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*"
-    r"(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")
+    r"^entity\[self\]\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*"
+    r"(<=|>=|==|!=|<|>)\s*(-?(?:0|[1-9]\d*)(?:\.\d+)?)\s*$")
 
 
 def _simple_var_test(cond: str, e: Any) -> Optional[bool]:
@@ -8588,7 +8648,17 @@ class Entity:
                 raise VTTError(
                     f"`{seg0}` is derived from `{num_v}`: "
                     f"write the size number there (on `{self.id}`).")
-            if seg0 == num_v and self._match.sizes_on():
+            if path == "__size_total_mode" and value not in (
+                    "body", "sum", "max"):
+                raise VTTError(
+                    f"`__size_total_mode` is body, sum or max (on "
+                    f"`{self.id}`), got {value!r}.")
+            if path == "__size_parts_inherit" and not isinstance(value, bool):
+                raise VTTError(
+                    f"`__size_parts_inherit` is true or false (on "
+                    f"`{self.id}`), got {value!r}.")
+            # Checked with sizes off too: turning them on reads it (L43).
+            if seg0 == num_v:
                 if "." in path:
                     raise VTTError(
                         f"Cannot nest under the size var '{seg0}' (writing "
@@ -8666,9 +8736,10 @@ class Entity:
         # log in the final return.
         attempt_log: List[str] = []
         if self._match is not None:
-            attempt_log = self._match._fire_var_attempt(
-                self.id, path, old, value, intended_value, was_clamped
-            )
+            with _outside_derivation():
+                attempt_log = self._match._fire_var_attempt(
+                    self.id, path, old, value, intended_value, was_clamped
+                )
 
         # Identify which ancestor segments along the path are missing BEFORE
         # the write. The keys are accumulated dotted paths (e.g. "inventory",
@@ -8749,10 +8820,11 @@ class Entity:
         # _MISSING — _diff_subtree already produced it as the first event.
         # Combine the attempt log (fired first) with the event log so the
         # caller sees everything in chronological order.
-        event_log = self._fire_var_events(ancestor_events + leaf_events)
+        with _outside_derivation():
+            event_log = self._fire_var_events(ancestor_events + leaf_events)
         combined = attempt_log + event_log
         if self._match is not None and self.id in self._match.entities \
-                and _size_trigger(self._match, path):
+                and _size_trigger(self._match, path, self):
             combined += self._match.sync_body_size(self)
             if size_named is not None and self.id in self._match.entities:
                 info = self._match.size_info(self)
@@ -8924,10 +8996,10 @@ class Entity:
             self._match.track_template_change(self, path, deleted=True)
             self._match._body_reshaped(self, path)
         events = _diff_subtree(path, old, _MISSING)
-        log = self._fire_var_events(events)
+        with _outside_derivation():
+            log = self._fire_var_events(events)
         if self._match is not None and self.id in self._match.entities \
-                and not SIZE_DERIVING.get() and _size_trigger(self._match,
-                                                              path):
+                and _size_trigger(self._match, path, self):
             log += self._match.sync_body_size(self)
         # Removing the init or team var also dirties turn order — same
         # policy gate as write_var above. Initiative being removed means
@@ -10850,9 +10922,12 @@ class Match:
                 self._grant_warned = (key, set())
             for zname, (first, units) in sorted(
                     (k, v) for k, v in errors.items() if k is not None):
+                # Hidden formula text leaves the error out (V15).
+                why = ("" if FORMULA_TEXT_HIDDEN.get()
+                       else f" ({first})")
                 line = (f"⚠️ zone `{zname}`: its grant_condition failed for "
                         + ", ".join(f"`{u}`" for u in sorted(units))
-                        + f" ({formula_text(first)}); no grant.")
+                        + f"{why}; no grant.")
                 if line not in self._grant_warned[1]:
                     self._grant_warned[1].add(line)
                     log.append(line)
@@ -11030,8 +11105,10 @@ class Match:
                                    and old.get("level") == lv):
             sdef = self.status_definitions.get(sname) or {}
             new_lv = int(lv)
-            if self.resist_affects(sname, new_lv) in ("level", "both") \
-                    and self._resistance_applies(e, sname, sdef, True):
+            # The update always sets a level, so resistance applies under
+            # every stack mode (E7: _resistance_applies answers for a
+            # stacking application, no under refresh / extend / none).
+            if self.resist_affects(sname, new_lv) in ("level", "both"):
                 fold = self.resist_fold(e.id, sname, new_lv, level=new_lv)
                 new_lv = fold["value"] if fold["applies"] else \
                     self.status_level(inst)
@@ -11634,15 +11711,18 @@ class Match:
         off."""
         if isinstance(value, str):
             txt = value.strip()
-            try:
+            if _SIZE_NUMBER_RE.fullmatch(txt):
                 value = float(txt)
-            except ValueError:
+            else:
                 if not self.size_scale():
                     raise VTTError(f"{where}: a size is a number (this "
                                    f"system defines no size categories).")
                 value = self.size_value_for_name(txt)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                or not math.isfinite(value):
+        if not size_number_ok(value):
+            if isinstance(value, (int, float)) \
+                    and not isinstance(value, bool):
+                raise VTTError(f"{where}: a size is at most {SIZE_LIMIT} "
+                               f"either way.")
             raise VTTError(f"{where}: a size is a number or a category "
                            f"name, got {value!r}.")
         value = self._size_round(value)
@@ -11653,8 +11733,7 @@ class Match:
 
     def _size_num(self, e: "Entity") -> Any:
         v = e.vars.get(self.size_names()[0])
-        if isinstance(v, bool) or not isinstance(v, (int, float)) \
-                or not math.isfinite(v):
+        if not size_number_ok(v):
             return None
         return v
 
@@ -11686,10 +11765,11 @@ class Match:
                       children: Optional[Dict[str, List["Entity"]]] = None
                       ) -> List["Entity"]:
         """`root`'s part subtree; from `children` (parent id -> parts, built
-        once by sync_all_sizes) when given, so a sweep over every body
-        costs one pass over the units."""
+        once by sync_all_sizes) when given, else from an index built here
+        in one pass over the units (entity_part_subtree scans every unit
+        per node: a 300-part body cost parts x units per read, X18 / X19)."""
         if children is None:
-            return self.entity_part_subtree(root.id)
+            children = self._children_index()
         out: List["Entity"] = []
         seen = {root.id}
         frontier = [root.id]
@@ -11703,6 +11783,14 @@ class Match:
                         nxt.append(child.id)
             frontier = nxt
         return out
+
+    def _children_index(self) -> Dict[str, List["Entity"]]:
+        """Parent id -> its attached parts, in pool order (one pass)."""
+        children: Dict[str, List["Entity"]] = {}
+        for u in self.entities.values():
+            if u.part_of and u.part_of in self.entities:
+                children.setdefault(u.part_of, []).append(u)
+        return children
 
     def size_info(self, e: "Entity",
                   children: Optional[Dict[str, List["Entity"]]] = None
@@ -11736,67 +11824,98 @@ class Match:
                 "unsized": [p.id for p, n in nums if n is None]}
 
     def sync_body_size(self, e: "Entity",
-                       children: Optional[Dict[str, List["Entity"]]] = None
-                       ) -> List[str]:
+                       children: Optional[Dict[str, List["Entity"]]] = None,
+                       warn: bool = True) -> List[str]:
         """Store the size total and category on `e`'s body root (and take
         them off its parts) when they changed: write_var under
-        SIZE_DERIVING, so on_var_* hooks fire. With sizes off, take them
-        off every unit of the body. Returns the hook log and warnings."""
+        SIZE_DERIVING, so on_var_* hooks fire (outside that scope: a hook's
+        own writes are ordinary ones, S15). A hook that changes a size
+        input re-derives through its own write; the root is read again
+        after each store, so the pair ends consistent. With sizes off, take
+        them off every unit of the body. `warn` False records the unsized
+        parts of a `sum` body without the warning (the sweeps after a
+        command, an undo or a load). Returns the hook log and warnings."""
         if e.id not in self.entities:
             return []
         root = self.body_root(e)
         _num, text_v, total_v = self.size_names()
         log: List[str] = []
+        info = None
+
+        def bump() -> None:
+            self._size_changes = getattr(self, "_size_changes", 0) + 1
+
         tok = SIZE_DERIVING.set(True)
         try:
             for p in self._size_subtree(root, children):
                 for k in (text_v, total_v):
                     if k in p.vars and p.id in self.entities:
-                        self._size_changes = getattr(
-                            self, "_size_changes", 0) + 1
+                        bump()
                         log += p.remove_var(k)
             if root.id not in self.entities:
                 return log
             if not self.sizes_on():
                 for k in (text_v, total_v):
                     if k in root.vars and root.id in self.entities:
-                        self._size_changes = getattr(
-                            self, "_size_changes", 0) + 1
+                        bump()
                         log += root.remove_var(k)
                 return log
-            info = self.size_info(root, children)
-            if not same_value(root.vars.get(total_v), info["total"]):
-                self._size_changes = getattr(self, "_size_changes", 0) + 1
-                log += root.write_var(total_v, info["total"])
-            if root.id in self.entities:
+            for _pass in range(SIZE_SYNC_PASSES):
+                if root.id not in self.entities:
+                    return log
+                info = self.size_info(root, children if _pass == 0
+                                      else None)
+                changed = False
+                if not same_value(root.vars.get(total_v), info["total"]):
+                    bump()
+                    changed = True
+                    log += root.write_var(total_v, info["total"])
+                    continue      # a hook may have changed a size input
                 cat = info["category"]
                 if cat is None:
                     if text_v in root.vars:
-                        self._size_changes = getattr(
-                            self, "_size_changes", 0) + 1
+                        bump()
+                        changed = True
                         log += root.remove_var(text_v)
                 elif not same_value(root.vars.get(text_v), cat):
-                    self._size_changes = getattr(self, "_size_changes", 0) + 1
+                    bump()
+                    changed = True
                     log += root.write_var(text_v, cat)
+                if not changed:
+                    break
+            else:
+                log.append(self.unit_line(root.id, (
+                    f"⚠️ `{root.id}`'s size didn't settle after "
+                    f"{SIZE_SYNC_PASSES} passes: a var hook keeps changing "
+                    f"what it derives from.")))
         finally:
             SIZE_DERIVING.reset(tok)
+        if info is None or root.id not in self.entities:
+            return log
         # Parts that add 0 to a `sum` body: a warning when the set grows.
         warned = getattr(self, "_size_unsized_warned", None)
         if warned is None:
             warned = self._size_unsized_warned = {}
         unsized = (frozenset(info["unsized"]) if info["mode"] == "sum"
                    else frozenset())
-        if unsized - warned.get(root.id, frozenset()):
+        if warn and unsized - warned.get(root.id, frozenset()):
+            names = sorted(unsized)
+            shown = ", ".join(f"`{u}`" for u in names[:SIZE_WARN_NAMES])
+            if len(names) > SIZE_WARN_NAMES:
+                shown += f" and {len(names) - SIZE_WARN_NAMES} more"
+            verb = "holds" if len(names) == 1 else "hold"
             log.append(self.unit_line(root.id, (
-                f"⚠️ `{root.id}`'s size is a sum; "
-                + ", ".join(f"`{u}`" for u in sorted(unsized))
-                + f" hold no {self.size_names()[0]} and add 0.")))
+                f"⚠️ `{root.id}`'s size is a sum; {shown} {verb} no "
+                f"{self.size_names()[0]} and add"
+                f"{'s' if len(names) == 1 else ''} 0.")))
         warned[root.id] = unsized
         return log
 
-    def sync_all_sizes(self) -> List[str]:
+    def sync_all_sizes(self, warn: bool = False) -> List[str]:
         """sync_body_size for every body, and the categories of corpses
-        re-read from their stored totals."""
+        re-read from their stored totals. `warn` (a size rule changed)
+        names the unsized parts of `sum` bodies; the sweep after each
+        command, an undo or a load records them silently (L44)."""
         log: List[str] = []
         roots: List["Entity"] = []
         children: Dict[str, List["Entity"]] = {}
@@ -11810,7 +11929,7 @@ class Match:
                 # A hook a write fired may have moved parts: the index
                 # holds only while nothing changed.
                 before = getattr(self, "_size_changes", 0)
-                log += self.sync_body_size(r, children)
+                log += self.sync_body_size(r, children, warn=warn)
                 if getattr(self, "_size_changes", 0) != before:
                     children = {}
                     for u in self.entities.values():
@@ -12978,6 +13097,8 @@ class Match:
         self._restamp_parts_for(part_id)
         self._restamp_riders_for(part_id)
         self._rebuild_turn_order()
+        if self.sizes_on():
+            self.surface_log(self.sync_body_size(p))
         return p
 
     def detach_part(self, part_id: str) -> "Entity":
@@ -12990,6 +13111,7 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         if not p.part_of:
             raise VTTError(f"`{part_id}` is not a body part.")
+        root_id = self.body_root(p).id
         # A detached segment leaves the body: the chain closes around it and
         # it stops being a segment (it no longer follows anything).
         self._splice_out_segment(p)
@@ -13011,6 +13133,12 @@ class Match:
                 self._restamp_parts_for(p.id)
                 self._restamp_riders_for(p.id)
         self._rebuild_turn_order()
+        if self.sizes_on():
+            old_root = self.entities.get(root_id) if root_id else None
+            if old_root is not None:
+                self.surface_log(self.sync_body_size(old_root))
+            if p.id in self.entities:
+                self.surface_log(self.sync_body_size(p))
         return p
 
     def locate_part(self, part_id: str, x: int, y: int) -> "Entity":
@@ -14382,8 +14510,10 @@ class Match:
                         extras=dict(extras)))
                 except FormulaError as ex:
                     where = f" on `{eid}`" if eid else ""
+                    why = ("" if FORMULA_TEXT_HIDDEN.get()
+                           else f": {ex}")
                     notes += self.tag_lines(utag, [
-                        f"⚠ watcher `{what}`{where} effect error: {ex}"])
+                        f"⚠ watcher `{what}`{where} effect error{why}"])
                 finally:
                     SURFACE_UNIT_TAG.reset(tok)
             if eid is None:
@@ -23755,6 +23885,18 @@ class Match:
         dvars = dis.get("vars")
         if isinstance(dvars, dict):
             out.update(dvars)
+            # The two derived size vars present as a pair (V16): a decoy
+            # total without a decoy category presents its own category.
+            _n, text_v, total_v = self.size_names()
+            t = dvars.get(total_v)
+            if total_v in dvars and text_v not in dvars:
+                cat = (self.size_category_of(t)
+                       if isinstance(t, (int, float))
+                       and not isinstance(t, bool) else None)
+                if cat is None:
+                    out.pop(text_v, None)
+                else:
+                    out[text_v] = cat
         return out
 
     def presented_statuses(self, e: "Entity",
@@ -25914,6 +26056,7 @@ def check_template(data: Any, name: str,
         try:
             pe = Entity.from_dict(trial)
             checked_unit_vars(pe.vars, ("hp", "max_hp", "initiative"), what)
+            check_size_var(pe.vars, spec.get("var_names"), what)
         except VTTError:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as ex:
@@ -27354,7 +27497,7 @@ class MatchManager:
         # category (#242), in every match on the system.
         if old and any(not same_value(old.get(k), m.rules.get(k))
                        for k in SIZE_RULES):
-            m.surface_log(m.sync_all_sizes())
+            m.surface_log(m.sync_all_sizes(warn=True))
         return notes
 
     def refresh_match_rules(self, system_name: str,

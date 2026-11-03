@@ -31,7 +31,7 @@ from vtt_commands import (registry, _usage_tokens, _split_top, _usage_tails,
 # new names): nothing to offer.
 _FREE_SLOTS = {
     "x", "y", "x1", "y1", "x2", "y2", "n", "value", "formula", "body", "dice",
-    "hp", "maxhp", "w", "h", "delay", "delta", "level", "duration", "count",
+    "hp", "maxhp", "w", "h", "number", "delay", "delta", "level", "duration", "count",
     "r", "radius", "dx", "dy", "expansion", "params", "spec", "json", "text",
     "phrase", "condition", "effect", "new_name", "new_id", "init", "field",
     "base", "op", "0-100", "MB", "csv", "row", "legend", "char", "color",

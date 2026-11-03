@@ -33594,7 +33594,7 @@ SCENARIO 994 — Sizes: a snake summed with its segments; a destroyed segment dr
 !system set default size_total_mode max
 !assert "entity[w].size_total == 100"
 !part segment w s2 Seg2 10 10
-?? `s2` hold no size_num and add 0
+?? `s2` holds no size_num and adds 0
 !ent set_var w size_total 500
 ?? `size_total` is derived from `size_num`
 !ent delete_var w size_text
@@ -33638,7 +33638,7 @@ SCENARIO 995 — Sizes: body and max totals, parts inheriting the body's size, !
 !help size giant
 ?? Parts: `ghead` (none), `gclub` 400.
 !help size
-?? 3. `large`: 150-299
+?? 3. `large`: 150 to 299
 !help size 160
 ?? 160 is `large` (rank 3 of 5).
 !part detach gclub
@@ -33802,3 +33802,238 @@ on the rat alone. An unknown category is refused. A disguise presenting a
 decoy size_total of 30 fools the blue view: `size:small` finds the drake,
 the roster's `{size} ({size_class})` reads 30 (small) and `!help size`
 shows only the decoy; the red view sees 260 (large).
+
+SCENARIO 999 — Sizes: the hooks a derivation fires are ordinary code (tracked, refused, re-derived)
+---------------------------------------------------------------------------------------------------
+!match new sh SH 12 6
+!match use sh
+!ent add o O 10 1 1 5
+!ent set_var o stats.reach 1
+!ent set_var o stats.carry 10
+!template save o obase path=stats
+!template give obase o stats
+!passive add o grow on_var_changed "if changed_key == 'size_text':\n    entity[o].stats.reach = 5\n    var_del('o', 'stats.carry')"
+!ent set_var o size_num 300
+!template refs o
+?? changed `reach`; removed `carry`
+!template save o osave
+!template spawn osave 9 4
+!assert "entity[osave].stats.reach == 5 and not var_has('osave', 'stats.carry')"
+!ent add a A 10 3 1 5
+!passive add a own on_var_changed "if changed_key == 'size_total':\n    entity[a].size_total = 'lots'"
+!ent set_var a size_num 31
+?? FAILED: `size_total` is derived from `size_num`
+!assert "entity[a].size_total == 31 and size_of('a') == 31"
+!passive remove a own
+!ent add g G 10 5 1 5
+!ent set_var g footprint_w 2
+!ent set_var g footprint_h 2
+!passive add g grow2 on_var_changed "if changed_key == 'size_text' and entity[g].size_num < 400:\n    entity[g].size_num = 400"
+!ent set_var g size_num 200
+!assert "entity[g].size_num == 400 and entity[g].size_total == 400 and entity[g].size_text == 'huge'"
+
+Expected: a unit whose `stats` come from the partial `obase` holds a
+passive that, when its size category changes, raises `reach` and drops
+`carry`. Those writes happen inside the size derivation's var hooks and
+are tracked like any other: `!template refs` lists them and a template
+saved from the unit spawns with reach 5 and no carry (they were dropped
+from the marker before). A hook writing the derived `size_total` itself
+is refused like a typed write, and the total stays 31. A 2x2 unit's hook
+that answers a new category by raising `size_num` to 400 re-derives
+through its own write, so the stored total and category end as the
+pair 400 / huge.
+
+SCENARIO 1000 — Sizes: a part's death counts at once, and another match settles after the command
+----------------------------------------------------------------------------------------------------
+!match new sl SL 12 6
+!match use sl
+!ent add b B 10 1 1 5
+!part add b fin fin 10 10
+!ent set_var b __size_total_mode sum
+!ent set_var fin size_num 100
+!assert "entity[b].size_total == 200"
+!batch ent kill fin ; assert "entity[b].size_total == 100 and entity[b].size_text == 'medium'" ; find size:large count
+?? **0** matches.
+!ent hp fin 10
+!assert "entity[b].size_total == 200 and entity[b].size_text == 'large'"
+!match new sl2 SL2 12 6
+!match use sl2
+!ent add c C 10 1 1 5
+!part add c cf cf 10 10
+!ent set_var c __size_total_mode sum
+!ent set_var cf size_num 100
+!match use sl
+!batch match use sl2 ; part detach cf ; match use sl
+!match use sl2
+!assert "entity[c].size_total == 100 and entity[cf].size_total == 100"
+
+Expected: inside one batch, killing the part `fin` of a `sum` body takes
+its 100 off the stored total at once (200 → 100), so a later line's
+`size:large` finds nothing and the stored total agrees with size_of.
+Healing the part puts it back. A batch that detaches a part in another
+match leaves that match settled when the command ends: `c` holds 100 and
+the detached `cf` its own total of 100.
+
+SCENARIO 1001 — Sizes: guards on values and rules (bounds, overrides, imports, inherited scales, notes)
+--------------------------------------------------------------------------------------------------------
+!match new sg SG 12 6
+!match use sg
+!ent add a A 10 1 1 5
+!ent set_var a __size_total_mode summ
+?? is body, sum or max
+!ent set_var a __size_parts_inherit yes
+?? is true or false
+!system set default size_default 1e308
+?? must be at most 1000000000000000
+!system set default size_default -50
+?? a negative size, and size_allow_negative is off
+!eval "size_of(10**400)"
+?? at most 1000000000000000 either way
+!eval "size_is('a', 'lareg', True)"
+?? `lareg` isn't a size category
+!template import huge {"name": "Huge", "vars": {"hp": 5, "max_hp": 5, "size_num": "zz"}}
+?? `size_num` is a size number
+!system set default size_enabled false
+!ent set_var a size_num large
+?? = 150 (typed 'large')
+!ent set_var a size_num lots
+?? `lots` isn't a size category
+!system set default size_enabled true
+!system new neg
+!system set neg size_allow_negative true
+!system set neg size_categories "abyss, low:-10, mid:10"
+!system new kid parent=neg
+!system set kid size_allow_negative false
+?? would hold only negative sizes
+!system set kid size_categories "tiny, small:25"
+!system set kid size_allow_negative false
+!system unset kid size_categories
+?? would hold only negative sizes
+!system set default size_decimals true
+!ent set_var a size_num 80.7
+!system set default size_decimals false
+?? still hold a fractional size
+?? `sg/a` (80.7)
+!system set default size_allow_negative true
+!system set default size_categories "abyss, low:-10, mid:10"
+!help size
+?? 1. `low`: -10 to 9
+!assert "entity[a].size_num == 80.7"
+
+Expected: the per-body overrides take only their words (body / sum / max,
+true / false); the default rules are bounded (1e15 either way) and
+refused negative while negatives are off; a size past the bound is
+refused in words; `size_is` refuses a mistyped category even for a size
+that is None; a template can't carry a size number its spawn would
+refuse; with sizes off `size_num` is still checked (a category name
+converts, an unknown word is refused). A child system that turns
+negatives off can't keep its parent's negative scale, by `!system set`
+or by `!system unset` of its own scale. Turning `size_decimals` off names
+the unit still holding a fraction. A negative range prints as `-10 to 9`.
+HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1002 — Sizes: a disguise's decoy total presents its own category
+----------------------------------------------------------------------------
+!match new sd SD 12 6
+!match use sd
+!ent add mask Mask 10 1 1 5
+!ent set_var mask team blue
+!ent set_var mask size_num 500
+!ent set_var mask disguise.name Mouse
+!ent set_var mask disguise.vars.size_total 10
+!as view red
+!find hp>0 show:size_total,size_text
+?? size_total=10, size_text=tiny
+!find size_text=huge
+?? No entities match.
+!find size_text=tiny ids
+?? mask
+!find size:tiny ids
+?? mask
+!as view blue
+!find size_text=huge ids
+?? mask
+!as view omniscient
+
+Expected: a disguise whose `vars` present a size_total of 10 and no
+category presents the decoy's own category with it: under the red
+(fooled) view `show:size_text` reads tiny, `size_text=huge` finds nothing
+and `size_text=tiny` and `size:tiny` find the disguised unit. Its own
+blue view sees the real huge.
+
+SCENARIO 1003 — Zone grants keep resistance when they follow their zones; grant and watcher errors stay hidden
+----------------------------------------------------------------------------------------------------------------
+!match new zr ZR 12 6
+!match use zr
+!status def bless
+!status stack bless refresh
+!ent add a A 10 1 1 5
+!ent set_var a status_resist.bless 2
+!zone new za
+!zone fill za 1 1 6 3
+!zone grant za bless level=3
+!zone new zb
+!zone fill zb 3 1 6 3
+!zone grant zb bless level=5
+!assert "status_level('a', 'bless') == 1"
+!ent move a 2 right
+!assert "status_level('a', 'bless') == 3"
+!zone grant zb bless level=7
+!assert "status_level('a', 'bless') == 5"
+!system set default formula_text_visibility host
+!zone grant_condition za "entity[self].zqxf_gc == 0"
+!watch add w "entity[a].hp < 6" "entity[a].zz = entity[a].zqxf_undef"
+!host access set ent all
+!as player bob
+!ent move a 1 right
+?? its grant_condition failed for `a`; no grant.
+?! zqxf
+!ent hp a 5
+?? effect error
+?! zqxf
+!as host
+
+Expected: a unit resisting `bless` by 2 gets level 1 from `za` (3 − 2),
+3 when it walks into `zb` (5 − 2) and 5 when `zb`'s grant becomes 7: a
+zone-held status that follows its zones under the default `refresh`
+stack mode takes the resistance like a fresh application (it used to
+take the zones' full 5 and 7). Under `formula_text_visibility host`, a
+player's move prints the grant condition's failure without its text,
+and the watcher's effect error without the identifier, also from the
+settling and the watcher poll that run after the handler.
+HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1004 — Conditions with leading zeros go to the formula engine; crash notes for approvals and a missing pre-state
+--------------------------------------------------------------------------------------------------------------------------
+!match new cz CZ 12 6
+!match use cz
+!ent add a A 10 1 1 5
+!ent set_var a __death_condition "entity[a].hp <= 007"
+!system set default death_condition_mode replace
+!ent hp a 5
+!assert "entity[a].hp == 5"
+!prefab import pz {"kind": "prefab", "system": "default", "width": 2, "height": 2, "zones": {"z9": {"cells": [[0, 0]], "grant_condition": "entity[self].hp < 007"}}}
+?? its grant_condition doesn't parse
+!as player bob
+!ent set_var a z 5
+!as host
+!batch approve r1 ; as crash boom
+?? Request `r1` is pending again
+!assert "not var_has('a', 'z')"
+!pending
+?? `r1` by bob
+!system set default autosave_command_retention_turns 0
+!system set default command_journal_limit 0
+!batch ent set_var a q 5 ; as crash boom
+?? kept no state from before the command
+!assert "var_has('a', 'q')"
+
+Expected: a per-unit death condition `entity[a].hp <= 007` replacing the
+rule is read by the formula engine, which refuses the leading zeros, so
+it reads as not met and `a` lives at 5 hp (the native reading used to
+take `007` as 7 and kill it). A prefab zone carrying that condition is
+refused at import. A batch that approves a player's request and then
+crashes is rolled back with the request put back in the queue, which the
+reply names. With command autosaves and the journal both off, a crash
+says that what the command changed before it stays.
+HARNESS-ALLOWS-ERRORS

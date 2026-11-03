@@ -1119,7 +1119,9 @@ hardcodes**.
   <op> <number>` over a stored number (the default death condition,
   typical grant and per-unit / held watcher conditions) is read natively
   (`logic._simple_var_test`) instead of building a formula namespace,
-  which costs ~2 ms (X15); anything else runs the formula.
+  which costs ~2 ms (X15); anything else runs the formula, including a
+  number with leading zeros or leading whitespace, which the formula
+  engine refuses (L42).
 - **Commands:** `!ent` add / remove / rename / info / dump / diff / set_var /
   set_vars / delete_var / hp / init / tp / move / push / pull / swap / face /
   kill / revive / clone / copy / transfer / transform / revert / status /
@@ -2254,7 +2256,7 @@ hardcodes**.
   records what they give (`ZONE_SPEC_KEY`: the highest level among them
   and that zone's data, `_grant_spec`), and when that changes (a walk
   into a higher zone, a grant edit) `_update_zone_grant` sets the level
-  (resistance and max_level apply) and the data, dropping the keys the
+  (resistance under every stack mode, E7, and max_level apply) and the data, dropping the keys the
   last grant's data set, as one status change. Who:
   `grant_bodies` / `zone_status_grant_bodies` (root: the body root once
   when any cell of the body, located / region parts included, is inside;
@@ -2383,7 +2385,9 @@ hardcodes**.
   of the channel's match reads every GM formula as `(hidden)` (names,
   triggers and signatures stay): `_run` sets `logic.FORMULA_TEXT_HIDDEN`
   (`_formula_text_hidden`; the rule from the channel's match, else its
-  default system; also around the `$()` resolution) and the reads print
+  default system; also around the `$()` resolution, the end-of-command
+  settling and the watcher poll, V15; a grant condition's failure and a
+  watcher's effect error then print without their text) and the reads print
   through `formula_text` / `_hide_formula_fields` (`_FORMULA_FIELD_KEYS`,
   `hooks` entries, `<field>_unless`): `!func`, `!help function`, passive
   lists / info, `!state`, `!status info`, `!action info`, `!schedule
@@ -2750,7 +2754,10 @@ hardcodes**.
   (`mgr._save_failure_ref`); a bad `next_ref` counts on from the highest
   kept ref. A crash rolls back the channel's match (its rules re-applied
   from its system as it stands) and the reply names what stays: other
-  matches the command reached and server-wide edits (W9, 989). `!owner
+  matches the command reached and server-wide edits (W9, 989); a request
+  the command approved goes back in the queue, and with command
+  autosaves and the journal both off the reply says the changes stay
+  (1004). `!owner
   errors [n] | show <ref> | clear`
   (every server), `!server errors [n] | show <ref>` (admin, own server). `!as
   crash [text]` (CLI / harness) raises one on purpose (890).
@@ -3078,41 +3085,64 @@ The design is `docs/tags_design.md` (built, PRs 1-3) (919-927).
 
 ### 7.21 Sizes
 
-#242 (993-998). One number per unit, a per-system scale of categories,
+#242 (993-998, 999-1002). One number per unit, a per-system scale of categories,
 and a total per body.
 - **Vars:** the GM writes `size_num` (rule `size_num_var`); the engine
   keeps `size_total` and `size_text` (`size_total_var` / `size_text_var`)
   on each BODY ROOT only, derived, written through write_var under the
   `logic.SIZE_DERIVING` context var (so on_var_* hooks fire on them) and
-  refused to any other write or delete. A root without a number reads
+  refused to any other write or delete. The hooks such a write fires run
+  outside that scope (`_outside_derivation`): their own writes are
+  tracked for partial templates, refused on the derived vars and
+  re-derive; `sync_body_size` re-reads the root after each store (at
+  most `SIZE_SYNC_PASSES`, then a ⚠️), so the pair ends consistent
+  (S15). A root without a number reads
   `size_default` (100) plus `size_default_per_extra_tile` (0) per
   footprint cell past the first, live, never stored in size_num.
-- **Writes** (`Match.checked_size_value`, in write_var and at spawn): a
-  finite number, floored unless `size_decimals`; a category name stores
+- **Writes** (`Match.checked_size_value`, in write_var and at spawn,
+  with sizes off too): a number of at most `SIZE_LIMIT` (1e15) either way
+  (`size_number_ok`; an int past the float range used to crash, E8),
+  floored unless `size_decimals`; a category name stores
   per `size_name_write` (refuse / lowest_size: its start, the first
   category 1 / average_size: the middle, the first category half the
   second's start, the last its start); a value landing outside the first
   category becomes the second start - 1 with negatives allowed, else is
   refused. A negative is refused while `size_allow_negative` is off;
-  turning it off leaves stored negatives (the reply and `!system lint`
-  list them).
+  turning it off leaves stored negatives, turning `size_decimals` off
+  leaves fractions (the reply and `!system lint` list them, lint also a
+  `size_num` holding text). The overrides take only their words
+  (`__size_total_mode` body / sum / max, `__size_parts_inherit` a bool).
+  A template or prefab unit must hold a size number (`check_size_var`):
+  a category name is the spawning system's.
 - **Scale** (`size_categories`, `parse_size_scale`, checked by
   `_FORMAT_RULE_CHECKS`): `tiny, small:25, medium:75, large:150,
   huge:300, colossal:800`; the first category takes no start, starts rise
-  strictly; a scale whose first category holds only negatives is refused
-  while negatives are off (`_check_size_scale_rules`, either rule).
+  strictly. While negatives are off, a scale whose first category holds
+  only negatives and a negative `size_default` /
+  `size_default_per_extra_tile` (both bounded by SIZE_LIMIT) are
+  refused, for the system and every system inheriting from it, after any
+  `!system set`, `unset` or `parent` (`_size_rule_problems`, the change
+  undone, L44).
 - **Totals** (`Match.size_info`): `size_total_mode` (per root
   `__size_total_mode`) body = the root's own number, sum = plus every
   living part's own number (unsized parts add 0; `sync_body_size` warns
   when the unsized set grows), max = the largest. Under body / max an
   unsized part's own size is the root's (`size_parts_inherit`, per root
   `__size_parts_inherit`). A part answers reads with its creature's total.
+  The `sum` warning names at most `SIZE_WARN_NAMES` parts and comes from
+  a write or a rule change only: the sweeps (after a command, an undo, a
+  load) record the unsized parts silently.
 - **When it derives:** after any write / delete of size_num, a footprint
-  var or the two override vars on any unit of the body (`_size_trigger`,
-  then `sync_body_size`), at spawn, after each command that changed the
-  match (`sync_all_sizes` in `CommandRegistry._run` beside the zone-grant
-  sync, also per `!dry` / `!simulate` step; one children index per sweep)
-  and on a change of any size or footprint rule (`apply_system_rules`).
+  var, the two override vars or a body part's hp (a death or heal) on any
+  unit of the body (`_size_trigger`, then `sync_body_size`), at an attach
+  or detach, at spawn, after each command that changed the match
+  (`sync_all_sizes` in `vtt_commands._settle_after` beside the zone-grant
+  sync, also per `!dry` / `!simulate` step) and in every other match the
+  command reached (`MATCHES_TOUCHED`, S16), and on a change of any size or
+  footprint rule (`apply_system_rules`). Body walks use a children index
+  built in one pass (`Match._children_index`; `entity_part_subtree` scans
+  every unit per node: a 300-part body on 2,300 units cost 12 s per
+  `!find`, X18 / X19).
   Corpses keep the total they died with; their category follows the scale.
   `size_enabled` off removes the derived vars from units (size_num stays a
   plain var) and every size function, selector and `!help size` refuses.
@@ -3121,10 +3151,11 @@ and a total per body.
   `size_steps(a, b)`, `size_range(cat)` ([start, next start), None at the
   open ends), `size_categories()` (loopable); x is a unit, a corpse id or a
   number, a category argument a name or a number. `!find` / `!foreach`
-  `size:<cat>[+|-]`; roster `{size}` / `{size_class}`; `!help size
-  [<unit>|<number>]`. A disguise's `vars` may present a decoy size_total
-  (the category follows it) to the selector, the placeholders and `!help
-  size`. Templates save the derived vars (engine-kept, like the snake
+  `size:<cat>[+|-]` (the live total, or a decoy's); roster `{size}` /
+  `{size_class}`; `!help size [<unit>|<number>]`. A disguise's `vars` may
+  present a decoy size_total: `presented_vars` presents its category
+  with it, so the selector, `show:`, `size_text=`, the placeholders and
+  `!help size` agree (V16). Templates save the derived vars (engine-kept, like the snake
   links) and a spawn derives them again.
 
 ---

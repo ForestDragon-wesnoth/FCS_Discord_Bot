@@ -1,7 +1,7 @@
 ## vtt_commands.py (framework‑agnostic commands + registry)
 # vtt_commands.py
 from __future__ import annotations
-from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Any, Set, Tuple
 from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 from match_history import MatchHistory, Snapshot, HistoryError, _now_iso
 from storage import storage_of, valid_id, fmt_bytes
@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -1073,6 +1073,9 @@ class CommandRegistry:
         # The command journal (journal.py): the channel's match before the
         # command, to tell after it (and its watchers) whether it changed.
         jm = mgr.matches.get(pre_active_mid) if pre_active_mid else None
+        # The approval queue before the command: a crash that undoes an
+        # approved request's effect puts the request back (W9).
+        pre_pending = dict(jm.pending_requests) if jm is not None else None
         jpre = None
         # A read-only command (_JOURNAL_READS) skips the two whole-match
         # serializations: a change it does make (a watcher firing after it)
@@ -1158,7 +1161,7 @@ class CommandRegistry:
             ref = crash_ref(f"command `{name}`", e)
             note = _crash_rollback(mgr, pre_active_mid,
                                    pre_state if pre_state is not None
-                                   else jpre)
+                                   else jpre, pre_pending)
             note += _crash_left_note(mgr, pre_active_mid,
                                      MATCHES_TOUCHED.get() or set())
             await ctx.send(f"💥 Unexpected error{ref}: {e}{note}")
@@ -1166,7 +1169,11 @@ class CommandRegistry:
             if touched_token is not None:
                 MATCHES_TOUCHED.reset(touched_token)
             _TYPED_UNIT_VIEW.reset(vtoken)
+            # The end-of-command settling and the watcher poll print under
+            # the same hiding (V15).
+            text_hidden = FORMULA_TEXT_HIDDEN.get()
             FORMULA_TEXT_HIDDEN.reset(ftoken)
+            touched = set(MATCHES_TOUCHED.get() or ())
             if reveals_token is not None:
                 revealed = _HOST_REVEALS.get() or []
                 _HOST_REVEALS.reset(reveals_token)
@@ -1211,48 +1218,12 @@ class CommandRegistry:
         # snapshot represents "the state to roll back to if you undo
         # this command".
         post_state = None
-        # Status-granting zones (#136) settle after a command that changed
-        # the match (a read leaves them as they are): what it changed may be
-        # a zone's cells or grants, or what a condition reads. (A change of
-        # the zone_status_grant_bodies rule settles in apply_system_rules.)
-        if pre_active_mid in mgr.matches:
-            m_post = mgr.matches[pre_active_mid]
-            grants = m_post._grants_present()
-            if (getattr(m_post, "_action_depth", 0) == 0
-                    and (grants or m_post.sizes_on())):
-                if pre_state is not None:
-                    post_state = m_post.to_dict(include_history=False)
-                    due = _differs_in_undo_state(pre_state, post_state)
-                else:
-                    due = not _settles_nothing(name, args)
-                if due:
-                    # Sizes (#242): what the command changed (a part
-                    # attached or killed, a unit spawned) re-derives each
-                    # body's size total and category.
-                    before = getattr(m_post, "_size_changes", 0)
-                    try:
-                        m_post.surface_log(m_post.sync_all_sizes())
-                    except VTTError as e:
-                        await ctx.send(f"❌ settling sizes: {e}")
-                    except Exception as e:
-                        ref = crash_ref("size sync", e)
-                        await ctx.send(f"💥 Unexpected error{ref} while "
-                                       f"settling sizes: {e}")
-                    if getattr(m_post, "_size_changes", 0) != before:
-                        post_state = None
-                if due and grants:
-                    before = m_post._grant_changes
-                    try:
-                        m_post.surface_log(m_post.sync_zone_grants())
-                    except VTTError as e:
-                        await ctx.send(f"❌ settling zone grants: {e}")
-                    except Exception as e:
-                        # E6: an exception here used to skip the undo step,
-                        # the watcher poll and the journal entry below.
-                        ref = crash_ref("zone grant sync", e)
-                        await ctx.send(f"💥 Unexpected error{ref} while "
-                                       f"settling zone grants: {e}")
-                    post_state = None
+        hide_tok = FORMULA_TEXT_HIDDEN.set(text_hidden)
+        try:
+            post_state = await _settle_after(
+                ctx, mgr, name, args, pre_active_mid, pre_state, touched)
+        finally:
+            FORMULA_TEXT_HIDDEN.reset(hide_tok)
         if pre_state is not None and pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
             if post_state is None:
@@ -1296,6 +1267,7 @@ class CommandRegistry:
             # reads go on the entry too.
             jstate_token = _JOURNAL_AS_STATE.set(jstate)
             preads_token = PREFAB_READS.set(preads)
+            hide_tok = FORMULA_TEXT_HIDDEN.set(text_hidden)
             try:
                 wm = mgr.matches[mid_now]
                 fired = getattr(wm, "_watchers_fired", 0)
@@ -1309,6 +1281,7 @@ class CommandRegistry:
                     wm.surface_log(wm.sync_zone_grants())
                     await _flush_formula_log(ctx)
             finally:
+                FORMULA_TEXT_HIDDEN.reset(hide_tok)
                 _JOURNAL_AS_STATE.reset(jstate_token)
                 PREFAB_READS.reset(preads_token)
             # Nested maps: a wreck marked __delete_when_empty goes once its
@@ -1330,6 +1303,69 @@ class CommandRegistry:
         if jparent is not None:
             jparent.update(jmine)
         return result
+
+async def _settle_after(ctx: ReplyContext, mgr: MatchManager, name: str,
+                        args: List[str], mid: Optional[str],
+                        pre_state: Optional[Dict[str, Any]],
+                        touched: Set[str]) -> Optional[Dict[str, Any]]:
+    """After a top-level command's handler: settle the sizes (#242) and
+    the zone grants (#136) of the channel's match when the command changed
+    it (a read leaves them as they are: what it changed may be a part's
+    death, a zone's cells or grants, or what a condition reads; a change
+    of a rule settles in apply_system_rules), and the sizes of the other
+    matches it reached (S16). Returns the match's post-state when it was
+    serialized and nothing changed it since (else None)."""
+    post_state = None
+    for other in sorted(touched - {mid}):
+        om = mgr.matches.get(other)
+        if om is not None and om.sizes_on() \
+                and getattr(om, "_action_depth", 0) == 0:
+            try:
+                om.surface_log(om.sync_all_sizes())
+            except VTTError as e:
+                await ctx.send(f"❌ settling sizes in `{other}`: {e}")
+    if mid not in mgr.matches:
+        return None
+    pre_active_mid = mid
+    m_post = mgr.matches[pre_active_mid]
+    grants = m_post._grants_present()
+    if (getattr(m_post, "_action_depth", 0) == 0
+            and (grants or m_post.sizes_on())):
+        if pre_state is not None:
+            post_state = m_post.to_dict(include_history=False)
+            due = _differs_in_undo_state(pre_state, post_state)
+        else:
+            due = not _settles_nothing(name, args)
+        if due:
+            # Sizes (#242): what the command changed (a part
+            # attached or killed, a unit spawned) re-derives each
+            # body's size total and category.
+            before = getattr(m_post, "_size_changes", 0)
+            try:
+                m_post.surface_log(m_post.sync_all_sizes())
+            except VTTError as e:
+                await ctx.send(f"❌ settling sizes: {e}")
+            except Exception as e:
+                ref = crash_ref("size sync", e)
+                await ctx.send(f"💥 Unexpected error{ref} while "
+                               f"settling sizes: {e}")
+            if getattr(m_post, "_size_changes", 0) != before:
+                post_state = None
+        if due and grants:
+            before = m_post._grant_changes
+            try:
+                m_post.surface_log(m_post.sync_zone_grants())
+            except VTTError as e:
+                await ctx.send(f"❌ settling zone grants: {e}")
+            except Exception as e:
+                # E6: an exception here used to skip the undo step,
+                # the watcher poll and the journal entry below.
+                ref = crash_ref("zone grant sync", e)
+                await ctx.send(f"💥 Unexpected error{ref} while "
+                               f"settling zone grants: {e}")
+            post_state = None
+    return post_state
+
 
 registry = CommandRegistry()
 
@@ -5638,14 +5674,26 @@ async def _in_vision_pass(ctx: ReplyContext, mgr: MatchManager, fn: Any,
 
 
 def _crash_rollback(mgr: MatchManager, mid: Optional[str],
-                    pre: Optional[Dict[str, Any]]) -> str:
+                    pre: Optional[Dict[str, Any]],
+                    pre_pending: Optional[Dict[str, Any]] = None) -> str:
     """After a command crashed: put the channel's match back to `pre`, its
     state before the command, so a half-done change (a transform without
-    its old parts, a half-revived unit) isn't kept and saved (W8). Returns
-    the note for the reply ("" when there was nothing to put back)."""
-    if pre is None or not mid or mid not in mgr.matches:
+    its old parts, a half-revived unit) isn't kept and saved (W8), and the
+    requests it approved back in the queue (their effect is undone too).
+    Returns the note for the reply ("" when there was nothing to put
+    back)."""
+    if not mid or mid not in mgr.matches:
         return ""
     m = mgr.matches[mid]
+    if pre is None:
+        # W9: with command autosaves and the journal both off there is no
+        # state from before the command to put back.
+        if int(m.rules.get("autosave_command_retention_turns", 3)) != 0 \
+                or journal_limit(m) != 0:
+            return ""
+        return (f"\n⚠️ Match `{mid}` kept no state from before the command "
+                f"(autosave_command_retention_turns and command_journal_limit "
+                f"are 0), so what it changed before the crash stays.")
     try:
         if not _differs_in_undo_state(pre, m.to_dict(include_history=False)):
             return ""
@@ -5657,7 +5705,17 @@ def _crash_rollback(mgr: MatchManager, mid: Optional[str],
             mgr.apply_system_rules(m)
     except Exception:   # noqa: BLE001 - the crash is already reported
         return ""
-    return (f"\nMatch `{mid}` is back as it was before the command.")
+    back = [rid for rid in (pre_pending or {})
+            if rid not in m.pending_requests]
+    for rid in back:
+        m.pending_requests[rid] = pre_pending[rid]
+    note = f"\nMatch `{mid}` is back as it was before the command."
+    if back:
+        note += (" Request" + ("s " if len(back) > 1 else " ")
+                 + ", ".join(f"`{r}`" for r in sorted(back))
+                 + (" are" if len(back) > 1 else " is")
+                 + " pending again (`!pending`).")
+    return note
 
 
 def _crash_left_note(mgr: MatchManager, mid: Optional[str],
@@ -7899,36 +7957,96 @@ def _inheritors(mgr: MatchManager, s: Any, key: str) -> List[Any]:
     return out
 
 
-def _check_size_scale_rules(mgr: MatchManager, s: Any, key: str,
-                            value: Any) -> None:
-    """Refuse a size scale whose first category could only hold negative
-    sizes (a second start of 0 or below) while size_allow_negative is off
-    (#242), whichever of the two rules is being set."""
-    scale = parse_size_scale(value if key == "size_categories"
-                             else mgr.system_value(s, "size_categories"))
-    allow = (value if key == "size_allow_negative"
-             else mgr.system_value(s, "size_allow_negative"))
-    if not allow and len(scale) >= 2 and scale[1][1] <= 0:
-        raise VTTError(
-            f"size_categories: `{scale[0][0]}` would hold only negative "
-            f"sizes (below `{scale[1][0]}:{scale[1][1]}`), and "
-            f"size_allow_negative is off. Start `{scale[1][0]}` above 0, "
-            f"or allow negative sizes first.")
+# The rules whose combination the size checks judge (#242).
+_SIZE_CHECK_RULES = ("size_categories", "size_allow_negative",
+                     "size_default", "size_default_per_extra_tile",
+                     "size_decimals")
 
 
-def _negative_size_units(mgr: MatchManager, system_name: str) -> List[str]:
-    """`match/unit` for every unit on `system_name` (and its children)
-    holding a negative size number."""
-    family = {system_name, *mgr.system_descendants(system_name)}
+def _size_rule_problems(mgr: MatchManager, name: str) -> List[str]:
+    """What the size rules of `name` and the systems inheriting from it
+    would refuse, as they stand now: a first category holding only
+    negative sizes, or a negative default, while size_allow_negative is
+    off. Run after any change to them (set, unset, a new parent: L44),
+    which is undone when this names a problem."""
+    out: List[str] = []
+    for sn in [name] + list(mgr.system_descendants(name)):
+        sy = mgr.systems.get(sn)
+        if sy is None:
+            continue
+        who = "" if sn == name else f"(in `{sn}`, which inherits it) "
+        try:
+            scale = parse_size_scale(mgr.system_value(sy, "size_categories"))
+        except VTTError as e:
+            out.append(f"{who}{e}")
+            continue
+        if mgr.system_value(sy, "size_allow_negative"):
+            continue
+        if len(scale) >= 2 and scale[1][1] <= 0:
+            out.append(
+                f"{who}size_categories: `{scale[0][0]}` would hold only "
+                f"negative sizes (below `{scale[1][0]}:{scale[1][1]}`), and "
+                f"size_allow_negative is off. Start `{scale[1][0]}` above 0, "
+                f"or allow negative sizes first.")
+        for k in ("size_default", "size_default_per_extra_tile"):
+            v = mgr.system_value(sy, k)
+            if isinstance(v, (int, float)) and v < 0:
+                out.append(f"{who}{k} is {v}, a negative size, and "
+                           f"size_allow_negative is off.")
+    return out
+
+
+def _size_rule_effective(mgr: MatchManager, name: str) -> Dict[str, Any]:
+    """(system -> (allow_negative, decimals)) for `name` and the systems
+    inheriting from it, to compare before and after a change."""
+    out = {}
+    for sn in [name] + list(mgr.system_descendants(name)):
+        sy = mgr.systems.get(sn)
+        if sy is not None:
+            out[sn] = (bool(mgr.system_value(sy, "size_allow_negative")),
+                       bool(mgr.system_value(sy, "size_decimals")))
+    return out
+
+
+def _size_rule_notes(mgr: MatchManager, before: Dict[str, Any]) -> List[str]:
+    """Notes after a size rule change: the units still holding a negative
+    size where negatives went off, and a fraction where decimals went off
+    (left as they are; new writes are refused / floored)."""
+    neg, frac = set(), set()
+    for sn, (allow, dec) in before.items():
+        sy = mgr.systems.get(sn)
+        if sy is None:
+            continue
+        if allow and not mgr.system_value(sy, "size_allow_negative"):
+            neg.add(sn)
+        if dec and not mgr.system_value(sy, "size_decimals"):
+            frac.add(sn)
+    notes: List[str] = []
+    for systems, test, what in (
+            (neg, lambda v: v < 0, "a negative size (left as they are; new "
+             "negative writes are refused)"),
+            (frac, lambda v: v != int(v), "a fractional size (left as they "
+             "are; new writes are floored)")):
+        if not systems:
+            continue
+        hits = _size_units(mgr, systems, test)
+        if hits:
+            notes.append(f"These units still hold {what}: "
+                         + ", ".join(hits) + ".")
+    return notes
+
+
+def _size_units(mgr: MatchManager, systems: Any, test: Any) -> List[str]:
+    """`match/unit` (value) for every unit on one of `systems` whose size
+    number passes `test`."""
     out = []
     for mid, m in sorted(mgr.matches.items()):
-        if m.system_name not in family:
+        if m.system_name not in systems:
             continue
         num_v = m.size_names()[0]
         for eid, e in sorted(m.entities.items()):
             v = e.vars.get(num_v)
-            if isinstance(v, (int, float)) and not isinstance(v, bool) \
-                    and v < 0:
+            if size_number_ok(v) and test(v):
                 out.append(f"`{mid}/{eid}` ({v})")
     return out
 
@@ -8359,7 +8477,13 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         old_parent = s.parent
         new_parent = None if target.lower() == "none" else target
         pre_state = mgr.server_state()
+        size_before = _size_rule_effective(mgr, name)
         mgr.set_system_parent(name, new_parent)
+        problems = _size_rule_problems(mgr, name)
+        if problems:
+            _apply_server_state(mgr, pre_state)
+            raise VTTError(f"Can't link `{name}` to `{target}`: "
+                           + " ".join(problems))
         # A new parent can rename var-name rules for this system and the
         # ones inheriting from it: under var_name_collision refuse, a var in
         # the way refuses the link, as `!system set` does.
@@ -8379,6 +8503,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                    if len(conflicts) > 5 else ""))
         notes: List[str] = []
         refreshed = mgr.refresh_match_rules(name, notes)
+        notes += _size_rule_notes(mgr, size_before)
         suffix = (f" (refreshed {refreshed} live match"
                   f"{'es' if refreshed != 1 else ''})" if refreshed else "")
         if new_parent is None:
@@ -8411,10 +8536,17 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             trial.settings.pop(key, None)
             moved_line = _rename_system_var(
                 mgr, s, name, key, mgr.system_value(trial, key))
+        size_before = _size_rule_effective(mgr, name)
+        pre_server = mgr.server_state()
         if not mgr.system_unset(s, key, entry or None):
             raise VTTError(f"`{name}` sets nothing for `{spec}` itself.")
+        problems = _size_rule_problems(mgr, name)
+        if problems:
+            _apply_server_state(mgr, pre_server)
+            raise VTTError(" ".join(problems))
         notes = []
         refreshed = mgr.refresh_match_rules(name, notes)
+        notes += _size_rule_notes(mgr, size_before)
         src = mgr.system_value_source(s, key) if key in RULES_REGISTRY else None
         shown = (f"now inherited from `{src}`" if src else
                  "back to the engine default" if key in RULES_REGISTRY
@@ -8453,18 +8585,19 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     
         s = mgr.get_system(name)
         warn = _check_formula_rule(mgr, s, key, value)
-        if key in ("size_categories", "size_allow_negative"):
-            _check_size_scale_rules(mgr, s, key, value)
+        size_before = _size_rule_effective(mgr, name)
+        if key in _SIZE_CHECK_RULES:
+            pre_server = mgr.server_state()
+            s.set(key, value)
+            problems = _size_rule_problems(mgr, name)
+            if problems:
+                _apply_server_state(mgr, pre_server)
+                raise VTTError(" ".join(problems))
         moved_line = _rename_system_var(mgr, s, name, key, value)
         s.set(key, value)
         notes: List[str] = []
         refreshed = mgr.refresh_match_rules(name, notes)
-        if key == "size_allow_negative" and not value:
-            neg = _negative_size_units(mgr, name)
-            if neg:
-                notes.append("These units still hold a negative size (left "
-                             "as they are; new negative writes are "
-                             "refused): " + ", ".join(neg) + ".")
+        notes += _size_rule_notes(mgr, size_before)
         suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
         return await ctx.send("\n".join(
             [f"`{name}`.{key} = {value!r}{suffix}"]
@@ -9153,6 +9286,15 @@ def _lint_sizes(matches: List[Match]) -> List[str]:
             if not allow and n is not None and n < 0:
                 out.append(f"⚠️ match `{m.id}` `{e.id}`: size {n} is negative "
                            f"(size_allow_negative is off)")
+            if n is not None and n != int(n) \
+                    and not m.rules.get("size_decimals", False):
+                out.append(f"⚠️ match `{m.id}` `{e.id}`: size {n} has a "
+                           f"fraction (size_decimals is off)")
+            num_v = m.size_names()[0]
+            if num_v in e.vars and n is None:
+                out.append(f"⚠️ match `{m.id}` `{e.id}`: `{num_v}` holds "
+                           f"{e.vars[num_v]!r}, not a size number (it reads "
+                           f"as the default)")
     return out
 
 
@@ -14163,12 +14305,17 @@ def _find_size_matches(m: Match, e: Entity, cat: str, mod: Optional[str],
         names = ", ".join(n for n, _s in scale) or "(none defined)"
         raise VTTError(f"`size:{cat}`: not a size category (the scale: "
                        f"{names}).")
+    # The live total (a part that died earlier in the same command counts
+    # already, S16), or the total a disguise presents to the query's team.
     root = m.body_root(e)
-    found, total = _entity_path_value(m, root, m.size_names()[2], pov)
-    if not found or isinstance(total, bool) \
-            or not isinstance(total, (int, float)):
-        if pov is not None and found:
+    total_v = m.size_names()[2]
+    dis = m._effective_disguise(root, pov) if pov is not None else None
+    dvars = dis.get("vars") if isinstance(dis, dict) else None
+    if isinstance(dvars, dict) and total_v in dvars:
+        total = dvars[total_v]
+        if isinstance(total, bool) or not isinstance(total, (int, float)):
             return False             # a decoy that isn't a number
+    else:
         total = m.size_info(e)["total"]
     have = m.size_rank_of(m.size_category_of(total))
     if have is None:
@@ -24722,7 +24869,9 @@ def _size_scale_lines(scale, decimals: bool) -> List[str]:
         elif decimals:
             rng = f"{start} up to {nxt}"
         else:
-            rng = f"{start}-{nxt - 1}" if nxt - 1 > start else f"{start}"
+            # The whole sizes it holds ("-10 to 9": a dash read as a minus).
+            lo, hi = math.ceil(start), math.ceil(nxt) - 1
+            rng = f"{lo} to {hi}" if hi > lo else f"{lo}"
         out.append(f"{i}. `{name}`: {rng}")
     return out
 
@@ -24761,11 +24910,9 @@ def _help_size(ctx: ReplyContext, mgr: MatchManager,
                     "(`size_categories`): sizes are plain numbers.")
         return "\n".join([head] + _size_scale_lines(scale, decimals))
     num = None
-    try:
+    if re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?", raw):
         num = float(raw)
-    except ValueError:
-        pass
-    if num is not None and math.isfinite(num):
+    if num is not None and size_number_ok(num):
         n = int(num) if num.is_integer() else num
         if not scale:
             return f"{n}: this system defines no size categories."
