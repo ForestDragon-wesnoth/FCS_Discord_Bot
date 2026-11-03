@@ -2880,6 +2880,27 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
                 if items:
                     text = _render_template(fmt(sec),
                                             {"items": "\n".join(items)})
+        elif sec == "mount":
+            # The vehicle it rides and the riders it carries, each as the
+            # viewer sees that unit (its own disguise, its own visibility).
+            riding = ""
+            veh = m.entities.get(e.mounted_on or "") if e.mounted_on else None
+            if veh is not None and not _pov_hides(m, pov_team, veh.id):
+                vctx = _entity_template_context(veh, pov_team)
+                vctx["slot"] = e.mount_slot or ""
+                riding = _render_template(_description_rule(
+                    m, "entity_description_riding_format"), vctx)
+            rfmt = _description_rule(m, "entity_description_rider_format")
+            riders = []
+            for r in sorted(m.vehicle_riders(e.id), key=lambda u: u.id):
+                if _pov_hides(m, pov_team, r.id):
+                    continue
+                rctx = _entity_template_context(r, pov_team)
+                rctx["slot"] = r.mount_slot or ""
+                riders.append(_render_template(rfmt, rctx))
+            if riding or riders:
+                text = _render_template(fmt(sec), {
+                    "riding": riding, "riders": "\n".join(riders)})
         if text.strip():
             out.append(text.rstrip("\n"))
     return "\n".join(out) if out else f"`{e.id}`"
@@ -3026,9 +3047,10 @@ def _entity_dump(e: Entity) -> str:
         for bp in body:
             role = bp.vars.get(name_var, "?")
             parts.append(f"- `{bp.id}` ({role}): {_part_status_str(m, bp)}")
-    if e.actions_used:
-        parts.append("**actions used:** " + ", ".join(
-            f"`{p}`" for p in e.actions_used))
+    if e.actions_seen:
+        parts.append("**actions seen used:** " + "; ".join(
+            f"{t}: " + ", ".join(f"`{p}`" for p in paths)
+            for t, paths in sorted(e.actions_seen.items())))
     return "\n".join(parts)
 
 
@@ -11840,7 +11862,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     # Strip / remap relational fields.
                     payload.pop("mounted_on", None)
                     payload.pop("mount_slot", None)
-                    payload.pop("actions_used", None)   # a new unit
+                    payload.pop("actions_seen", None)   # a new unit
                     if oid == src_id:
                         payload.pop("part_of", None)  # root clone is standalone
                     elif payload.get("part_of") in idmap:

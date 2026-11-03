@@ -861,19 +861,34 @@ EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
 # past the float range a size crashed the reads and the default's maths.
 SIZE_LIMIT = 10 ** 15
 
-# Unit history kept in a unit's saved dict (Entity.actions_used) that a
+# Unit history kept in a unit's saved dict (Entity.actions_seen) that a
 # NEW unit made from it must not inherit: stripped with the identity keys
 # by templates, statblocks, summon snapshots, prefabs, clones and copies.
-UNIT_HISTORY_KEYS: Tuple[str, ...] = ("actions_used",)
-# At most this many recorded action paths per unit (each distinct path once).
+UNIT_HISTORY_KEYS: Tuple[str, ...] = ("actions_seen",)
+# At most this many recorded action paths per unit and team (each distinct
+# path once).
 ACTIONS_USED_MAX = 1000
+
+def _checked_actions_seen(raw: Any) -> Dict[str, List[str]]:
+    """A saved Entity.actions_seen read back: team -> distinct paths (text),
+    at most ACTIONS_USED_MAX each; anything else dropped."""
+    out: Dict[str, List[str]] = {}
+    if isinstance(raw, dict):
+        for team, paths in raw.items():
+            if isinstance(paths, list):
+                keep = list(dict.fromkeys(p for p in paths
+                                          if isinstance(p, str)))
+                if keep:
+                    out[str(team)] = keep[:ACTIONS_USED_MAX]
+    return out
+
 
 # The sections of the entity description (`!ent info <id>`), each with an
 # entity_description_<section>_format rule (entity_description_sections
 # orders them).
 DESCRIPTION_SECTIONS: Tuple[str, ...] = (
     "header", "vitals", "size", "statuses", "tags", "data", "actions",
-    "passives", "parts")
+    "passives", "parts", "mount")
 
 RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # --- Vital variable names (what var keys map to HP / MaxHP / turn-order) ---
@@ -2524,7 +2539,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # `!ent dump` (the raw data, host-only).
     "entity_description_sections": {
         "default": ("header, vitals, size, statuses, tags, data, actions, "
-                    "passives, parts"),
+                    "passives, parts, mount"),
         "schema": {"type": "str", "word_list": list(DESCRIPTION_SECTIONS)},
         "desc": (
             "The sections `!ent info <id>` prints, in this order: "
@@ -2664,10 +2679,12 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "pov=`) sees, in the description and in `!action list` / "
             "`!action info`: 'all' every unit's; 'allies' only its own "
             "team's units' (others list none); 'used' its own team's units' "
-            "all, other units' only the actions they have used during this "
-            "match (a successful use; a unit copied or transferred in "
-            "starts with none). A channel without a team view sees every "
-            "action."
+            "all, other units' only the actions that team has seen them use "
+            "in this match (a successful use, while the team's view saw the "
+            "unit as it began; recorded per team, so under fog a use out of "
+            "sight stays unknown to that team; a unit copied or transferred "
+            "in starts with none). A channel without a team view sees "
+            "every action."
         ),
     },
     "entity_description_passives_format": {
@@ -2682,6 +2699,31 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": "The description's body-part section; `{items}` is one "
                 "entity_description_part_format line per part the viewer "
                 "can see (left out under a disguise).",
+    },
+    "entity_description_mount_format": {
+        "default": "{?riding?}{riding}\\n{/?}{?riders?}**Riders**\\n{riders}{/?}",
+        "schema": {"type": "str"},
+        "desc": (
+            "The description's mount section: `{riding}` is the "
+            "entity_description_riding_format line of the vehicle the unit "
+            "rides, `{riders}` one entity_description_rider_format line per "
+            "rider the viewer can see (a rider hidden inside a vehicle "
+            "shows only to its own team)."
+        ),
+    },
+    "entity_description_riding_format": {
+        "default": ("Riding: {name} (`{id}`) in seat {slot}: HP "
+                    "{hp}/{max_hp}"),
+        "schema": {"type": "str"},
+        "desc": ("The line naming the vehicle a unit rides: the VEHICLE's "
+                 "entity_info_format placeholders (as the viewer sees it) "
+                 "plus `{slot}`."),
+    },
+    "entity_description_rider_format": {
+        "default": "- {name} (`{id}`) in seat {slot}: HP {hp}/{max_hp}",
+        "schema": {"type": "str"},
+        "desc": ("One rider of a vehicle in its description: the RIDER's "
+                 "entity_info_format placeholders plus `{slot}`."),
     },
     "entity_description_part_format": {
         "default": "- {name} (`{id}`): HP {hp}/{max_hp}",
@@ -7963,14 +8005,16 @@ class Entity:
     # names. Protected (not a var), saved with the unit and its templates.
     var_names: Dict[str, str] = field(default_factory=dict)
 
-    # The vars paths of the actions this unit has used successfully in this
-    # match, in order of first use (entity_description_action_visibility
-    # `used`). Recorded on the unit HOLDING the action (a vehicle for a
-    # rider's seat action) by run_action. Unit history, never identity:
-    # templates, statblocks, summon snapshots, prefabs, clones and copies /
-    # transfers into another match start without it (UNIT_HISTORY_KEYS); a
-    # corpse keeps it, so a revive does too.
-    actions_used: List[str] = field(default_factory=list)
+    # Per team, the vars paths of the actions that team has seen this unit
+    # use successfully in this match, in order of first use
+    # (entity_description_action_visibility `used`): team -> [path, ...].
+    # Recorded on the unit HOLDING the action (a vehicle for a rider's seat
+    # action) by run_action, for each team whose view saw the actor when it
+    # began (Match.teams_seeing). Unit history, never identity: templates,
+    # statblocks, summon snapshots, prefabs, clones and copies / transfers
+    # into another match start without it (UNIT_HISTORY_KEYS); a corpse
+    # keeps it, so a revive does too.
+    actions_seen: Dict[str, List[str]] = field(default_factory=dict)
 
     #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
@@ -9352,8 +9396,9 @@ class Entity:
             "mount_slot": self.mount_slot,
             "var_names": dict(self.var_names),
             # Only when there is any: a unit that never acted saves as before.
-            **({"actions_used": list(self.actions_used)}
-               if self.actions_used else {}),
+            **({"actions_seen": {t: list(p) for t, p in
+                                 self.actions_seen.items()}}
+               if self.actions_seen else {}),
         }
 
     @staticmethod
@@ -9374,9 +9419,7 @@ class Entity:
             mounted_on=data.get("mounted_on", None),
             mount_slot=data.get("mount_slot", None),
             var_names=checked_var_names(data.get("var_names")),
-            actions_used=[str(p) for p in (data.get("actions_used") or [])
-                          if isinstance(p, str)][:ACTIONS_USED_MAX]
-            if isinstance(data.get("actions_used"), list) else [],
+            actions_seen=_checked_actions_seen(data.get("actions_seen")),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
@@ -24148,8 +24191,33 @@ class Match:
         if mode == "all" or self.body_team(e) == str(pov_team):
             return True
         if mode == "used":
-            return path in (holder or e).actions_used
+            return path in (holder or e).actions_seen.get(str(pov_team), ())
         return False
+
+    def teams_seeing(self, eid: str) -> List[str]:
+        """The teams whose view sees unit `eid` now: every team a unit's body
+        belongs to, that holds team data or that a channel views, which
+        either is the unit's own body team or sees it (entity_visible_to; a
+        glued part through the body it sits on). Who saw an action used
+        (Entity.actions_seen)."""
+        e = self.entities.get(eid)
+        if e is None:
+            return []
+        teams = {self.body_team(u) for u in self.entities.values()}
+        teams |= {str(t) for t in self.team_data}
+        teams |= {str(meta["pov"]) for meta in self.bound_channels.values()
+                  if isinstance(meta, dict) and meta.get("pov")
+                  and meta.get("pov") != "omniscient"}
+        teams.discard(None)
+        teams.discard("")
+        seen, body = {e.id}, e
+        while body.is_glued_part and body.part_of in self.entities \
+                and body.part_of not in seen:
+            body = self.entities[body.part_of]
+            seen.add(body.id)
+        own = self.body_team(e)
+        return sorted(t for t in teams
+                      if t == own or self.entity_visible_to(body.id, t))
 
     def presented_vars(self, e: "Entity",
                        pov_team: Optional[str] = None) -> Dict[str, Any]:
@@ -27728,7 +27796,7 @@ class MatchManager:
             oe = src.entities[oid]
             # A unit arriving in another match has used nothing there.
             ne = Entity.from_dict(dict(oe.to_dict(), id=idmap[oid],
-                                       actions_used=[]))
+                                       actions_seen={}))
             # Mount linkage does NOT survive a cross-match copy/transfer: the
             # vehicle lives in the SOURCE match (transferring a vehicle ejects
             # its riders, so the pair can't travel together). Carrying a stale

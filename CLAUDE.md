@@ -3181,20 +3181,24 @@ and a total per body.
 
 ### 7.22 Reading a unit: line, description, dump
 
-Three tiers (user design, 1008-1011): the info line (entity_line_format in
+Three tiers (user design, 1008-1012): the info line (entity_line_format in
 `!list` / `!state`; entity_info_format in `!ent info <id> short`) is the
 unit's state at a glance; the description (`!ent info <id>`,
 `vtt_commands._entity_description`) is what a player reads about it; `!ent
 dump` is the raw data for the GM.
 - **Sections:** `entity_description_sections` (a word list of
   `logic.DESCRIPTION_SECTIONS`: header, vitals, size, statuses, tags, data,
-  actions, passives, parts) orders them, each rendered by its
+  actions, passives, parts, mount) orders them, each rendered by its
   `entity_description_<section>_format` rule (entity_info_format's
   placeholders; the list sections take `{items}`, one
   `entity_description_status_format` / `_action_format` / `_part_format`
   line each). A section with nothing to show is left out. The header shows
   the unit's `description` var, a status its definition's `description`
-  data (level entries layered), an action its `description`.
+  data (level entries layered), an action its `description`. The mount
+  section names the vehicle a rider rides (`_riding_format`, the
+  vehicle's placeholders + `{slot}`) and a vehicle's riders
+  (`_rider_format`), each as the viewer sees that unit; a rider the view
+  can't see (hidden inside) isn't listed.
 - **Data:** the unit's vars as an indented list (`_description_vars` /
   `_description_tree`: a dict of plain values on one line, a dict's
   `description` after its key, plain lists joined, bools yes / no), cut at
@@ -3209,14 +3213,17 @@ dump` is the raw data for the GM.
   a team view (`_query_pov`) to the description, `!action list` / `info`,
   `!find action:` and Tab (`_visible_actions`, `Match.action_visible`):
   the view's own team's units (body root's team, `Match.body_team`) always
-  show theirs; `allies` shows other units none, `used` those in
-  `Entity.actions_used`. A restricted `!action list` answers "No actions
+  show theirs; `allies` shows other units none, `used` those the view's
+  team has seen used (`Entity.actions_seen[team]`, user call: per team). A restricted `!action list` answers "No actions
   of `x` that this channel's view can see." whether the unit has any.
-- **`Entity.actions_used`:** full action paths, in order of first use (at
-  most `ACTIONS_USED_MAX`), recorded on the unit HOLDING the action
-  (`Action.holder`, set by discover_actions; a vehicle for a seat action)
-  after the body succeeds, before the hooks; a failed outer action or an
-  undo takes it back (it is serialized state). Saved only when non-empty.
+- **`Entity.actions_seen`:** team -> full action paths, in order of first
+  use (at most `ACTIONS_USED_MAX` per team), recorded on the unit HOLDING
+  the action (`Action.holder`, set by discover_actions; a vehicle for a
+  seat action) after the body succeeds, before the hooks, for each team
+  in `Match.teams_seeing(actor)` when the body began (every unit's body
+  team, team-data teams and channel POVs, that is the actor's own team or
+  sees it, `entity_visible_to`); a failed outer action or an undo takes it
+  back (it is serialized state). Saved only when non-empty.
   Unit history (`logic.UNIT_HISTORY_KEYS`): templates, statblocks, summon
   snapshots, prefabs, clones and copies / transfers into another match
   strip it; a corpse keeps it. `!ent dump` lists it.

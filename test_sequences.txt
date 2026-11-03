@@ -34370,7 +34370,7 @@ HARNESS-ALLOWS-ERRORS (`!action info` of an action the view can't see reads as m
 !action orc howl
 !undo command
 !ent dump orc
-?? **actions used:** `inventory.axe.actions.chop`
+?? **actions seen used:** blue: `inventory.axe.actions.chop`; red: `inventory.axe.actions.chop`
 ?! `actions.howl`
 !as view red
 !ent info orc
@@ -34390,16 +34390,16 @@ HARNESS-ALLOWS-ERRORS (`!action info` of an action the view can't see reads as m
 !ent clone orc orc_twin 8 4
 !ent copy orc av2
 !ent dump brute
-?! actions used
+?! actions seen
 !ent dump orc_twin
-?! actions used
+?! actions seen
 !ent kill orc
 !ent revive orc
 !ent dump orc
-?? **actions used:** `inventory.axe.actions.chop`
+?? **actions seen used:** blue: `inventory.axe.actions.chop`; red: `inventory.axe.actions.chop`
 !match use av2
 !ent dump orc
-?! actions used
+?! actions seen
 !match use av
 !as view red
 !ent info brute
@@ -34414,9 +34414,10 @@ the description has no Actions section, `!action list` says none can be
 seen (the same reply for a unit without actions), `!action info` reads the
 action as missing, `!find action:` doesn't match and Tab doesn't offer it;
 red's own hero still lists `parry`. Under `used` the orc shows only what
-it has used: `chop` after a successful use, never `bite` (its body
-fails, so it isn't recorded) and not `howl`, whose use `!undo command`
-took back. `!ent dump` names the used actions. A template spawned from
+red has seen it use: `chop` after a successful use (no fog: every team
+sees it), never `bite` (its body fails, so it isn't recorded) and not
+`howl`, whose use `!undo command` took back. `!ent dump` names the used
+actions per team that saw them (red and blue). A template spawned from
 the orc, a clone and a copy in another match start with none; a death and
 revive keep them (the corpse holds them).
 
@@ -34483,8 +34484,15 @@ SCENARIO 1011 — The description under a disguise and for a rider; the short ca
 !as view omniscient
 !ent info archer
 ?? - **fire**: Shoot from the cart.
+?? Riding: Cart (`cart`) in seat gunner: HP 30/30
 !ent info cart
 ?? - **fire**: Shoot from the cart.
+?? **Riders**
+?? - Archer (`archer`) in seat gunner: HP 8/8
+!as view red
+!ent info cart
+?! Archer
+!as view omniscient
 !ent dump spy
 ?? "dagger"
 !action spy haggle
@@ -34499,5 +34507,56 @@ the decoy actions too. Under `used` the decoy's actions show only once the
 unit has used them (never here). The spy's own team (blue) and the
 omniscient view see the real unit, whose actions don't include the decoy's
 (action discovery skips the disguise var: `!action spy haggle` finds
-nothing). A rider's description lists the actions
-its seat gives it; the cart lists its slot's actions as its own.
+nothing). A rider's description lists the actions its seat gives it and
+names the vehicle it rides; the cart lists its slot's actions as its own
+and its riders, except to a team that can't see them (the gunner seat has
+no region, so the archer rides hidden inside and red's view of the cart
+names no rider).
+
+SCENARIO 1012 — Action visibility `used` is per team: under fog a use out of a team's sight stays unknown to it
+---------------------------------------------------------------------------------------------------------------------
+!match new fv Fv 12 4
+!match use fv
+!system set default entity_description_action_visibility used
+!ent add orc Orc 15 5 2
+!ent set_var orc team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc actions.roar.description "A terrible roar."
+!ent set_var orc actions.roar.body "x = 1"
+!ent add scout Scout 10 3 2
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 2
+!ent add sentry Sentry 10 12 4
+!ent set_var sentry team green
+!ent set_var sentry fog_vision_radius 1
+!match fog on
+!action orc roar
+!as view red
+!ent info orc
+?? - **roar**: A terrible roar.
+!as view green
+!find action:roar ids
+?! orc
+!as view omniscient
+!ent tp sentry 7 2
+!as view green
+!ent info orc
+?? **Orc** (`orc`)
+?! roar
+!as view omniscient
+!action orc roar
+!as view green
+!ent info orc
+?? - **roar**: A terrible roar.
+!as view omniscient
+!ent dump orc
+?? **actions seen used:** blue: `actions.roar`; green: `actions.roar`; red: `actions.roar`
+!system unset default entity_description_action_visibility
+
+Expected: under `used` each team records what it has seen. Fog is on; the
+2x2 orc roars while the red scout (vision 2) sees it and the green sentry
+(vision 1, far away) doesn't: red's view lists `roar`, green's doesn't
+(`!find action:` neither). Moving the sentry beside the orc's second cell
+shows green the orc but doesn't reveal
+the earlier roar; once green sees the orc roar again, its view lists it.
+`!ent dump` names who saw it: blue (the orc's own team), green and red.

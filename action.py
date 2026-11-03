@@ -341,7 +341,7 @@ class Action:
     target_refuses_tags: Any = None
     # The unit whose vars hold the action (set by discover_actions; a
     # vehicle for a rider's seat action). run_action records a successful
-    # use on it (Entity.actions_used).
+    # use on it, per team that saw it (Entity.actions_seen).
     holder: Optional[str] = None
 
     @staticmethod
@@ -1478,6 +1478,9 @@ async def run_action(
         target = kept
         bindings["target"] = target
 
+    # The teams that see the actor as it begins: they see the action used
+    # (recorded on success, below).
+    seers = match.teams_seeing(actor_id)
     match._action_depth += 1
     try:
         engine = FormulaEngine(match)
@@ -1597,9 +1600,12 @@ async def run_action(
     # hooks, so a hook that kills or removes the holder can't skip it; an
     # enclosing action that fails rolls it back with everything else.
     holder = match.entities.get(action.holder) if action.holder else None
-    if holder is not None and action.full_path not in holder.actions_used \
-            and len(holder.actions_used) < ACTIONS_USED_MAX:
-        holder.actions_used.append(action.full_path)
+    if holder is not None:
+        for team in seers:
+            paths = holder.actions_seen.setdefault(team, [])
+            if action.full_path not in paths \
+                    and len(paths) < ACTIONS_USED_MAX:
+                paths.append(action.full_path)
     # Successful completion. Fire the on_action_used hook AFTER the
     # body's writes have settled (so a passive observing this hook
     # sees post-action state).
