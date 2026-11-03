@@ -6692,6 +6692,11 @@ ZONE_GRANT_BODIES = ("root", "all")
 ZONE_GRANT_KEY = "__zone_grant"
 ZONE_LINGER_KEY = "__zone_linger"
 ZONE_LINGERING_KEY = "__zone_lingering"
+# What the zones holding a granted status give it now ({level, data}: the
+# highest level among them and that zone's data), so a later sync updates
+# the instance when it changes (L40: a unit walking from a level-1 zone into
+# a level-3 one, or a grant edit, reaches the units already inside).
+ZONE_SPEC_KEY = "__zone_spec"
 # Passes one sync makes at most when the status hooks it fires move units
 # (each move asks for another pass).
 ZONE_GRANT_PASSES = 8
@@ -6726,7 +6731,8 @@ def check_zone_grant(status: Any, entry: Any) -> Dict[str, Any]:
         if not isinstance(data, dict):
             raise VTTError(f"grant `{status}`: data must be a dict.")
         bad = sorted(k for k in data if str(k) in (
-            "level", ZONE_GRANT_KEY, ZONE_LINGER_KEY, ZONE_LINGERING_KEY))
+            "level", ZONE_GRANT_KEY, ZONE_LINGER_KEY, ZONE_LINGERING_KEY,
+            ZONE_SPEC_KEY))
         if bad:
             raise VTTError(f"grant `{status}`: data can't set "
                            f"{', '.join(bad)} (`level` is its own field).")
@@ -10627,6 +10633,7 @@ class Match:
                         inst[ZONE_LINGER_KEY] = linger
                     else:
                         inst.pop(ZONE_LINGER_KEY, None)
+                log += self._update_zone_grant(e, sname, zones)
                 continue
             before = copy.deepcopy(inst)
             self._grant_changes += 1
@@ -10634,7 +10641,8 @@ class Match:
             if isinstance(linger, int) and not isinstance(linger, bool) \
                     and linger > 0:
                 after = {k: v for k, v in inst.items()
-                         if k not in (ZONE_GRANT_KEY, ZONE_LINGER_KEY)}
+                         if k not in (ZONE_GRANT_KEY, ZONE_LINGER_KEY,
+                                      ZONE_SPEC_KEY)}
                 after["duration"] = linger
                 after[ZONE_LINGERING_KEY] = True
                 e.status[sname] = after
@@ -10665,25 +10673,89 @@ class Match:
                     inst[ZONE_LINGER_KEY] = linger
                 log += self._emit_status_diff(eid, sname, before,
                                               copy.deepcopy(inst))
+                if eid in self.entities and sname in e.status:
+                    log += self._update_zone_grant(e, sname, zones)
                 continue
             if inst is not None:
                 continue    # its own status: never taken over
             if e.is_part and sname in self._part_status_names(
                     e, "__status_redirect", "part_status_redirect"):
                 continue    # it would land on the parent
-            grant = self.zone_grants_of(self.find_zone(zones[0])).get(
-                sname) or {}
+            spec = self._grant_spec(zones, sname)
             sdef = self.status_definitions.get(sname) or {}
             seed = (copy.deepcopy(sdef.get("data"))
                     if isinstance(sdef.get("data"), dict) else {})
-            seed.update(copy.deepcopy(grant.get("data") or {}))
+            seed.update(copy.deepcopy(spec["data"]))
             seed[ZONE_GRANT_KEY] = list(zones)
+            seed[ZONE_SPEC_KEY] = copy.deepcopy(spec)
             if linger:
                 seed[ZONE_LINGER_KEY] = linger
-            log += self.apply_status(eid, sname, grant.get("level"),
+            log += self.apply_status(eid, sname, spec["level"],
                                      seed_data=seed)
             if e.status.get(sname) is not None:
                 self._grant_changes += 1
+
+    def _grant_spec(self, zones: List[str], sname: str) -> Dict[str, Any]:
+        """What `zones` (holding status `sname`) give it now: the highest
+        level any of them grants (None: none sets one) and the data of the
+        zone granting it (the first of those tied, else the first zone)."""
+        best_level = None
+        best_data: Any = None
+        for zn in zones:
+            g = self.zone_grants_of(self.find_zone(zn)).get(sname) or {}
+            lv = g.get("level")
+            if isinstance(lv, bool) or not isinstance(lv, (int, float)):
+                lv = None
+            if best_data is None or (lv is not None and (
+                    best_level is None or lv > best_level)):
+                if lv is not None or best_data is None:
+                    best_data = g.get("data") or {}
+                if lv is not None:
+                    best_level = lv
+        return {"level": best_level,
+                "data": copy.deepcopy(best_data)
+                if isinstance(best_data, dict) else {}}
+
+    def _update_zone_grant(self, e: "Entity", sname: str,
+                           zones: List[str]) -> List[str]:
+        """Bring a zone-held status in line with what its zones give now
+        (L40, user call): the level they grant (resistance and max_level
+        apply, as at the first application) and their data; the keys the
+        last grant's data set and this one's lacks go. A status change, so
+        on_status_changed fires. Nothing when it already matches."""
+        inst = e.status.get(sname)
+        if not isinstance(inst, dict):
+            return []
+        spec = self._grant_spec(zones, sname)
+        old = inst.get(ZONE_SPEC_KEY)
+        if same_value(old, spec):
+            return []
+        before = copy.deepcopy(inst)
+        old_data = (old.get("data") if isinstance(old, dict)
+                    and isinstance(old.get("data"), dict) else {})
+        for k in old_data:
+            if k not in spec["data"] and k not in ("level", "duration"):
+                inst.pop(k, None)
+        for k, v in spec["data"].items():
+            inst[k] = copy.deepcopy(v)
+        lv = spec["level"]
+        if lv is not None and not (isinstance(old, dict)
+                                   and old.get("level") == lv):
+            sdef = self.status_definitions.get(sname) or {}
+            new_lv = int(lv)
+            if self.resist_affects(sname, new_lv) in ("level", "both") \
+                    and self._resistance_applies(e, sname, sdef, True):
+                fold = self.resist_fold(e.id, sname, new_lv, level=new_lv)
+                new_lv = fold["value"] if fold["applies"] else \
+                    self.status_level(inst)
+            inst["level"] = self._cap_status_level(sdef, new_lv)
+        inst[ZONE_SPEC_KEY] = copy.deepcopy(spec)
+        self._grant_changes += 1
+        after = copy.deepcopy(inst)
+        strip = lambda d: {k: v for k, v in d.items() if k != ZONE_SPEC_KEY}
+        if same_value(strip(before), strip(after)):
+            return []
+        return self._emit_status_diff(e.id, sname, before, after)
 
     def strip_zone_grants(self, e: "Entity") -> None:
         """Drop the statuses a zone holds on `e` without hooks (a dying
@@ -18279,6 +18351,12 @@ class Match:
         else:
             mode = sdef.get("stack") or str(self.rules.get("status_default_stack", "refresh"))
             inst = e.status[name]
+            # A status with no duration is permanent (∞) and stays so under
+            # every stack mode: an application's duration doesn't start it
+            # counting down (user call, L38; `status_counter_set` gives it
+            # one on purpose).
+            if inst.get("duration") is None:
+                new_duration = None
             if mode == "none":
                 pass
             elif mode == "replace":
@@ -18287,9 +18365,7 @@ class Match:
                 if new_duration is not None:
                     inst["duration"] = new_duration
             elif mode == "extend":
-                # A status with no duration is permanent (∞): extending it
-                # leaves it permanent (user call).
-                if new_duration is not None and inst.get("duration") is not None:
+                if new_duration is not None:
                     inst["duration"] = (_coerce_number(inst.get("duration", 0)) or 0) + new_duration
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1

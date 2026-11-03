@@ -1432,8 +1432,9 @@ hardcodes**.
   field; the status is removed at ≤ 0 (durations and charges alike). A
   counter on a text field is refused. A status with no `duration` is
   permanent (shown as ∞, user call): `status_counter_add` on its duration
-  and a `stack extend` application leave it so (the add returns None);
-  `status_counter_set` gives it one (960).
+  and an application with a duration under every stack mode leave it so
+  (the add returns None; `add_level` still adds its level; L38, user
+  call, 683, 992); `status_counter_set` gives it one (960).
 - **Dispel / transfer:** `status_dispel(eid, token, max)` (token-only, no
   undispellable guard, user call); `status_transfer(from, to, name)` removes
   from the source unconditionally and re-applies on the destination through
@@ -2247,8 +2248,12 @@ hardcodes**.
   removes with removed_by `zone`, or with linger leaves the status with a
   `duration` and `__zone_lingering` (counted down by the GM's tick; a zone
   covering it again takes it back). A status without the marker is the
-  unit's own: never taken over or removed. A held grant isn't re-applied
-  when another zone takes over (its first level / data stay). Who:
+  unit's own: never taken over or removed. A held grant follows its zones (L40, user call, 992): the instance
+  records what they give (`ZONE_SPEC_KEY`: the highest level among them
+  and that zone's data, `_grant_spec`), and when that changes (a walk
+  into a higher zone, a grant edit) `_update_zone_grant` sets the level
+  (resistance and max_level apply) and the data, dropping the keys the
+  last grant's data set, as one status change. Who:
   `grant_bodies` / `zone_status_grant_bodies` (root: the body root once
   when any cell of the body, located / region parts included, is inside;
   all: every unit with a cell inside, glued parts following their unit),
@@ -3107,14 +3112,7 @@ rejected already. Update this section in the PR that resolves an item.
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
   topic of debate (user: write it down).
-- **A timed application of a permanent status** (L38, asked): under
-  `refresh` (the default), `replace` and `add_level` an application with
-  a duration gives a permanent status that duration; only `extend` (and
-  `status_counter_add`) keep it permanent.
-- **A zone grant applies at the first application only** (L40, asked): a
-  unit walking from a level-1 zone into a level-3 one keeps level 1, and
-  an edit of a zone's grant (level, data) reaches only units arriving
-  after it, while definitions are read live.
+
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
   tile, zone or corpse blocks it. Known issue (user: list it).

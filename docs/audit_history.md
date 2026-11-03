@@ -2562,6 +2562,9 @@ differential on the whole suite.
     keyword and None compared with a number are refused in words, JSON
     replies open their fence as ```json, " Nothing was changed." gets its
     own sentence (L36, L37).
+  - Answered after the pass (user calls, 683, 992): a permanent status
+    stays permanent under every stack mode (L38); a zone-held status
+    follows its zones' highest level and that zone's data, a grant edit
+    reaching the units inside (L40).
   - Left open: the action half of X13 (every action serializes the
-    match), formula namespaces at ~2 ms for other conditions, and two
-    questions for the user (L38, L40's first item).
+    match) and formula namespaces at ~2 ms for other conditions.

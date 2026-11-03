@@ -18739,14 +18739,15 @@ SCENARIO 683 — status_transfer keeps the moved instance's own fields
 !status apply c mark
 !ent status c set mark caster other
 !status transfer b c mark
-!assert "status_get('c', 'mark', 'caster') == 'other' and status_get('c', 'mark', 'duration') == 4"
+!assert "status_get('c', 'mark', 'caster') == 'other' and status_duration('c', 'mark') == None"
 
 Expected: A transferred status keeps every field of the moved instance
 (caster, notes): it used to re-seed them from the definition, losing
 `caster = hunter`. Level and duration still go through the destination's
 stacking, resistance and immunity. Onto a destination that already has the
-status, only the stacking applies (the default refresh sets duration 4) and
-the destination's own data stays (`caster = other`).
+status, only the stacking applies and the destination's own data stays
+(`caster = other`); its mark was applied without a duration, so it is
+permanent and stays permanent (the refresh would have set duration 4).
 
 
 SCENARIO 684 — !ent set_vars: several vars, one undo step, all-or-nothing
@@ -33471,3 +33472,52 @@ time (every run puts back the matches it reached) and `k` is home after
 it. A read-only formula's refusal doesn't claim it changed nothing, while a writing one does, in its own sentence. `summon`
 with `vars: null`, `abs(..., map=)` and a None compared with a number are
 refused in words.
+
+SCENARIO 992 — A zone-held status follows its zones; a permanent status stays permanent
+-----------------------------------------------------------------------------------------
+!match new m M 12 6
+!match use m
+!status def bless
+!status hook bless on_changed "entity[self].changed = entity[self].changed + 1"
+!ent add u U 10 1 1 5
+!ent set_var u footprint_w 2
+!ent set_var u changed 0
+!zone new za
+!zone fill za 1 1 3 3
+!zone grant za bless level=1
+!zone new zb
+!zone fill zb 4 1 6 3
+!zone grant zb bless level=3 power=9
+!assert "status_level('u', 'bless') == 1 and entity[u].changed == 0"
+!ent move u 2 right
+!assert "status_level('u', 'bless') == 3 and status_get('u', 'bless', 'power') == 9 and entity[u].changed == 1"
+!zone grant zb bless level=5
+!assert "status_level('u', 'bless') == 5 and not status_has_path('u', 'bless', 'power')"
+!ent move u 2 left
+!assert "status_level('u', 'bless') == 1"
+!ent info u
+?? bless ×1
+?! __zone
+!status def hex
+!status apply u hex
+!status apply u hex 2 3
+?? (level=1, duration=∞)
+!status def ward
+!status stack ward add_level
+!status apply u ward
+!status apply u ward 1 3
+!assert "status_level('u', 'ward') == 2 and status_duration('u', 'ward') == None"
+!status counter u ward set 2
+!status apply u ward 1 5
+!assert "status_duration('u', 'ward') == 5"
+
+Expected: a 2x2 unit standing in `za` (level 1) and then, with a cell, in
+`zb` (level 3, power 9) holds `bless` at the highest level its zones give
+and the data of the zone giving it: level 3 with power 9, through one
+status change (on_changed fires; it kept level 1). Editing `zb`'s grant
+to level 5 without data reaches the unit already inside (level 5, power
+gone). Back in `za` alone, level 1. The bookkeeping keys stay out of `!ent
+info`. A permanent status stays permanent under every stack mode: a timed
+application of `hex` (refresh) or `ward` (add_level, which still adds the
+level) leaves its duration at ∞; once `status_counter set` gives `ward` a
+duration, applications set it as before (5).
