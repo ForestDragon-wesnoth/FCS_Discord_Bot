@@ -394,7 +394,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT
 
 
 class FormulaError(VTTError):
@@ -6053,8 +6053,10 @@ class FormulaEngine:
         def _size_ref(x: Any, own: Any, fname: str) -> Any:
             _sizes_check(fname)
             if isinstance(x, (int, float)) and not isinstance(x, bool):
-                if not math.isfinite(x):
-                    raise FormulaError(f"{fname}(...): a size must be finite.")
+                if not size_number_ok(x):
+                    raise FormulaError(
+                        f"{fname}(...): a size is a finite number of at "
+                        f"most {SIZE_LIMIT} either way.")
                 return x
             if x is None or not isinstance(x, str):
                 eid = _eid(x)        # refuses with the usual wording
@@ -6072,6 +6074,10 @@ class FormulaEngine:
             """(start, next start) of category `cat` (None at an open end);
             a number is its own start and end."""
             if isinstance(cat, (int, float)) and not isinstance(cat, bool):
+                if not size_number_ok(cat):
+                    raise FormulaError(
+                        f"{fname}(...): a size is a finite number of at "
+                        f"most {SIZE_LIMIT} either way.")
                 return cat, None
             if not isinstance(cat, str):
                 raise FormulaError(
@@ -6109,11 +6115,11 @@ class FormulaEngine:
             `category` (a name, or a number standing for its category)."""
             _sizes_check("size_is", scale=True)
             n = _size_ref(x, own, "size_is")
-            if n is None:
-                return False
+            _size_bounds(cat, "size_is")      # a mistyped name is refused
             if isinstance(cat, (int, float)) and not isinstance(cat, bool):
                 cat = match.size_category_of(cat)
-            _size_bounds(cat, "size_is")
+            if n is None:
+                return False
             return match.size_category_of(n) == cat
 
         def _size_at_least(x: Any, cat: Any, own: Any = False) -> bool:
@@ -6131,9 +6137,9 @@ class FormulaEngine:
             in `category` or below; a number compares as size <= that
             number."""
             n = _size_ref(x, own, "size_at_most")
+            _lo, hi = _size_bounds(cat, "size_at_most")
             if isinstance(cat, (int, float)) and not isinstance(cat, bool):
                 return n is not None and n <= cat
-            _lo, hi = _size_bounds(cat, "size_at_most")
             if n is None:
                 return False
             return hi is None or n < hi
@@ -6293,12 +6299,19 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
+            # The current value reads through the level entries (user call,
+            # S14): a level entry's `duration: 5` or `charges: 3` counts down
+            # from 5 / 3, and the result is the instance's own key from then
+            # on (an instance key wins over the entries, as for any field).
+            view = _status_read_view(name, e.status[name])
+            if not isinstance(view, dict):
+                view = {}
             if (not absolute and field == "duration"
-                    and e.status[name].get(field) is None):
+                    and view.get(field) is None):
                 # No duration = permanent (shown as ∞): adding to it leaves
                 # it permanent (user call); status_counter_set gives one.
                 return None
-            raw = e.status[name].get(field, 0)
+            raw = view.get(field, 0)
             cur = _coerce_number(raw)
             if cur is None:
                 raise FormulaError(

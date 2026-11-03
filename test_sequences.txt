@@ -142,11 +142,11 @@ SCENARIO 6 — Custom entity_info_format + !ent dump
 !ent set_var hero max_stamina 50
 !ent set_var hero inventory.sword.damage 12
 !passive add hero regen on_turn_start "entity[self].stamina = entity[self].stamina + 5"
-!ent info hero
+!ent info hero short
 !system set default entity_info_format "{name} [{id}]\nHP: {hp}/{max_hp}\nStamina: {stamina}/{max_stamina}\nPos: ({x},{y}) facing {facing}{?passives_csv?}\nPassives: {passives_csv}{/?}{?inventory.sword?}\nSword damage: {inventory.sword.damage}{/?}"
-!ent info hero
+!ent info hero short
 !system set default entity_info_format "BROKEN_TEMPLATE_NO_PLACEHOLDERS"
-!ent info hero
+!ent info hero short
 !ent dump hero
 
 Expected: First !ent info uses the default multi-line card. Second uses
@@ -189,7 +189,7 @@ SCENARIO 8 — Save/load round-trips templates, passives, state
 !store load savetest.json
 !match use m8
 !list
-!ent info hero
+!ent info hero short
 !passive list hero
 !gpassive list
 !turn next
@@ -388,7 +388,7 @@ SCENARIO 16 — Silent removal bypasses hooks
 !ent set_var hero secret 42
 !passive add hero observer on_var_removed target=secret scope=exact "entity[self].observed = 1"
 !ent delete_var_silent hero secret
-!ent info hero
+!ent info hero short
 
 Expected: secret is gone from vars (silent delete worked) but `observed`
 is NOT set on the entity — the silent variant bypasses the hook.
@@ -419,9 +419,9 @@ SCENARIO 18 — Reactive passive: poison drains hp on item removal
 !ent add hero Hero 30 4 4 10
 !ent set_var hero antidote 1
 !passive add hero poison_kicks_in on_var_removed target=antidote scope=exact "entity[self].hp = entity[self].hp - 10"
-!ent info hero
+!ent info hero short
 !ent delete_var hero antidote
-!ent info hero
+!ent info hero short
 
 Expected: Hero starts at HP 30. After deleting antidote, the passive
 fires on_var_removed and reduces HP to 20. This is a complete reactive
@@ -475,7 +475,7 @@ SCENARIO 21 — Default soft clamp on hp via max_hp
 !ent add hero Hero 30 4 4 10
 !ent set_var hero hp 10
 !ent hp hero +100
-!ent info hero
+!ent info hero short
 !ent set_var hero hp 50
 !ent set_var hero hp 80
 
@@ -496,9 +496,9 @@ SCENARIO 22 — Bypass clamp for overheal
 !ent add hero Hero 30 4 4 10
 !ent set_var hero hp 10
 !ent hp hero +100 bypass_clamp=yes
-!ent info hero
+!ent info hero short
 !ent set_var hero hp 999 bypass_clamp=yes
-!ent info hero
+!ent info hero short
 
 Expected: hp goes from 10 → 110 (bypass lets it exceed max_hp=30), then
 the !ent set_var with bypass sets hp=999. Both ack messages mention
@@ -530,9 +530,9 @@ SCENARIO 24 — System-level clamp via !gclamp commands
 !gclamp add mana max=100 min=0 mode=soft
 !gclamp list
 !ent set_var hero mana 150
-!ent info hero
+!ent info hero short
 !ent set_var hero mana -50
-!ent info hero
+!ent info hero short
 !gclamp remove mana
 
 Expected: !gclamp list initially shows the default hp clamp shipped in
@@ -552,7 +552,7 @@ SCENARIO 25 — Overheal tracking passive via was_clamped/intended_value
 !ent set_var hero overheal_log 0
 !passive add hero overheal_track on_var_changed target=hp scope=exact "entity[self].overheal_log = entity[self].overheal_log + (intended_value - new_value) if was_clamped else entity[self].overheal_log"
 !ent hp hero +100
-!ent info hero
+!ent info hero short
 !ent hp hero +50
 
 Expected: Hero hp goes from 5 toward 105 but clamps at max_hp=30, so the
@@ -588,7 +588,7 @@ Stage A: on_var_changed catches heal-from-below clamping
 !passive add hero track_changed on_var_changed target=hp scope=exact "entity[self].overheal_changed = entity[self].overheal_changed + (intended_value - new_value) if was_clamped else entity[self].overheal_changed"
 !ent set_var hero hp 5
 !ent hp hero +100
-!ent info hero
+!ent info hero short
 
 Result: hp goes from 5 toward 105 but the default soft clamp engages at
 max_hp=30. The on_var_changed event fires with intended_value=105 and
@@ -598,7 +598,7 @@ just the existing hooks.
 Stage B: the gap — heal at full HP produces NO on_var_changed event
 
 !ent hp hero +50
-!ent info hero
+!ent info hero short
 
 Result: hp stays at 30 (already at cap, soft clamp dormant from below
 since old=30=cap, write 80 → clamped to 30 — but 30==30 means the diff is
@@ -612,9 +612,9 @@ Stage C: on_var_write_attempt closes the gap
 !passive add hero track_attempt on_var_write_attempt target=hp scope=exact "entity[self].overheal_attempt = entity[self].overheal_attempt + (intended_value - new_value) if intended_value > new_value else entity[self].overheal_attempt"
 !ent set_var hero hp 5
 !ent hp hero +100
-!ent info hero
+!ent info hero short
 !ent hp hero +50
-!ent info hero
+!ent info hero short
 !eval "entity[hero].overheal_attempt"
 !eval "entity[hero].overheal_changed"
 
@@ -648,7 +648,7 @@ SCENARIO 27 — on_var_write_attempt fires on bypassed writes
 !ent set_var hero hp 25
 !ent hp hero +100 bypass_clamp=yes
 !ent set_var hero hp 5
-!ent info hero
+!ent info hero short
 
 Expected: attempt_log contains three entries:
   |25->25  (normal write, value under cap, no clamp)
@@ -669,7 +669,7 @@ SCENARIO 28 — on_var_write_attempt does NOT fire on removals
 !passive add hero watch_secret on_var_write_attempt target=secret scope=exact "entity[self].remove_attempt_count = entity[self].remove_attempt_count + 1"
 !ent set_var hero secret 99
 !ent delete_var hero secret
-!ent info hero
+!ent info hero short
 
 Expected: remove_attempt_count = 1 (only the set_var fired the attempt
 hook; the delete_var does NOT). Removals have no "no-op gap" — they
@@ -807,9 +807,9 @@ SCENARIO 36 — Entity rename
 !match new ren36 Rename 6 6
 !match use ren36
 !ent add hero Hero 30 3 3 10
-!ent info hero
+!ent info hero short
 !ent rename hero "The Chosen One"
-!ent info hero
+!ent info hero short
 
 Expected: The entity's display name changes; its id (hero) stays the
 same. Subsequent !ent commands still use the id.
@@ -823,7 +823,7 @@ SCENARIO 37 — Entity clone preserves stats and creates new id
 !ent add original Hero 30 2 2 10
 !ent set_var original mana 50
 !ent clone original copy 5 5
-!ent info copy
+!ent info copy short
 
 Expected: A second entity with id "copy" appears at (5,5). It has the
 same hp, mana, and other vars as the original (deep copy). Initiative
@@ -850,11 +850,11 @@ SCENARIO 39 — Entity facing direction
 !match new face39 Face 8 8
 !match use face39
 !ent add hero Hero 30 4 4 10
-!ent info hero
+!ent info hero short
 !ent face hero left
-!ent info hero
+!ent info hero short
 !ent face hero down
-!ent info hero
+!ent info hero short
 
 Expected: Initial facing is set by spawn rules (typically toward map
 center). After !ent face, the facing updates to the specified
@@ -869,9 +869,9 @@ SCENARIO 40 — Entity status flags
 !ent add hero Hero 30 3 3 10
 !ent status hero add poisoned
 !ent status hero add bleeding
-!ent info hero
+!ent info hero short
 !ent status hero remove poisoned
-!ent info hero
+!ent info hero short
 
 Expected: Statuses are entity-owned dicts (each status name maps to
 its own data dict — see scenarios 241+ for the data-carrying side).
@@ -889,8 +889,8 @@ SCENARIO 41 — Entity team assignment
 !ent add enemy Enemy 25 6 6 8
 !ent set_var ally team blue
 !ent set_var enemy team red
-!ent info ally
-!ent info enemy
+!ent info ally short
+!ent info enemy short
 
 Expected: Each entity's team field is set. The default entity_info_format
 template shows the team field when populated. Teams are used by some
@@ -905,7 +905,7 @@ SCENARIO 42 — Entity teleport (instant move, no movement passives)
 !match use tp42
 !ent add hero Hero 30 1 1 10
 !ent tp hero 5 5
-!ent info hero
+!ent info hero short
 
 Expected: Hero moves from (1,1) to (5,5) in one operation. !ent tp does
 no path-checking or movement-cost validation; it's an instant relocate.
@@ -972,9 +972,9 @@ SCENARIO 46 — Deleting a single var
 !ent add hero Hero 30 3 3 10
 !ent set_var hero buff_strength 5
 !ent set_var hero buff_speed 3
-!ent info hero
+!ent info hero short
 !ent delete_var hero buff_strength
-!ent info hero
+!ent info hero short
 
 Expected: buff_strength is removed from the entity's vars. buff_speed
 remains. !ent info reflects the updated state.
@@ -1024,7 +1024,7 @@ SCENARIO 49 — Silent deletion bypasses hooks
 !ent set_var hero junk 42
 !passive add hero watch on_var_removed target=junk scope=exact "entity[self].observed = 1"
 !ent delete_var_silent hero junk
-!ent info hero
+!ent info hero short
 
 Expected: junk is removed from vars, but the watching passive does NOT
 fire. observed stays at 0. The silent variant is for cleanup operations
@@ -1039,9 +1039,9 @@ SCENARIO 50 — Reading and writing inside formulas via $(...)
 !ent add hero Hero 30 3 3 10
 !ent set_var hero strength 8
 !ent hp hero "+$(entity[this].strength * -2)"
-!ent info hero
+!ent info hero short
 !ent hp hero "+$(entity[this].strength)"
-!ent info hero
+!ent info hero short
 
 Expected: First $() evaluates to strength*-2 = -16, applied as damage
 (hp drops to 14). Second $() evaluates to strength = 8, applied as heal
@@ -1134,10 +1134,10 @@ SCENARIO 55 — Stamina regen each turn
 !ent set_var hero max_stamina 50
 !passive add hero stamina_regen on_turn_start "entity[self].stamina = min(entity[self].stamina + 8, entity[self].max_stamina)"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Each on_turn_start fires, stamina increases by 8 capped at 50.
 After first turn: 18. After second: 26. (The first !turn next is the
@@ -1152,11 +1152,11 @@ SCENARIO 56 — Poison damage over time
 !ent add hero Hero 30 3 3 10
 !ent set_var hero poison_stacks 3
 !passive add hero poison_dot on_turn_start "entity[self].hp = entity[self].hp - entity[self].poison_stacks"
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: At the start of each turn, hero loses HP equal to poison_stacks
 (3 per turn). Note this passive doesn't decrement stacks — that's a
@@ -1172,11 +1172,11 @@ SCENARIO 57 — Poison with decaying stacks
 !ent set_var hero poison_stacks 5
 !passive add hero poison_tick on_turn_start "if entity[self].poison_stacks > 0:\n    entity[self].hp = entity[self].hp - entity[self].poison_stacks\n    entity[self].poison_stacks = entity[self].poison_stacks - 1"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Each turn the dot ticks AND poison_stacks decrements by 1.
 After three turns: 5+4+3 = 12 damage taken, stacks down to 2. After
@@ -1192,11 +1192,11 @@ SCENARIO 58 — Regen that scales with missing HP (more powerful when wounded)
 !ent set_var hero hp 10
 !passive add hero adaptive_regen on_turn_start "entity[self].hp = entity[self].hp + max(2, (entity[self].max_hp - entity[self].hp) // 4)"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Heal amount is max(2, missing_hp / 4). At 10/30 (missing 20):
 heal 5 → 15/30. At 15/30 (missing 15): heal 3 → 18/30. At 18/30 (missing
@@ -1214,8 +1214,8 @@ SCENARIO 59 — Round-start global passive: all entities get a small heal
 !ent set_var a2 hp 20
 !gpassive add hearth_heal on_round_start "entity[self].hp = entity[self].hp + 2"
 !turn next
-!ent info a1
-!ent info a2
+!ent info a1 short
+!ent info a2 short
 
 Expected: on_round_start fires once per entity in turn order. Both
 entities heal by 2 at the start of round 1.
@@ -1230,13 +1230,13 @@ SCENARIO 60 — Decrementing duration counters
 !ent set_var hero buff_turns 3
 !passive add hero buff_tick on_turn_start "if entity[self].buff_turns > 0:\n    entity[self].buff_turns = entity[self].buff_turns - 1"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: buff_turns decrements each turn until it hits 0 and stays
 there. After 3 !turn next cycles, buff_turns is 0.
@@ -1249,7 +1249,7 @@ SCENARIO 61 — On_entity_spawned: initialize entity-specific state
 !match use spawn61
 !gpassive add init_action_economy on_entity_spawned "entity[self].actions_remaining = 2"
 !ent add hero Hero 30 3 3 10
-!ent info hero
+!ent info hero short
 
 Expected: When Hero is spawned, the global passive fires with self=hero
 and initializes actions_remaining to 2.
@@ -1268,8 +1268,8 @@ SCENARIO 62 — Round-end cleanup
 !turn next
 !turn next
 !turn next
-!ent info a1
-!ent info a2
+!ent info a1 short
+!ent info a2 short
 
 Expected: After the round wraps (on_round_end fires), both entities have
 actions_remaining reset to 2. The on_round_end fires once per entity in
@@ -1289,7 +1289,7 @@ SCENARIO 63 — Turn-end vs turn-start: when to put each kind of tick
 !turn next
 !turn next
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: First !turn next: start_count goes 0→1, no advance. Second:
 end_count 0→1, advance (only one entity so wraps), start_count 1→2.
@@ -1315,9 +1315,9 @@ SCENARIO 64 — Life-to-mana conversion: damage taken refunds mana
 !ent set_var hero max_mana 100
 !passive add hero blood_mage on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[self].mana = min(entity[self].mana + (old_value - new_value) // 2, entity[self].max_mana)"
 !ent hp hero -10
-!ent info hero
+!ent info hero short
 !ent hp hero -8
-!ent info hero
+!ent info hero short
 
 Expected: First damage: 30→20, hero gains 5 mana. Second damage: 20→12,
 hero gains 4 mana (8 damage / 2 = 4). Mana caps at max_mana.
@@ -1334,8 +1334,8 @@ SCENARIO 65 — Thorns: attacker takes damage equal to half what you took
 !list
 !passive add hero thorns on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[this].hp = entity[this].hp - (old_value - new_value) // 2"
 !ent hp hero -10
-!ent info hero
-!ent info foe
+!ent info hero short
+!ent info foe short
 
 Expected: Foe has higher initiative so it's the current entity (this).
 When hero takes 10 damage, the thorns passive runs with self=hero and
@@ -1359,11 +1359,11 @@ This is getting complex. A simpler version:
 !passive remove hero mana_shield
 !passive add hero mana_absorbs on_var_changed target=hp scope=exact "if new_value < old_value and entity[self].mana > 0:\n    entity[self].hp = old_value\n    entity[self].mana = max(0, entity[self].mana - (old_value - new_value))"
 !ent hp hero -15
-!ent info hero
+!ent info hero short
 !ent hp hero -15
-!ent info hero
+!ent info hero short
 !ent hp hero -15
-!ent info hero
+!ent info hero short
 
 Expected: When hp drops, mana absorbs the damage (hp is restored, mana
 takes the hit). At mana=20, taking 15 damage restores hp and drops mana
@@ -1387,8 +1387,8 @@ SCENARIO 67 — Lifesteal: healing on every successful hp drop on opponents
 !turn next
 !list
 !ent hp foe -20
-!ent info hero
-!ent info foe
+!ent info hero short
+!ent info foe short
 
 Expected: Hero is current (higher init). When foe takes 20 damage, the
 global lifesteal passive fires with self=foe and this=hero. Since
@@ -1426,9 +1426,9 @@ SCENARIO 69 — Phase transition: boss changes state below 50% hp
 !ent set_var boss base_attack 5
 !passive add boss enrage on_var_changed target=hp scope=exact "if new_value <= entity[self].max_hp // 2 and entity[self].phase == 1:\n    entity[self].phase = 2\n    entity[self].base_attack = entity[self].base_attack * 2"
 !ent hp boss -40
-!ent info boss
+!ent info boss short
 !ent hp boss -15
-!ent info boss
+!ent info boss short
 
 Expected: First damage: hp 100→60, still above 50% (=50), phase stays
 1. Second damage: hp 60→45, drops below 50% threshold. Phase becomes 2,
@@ -1444,11 +1444,11 @@ SCENARIO 70 — Shield variable absorbs damage before hp
 !ent add hero Hero 30 3 3 10
 !ent set_var hero shield 20
 !passive add hero shield_absorb on_var_write_attempt target=hp scope=exact "if intended_value < old_value and entity[self].shield > 0:\n    entity[self].shield = max(0, entity[self].shield - (old_value - intended_value))"
-!ent info hero
+!ent info hero short
 !ent hp hero -15
-!ent info hero
+!ent info hero short
 !ent hp hero -15
-!ent info hero
+!ent info hero short
 
 Expected: Note this uses on_var_write_attempt because we want to react
 even when the resulting hp is unchanged. The passive doesn't actually
@@ -1469,11 +1469,11 @@ SCENARIO 71 — Cooldown timer on a special ability
 !passive add hero cooldown_tick on_turn_end "if entity[self].ult_cooldown > 0:\n    entity[self].ult_cooldown = entity[self].ult_cooldown - 1"
 !ent set_var hero ult_cooldown 3
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: ult_cooldown decrements each turn end until it hits 0. The
 GM checks `ult_cooldown > 0` before letting the player use the ability,
@@ -1492,9 +1492,9 @@ SCENARIO 72 — Death save: when hp hits 0, roll a save (counter)
 !ent set_var hero __death_condition "entity[self].death_saves >= 3"
 !passive add hero on_dying on_var_changed target=hp scope=exact "if new_value <= 0 and entity[self].status_downed == 0:\n    entity[self].status_downed = 1\n    entity[self].hp = 0"
 !ent hp hero -50
-!ent info hero
+!ent info hero short
 !ent hp hero -5
-!ent info hero
+!ent info hero short
 
 Expected: The hero's own death condition replaces the default (`__death_mode
 replace`, `__death_condition` = three failed saves), so hp 0 downs it without
@@ -1513,7 +1513,7 @@ SCENARIO 73 — Mana cost validation via formula in $()
 !ent set_var hero mana 20
 !eval "entity[hero].mana >= 15"
 !ent set_var hero mana "$(entity[hero].mana - 15)"
-!ent info hero
+!ent info hero short
 !eval "entity[hero].mana >= 15"
 
 Expected: First eval returns True (20 >= 15). Cast the spell: mana goes
@@ -1569,13 +1569,13 @@ SCENARIO 76 — Buff with duration tied to round count
 !passive add hero rage_tick on_turn_start "if entity[self].rage_turns > 0:\n    entity[self].rage_turns = entity[self].rage_turns - 1\n    entity[self].damage_bonus = 5\nelse:\n    entity[self].damage_bonus = 0"
 !ent set_var hero rage_turns 3
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: When rage_turns is activated to 3, the next 3 turn_starts
 keep damage_bonus at 5 and decrement rage_turns. On the 4th turn,
@@ -1595,9 +1595,9 @@ SCENARIO 77 — Aura: global passive applies to every entity each round
 !ent set_var ally team blue
 !ent set_var enemy team red
 !turn next
-!ent info hero
-!ent info ally
-!ent info enemy
+!ent info hero short
+!ent info ally short
+!ent info enemy short
 
 Expected: At round start, the aura fires once per entity. Blue team
 members (hero, ally) get morale_bonus=2; red team (enemy) gets
@@ -1615,7 +1615,7 @@ SCENARIO 78 — XP gain tracked on entity, level-up via passive
 !ent set_var hero xp_to_next 100
 !passive add hero level_up on_var_changed target=xp scope=exact "if new_value >= entity[self].xp_to_next:\n    entity[self].level = entity[self].level + 1\n    entity[self].xp = new_value - entity[self].xp_to_next\n    entity[self].xp_to_next = entity[self].xp_to_next + 50"
 !ent set_var hero xp 60
-!ent info hero
+!ent info hero short
 !ent set_var hero xp 110
 
 Expected: First xp gain: 60 stays below threshold (100), level stays 1.
@@ -1638,15 +1638,15 @@ SCENARIO 79 — Spell that costs mana AND has a duration
 !ent set_var hero shield_turns 3
 !ent set_var hero shield_active 1
 !passive add hero shield_decay on_turn_start "if entity[self].shield_turns > 0:\n    entity[self].shield_turns = entity[self].shield_turns - 1\nelse:\n    entity[self].shield_active = 0"
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Casting the spell costs 20 mana (50→30) and sets shield_turns
 to 3 + shield_active to 1. Each turn_start, the decay passive ticks
@@ -1683,7 +1683,7 @@ SCENARIO 81 — Counter-attack: when you dodge, you hit back
 !ent set_var hero last_dodge 0
 !passive add hero counter_strike on_var_changed target=last_dodge scope=exact "if new_value == 1:\n    entity[this].hp = entity[this].hp - entity[self].counter_damage\n    entity[self].last_dodge = 0"
 !ent set_var hero last_dodge 1
-!ent info foe
+!ent info foe short
 
 Expected: last_dodge starts at 0 (on_var_changed fires on a CHANGE, not on
 the var's creation, so the var has to exist first). When the GM signals a
@@ -1720,11 +1720,11 @@ SCENARIO 83 — Multiple-status DOT with per-status passives
 !passive add hero burn_tick on_turn_start "if entity[self].burn_turns > 0:\n    entity[self].hp = entity[self].hp - 3\n    entity[self].burn_turns = entity[self].burn_turns - 1"
 !passive add hero poison_tick on_turn_start "if entity[self].poison_turns > 0:\n    entity[self].hp = entity[self].hp - 2\n    entity[self].poison_turns = entity[self].poison_turns - 1"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Two passives fire on each turn_start. First turn: burn 3,
 poison 2, hp 50→45. Burn_turns 2, poison_turns 1. Second turn: burn 3,
@@ -1748,7 +1748,7 @@ SCENARIO 84 — On_var_created: trigger when first picked up
 !ent set_var hero inventory.sword.damage 12
 !ent set_var hero inventory.potion.healing 20
 !ent set_var hero inventory.sword.weight 5
-!ent info hero
+!ent info hero short
 
 Expected: pickup_log shows "|inventory.sword|inventory.potion" — both
 were direct children of inventory and were newly created. The sword.weight
@@ -1766,7 +1766,7 @@ SCENARIO 85 — On_var_removed: clean up when an item leaves
 !ent set_var hero attuned_to "sword"
 !passive add hero unattune on_var_removed target=inventory.sword scope=exact "if entity[self].attuned_to == \"sword\":\n    entity[self].attuned_to = \"\""
 !ent delete_var hero inventory.sword
-!ent info hero
+!ent info hero short
 
 Expected: When the sword is removed, the passive checks if the entity
 was attuned to it. Since attuned_to == "sword", it gets cleared.
@@ -1783,7 +1783,7 @@ SCENARIO 86 — Deep watch: track every change inside an inventory subtree
 !ent set_var hero inventory.sword.damage 12
 !ent set_var hero inventory.sword.damage 15
 !ent delete_var hero inventory.sword
-!ent info hero
+!ent info hero short
 
 Expected: audit_log accumulates created events for inventory, sword,
 damage; one changed event for damage (12→15); removed events for damage
@@ -1801,7 +1801,7 @@ SCENARIO 87 — Use intended_value to validate writes that would have been waste
 !passive add hero heal_audit on_var_write_attempt target=hp scope=exact "if intended_value > old_value and intended_value > new_value:\n    entity[self].wasted_heal_log = entity[self].wasted_heal_log + (intended_value - new_value)"
 !ent set_var hero hp 25
 !ent hp hero +100
-!ent info hero
+!ent info hero short
 !ent hp hero +30
 
 Expected: First heal: intended=125, new=30, wasted=95. Counter += 95.
@@ -1821,7 +1821,7 @@ SCENARIO 88 — Root-watch passive (target="" scope=deep): audit everything
 !ent set_var hero mana 50
 !ent set_var hero stamina 30
 !ent set_var hero gold 100
-!ent info hero
+!ent info hero short
 
 Expected: Empty target with deep scope catches every var change on the
 entity. Note: writes to "touches" itself also count, which leads to
@@ -1843,7 +1843,7 @@ SCENARIO 89 — Was_clamped flag distinguishes natural changes from clamped ones
 !ent hp hero +3
 !ent hp hero +100
 !ent hp hero -10
-!ent info hero
+!ent info hero short
 
 Expected: First heal (+3): hp 5→8, no clamp, unclamped_count → 1.
 Second heal (+100): hp 8→30 (clamped), clamped_count → 1.
@@ -1864,7 +1864,7 @@ SCENARIO 90 — Hook_name discriminator inside on_var_written
 !ent set_var hero mana 30
 !ent set_var hero mana 30
 !ent delete_var hero mana
-!ent info hero
+!ent info hero short
 
 Expected: created_count=1 (first set), changed_count=1 (50→30; same
 value 30→30 fires nothing because no diff), removed_count=1 (delete).
@@ -1888,7 +1888,7 @@ SCENARIO 91 — Multiple clamps on one entity
 !ent set_var hero mana 150
 !ent set_var hero stamina -10
 !ent set_var hero rage 20
-!ent info hero
+!ent info hero short
 
 Expected: mana clamps to 100, stamina to 0 (hard min), rage to 10.
 
@@ -1902,7 +1902,7 @@ SCENARIO 92 — Cross-variable clamp: damage clamped by armor
 !ent set_var hero max_focus 50
 !clamp add hero focus max=max_focus min=0 mode=soft
 !ent set_var hero focus 100
-!ent info hero
+!ent info hero short
 !ent set_var hero max_focus 30
 !ent set_var hero focus 100
 
@@ -1919,10 +1919,10 @@ SCENARIO 93 — Hard clamp pulls a value down when it's already over
 !match use hc93
 !ent add hero Hero 30 3 3 10
 !ent set_var hero hp 999 bypass_clamp=yes
-!ent info hero
+!ent info hero short
 !clamp add hero hp max=max_hp mode=hard
 !ent hp hero -1
-!ent info hero
+!ent info hero short
 
 Expected: Hp is 999 (bypassed). Adding a hard clamp. The next hp
 adjustment (heal/damage) goes through write_var, which engages the
@@ -1938,7 +1938,7 @@ SCENARIO 94 — Soft clamp DOES NOT pull a value down when it's already over
 !ent add hero Hero 30 3 3 10
 !ent set_var hero hp 999 bypass_clamp=yes
 !ent hp hero -1
-!ent info hero
+!ent info hero short
 
 Expected: hp is 999 (bypassed). Hp loss of 1 brings it to 998. The
 default soft clamp doesn't engage because the prior value (999) was
@@ -1953,7 +1953,7 @@ SCENARIO 95 — Bypass clamp for overheal scaling
 !ent add hero Hero 30 3 3 10
 !ent set_var hero hp 25
 !ent hp hero +50 bypass_clamp=yes
-!ent info hero
+!ent info hero short
 
 Expected: Heal 25→75, bypassing the max_hp=30 clamp. Useful for
 characters with explicit overheal mechanics where the normal cap
@@ -1970,9 +1970,9 @@ SCENARIO 96 — System-level clamp via !gclamp commands
 !gclamp add stamina max=50 min=0 mode=soft
 !gclamp list
 !ent set_var hero stamina 999
-!ent info hero
+!ent info hero short
 !ent set_var hero stamina -5
-!ent info hero
+!ent info hero short
 !gclamp remove stamina
 
 Expected: gclamp shows the default hp clamp and the new stamina clamp.
@@ -1987,7 +1987,7 @@ SCENARIO 97 — Removing the default hp clamp lets hp go free
 !ent add hero Hero 30 3 3 10
 !gclamp remove hp
 !ent hp hero +100
-!ent info hero
+!ent info hero short
 !gclamp add hp max=max_hp mode=soft
 
 Expected: Without the hp clamp, hp goes to 130 freely after a +100 heal.
@@ -2004,7 +2004,7 @@ SCENARIO 98 — Min-only clamp (floor without ceiling)
 !clamp add hero debt min=0 mode=hard
 !ent set_var hero debt 100
 !ent set_var hero debt -50
-!ent info hero
+!ent info hero short
 
 Expected: Setting debt to 100 succeeds (no max). Setting it to -50 hits
 the hard min and clamps to 0.
@@ -2030,7 +2030,7 @@ SCENARIO 100 — Non-numeric writes bypass clamps
 !ent add hero Hero 30 3 3 10
 !clamp add hero status max=10 mode=hard
 !ent set_var hero status "knocked_out"
-!ent info hero
+!ent info hero short
 
 Expected: status is a string. The clamp only applies to numeric writes,
 so the string passes through unchanged.
@@ -2108,9 +2108,9 @@ SCENARIO 105 — Multi-line entity_info_format
 !ent set_var hero level 5
 !ent set_var hero stats.str 14
 !system set default entity_info_format "**{name}** L{level}\nHP: {hp}/{max_hp}\nSTR: {stats.str}{?team?}\nTeam: {team}{/?}"
-!ent info hero
+!ent info hero short
 !ent set_var hero team blue
-!ent info hero
+!ent info hero short
 
 Expected: !ent info shows a 3-line card initially. After setting the
 team, the conditional section adds a 4th line. The \n in the template
@@ -2172,7 +2172,7 @@ SCENARIO 108 — Full match round-trip
 !store load save108.json
 !match use save108
 !list
-!ent info hero
+!ent info hero short
 !passive list hero
 !clamp list hero
 
@@ -2250,7 +2250,7 @@ SCENARIO 112 — $() with self binding
 !ent add hero Hero 30 3 3 10
 !ent set_var hero atk 8
 !ent hp hero "+$(entity[self].atk * -1)"
-!ent info hero
+!ent info hero short
 
 Expected: $() evaluates with self=hero (the entity in arg[1] of !ent hp).
 entity[self].atk * -1 = -8, applied as damage. Hp: 30→22.
@@ -2266,7 +2266,7 @@ SCENARIO 113 — $() with this binding (current-turn entity)
 !turn next
 !ent set_var foe weapon_dmg 12
 !ent hp hero "+$(entity[this].weapon_dmg * -1)"
-!ent info hero
+!ent info hero short
 
 Expected: Foe is current (init=20). $() resolves this=foe. Foe's
 weapon_dmg=12 becomes -12 damage to hero. Hero hp: 30→18.
@@ -2280,7 +2280,7 @@ SCENARIO 114 — $() in set_var, computing a derived value
 !ent add hero Hero 30 3 3 10
 !ent set_var hero level 5
 !ent set_var hero max_mana "$(entity[self].level * 20)"
-!ent info hero
+!ent info hero short
 
 Expected: max_mana = level * 20 = 100.
 
@@ -2293,10 +2293,10 @@ SCENARIO 115 — Conditional damage via $()
 !ent add hero Hero 30 3 3 10
 !ent set_var hero dodging 0
 !ent hp hero "+$(0 if entity[self].dodging else -10)"
-!ent info hero
+!ent info hero short
 !ent set_var hero dodging 1
 !ent hp hero "+$(0 if entity[self].dodging else -10)"
-!ent info hero
+!ent info hero short
 
 Expected: First hit: dodging=0, takes -10, hp 30→20. Second hit:
 dodging=1, takes 0, hp stays at 20.
@@ -2311,7 +2311,7 @@ SCENARIO 116 — Computed initiative based on stats
 !ent set_var hero dex 14
 !ent set_var hero base_init 5
 !ent init hero "$(entity[self].base_init + entity[self].dex // 2)"
-!ent info hero
+!ent info hero short
 
 Expected: Initiative = base + dex/2 = 5 + 7 = 12.
 
@@ -2342,7 +2342,7 @@ SCENARIO 118 — If/elif/else statement
 !ent add hero Hero 30 3 3 10
 !ent set_var hero mode normal
 !eval "if entity[hero].mode == \"easy\":\n    entity[hero].score = 100\nelif entity[hero].mode == \"normal\":\n    entity[hero].score = 50\nelse:\n    entity[hero].score = 10"
-!ent info hero
+!ent info hero short
 
 Expected: mode=normal hits elif, score=50.
 
@@ -2505,17 +2505,17 @@ SCENARIO 129 — Charge-up ability: build resource over turns
 !ent set_var hero charge_max 100
 !passive add hero build_charge on_turn_start "entity[self].charge = min(entity[self].charge + 20, entity[self].charge_max)"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Charge builds 20 per turn: 20, 40, 60, 80, 100, then caps at
 100. At 100 the GM lets the player unleash a powerful ability and
@@ -2549,11 +2549,11 @@ SCENARIO 131 — Curse mark that triggers when crossed
 !ent set_var hero curse_triggered 0
 !passive add hero curse_mark on_var_changed target=hp scope=exact "if new_value < 10 and entity[self].curse_triggered == 0:\n    entity[self].curse_triggered = 1\n    entity[self].hp = entity[self].hp - 5"
 !ent hp hero -10
-!ent info hero
+!ent info hero short
 !ent hp hero -8
-!ent info hero
+!ent info hero short
 !ent hp hero -1
-!ent info hero
+!ent info hero short
 
 Expected: First damage 25→15, not yet below 10. Second damage 15→7,
 crosses below 10, curse triggers — extra -5 → hp=2. curse_triggered=1
@@ -2570,7 +2570,7 @@ SCENARIO 132 — Counter-attack damage based on enemy's missing HP
 !turn next
 !ent set_var foe hp 20
 !ent hp hero "+$((entity[this].max_hp - entity[this].hp) // 5)"
-!ent info hero
+!ent info hero short
 
 Expected: Foe (this) is at 20/100, missing 80. Execute heal scales with
 foe's wound: 80/5 = 16 heal for hero. Hero hp 30 + 16 = 46, but clamps
@@ -2587,7 +2587,7 @@ SCENARIO 133 — Damage reflect that bypasses clamp for "true damage"
 !turn next
 !ent hp foe -25
 !ent set_var foe hp 5 bypass_clamp=yes
-!ent info foe
+!ent info foe short
 
 Expected: First, foe takes 25 damage (50→25, well within max). Second,
 the GM uses bypass_clamp to force hp to 5 (simulating "true damage" or
@@ -2606,11 +2606,11 @@ SCENARIO 134 — Multi-stage boss with health gates
 !passive add boss phase_3_gate on_var_changed target=hp scope=exact "if new_value <= entity[self].max_hp // 2 and entity[self].phase < 3:\n    entity[self].phase = 3"
 !passive add boss enrage_gate on_var_changed target=hp scope=exact "if new_value <= entity[self].max_hp // 4 and entity[self].enraged == 0:\n    entity[self].enraged = 1"
 !ent hp boss -60
-!ent info boss
+!ent info boss short
 !ent hp boss -50
-!ent info boss
+!ent info boss short
 !ent hp boss -60
-!ent info boss
+!ent info boss short
 
 Expected: Phase advances as hp crosses 75%, 50%, 25% thresholds.
 Damage 60→140: phase 2 triggers (140 <= 150). Damage 50→90: phase 3
@@ -2632,8 +2632,8 @@ SCENARIO 135 — Heal-on-kill: when enemy hp hits 0, allies heal
 !turn next
 !ent set_var hero hp 15
 !ent hp foe -25
-!ent info hero
-!ent info foe
+!ent info hero short
+!ent info foe short
 
 Expected: Foe (initiative 20) opens the round, so `this` = foe. The global
 passive fires on each hp change, but in a var hook `self` is also the
@@ -2653,11 +2653,11 @@ SCENARIO 136 — Stack count with cap
 !ent set_var hero stacks 0
 !clamp add hero stacks max=5 min=0 mode=hard
 !ent set_var hero stacks 3
-!ent info hero
+!ent info hero short
 !ent set_var hero stacks 8
-!ent info hero
+!ent info hero short
 !ent set_var hero stacks -1
-!ent info hero
+!ent info hero short
 
 Expected: Stacks always stays in [0, 5]. Writes of 3, 8, -1 produce
 3, 5 (clamped), 0 (clamped).
@@ -2675,7 +2675,7 @@ SCENARIO 137 — Cumulative damage tracker (lifetime stat)
 !ent hp hero -8
 !ent hp hero +3
 !ent hp hero -10
-!ent info hero
+!ent info hero short
 
 Expected: damage_taken_lifetime = 5 + 8 + 0 + 10 = 23. The heal (+3)
 doesn't increase the counter because the conditional checks new < old.
@@ -2692,7 +2692,7 @@ SCENARIO 138 — Mirror match: copy stats from another entity
 !ent add mirror Mirror 30 5 5 10
 !ent set_var mirror atk "$(entity[hero].atk)"
 !ent set_var mirror defense "$(entity[hero].defense)"
-!ent info mirror
+!ent info mirror short
 
 Expected: Mirror's atk=15 and defense=8, copied from hero via $() at
 creation time. Note: this is a one-time copy, not a binding — if
@@ -2712,9 +2712,9 @@ SCENARIO 139 — Aggregate damage check across multiple sources
 !ent hp hero -3
 !ent hp hero -5
 !ent hp hero -2
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Across the turn, hero takes 3+5+2=10 damage, turn_damage=10.
 At the next turn_start, turn_damage resets to 0. Useful for "if you
@@ -2731,9 +2731,9 @@ SCENARIO 140 — Channeled ability: must stay still
 !ent set_var hero channel_x 3
 !ent set_var hero channel_y 3
 !passive add hero break_channel on_var_changed target=x scope=exact "if entity[self].channeling == 1 and new_value != entity[self].channel_x:\n    entity[self].channeling = 0"
-!ent info hero
+!ent info hero short
 !ent tp hero 4 3
-!ent info hero
+!ent info hero short
 
 Expected: Hero starts channeling at (3,3). Teleporting to (4,3) changes
 x from 3 to 4. The passive sees x changed and channel_x is still 3, so
@@ -2754,11 +2754,11 @@ SCENARIO 141 — Resource regen rate tied to a stat
 !ent set_var hero max_mana 100
 !passive add hero spirit_regen on_turn_start "entity[self].mana = min(entity[self].mana + entity[self].spirit // 3, entity[self].max_mana)"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Mana regen per turn = spirit / 3 = 4. After three turns:
 4, 8, 12. The rate scales with the entity's spirit stat — buff spirit
@@ -2775,9 +2775,9 @@ SCENARIO 142 — Dynamic max_hp scaled by level
 !ent set_var hero hp_per_level 5
 !passive add hero level_max_hp on_var_changed target=level scope=exact "entity[self].max_hp = 25 + new_value * entity[self].hp_per_level"
 !ent set_var hero level 2
-!ent info hero
+!ent info hero short
 !ent set_var hero level 5
-!ent info hero
+!ent info hero short
 
 Expected: Setting level=2 triggers the passive, max_hp = 25 + 2*5 = 35.
 Setting level=5: max_hp = 25 + 25 = 50. The clamp's reference to
@@ -2815,7 +2815,7 @@ SCENARIO 144 — Periodic event: every 3 turns, something happens
 !turn next
 !turn next
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: Every 3 turns the counter wraps and pulse_count increments.
 After 8 turn_starts (the initial init + 7 more): turn_counter cycles
@@ -2860,7 +2860,7 @@ SCENARIO 146 — Build a custom RPG system from scratch
 !ent set_var fighter ac 16
 !ent set_var fighter class "Fighter"
 !list
-!ent info fighter
+!ent info fighter short
 
 Expected: A bespoke D&D-style system with custom rendering. The
 template references ac, level, class — vars that the GM sets per
@@ -2899,8 +2899,8 @@ SCENARIO 148 — Combined: lifesteal vamp + thorns barrier on a single entity
 !ent add target Target 30 5 5 10
 !passive add target thorn_aura on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[this].hp = entity[this].hp - (old_value - new_value) // 4"
 !ent hp target -20
-!ent info vamp
-!ent info target
+!ent info vamp short
+!ent info target short
 
 Expected: Vampire is current (init=15 > 10). Target takes 20 damage
 (30→10). Target's thorn passive fires: vamp (this) takes 20/4 = 5
@@ -2938,7 +2938,7 @@ SCENARIO 150 — Demonstration of two scopes interacting
 !ent set_var hero loadout.weapon "axe"
 !ent set_var hero loadout.gear.boots "leather"
 !ent set_var hero loadout.gear.boots "iron"
-!ent info hero
+!ent info hero short
 
 Expected: First write: creates loadout, loadout.weapon (children + deep
 both watching at their respective paths fire creation NOT change so
@@ -2968,10 +2968,10 @@ SCENARIO 151 — Demonstration of save/load equivalence
 !clamp add hero mana max=100 mode=soft
 !turn next
 !turn next
-!ent info hero
+!ent info hero short
 !store save eq151_before.json
 !store load eq151_before.json
-!ent info hero
+!ent info hero short
 
 Expected: !ent info before save and after load show identical state.
 This is the strongest validation that serialization is complete and
@@ -2995,7 +2995,7 @@ SCENARIO 152 — Multiple passives on the same hook fire in registration order
 !passive add hero p2 on_turn_start "entity[self].log = entity[self].log + \"|P2\""
 !passive add hero p3 on_turn_start "entity[self].log = entity[self].log + \"|P3\""
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: log = "|P1|P2|P3" — passives fire in the order they were
 registered (insertion order in the dict).
@@ -3011,7 +3011,7 @@ SCENARIO 153 — Global passive runs BEFORE entity-owned passive
 !gpassive add g1 on_turn_start "entity[self].log = entity[self].log + \"|G1\""
 !passive add hero e1 on_turn_start "entity[self].log = entity[self].log + \"|E1\""
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: log = "|G1|E1". Global passives fire first, then entity
 passives — both filtered to the entity whose turn is starting.
@@ -3029,7 +3029,7 @@ SCENARIO 154 — Multiple matching var passives all fire on one event
 !passive add hero count_writes on_var_written target=hp scope=exact "entity[self].written_events = entity[self].written_events + 1"
 !ent hp hero -5
 !ent hp hero +3
-!ent info hero
+!ent info hero short
 
 Expected: hp_changes=2 (both writes produced changes), written_events=2
 (on_var_written catch-all fires for each, since each was a change).
@@ -3044,14 +3044,14 @@ SCENARIO 155 — Removing a passive mid-match
 !ent set_var hero ticks 0
 !passive add hero counter on_turn_start "entity[self].ticks = entity[self].ticks + 1"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !passive remove hero counter
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: ticks counts up while the passive is active (2 ticks), then
 stays at 2 after the passive is removed.
@@ -3067,7 +3067,7 @@ SCENARIO 156 — Buggy passive doesn't crash siblings
 !passive add hero buggy on_turn_start "entity[self].crash = 1 / 0"
 !passive add hero good on_turn_start "entity[self].good_tick = entity[self].good_tick + 1"
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: The buggy passive errors at runtime (division by zero); the
 log shows a "CRASHED" line for it. The good passive still fires
@@ -3225,7 +3225,7 @@ SCENARIO 162 — Iterating !ent subcommands across a group
 !ent hp group:mooks -5
 !ent set_var group:mooks status_token marked
 !ent face group:mooks down
-!ent info group:mooks
+!ent info group:mooks short
 !ent group new ghosts
 !ent hp group:ghosts +5
 
@@ -3413,10 +3413,10 @@ SCENARIO 169 — Autosaves, manual save, and silent command undo
 !ent hp a -7
 !history save before_more_damage
 !ent hp a -7
-!ent info a
+!ent info a short
 !history list commands
 !history undo command
-!ent info a
+!ent info a short
 
 Expected: Three turn-nexts open round 1 (B, initiative 11), then A, then
 round 2 (B). By that point the history holds 2 round snapshots and 3 turn
@@ -3515,7 +3515,7 @@ SCENARIO 172 — Snapshot export and import as a manual save
 !history import _hist_export_test.json as restored
 !history list manual
 !history restore restored confirm
-!ent info a
+!ent info a short
 
 Expected: `checkpoint` bookmarks A at 30 HP. After damaging A to 20,
 the snapshot is exported to JSON, then the manual entry is deleted
@@ -3570,11 +3570,11 @@ SCENARIO 174 — random_int via eval and inside a passive
 !ent set_var hero last_roll 0
 !passive add hero burning on_turn_start "entity[self].last_roll = random_int(2, 8); entity[self].hp = entity[self].hp - entity[self].last_roll"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !eval random_int(5, 3)
 !eval "random_int('not', 'int')"
 !eval random_string()
@@ -3613,13 +3613,13 @@ SCENARIO 175 — random_string with if/elif/else branching
 !ent set_var hero buff 0
 !passive add hero mood on_turn_start "entity[self].status = random_string('rage', 'calm', 'fear'); entity[self].hp = max(0, entity[self].hp - 8) if entity[self].status == 'rage' else (min(entity[self].max_hp, entity[self].hp + 4) if entity[self].status == 'calm' else entity[self].hp); entity[self].buff = 0 if entity[self].status == 'rage' else (5 if entity[self].status == 'calm' else -2)"
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: The `mood` passive rolls a status on each turn-start —
 one of 'rage', 'calm', 'fear' — stores it on the entity, then
@@ -3668,14 +3668,14 @@ SCENARIO 176 — Team is now an entity var, readable and writable from formulas
 !ent add b B 10 2 1 11
 !ent set_var a team red
 !ent set_var b team blue
-!ent info a
-!ent info b
+!ent info a short
+!ent info b short
 !eval entity[a].team
 !eval entity[b].team
 !eval 'entity[a].team == "red"'
 !eval 'entity[b].team == "red"'
 !eval 'entity[a].team = "purple"'
-!ent info a
+!ent info a short
 !eval entity[a].team
 !system new sci_fi
 !system set sci_fi team_var faction
@@ -3683,7 +3683,7 @@ SCENARIO 176 — Team is now an entity var, readable and writable from formulas
 !match use mteam2
 !ent add s1 Ship1 10 1 1 10
 !ent set_var s1 faction federation
-!ent info s1
+!ent info s1 short
 !eval entity[s1].faction
 !eval entity[s1].team
 
@@ -3733,15 +3733,15 @@ SCENARIO 177 — Friendly-fire damage aura via a team check inside a global pass
 !ent set_var goblin team horde
 !gpassive add aura on_round_start 'entity[self].hp = entity[self].hp - 5 if entity[self].team != entity[this].team else entity[self].hp'
 !turn next
-!ent info knight
-!ent info archer
-!ent info goblin
+!ent info knight short
+!ent info archer short
+!ent info goblin short
 !turn next
 !turn next
 !turn next
-!ent info knight
-!ent info archer
-!ent info goblin
+!ent info knight short
+!ent info archer short
+!ent info goblin short
 
 Expected: The `aura` global passive runs on_round_start, which fires for
 EVERY entity in turn-order (unlike on_turn_start which fires only for the
@@ -3786,7 +3786,7 @@ SCENARIO 178 — Reading entity x,y from formulas (writes are rejected)
 !eval entity[a].x - entity[a].anchor_x
 !eval entity[a].x = 3
 !eval entity[a].y = 7
-!ent info a
+!ent info a short
 
 Expected: Formulas can read entity[X].x and entity[X].y as
 first-class values — they return the entity's actual grid
@@ -3876,13 +3876,13 @@ SCENARIO 180 — Formula access to tile data via tile_get / tile_has
 !eval 'entity[hero].hp - tile_get(entity[hero].x, entity[hero].y, "flame.burn_damage")'
 !passive add hero burn on_turn_start "entity[self].hp = entity[self].hp - tile_get(entity[self].x, entity[self].y, \"flame.burn_damage\") if tile_has(entity[self].x, entity[self].y, \"flame.burn_damage\") else entity[self].hp"
 !turn next
-!ent info hero
+!ent info hero short
 !ent tp hero 1 1
 !turn next
-!ent info hero
+!ent info hero short
 !ent tp hero 5 5
 !turn next
-!ent info hero
+!ent info hero short
 
 Expected: tile_get returns the value at a dotted path on a tile;
 missing paths raise ❌ FormulaError ("tile (3,3) has no value at
@@ -3966,7 +3966,7 @@ SCENARIO 182 — Define a tile template and place instances
 !tile info 3 1
 !tile list
 !ent move hero 5 right
-!ent info hero
+!ent info hero short
 
 Expected: The match starts with no templates ("No tile templates
 defined."). Defining `flame` creates an empty template that's then
@@ -4001,16 +4001,16 @@ SCENARIO 183 — Template hook edits propagate; template data edits do NOT
 !tile place spike 3 3
 !tile place spike 5 5
 !ent tp hero 3 3
-!ent info hero
+!ent info hero short
 !tile def data spike damage 999
 !tile info 3 3
 !ent tp hero 1 1
 !ent tp hero 3 3
-!ent info hero
+!ent info hero short
 !tile def hook spike on_enter 'entity[self].hp = entity[self].hp - 50'
 !ent tp hero 1 1
 !ent tp hero 5 5
-!ent info hero
+!ent info hero short
 
 Expected: Two spikes are placed from the same template. Stepping
 on the first deals 5 damage (hp 95). Editing the template's
@@ -4041,13 +4041,13 @@ SCENARIO 184 — Placement overrides and per-tile hook override
 !tile info 3 3
 !tile info 4 3
 !ent tp hero 3 3
-!ent info hero
+!ent info hero short
 !ent tp hero 4 3
-!ent info hero
+!ent info hero short
 !tile hook add 4 3 on_enter 'entity[self].hp = entity[self].hp - 1'
 !ent tp hero 1 1
 !ent tp hero 4 3
-!ent info hero
+!ent info hero short
 
 Expected: Two flames are placed. The first uses template defaults
 (burn_damage=5); the second uses a placement override
@@ -4077,14 +4077,14 @@ SCENARIO 185 — Landmine: template-based self-destruct
 !tile place landmine 5 5
 !tile def list
 !ent tp hero 3 3
-!ent info hero
+!ent info hero short
 !tile info 3 3
 !ent tp hero 5 5
-!ent info hero
+!ent info hero short
 !tile info 5 5
 !ent tp hero 1 1
 !ent tp hero 3 3
-!ent info hero
+!ent info hero short
 
 Expected: Define a `landmine` template once. Place two instances.
 Stepping on the first detonates it: -25 damage AND `tile_clear`
@@ -4116,7 +4116,7 @@ SCENARIO 186 — Ad-hoc tiles are still supported (unique loot chest)
 !tile hook add 4 4 on_enter 'entity[self].gold = entity[self].gold + tile_get(tile_x, tile_y, "contents.gold"); tile_clear(tile_x, tile_y)'
 !tile info 4 4
 !ent tp hero 4 4
-!ent info hero
+!ent info hero short
 !tile info 4 4
 
 Expected: A one-off treasure chest at (4,4) with no template
@@ -4149,8 +4149,8 @@ SCENARIO 187 — Group move fires per-member template hooks
 !tile place flame 2 6
 !tile place flame 3 6
 !ent move group:party 1 down
-!ent info soldier
-!ent info wizard
+!ent info soldier short
+!ent info wizard short
 
 Expected: One `flame` template covers two placed instances at
 (2,6) and (3,6). The party group steps onto them simultaneously
@@ -4217,13 +4217,13 @@ SCENARIO 189 — Tile templates persist through save/load
 !match use mfresh
 !ent add hero Hero 50 1 1 10
 !ent tp hero 4 4
-!ent info hero
+!ent info hero short
 !store load tpl_save
 !match use mtpl8
 !tile def list
 !tile def info flame
 !ent tp hero 4 4
-!ent info hero
+!ent info hero short
 
 Expected: Template definitions and placed instances both survive
 a !store save / !store load round-trip. After defining `flame`
@@ -4996,13 +4996,13 @@ SCENARIO 214 — !undo: shortcut for `!history undo`
 !ent add hero Hero 30 1 1 10
 !turn next
 !ent hp hero -10
-!ent info hero
+!ent info hero short
 !undo command 1 confirm
-!ent info hero
+!ent info hero short
 !ent hp hero -5
 !ent hp hero -5
 !undo command 2 confirm
-!ent info hero
+!ent info hero short
 
 Expected: `!undo <scope> ...` forwards to `!history undo <scope>
 ...` with identical behavior — same scopes (command/turn/round/to
@@ -9164,7 +9164,7 @@ SCENARIO 360 — channel binding + per-match access overrides (fog-of-war read r
 !match bind label=host-room
 !match channels
 !as player watcher
-!ent info spy
+!ent info spy short
 !ent dump spy
 !as host
 !host access set "ent dump" all
@@ -9243,7 +9243,7 @@ SCENARIO 362 — default access levels: overview reads open to players, detailed
 !state
 !turn
 !history
-!ent info hero
+!ent info hero short
 !ent dump hero
 !ent move hero 1 e
 
@@ -9908,7 +9908,7 @@ SCENARIO 385 — 2×2 crossing a fire band: per-cell tile hooks; zone membership
 !tile place flame 5 1
 !tile place flame 5 2
 !ent move dragon 4 right
-!ent info dragon
+!ent info dragon short
 !zone new gas
 !zone add gas 8 1
 !ent tp dragon 7 1
@@ -10087,12 +10087,12 @@ SCENARIO 391 — Status DoT ticks at the bearer's turn end and self-expires
 !status tick burn "entity[self].hp = entity[self].hp - 5 * status_get(self, status_name, 'level')\nstatus_set(self, status_name, 'duration', status_get(self, status_name, 'duration') - 1)\nif status_get(self, status_name, 'duration') <= 0:\n    status_remove(self, status_name)"
 !status apply hero burn 3 2
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
-!ent info hero
+!ent info hero short
 !turn next
 !turn next
-!ent info hero
+!ent info hero short
 !ent status hero list
 
 Expected: burn ticks at turn_end (the default) only for the entity whose
@@ -11793,12 +11793,12 @@ SCENARIO 458 — Mounts: slots, capacity budget + cost + condition, carry & driv
 !mount ogre car seats
 !mount list car
 !ent move drv 2 right
-!ent info car
-!ent info drv
-!ent info p1
+!ent info car short
+!ent info drv short
+!ent info p1 short
 !ent move p1 1 right
 !mount dismount p1 1 5
-!ent info p1
+!ent info p1 short
 
 Expected: `car` is a 2-wide vehicle with a `driver` slot (capacity 1, drives,
 shown at the front) and a `seats` slot (capacity 3, each rider costs its `size`,
@@ -11833,8 +11833,8 @@ SCENARIO 459 — Mounts: slot actions, allowed_slots, and rider-vs-vehicle actor
 !mount gun tank gunner
 !action list gun
 !action gun shoot foe
-!ent info foe
-!ent info tank
+!ent info foe short
+!ent info tank short
 !action gun horn
 !ent dump tank
 !ent set_var tank mount_action_actor vehicle
@@ -11875,7 +11875,7 @@ SCENARIO 460 — Mounts: visible vs hidden riders, render and ground occupancy
 !ent add box Box 10 6 5 5
 !mount cg bus hold
 !ent add box2 Box2 10 6 5 5
-!ent info box2
+!ent info box2 short
 
 Expected: `bus` is a 2-wide vehicle. rg mounts the visible `roof` slot (it shows
 on the map at the bus's front cell, glyph R drawn over the bus's B); cg mounts
@@ -11909,8 +11909,8 @@ SCENARIO 461 — Mounts: switching slots and host-death ejection
 !mount list boat
 !ent set_var boat hp 0
 !list
-!ent info sailor
-!ent info cap
+!ent info sailor short
+!ent info cap short
 
 Expected: sailor boards the deck, cap takes the helm. `!mount switch sailor helm`
 is REFUSED (helm is capacity 1, cap is in it) — sailor stays on deck. Switching
@@ -11934,15 +11934,15 @@ SCENARIO 462 — Mounts: group move skips (or aborts on) carried riders
 !mount pax car seat
 !ent group add squad foot pax
 !ent move group:squad 2 right
-!ent info foot
-!ent info pax
+!ent info foot short
+!ent info pax short
 !ent group add convoy car pax
 !ent move group:convoy 2 right
-!ent info car
-!ent info pax
+!ent info car short
+!ent info pax short
 !system set default mount_group_move_mode abort
 !ent move group:squad 2 right
-!ent info foot
+!ent info foot short
 
 Expected: `pax` rides the car (seat slot). With the default
 `mount_group_move_mode` = skip, `!ent move group:squad 2 right` moves only the
@@ -14039,7 +14039,7 @@ SCENARIO 542 — Inline $() args SECURITY: state-changing functions are banned
 !dist $(abs(var_set(goblin,hp,1))) 1 2 3
 !dist $(entity[goblin].hp+emit(boom)) 1 2 3
 !ent set_var ally note $(entity[goblin].hp=0)
-!ent info goblin
+!ent info goblin short
 
 Expected: the STRICT read-only gate (formula.validate_arg_safe) rejects every
 state-CHANGING function inside a `$()` argument — kill, summon, var_set, emit,
@@ -14854,10 +14854,10 @@ SCENARIO 570 — read-only downgrade is per-command: no `!batch list` bypass
 !match outcome
 !status list
 !zone list
-!ent info boss
+!ent info boss short
 !as host
 !pending
-!ent info boss
+!ent info boss short
 
 Expected: the player's `!batch list ; ent hp boss -40`, `!emit list`, and
 `!foreach list ; ...` are all HELD for host approval (`!pending` lists r1-r3),
@@ -14889,7 +14889,7 @@ SCENARIO 571 — the approval queue survives an undo (no silent drop, no id reus
 !as host
 !pending
 !approve r1
-!ent info boss
+!ent info boss short
 
 Expected: the undo reverts the host's `-5` (boss back to 50) but bob's queued
 request `r1` (`!ent hp boss -1`) is still pending afterwards. Bob's next request
@@ -14959,7 +14959,7 @@ SCENARIO 573 — file commands are confined to the saves/ folder
 !ent hp hero -5
 !store load campaign/session1.json
 !match use svm
-!ent info hero
+!ent info hero short
 
 Expected: every path that leaves the `saves/` folder is refused before any
 file is touched — `..`, an absolute path, and a Windows-style `..\` all get
@@ -14997,12 +14997,12 @@ SCENARIO 574 — commands that name another match need host rights on it
 !ent add bot Bot 10 1 1 5
 !ent copy bot alice 2 2
 !ent transfer bot alice 2 2
-!ent info bot
+!ent info bot short
 !match unbind
 !match
 !as host
 !match use alice
-!ent info assassin
+!ent info assassin short
 
 Expected: with no active match in the channel the access gate doesn't engage,
 so the TARGET check is what stops `mallory`: `!match use alice` / `!match bind
@@ -15031,11 +15031,11 @@ SCENARIO 575 — command undo: count cap + repeated single-step undo
 !ent hp boss -8
 !history list commands
 !undo command 1 confirm
-!ent info boss
+!ent info boss short
 !undo command 1 confirm
-!ent info boss
+!ent info boss short
 !undo command 1 confirm
-!ent info boss
+!ent info boss short
 !undo command 1 confirm
 !system set default autosave_command_retention_max 100
 
@@ -15182,10 +15182,10 @@ SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
 !match bind pov=red
 !as player bob
 !list
-!ent info ghost
-!ent info wall
-!ent info pilot
-!ent info spy
+!ent info ghost short
+!ent info wall short
+!ent info pilot short
+!ent info spy short
 !find hp>0
 !dist scout ghost
 !mount list jeep
@@ -15200,7 +15200,7 @@ SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
 !as host
 !system set default pov_filters_queries false
 !as player bob
-!ent info ghost
+!ent info ghost short
 !find hp>0
 !as host
 !system set default pov_filters_queries true
@@ -15240,12 +15240,12 @@ SCENARIO 580 — Disguise in !ent info; !part info is host-only
 !part add mimic mjaw Jaw 5 5
 !match bind pov=red
 !as player bob
-!ent info mimic
+!ent info mimic short
 !part list mimic
 !part info mjaw
 !as host
 !as view omniscient
-!ent info mimic
+!ent info mimic short
 !approve r1
 !as view clear
 
@@ -15365,7 +15365,7 @@ SCENARIO 584 — A failed action keeps the undo history
 !history list manual
 !history list commands
 !undo command 5
-!ent info a
+!ent info a short
 
 Expected: the failing action rolls back its own -7 (a stays at 48) and — the
 fix — leaves the match's undo history alone. Before, the rollback rebuilt the
@@ -17042,7 +17042,7 @@ SCENARIO 635 — Harness `??` / `?!` reply checks (a failing one on purpose)
 !ent move nobody 1 right
 ?? not found
 ?! Moved
-!ent info hero
+!ent info hero short
 ?? "Hero"
 ?? this text is not in the reply
 
@@ -19246,7 +19246,7 @@ SCENARIO 698 — Each server has its own workspace: systems, matches and saves s
 ?? Created match `Other` with id `camp`
 !match use camp
 !assert "grid_width() == 6" "server 222's camp is its own match"
-!ent info hero
+!ent info hero short
 ?? not found
 !store load shared
 ?? File not found
@@ -20222,7 +20222,7 @@ SCENARIO 723 — !template set / unset / show <path>: edit a saved body without 
 !assert "status_get('wyrm', 'burn', 'level') == 2"
 !assert "var_get('wyrm_head', 'to_main_percent') == 200 and not var_has('wyrm_torso', 'to_main_percent')"
 !assert "len(footprint_cells('wyrm_head')) == 2"
-!ent info wyrm
+!ent info wyrm short
 ?? Old Wyrm
 
 Expected: HARNESS-ALLOWS-ERRORS. `!template show <name> <path>` prints one
@@ -23067,7 +23067,7 @@ SCENARIO 778 — Command journal: what it records (!match journal)
 !ent set_vars ogre footprint_w=2 footprint_h=2
 !roll 1d20
 !ent hp ogre "-$(roll('1d6'))"
-!ent info hero
+!ent info hero short
 !ent move hero 2 right
 !undo command
 !system set base friendlyfire true
@@ -23319,11 +23319,11 @@ SCENARIO 782 — Maps: create, list, rename, delete (refuse or kill the units on
 ?? - `cellar`: 6x4, 2 units
 !map cellar
 ?? 🗺️ map `cellar` (2 of 2) (6x4)
-!ent info rat
+!ent info rat short
 ?? Position: (3,3) on cellar
 !map rename cellar vault
 ?? Renamed map `cellar` to `vault`.
-!ent info rat
+!ent info rat short
 ?? Position: (3,3) on vault
 !map delete vault
 ?? still has unit(s) on it (`bat`, `rat`)
@@ -23338,7 +23338,7 @@ SCENARIO 782 — Maps: create, list, rename, delete (refuse or kill the units on
 ?! rat
 !map list
 ?! vault
-!ent info hero
+!ent info hero short
 ?! on main
 !map delete main
 ?? `main` is this match's only map
@@ -23852,9 +23852,9 @@ SCENARIO 791 — Cross-map !ent tp carries the whole body: footprint, located pa
 !assert "entity[ogre].went == 'main>cellar' and entity[ogre].moved == 'main>cellar'"
 !assert "entity[ogre].left_main == 1 and entity[ogre].entered == 23"
 !assert "entity[oarm].x == 4 and entity[oarm].y == 3"
-!ent info oarm
+!ent info oarm short
 ?? on cellar
-!ent info imp
+!ent info imp short
 ?? Position: (2,3) on cellar
 !zone list
 ?? - `stink` on `cellar`: 16 cell(s) — aura→`ogre` r1
@@ -23962,7 +23962,7 @@ SCENARIO 793 — Clone and template spawn onto a map; maps, map vars and the cha
 ?? Cloned `knight` → `shade` at (1,1) on `cellar`.
 !ent clone knight ghost 6 4 map=cellar
 ?? ❌ (6,4) outside 5x3 on `cellar`.
-!ent info shade
+!ent info shade short
 ?? on cellar
 !template save knight knightling
 !template spawn knightling 3 3
@@ -23997,7 +23997,7 @@ SCENARIO 793 — Clone and template spawn onto a map; maps, map vars and the cha
 !ent tp shade 3 3 main
 ?? on map `main` (from `cellar`)
 !undo command
-!ent info shade
+!ent info shade short
 ?? on cellar
 
 Expected: `!ent clone` puts the copies on the source's map, or on the map
@@ -24131,11 +24131,11 @@ SCENARIO 796 — A loaded vehicle boarding another carries its riders; parts and
 ?? ❌ `oarm` is a body part of `ogre`: move `ogre` to another map to take it along.
 !ent tp ogre 7 2 cellar
 ?? ❌
-!ent info oarm
+!ent info oarm short
 ?? on main
 !ent tp ogre 2 2 cellar
 ?? on map `cellar` (from `main`)
-!ent info oarm
+!ent info oarm short
 ?? on cellar
 !ent add worm Worm 10 9 7 5 map=main
 !part segment worm w1 W1 5 5
@@ -24144,7 +24144,7 @@ SCENARIO 796 — A loaded vehicle boarding another carries its riders; parts and
 ?? ❌ `w1` is a body part of `worm`
 !ent tp worm 1 1 closet
 ?? ❌ no room on map `closet` for segment(s)
-!ent info worm
+!ent info worm short
 ?? on main
 !ent tp worm 5 5 cellar
 !find map:cellar ids
@@ -24486,9 +24486,9 @@ SCENARIO 805 — The random_seed rule's value is hidden from players
 ?? `default` = `(hidden)` (own), `child` = `(hidden)` (own)
 !help find random_seed
 ?? `random_seed` = `(hidden)`
-!ent info "$(rule_get('random_seed'))"
+!ent info "$(rule_get('random_seed'))" short
 ?? ❌ rule_get('random_seed') can't be read in a `$()` argument
-!ent info "$(rule_get('friendlyfire'))"
+!ent info "$(rule_get('friendlyfire'))" short
 ?? ❌ Entity 'false' not found.
 
 Expected: The seed predicts every roll, so `random_seed` is a secret rule:
@@ -24515,7 +24515,7 @@ SCENARIO 806 — A ceiling rule's -1 means the ceiling; a parent link honours va
 !ent set_var hero health 99
 !system parent c p
 ?? ❌ Can't link `c` to `p`: pc: `hero` already has a var `health`
-!ent info hero
+!ent info hero short
 ?? HP: 30/30
 !ent delete_var hero health
 !system parent c p
@@ -24691,17 +24691,17 @@ SCENARIO 811 — inline_args_access = host covers !ent, !foreach and queued requ
 !match bind pov=red
 !system set default inline_args_access host
 !as player alice
-!ent info $(entity[spy].secret)
+!ent info $(entity[spy].secret) short
 ?? ❌ inline `$()` arguments are host-only on this match (inline_args_access).
 !foreach hp>0 ; ent info $(entity[spy].secret)
 ?? ❌ inline `$()` arguments are host-only
 !ent set_var hero note $(entity[spy].hp)
 ?? ❌ inline `$()` arguments are host-only
 ?! needs host approval
-!ent info hero
+!ent info hero short
 ?? **Hero** (`hero`)
 !as host
-!ent info $(entity[hero].team)
+!ent info $(entity[hero].team) short
 ?? ❌ Could not find a unit named `red`. Either it does not exist
 
 Expected: A non-host's `$()` is refused for every command, `!ent` and
@@ -25906,12 +25906,12 @@ SCENARIO 839 — Two-sided wording for units under a team view
 !ent add orc Orc 10 7 3
 !ent set_var orc team blue
 !as view red
-!ent info orc
+!ent info orc short
 ?? ❌ Could not find a unit named `orc`. Either it does not exist, or this channel currently does not have permission to view it.
-!ent info troll
+!ent info troll short
 ?? ❌ Could not find a unit named `troll`. Either it does not exist, or this channel currently does not have permission to view it.
 !as view clear
-!ent info troll
+!ent info troll short
 ?? Entity 'troll' not found.
 
 Expected: HARNESS-ALLOWS-ERRORS. Under red's view the fogged orc and a
@@ -28085,7 +28085,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 !status def burn
 !status apply u burn 2 3
 !ent status u add mark
-!ent info u
+!ent info u short
 ?? Status: burn ×2 (3), mark
 !status def rot
 !status display rot "rot (-{lost} max hp)"
@@ -28967,7 +28967,7 @@ SCENARIO 903 — A secret reminder shows only in a channel without a team POV
 ?? (Secret reminders are listed only in a channel without a team POV.)
 !turn next
 ?! trapped
-!ent info a
+!ent info a short
 ?! trapped
 !remind list
 ?! trapped
@@ -29953,9 +29953,9 @@ SCENARIO 919 — Unit tags: the tags var, granted tags, engine tags, corpses
 !ent set_var knight equipped.amulet.grants_unit_tags blessed
 !ent set_var knight inventory.relic.grants_unit_tags cursed
 !assert "unit_tags('zed') == ['mindless', 'undead'] and unit_tags('knight') == ['blessed', 'human', 'soldier', 'rider']"
-!ent info knight
+!ent info knight short
 ?? Tags: blessed (equipped.amulet), human (team red), soldier (team red), rider (engine)
-!ent info zed
+!ent info zed short
 ?? Tags: mindless, undead (status zombified)
 !eval "entity[knight].__unit_tag_sources_add = ['inventory']"
 !assert "'cursed' in unit_tags('knight')"
@@ -31140,7 +31140,7 @@ SCENARIO 939 — Players name units through the view on every opened root
 !system set default host_reveal_warning true
 !ent dump ogre
 ?? named `ogre`, hidden from it
-!ent info ogre
+!ent info ogre short
 ?! host_reveal_warning
 !ent dump scout
 ?! host_reveal_warning
@@ -31181,7 +31181,7 @@ SCENARIO 940 — A disguise presents its own statuses and the tags they grant
 !list
 ?? Merchant (spy)
 ?! poison
-!ent info spy
+!ent info spy short
 ?? Tags: trader
 ?! invisible
 ?! cloak
@@ -31197,7 +31197,7 @@ SCENARIO 940 — A disguise presents its own statuses and the tags they grant
 !as host
 !match unbind
 !match use dg940
-!ent info spy
+!ent info spy short
 ?? cloak
 
 Expected: A disguised unit's real statuses (with levels and turns left)
@@ -31267,7 +31267,7 @@ SCENARIO 942 — A var-name rule renames a disguise's decoy vars too
 ?? Merchant (spy) side=red health=99 trader
 !find side=red
 ?? 2 matches
-!ent info spy
+!ent info spy short
 ?? HP: 99/20
 ?? Team: red
 ?? Tags: trader
@@ -32321,7 +32321,7 @@ SCENARIO 966 — Per-level status data: data, modifiers, ticks and display by le
 !assert "apply_mods('a', 'speed', 6) == 3"
 !mod show a speed 6
 ?? status:chill@3+.slow
-!ent info a
+!ent info a short
 ?? chill (deep, cold 2)
 !turn next
 !turn next
@@ -32338,7 +32338,7 @@ SCENARIO 966 — Per-level status data: data, modifiers, ticks and display by le
 !ent status a del chill modifiers
 !ent status a del chill cold
 !assert "status_get('a', 'chill', 'cold') == 1 and apply_mods('a', 'speed', 6) == 6"
-!ent info a
+!ent info a short
 ?! deep
 
 Expected: per-level data is read live at the instance's level. `cold`
@@ -33276,7 +33276,7 @@ SCENARIO 987 — Zone grants and watchers on a unit the channel's view hides sta
 !host access set ent all
 !host access set watch all
 !as player bob
-!ent info zqxspy
+!ent info zqxspy short
 ?? Could not find a unit named `zqxspy`
 !ent move scout 3 right
 ?? global passive `seen` fired on `scout`
@@ -33495,7 +33495,7 @@ SCENARIO 992 — A zone-held status follows its zones; a permanent status stays 
 !assert "status_level('u', 'bless') == 5 and not status_has_path('u', 'bless', 'power')"
 !ent move u 2 left
 !assert "status_level('u', 'bless') == 1"
-!ent info u
+!ent info u short
 ?? bless ×1
 ?! __zone
 !status def hex
@@ -33528,7 +33528,7 @@ SCENARIO 993 — Sizes in real use: a grapple limited by size steps, defaults by
 !match use sz
 !ent add hero Hero 30 2 2 5
 !ent set_var hero size_num medium
-?? = 76 (typed 'medium')
+?? = 75 (typed 'medium')
 !ent add ogre Ogre 60 5 2 5
 !ent set_var ogre footprint_w 2
 !ent set_var ogre footprint_h 2
@@ -33559,7 +33559,7 @@ SCENARIO 993 — Sizes in real use: a grapple limited by size steps, defaults by
 ?? `gigantic` isn't a size category
 
 Expected: writing the category `medium` into the hero's size number stores
-76, medium's start (size_name_write lowest_size). An unsized 2x2 ogre reads
+75, medium's start (size_name_write lowest_size). An unsized 2x2 ogre reads
 size_default 100 until size_default_per_extra_tile 50 adds 3 x 50 for its
 extra cells: 250, large, stored as its derived size_total / size_text while
 it holds no size_num. The hero's grapple action reads size_steps(self,
@@ -33594,7 +33594,7 @@ SCENARIO 994 — Sizes: a snake summed with its segments; a destroyed segment dr
 !system set default size_total_mode max
 !assert "entity[w].size_total == 100"
 !part segment w s2 Seg2 10 10
-?? `s2` hold no size_num and add 0
+?? `s2` holds no size_num and adds 0
 !ent set_var w size_total 500
 ?? `size_total` is derived from `size_num`
 !ent delete_var w size_text
@@ -33638,7 +33638,7 @@ SCENARIO 995 — Sizes: body and max totals, parts inheriting the body's size, !
 !help size giant
 ?? Parts: `ghead` (none), `gclub` 400.
 !help size
-?? 3. `large`: 150-299
+?? 3. `large`: 150 to 299
 !help size 160
 ?? 160 is `large` (rank 3 of 5).
 !part detach gclub
@@ -33802,3 +33802,836 @@ on the rat alone. An unknown category is refused. A disguise presenting a
 decoy size_total of 30 fools the blue view: `size:small` finds the drake,
 the roster's `{size} ({size_class})` reads 30 (small) and `!help size`
 shows only the decoy; the red view sees 260 (large).
+
+SCENARIO 999 — Sizes: the hooks a derivation fires are ordinary code (tracked, refused, re-derived)
+---------------------------------------------------------------------------------------------------
+!match new sh SH 12 6
+!match use sh
+!ent add o O 10 1 1 5
+!ent set_var o stats.reach 1
+!ent set_var o stats.carry 10
+!template save o obase path=stats
+!template give obase o stats
+!passive add o grow on_var_changed "if changed_key == 'size_text':\n    entity[o].stats.reach = 5\n    var_del('o', 'stats.carry')"
+!ent set_var o size_num 300
+!template refs o
+?? changed `reach`; removed `carry`
+!template save o osave
+!template spawn osave 9 4
+!assert "entity[osave].stats.reach == 5 and not var_has('osave', 'stats.carry')"
+!ent add a A 10 3 1 5
+!passive add a own on_var_changed "if changed_key == 'size_total':\n    entity[a].size_total = 'lots'"
+!ent set_var a size_num 31
+?? FAILED: `size_total` is derived from `size_num`
+!assert "entity[a].size_total == 31 and size_of('a') == 31"
+!passive remove a own
+!ent add g G 10 5 1 5
+!ent set_var g footprint_w 2
+!ent set_var g footprint_h 2
+!passive add g grow2 on_var_changed "if changed_key == 'size_text' and entity[g].size_num < 400:\n    entity[g].size_num = 400"
+!ent set_var g size_num 200
+!assert "entity[g].size_num == 400 and entity[g].size_total == 400 and entity[g].size_text == 'huge'"
+
+Expected: a unit whose `stats` come from the partial `obase` holds a
+passive that, when its size category changes, raises `reach` and drops
+`carry`. Those writes happen inside the size derivation's var hooks and
+are tracked like any other: `!template refs` lists them and a template
+saved from the unit spawns with reach 5 and no carry (they were dropped
+from the marker before). A hook writing the derived `size_total` itself
+is refused like a typed write, and the total stays 31. A 2x2 unit's hook
+that answers a new category by raising `size_num` to 400 re-derives
+through its own write, so the stored total and category end as the
+pair 400 / huge.
+
+SCENARIO 1000 — Sizes: a part's death counts at once, and another match settles after the command
+----------------------------------------------------------------------------------------------------
+!match new sl SL 12 6
+!match use sl
+!ent add b B 10 1 1 5
+!part add b fin fin 10 10
+!ent set_var b __size_total_mode sum
+!ent set_var fin size_num 100
+!assert "entity[b].size_total == 200"
+!batch ent kill fin ; assert "entity[b].size_total == 100 and entity[b].size_text == 'medium'" ; find size:large count
+?? **0** matches.
+!ent hp fin 10
+!assert "entity[b].size_total == 200 and entity[b].size_text == 'large'"
+!match new sl2 SL2 12 6
+!match use sl2
+!ent add c C 10 1 1 5
+!part add c cf cf 10 10
+!ent set_var c __size_total_mode sum
+!ent set_var cf size_num 100
+!match use sl
+!batch match use sl2 ; part detach cf ; match use sl
+!match use sl2
+!assert "entity[c].size_total == 100 and entity[cf].size_total == 100"
+
+Expected: inside one batch, killing the part `fin` of a `sum` body takes
+its 100 off the stored total at once (200 → 100), so a later line's
+`size:large` finds nothing and the stored total agrees with size_of.
+Healing the part puts it back. A batch that detaches a part in another
+match leaves that match settled when the command ends: `c` holds 100 and
+the detached `cf` its own total of 100.
+
+SCENARIO 1001 — Sizes: guards on values and rules (bounds, overrides, imports, inherited scales, notes)
+--------------------------------------------------------------------------------------------------------
+!match new sg SG 12 6
+!match use sg
+!ent add a A 10 1 1 5
+!ent set_var a __size_total_mode summ
+?? is body, sum or max
+!ent set_var a __size_parts_inherit yes
+?? is true or false
+!system set default size_default 1e308
+?? must be at most 1000000000000000
+!system set default size_default -50
+?? a negative size, and size_allow_negative is off
+!eval "size_of(10**400)"
+?? at most 1000000000000000 either way
+!eval "size_is('a', 'lareg', True)"
+?? `lareg` isn't a size category
+!template import huge {"name": "Huge", "vars": {"hp": 5, "max_hp": 5, "size_num": "zz"}}
+?? `size_num` is a size number
+!system set default size_enabled false
+!ent set_var a size_num large
+?? = 150 (typed 'large')
+!ent set_var a size_num lots
+?? `lots` isn't a size category
+!system set default size_enabled true
+!system new neg
+!system set neg size_allow_negative true
+!system set neg size_categories "abyss, low:-10, mid:10"
+!system new kid parent=neg
+!system set kid size_allow_negative false
+?? would hold only negative sizes
+!system set kid size_categories "tiny, small:25"
+!system set kid size_allow_negative false
+!system unset kid size_categories
+?? would hold only negative sizes
+!system set default size_decimals true
+!ent set_var a size_num 80.7
+!system set default size_decimals false
+?? still hold a fractional size
+?? `sg/a` (80.7)
+!system set default size_allow_negative true
+!system set default size_categories "abyss, low:-10, mid:10"
+!help size
+?? 1. `low`: -10 to 9
+!assert "entity[a].size_num == 80.7"
+
+Expected: the per-body overrides take only their words (body / sum / max,
+true / false); the default rules are bounded (1e15 either way) and
+refused negative while negatives are off; a size past the bound is
+refused in words; `size_is` refuses a mistyped category even for a size
+that is None; a template can't carry a size number its spawn would
+refuse; with sizes off `size_num` is still checked (a category name
+converts, an unknown word is refused). A child system that turns
+negatives off can't keep its parent's negative scale, by `!system set`
+or by `!system unset` of its own scale. Turning `size_decimals` off names
+the unit still holding a fraction. A negative range prints as `-10 to 9`.
+HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1002 — Sizes: a disguise's decoy total presents its own category
+----------------------------------------------------------------------------
+!match new sd SD 12 6
+!match use sd
+!ent add mask Mask 10 1 1 5
+!ent set_var mask team blue
+!ent set_var mask size_num 500
+!ent set_var mask disguise.name Mouse
+!ent set_var mask disguise.vars.size_total 10
+!as view red
+!find hp>0 show:size_total,size_text
+?? size_total=10, size_text=tiny
+!find size_text=huge
+?? No entities match.
+!find size_text=tiny ids
+?? mask
+!find size:tiny ids
+?? mask
+!as view blue
+!find size_text=huge ids
+?? mask
+!as view omniscient
+
+Expected: a disguise whose `vars` present a size_total of 10 and no
+category presents the decoy's own category with it: under the red
+(fooled) view `show:size_text` reads tiny, `size_text=huge` finds nothing
+and `size_text=tiny` and `size:tiny` find the disguised unit. Its own
+blue view sees the real huge.
+
+SCENARIO 1003 — Zone grants keep resistance when they follow their zones; grant and watcher errors stay hidden
+----------------------------------------------------------------------------------------------------------------
+!match new zr ZR 12 6
+!match use zr
+!status def bless
+!status stack bless refresh
+!ent add a A 10 1 1 5
+!ent set_var a status_resist.bless 2
+!zone new za
+!zone fill za 1 1 6 3
+!zone grant za bless level=3
+!zone new zb
+!zone fill zb 3 1 6 3
+!zone grant zb bless level=5
+!assert "status_level('a', 'bless') == 1"
+!ent move a 2 right
+!assert "status_level('a', 'bless') == 3"
+!zone grant zb bless level=7
+!assert "status_level('a', 'bless') == 5"
+!system set default formula_text_visibility host
+!zone grant_condition za "entity[self].zqxf_gc == 0"
+!watch add w "entity[a].hp < 6" "entity[a].zz = entity[a].zqxf_undef"
+!host access set ent all
+!as player bob
+!ent move a 1 right
+?? its grant_condition failed for `a`; no grant.
+?! zqxf
+!ent hp a 5
+?? effect error
+?! zqxf
+!as host
+
+Expected: a unit resisting `bless` by 2 gets level 1 from `za` (3 − 2),
+3 when it walks into `zb` (5 − 2) and 5 when `zb`'s grant becomes 7: a
+zone-held status that follows its zones under the default `refresh`
+stack mode takes the resistance like a fresh application (it used to
+take the zones' full 5 and 7). Under `formula_text_visibility host`, a
+player's move prints the grant condition's failure without its text,
+and the watcher's effect error without the identifier, also from the
+settling and the watcher poll that run after the handler.
+HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1004 — Conditions with leading zeros go to the formula engine; crash notes for approvals and a missing pre-state
+--------------------------------------------------------------------------------------------------------------------------
+!match new cz CZ 12 6
+!match use cz
+!ent add a A 10 1 1 5
+!ent set_var a __death_condition "entity[a].hp <= 007"
+!system set default death_condition_mode replace
+!ent hp a 5
+!assert "entity[a].hp == 5"
+!prefab import pz {"kind": "prefab", "system": "default", "width": 2, "height": 2, "zones": {"z9": {"cells": [[0, 0]], "grant_condition": "entity[self].hp < 007"}}}
+?? its grant_condition doesn't parse
+!as player bob
+!ent set_var a z 5
+!as host
+!batch approve r1 ; as crash boom
+?? Request `r1` is pending again
+!assert "not var_has('a', 'z')"
+!pending
+?? `r1` by bob
+!system set default autosave_command_retention_turns 0
+!system set default command_journal_limit 0
+!batch ent set_var a q 5 ; as crash boom
+?? kept no state from before the command
+!assert "var_has('a', 'q')"
+
+Expected: a per-unit death condition `entity[a].hp <= 007` replacing the
+rule is read by the formula engine, which refuses the leading zeros, so
+it reads as not met and `a` lives at 5 hp (the native reading used to
+take `007` as 7 and kill it). A prefab zone carrying that condition is
+refused at import. A batch that approves a player's request and then
+crashes is rolled back with the request put back in the queue, which the
+reply names. With command autosaves and the journal both off, a crash
+says that what the command changed before it stays.
+HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1005 — Whole-number size starts, no clamps on derived sizes, the linger of the zone a grant came from
+-----------------------------------------------------------------------------------------------------------------
+!match new sw SW 12 8
+!match use sw
+!system set default size_categories "tiny, small:25.5, medium:76"
+?? `small:25.5` starts between whole sizes, and size_decimals is off
+!system set default size_decimals true
+!system set default size_categories "tiny, small:25.5, medium:76"
+!system set default size_decimals false
+?? `small:25.5` starts between whole sizes
+!system set default size_categories "tiny, small:25, medium:75"
+!system set default size_decimals false
+!ent add a A 10 1 1 5
+!clamp add a size_total max=120 mode=hard
+?? Can't clamp `size_total`: it is derived from `size_num`, so clamp `size_num` instead
+!gclamp add size_text max=1
+?? Can't clamp `size_text`
+!template import t1 {"name": "T", "vars": {"hp": 5, "max_hp": 5}, "clamps": {"size_total": {"path": "size_total", "max": 5}}}
+?? can't clamp `size_total`
+!clamp add a size_num max=120 mode=hard
+!ent set_var a size_num 410
+!assert "entity[a].size_num == 120 and entity[a].size_total == 120 and entity[a].size_text == 'medium'"
+!status def bless
+!zone new za
+!zone fill za 1 3 6 3
+!zone grant za bless level=3 linger=5
+!zone new zb
+!zone fill zb 1 3 6 3
+!zone grant zb bless level=5 linger=2
+!ent add u U 10 2 3 5
+!assert "status_level('u', 'bless') == 5"
+!ent tp u 2 6
+!assert "status_level('u', 'bless') == 5 and status_get('u', 'bless', 'duration') == 2"
+
+Expected: while size_decimals is off, a scale with a start between whole
+sizes (`small:25.5`) is refused, and so is turning decimals off under
+such a scale; whole-number starts go through. A clamp on the derived
+`size_total` or `size_text` is refused (by `!clamp add`, `!gclamp add`
+and a template import), pointing at `size_num`; a clamp on `size_num`
+bounds the size and the derived pair follows (410 → 120, medium). A unit
+leaving two granting zones at once keeps the level of the zone it held
+the status from (5, from `zb`) and lingers for that zone's linger (2
+turns), not the longer linger of `za`.
+HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1006 — Level-entry durations, charges and skips_turn count in the engine's own readers
+--------------------------------------------------------------------------------------------------
+!match new lv LV 12 8
+!match use lv
+!ent add a A 10 1 1 5
+!ent add b B 10 3 1 4
+!status def burn
+!status level burn 3+ duration 5
+!status level burn 1+ charges 3
+!status apply a burn 3
+?? (level=3, duration=5)
+!eval "status_counter_add('a', 'burn', -1)"
+?? = `4`
+!eval "status_counter_add('a', 'burn', -1, 'charges')"
+?? = `2`
+!assert "status_has('a', 'burn') and status_duration('a', 'burn') == 4 and status_get('a', 'burn', 'charges') == 2"
+!status stack burn extend
+!status apply a burn 3 2
+?? duration=6
+!status def stun
+!status level stun 2+ skips_turn true
+!status apply b stun 2
+!turn next
+!turn next
+?? `b`'s turn skipped (stun)
+
+Expected: a level entry's fields count in the counters, the stacking,
+the turn skip and the application reply (user call, read through the
+level view). `burn` at level 3 reads duration 5 from its entry: the
+application reply says 5, a decrement gives 4, and the entry's `charges:
+3` counts down to 2 (it used to start from 0 and remove the status). The
+result is the instance's own key from then on, so a later `extend`
+application adds 2 to the 4 (6). A `stun` whose level-2 entry sets
+`skips_turn` skips `b`'s turn.
+
+SCENARIO 1007 — A disguise faking only the size category presents the number that category stores
+-----------------------------------------------------------------------------------------------------
+!match new dc DC 12 6
+!match use dc
+!ent add mask Mask 10 1 1 5
+!ent set_var mask team blue
+!ent set_var mask size_num 500
+!ent set_var mask disguise.vars.size_text tiny
+!system set default entity_line_format "{name}: {size} ({size_class})"
+!as view red
+!find size:tiny ids
+?? mask
+!find size:huge count
+?? **0** matches.
+!help size mask
+?? size 1 (`tiny`)
+!list
+?? Mask: 1 (tiny)
+!find hp>0 show:size_total,size_text
+?? size_total=1, size_text=tiny
+!as view omniscient
+!system set default size_name_write average_size
+!as view red
+!help size mask
+?? size 12 (`tiny`)
+!as view omniscient
+!system set default size_name_write refuse
+!as view red
+!help size mask
+?? size `tiny`.
+!find size:tiny ids
+?? mask
+!as view omniscient
+!help size mask
+?? size 500 (`huge`)
+
+Expected: a disguise whose `vars` name only the category `tiny` presents,
+to the fooled red view, the number writing `tiny` into `size_num` stores
+(user call): 1 under lowest_size (the default), 12 under average_size;
+`size:`, `!help size`, the roster's `{size}` / `{size_class}` and `show:`
+all read that pair. Under `size_name_write refuse` it presents no number
+(`!help size` prints the category alone) and `size:tiny` still finds it.
+The omniscient view sees the real 500 (huge).
+
+SCENARIO 1008 — The entity description: `!ent info` sections, readable vars, actions, parts; `short` is the card
+---------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS (a stray word after `!ent info <id>` is refused)
+!match new desc Desc 10 8
+!match use desc
+!ent add knight Knight 20 3 3
+!ent set_var knight team blue
+!ent set_var knight footprint_w 2
+!ent set_var knight footprint_h 2
+!ent set_var knight description "A sworn sword of the river keep."
+!ent set_var knight stats.str 5
+!ent set_var knight stats.dex 3
+!ent set_var knight inventory.sword.description "A notched blade"
+!ent set_var knight inventory.sword.damage 8
+!ent set_var knight inventory.sword.glyph "/"
+!ent set_var knight inventory.sword.actions.slash.target entity
+!ent set_var knight inventory.sword.actions.slash.description "Cut a foe for 8."
+!ent set_var knight inventory.sword.actions.slash.body "entity[target].hp -= 8"
+!ent set_var knight inventory.rations 3
+!ent set_var knight notes.secret_dc 14
+!ent set_var knight __gm_note "ambush at dawn"
+!ent set_var knight glyph K
+!ent set_var knight actions.rally.description "Steady the line."
+!ent set_var knight actions.rally.body "x = 1"
+!status def bleed
+!status data bleed description "Loses 1 hp a turn."
+!status apply knight bleed 2 3
+!ent set_var knight tags human
+!part add knight shield Shield 10 10
+!passive add knight guard on_turn_start "1"
+!ent info knight
+?? **Knight** (`knight`)
+?? *A sworn sword of the river keep.*
+?? HP: 20/20
+?? Size: 100 (medium)
+?? **Statuses**
+?? - bleed (level 2), 3 turns left: Loses 1 hp a turn.
+?? Tags: human
+?? **Details**
+?? - stats: str 5, dex 3
+?? - inventory
+??   - sword: A notched blade (damage 8)
+??   - rations: 3
+?? - notes: secret_dc 14
+?? **Actions**
+?? - **rally**: Steady the line.
+?? - **slash** (target: entity): Cut a foe for 8.
+?? Passives: guard
+?? **Parts**
+?? - Shield (`shield`): HP 10/10
+?! ambush
+?! glyph
+?! footprint
+?! description:
+?! hp:
+!ent info knight short
+?? Status: bleed ×2 (3)
+?? Inventory: {sword, rations}
+?! Details
+?! A sworn sword
+!ent info knight brief
+?? ❌ Unexpected `brief` — usage: `!ent info <id> [short]`.
+!system set default entity_description_sections "header, actions, data"
+!system set default entity_description_action_format "- {name} [{path}]"
+!ent info knight
+?? **Knight** (`knight`)
+?? *A sworn sword of the river keep.*
+?? **Actions**
+?? - rally [actions.rally]
+?? - slash [inventory.sword.actions.slash]
+?? **Details**
+?! HP:
+?! Parts
+!system set default entity_description_sections "header, vitals"
+!ent info shield
+?? **Shield** (`shield`)
+?? HP: 10/10   Position: (3,3)
+!ent info knight shrt
+?? ❌ Unexpected `shrt`
+!system unset default entity_description_sections
+!system unset default entity_description_action_format
+
+Expected: plain `!ent info` prints the description: the header (name, id and
+the unit's `description` var in italics), the vitals, the body's size
+(100, medium: the 2x2 knight holds no size number and size_default is
+100), each status with its definition's `description` data, the tags, the
+readable vars as a list (`stats` on one line, `inventory` with the sword's
+own `description` and damage, `rations: 3`), the actions with their
+target types and descriptions (the sword's `slash` and the unit's own
+`rally`), the passives and the body parts. `__gm_note`, the glyph vars
+(the unit's and the sword's), the footprint vars, hp and the description
+var itself stay out of Details. `short` prints the card
+(entity_info_format); a stray word is refused. entity_description_sections
+picks and orders the sections, entity_description_action_format reshapes an
+action line (`{path}`); a body part has its own description.
+
+SCENARIO 1009 — The description's readable vars: whitelist, blacklist paths, `*.key`, `@engine`, the line limit
+---------------------------------------------------------------------------------------------------------------------
+!match new vf Vf 8 6
+!match use vf
+!ent add mage Mage 12 2 2
+!ent set_var mage stats.int 7
+!ent set_var mage stats.wis 4
+!ent set_var mage stats.secret_dc 15
+!ent set_var mage spells.firebolt.description "A bolt of flame"
+!ent set_var mage spells.firebolt.cost 3
+!ent set_var mage spells.firebolt.note "GM: fizzles near water"
+!ent set_var mage gear.cloak.warmth 2
+!ent set_var mage gear.cloak.note "stolen"
+!eval "entity[mage].bag = ['herbs', 'chalk', 'candle']"
+!ent set_var mage favors 0
+!ent set_var mage ready true
+!ent info mage
+?? - stats: int 7, wis 4, secret_dc 15
+?? - bag: herbs, chalk, candle
+?? - ready: yes
+?? - spells
+?? - firebolt: A bolt of flame (cost 3, note GM: fizzles near water)
+?? - favors: 0
+?! hp:
+!system set default entity_description_hidden_vars "@engine, stats.secret_dc, *.note"
+!ent info mage
+?? - stats: int 7, wis 4
+?? - firebolt: A bolt of flame (cost 3)
+?? - gear
+?? - cloak: warmth 2
+?! secret_dc
+?! stolen
+?! GM:
+!system set default entity_description_shown_vars "stats, gear.cloak"
+!ent info mage
+?? - stats: int 7, wis 4
+?? - cloak: warmth 2
+?! spells
+?! favors
+?! bag
+!system set default entity_description_hidden_vars "*.note"
+!system set default entity_description_shown_vars ""
+!ent info mage
+?? - hp: 12
+?? - max_hp: 12
+!system set default entity_description_line_limit 3
+!ent info mage
+?? more lines)
+!assert "len(rule_get('entity_description_hidden_vars')) > 0"
+!system unset default entity_description_hidden_vars
+!system unset default entity_description_shown_vars
+!system unset default entity_description_line_limit
+!ent info mage
+?! - hp:
+
+Expected: by default every var shows except `__` keys, action dicts and the
+blacklist (entity_description_hidden_vars, whose default hides the engine's
+vars through `@engine`: hp and max_hp aren't in Details); a list of plain
+values is joined, a bool reads yes / no, a 0 still shows. A blacklist path
+(`stats.secret_dc`) hides one var, `*.note` the key `note` at any depth (the
+spell's and the cloak's). The whitelist entity_description_shown_vars
+(`stats, gear.cloak`) shows only those paths, the blacklist still applying
+inside them. Dropping `@engine` from the blacklist puts hp / max_hp in
+Details; entity_description_line_limit 3 cuts the section with a count of
+the lines left out.
+
+SCENARIO 1010 — Action visibility: all, allies, used; `!action list` / `info`, `!find action:`, Tab; what a use records
+---------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS (`!action info` of an action the view can't see reads as missing)
+!match new av Av 10 6
+!match new av2 Av2 10 6
+!match use av
+!ent add hero Hero 20 1 1
+!ent set_var hero team red
+!ent set_var hero actions.parry.body "x = 1"
+!ent add orc Orc 15 5 1
+!ent set_var orc team blue
+!ent set_var orc inventory.axe.actions.chop.target entity
+!ent set_var orc inventory.axe.actions.chop.description "Hit for 3."
+!ent set_var orc inventory.axe.actions.chop.body "entity[target].hp = entity[target].hp - 3"
+!ent set_var orc actions.howl.description "A war cry."
+!ent set_var orc actions.howl.body "x = 1"
+!ent set_var orc actions.bite.body "fail('no teeth')"
+!as view red
+!ent info orc
+?? - **chop** (target: entity): Hit for 3.
+?? - **howl**: A war cry.
+!system set default entity_description_action_visibility allies
+!ent info orc
+?! **Actions**
+?! chop
+!action list orc
+?? No actions of `orc` that this channel's view can see.
+!action info orc chop
+?? ❌ no action `chop` on `orc`.
+!find action:chop ids
+?! orc
+?tab "!action orc "
+?! chop
+!ent info hero
+?? - **parry**
+!action list hero
+?? `parry`
+!system set default entity_description_action_visibility used
+!ent info orc
+?! **Actions**
+!as view omniscient
+!action orc chop hero
+!action orc bite
+!action orc howl
+!undo command
+!ent dump orc
+?? **actions seen used:** blue: `inventory.axe.actions.chop`; red: `inventory.axe.actions.chop`
+?! `actions.howl`
+!as view red
+!ent info orc
+?? - **chop** (target: entity): Hit for 3.
+?! howl
+?! bite
+!action list orc
+?? `chop`
+?! `howl`
+!find action:chop ids
+?? orc
+!action info orc howl
+?? ❌ no action `howl` on `orc`.
+!as view omniscient
+!template save orc brute
+!template spawn brute 7 3
+!ent clone orc orc_twin 8 4
+!ent copy orc av2
+!ent dump brute
+?! actions seen
+!ent dump orc_twin
+?! actions seen
+!ent kill orc
+!ent revive orc
+!ent dump orc
+?? **actions seen used:** blue: `inventory.axe.actions.chop`; red: `inventory.axe.actions.chop`
+!match use av2
+!ent dump orc
+?! actions seen
+!match use av
+!as view red
+!ent info brute
+?! **Actions**
+!system unset default entity_description_action_visibility
+!ent info brute
+?? - **chop**
+
+Expected: under `all` (the default) the red view sees the blue orc's
+actions. Under `allies` it sees none of another team's units' actions:
+the description has no Actions section, `!action list` says none can be
+seen (the same reply for a unit without actions), `!action info` reads the
+action as missing, `!find action:` doesn't match and Tab doesn't offer it;
+red's own hero still lists `parry`. Under `used` the orc shows only what
+red has seen it use: `chop` after a successful use (no fog: every team
+sees it), never `bite` (its body fails, so it isn't recorded) and not
+`howl`, whose use `!undo command` took back. `!ent dump` names the used
+actions per team that saw them (red and blue). A template spawned from
+the orc, a clone and a copy in another match start with none; a death and
+revive keep them (the corpse holds them).
+
+SCENARIO 1011 — The description under a disguise and for a rider; the short card no longer shows a disguised unit's real vars
+---------------------------------------------------------------------------------------------------------------------
+!match new dg Dg 10 6
+!match use dg
+!ent add spy Spy 10 4 2
+!ent set_var spy team blue
+!ent set_var spy description "An agent of the blue court."
+!ent set_var spy inventory.dagger.damage 4
+!ent set_var spy actions.stab.description "A hidden blade."
+!ent set_var spy actions.stab.body "x = 1"
+!passive add spy cloak on_turn_start "1"
+!part add spy mask_part Mask 1 1
+!ent set_var spy disguise.name Merchant
+!ent set_var spy disguise.vars.description "A travelling seller of silks."
+!ent set_var spy disguise.vars.wares.silk 3
+!ent set_var spy disguise.vars.actions.haggle.description "Barter for a better price."
+!ent set_var spy disguise.vars.actions.haggle.body "x = 1"
+!ent add cart Cart 30 7 4
+!ent set_var cart slots.gunner.capacity 1
+!ent set_var cart slots.gunner.actions.fire.description "Shoot from the cart."
+!ent set_var cart slots.gunner.actions.fire.body "x = 1"
+!ent add archer Archer 8 6 5
+!mount archer cart gunner
+!as view red
+!ent info spy
+?? **Merchant** (`spy`)
+?? *A travelling seller of silks.*
+?? - wares: silk 3
+?? - **haggle**: Barter for a better price.
+?! agent
+?! dagger
+?! stab
+?! Passives
+?! Parts
+?! disguise
+!ent info spy short
+?? **Merchant** (`spy`)
+?! Inventory
+?! Passives
+!action list spy
+?? `haggle`
+?! stab
+!find action:stab ids
+?! spy
+!find action:haggle ids
+?? spy
+!system set default entity_description_action_visibility used
+!ent info spy
+?! haggle
+!system unset default entity_description_action_visibility
+!as view blue
+!ent info spy
+?? **Spy** (`spy`)
+?? *An agent of the blue court.*
+?? - inventory
+?? - **stab**: A hidden blade.
+?! haggle
+?? Passives: cloak
+?? - Mask (`mask_part`)
+?! wares
+!as view omniscient
+!ent info archer
+?? - **fire**: Shoot from the cart.
+?? Riding: Cart (`cart`) in seat gunner: HP 30/30
+!ent info cart
+?? - **fire**: Shoot from the cart.
+?? **Riders**
+?? - Archer (`archer`) in seat gunner: HP 8/8
+!as view red
+!ent info cart
+?! Archer
+!as view omniscient
+!ent dump spy
+?? "dagger"
+!action spy haggle
+?? ❌
+
+Expected: a disguise presents its own statblock to a fooled view (red): the
+disguise's name, the `description` in its vars, its decoy vars (wares) and
+its decoy actions (haggle), and no passives, parts or real vars. The short
+card no longer prints the real inventory under a disguise (it used to merge
+the real vars under the decoys). `!action list` and `!find action:` read
+the decoy actions too. Under `used` the decoy's actions show only once the
+unit has used them (never here). The spy's own team (blue) and the
+omniscient view see the real unit, whose actions don't include the decoy's
+(action discovery skips the disguise var: `!action spy haggle` finds
+nothing). A rider's description lists the actions its seat gives it and
+names the vehicle it rides; the cart lists its slot's actions as its own
+and its riders, except to a team that can't see them (the gunner seat has
+no region, so the archer rides hidden inside and red's view of the cart
+names no rider).
+
+SCENARIO 1012 — Action visibility `used` is per team: under fog a use out of a team's sight stays unknown to it
+---------------------------------------------------------------------------------------------------------------------
+!match new fv Fv 12 4
+!match use fv
+!system set default entity_description_action_visibility used
+!ent add orc Orc 15 5 2
+!ent set_var orc team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc actions.roar.description "A terrible roar."
+!ent set_var orc actions.roar.body "x = 1"
+!ent add scout Scout 10 3 2
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 2
+!ent add sentry Sentry 10 12 4
+!ent set_var sentry team green
+!ent set_var sentry fog_vision_radius 1
+!match fog on
+!action orc roar
+!as view red
+!ent info orc
+?? - **roar**: A terrible roar.
+!as view green
+!find action:roar ids
+?! orc
+!as view omniscient
+!ent tp sentry 7 2
+!as view green
+!ent info orc
+?? **Orc** (`orc`)
+?! roar
+!as view omniscient
+!action orc roar
+!as view green
+!ent info orc
+?? - **roar**: A terrible roar.
+!as view omniscient
+!ent dump orc
+?? **actions seen used:** blue: `actions.roar`; green: `actions.roar`; red: `actions.roar`
+!system unset default entity_description_action_visibility
+
+Expected: under `used` each team records what it has seen. Fog is on; the
+2x2 orc roars while the red scout (vision 2) sees it and the green sentry
+(vision 1, far away) doesn't: red's view lists `roar`, green's doesn't
+(`!find action:` neither). Moving the sentry beside the orc's second cell
+shows green the orc but doesn't reveal
+the earlier roar; once green sees the orc roar again, its view lists it.
+`!ent dump` names who saw it: blue (the orc's own team), green and red.
+
+SCENARIO 1013 — Player-facing var labels: `!system labels`, path over key, the description and card, GM reads keep keys
+---------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS (bad label paths are refused)
+!match new vl Vl 8 4
+!match use vl
+!ent add hero Hero 20 2 2
+!ent set_var hero stats.str 5
+!ent set_var hero stats.dex 3
+!ent set_var hero inventory.sword.damage 8
+!ent set_var hero inventory.rope 1
+!ent set_var hero str 9
+!system labels set default str Brawn
+?? `str` reads **Brawn** to players on `default`. Labels show once `var_labels_enabled` is on.
+!system labels set default stats.str Strength
+!system labels set default stats Attributes
+!system labels set default damage Damage
+!system labels set default sword "Notched Sword"
+!ent info hero
+?? - stats: str 5, dex 3
+?! Strength
+!system set default var_labels_enabled true
+!ent info hero
+?? - Attributes: Strength 5, dex 3
+?? - Notched Sword: Damage 8
+?? - rope: 1
+?? - Brawn: 9
+!ent info hero short
+?? Inventory: {Notched Sword, rope}
+!list
+!ent dump hero
+?! Strength
+?! Notched
+!find hp>0 show:stats.str
+?? stats.str=5
+!assert "entity[hero].stats.str == 5"
+!system labels list default
+?? - `stats.str` (path): Strength
+?? - `damage` (key, any depth): Damage
+!system labels set default stats.__x Hidden
+?? ❌ Can't label `stats.__x`: `stats.__x` names a `__` key, which players never see.
+!system labels set default stats..str X
+?? ❌ Can't label `stats..str`: `stats..str` has an empty segment.
+?tab "!system labels remove default st"
+?? candidates: stats  stats.str  str
+!system new house parent=default
+!match new vl2 Vl2 8 4 house
+!match use vl2
+!ent add guard Guard 10 2 2
+!ent set_var guard stats.str 4
+!system labels remove house stats.str
+!ent info guard
+?? - Attributes: Brawn 4
+!system unset house var_labels:stats.str
+!ent info guard
+?? - Attributes: Strength 4
+!as restart
+!match use vl
+!ent info hero
+?? - Attributes: Strength 5, dex 3
+!system labels remove default sword
+!ent info hero short
+?? Inventory: {sword, rope}
+
+Expected: `!system labels set` maps a var path or a bare key to the label
+players read; until var_labels_enabled is on nothing changes. Once on, the
+description's Details read the labels: `stats` reads Attributes, its `str`
+Strength (the path label wins over the key label Brawn, which still names
+the top-level `str`), `damage` and `sword` take their key labels at any
+depth, and unlabelled keys stay as they are. The short card's `{inventory}`
+names the sword by its label. `!ent dump`, `!find show:` and formulas keep
+the keys. A label can't name a `__` key or a path with an empty segment.
+Tab offers the system's labelled paths for a removal. A child system
+inherits the labels; removing `stats.str` there hides it (the key label
+Brawn then names the guard's `str`) until `!system unset` brings it back. Labels persist across a restart.

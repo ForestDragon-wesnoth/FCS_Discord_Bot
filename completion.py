@@ -31,7 +31,7 @@ from vtt_commands import (registry, _usage_tokens, _split_top, _usage_tails,
 # new names): nothing to offer.
 _FREE_SLOTS = {
     "x", "y", "x1", "y1", "x2", "y2", "n", "value", "formula", "body", "dice",
-    "hp", "maxhp", "w", "h", "delay", "delta", "level", "duration", "count",
+    "hp", "maxhp", "w", "h", "number", "delay", "delta", "level", "duration", "count",
     "r", "radius", "dx", "dy", "expansion", "params", "spec", "json", "text",
     "phrase", "condition", "effect", "new_name", "new_id", "init", "field",
     "base", "op", "0-100", "MB", "csv", "row", "legend", "char", "color",
@@ -413,6 +413,12 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(mgr.systems if slot == "system" else mgr.matches)
     if slot == "rule":
         return sorted(logic.RULES_REGISTRY)
+    if slot == "var_path" and root == "system" and sub == "labels":
+        # `set` names any path; the removals one the system labels.
+        if binds.get(_LAST_LIT) == "set":
+            return []
+        s = mgr.systems.get(binds.get("system", ""))
+        return sorted(mgr.system_library(s, "var_labels")) if s else []
     if slot in ("tag", "filter"):
         if root == "system" and sub == "tags":
             # `add` names a new tag; the others one the system declares.
@@ -472,8 +478,13 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         seen = set(_entity_ids(mgr, ctx))
         if root in ("action", "ent") and (root == "action" or sub == "action"):
             if ent in seen:
-                from action import discover_actions
-                return sorted(discover_actions(m.entities[ent], m.rules))
+                # What the view may see (entity_description_action_visibility).
+                from vtt_commands import _visible_actions
+                try:
+                    pov = _query_pov(ctx, m)
+                except Exception:
+                    pov = None
+                return sorted(_visible_actions(m, m.entities[ent], pov))
             return []
         if root == "ent" and sub == "status":
             own = set(m.entities[ent].status) if ent in seen else set()

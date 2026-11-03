@@ -1,7 +1,7 @@
 ## vtt_commands.py (framework‑agnostic commands + registry)
 # vtt_commands.py
 from __future__ import annotations
-from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Any, Set, Tuple
 from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 from match_history import MatchHistory, Snapshot, HistoryError, _now_iso
 from storage import storage_of, valid_id, fmt_bytes
@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -299,7 +299,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
         if sub in ("alias", "tile", "func", "status", "table", "macro",
-                   "zone", "tags"):
+                   "zone", "tags", "labels"):
             # !system alias <action> <sys> ...
             return len(args) < 2 or args[1].lower() not in ("list", "info",
                                                             "show")
@@ -1073,6 +1073,9 @@ class CommandRegistry:
         # The command journal (journal.py): the channel's match before the
         # command, to tell after it (and its watchers) whether it changed.
         jm = mgr.matches.get(pre_active_mid) if pre_active_mid else None
+        # The approval queue before the command: a crash that undoes an
+        # approved request's effect puts the request back (W9).
+        pre_pending = dict(jm.pending_requests) if jm is not None else None
         jpre = None
         # A read-only command (_JOURNAL_READS) skips the two whole-match
         # serializations: a change it does make (a watcher firing after it)
@@ -1158,7 +1161,7 @@ class CommandRegistry:
             ref = crash_ref(f"command `{name}`", e)
             note = _crash_rollback(mgr, pre_active_mid,
                                    pre_state if pre_state is not None
-                                   else jpre)
+                                   else jpre, pre_pending)
             note += _crash_left_note(mgr, pre_active_mid,
                                      MATCHES_TOUCHED.get() or set())
             await ctx.send(f"💥 Unexpected error{ref}: {e}{note}")
@@ -1166,7 +1169,11 @@ class CommandRegistry:
             if touched_token is not None:
                 MATCHES_TOUCHED.reset(touched_token)
             _TYPED_UNIT_VIEW.reset(vtoken)
+            # The end-of-command settling and the watcher poll print under
+            # the same hiding (V15).
+            text_hidden = FORMULA_TEXT_HIDDEN.get()
             FORMULA_TEXT_HIDDEN.reset(ftoken)
+            touched = set(MATCHES_TOUCHED.get() or ())
             if reveals_token is not None:
                 revealed = _HOST_REVEALS.get() or []
                 _HOST_REVEALS.reset(reveals_token)
@@ -1211,48 +1218,12 @@ class CommandRegistry:
         # snapshot represents "the state to roll back to if you undo
         # this command".
         post_state = None
-        # Status-granting zones (#136) settle after a command that changed
-        # the match (a read leaves them as they are): what it changed may be
-        # a zone's cells or grants, or what a condition reads. (A change of
-        # the zone_status_grant_bodies rule settles in apply_system_rules.)
-        if pre_active_mid in mgr.matches:
-            m_post = mgr.matches[pre_active_mid]
-            grants = m_post._grants_present()
-            if (getattr(m_post, "_action_depth", 0) == 0
-                    and (grants or m_post.sizes_on())):
-                if pre_state is not None:
-                    post_state = m_post.to_dict(include_history=False)
-                    due = _differs_in_undo_state(pre_state, post_state)
-                else:
-                    due = not _settles_nothing(name, args)
-                if due:
-                    # Sizes (#242): what the command changed (a part
-                    # attached or killed, a unit spawned) re-derives each
-                    # body's size total and category.
-                    before = getattr(m_post, "_size_changes", 0)
-                    try:
-                        m_post.surface_log(m_post.sync_all_sizes())
-                    except VTTError as e:
-                        await ctx.send(f"❌ settling sizes: {e}")
-                    except Exception as e:
-                        ref = crash_ref("size sync", e)
-                        await ctx.send(f"💥 Unexpected error{ref} while "
-                                       f"settling sizes: {e}")
-                    if getattr(m_post, "_size_changes", 0) != before:
-                        post_state = None
-                if due and grants:
-                    before = m_post._grant_changes
-                    try:
-                        m_post.surface_log(m_post.sync_zone_grants())
-                    except VTTError as e:
-                        await ctx.send(f"❌ settling zone grants: {e}")
-                    except Exception as e:
-                        # E6: an exception here used to skip the undo step,
-                        # the watcher poll and the journal entry below.
-                        ref = crash_ref("zone grant sync", e)
-                        await ctx.send(f"💥 Unexpected error{ref} while "
-                                       f"settling zone grants: {e}")
-                    post_state = None
+        hide_tok = FORMULA_TEXT_HIDDEN.set(text_hidden)
+        try:
+            post_state = await _settle_after(
+                ctx, mgr, name, args, pre_active_mid, pre_state, touched)
+        finally:
+            FORMULA_TEXT_HIDDEN.reset(hide_tok)
         if pre_state is not None and pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
             if post_state is None:
@@ -1296,6 +1267,7 @@ class CommandRegistry:
             # reads go on the entry too.
             jstate_token = _JOURNAL_AS_STATE.set(jstate)
             preads_token = PREFAB_READS.set(preads)
+            hide_tok = FORMULA_TEXT_HIDDEN.set(text_hidden)
             try:
                 wm = mgr.matches[mid_now]
                 fired = getattr(wm, "_watchers_fired", 0)
@@ -1309,6 +1281,7 @@ class CommandRegistry:
                     wm.surface_log(wm.sync_zone_grants())
                     await _flush_formula_log(ctx)
             finally:
+                FORMULA_TEXT_HIDDEN.reset(hide_tok)
                 _JOURNAL_AS_STATE.reset(jstate_token)
                 PREFAB_READS.reset(preads_token)
             # Nested maps: a wreck marked __delete_when_empty goes once its
@@ -1330,6 +1303,69 @@ class CommandRegistry:
         if jparent is not None:
             jparent.update(jmine)
         return result
+
+async def _settle_after(ctx: ReplyContext, mgr: MatchManager, name: str,
+                        args: List[str], mid: Optional[str],
+                        pre_state: Optional[Dict[str, Any]],
+                        touched: Set[str]) -> Optional[Dict[str, Any]]:
+    """After a top-level command's handler: settle the sizes (#242) and
+    the zone grants (#136) of the channel's match when the command changed
+    it (a read leaves them as they are: what it changed may be a part's
+    death, a zone's cells or grants, or what a condition reads; a change
+    of a rule settles in apply_system_rules), and the sizes of the other
+    matches it reached (S16). Returns the match's post-state when it was
+    serialized and nothing changed it since (else None)."""
+    post_state = None
+    for other in sorted(touched - {mid}):
+        om = mgr.matches.get(other)
+        if om is not None and om.sizes_on() \
+                and getattr(om, "_action_depth", 0) == 0:
+            try:
+                om.surface_log(om.sync_all_sizes())
+            except VTTError as e:
+                await ctx.send(f"❌ settling sizes in `{other}`: {e}")
+    if mid not in mgr.matches:
+        return None
+    pre_active_mid = mid
+    m_post = mgr.matches[pre_active_mid]
+    grants = m_post._grants_present()
+    if (getattr(m_post, "_action_depth", 0) == 0
+            and (grants or m_post.sizes_on())):
+        if pre_state is not None:
+            post_state = m_post.to_dict(include_history=False)
+            due = _differs_in_undo_state(pre_state, post_state)
+        else:
+            due = not _settles_nothing(name, args)
+        if due:
+            # Sizes (#242): what the command changed (a part
+            # attached or killed, a unit spawned) re-derives each
+            # body's size total and category.
+            before = getattr(m_post, "_size_changes", 0)
+            try:
+                m_post.surface_log(m_post.sync_all_sizes())
+            except VTTError as e:
+                await ctx.send(f"❌ settling sizes: {e}")
+            except Exception as e:
+                ref = crash_ref("size sync", e)
+                await ctx.send(f"💥 Unexpected error{ref} while "
+                               f"settling sizes: {e}")
+            if getattr(m_post, "_size_changes", 0) != before:
+                post_state = None
+        if due and grants:
+            before = m_post._grant_changes
+            try:
+                m_post.surface_log(m_post.sync_zone_grants())
+            except VTTError as e:
+                await ctx.send(f"❌ settling zone grants: {e}")
+            except Exception as e:
+                # E6: an exception here used to skip the undo step,
+                # the watcher poll and the journal entry below.
+                ref = crash_ref("zone grant sync", e)
+                await ctx.send(f"💥 Unexpected error{ref} while "
+                               f"settling zone grants: {e}")
+            post_state = None
+    return post_state
+
 
 registry = CommandRegistry()
 
@@ -1955,7 +1991,8 @@ def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
                           ("zone_definitions", "zone definitions"),
                           ("tables", "tables"), ("macros", "macros"),
                           ("tag_vocabulary", "tag vocabulary"),
-                          ("watchers", "watchers")):
+                          ("watchers", "watchers"),
+                          ("var_labels", "var labels")):
             la, lb = a.get(lib) or {}, b.get(lib) or {}
             names = sorted(k for k in set(la) | set(lb)
                            if la.get(k) != lb.get(k))
@@ -2322,8 +2359,11 @@ _TMPL_COND_RE = _re.compile(r"\{\?([a-zA-Z_][\w.]*)\?\}(.*?)\{/\?\}", _re.DOTALL
 _TMPL_PLACE_RE = _re.compile(r"\{([a-zA-Z_][\w.]*)\}")
 
 
-def _tmpl_fmt_value(v: Any) -> str:
-    """Format a value for placeholder substitution."""
+def _tmpl_fmt_value(v: Any, labels: Optional[Dict[str, str]] = None,
+                    at: str = "") -> str:
+    """Format a value for placeholder substitution. `labels` (a system's
+    var labels, var_labels_enabled) name a dict's keys, `at` being the
+    dict's var path."""
     if v is None:
         return ""
     if isinstance(v, bool):
@@ -2332,6 +2372,9 @@ def _tmpl_fmt_value(v: Any) -> str:
         if not v:
             return ""
         keys = list(v.keys())
+        if labels:
+            keys = [var_label_for(labels, f"{at}.{k}" if at else str(k))
+                    or k for k in keys]
         # str()-coerce keys: a formula can write a dict with non-string keys
         # (e.g. `entity[x].loot = {1: 'a'}`), and joining an int key raised
         # "expected str instance" (a 💥) when such a var fed a template
@@ -2370,8 +2413,11 @@ def _tmpl_truthy(found: bool, val: Any) -> bool:
     return bool(val)
 
 
-def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
-    """Render a template string with placeholders and conditionals."""
+def _render_template(tmpl: str, ctx: Dict[str, Any],
+                     labels: Optional[Dict[str, str]] = None) -> str:
+    """Render a template string with placeholders and conditionals.
+    `labels` (player-facing var labels, `_var_labels`) name the keys of a
+    dict a placeholder prints."""
     # Allow \n in the stored rule string to produce real newlines
     s = tmpl.replace("\\n", "\n").replace("\\t", "\t")
 
@@ -2395,8 +2441,22 @@ def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
         found, val = _tmpl_resolve(ctx, path)
         if not found:
             return f"<?{path}?>"
-        return _tmpl_fmt_value(val)
+        return _tmpl_fmt_value(val, labels, path)
     return _TMPL_PLACE_RE.sub(_place_sub, s)
+
+
+def _var_labels(m: Optional[Match]) -> Optional[Dict[str, str]]:
+    """The var labels players read on `m` (its system's `var_labels`
+    library, read live), or None while var_labels_enabled is off or there
+    are none. Only the player-facing reads take them: the description, the
+    short card and the roster lines."""
+    if m is None or not m.rules.get("var_labels_enabled", False):
+        return None
+    mgr = CURRENT_WORKSPACE.get()
+    s = getattr(mgr, "systems", {}).get(m.system_name) if mgr else None
+    if s is None:
+        return None
+    return mgr.system_library(s, "var_labels") or None
 
 
 def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
@@ -2461,39 +2521,43 @@ def _entity_template_context(e: Entity,
         info = e._match.size_info(e)
         ctx["size"] = info["total"]
         ctx["size_class"] = info["category"] or ""
+    dis = (e._match._effective_disguise(e, pov_team)
+           if pov_team is not None and e._match is not None else None)
     # Merge vars — vars win for keys NOT already in the well-known set above.
     # (So a user's `hp` var won't override the computed alias, since `hp` is in ctx.)
-    for k, v in e.vars.items():
-        if k not in ctx:
-            ctx[k] = v
+    # A disguised unit shows only its disguise's vars to a fooled viewer:
+    # `{inventory}` read the real one under any disguise. Its passives
+    # stay hidden too.
+    if dis is None:
+        for k, v in e.vars.items():
+            if k not in ctx:
+                ctx[k] = v
+    else:
+        ctx["passives_csv"] = ""
     # Disguise overlay (116): a non-allied viewer sees the fake name + vars.
     # The disguise's vars win over EVERYTHING (incl. the computed hp/max_hp/
     # team) — that's the point of a fake statblock.
-    if pov_team is not None and e._match is not None:
-        dis = e._match._effective_disguise(e, pov_team)
-        if dis is not None:
-            n = e._match.entity_display_name(e, pov_team)
-            if isinstance(n, str) and n:
-                ctx["name"] = n
-            dvars = dis.get("vars")
-            if isinstance(dvars, dict):
-                for k, v in dvars.items():
-                    ctx[k] = v
-                # The fixed placeholders follow the decoy of the var behind
-                # them, whatever the var-name rules call it.
-                _sn, size_t, size_n = e._match.size_names()
-                for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
-                                   ("initiative", init_var),
-                                   ("team", e._team_var_name()),
-                                   ("size", size_n), ("size_class", size_t)):
-                    if var in dvars:
-                        ctx[alias] = dvars[var]
-                # A decoy total without a decoy category shows its own.
-                dt = dvars.get(size_n)
-                if size_n in dvars and size_t not in dvars \
-                        and isinstance(dt, (int, float)) \
-                        and not isinstance(dt, bool):
-                    ctx["size_class"] = e._match.size_category_of(dt) or ""
+    if dis is not None:
+        n = e._match.entity_display_name(e, pov_team)
+        if isinstance(n, str) and n:
+            ctx["name"] = n
+        dvars = dis.get("vars")
+        if isinstance(dvars, dict):
+            for k, v in dvars.items():
+                ctx[k] = v
+            # The fixed placeholders follow the decoy of the var behind
+            # them, whatever the var-name rules call it.
+            _sn, size_t, size_n = e._match.size_names()
+            for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
+                               ("initiative", init_var),
+                               ("team", e._team_var_name())):
+                if var in dvars:
+                    ctx[alias] = dvars[var]
+            # The size pair as the disguise presents it (V16).
+            if size_n in dvars or size_t in dvars:
+                pv = e._match.presented_vars(e, pov_team)
+                ctx["size"] = pv.get(size_n, "")
+                ctx["size_class"] = pv.get(size_t, "")
     # The unit's full tag set (own, granted, engine), as the viewer's
     # disguise presents it; `tags_sourced` names where each came from.
     if e._match is not None:
@@ -2517,7 +2581,9 @@ def _entity_line(e: Entity, pov_team: Optional[str] = None) -> str:
             "entity_line_format",
             "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
         )
-    line = _render_template(tmpl, _entity_template_context(e, pov_team))
+    labels = _var_labels(e._match)
+    line = _render_template(tmpl, _entity_template_context(e, pov_team),
+                            labels)
     # Sub-entity (body part / segment) suffix: append body_part_entity_line_suffix
     # with {parent} / {parent_name} bound, so a roster shows which body a part
     # belongs to. Only fires for an entity whose part_of points at a live parent.
@@ -2560,7 +2626,328 @@ def _entity_card(e: Entity, pov_team: Optional[str] = None) -> str:
         tmpl = e._match.rules.get("entity_info_format")
     if not tmpl:
         tmpl = DEFAULT_SYSTEM_SETTINGS.get("entity_info_format", "")
-    return _render_template(tmpl, _entity_template_context(e, pov_team))
+    return _render_template(tmpl, _entity_template_context(e, pov_team),
+                            _var_labels(e._match))
+
+
+# ---- the entity description (`!ent info <id>`) ----------------------------
+# Tier 2 of reading a unit, between the short card (entity_info_format,
+# `!ent info <id> short`) and `!ent dump`: a player-facing description in the
+# sections entity_description_sections lists, each rendered by its
+# entity_description_<section>_format rule.
+
+def _description_rule(m: Match, key: str) -> str:
+    v = m.rules.get(key)
+    if not isinstance(v, str):
+        v = DEFAULT_SYSTEM_SETTINGS.get(key, "")
+    return v
+
+
+def _description_paths(text: Any) -> List[str]:
+    """A comma / space separated list of var paths from a rule."""
+    return [w for w in _re.split(r"[\s,]+", str(text or "")) if w]
+
+
+def _description_vars(m: Match, e: Entity, vars_: Dict[str, Any],
+                      engine_vars: bool) -> Dict[str, Any]:
+    """The vars the description's data section shows: `vars_` without `__`
+    keys, action dicts and what entity_description_hidden_vars hides, and
+    only what entity_description_shown_vars names when it names anything.
+    `engine_vars`: the `@engine` word applies (a real unit's vars; a
+    disguise's decoys go through it too)."""
+    shown = _description_paths(m.rules.get("entity_description_shown_vars"))
+    hidden_words = _description_paths(
+        m.rules.get("entity_description_hidden_vars"))
+    hidden_paths = {w for w in hidden_words
+                    if not w.startswith("*.") and w != "@engine"}
+    hidden_keys = {w[2:] for w in hidden_words if w.startswith("*.")}
+    engine: Set[str] = set()
+    if "@engine" in hidden_words and engine_vars:
+        for rule in VAR_NAME_RULES:
+            name = e.var_names.get(rule) or m.rules.get(rule)
+            if isinstance(name, str) and name:
+                engine.add(name)
+
+    def wanted(path: str) -> Tuple[bool, bool]:
+        """(show it, everything under it shows) per the whitelist."""
+        if not shown:
+            return True, True
+        for w in shown:
+            if path == w or path.startswith(w + "."):
+                return True, True
+        return any(w.startswith(path + ".") for w in shown), False
+
+    def walk(node: Dict[str, Any], at: str, inside: bool) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            key = str(k)
+            path = f"{at}.{key}" if at else key
+            if key.startswith("__") or key == "actions" \
+                    or key in hidden_keys or path in hidden_paths \
+                    or (not at and key in engine):
+                continue
+            under = inside
+            if not inside:
+                ok, under = wanted(path)
+                if not ok:
+                    continue
+            if isinstance(v, dict):
+                sub = walk(v, path, under)
+                if not sub:
+                    continue
+                out[key] = sub
+            elif under:
+                out[key] = v
+        return out
+    return walk(vars_, "", False)
+
+
+def _description_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _description_tree(node: Dict[str, Any], depth: int,
+                      out: List[str],
+                      labels: Optional[Dict[str, str]] = None,
+                      at: str = "") -> None:
+    """`node` as an indented bullet list: `key: value`; a dict of plain
+    values on one line (`stats: str 5, dex 3`); a dict's `description` text
+    after its key; lists of plain values joined with `, `. `labels` (the
+    var labels players read) name the keys, `at` being `node`'s var
+    path."""
+    pad = "  " * depth + "- "
+
+    def name(key: Any) -> str:
+        if not labels:
+            return str(key)
+        return var_label_for(labels, f"{at}.{key}" if at else str(key)) \
+            or str(key)
+
+    for k0, v in node.items():
+        k = name(k0)
+        here = f"{at}.{k0}" if at else str(k0)
+        if isinstance(v, dict):
+            desc = v.get("description")
+            desc = desc if isinstance(desc, str) and desc else None
+            rest = {kk: vv for kk, vv in v.items()
+                    if not (kk == "description" and desc is not None)}
+            plain = all(not isinstance(x, (dict, list)) for x in rest.values())
+            if plain and len(rest) <= 6:
+                inner = ", ".join(
+                    f"{(var_label_for(labels, f'{here}.{kk}') if labels else None) or kk} "
+                    f"{_description_value(vv)}"
+                    for kk, vv in rest.items() if vv is not None)
+                if desc and inner:
+                    out.append(f"{pad}{k}: {desc} ({inner})")
+                else:
+                    out.append(f"{pad}{k}: {desc or inner}")
+                continue
+            out.append(f"{pad}{k}" + (f": {desc}" if desc else ""))
+            _description_tree(rest, depth + 1, out, labels, here)
+        elif isinstance(v, list):
+            items = [x for x in v if x is not None]
+            if not items:
+                continue
+            if all(not isinstance(x, (dict, list)) for x in items):
+                out.append(f"{pad}{k}: "
+                           + ", ".join(_description_value(x) for x in items))
+                continue
+            out.append(f"{pad}{k}")
+            for i, x in enumerate(items, start=1):
+                if isinstance(x, dict):
+                    _description_tree({str(i): x}, depth + 1, out, labels,
+                                      here)
+                elif isinstance(x, list):
+                    out.append("  " * (depth + 1) + "- "
+                               + ", ".join(_description_value(y) for y in x))
+                else:
+                    out.append("  " * (depth + 1) + "- "
+                               + _description_value(x))
+        elif v is not None and v != "":
+            out.append(f"{pad}{k}: {_description_value(v)}")
+
+
+def _visible_actions(m: Match, e: Entity,
+                     pov: Optional[str]) -> Dict[str, List[Any]]:
+    """The actions of `e` (its own, without a seat's) a viewer on `pov`
+    may see, as discover_actions gives them: under a disguise the decoy
+    actions in its `vars`, else those entity_description_action_visibility
+    lets the view see (every one without a team view)."""
+    from types import SimpleNamespace
+    from action import discover_actions
+    dis = m._effective_disguise(e, pov) if pov is not None else None
+    if dis is not None:
+        dvars = dis.get("vars")
+        src: Any = SimpleNamespace(id=None, vars=dvars if isinstance(
+            dvars, dict) else {})
+    else:
+        src = e
+    out: Dict[str, List[Any]] = {}
+    for name, acts in discover_actions(src, m.rules).items():
+        keep = [a for a in acts if m.action_visible(e, a.full_path, pov)]
+        if keep:
+            out[name] = keep
+    return out
+
+
+def _description_actions(m: Match, e: Entity, pov: Optional[str],
+                         dis: Optional[Dict[str, Any]]) -> List[str]:
+    """One entity_description_action_format line per action the viewer may
+    see: the unit's own and, for a rider, those its seat gives it; a
+    disguise's decoy actions under a disguise."""
+    from action import discover_mount_actions
+    fmt = _description_rule(m, "entity_description_action_format")
+    rows: List[Tuple[Any, Optional[Entity], str]] = []
+    found = _visible_actions(m, e, pov)
+    for name in sorted(found):
+        for act in found[name]:
+            rows.append((act, None if dis is not None else e, ""))
+    if dis is None:
+        if e.is_mounted:
+            veh = m.entities.get(e.mounted_on)
+            for name, acts in sorted(
+                    discover_mount_actions(e, m, m.rules).items()):
+                for act in acts:
+                    rows.append((act, veh, e.mounted_on or ""))
+    lines = []
+    for act, holder, via in rows:
+        if via and not m.action_visible(e, act.full_path, pov, holder):
+            continue
+        forbid = (_action_forbid_note(m, e.id, act, via or None)
+                  if holder is not None else "")
+        actx = {
+            "name": act.name,
+            "target": "" if act.target_type == "none" else act.target_type,
+            "description": act.description,
+            "tags": ", ".join(act.tags),
+            "path": act.full_path,
+            "forbidden": forbid,
+            "via": via,
+        }
+        lines.append(_render_template(fmt, actx))
+    return lines
+
+
+def _description_statuses(m: Match, status: Dict[str, Any]) -> List[str]:
+    """One entity_description_status_format line per status (its fields and
+    its definition's level entries at its level as placeholders)."""
+    fmt = _description_rule(m, "entity_description_status_format")
+    lines = []
+    for name in sorted(status, key=str):
+        inst = status[name]
+        sctx: Dict[str, Any] = dict(inst) if isinstance(inst, dict) else {}
+        if isinstance(inst, dict):
+            sctx = merge_layer(m.status_level_data(name,
+                                                   m.status_level(inst))[0],
+                               sctx)
+        sctx = _hide_formula_fields(sctx)
+        sctx["name"] = name
+        lines.append(_render_template(fmt, sctx))
+    return lines
+
+
+def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
+    """The description of `e` (`!ent info <id>`) as a viewer on `pov_team`
+    sees it (None = every unit's whole truth): the sections
+    entity_description_sections lists, a section with nothing to show left
+    out. A disguise presents its own name, statuses, vars and actions to a
+    fooled viewer, and no passives or parts."""
+    m = e._match
+    assert m is not None
+    dis = m._effective_disguise(e, pov_team) if pov_team is not None else None
+    ctx = _entity_template_context(e, pov_team)
+    if dis is None:
+        own = e.vars.get("description")
+    else:
+        dv = dis.get("vars")
+        own = dv.get("description") if isinstance(dv, dict) else None
+    ctx["description"] = own if isinstance(own, str) else ""
+    sections = _description_paths(m.rules.get("entity_description_sections"))
+    labels = _var_labels(m)
+    out: List[str] = []
+
+    def fmt(sec: str) -> str:
+        return _description_rule(m, f"entity_description_{sec}_format")
+
+    for sec in sections:
+        text = ""
+        if sec in ("header", "vitals"):
+            text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "size":
+            if m.sizes_on() and ctx.get("size") not in (None, ""):
+                text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "tags":
+            if ctx.get("tags"):
+                text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "passives":
+            if ctx.get("passives_csv"):
+                text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "statuses":
+            status = (m.presented_statuses(e, pov_team)
+                      if pov_team is not None else e.status)
+            items = _description_statuses(m, status)
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        elif sec == "data":
+            if dis is None:
+                src = e.vars
+            else:
+                dv = dis.get("vars")
+                src = dv if isinstance(dv, dict) else {}
+            tree = _hide_formula_fields(_description_vars(m, e, src, True))
+            lines: List[str] = []
+            _description_tree(tree, 0, lines, labels)
+            if lines:
+                cap = int(m.rules.get("entity_description_line_limit", 60))
+                if len(lines) > cap:
+                    lines = lines[:cap] + [
+                        f"... ({len(lines) - cap} more lines)"]
+                text = _render_template(fmt(sec),
+                                        {"items": "\n".join(lines)})
+        elif sec == "actions":
+            items = _description_actions(m, e, pov_team, dis)
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        elif sec == "parts":
+            if dis is None:
+                pfmt = _description_rule(m, "entity_description_part_format")
+                items = [_render_template(pfmt,
+                                          _entity_template_context(p, pov_team))
+                         for p in sorted(m.entities.values(),
+                                         key=lambda u: u.id)
+                         if p.part_of == e.id
+                         and not _pov_hides(m, pov_team, p.id)]
+                if items:
+                    text = _render_template(fmt(sec),
+                                            {"items": "\n".join(items)})
+        elif sec == "mount":
+            # The vehicle it rides and the riders it carries, each as the
+            # viewer sees that unit (its own disguise, its own visibility).
+            riding = ""
+            veh = m.entities.get(e.mounted_on or "") if e.mounted_on else None
+            if veh is not None and not _pov_hides(m, pov_team, veh.id):
+                vctx = _entity_template_context(veh, pov_team)
+                vctx["slot"] = e.mount_slot or ""
+                riding = _render_template(_description_rule(
+                    m, "entity_description_riding_format"), vctx)
+            rfmt = _description_rule(m, "entity_description_rider_format")
+            riders = []
+            for r in sorted(m.vehicle_riders(e.id), key=lambda u: u.id):
+                if _pov_hides(m, pov_team, r.id):
+                    continue
+                rctx = _entity_template_context(r, pov_team)
+                rctx["slot"] = r.mount_slot or ""
+                riders.append(_render_template(rfmt, rctx))
+            if riding or riders:
+                text = _render_template(fmt(sec), {
+                    "riding": riding, "riders": "\n".join(riders)})
+        if text.strip():
+            out.append(text.rstrip("\n"))
+    return "\n".join(out) if out else f"`{e.id}`"
 
 
 def _corpse_template_context(
@@ -2634,7 +3021,7 @@ def _corpse_line(
     tctx["map"] = mp.name if mp is not None else ""
     tctx["map_shown"] = (mp.name if mp is not None and len(m.maps) > 1
                          else "")
-    return _render_template(tmpl, tctx)
+    return _render_template(tmpl, tctx, _var_labels(m))
 
 
 def _part_status_str(m, p: Entity) -> str:
@@ -2704,6 +3091,10 @@ def _entity_dump(e: Entity) -> str:
         for bp in body:
             role = bp.vars.get(name_var, "?")
             parts.append(f"- `{bp.id}` ({role}): {_part_status_str(m, bp)}")
+    if e.actions_seen:
+        parts.append("**actions seen used:** " + "; ".join(
+            f"{t}: " + ", ".join(f"`{p}`" for p in paths)
+            for t, paths in sorted(e.actions_seen.items())))
     return "\n".join(parts)
 
 
@@ -5638,14 +6029,26 @@ async def _in_vision_pass(ctx: ReplyContext, mgr: MatchManager, fn: Any,
 
 
 def _crash_rollback(mgr: MatchManager, mid: Optional[str],
-                    pre: Optional[Dict[str, Any]]) -> str:
+                    pre: Optional[Dict[str, Any]],
+                    pre_pending: Optional[Dict[str, Any]] = None) -> str:
     """After a command crashed: put the channel's match back to `pre`, its
     state before the command, so a half-done change (a transform without
-    its old parts, a half-revived unit) isn't kept and saved (W8). Returns
-    the note for the reply ("" when there was nothing to put back)."""
-    if pre is None or not mid or mid not in mgr.matches:
+    its old parts, a half-revived unit) isn't kept and saved (W8), and the
+    requests it approved back in the queue (their effect is undone too).
+    Returns the note for the reply ("" when there was nothing to put
+    back)."""
+    if not mid or mid not in mgr.matches:
         return ""
     m = mgr.matches[mid]
+    if pre is None:
+        # W9: with command autosaves and the journal both off there is no
+        # state from before the command to put back.
+        if int(m.rules.get("autosave_command_retention_turns", 3)) != 0 \
+                or journal_limit(m) != 0:
+            return ""
+        return (f"\n⚠️ Match `{mid}` kept no state from before the command "
+                f"(autosave_command_retention_turns and command_journal_limit "
+                f"are 0), so what it changed before the crash stays.")
     try:
         if not _differs_in_undo_state(pre, m.to_dict(include_history=False)):
             return ""
@@ -5657,7 +6060,17 @@ def _crash_rollback(mgr: MatchManager, mid: Optional[str],
             mgr.apply_system_rules(m)
     except Exception:   # noqa: BLE001 - the crash is already reported
         return ""
-    return (f"\nMatch `{mid}` is back as it was before the command.")
+    back = [rid for rid in (pre_pending or {})
+            if rid not in m.pending_requests]
+    for rid in back:
+        m.pending_requests[rid] = pre_pending[rid]
+    note = f"\nMatch `{mid}` is back as it was before the command."
+    if back:
+        note += (" Request" + ("s " if len(back) > 1 else " ")
+                 + ", ".join(f"`{r}`" for r in sorted(back))
+                 + (" are" if len(back) > 1 else " is")
+                 + " pending again (`!pending`).")
+    return note
 
 
 def _crash_left_note(mgr: MatchManager, mid: Optional[str],
@@ -7899,36 +8312,108 @@ def _inheritors(mgr: MatchManager, s: Any, key: str) -> List[Any]:
     return out
 
 
-def _check_size_scale_rules(mgr: MatchManager, s: Any, key: str,
-                            value: Any) -> None:
-    """Refuse a size scale whose first category could only hold negative
-    sizes (a second start of 0 or below) while size_allow_negative is off
-    (#242), whichever of the two rules is being set."""
-    scale = parse_size_scale(value if key == "size_categories"
-                             else mgr.system_value(s, "size_categories"))
-    allow = (value if key == "size_allow_negative"
-             else mgr.system_value(s, "size_allow_negative"))
-    if not allow and len(scale) >= 2 and scale[1][1] <= 0:
-        raise VTTError(
-            f"size_categories: `{scale[0][0]}` would hold only negative "
-            f"sizes (below `{scale[1][0]}:{scale[1][1]}`), and "
-            f"size_allow_negative is off. Start `{scale[1][0]}` above 0, "
-            f"or allow negative sizes first.")
+# The rules whose combination the size checks judge (#242).
+_SIZE_CHECK_RULES = ("size_categories", "size_allow_negative",
+                     "size_default", "size_default_per_extra_tile",
+                     "size_decimals")
 
 
-def _negative_size_units(mgr: MatchManager, system_name: str) -> List[str]:
-    """`match/unit` for every unit on `system_name` (and its children)
-    holding a negative size number."""
-    family = {system_name, *mgr.system_descendants(system_name)}
+def _size_rule_problems(mgr: MatchManager, name: str) -> List[str]:
+    """What the size rules of `name` and the systems inheriting from it
+    would refuse, as they stand now: a first category holding only
+    negative sizes, or a negative default, while size_allow_negative is
+    off. Run after any change to them (set, unset, a new parent: L44),
+    which is undone when this names a problem."""
+    out: List[str] = []
+    for sn in [name] + list(mgr.system_descendants(name)):
+        sy = mgr.systems.get(sn)
+        if sy is None:
+            continue
+        who = "" if sn == name else f"(in `{sn}`, which inherits it) "
+        try:
+            scale = parse_size_scale(mgr.system_value(sy, "size_categories"))
+        except VTTError as e:
+            out.append(f"{who}{e}")
+            continue
+        # Whole-number sizes have whole-number starts (user call, L43: with
+        # `small:25.5`, writing `small` stored 25, a tiny size).
+        if not mgr.system_value(sy, "size_decimals"):
+            frac = [f"{n}:{st}" for n, st in scale
+                    if st is not None and st != int(st)]
+            if frac:
+                out.append(
+                    f"{who}size_categories: " + ", ".join(
+                        f"`{f}`" for f in frac)
+                    + (" start" if len(frac) > 1 else " starts")
+                    + " between whole sizes, and size_decimals is off. Use "
+                    "whole-number starts, or turn size_decimals on first.")
+        if mgr.system_value(sy, "size_allow_negative"):
+            continue
+        if len(scale) >= 2 and scale[1][1] <= 0:
+            out.append(
+                f"{who}size_categories: `{scale[0][0]}` would hold only "
+                f"negative sizes (below `{scale[1][0]}:{scale[1][1]}`), and "
+                f"size_allow_negative is off. Start `{scale[1][0]}` above 0, "
+                f"or allow negative sizes first.")
+        for k in ("size_default", "size_default_per_extra_tile"):
+            v = mgr.system_value(sy, k)
+            if isinstance(v, (int, float)) and v < 0:
+                out.append(f"{who}{k} is {v}, a negative size, and "
+                           f"size_allow_negative is off.")
+    return out
+
+
+def _size_rule_effective(mgr: MatchManager, name: str) -> Dict[str, Any]:
+    """(system -> (allow_negative, decimals)) for `name` and the systems
+    inheriting from it, to compare before and after a change."""
+    out = {}
+    for sn in [name] + list(mgr.system_descendants(name)):
+        sy = mgr.systems.get(sn)
+        if sy is not None:
+            out[sn] = (bool(mgr.system_value(sy, "size_allow_negative")),
+                       bool(mgr.system_value(sy, "size_decimals")))
+    return out
+
+
+def _size_rule_notes(mgr: MatchManager, before: Dict[str, Any]) -> List[str]:
+    """Notes after a size rule change: the units still holding a negative
+    size where negatives went off, and a fraction where decimals went off
+    (left as they are; new writes are refused / floored)."""
+    neg, frac = set(), set()
+    for sn, (allow, dec) in before.items():
+        sy = mgr.systems.get(sn)
+        if sy is None:
+            continue
+        if allow and not mgr.system_value(sy, "size_allow_negative"):
+            neg.add(sn)
+        if dec and not mgr.system_value(sy, "size_decimals"):
+            frac.add(sn)
+    notes: List[str] = []
+    for systems, test, what in (
+            (neg, lambda v: v < 0, "a negative size (left as they are; new "
+             "negative writes are refused)"),
+            (frac, lambda v: v != int(v), "a fractional size (left as they "
+             "are; new writes are floored)")):
+        if not systems:
+            continue
+        hits = _size_units(mgr, systems, test)
+        if hits:
+            notes.append(f"These units still hold {what}: "
+                         + ", ".join(hits) + ".")
+    return notes
+
+
+def _size_units(mgr: MatchManager, systems: Any, test: Any) -> List[str]:
+    """`match/unit` (value) for every unit on one of `systems` whose size
+    number passes `test`."""
     out = []
     for mid, m in sorted(mgr.matches.items()):
-        if m.system_name not in family:
+        if m.system_name not in systems:
             continue
         num_v = m.size_names()[0]
         for eid, e in sorted(m.entities.items()):
             v = e.vars.get(num_v)
-            if isinstance(v, (int, float)) and not isinstance(v, bool) \
-                    and v < 0:
+            if size_number_ok(v) and test(v):
                 out.append(f"`{mid}/{eid}` ({v})")
     return out
 
@@ -8359,7 +8844,13 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         old_parent = s.parent
         new_parent = None if target.lower() == "none" else target
         pre_state = mgr.server_state()
+        size_before = _size_rule_effective(mgr, name)
         mgr.set_system_parent(name, new_parent)
+        problems = _size_rule_problems(mgr, name)
+        if problems:
+            _apply_server_state(mgr, pre_state)
+            raise VTTError(f"Can't link `{name}` to `{target}`: "
+                           + " ".join(problems))
         # A new parent can rename var-name rules for this system and the
         # ones inheriting from it: under var_name_collision refuse, a var in
         # the way refuses the link, as `!system set` does.
@@ -8379,6 +8870,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                    if len(conflicts) > 5 else ""))
         notes: List[str] = []
         refreshed = mgr.refresh_match_rules(name, notes)
+        notes += _size_rule_notes(mgr, size_before)
         suffix = (f" (refreshed {refreshed} live match"
                   f"{'es' if refreshed != 1 else ''})" if refreshed else "")
         if new_parent is None:
@@ -8411,10 +8903,17 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             trial.settings.pop(key, None)
             moved_line = _rename_system_var(
                 mgr, s, name, key, mgr.system_value(trial, key))
+        size_before = _size_rule_effective(mgr, name)
+        pre_server = mgr.server_state()
         if not mgr.system_unset(s, key, entry or None):
             raise VTTError(f"`{name}` sets nothing for `{spec}` itself.")
+        problems = _size_rule_problems(mgr, name)
+        if problems:
+            _apply_server_state(mgr, pre_server)
+            raise VTTError(" ".join(problems))
         notes = []
         refreshed = mgr.refresh_match_rules(name, notes)
+        notes += _size_rule_notes(mgr, size_before)
         src = mgr.system_value_source(s, key) if key in RULES_REGISTRY else None
         shown = (f"now inherited from `{src}`" if src else
                  "back to the engine default" if key in RULES_REGISTRY
@@ -8453,18 +8952,19 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     
         s = mgr.get_system(name)
         warn = _check_formula_rule(mgr, s, key, value)
-        if key in ("size_categories", "size_allow_negative"):
-            _check_size_scale_rules(mgr, s, key, value)
+        size_before = _size_rule_effective(mgr, name)
+        if key in _SIZE_CHECK_RULES:
+            pre_server = mgr.server_state()
+            s.set(key, value)
+            problems = _size_rule_problems(mgr, name)
+            if problems:
+                _apply_server_state(mgr, pre_server)
+                raise VTTError(" ".join(problems))
         moved_line = _rename_system_var(mgr, s, name, key, value)
         s.set(key, value)
         notes: List[str] = []
         refreshed = mgr.refresh_match_rules(name, notes)
-        if key == "size_allow_negative" and not value:
-            neg = _negative_size_units(mgr, name)
-            if neg:
-                notes.append("These units still hold a negative size (left "
-                             "as they are; new negative writes are "
-                             "refused): " + ", ".join(neg) + ".")
+        notes += _size_rule_notes(mgr, size_before)
         suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
         return await ctx.send("\n".join(
             [f"`{name}`.{key} = {value!r}{suffix}"]
@@ -8625,6 +9125,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_zone(ctx, args, mgr)
     if sub == "tags":
         return await _system_tags(ctx, args, mgr)
+    if sub == "labels":
+        return await _system_labels(ctx, args, mgr)
     if sub in ("table", "macro"):
         return await _system_text_lib(ctx, args, mgr, sub)
     if sub == "watch":
@@ -9153,6 +9655,15 @@ def _lint_sizes(matches: List[Match]) -> List[str]:
             if not allow and n is not None and n < 0:
                 out.append(f"⚠️ match `{m.id}` `{e.id}`: size {n} is negative "
                            f"(size_allow_negative is off)")
+            if n is not None and n != int(n) \
+                    and not m.rules.get("size_decimals", False):
+                out.append(f"⚠️ match `{m.id}` `{e.id}`: size {n} has a "
+                           f"fraction (size_decimals is off)")
+            num_v = m.size_names()[0]
+            if num_v in e.vars and n is None:
+                out.append(f"⚠️ match `{m.id}` `{e.id}`: `{num_v}` holds "
+                           f"{e.vars[num_v]!r}, not a size number (it reads "
+                           f"as the default)")
     return out
 
 
@@ -9919,6 +10430,73 @@ async def _system_tags(ctx: ReplyContext, args: List[str],
         _system_deleted_line(mgr, s, kind, "tag", t) for t in gone))
 
 
+_SYSTEM_LABELS_USAGE = ("!system labels <list <system> | "
+                        "set <system> <var_path> <label ...> | "
+                        + " | ".join(f"{d} <system> <var_path ...>"
+                                     for d in _SYSTEM_LIB_DELETES) + ">")
+
+
+async def _system_labels(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager):
+    """`!system labels <list|set|remove> <system> ...` — the player-facing
+    var labels: a var path or a bare key -> the label players read under
+    var_labels_enabled. Inherited entry by entry, read live (never copied
+    into a match)."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "labels"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    kind = "var_labels"
+    if action not in ("list", "set") + _SYSTEM_LIB_DELETES:
+        return await _help_fallback(ctx, ["system", "labels"], args[1])
+    lib = mgr.system_library(s, kind)
+    if action == "list":
+        _check_tail(args, 3, (), "!system labels list <system>")
+        on = mgr.system_value(s, "var_labels_enabled")
+        state = "on" if on else "off: `!system set <system> var_labels_enabled true`"
+        if not lib:
+            return await ctx.send("\n".join(
+                [f"No var labels on system `{sys_name}` (var_labels_enabled "
+                 f"{'on' if on else 'off'})."] + _system_hidden_line(s, kind)))
+        lines = [f"**Var labels of `{sys_name}`** ({len(lib)}; "
+                 f"var_labels_enabled {state}):"]
+        for k in sorted(lib):
+            src = "" if k in s.var_labels else " (inherited)"
+            where = "path" if "." in k else "key, any depth"
+            lines.append(f"- `{k}` ({where}): {lib[k]}{src}")
+        return await ctx.send("\n".join(lines + _system_hidden_line(s, kind)))
+    if await return_help_if_not_enough_args(ctx, args, 4, "system", "labels"):
+        return
+    if action == "set":
+        if len(args) < 5:
+            raise VTTError(f"Usage: `!system labels set <system> <var_path> "
+                           f"<label ...>`.")
+        path, label = args[3], " ".join(args[4:]).strip()
+        why = var_label_problem(path, label)
+        if why:
+            raise VTTError(f"Can't label `{path}`: {why}.")
+        prior = lib.get(path)
+        lib[path] = label
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(
+            f"🏷️ `{path}` reads **{label}** to players on `{sys_name}`"
+            + (f" (it was **{prior}**)"
+               if prior is not None and prior != label else "")
+            + "." + ("" if mgr.system_value(s, "var_labels_enabled") else
+                     " Labels show once `var_labels_enabled` is on."))
+    gone = []
+    for raw in args[3:]:
+        if raw not in lib:
+            raise VTTError(f"`{raw}` has no label on system `{sys_name}` "
+                           f"(`!system labels list {sys_name}`).")
+        gone.append(raw)
+    for k in gone:
+        del lib[k]
+    mgr.system_library_write(s, kind, lib)
+    return await ctx.send("\n".join(
+        _system_deleted_line(mgr, s, kind, "label", k) for k in gone))
+
+
 async def _system_text_lib(ctx: ReplyContext, args: List[str],
                            mgr: MatchManager, sub: str):
     """`!system table|macro <action> <system> ...` — the tables (`!table`
@@ -10324,6 +10902,23 @@ registry.annotate_sub(
         "Engine tags (corpse, part, segment, rider, vehicle, map_carrier) "
         "are declared by the engine."),
 )
+registry.annotate_sub(
+    "system", "labels",
+    usage=_SYSTEM_LABELS_USAGE,
+    desc=(
+        "Player-facing var labels: `set <sys> <var_path> <label>` makes "
+        "players read the label in place of the var's key. A dotted path "
+        "(`stats.str`) labels that var; a bare key (`damage`) labels the key "
+        "at any depth, and a path label wins over a key label. Labels show "
+        "only while the var_labels_enabled rule is on, and only in player "
+        "reads: the description's data section (`!ent info`) and a dict's "
+        "keys printed by a placeholder of the short card or roster line; "
+        "`!ent dump`, `!find show:`, formulas and selectors keep the keys. "
+        "Values are shown as stored. Read live from the system (a match "
+        "takes no copy); a child system inherits its parent's labels, and "
+        "removing an inherited one hides it (`!system unset <sys> "
+        "var_labels:<path>` brings it back)."),
+)
 registry.annotate_sub("system", "default", usage="!system default <server|channel> <name>", desc="Set the GameSystem new matches use: this server's default, or this channel's own.")
 
 # ---- group fan-out helpers -------------------------------------------------
@@ -10696,12 +11291,19 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg += "\n" + "\n".join(spawn_log)
         return await ctx.send(msg)
 
-    # --- info (entity card per entity_info_format rule) ---
+    # --- info: the description, or `short` the card (entity_info_format) ---
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
+        if len(args) > 2 and (len(args) > 3 or args[2].lower() != "short"):
+            raise VTTError(f"Unexpected `{' '.join(args[2:])}` — usage: "
+                           f"`!ent info <id> [short]`.")
         eid = _query_eid(ctx, m, args[1])
-        return await ctx.send(_entity_card(m.entities[eid], _query_pov(ctx, m)))
+        if len(args) > 2:
+            return await ctx.send(_entity_card(m.entities[eid],
+                                               _query_pov(ctx, m)))
+        return await ctx.send(_entity_description(m.entities[eid],
+                                                  _query_pov(ctx, m)))
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -11390,6 +11992,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     # Strip / remap relational fields.
                     payload.pop("mounted_on", None)
                     payload.pop("mount_slot", None)
+                    payload.pop("actions_seen", None)   # a new unit
                     if oid == src_id:
                         payload.pop("part_of", None)  # root clone is standalone
                     elif payload.get("part_of") in idmap:
@@ -11800,9 +12403,14 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "info",
-    usage="!ent info <id>",
-    desc=("Show an entity card per the game system's entity_info_format rule. "
-          "For complete raw state regardless of template, use !ent dump."),
+    usage="!ent info <id> [short]",
+    desc=("Describe a unit for players: its vitals, size, statuses, tags, "
+          "readable vars, actions, passives and parts, per the "
+          "entity_description_* rules (`!help find entity_description`). "
+          "`short` shows the short card (the entity_info_format rule), the "
+          "unit's state at a glance. A disguise presents its own statblock "
+          "to a fooled viewer. For everything stored on the unit, raw, use "
+          "!ent dump (hosts)."),
 )
 registry.annotate_sub(
     "ent", "dump",
@@ -14163,14 +14771,22 @@ def _find_size_matches(m: Match, e: Entity, cat: str, mod: Optional[str],
         names = ", ".join(n for n, _s in scale) or "(none defined)"
         raise VTTError(f"`size:{cat}`: not a size category (the scale: "
                        f"{names}).")
+    # The live total (a part that died earlier in the same command counts
+    # already, S16), or the total a disguise presents to the query's team.
     root = m.body_root(e)
-    found, total = _entity_path_value(m, root, m.size_names()[2], pov)
-    if not found or isinstance(total, bool) \
-            or not isinstance(total, (int, float)):
-        if pov is not None and found:
-            return False             # a decoy that isn't a number
+    _num_v, text_v, total_v = m.size_names()
+    dis = m._effective_disguise(root, pov) if pov is not None else None
+    dvars = dis.get("vars") if isinstance(dis, dict) else None
+    if isinstance(dvars, dict) and (total_v in dvars or text_v in dvars):
+        # The size pair the disguise presents (V16): its category, from a
+        # decoy total or named outright.
+        pv = m.presented_vars(root, pov)
+        have = m.size_rank_of(str(pv.get(text_v)))
+        if have is None:
+            return False
+    else:
         total = m.size_info(e)["total"]
-    have = m.size_rank_of(m.size_category_of(total))
+        have = m.size_rank_of(m.size_category_of(total))
     if have is None:
         return False
     if mod == "+":
@@ -14214,8 +14830,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             # !action handler uses, so a `!find action:slice` query
             # answer is consistent with "will `!action <eid> slice`
             # find anything?".
-            from action import discover_actions, lookup_action
-            actions = discover_actions(e, m.rules)
+            # Under a team view only the actions that view may see
+            # (entity_description_action_visibility; a disguise's decoys).
+            from action import lookup_action
+            actions = _visible_actions(m, e, pov)
             if not lookup_action(actions, key, m.rules):
                 return False
             continue
@@ -16819,6 +17437,9 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         path = args[2]
+        err = derived_clamp_error(path, m.rules)
+        if err:
+            raise VTTError(f"Can't clamp {err}")
         parsed = _parse_clamp_args(args[3:])
         if "max" not in parsed and "min" not in parsed:
             raise VTTError(
@@ -16954,6 +17575,11 @@ async def gclamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "gclamp", "add"):
             return
         path = args[1]
+        err = derived_clamp_error(path, {
+            k: mgr.system_value(sysobj, k)
+            for k in ("size_num_var", "size_text_var", "size_total_var")})
+        if err:
+            raise VTTError(f"Can't clamp {err}")
         parsed = _parse_clamp_args(args[2:])
         if "max" not in parsed and "min" not in parsed:
             raise VTTError("Clamp must specify at least one of max=... or min=...")
@@ -20751,10 +21377,12 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pre_reason and same_value(e.status.get(name), pre_inst):
             return await ctx.send(f"`{eid}`: {pre_reason} — no effect.{tail}")
         inst = e.status.get(name, {})
+        # The duration as the status reads it, level entries included (S14).
+        dur = m.status_field(inst, name, "duration")
         return await ctx.send(
             f"{verb} `{name}` to `{eid}` "
             f"(level={inst.get('level', '?')}, "
-            f"duration={inst.get('duration', '∞')}).{tail}"
+            f"duration={'∞' if dur is None else dur}).{tail}"
         )
 
     return await _help_fallback(ctx, ["status"], args[0] if args else None)
@@ -24140,16 +24768,35 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
     appears in multiple containers), and the GM's description if any.
     Empty entries hint at the available subcommands so a confused
     user sees a way forward."""
-    from action import discover_actions, discover_mount_actions
+    from action import discover_mount_actions
     actor = m.entities[actor_id]
-    actions = discover_actions(actor, m.rules)
-    mount_actions = discover_mount_actions(actor, m, m.rules) \
-        if actor.is_mounted else {}
-    bad = _textless_bodies(actor.vars)
+    pov = _query_pov(ctx, m)
+    # A team view sees what entity_description_action_visibility lets it
+    # (a disguise's decoys under a disguise); `limited` = it may not see
+    # them all, so the replies don't tell "none" from "none you can see".
+    disguised = (pov is not None
+                 and m._effective_disguise(actor, pov) is not None)
+    limited = disguised or (
+        pov is not None and m.body_team(actor) != str(pov)
+        and str(m.rules.get("entity_description_action_visibility",
+                            "all")) != "all")
+    actions = _visible_actions(m, actor, pov)
+    mount_actions: Dict[str, List[Any]] = {}
+    if actor.is_mounted and not disguised:
+        veh = m.entities.get(actor.mounted_on or "")
+        for name, acts in discover_mount_actions(actor, m, m.rules).items():
+            keep = [a for a in acts
+                    if m.action_visible(actor, a.full_path, pov, veh)]
+            if keep:
+                mount_actions[name] = keep
+    bad = [] if limited else _textless_bodies(actor.vars)
     notes = [f"⚠️ `{p}` isn't an action: its body is "
              f"{type(v).__name__}, not formula text."
              for p, v in bad]
     if not actions and not mount_actions:
+        if limited:
+            return await ctx.send(f"No actions of `{actor_id}` that this "
+                                  f"channel's view can see.")
         return await ctx.send("\n".join(
             [f"No actions discoverable on `{actor_id}`. Add one by "
              f"setting `<container>.actions.<name>.body` (and "
@@ -24163,7 +24810,8 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
             container = act.container_path or "(entity root)"
             desc = f" — {act.description}" if act.description else ""
             tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
-            forbid = _action_forbid_note(m, actor_id, act)
+            forbid = "" if disguised else _action_forbid_note(m, actor_id,
+                                                              act)
             lines.append(
                 f"- `{act.name}` (target: `{act.target_type}`, at "
                 f"`{container}`{tags}){desc}"
@@ -24239,9 +24887,13 @@ async def _action_info(
     """!action info <eid> <name>: full detail for one action,
     including the body source. Accepts either a bare name (with
     disambiguation menu on collision) or a full vars path."""
-    from action import discover_actions, lookup_action
+    from action import lookup_action
     actor = m.entities[actor_id]
-    actions = discover_actions(actor, m.rules)
+    pov = _query_pov(ctx, m)
+    disguised = (pov is not None
+                 and m._effective_disguise(actor, pov) is not None)
+    # Only what the view may see (entity_description_action_visibility).
+    actions = _visible_actions(m, actor, pov)
     # Full-path first (matches the !action invocation precedence).
     matches: List[Any] = []
     for act_list in actions.values():
@@ -24286,7 +24938,7 @@ async def _action_info(
                      if isinstance(filt, list) else f"`{filt}`")
             lines.append(f"{label} {shown}")
     lines += [f"⚠️ {p}" for p in act.tag_problems]
-    forbid = _action_forbid_note(m, actor_id, act)
+    forbid = "" if disguised else _action_forbid_note(m, actor_id, act)
     if forbid:
         lines.append(f"Forbidden:   {forbid}")
     lines += [
@@ -24722,7 +25374,9 @@ def _size_scale_lines(scale, decimals: bool) -> List[str]:
         elif decimals:
             rng = f"{start} up to {nxt}"
         else:
-            rng = f"{start}-{nxt - 1}" if nxt - 1 > start else f"{start}"
+            # The whole sizes it holds ("-10 to 9": a dash read as a minus).
+            lo, hi = math.ceil(start), math.ceil(nxt) - 1
+            rng = f"{lo} to {hi}" if hi > lo else f"{lo}"
         out.append(f"{i}. `{name}`: {rng}")
     return out
 
@@ -24761,11 +25415,9 @@ def _help_size(ctx: ReplyContext, mgr: MatchManager,
                     "(`size_categories`): sizes are plain numbers.")
         return "\n".join([head] + _size_scale_lines(scale, decimals))
     num = None
-    try:
+    if re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?", raw):
         num = float(raw)
-    except ValueError:
-        pass
-    if num is not None and math.isfinite(num):
+    if num is not None and size_number_ok(num):
         n = int(num) if num.is_integer() else num
         if not scale:
             return f"{n}: this system defines no size categories."
@@ -24786,11 +25438,17 @@ def _help_size(ctx: ReplyContext, mgr: MatchManager,
     num_v, text_v, total_v = m.size_names()
     dis = (m._effective_disguise(root, pov) if pov is not None else None)
     if dis is not None:
-        # A disguised body shows only what its decoy vars present.
-        found, t = _entity_path_value(m, root, total_v, pov)
-        if not found or isinstance(t, bool) or not isinstance(t, (int, float)):
-            t = info["total"]
-        cat = m.size_category_of(t)
+        # A disguised body shows only the size pair it presents (V16): a
+        # decoy total, a decoy category's number, or a category alone
+        # (size_name_write refuse), else the real total and category.
+        pv = m.presented_vars(root, pov)
+        t, cat = pv.get(total_v), pv.get(text_v)
+        if not size_number_ok(t):
+            t = None
+        if t is None and not cat:
+            t, cat = info["total"], info["category"]
+        if t is None:
+            return f"**`{raw}`** size `{cat}`."
         return (f"**`{raw}`** size {t}" + (f" (`{cat}`)" if cat else "") + ".")
     own = info["own"]
     lines = [f"**`{e.id}`** size {info['total']}"

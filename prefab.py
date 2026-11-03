@@ -29,6 +29,7 @@ remapping act on one shape.
 
 from __future__ import annotations
 
+import ast
 import copy
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -172,6 +173,8 @@ def capture_prefab(mgr: Any, m: Match, mp: Map, x1: int, y1: int, x2: int,
                 for u in tree:
                     d = u.to_dict()
                     d.pop("map", None)
+                    for k in logic.UNIT_HISTORY_KEYS:
+                        d.pop(k, None)
                     # A zone's grants come back from the zone (#136).
                     d["status"] = logic.without_zone_grants(d.get("status"))
                     d["x"] = int(d.get("x", u.x)) - xa
@@ -465,6 +468,7 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                 raise VTTError(f"Prefab `{name}`: zone `{zname}` cells are "
                                f"[dx, dy] pairs.")
             cell(c[0], c[1], f"a cell of zone `{zname}`")
+        _check_grant_condition(z, f"Prefab `{name}`: zone `{zname}`")
         if z.get("anchor") and z["anchor"] not in ids:
             raise VTTError(f"Prefab `{name}`: zone `{zname}` is anchored to "
                            f"`{z['anchor']}`, which isn't a unit of the "
@@ -490,8 +494,25 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                 _check_status_definition(entry, name, ename)
             elif lib == "zone_definitions":
                 logic.check_zone_def_name(ename)
+                _check_grant_condition(
+                    entry, f"Prefab `{name}`: zone definition `{ename}`")
                 entries[ename] = logic.normalize_zone_def(entry)
     return d
+
+
+def _check_grant_condition(z: Dict[str, Any], who: str) -> None:
+    """A carried zone's / definition's `grant_condition` parses as an
+    expression, as `!zone grant_condition` requires (L42: a stamp placed
+    `hp < 007`, which the formula engine refuses and the native reading
+    took)."""
+    cond = z.get("grant_condition")
+    if not isinstance(cond, str) or not cond.strip():
+        return
+    try:
+        ast.parse(cond, mode="eval")
+    except SyntaxError as ex:
+        raise VTTError(f"{who}: its grant_condition doesn't parse "
+                       f"({ex.msg}).")
 
 
 def _check_unit_dict(u: Any, name: str, where: str) -> None:
@@ -519,6 +540,11 @@ def _check_unit_dict(u: Any, name: str, where: str) -> None:
             raise VTTError(f"{who}: `{k}` must be text (an id) or absent.")
     if "var_names" in u:
         u["var_names"] = logic.check_var_names_field(u["var_names"], who)
+    logic.check_size_var(u.get("vars"), u.get("var_names"), who)
+    for cpath in (u.get("clamps") or {}):
+        err = logic.derived_clamp_error(cpath, u.get("var_names"))
+        if err:
+            raise VTTError(f"{who}: can't clamp {err}")
     f = u.get("facing")
     if f is not None and (not isinstance(f, str)
                           or f not in logic.FACING_VECTORS):
