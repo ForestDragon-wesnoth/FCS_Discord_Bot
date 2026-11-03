@@ -32742,7 +32742,7 @@ SCENARIO 974 — !simulate: refusals, the step limit, hosts only
 !simulate 2 bogus=1 !ent hp ogre 1
 ?? Unknown option `bogus=`
 !simulate 2 tally="kill('ogre')" !ent hp ogre -1
-?? banned in a $() inline argument
+?? is banned in `tally=`
 !simulate 2 steps=0 !ent hp ogre -1
 ?? `steps=` is 1 or more
 !simulate 2 until="entity[zz].hp > 0" !ent hp ogre -1

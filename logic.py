@@ -10559,7 +10559,7 @@ class Match:
                     (k, v) for k, v in errors.items() if k is not None):
                 line = (f"⚠️ zone `{zname}`: its grant_condition failed for "
                         + ", ".join(f"`{u}`" for u in sorted(units))
-                        + f" ({first}); no grant.")
+                        + f" ({formula_text(first)}); no grant.")
                 if line not in self._grant_warned[1]:
                     self._grant_warned[1].add(line)
                     log.append(line)
@@ -13695,6 +13695,9 @@ class Match:
                                    if pr is None}):
                 continue                # its item / status went (L41)
             what = extras.get("watcher_name", key)
+            # Runtime count of effects run (the command layer settles zone
+            # grants again after a poll that ran any).
+            self._watchers_fired = getattr(self, "_watchers_fired", 0) + 1
             if eff:
                 # A watcher read for a unit, or one it holds, shows its
                 # output as lines about that unit (V14).
@@ -19153,7 +19156,24 @@ class Match:
         if pinning:
             self.template_pins[name] = {"data": copy.deepcopy(t.get("data")),
                                         "turn": self.turns_elapsed}
+            # A pin is read in the var names its data was written in, not
+            # in a later save's (S9+).
+            if isinstance(t.get("var_names"), dict):
+                self.template_pins[name]["var_names"] = copy.deepcopy(
+                    t["var_names"])
         return t.get("data")
+
+    def partial_var_names(self, name: str) -> Optional[Dict[str, Any]]:
+        """The var names partial `name`'s data was written in, as this
+        match reads it: its pin's when pinned (template_pinning), else the
+        library entry's. None when it records none."""
+        pinning = bool(self.rules.get("template_pinning", False))
+        if pinning and name in self.template_pins:
+            vn = self.template_pins[name].get("var_names")
+            return vn if isinstance(vn, dict) else None
+        t = self._template_library().get(name)
+        vn = t.get("var_names") if isinstance(t, dict) else None
+        return vn if isinstance(vn, dict) else None
 
     def resolve_partial(self, name: str, _chain: Tuple[str, ...] = (),
                         fresh: bool = True) -> Dict[str, Any]:
@@ -19191,7 +19211,12 @@ class Match:
         data = self.partial_data(name)
         if not isinstance(data, dict):
             raise VTTError(f"There is no partial template `{name}`.")
-        res = self._materialize(data, True, _chain + (name,))
+        # A partial built on another (`{"__template": "base", ...}`) reads
+        # the inner one in its own var names before its layer goes on, so a
+        # chain arrives in the outermost partial's names (S9+).
+        own = self.partial_var_names(name)
+        res = self._materialize(data, True, _chain + (name,),
+                                self.unit_names_for(own) if own else None)
         _inherit_nested(res)
         if cache is None:
             return res
@@ -19252,8 +19277,7 @@ class Match:
                             ) -> List[Tuple[str, str]]:
         """The (old, new) var moves partial `name` needs as a unit's whole
         vars under the var names `names` ([] when they match)."""
-        t = self._template_library().get(name)
-        own = t.get("var_names") if isinstance(t, dict) else None
+        own = self.partial_var_names(name)
         if not isinstance(own, dict):
             return []
         return [(own[k], names[k]) for k in VAR_NAME_RULES
@@ -19269,11 +19293,28 @@ class Match:
         `health` its `health` (user call, S9)."""
         moves = self._root_partial_moves(name, names)
         held = {old: base[old] for old, _new in moves if old in base}
+        mode = str(self.rules.get("var_name_collision", "tracked"))
+        targets = {new for _old, new in moves}
+        clash = [(old, new) for old, new in moves
+                 if old in held and new in base and new not in held]
+        if clash and mode == "refuse":
+            old, new = clash[0]
+            raise VTTError(
+                f"Partial `{name}` holds both `{old}` and `{new}`, and its "
+                f"`{old}` would move to `{new}` (var_name_collision "
+                f"refuse).")
         for old, _new in moves:
-            base.pop(old, None)
+            if old in held and old not in targets:
+                base.pop(old, None)
         for old, new in moves:
-            if old in held and new not in base:
-                base[new] = held[old]
+            if old not in held:
+                continue
+            if new in base and new not in held and mode == "existing":
+                # The var already there stays; the moved one is kept as
+                # plain data under its old name.
+                base[old] = held[old]
+                continue
+            base[new] = held[old]
 
     def _materialize(self, node: Any, root: bool,
                      _chain: Tuple[str, ...],
@@ -19842,6 +19883,10 @@ class Match:
         for k in ("part_of", "mounted_on", "mount_slot"):
             d.pop(k, None)
         d["map"] = mp.name
+        if "vars" in d and not isinstance(d.get("vars"), dict):
+            # `vars: null` (L36) is refused like a list, not a raw error.
+            raise VTTError("summon: the template's `vars` must be an "
+                           "object.")
         if isinstance(d.get("vars"), dict):
             d["vars"].pop("__follows", None)   # a segment's link ahead
         # Partial-template references in the vars are materialized now, so
@@ -26551,6 +26596,9 @@ class MatchManager:
                 log.append(f"💀 `{eid}` died as it left **{src.name}**; "
                            f"it was not transferred.")
                 return None, log
+        new_ids = {idmap[o] for o in order if idmap.get(o) in dest.entities}
+        if new_ids:
+            log.extend(dest.sync_zone_grants(new_ids))
         return idmap[eid], log
 
     def _spawn_copies(self, src: "Match", dest: "Match", e: "Entity",
@@ -26574,6 +26622,9 @@ class MatchManager:
             # do; the copy arrives dismounted and can mount for real.
             ne.mounted_on = None
             ne.mount_slot = None
+            # A status a zone holds stays with that zone (L40): the
+            # destination's own zones give theirs below.
+            ne.status = without_zone_grants(ne.status)
             if ne.part_of:
                 ne.part_of = idmap.get(ne.part_of, ne.part_of)
             # Segment chains: remap the `__follows` back-pointer (an entity id)

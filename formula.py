@@ -1620,6 +1620,18 @@ def _runtime_msg(e: BaseException) -> str:
     arguments`, not the private `FormulaEngine._namespace.<locals>.
     _slot_capacity()` it is implemented as."""
     msg = _IMPL_NAME_RE.sub(r"\1()", str(e))
+    mt = _NO_KW_RE.search(msg)
+    if mt is not None:
+        # A C builtin (abs) says it differently (L37).
+        return f"{mt.group(1)} takes no keyword arguments (map= included)."
+    mn = _NONE_CMP_RE.search(msg)
+    if mn is not None:
+        # A value that reads None compared with a number: a permanent
+        # status's duration (status_counter_add / status_duration), a
+        # schedule gone, a missing field (L37).
+        return (f"a comparison `{mn.group(1)}` met None: a value read as "
+                f"None (no duration on a permanent status, a missing field) "
+                f"was compared with a number; test it with `!= None` first.")
     mt = _MAP_KW_RE.search(msg)
     if mt is not None:
         # map= on a function with no map slot (it works on its unit's or
@@ -1633,6 +1645,10 @@ def _runtime_msg(e: BaseException) -> str:
 
 
 _MAP_KW_RE = re.compile(r"(\w+)\(\) got an unexpected keyword argument 'map'")
+_NO_KW_RE = re.compile(r"^(\w+)\(\) takes no keyword arguments$")
+_NONE_CMP_RE = re.compile(
+    r"'([<>]=?)' not supported between instances of '(?:NoneType'"
+    r" and '\w+|\w+' and 'NoneType)'")
 
 
 def _cell_arg(v: Any, fname: str, argname: str) -> int:

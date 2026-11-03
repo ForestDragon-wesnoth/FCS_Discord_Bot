@@ -1223,7 +1223,7 @@ class CommandRegistry:
                     post_state = m_post.to_dict(include_history=False)
                     due = _differs_in_undo_state(pre_state, post_state)
                 else:
-                    due = name not in _JOURNAL_READS
+                    due = not _settles_nothing(name, args)
                 if due:
                     before = m_post._grant_changes
                     try:
@@ -1281,8 +1281,17 @@ class CommandRegistry:
             jstate_token = _JOURNAL_AS_STATE.set(jstate)
             preads_token = PREFAB_READS.set(preads)
             try:
-                for line in mgr.matches[mid_now].fire_watchers():
+                wm = mgr.matches[mid_now]
+                fired = getattr(wm, "_watchers_fired", 0)
+                for line in wm.fire_watchers():
                     await ctx.send(line)
+                # A watcher's effect may change what a grant_condition reads
+                # (L40: it settled a command late).
+                if getattr(wm, "_watchers_fired", 0) != fired \
+                        and mgr.matches.get(mid_now) is wm \
+                        and wm._grants_present():
+                    wm.surface_log(wm.sync_zone_grants())
+                    await _flush_formula_log(ctx)
             finally:
                 _JOURNAL_AS_STATE.reset(jstate_token)
                 PREFAB_READS.reset(preads_token)
@@ -1650,6 +1659,24 @@ _SNAPSHOT_SUBS = frozenset({("turn", "set")})
 # doesn't serialize it around them.
 _JOURNAL_READS = frozenset({"assert", "dist", "dry", "find", "pending",
                             "roll", "simulate", "whoami"})
+
+
+def _settles_nothing(name: str, args: List[str]) -> bool:
+    """A read whose run takes no undo pre-state: it doesn't settle zone
+    grants (L40: `!history list`, an undo `preview` and a bare `!turn`
+    settled them, changing the match from a read)."""
+    root = name.lower()
+    sub = str(args[0]).lower() if args else None
+    if root in _JOURNAL_READS:
+        return True
+    if any(str(a).lower() == "preview" for a in args) \
+            and root in ("undo", "history"):
+        return True
+    if sub is None and root in READ_ONLY_BARE_ROOTS:
+        return True
+    return sub is not None and (
+        sub in READ_ONLY_SUBCOMMANDS.get(root, ())
+        or sub in (_HOST_READS.get(root) or ()))
 
 
 def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
@@ -2628,7 +2655,7 @@ def _entity_dump(e: Entity) -> str:
     )
     parts.append("")
     parts.append("**vars (full json):**")
-    parts.append(f"```{json.dumps(_hide_formula_fields(e.vars or {}), indent=2, sort_keys=True)}\n```")
+    parts.append(f"```json\n{json.dumps(_hide_formula_fields(e.vars or {}), indent=2, sort_keys=True)}\n```")
     if e.passives:
         parts.append("**passives:**")
         for pid, p in e.passives.items():
@@ -6351,8 +6378,36 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             live = resolver.template_materialize(node)
             live.pop(TEMPLATE_MARKER, None)
             return resolver.template_file_form(live)
+        def inline_roots(dep: Dict[str, Any]) -> Dict[str, Any]:
+            """A dependent whose whole vars (or data) reference `name`
+            under other var names: those roots written in full in the
+            dependent's names (S9+); `inline` does the rest."""
+            dep = copy.deepcopy(dep)
+
+            def fix(node: Any, var_names: Any) -> Any:
+                if not (isinstance(node, dict)
+                        and node.get(TEMPLATE_MARKER) == name):
+                    return node
+                names = resolver.unit_names_for(var_names)
+                if not resolver._root_partial_moves(name, names):
+                    return node
+                live = resolver.template_materialize(node, names=names)
+                live.pop(TEMPLATE_MARKER, None)
+                return resolver.template_file_form(live)
+            if _is_partial(dep):
+                dep["data"] = fix(dep.get("data"), dep.get("var_names"))
+                return dep
+            dep["vars"] = fix(dep.get("vars") or {}, dep.get("var_names"))
+            parts = dep.get("parts")
+            for p in (parts.values() if isinstance(parts, dict)
+                      else parts or []):
+                if isinstance(p, dict) and "vars" in p:
+                    p["vars"] = fix(p["vars"], p.get("var_names")
+                                    or dep.get("var_names"))
+            return dep
         for d in deps:
-            inlined[d] = _rewrite_template_refs(mgr.templates[d], inline)
+            inlined[d] = _rewrite_template_refs(
+                inline_roots(mgr.templates[d]), inline)
         _reserve_template_room(mgr, list(inlined.values()))
         st = storage_of(mgr)
         kept = st is not None and st.trash_template(mgr, name)
@@ -9221,7 +9276,7 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
         body = json.dumps(view, indent=2, default=str)
         src = "" if name in s.tile_templates else " (inherited)"
         return await ctx.send(f"**tile template `{name}`** on "
-                              f"`{sys_name}`{src}\n```{body}\n```")
+                              f"`{sys_name}`{src}\n```json\n{body}\n```")
     if action in ("del", "delete", "remove", "rm"):
         del lib[name]
         mgr.system_library_write(s, "tile_templates", lib)
@@ -9600,7 +9655,7 @@ async def _system_status(ctx: ReplyContext, args: List[str],
         src = "" if name in s.status_definitions else " (inherited)"
         return await ctx.send(
             f"**status def `{name}`** on `{sys_name}`{src}\n"
-            f"```{json.dumps(_hide_formula_fields(d), indent=2, sort_keys=True)}\n```")
+            f"```json\n{json.dumps(_hide_formula_fields(d), indent=2, sort_keys=True)}\n```")
     if action in _SYSTEM_LIB_DELETES:
         _check_tail(args, 4, (), f"!system status {action} <system> <name>")
         _system_lib_entry(mgr, s, kind, name, sys_name, "status definition")
@@ -9679,7 +9734,7 @@ async def _system_zone(ctx: ReplyContext, args: List[str],
         src = "" if name in s.zone_definitions else " (inherited)"
         return await ctx.send(
             f"**zone definition `{name}`** on `{sys_name}`{src}\n"
-            f"```{json.dumps(_zone_def_dict_view(d), indent=2, sort_keys=True, default=str)}\n```")
+            f"```json\n{json.dumps(_zone_def_dict_view(d), indent=2, sort_keys=True, default=str)}\n```")
     if action in _SYSTEM_LIB_DELETES:
         _check_tail(args, 4, (), f"!system zone {action} <system> <name>")
         _system_lib_entry(mgr, s, kind, name, sys_name, "zone definition")
@@ -10694,7 +10749,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if not data:
                     return await ctx.send(f"**`{eid}.{name}`** (no data)")
                 body = json.dumps(data, indent=2, default=str)
-                return await ctx.send(f"**`{eid}.{name}`**\n```{body}\n```")
+                return await ctx.send(f"**`{eid}.{name}`**\n```json\n{body}\n```")
             if action == "set":
                 if len(args) < 6:
                     return await ctx.send(
@@ -17700,7 +17755,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         tags = m.tile_tags(x, y, mp)
         data = _hide_formula_fields(data)
         return await ctx.send(
-            f"**tile ({x},{y})**\n```{json.dumps(data, indent=2, sort_keys=True)}\n```"
+            f"**tile ({x},{y})**\n```json\n{json.dumps(data, indent=2, sort_keys=True)}\n```"
             + (f"\nTags (its template's and its own): {', '.join(tags)}"
                if tags else "")
         )
@@ -18059,7 +18114,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             body = _json.dumps(_hide_formula_fields(view), indent=2,
                                default=str)
             return await ctx.send(
-                f"**template `{name}`** ({placed} placed)\n```{body}\n```"
+                f"**template `{name}`** ({placed} placed)\n```json\n{body}\n```"
             )
 
         return await _help_fallback(ctx, ["tile", "def"], args[1] if len(args) > 1 else None)
@@ -19100,7 +19155,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             }
         return await ctx.send(
             f"**zone `{name}`** ({len(cells)} cell(s))\n"
-            f"```{json.dumps(_hide_formula_fields(view), indent=2, sort_keys=True)}\n```"
+            f"```json\n{json.dumps(_hide_formula_fields(view), indent=2, sort_keys=True)}\n```"
         )
 
     # ---- list [tag=<tag>] [def=<definition>] ----
@@ -19553,7 +19608,7 @@ async def _zone_def_cmd(ctx: ReplyContext, args: List[str], m: Match):
             f"**zone definition `{args[2]}`** ({len(used)} zone(s)"
             + (": " + ", ".join(f"`{z}`" for z in used[:10])
                + (" ..." if len(used) > 10 else "") if used else "")
-            + f")\n```{json.dumps(_zone_def_dict_view(d), indent=2, sort_keys=True, default=str)}\n```")
+            + f")\n```json\n{json.dumps(_zone_def_dict_view(d), indent=2, sort_keys=True, default=str)}\n```")
     if dsub in _ZONE_DEF_DELETES:
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "def"):
             return
@@ -19764,7 +19819,7 @@ async def _status_level_sub(ctx: ReplyContext, args: List[str], m: Any,
                     f"`3+` = level 3 and up).")
         return (f"**`{name}` level entries** (`N+` by ascending N, then the "
                 f"exact level, each over the last; an instance's own key "
-                f"wins)\n```{_status_levels_view(sdef)}\n```")
+                f"wins)\n```json\n{_status_levels_view(sdef)}\n```")
     spec = check_level_spec(args[2])
     levels = sdef.setdefault(STATUS_LEVELS_FIELD, {})
     if len(args) < 4:
@@ -20453,7 +20508,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if d is None:
             return await ctx.send(f"No status definition `{name}`.")
         return await ctx.send(
-            f"**status def `{name}`**\n```{json.dumps(_hide_formula_fields(d), indent=2, sort_keys=True)}\n```"
+            f"**status def `{name}`**\n```json\n{json.dumps(_hide_formula_fields(d), indent=2, sort_keys=True)}\n```"
         )
 
     if sub in ("apply", "force"):
@@ -21925,11 +21980,15 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
     if steps < 1:
         return await ctx.send("❌ `steps=` is 1 or more.")
     from formula import validate_arg_safe
-    for src in ([until] if until else []) + opts["tally"]:
+    for key, src in ([("until", until)] if until else []) + [
+            ("tally", t) for t in opts["tally"]]:
         try:
             validate_arg_safe(src)
         except FormulaError as ex:
-            return await ctx.send(f"❌ `{src}`: {ex}")
+            # The read-only test is the $() one; name the option (L40).
+            why = (str(ex).replace("a $() inline argument", f"`{key}=`")
+                   .replace("inline $() argument", f"`{key}=`"))
+            return await ctx.send(f"❌ `{key}={src}`: {why}")
     units = [u for u in str(opts.get("units", "")).split(",") if u]
     missing = [u for u in units if u not in m.entities
                and m.find_corpse(u) is None]
@@ -23766,7 +23825,7 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             occ = m.slot_occupants(vid, name)
             return await ctx.send(
                 f"**slot `{name}` on `{vid}`**\n"
-                f"```{json.dumps(_hide_formula_fields(sd), indent=2, sort_keys=True)}\n```\n"
+                f"```json\n{json.dumps(_hide_formula_fields(sd), indent=2, sort_keys=True)}\n```\n"
                 f"capacity {m.slot_used_capacity(vid, name):g}/"
                 f"{m.slot_capacity(vid, name):g}; occupants: "
                 + (", ".join(f"`{e.id}`" if not _pov_hides(m, pov, e.id)
