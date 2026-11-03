@@ -3209,6 +3209,29 @@ def validate_arg_safe(src: str) -> None:
         # nothing in expression mode produces one, so no extra check is needed.
 
 
+def program_is_read_only(src: str) -> bool:
+    """Whether the program `src` can't change the match: every assignment
+    binds a bare local and every call is a read-only function
+    (ARG_SAFE_FUNC_NAMES, the `$()` test; a `!func` or a lambda helper may
+    write). False when it doesn't parse (the run reports why). `!eval`
+    takes its rollback state only for a program that may write (X13)."""
+    try:
+        tree = ast.parse(normalize_body_source(src), mode="exec")
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if not all(isinstance(t, ast.Name) for t in node.targets):
+                return False
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            return False
+        elif isinstance(node, ast.Call):
+            if not (isinstance(node.func, ast.Name)
+                    and node.func.id in ARG_SAFE_FUNC_NAMES):
+                return False
+    return True
+
+
 _ALLOWED_NODES: Tuple[type, ...] = (
     ast.Module, ast.Expression,
     ast.Expr, ast.Assign,

@@ -474,6 +474,20 @@ UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\
 SURFACE_UNIT_TAG: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "vtt_surface_unit_tag", default="")
 
+# The ids of the matches a command reached (MatchManager.get, copy_entity,
+# vtt_commands.require_target_host), collected while `!simulate` runs, so a
+# run restores only those (X16). None = not collecting.
+MATCHES_TOUCHED: "contextvars.ContextVar[Optional[Set[str]]]" = (
+    contextvars.ContextVar("vtt_matches_touched", default=None))
+
+
+def touch_match(mid: Optional[str]) -> None:
+    """Note that the running command reached match `mid` (MATCHES_TOUCHED)."""
+    seen = MATCHES_TOUCHED.get()
+    if seen is not None and mid:
+        seen.add(mid)
+
+
 # The workspace (MatchManager) whose command is running: formulas reach the
 # server's saved entity templates through it (summon_template). Set by each
 # CommandRegistry.run; None outside a command.
@@ -5048,6 +5062,36 @@ def checked_status_value(path: str, value: Any, where: str) -> Any:
         raise VTTError(f"{where}: `{seg0}` must be a finite number, "
                        f"got {value!r}.")
     return n
+
+
+# `entity[self].<var path> <op> <number>`, the shape of the default death
+# condition: read without building a formula namespace (~2 ms each), since
+# the death check runs after every var write and status change (X15).
+_SIMPLE_VAR_TEST_RE = re.compile(
+    r"^\s*entity\[self\]\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*"
+    r"(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")
+
+
+def _simple_var_test(cond: str, e: Any) -> Optional[bool]:
+    """The value of condition `cond` on unit `e` when it is a plain
+    `entity[self].<path> <op> <number>` over a stored number, the way the
+    formula reads it; None when it isn't (the caller runs the formula)."""
+    mo = _SIMPLE_VAR_TEST_RE.match(cond or "")
+    if mo is None:
+        return None
+    path, op, num = mo.group(1), mo.group(2), mo.group(3)
+    if path.split(".")[0] in RESERVED_VAR_PATHS or "__" in path:
+        return None
+    cur: Any = e.vars
+    for seg in path.split("."):
+        if not isinstance(cur, dict) or seg not in cur:
+            return None
+        cur = cur[seg]
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+        return None
+    n = float(num) if "." in num else int(num)
+    return {"<=": cur <= n, ">=": cur >= n, "==": cur == n, "!=": cur != n,
+            "<": cur < n, ">": cur > n}[op]
 
 
 # The largest total a status resistance fold may reach (E6): a level or a
@@ -10384,6 +10428,10 @@ class Match:
         the unit; zone_name and zone_map bound). One that fails reads as
         not met; `errors` keeps, per zone, its first error and the units
         it failed for."""
+        e = self.entities.get(eid)
+        fast = _simple_var_test(cond, e) if e is not None else None
+        if fast is not None:
+            return fast
         from formula import FormulaEngine, EvalCtx, FormulaError
         ctx = EvalCtx(this=self.current_entity_id(), target=eid,
                       extras={"zone_name": zname, "zone_map": mp.name})
@@ -10436,18 +10484,35 @@ class Match:
 
     def grant_scope(self, eid: str) -> Optional[Set[str]]:
         """The units a move of `eid` can change the zone grants of: its
-        whole carried body; None (every unit) when that body anchors an
-        aura. A per-step sync looks at these only (a condition costs a
+        whole carried body, and when that body anchors a granting aura, the
+        bodies the aura covers or held its grant. A per-step sync looks at these only (a condition costs a
         formula per unit); the end-of-command sync looks at everyone."""
         e = self.entities.get(eid)
         if e is None:
             return set()
         ids = {u.id for u in self.carried_body(self.body_root(e))}
+        scope = set(ids)
         for mp in self.maps.values():
-            for z in mp.zones.values():
-                if isinstance(z, dict) and z.get("anchor") in ids:
-                    return None
-        return ids
+            for zname, z in mp.zones.items():
+                if not (isinstance(z, dict) and z.get("anchor") in ids
+                        and self.zone_grants_of(z)):
+                    continue
+                # A granting aura the body carries (X15: every unit and
+                # zone was re-synced per step): the units it covers now and
+                # those holding its grant from before the step.
+                hit = set(self._zone_grant_targets(
+                    mp, z.get("cells") or (), "all"))
+                for u in self.entities.values():
+                    if any(isinstance(i, dict) and zname in (
+                            i.get(ZONE_GRANT_KEY) or ())
+                           for i in u.status.values()):
+                        hit.add(u.id)
+                for uid in hit:
+                    u = self.entities.get(uid)
+                    if u is not None:
+                        scope |= {b.id for b in self.carried_body(
+                            self.body_root(u))}
+        return scope
 
     def sync_zone_grants(self, scope: Optional[Set[str]] = None
                          ) -> List[str]:
@@ -13504,6 +13569,10 @@ class Match:
                   ) -> bool:
             if not cond:
                 return False
+            if eid is not None and eid in self.entities:
+                fast = _simple_var_test(cond, self.entities[eid])
+                if fast is not None:
+                    return fast
             try:
                 return bool(engine.eval_expression(
                     cond, EvalCtx(this=this_id, target=eid, extras=extras)))
@@ -19179,6 +19248,18 @@ class Match:
                     k, RULES_REGISTRY[k]["default"]))
                 for k in VAR_NAME_RULES}
 
+    def _root_partial_moves(self, name: str, names: Dict[str, Any]
+                            ) -> List[Tuple[str, str]]:
+        """The (old, new) var moves partial `name` needs as a unit's whole
+        vars under the var names `names` ([] when they match)."""
+        t = self._template_library().get(name)
+        own = t.get("var_names") if isinstance(t, dict) else None
+        if not isinstance(own, dict):
+            return []
+        return [(own[k], names[k]) for k in VAR_NAME_RULES
+                if isinstance(own.get(k), str) and isinstance(
+                    names.get(k), str) and own[k] != names[k]]
+
     def _rename_root_partial(self, name: str, base: Dict[str, Any],
                              names: Dict[str, Any]) -> None:
         """Partial `name`'s resolved data, used as a unit's whole vars, in
@@ -19186,13 +19267,7 @@ class Match:
         records (`var_names`, saved with it) moves to the unit's name for
         that rule, so a partial written under `hp` gives a unit on
         `health` its `health` (user call, S9)."""
-        t = self._template_library().get(name)
-        own = t.get("var_names") if isinstance(t, dict) else None
-        if not isinstance(own, dict):
-            return
-        moves = [(own[k], names[k]) for k in VAR_NAME_RULES
-                 if isinstance(own.get(k), str) and isinstance(
-                     names.get(k), str) and own[k] != names[k]]
+        moves = self._root_partial_moves(name, names)
         held = {old: base[old] for old, _new in moves if old in base}
         for old, _new in moves:
             base.pop(old, None)
@@ -19352,9 +19427,23 @@ class Match:
             base, at = self.resolve_partial(mk["name"], fresh=False), p
             if p == "" and names is not None:
                 # The unit's whole vars: its partial under the unit's var
-                # names, as it was materialized (S9).
-                base = copy.deepcopy(base)
-                self._rename_root_partial(mk["name"], base, names)
+                # names, as it was materialized (S9). Copied only when a
+                # var moves, and once per command (X14: every write on such
+                # a unit copied the whole partial).
+                moves = self._root_partial_moves(mk["name"], names)
+                if moves:
+                    cache = PARTIAL_CACHE.get()
+                    key = ("root", getattr(CURRENT_WORKSPACE.get(),
+                                           "guild_key", None), self.id,
+                           bool(self.rules.get("template_pinning", False)),
+                           mk["name"], tuple(moves))
+                    if cache is not None and key in cache:
+                        base = cache[key]
+                    else:
+                        base = copy.deepcopy(base)
+                        self._rename_root_partial(mk["name"], base, names)
+                        if cache is not None:
+                            cache[key] = base
         if base is None:
             raise VTTError("not built from a partial template")
         return base
@@ -20111,6 +20200,11 @@ class Match:
         if e.is_part:
             return []
         condition, _mode = self._effective_death_condition(e)
+        fast = _simple_var_test(condition, e)
+        if fast is not None:
+            if not fast:
+                return []
+            return self._process_death(entity_id)
         from formula import FormulaEngine, EvalCtx, FormulaError
         engine = FormulaEngine(self)
         ctx = EvalCtx(this=self.current_entity_id(), target=entity_id)
@@ -26384,6 +26478,8 @@ class MatchManager:
         on_entity_spawned in the destination (the transfer routes through
         Entity.spawn, not a raw insert). The template-save-for-later flow is
         a separate feature; this is the direct match->match transfer."""
+        touch_match(src_mid)
+        touch_match(dest_mid)
         if src_mid not in self.matches:
             raise NotFound(f"Source match '{src_mid}' not found.")
         if dest_mid not in self.matches:
@@ -26616,6 +26712,7 @@ class MatchManager:
         m = self.matches.get(match_id)
         if not m:
             raise NotFound("Match not found")
+        touch_match(match_id)
         return m
 
     def list(self) -> List[Tuple[str, str]]:

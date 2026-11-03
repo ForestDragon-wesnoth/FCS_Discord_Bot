@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -109,6 +109,7 @@ def require_target_host(ctx: "ReplyContext", m: "Match", action: str,
     Same no-op conditions as the gate: a single-operator surface
     (auto_approve), an identity-less context, or a match with no owner
     (legacy / open) is not checked."""
+    touch_match(m.id)
     if getattr(ctx, "auto_approve", False) or m.owner is None:
         return
     user = ctx_user(ctx)
@@ -21491,10 +21492,14 @@ def _snapshot_all_matches(mgr: MatchManager) -> Dict[str, Any]:
     }
 
 
-def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
+def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any],
+                         only: Optional[Set[str]] = None) -> None:
     """Undo `!batch strict`'s lines: matches the batch created go, the
     others go back to their state before it (in place, keeping their undo
-    history, like an action rollback), and channel pointers are restored."""
+    history, like an action rollback), and channel pointers are restored.
+    `only` (a `!simulate` run, X16): the matches the run reached; the rest
+    are left as they are unless deleted or replaced (comparing a big match
+    nobody touched cost a serialization per run)."""
     from action import _rollback_match
     pre = snap["matches"]
     for mid in [mid for mid in mgr.matches if mid not in pre]:
@@ -21502,6 +21507,9 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
     for mid, state in pre.items():
         m = mgr.matches.get(mid)
         orig = snap.get("objs", {}).get(mid)
+        if only is not None and mid not in only and m is not None \
+                and (orig is None or m is orig):
+            continue
         if m is None or (orig is not None and m is not orig):
             # Deleted meanwhile, or deleted and made anew under its id:
             # the original object comes back (its journal and history).
@@ -21890,6 +21898,8 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
     error_runs = 0
     token = _DRY_ACTIVE.set("simulate")
     tags_token = STORED_TAGS.set(None)
+    touched: Set[str] = set()
+    touch_token = MATCHES_TOUCHED.set(touched)
     try:
         for run in range(n):
             if budget <= 0:
@@ -21900,6 +21910,8 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                 x._rng_seed = effective_seed(x)
             sctx = _SimCtx(ctx)
             dirty = True
+            touched.clear()
+            touched.add(mid)
             rec: Dict[str, Any] = {"steps": 0, "met": False}
             failed = None
             for _step in range(steps):
@@ -21967,8 +21979,9 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                 error_runs += 1
                 if len(errors) < 3 and bad[0] not in errors:
                     errors.append(bad[0])
-            _restore_all_matches(mgr, snap)
-            dirty = False
+            # Only the matches this run reached go back now; the finally
+            # below puts every match back once at the end.
+            _restore_all_matches(mgr, snap, only=touched)
             if failed is not None:
                 return await ctx.send(failed + f" (run {run + 1}); nothing "
                                       f"was kept.")
@@ -21976,9 +21989,10 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
             # Other servers' commands get a turn between runs.
             await asyncio.sleep(0)
     finally:
+        MATCHES_TOUCHED.reset(touch_token)
         STORED_TAGS.reset(tags_token)
         _DRY_ACTIVE.reset(token)
-        if dirty:       # an exception left a run's changes in place
+        if dirty:       # a run's changes (or the untouched matches' check)
             _restore_all_matches(mgr, snap)
         for k, sq in seqs.items():
             if k in mgr.matches:
@@ -23472,6 +23486,11 @@ def _eval_all_or_nothing(m: Match, mgr: MatchManager, engine: Any,
     surfaced. Raises the refusal with a note that nothing changed."""
     from action import (_rollback_match, _snapshot_other_matches,
                         _restore_other_matches, _CROSS_LEVELS)
+    from formula import program_is_read_only
+    if program_is_read_only(src):
+        # Nothing to put back (X13): a read-only program needs no
+        # serialization of the match, and its refusal changed nothing.
+        return engine.eval_program(src, eval_ctx)
     pre = m.to_dict(include_history=False)
     mark = m.history.mark()
     cross: Dict[str, Any] = {"snap": None}
@@ -23493,7 +23512,9 @@ def _eval_all_or_nothing(m: Match, mgr: MatchManager, engine: Any,
             _restore_other_matches(mgr, live, cross["snap"])
         if sink is not None:
             del sink[sink_mark:]
-        raise FormulaError(f"{ex} Nothing was changed.")
+        msg = str(ex).rstrip()
+        sep = " " if msg.endswith((".", "!", "?")) else ". "
+        raise FormulaError(f"{msg}{sep}Nothing was changed.")
     finally:
         _CROSS_LEVELS.reset(ltoken)
         CROSS_MATCH_GUARD.reset(gtoken)
