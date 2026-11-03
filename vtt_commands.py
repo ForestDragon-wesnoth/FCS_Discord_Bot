@@ -798,9 +798,12 @@ class CommandRegistry:
         """Hold a host's state-changing command while the match is paused
         (pause_affects_hosts) and ask to unpause: `!match resume` runs it.
         A surface with buttons (Discord) offers Resume & run / Cancel."""
+        # The holder's authority is recorded with the command: it runs at
+        # `!match resume` as the holder, whoever resumes (G7).
         entry = {"user": ctx_user(ctx), "user_name": ctx_user_name(ctx),
                  "channel_key": ctx.channel_key, "name": name,
-                 "args": list(args)}
+                 "args": list(args), "admin": ctx_is_admin(ctx),
+                 "bot_owner": ctx_is_bot_owner(ctx)}
         m.held_commands.append(entry)
         offer = getattr(ctx, "offer_resume", None)
         if callable(offer):
@@ -922,6 +925,7 @@ class CommandRegistry:
         tags_token = (STORED_TAGS.set({}) if outer and _vocabulary_warns(mgr)
                       else None)
         pre_text = mgr.server_state_text() if outer else ""
+        srv_token = _SERVER_PRE_TEXT.set(pre_text) if outer else None
         pre_matches = ({mid: m.system_name for mid, m in mgr.matches.items()}
                        if outer else {})
         if outer and not _DRY_ACTIVE.get():
@@ -949,6 +953,8 @@ class CommandRegistry:
                     await ctx.send(warn)
             return result
         finally:
+            if srv_token is not None:
+                _SERVER_PRE_TEXT.reset(srv_token)
             if tags_token is not None:
                 STORED_TAGS.reset(tags_token)
             if audit_token is not None:
@@ -1141,6 +1147,9 @@ class CommandRegistry:
             _formula_text_hidden(ctx, mgr, pre_active_mid))
         reveals_token = (_HOST_REVEALS.set([])
                          if _HOST_REVEALS.get() is None else None)
+        # The other matches this command reaches, for a crash's note (W9).
+        touched_token = (MATCHES_TOUCHED.set(set())
+                         if MATCHES_TOUCHED.get() is None else None)
         try:
             result = await h(ctx, args, mgr)
         except VTTError as e:
@@ -1150,8 +1159,12 @@ class CommandRegistry:
             note = _crash_rollback(mgr, pre_active_mid,
                                    pre_state if pre_state is not None
                                    else jpre)
+            note += _crash_left_note(mgr, pre_active_mid,
+                                     MATCHES_TOUCHED.get() or set())
             await ctx.send(f"💥 Unexpected error{ref}: {e}{note}")
         finally:
+            if touched_token is not None:
+                MATCHES_TOUCHED.reset(touched_token)
             _TYPED_UNIT_VIEW.reset(vtoken)
             FORMULA_TEXT_HIDDEN.reset(ftoken)
             if reveals_token is not None:
@@ -1709,6 +1722,11 @@ _DRY_ACTIVE: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "vtt_dry_active", default="")
 # Lines for the `!server audit` entry of the typed command running now (see
 # audit_note); None outside a top-level command.
+# The server state text before the running typed command (_run_top), for a
+# crash's note on what stays (W9). "" outside one.
+_SERVER_PRE_TEXT: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "vtt_server_pre_text", default="")
+
 _AUDIT_NOTES: "contextvars.ContextVar[Optional[List[str]]]" = \
     contextvars.ContextVar("vtt_audit_notes", default=None)
 
@@ -2209,12 +2227,21 @@ _HOST_READS: Dict[str, Optional[frozenset]] = {
 
 def _pause_control(name: str, args: List[str]) -> bool:
     """What a host may still run while paused with pause_affects_hosts:
-    `!match pause` / `!match resume`, the host-only reads (`!assert`,
+    `!match pause` / `!match resume`, the commands pointing the channel
+    elsewhere or making another match (`!match use / new / bind / unbind /
+    clone`, `!map use`), the host-only reads (`!assert`,
     `!ent dump`, `!map full`, a bare `!match`, ...), an undo `preview` and
     `!dry` (it restores everything it ran)."""
     root = name.lower()
     sub = str(args[0]).lower() if args else None
     if root == "match" and sub in ("pause", "resume"):
+        return True
+    # Pointing the channel elsewhere, or making another match, leaves the
+    # paused match as it is (L39).
+    if root == "match" and sub in ("use", "new", "bind", "unbind",
+                                   "clone"):
+        return True
+    if root == "map" and sub == "use":
         return True
     if root in ("dry", "simulate"):
         return True
@@ -3222,13 +3249,19 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                f"longer a host.")
                 continue
             await ctx.send(f"▶ `{cmd}` ({h['user_name']})")
-            run_ctx = (ctx if h["channel_key"] == ctx.channel_key
-                       else _RequesterChannelCtx(ctx, h["channel_key"]))
-            # Against THIS match, even if the holder's channel now shows
-            # another one.
-            with _channel_pointed_at(mgr, h["channel_key"], m.id):
-                await registry.dispatch_no_snapshot(h["name"], h["args"],
-                                                    run_ctx, mgr)
+            # As the holder (G7): the checks the handler makes (a host of
+            # another match, a template's saver, an administrator) judge
+            # the holder, and the log names them; the replies come here.
+            run_ctx = _HolderCtx(ctx, h)
+            utoken = COMMAND_USER.set(h.get("user_name") or "")
+            try:
+                # Against THIS match, even if the holder's channel now
+                # shows another one.
+                with _channel_pointed_at(mgr, h["channel_key"], m.id):
+                    await registry.dispatch_no_snapshot(h["name"], h["args"],
+                                                        run_ctx, mgr)
+            finally:
+                COMMAND_USER.reset(utoken)
         return
     if sub == "new":# and len(args) >= 5:
         if await return_help_if_not_enough_args(ctx, args, 5, "match", "new"):
@@ -5558,10 +5591,30 @@ def _crash_rollback(mgr: MatchManager, mid: Optional[str],
             return ""
         from action import _rollback_match
         _rollback_match(m, mgr, pre)
+        # Its rules come from its system as it is now (W9: a system edit
+        # earlier in the command stays, and the match must follow it).
+        if m.system_name in mgr.systems:
+            mgr.apply_system_rules(m)
     except Exception:   # noqa: BLE001 - the crash is already reported
         return ""
-    return (f"\nNothing was changed: match `{mid}` is back as it was "
-            f"before the command.")
+    return (f"\nMatch `{mid}` is back as it was before the command.")
+
+
+def _crash_left_note(mgr: MatchManager, mid: Optional[str],
+                     touched: Set[str]) -> str:
+    """What a crashed command changed that its rollback (the channel's
+    match only) left in place: other matches it reached, and server-wide
+    edits (W9)."""
+    lines = []
+    others = sorted(t for t in touched if t != mid and t in mgr.matches)
+    if others:
+        lines.append("⚠️ It also reached " + ", ".join(
+            f"`{t}`" for t in others) + ": what it changed there stays.")
+    pre_text = _SERVER_PRE_TEXT.get()
+    if pre_text and mgr.server_state_text() != pre_text:
+        lines.append("⚠️ Its server-wide edits stay (`!system undo` takes "
+                     "them back).")
+    return "".join("\n" + ln for ln in lines)
 
 
 def _stored_var(e: Entity, path: str, default: Any) -> Any:
@@ -7600,6 +7653,27 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
             continue
         break
     return {"ran": ran, "off": first_off}
+
+
+class _HolderCtx:
+    """The resumer's context running a command a host held while the match
+    was paused: the holder's identity and authority (recorded when it was
+    held) and channel, the resumer's replies (G7)."""
+
+    def __init__(self, inner: ReplyContext, held: Dict[str, Any]):
+        self._inner = inner
+        self.channel_key = held.get("channel_key") or inner.channel_key
+        self.user_id = held.get("user")
+        self.user_name = held.get("user_name") or held.get("user")
+        self.is_admin = bool(held.get("admin", False))
+        self.is_bot_owner = bool(held.get("bot_owner", False))
+        # A single-operator surface's held command keeps its blanket
+        # authority only when it was held there.
+        self.auto_approve = bool(getattr(inner, "auto_approve", False)
+                                 and held.get("admin", True))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 class _RequesterChannelCtx:
