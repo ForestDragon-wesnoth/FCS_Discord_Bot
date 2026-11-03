@@ -1212,9 +1212,17 @@ class CommandRegistry:
                     due = name not in _JOURNAL_READS
                 if due:
                     before = m_post._grant_changes
-                    m_post.surface_log(m_post.sync_zone_grants())
-                    if m_post._grant_changes != before:
-                        post_state = None
+                    try:
+                        m_post.surface_log(m_post.sync_zone_grants())
+                    except VTTError as e:
+                        await ctx.send(f"❌ settling zone grants: {e}")
+                    except Exception as e:
+                        # E6: an exception here used to skip the undo step,
+                        # the watcher poll and the journal entry below.
+                        ref = crash_ref("zone grant sync", e)
+                        await ctx.send(f"💥 Unexpected error{ref} while "
+                                       f"settling zone grants: {e}")
+                    post_state = None
         if pre_state is not None and pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
             if post_state is None:
@@ -23083,13 +23091,18 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ no watcher `{args[1]}`.")
         lines = [f"**watcher `{args[1]}`**{_watcher_flags(w)}"]
         if w.get("each"):
-            units = w.get("units") or {}
+            # Units the channel's view hides read as absent (V14).
+            pov = _query_pov(ctx, m)
+            units = {u: v for u, v in (w.get("units") or {}).items()
+                     if not _pov_hides(m, pov, u)}
             on = [u for u, v in units.items() if v]
             lines.append(f"read for {len(units)} unit(s); true now for: "
                          + (", ".join(f"`{u}`" for u in on) or "none"))
-            if w.get("spent"):
+            spent = [u for u in (w.get("spent") or [])
+                     if not _pov_hides(m, pov, u)]
+            if spent:
                 lines.append("spent (fired once): " + ", ".join(
-                    f"`{u}`" for u in w["spent"]))
+                    f"`{u}`" for u in spent))
         else:
             lines.append(f"armed: {not w.get('last')}")
         lines.append(f"when: `{formula_text(w.get('condition', ''))}`")
