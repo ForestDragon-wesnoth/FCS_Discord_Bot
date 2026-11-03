@@ -338,8 +338,9 @@ def _flagged(transcript: List[Tuple[str, List[str]]],
         markers = markers + _ASSERT_MARKERS
     hits = []
     for cmd, outs in transcript:
-        # `!as crash` is the error log's test hook: its 💥 is the point.
-        crash_hook = cmd.split()[:2] == ["!as", "crash"]
+        # `!as crash` is the error log's test hook: its 💥 is the point,
+        # typed or as a `!batch` line.
+        crash_hook = re.search(r"(^!|;\s*)as crash\b", cmd) is not None
         for o in outs:
             if crash_hook and o.startswith("💥 Unexpected error (ref "):
                 continue
