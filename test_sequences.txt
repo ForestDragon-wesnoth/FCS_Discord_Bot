@@ -33082,3 +33082,127 @@ state survives a restart (a heals and drops: its second firing). With
 the owner limit watcher_unit_checks at 2, a poll reads two units and the
 third waits, with a warning; once the limit is back, the next command
 reads it and fires (c drops to 3 below 10).
+
+SCENARIO 983 — status_level / status_duration: 0 for a missing status, no guard needed
+---------------------------------------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add mage Mage 30 2 2 10
+!ent add orc Orc 40 4 2 5
+!status def burn
+!status def stun
+!status def ward
+!status level ward 3+ duration 9
+!ent set_var mage spells.actions.ignite.target entity
+!ent set_var mage spells.actions.ignite.body "entity[target].hp = entity[target].hp - (2 + 3 * status_level(target, 'burn'))\nstatus_apply(target, 'burn', 1, 2)"
+!action mage ignite orc
+!assert "entity[orc].hp == 38"
+!assert "status_level('orc', 'burn') == 1 and status_duration('orc', 'burn') == 2"
+!action mage ignite orc
+!assert "entity[orc].hp == 33"
+!status apply orc stun
+!assert "status_level('orc', 'stun') == 1 and status_duration('orc', 'stun') == None"
+!assert "status_level('mage', 'burn') == 0 and status_duration('mage', 'burn') == 0"
+!ent status orc set ward level 3
+!assert "status_duration('orc', 'ward') == 9"
+!ent set_var mage seen "$(status_level('orc', 'burn') + status_duration('orc', 'ward'))"
+!assert "entity[mage].seen == 10"
+!eval "status_level('ghost', 'burn')"
+?? ❌ unknown entity id 'ghost'
+!eval "status_duration('orc', 5)"
+?? ❌ status_duration(eid, name): name must be a string
+
+Expected: HARNESS-ALLOWS-ERRORS. `ignite` deals 2 plus 3 per level of
+burn the target already holds, then applies burn (default stack refresh,
+level 1, duration 2). The first cast reads level 0 with no `status_has`
+guard: 2 damage (40 -> 38). The second reads level 1: 5 damage (-> 33).
+A stun applied without a duration is permanent: level 1, duration None.
+A unit without the status reads 0 for both. A ward set to level 3 takes
+its duration 9 from the definition's `3+` level entry, as `status_get`
+reads it. Both are read-only and work in a `$()` argument (1 + 9 = 10).
+An unknown unit is refused, as `status_has` refuses it; so is a name
+that isn't text.
+
+SCENARIO 984 — Match-wide modifiers: rain lowers every unit's accuracy outside shelter
+--------------------------------------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!ent add archer Archer 20 2 2 10
+!ent add orc Orc 20 6 6 5
+!ent set_var orc sheltered 1
+!ent set_var archer accuracy 12
+!ent set_var orc accuracy 9
+!ent set_var archer bow.actions.shoot.target entity
+!ent set_var archer bow.actions.shoot.body "entity[self].last_roll = apply_mods(self, 'accuracy', entity[self].accuracy)"
+!match var set modifiers.rain.stat accuracy
+!match var set modifiers.rain.op add
+!match var set modifiers.rain.value -3
+!match var set modifiers.rain.condition "not var_has(self, 'sheltered')"
+!mod show archer accuracy 12
+?? add -3 (pri 0) [match.rain]
+?? → base 12 becomes 9
+!mod show orc accuracy 9
+?! match.rain
+!action archer shoot orc
+!assert "entity[archer].last_roll == 9"
+!assert "apply_mods('orc', 'accuracy', 9) == 9"
+!team set red modifiers.drill.stat accuracy
+!team set red modifiers.drill.op add
+!team set red modifiers.drill.value 1
+!ent set_var archer team red
+!mod show archer accuracy 12
+?? [match.rain]
+?? [team:red.drill]
+?? → base 12 becomes 10
+!match var del modifiers.rain
+!assert "apply_mods('archer', 'accuracy', 12) == 13"
+!undo command
+!assert "apply_mods('archer', 'accuracy', 12) == 10"
+
+Expected: a `modifiers` bundle in the match vars reaches every unit,
+labelled `match.<key>`. Its `condition` reads with self = the unit
+judged, so the sheltered orc is left out. The archer's `shoot` action
+folds it end to end (12 - 3 = 9). A team bundle stacks with it (12 - 3
++ 1 = 10). Deleting the match var lifts the rain (13), and undo brings
+it back (10).
+
+SCENARIO 985 — Map-wide modifiers: darkness on one map, a multi-tile body, a map change
+---------------------------------------------------------------------------------------
+!match new m1 demo 10 10
+!match use m1
+!map new cave 8 8
+!ent add ogre Ogre 50 2 2 5 map=cave
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre ohead head 10 10
+!ent add scout Scout 20 2 2 10 map=main
+!map var set modifiers.dark.stat sight map=cave
+!map var set modifiers.dark.op add map=cave
+!map var set modifiers.dark.value "-2 - footprint_width(self)" map=cave
+!mod show ogre sight 6
+?? add -4 (pri 0) [map:cave.dark]
+?? → base 6 becomes 2
+!assert "apply_mods('ohead', 'sight', 6) == 3"
+!assert "apply_mods('scout', 'sight', 6) == 6"
+!ent tp ogre 5 5 main
+!assert "apply_mods('ogre', 'sight', 6) == 6"
+!assert "apply_mods('ohead', 'sight', 6) == 6"
+!ent tp scout 1 1 cave
+!assert "apply_mods('scout', 'sight', 6) == 3"
+!host access set "map var" all
+!system set default formula_text_visibility host
+!as player bob
+!map var list map=cave
+?? (hidden)
+?! footprint_width
+!as owner
+
+Expected: HARNESS-ALLOWS-ERRORS. A `modifiers` bundle in a map's vars
+reaches the units on that map, labelled `map:<name>.<key>`. Its value
+formula reads with self = the unit judged: the 2x2 ogre gets -2 - 2 = -4
+(6 -> 2), its 1x1 body part on the same map -3 (6 -> 3), and the scout on `main`
+none.
+Teleported to `main`, the ogre and the part it carries lose it; the scout
+moved into the cave gains it. With `!map var` opened to players and
+formula_text_visibility host, a player reads the record's value formula
+in `!map var list` as hidden.

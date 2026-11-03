@@ -12919,7 +12919,8 @@ class Match:
 
     def _raw_modifier_records(self, e: "Entity") -> List[Tuple[dict, str]]:
         """Every (record, source) contributing to `e`, aggregated live from
-        its sources: each status instance's `modifiers`, the direct
+        its sources: each status instance's `modifiers`, the match vars'
+        and its map's vars' bundles, its team data's, the direct
         `entity.modifiers` slot, and each scan-root subtree. Source is a
         readable label (e.g. `status:burning.fireboost`, `equipped.sword.0`)
         for the list_mods breakdown."""
@@ -12945,6 +12946,16 @@ class Match:
             if "modifiers" in sdata:
                 for key, rec in self._bundle_items(sdata["modifiers"]):
                     out.append((rec, self._mod_source(f"status:{sname}", key)))
+        # Match-wide and map-wide modifiers (#108): a `modifiers` bundle in
+        # the match vars applies to every unit, one in a map's vars to the
+        # units on that map (weather, darkness, an anti-magic field).
+        if "modifiers" in self.vars:
+            for key, rec in self._bundle_items(self.vars["modifiers"]):
+                out.append((rec, self._mod_source("match", key)))
+        mp = self.maps.get(e.map)
+        if mp is not None and "modifiers" in mp.vars:
+            for key, rec in self._bundle_items(mp.vars["modifiers"]):
+                out.append((rec, self._mod_source(f"map:{mp.name}", key)))
         # Team-scoped modifiers: a `modifiers` bundle in the entity's team
         # data applies to every member.
         team = e.team

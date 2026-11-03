@@ -2667,6 +2667,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_remove(eid, name)            -> bool (True iff removed)
     "status_has", "status_has_path", "status_get", "status_level_data",
     "status_resisted",
+    # status_level(eid, name) / status_duration(eid, name) -> 0 when the
+    # unit lacks the status (#90); a level-less status reads 1, one
+    # without a duration (permanent) reads None.
+    "status_level", "status_duration",
     "status_set", "status_del", "status_add", "status_remove",
     # status_apply(eid, name[, level, duration]) -> apply a status via its
     # definition + stack mode (the host-friendly "inflict burn" call),
@@ -3086,7 +3090,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
     'slot_of', 'slot_riders', 'status_get', 'status_level_data',
     'status_resisted',
-    'status_has',
+    'status_has', 'status_level', 'status_duration',
     'status_has_path', 'status_has_tag', 'status_names',
     'status_resist_of', 'status_tags', 'statuses_with_tag',
     'table_roll', 'team_get', 'team_has', 'team_sees_cell',
@@ -5636,6 +5640,35 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             return name in e.status
 
+        def _status_level_fn(eid_t: Any, name: Any) -> Any:
+            """status_level(eid, name): the level of the unit's status
+            `name` (1 when it holds no level), 0 when the unit lacks it, so
+            no status_has guard is needed."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_level(eid, name): name must be a string.")
+            data, _ = _status_data(eid, name, must_exist=False)
+            if data is None:
+                return 0
+            return match.status_level(data)
+
+        def _status_duration(eid_t: Any, name: Any) -> Any:
+            """status_duration(eid, name): the duration left on the unit's
+            status `name` (read through its level entries as status_get),
+            0 when the unit lacks it, None for a permanent status (one
+            without a duration)."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_duration(eid, name): name must be a string.")
+            data, _ = _status_data(eid, name, must_exist=False)
+            if data is None:
+                return 0
+            view = _status_read_view(name, data)
+            d = view.get("duration") if isinstance(view, dict) else None
+            if isinstance(d, bool) or not isinstance(d, (int, float)):
+                return None
+            return d
+
         def _status_has_path(eid_t: Any, name: Any, path: Any) -> bool:
             """status_has_path(eid, name, path): whether the unit's status
             `name` has the field at the dotted path (False when it lacks the
@@ -5955,6 +5988,8 @@ class FormulaEngine:
             return _do_status_apply("status_force", eid_t, name, level, duration, True)
 
         ns["status_has"]      = _status_has
+        ns["status_level"]    = _status_level_fn
+        ns["status_duration"] = _status_duration
         ns["status_has_path"] = _status_has_path
         ns["status_get"]      = _status_get
         ns["status_resisted"] = _status_resisted

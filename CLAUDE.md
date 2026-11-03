@@ -1368,7 +1368,10 @@ hardcodes**.
   and macros rename the same way (`_rename_entry`; `_mentions_note` scans
   `_match_formula_slots` and macro bodies for the old name); `!macro copy`,
   `!tile def copy`, `!passive copy <eid> <pid> <dest> [new_pid]` (767).
-- **Prims:** `status_apply` / `status_force` / `status_get` / `status_set` /
+- **Prims:** `status_level` / `status_duration` (#90, 983: 0 when the
+  unit lacks the status, so no guard; a level-less status reads 1, a
+  permanent one's duration None; read through the level entries),
+  `status_apply` / `status_force` / `status_get` / `status_set` /
   `status_has` / `status_tags` / `status_has_tag` / `statuses_with_tag` /
   `status_resist_of` / `is_status_immune` / counters / dispel / transfer.
 - **Tags and tokens:** a definition's `tags`; a token is a bare name or
@@ -1471,7 +1474,9 @@ hardcodes**.
   tags, not_tags, priority, condition, grants_tags}` aggregated live by
   `_raw_modifier_records` from status instances, a unit's `modifiers` var,
   scanned roots (`modifier_sources`, default `equipped`; per-unit
-  `__modifier_sources` / `__modifier_sources_add`) and team data (`team:<t>`).
+  `__modifier_sources` / `__modifier_sources_add`), team data (`team:<t>`),
+  the match vars (`match`, every unit) and the unit's map's vars
+  (`map:<name>`, the units on that map; #108, 984-985).
   A bundle is a list or a dict of named records.
 - `value` / `condition` may be formulas with `self` = owner plus the call's
   `target` / `attacker` / `defender` / `other`.

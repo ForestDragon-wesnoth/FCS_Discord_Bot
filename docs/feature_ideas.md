@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -59,7 +59,6 @@ or rejects one, it moves to "Off the list".
 - **#83 `!roll <dice> <op> <n>`.** A roll against a target, e.g. "17 — success".
 - **#87 `line_walkable(eid, x, y)`.** Checks a straight-line walk for the unit's whole body, for charges and dashes.
 - **#89 `chance(percent)`** on the match RNG, so it respects `random_seed`.
-- **#90 `status_level` / `status_duration`.** Return 0 when the status is missing, so no `status_has` guard is needed.
 - **#95 Vision radius through `apply_mods`,** so items and statuses can change sight.
 - **#98 Turn-order markers in `!list`.** Marks units that will skip their next turn and units with no initiative.
 - **#104 Dice pools in the dice grammar,** the same in `roll()`, `!roll` and `!roll odds`:
@@ -69,7 +68,6 @@ or rejects one, it moves to "Off the list".
   - `d%`.
 - **#105 `opposed(spec_a, spec_b)` and `degree(roll, target, step)`.** An opposed roll returns its margin; success tiers cover hard/extreme (CoC) and 7–9/10+ (PbtA). These are generic helpers for the GM's own resolution.
 - **#107 Line-of-effect areas.** A `los=True` option on `cells_in_burst` / `cells_in_cone` and `!map preview`, so an explosion stops at walls.
-- **#108 Match-wide modifiers.** A `modifiers` bundle in match vars applies to every unit (weather, darkness, an anti-magic field), the match-level twin of team modifiers.
 - **#111 `!ent get <id> <path>`.** Reads one var or subtree. Players can use it under the POV rules and #70's private vars; today reading needs `!ent dump` (host-only) or a `$()`.
 - **#112 Bar placeholders** for `entity_line_format` and #68: `{hp_bar}` (▰▰▰▱▱, width from a rule), and `{bar:mana:max_mana}` for any pair of vars.
 - **#114 Status glyph and color on the ASCII map.** A status definition's `glyph` / `color` (with a priority) show on the bearer. This is the text twin of status overlay sprites.
@@ -531,7 +529,7 @@ or rejects one, it moves to "Off the list".
 
 ## Suggested groupings
 
-- **Formula ergonomics:** #89, #90, #194
+- **Formula ergonomics:** #89, #194
 - **Status bundle:** #56, #114, #115, #116, #150
 - **Zone bundle:** #117, #118, #119
 - **Discord table play:** #128, #148, #182, then #28 and #198
@@ -546,7 +544,7 @@ From the combat-systems review (docs/combat_systems_fit.md):
 - **Discord table comfort:** #247, #248, #254, #255, #244, #245
 - **Behaviour kept in its data:** #200, #208, #201
 - **GM tooling:** #202, #203, #207, #211, #204, #231, #249, #250
-- **Formula ergonomics:** #89, #90, #194, #205, #210, #216, #217, #219, #228
+- **Formula ergonomics:** #89, #194, #205, #210, #216, #217, #219, #228
 - **Integrity of GM data:** #209, #210, #223
 - **Before a public rollout:** #177, #178, #197 (+ lazy servers), #206, #214
 - **Onboarding:** #213, #202, #231
