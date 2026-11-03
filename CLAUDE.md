@@ -3271,6 +3271,10 @@ dump` is the raw data for the GM.
   `private_var_host_reminder` (default on), at most once per
   `private_var_reminder_cooldown` minutes (10) per host and channel
   (runtime, wall clock: a reply, never match state).
+  Scope (user call): private vars hide the obvious where players expect
+  to look; they needn't be airtight. A player working around them (a
+  mutating `!eval` through an access override, a clamp's path in `!clamp
+  list`) is an honor-system matter for the GM, not a leak to close.
 
 ---
 
