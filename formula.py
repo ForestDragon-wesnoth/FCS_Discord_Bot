@@ -390,11 +390,12 @@ import itertools
 import json
 import re
 import contextvars
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER
 
 
 class FormulaError(VTTError):
@@ -10880,8 +10881,15 @@ def resolve_arg_token(token: str, match, self_id: Optional[str] = None) -> str:
     this_id = match.current_entity_id() if hasattr(match, "current_entity_id") else None
     ctx = EvalCtx(this=this_id, target=self_id)
     token = _IN_ARG_TOKEN.set(True)
+    # A player's `$()` reads the vars as that player may (#70): every unit's
+    # and corpse's private vars read as missing, a dict without them.
+    reader = _VAR_READER.get()
+    view = (match.private_view(reader)
+            if reader is not None and hasattr(match, "private_view")
+            else contextlib.nullcontext())
     try:
-        val = FormulaEngine(match).eval_expression(body, ctx)
+        with view:
+            val = FormulaEngine(match).eval_expression(body, ctx)
     finally:
         _IN_ARG_TOKEN.reset(token)
     rules = getattr(match, "rules", None) or {}

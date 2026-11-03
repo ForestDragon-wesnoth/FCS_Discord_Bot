@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -50,9 +50,6 @@ or rejects one, it moves to "Off the list".
 - **#59 `!turn roll [selector]`.** Rerolls initiative for the selected units with an `initiative_roll_formula` rule.
 - **#66 `!redo`.** Keeps the snapshots an undo dropped until the next state-changing command, so an undo can be taken back.
   - Note: undo replaces the Match object, and the journal records undo as state. Redo snapshots have to be dropped by any state change on the match from any channel, approvals and watchers included, and a redo needs its own journal entry.
-- **#70 Private vars.** A `private_var_prefix` rule hides GM notes and hidden stats from non-hosts, including reads through `$()`.
-  - The entity description (#261, `!ent info`) must skip private vars in its data section and in every placeholder, and the short card the same (user: on the todo list).
-  - Note (with #70 / #115): private vars and hidden statuses need the existence-oracle treatment that document 2's audits apply to unit queries: `!find hp>5`, `status:`, `sort:`, `count` and `$()` must all treat a private var or a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
 - **#71 Progress clocks.** `!clock add/tick` keeps named clocks, shown in the `!state` header, firing a `clock_filled` event when one fills.
 - **#73 `!rest <selector>`.** Runs a GM-defined `rest_formula` rule on each selected unit.
 - **#76 Named map points.** `@gate` works anywhere a command takes `x y`, and `point_x` / `point_y` read it in formulas.
@@ -73,7 +70,7 @@ or rejects one, it moves to "Off the list".
 - **#112 Bar placeholders** for `entity_line_format` and #68: `{hp_bar}` (▰▰▰▱▱, width from a rule), and `{bar:mana:max_mana}` for any pair of vars.
 - **#114 Status glyph and color on the ASCII map.** A status definition's `glyph` / `color` (with a priority) show on the bearer. This is the text twin of status overlay sprites.
 - **#115 Hidden statuses.** A definition flag (or a visibility formula) keeps a status out of non-host views: `!ent info`, `show:status`, `status:` selectors. For curses and tracking marks.
-  - Note (with #70 / #115): private vars and hidden statuses need the existence-oracle treatment that document 2's audits apply to unit queries: `!find hp>5`, `status:`, `sort:`, `count` and `$()` must all treat a private var or a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
+  - Note: hidden statuses need the existence-oracle treatment #70's private vars got (`VAR_READER`, CLAUDE.md §7.22): `status:`, `show:status`, `count` and `$()` must treat a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
 - **#116 `max_duration` on status definitions,** the duration twin of `max_level`.
 - **#117 Zone and tile lifetimes.** `expires_in` on zones and placed tiles, counted on `turns_elapsed` (a 3-turn fire wall, a smoke cloud). It pairs with #11.
 - **#118 `zone_grow(name, n)` / `zone_shrink`, plus `!zone grow/shrink`.** Optionally stopped by block conditions; for spreading fire, expanding gas and a closing storm circle.
