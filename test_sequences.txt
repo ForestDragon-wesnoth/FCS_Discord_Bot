@@ -33528,7 +33528,7 @@ SCENARIO 993 — Sizes in real use: a grapple limited by size steps, defaults by
 !match use sz
 !ent add hero Hero 30 2 2 5
 !ent set_var hero size_num medium
-?? = 76 (typed 'medium')
+?? = 75 (typed 'medium')
 !ent add ogre Ogre 60 5 2 5
 !ent set_var ogre footprint_w 2
 !ent set_var ogre footprint_h 2
@@ -33559,7 +33559,7 @@ SCENARIO 993 — Sizes in real use: a grapple limited by size steps, defaults by
 ?? `gigantic` isn't a size category
 
 Expected: writing the category `medium` into the hero's size number stores
-76, medium's start (size_name_write lowest_size). An unsized 2x2 ogre reads
+75, medium's start (size_name_write lowest_size). An unsized 2x2 ogre reads
 size_default 100 until size_default_per_extra_tile 50 adds 3 x 50 for its
 extra cells: 250, large, stored as its derived size_total / size_text while
 it holds no size_num. The hero's grapple action reads size_steps(self,

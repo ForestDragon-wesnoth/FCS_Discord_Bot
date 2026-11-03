@@ -945,14 +945,14 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Whether units have sizes (#242). Off: the size functions, "
             "`!find size:` and the {size} / {size_class} placeholders "
-            "refuse, and the engine stops deriving: every unit and corpse "
-            "loses its size_text_var / size_total_var (the size_num_var "
-            "numbers a GM wrote stay, as plain vars). Back on, everything "
-            "is derived again."
+            "refuse, and the engine stops deriving: every unit loses its "
+            "size_text_var / size_total_var (the size_num_var numbers a GM "
+            "wrote stay, as plain vars; a corpse keeps the total it died "
+            "with). Back on, everything is derived again."
         ),
     },
     "size_categories": {
-        "default": "tiny, small:25, medium:76, large:150, huge:300, "
+        "default": "tiny, small:25, medium:75, large:150, huge:300, "
                    "colossal:800",
         "schema": {"type": "str"},
         "desc": (

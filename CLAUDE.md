@@ -3097,7 +3097,7 @@ and a total per body.
   turning it off leaves stored negatives (the reply and `!system lint`
   list them).
 - **Scale** (`size_categories`, `parse_size_scale`, checked by
-  `_FORMAT_RULE_CHECKS`): `tiny, small:25, medium:76, large:150,
+  `_FORMAT_RULE_CHECKS`): `tiny, small:25, medium:75, large:150,
   huge:300, colossal:800`; the first category takes no start, starts rise
   strictly; a scale whose first category holds only negatives is refused
   while negatives are off (`_check_size_scale_rules`, either rule).
