@@ -20451,7 +20451,7 @@ SCENARIO 728 — Partial templates: whole-unit inheritance, save writes only the
 !template save orc_archer veteran
 ?? Saved template `veteran` from `orc_archer`
 !template show veteran vars compact
-?? {"__template":"orc_base","hp":20,"inventory":{"axe":{"damage":8},"bow":{"damage":4}},"max_hp":24}
+?? {"__template":"orc_base","hp":20,"inventory":{"axe":{"damage":8},"bow":{"damage":4}},"max_hp":24,"size_text":"medium","size_total":100}
 !template spawn veteran 8 5
 !assert "entity[veteran].hp == 20 and entity[veteran].inventory.axe.damage == 8"
 !assert "entity[veteran].inventory.axe.flavor == 'an axe' and len(footprint_cells('veteran')) == 4"
@@ -20740,7 +20740,7 @@ SCENARIO 732 — Partial templates: what comes with a partial follows library ed
 ?? `gear.axe` ← `axe_common` (unchanged)
 !template save orc vet
 !template show vet vars compact
-?? {"__template":"orc_base","gear":{"axe":{"edge":"keen"}}}
+?? {"__template":"orc_base","gear":{"axe":{"edge":"keen"}},"size_text":"medium","size_total":100}
 !template set orc_base gear.axe.damage 9
 !template resync orc
 !template resync orc2
@@ -20757,7 +20757,7 @@ SCENARIO 732 — Partial templates: what comes with a partial follows library ed
 ?? (vars) ← `orc_base`: changed `gear.axe`
 !template save orc plain_vet
 !template show plain_vet vars compact
-?? {"__removed":["gear.axe"],"__template":"orc_base","gear":{"axe":{"damage":9,"edge":"keen"}}}
+?? {"__removed":["gear.axe"],"__template":"orc_base","gear":{"axe":{"damage":9,"edge":"keen"}},"size_text":"medium","size_total":100}
 !template spawn plain_vet 8 5
 !assert "template_of('plain_vet', 'gear.axe') == None and entity[plain_vet].gear.axe.edge == 'keen'"
 
@@ -20851,7 +20851,7 @@ SCENARIO 734 — Partial templates: engine-kept vars, default vars and empty con
 !assert "entity[golem].armor == 3 and len(footprint_cells('golem')) == 4"
 !template save golem golem2
 !template show golem2 vars compact
-?? {"__removed":["pack"],"__template":"gbase","pack":{}}
+?? {"__removed":["pack"],"__template":"gbase","pack":{},"size_text":"medium","size_total":100}
 !template spawn golem2 4 6
 !assert "var_get('golem2_arm', '__part_region') == 'front' and entity[golem2_eye].x == 8 and entity[golem2_eye].y == 6"
 !assert "entity[golem2].pack == {} and entity[golem2].armor == 3"
@@ -21282,7 +21282,7 @@ SCENARIO 742 — Var-name rules: collisions, shared names, other systems
 !system set default hp_var health
 !template save orc orc3
 !template show orc3 vars compact
-?? {"__template":"base"}
+?? {"__template":"base","size_text":"medium","size_total":100}
 !template spawn orc3 6 6
 !assert "entity[orc3].health == 7 and not var_has('orc3', 'hp')"
 
@@ -33521,3 +33521,284 @@ info`. A permanent status stays permanent under every stack mode: a timed
 application of `hex` (refresh) or `ward` (add_level, which still adds the
 level) leaves its duration at ∞; once `status_counter set` gives `ward` a
 duration, applications set it as before (5).
+
+SCENARIO 993 — Sizes in real use: a grapple limited by size steps, defaults by footprint, $() reads
+------------------------------------------------------------------------------------------------------
+!match new sz SZ 14 8
+!match use sz
+!ent add hero Hero 30 2 2 5
+!ent set_var hero size_num medium
+?? = 76 (typed 'medium')
+!ent add ogre Ogre 60 5 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!assert "size_of('ogre') == 100 and size_class('ogre') == 'medium'"
+!system set default size_default_per_extra_tile 50
+!assert "size_of('ogre') == 250 and entity[ogre].size_text == 'large' and entity[ogre].size_total == 250"
+!assert "not var_has('ogre', 'size_num')"
+!ent add troll Troll 80 9 2 5
+!ent set_var troll size_num huge
+!status def grappled
+!ent set_var hero actions.grapple.target entity
+!ent set_var hero actions.grapple.body "if size_steps(self, target) > 1:\n    fail('too big to grapple: ' + size_class(target))\nstatus_apply(target, 'grappled')\nentity[self].grapples = size_steps(self, target)"
+!action hero grapple ogre
+!assert "status_has('ogre', 'grappled') and entity[hero].grapples == 1"
+!action hero grapple troll
+?? too big to grapple: huge
+!assert "not status_has('troll', 'grappled')"
+!assert "size_range('large') == [150, 300] and size_range('tiny') == [None, 25] and size_range('colossal') == [800, None]"
+!assert "size_rank('troll') == 4 and size_steps('troll', 'hero') == -2 and size_at_least('ogre', 'large') and size_at_most('hero', 'medium') and not size_is('hero', 'small')"
+!assert "size_class(800) == 'colossal' and size_is(90, 'medium') and size_at_least('hero', 70) and not size_at_most('hero', 70)"
+!assert "size_categories() == ['tiny', 'small', 'medium', 'large', 'huge', 'colossal']"
+!ent set_var hero note "$(size_class('troll'))"
+!assert "entity[hero].note == 'huge'"
+!ent set_var hero note "$(status_apply('troll', 'grappled'))"
+?? banned in a $() inline argument
+!assert "not status_has('troll', 'grappled') and entity[hero].note == 'huge'"
+!eval "size_is('hero', 'gigantic')"
+?? `gigantic` isn't a size category
+
+Expected: writing the category `medium` into the hero's size number stores
+76, medium's start (size_name_write lowest_size). An unsized 2x2 ogre reads
+size_default 100 until size_default_per_extra_tile 50 adds 3 x 50 for its
+extra cells: 250, large, stored as its derived size_total / size_text while
+it holds no size_num. The hero's grapple action reads size_steps(self,
+target): the large ogre is one step up and is grappled, the huge troll two
+steps up and the action fails with its category in the message, changing
+nothing. size_range gives [start, next start) with None at the open ends;
+size_rank counts from 0; a number works wherever a unit or a category
+does. A `$()` argument reads size_class, while status_apply in one is
+refused and changes nothing; an unknown category is refused by name.
+
+SCENARIO 994 — Sizes: a snake summed with its segments; a destroyed segment drops out; derived vars are the engine's
+----------------------------------------------------------------------------------------------------------------------
+!match new sn SN 16 5
+!match use sn
+!ent add w Worm 60 10 2 9
+!ent face w right
+!part segment w s0 Seg0 10 10
+!part segment w s1 Seg1 10 10
+!ent set_var w changes 0
+!passive add w watch_size on_var_changed target=size_text scope=exact "entity[w].changes = entity[w].changes + 1"
+!ent set_var w __size_total_mode sum
+?? `s0`, `s1` hold no size_num and add 0
+!ent set_var w size_num 40
+!ent set_var s0 size_num 30
+!ent set_var s1 size_num 30
+!assert "entity[w].size_total == 100 and entity[w].size_text == 'medium' and size_of('s1') == 100 and size_of('s1', own=True) == 30"
+!assert "not var_has('s0', 'size_total') and not var_has('s0', 'size_text')"
+!ent hp s1 0
+!assert "entity[w].size_total == 70 and entity[w].size_text == 'small' and entity[w].changes == 3"
+!ent hp s1 10
+!assert "entity[w].size_total == 100 and entity[w].changes == 4"
+!system set default size_total_mode max
+!assert "entity[w].size_total == 100"
+!part segment w s2 Seg2 10 10
+?? `s2` hold no size_num and add 0
+!ent set_var w size_total 500
+?? `size_total` is derived from `size_num`
+!ent delete_var w size_text
+?? the engine keeps it
+!ent set_var s0 size_text huge
+?? is derived from `size_num`
+!assert "entity[w].size_total == 100"
+
+Expected: a worm whose own `__size_total_mode` is sum adds its segments'
+sizes to its own: 40 + 30 + 30 = 100 (medium). Before the segments hold a
+number a ⚠️ names them (they add 0). The derived vars sit on the head
+only; a segment reads its creature's total with size_of and its own with
+own=True. Killing `s1` (a destroyed segment lingers dead) takes its 30 off
+(70, small) and healing it puts it back; the on_var_changed passive on
+size_text counts each category change: small at 40, medium at 100, small
+and medium again (4). The rule size_total_mode max leaves the worm's own sum.
+A new unsized segment is named in a new ⚠️. Writing or deleting
+size_total / size_text is refused on any unit.
+
+SCENARIO 995 — Sizes: body and max totals, parts inheriting the body's size, !help size, a detached part
+--------------------------------------------------------------------------------------------------------
+!match new bd BD 12 8
+!match use bd
+!ent add giant Giant 100 3 3 5
+!ent set_var giant size_num 200
+!part add giant ghead head 20 20
+!part add giant gclub club 10 10
+!ent set_var gclub size_num 400
+!assert "size_of('giant') == 200 and size_of('ghead', own=True) == 200 and size_of('gclub', own=True) == 400"
+!ent set_var giant __size_total_mode max
+!assert "size_of('giant') == 400 and entity[giant].size_text == 'huge'"
+!ent set_var giant size_num large
+?? `giant`'s own size is set to large (150); with its parts its total is 400 (huge).
+!ent set_var giant __size_parts_inherit false
+!assert "size_of('ghead', own=True) == None and size_class('ghead', own=True) == None and size_of('ghead') == 400"
+!help size gclub
+?? size 400 (`huge`), the total of body `giant`
+?? Own size: 400.
+!help size ghead
+?? Own size: none
+!help size giant
+?? Parts: `ghead` (none), `gclub` 400.
+!help size
+?? 3. `large`: 150-299
+!help size 160
+?? 160 is `large` (rank 3 of 5).
+!part detach gclub
+!assert "size_of('giant') == 150 and entity[giant].size_text == 'large' and size_of('gclub') == 400 and entity[gclub].size_text == 'huge'"
+
+Expected: in the default body mode the giant's total is its own 200; its
+unsized head reads 200 as its own (size_parts_inherit), the club its own
+400. Under the giant's own max mode the club's 400 is the total (huge), and
+writing `large` into the giant's own number warns that its total with its
+parts stays 400 (huge). With `__size_parts_inherit` false the head has no
+own size (None) and still answers size_of with the body's total. `!help
+size` shows a part's total and own size, a body's parts with their
+numbers, the scale with each category's range, and a number's category.
+Detaching the club makes it a body of its own: the giant's total falls to
+150 and the club gets its own derived vars, at the end of the command.
+
+SCENARIO 996 — Sizes: scale validation, category writes per size_name_write, decimals, negatives, lint
+--------------------------------------------------------------------------------------------------------
+!match new sc SC 10 6
+!match use sc
+!system set default size_categories "small:25, medium:76"
+?? the first category takes no start
+!system set default size_categories "tiny, small:50, medium:40"
+?? starts rise strictly
+!system set default size_categories "tiny, small:0, medium:76"
+?? would hold only negative sizes
+!ent add a A 10 1 1 5
+!system set default size_name_write average_size
+!ent set_var a size_num tiny
+?? = 12 (typed 'tiny')
+!ent set_var a size_num small
+?? = 50 (typed 'small')
+!ent set_var a size_num colossal
+?? = 800 (typed 'colossal')
+!system set default size_name_write refuse
+!ent set_var a size_num large
+?? category names are refused here
+!ent set_var a size_num 80.7
+?? = 80 (typed 80.7)
+!system set default size_decimals true
+!ent set_var a size_num 80.5
+!assert "entity[a].size_num == 80.5 and entity[a].size_total == 80.5"
+!ent set_var a size_num -5
+?? negative size
+!system set default size_allow_negative true
+!system set default size_categories "tiny, small:0, medium:76"
+!system set default size_name_write lowest_size
+!ent set_var a size_num tiny
+?? = -1 (typed 'tiny')
+!ent set_var a size_num -5
+!assert "entity[a].size_text == 'tiny' and size_class('a') == 'tiny'"
+!system set default size_allow_negative false
+?? would hold only negative sizes
+!system set default size_categories "tiny, small:25, medium:76"
+!system set default size_allow_negative false
+?? `sc/a` (-5)
+!system lint default
+?? `a`: size -5 is negative
+
+Expected: a scale whose first category names a start, whose starts don't
+rise, or whose first category holds only negatives while negatives are off
+is refused. average_size writes the middle of a category (tiny: half of
+small's start, 12; small: 50), the last category its start; refuse turns
+category names away; size_decimals off floors 80.7 to 80, on keeps 80.5.
+A negative size is refused until size_allow_negative is on; then tiny,
+holding only sizes below 0, writes -1 under lowest_size. Turning negatives
+off is refused while the scale needs them; once it doesn't, the change
+goes through and its reply names the unit still holding -5, as does
+`!system lint`.
+
+SCENARIO 997 — Sizes: a scale change re-labels units and corpses; sizes off and on again
+-------------------------------------------------------------------------------------------
+!match new cp CP 10 6
+!match use cp
+!ent add orc Orc 20 2 2 5
+!ent set_var orc size_num 140
+!ent set_var orc relabels 0
+!passive add orc relabel on_var_changed target=size_text scope=exact "entity[orc].relabels = entity[orc].relabels + 1"
+!system set default size_categories "tiny, small:25, medium:76, large:130"
+!assert "entity[orc].size_text == 'large' and entity[orc].relabels == 1"
+!ent add imp Imp 5 5 2 5
+!ent set_var imp size_num 20
+!ent kill imp
+!assert "size_of('imp') == 20 and size_class('imp') == 'tiny'"
+!system set default size_categories "tiny, small:10, medium:76, large:130"
+!assert "size_class('imp') == 'small'"
+!tile info 5 2
+?? "size_text": "small"
+!system set default size_enabled false
+!ent dump orc
+?! size_text
+?? "size_num": 140
+!eval "size_of('orc')"
+?? sizes are off on this match
+!find size:large
+?? needs sizes on
+!system set default size_enabled true
+!assert "entity[orc].size_total == 140 and entity[orc].size_text == 'large' and size_class('imp') == 'small'"
+!ent revive imp
+!assert "entity[imp].size_total == 20 and entity[imp].size_text == 'small'"
+!template save orc
+!template spawn orc 8 4
+!assert "entity[orc2].size_total == 140 and entity[orc2].size_text == 'large'"
+
+Expected: changing size_categories re-derives every unit's category
+(the orc's 140 becomes large, firing its on_var_changed passive once) and
+re-labels corpses from the total they died with (the imp's 20, tiny under
+small:25, small under small:10, shown in the corpse's tile data). With
+size_enabled off the derived vars leave the units (size_num stays), the
+size functions and `size:` selectors refuse; on again, they come back, the
+corpse keeping its total. A revived unit and a unit spawned from a
+template derive their sizes again.
+
+SCENARIO 998 — Sizes: !find size: selectors, the {size} placeholders, a disguise's decoy size
+-----------------------------------------------------------------------------------------------
+!match new fd FD 12 6
+!match use fd
+!ent add rat Rat 3 1 1 5
+!ent set_var rat size_num 10
+!ent add hero Hero 30 3 1 5
+!ent add drake Drake 90 6 1 5
+!ent set_var drake size_num 260
+!ent set_var drake team red
+!ent set_var hero team blue
+!ent set_var rat team blue
+!find size:large ids
+?? drake
+!find size:medium+ ids
+?? hero
+?? drake
+?! rat
+!find size:tiny|large count
+?? 2
+!find !size:medium ids
+?? rat
+?! hero
+!foreach size:small- ; !ent set_var $id small 1
+!assert "var_has('rat', 'small') and not var_has('hero', 'small')"
+!find size:giant
+?? not a size category
+!ent set_var drake disguise.name Lizard
+!ent set_var drake disguise.vars.size_total 30
+!system set default entity_line_format "{name}: {size} ({size_class})"
+!as view blue
+!find size:small ids
+?? drake
+!list
+?? Lizard: 30 (small)
+!help size drake
+?? size 30 (`small`)
+?! 260
+!as view red
+!list
+?? Drake: 260 (large)
+!as view omniscient
+
+Expected: `size:large` matches the drake (260), `size:medium+` the hero
+(the default 100) and the drake, `size:tiny|large` both ends, and a
+negated `!size:medium` everyone but the hero. `!foreach size:small-` runs
+on the rat alone. An unknown category is refused. A disguise presenting a
+decoy size_total of 30 fools the blue view: `size:small` finds the drake,
+the roster's `{size} ({size_class})` reads 30 (small) and `!help size`
+shows only the decoy; the red view sees 260 (large).

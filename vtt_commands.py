@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -1217,14 +1217,30 @@ class CommandRegistry:
         # the zone_status_grant_bodies rule settles in apply_system_rules.)
         if pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
+            grants = m_post._grants_present()
             if (getattr(m_post, "_action_depth", 0) == 0
-                    and m_post._grants_present()):
+                    and (grants or m_post.sizes_on())):
                 if pre_state is not None:
                     post_state = m_post.to_dict(include_history=False)
                     due = _differs_in_undo_state(pre_state, post_state)
                 else:
                     due = not _settles_nothing(name, args)
                 if due:
+                    # Sizes (#242): what the command changed (a part
+                    # attached or killed, a unit spawned) re-derives each
+                    # body's size total and category.
+                    before = getattr(m_post, "_size_changes", 0)
+                    try:
+                        m_post.surface_log(m_post.sync_all_sizes())
+                    except VTTError as e:
+                        await ctx.send(f"❌ settling sizes: {e}")
+                    except Exception as e:
+                        ref = crash_ref("size sync", e)
+                        await ctx.send(f"💥 Unexpected error{ref} while "
+                                       f"settling sizes: {e}")
+                    if getattr(m_post, "_size_changes", 0) != before:
+                        post_state = None
+                if due and grants:
                     before = m_post._grant_changes
                     try:
                         m_post.surface_log(m_post.sync_zone_grants())
@@ -2439,6 +2455,12 @@ def _entity_template_context(e: Entity,
         "statuses": _statuses_text(e._match, status),
         "passives_csv": ", ".join(sorted(e.passives.keys())) if e.passives else "",
     }
+    # The body's total size and its category (#242; empty with sizes off).
+    ctx["size"], ctx["size_class"] = "", ""
+    if e._match is not None and e._match.sizes_on():
+        info = e._match.size_info(e)
+        ctx["size"] = info["total"]
+        ctx["size_class"] = info["category"] or ""
     # Merge vars — vars win for keys NOT already in the well-known set above.
     # (So a user's `hp` var won't override the computed alias, since `hp` is in ctx.)
     for k, v in e.vars.items():
@@ -2459,11 +2481,19 @@ def _entity_template_context(e: Entity,
                     ctx[k] = v
                 # The fixed placeholders follow the decoy of the var behind
                 # them, whatever the var-name rules call it.
+                _sn, size_t, size_n = e._match.size_names()
                 for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
                                    ("initiative", init_var),
-                                   ("team", e._team_var_name())):
+                                   ("team", e._team_var_name()),
+                                   ("size", size_n), ("size_class", size_t)):
                     if var in dvars:
                         ctx[alias] = dvars[var]
+                # A decoy total without a decoy category shows its own.
+                dt = dvars.get(size_n)
+                if size_n in dvars and size_t not in dvars \
+                        and isinstance(dt, (int, float)) \
+                        and not isinstance(dt, bool):
+                    ctx["size_class"] = e._match.size_category_of(dt) or ""
     # The unit's full tag set (own, granted, engine), as the viewer's
     # disguise presents it; `tags_sourced` names where each came from.
     if e._match is not None:
@@ -2574,6 +2604,9 @@ def _corpse_template_context(
         "passives_csv": ", ".join(sorted(passives.keys())) if passives else "",
         "died_round": corpse.get("died_round", "?"),
     }
+    _sn, size_t, size_n = m.size_names()
+    ctx["size"] = ent_vars.get(size_n, "") if m.sizes_on() else ""
+    ctx["size_class"] = ent_vars.get(size_t, "") if m.sizes_on() else ""
     pairs = m.corpse_tag_sources(corpse)
     ctx["tags"] = ", ".join(t for t, _s in pairs)
     ctx["tags_sourced"] = ", ".join(
@@ -7866,6 +7899,40 @@ def _inheritors(mgr: MatchManager, s: Any, key: str) -> List[Any]:
     return out
 
 
+def _check_size_scale_rules(mgr: MatchManager, s: Any, key: str,
+                            value: Any) -> None:
+    """Refuse a size scale whose first category could only hold negative
+    sizes (a second start of 0 or below) while size_allow_negative is off
+    (#242), whichever of the two rules is being set."""
+    scale = parse_size_scale(value if key == "size_categories"
+                             else mgr.system_value(s, "size_categories"))
+    allow = (value if key == "size_allow_negative"
+             else mgr.system_value(s, "size_allow_negative"))
+    if not allow and len(scale) >= 2 and scale[1][1] <= 0:
+        raise VTTError(
+            f"size_categories: `{scale[0][0]}` would hold only negative "
+            f"sizes (below `{scale[1][0]}:{scale[1][1]}`), and "
+            f"size_allow_negative is off. Start `{scale[1][0]}` above 0, "
+            f"or allow negative sizes first.")
+
+
+def _negative_size_units(mgr: MatchManager, system_name: str) -> List[str]:
+    """`match/unit` for every unit on `system_name` (and its children)
+    holding a negative size number."""
+    family = {system_name, *mgr.system_descendants(system_name)}
+    out = []
+    for mid, m in sorted(mgr.matches.items()):
+        if m.system_name not in family:
+            continue
+        num_v = m.size_names()[0]
+        for eid, e in sorted(m.entities.items()):
+            v = e.vars.get(num_v)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                    and v < 0:
+                out.append(f"`{mid}/{eid}` ({v})")
+    return out
+
+
 def _rename_system_var(mgr: MatchManager, s: Any, name: str, key: str,
                        value: Any) -> Optional[str]:
     """Before `!system set <name> <key>` renames a unit var (VAR_NAME_RULES):
@@ -8386,10 +8453,18 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     
         s = mgr.get_system(name)
         warn = _check_formula_rule(mgr, s, key, value)
+        if key in ("size_categories", "size_allow_negative"):
+            _check_size_scale_rules(mgr, s, key, value)
         moved_line = _rename_system_var(mgr, s, name, key, value)
         s.set(key, value)
         notes: List[str] = []
         refreshed = mgr.refresh_match_rules(name, notes)
+        if key == "size_allow_negative" and not value:
+            neg = _negative_size_units(mgr, name)
+            if neg:
+                notes.append("These units still hold a negative size (left "
+                             "as they are; new negative writes are "
+                             "refused): " + ", ".join(neg) + ".")
         suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
         return await ctx.send("\n".join(
             [f"`{name}`.{key} = {value!r}{suffix}"]
@@ -9046,6 +9121,7 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             check(f"match `{m.id}` {where}", src, mode, known, params,
                   action_mode)
     warn += _lint_undeclared_tags(mgr, s, matches)
+    warn += _lint_sizes(matches)
     head = (f"🔍 `{s.name}` and its {len(matches)} match"
             f"{'es' if len(matches) != 1 else ''}: {n} formula slot(s) "
             f"checked")
@@ -9053,6 +9129,31 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         return head + " — all clean."
     return "\n".join([head + f" — {len(bad)} problem(s), {len(warn)} "
                       f"warning(s):"] + bad + warn)
+
+
+def _lint_sizes(matches: List[Match]) -> List[str]:
+    """`!system lint`'s size check (#242), per match with sizes on: bodies
+    whose total is a sum holding living parts without a size number (they
+    add 0), and units holding a negative size while size_allow_negative is
+    off (stored before it was turned off)."""
+    out: List[str] = []
+    for m in matches:
+        if not m.sizes_on():
+            continue
+        allow = bool(m.rules.get("size_allow_negative", False))
+        for e in sorted(m.entities.values(), key=lambda u: u.id):
+            if m.body_root(e) is e:
+                info = m.size_info(e)
+                if info["mode"] == "sum" and info["unsized"]:
+                    out.append(
+                        f"⚠️ match `{m.id}` `{e.id}`: its size is a sum; "
+                        + ", ".join(f"`{u}`" for u in info["unsized"])
+                        + f" hold no {m.size_names()[0]} and add 0")
+            n = m._size_num(e)
+            if not allow and n is not None and n < 0:
+                out.append(f"⚠️ match `{m.id}` `{e.id}`: size {n} is negative "
+                           f"(size_allow_negative is off)")
+    return out
 
 
 def _lint_undeclared_tags(mgr: MatchManager, s: Any,
@@ -13846,6 +13947,17 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
         if not name:
             raise VTTError("`map:` predicate needs a map name.")
         return "map", name, None
+    if token.startswith("size:"):
+        # size:<category>[+|-] — the unit's body total size is in that
+        # category (+ = or above, - = or below), #242.
+        name = token[len("size:"):]
+        mod = ""
+        if name.endswith(("+", "-")):
+            name, mod = name[:-1], name[-1]
+        if not name:
+            raise VTTError("`size:` predicate needs a size category "
+                           "(`size:large`, `size:large+`, `size:medium-`).")
+        return "size", name, mod
     if token.startswith("near:"):
         # near:<eid>:<radius> — within `radius` (footprint-aware nearest-cell,
         # Chebyshev) of the reference entity. key=eid, value=radius.
@@ -13874,7 +13986,8 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
     raise VTTError(
         f"Unrecognized find predicate `{token}`. Expected `key=value`, "
         f"`key<value`, `status:NAME`, `group:NAME`, `action:NAME`, "
-        f"`map:NAME`, `near:<eid>:<radius>`, or `within:<x>:<y>:<radius>`."
+        f"`map:NAME`, `size:<category>[+|-]`, `near:<eid>:<radius>`, or "
+        f"`within:<x>:<y>:<radius>`."
     )
 
 
@@ -13986,6 +14099,8 @@ def _parse_find_selector(token: str) -> Tuple[bool, List[Tuple[str, str, Optiona
         kind, key, _val = alts[-1]
         if kind in ("status", "group", "action", "map", "tag"):
             alts.append((kind, raw, None))
+        elif kind == "size":
+            alts.append(_parse_find_predicate("size:" + raw))
         elif kind == "near":
             alts.append(_parse_find_predicate("near:" + raw))
         elif kind == "within":
@@ -14034,6 +14149,37 @@ def _on_ground(e) -> bool:
     return e.is_alive and not e.is_glued_part and not e.is_hidden_rider
 
 
+def _find_size_matches(m: Match, e: Entity, cat: str, mod: Optional[str],
+                       pov: Optional[str]) -> bool:
+    """`size:<cat>[+|-]`: the category of `e`'s body total, read through
+    its body root's stored total as the query's team is shown it (a
+    disguise's `vars` may present a decoy)."""
+    if not m.sizes_on():
+        raise VTTError("`size:` needs sizes on (size_enabled is off on "
+                       "this match).")
+    scale = m.size_scale()
+    want = m.size_rank_of(cat)
+    if want is None:
+        names = ", ".join(n for n, _s in scale) or "(none defined)"
+        raise VTTError(f"`size:{cat}`: not a size category (the scale: "
+                       f"{names}).")
+    root = m.body_root(e)
+    found, total = _entity_path_value(m, root, m.size_names()[2], pov)
+    if not found or isinstance(total, bool) \
+            or not isinstance(total, (int, float)):
+        if pov is not None and found:
+            return False             # a decoy that isn't a number
+        total = m.size_info(e)["total"]
+    have = m.size_rank_of(m.size_category_of(total))
+    if have is None:
+        return False
+    if mod == "+":
+        return have >= want
+    if mod == "-":
+        return have <= want
+    return have == want
+
+
 def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Optional[str]]],
                     pov: Optional[str] = None) -> bool:
     """Return True iff every predicate matches `e`. Predicates short-
@@ -14056,6 +14202,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             continue
         if kind == "tag":
             if not tag_filter_matches(m.unit_tags(e, pov), key):
+                return False
+            continue
+        if kind == "size":
+            if not _find_size_matches(m, e, key, val, pov):
                 return False
             continue
         if kind == "action":
@@ -14168,6 +14318,9 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
         "discoverable-action availability; `tag:<filter>` for the units "
         "whose tags match a tag filter (`tag:undead`, `tag:animal,beast` = "
         "either, a quoted expression `\"tag:(animal and not undead)\"`); "
+        "`size:<category>` for the units whose body's total size is in "
+        "that category (`size:large+` = large or above, `size:medium-` = "
+        "medium or below); "
         "`map:NAME` for the units on a "
         "map; `near:<eid>:<radius>` (units on that unit's map) and "
         "`within:<x>:<y>:<radius>` (on the map a `map:` word names, else "
@@ -21739,7 +21892,10 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     finally:
         _DRY_ACTIVE.reset(token)
         after = mgr.matches.get(mid)
-        # The zone grants it would settle (#136), as after a real command.
+        # The sizes and zone grants it would settle (#242, #136), as after
+        # a real command.
+        if after is not None:
+            after.surface_log(after.sync_all_sizes())
         if after is not None and after._grants_present():
             after.surface_log(after.sync_zone_grants())
         post = after.to_dict(include_history=False) if after is not None \
@@ -22061,6 +22217,7 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                     await registry.dispatch_no_snapshot(name, rest, sctx, mgr)
                     cur = mgr.matches.get(mid)
                     if cur is not None:
+                        cur.surface_log(cur.sync_all_sizes())
                         if cur._grants_present():
                             cur.surface_log(cur.sync_zone_grants())
                         if cur.has_watchers():
@@ -24521,7 +24678,7 @@ def _help_functions(kind: Optional[str]) -> str:
     return "\n".join(out)
 
 
-@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help tag [<tag>] | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help tag [tag]` shows a tag's description from the tag vocabulary of this channel's game system (`!system tags`), or lists the declared tags. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
+@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help tag [<tag>] | !help size [<unit>|<number>] | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help tag [tag]` shows a tag's description from the tag vocabulary of this channel's game system (`!system tags`), or lists the declared tags. `!help size` shows this match's size categories with their ranges, `!help size <unit>` a unit's own and total size and what makes up the total, `!help size <number>` the category of a number. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "find":
         return await ctx.send(_help_find(ctx, mgr, args[1:]))
@@ -24539,12 +24696,138 @@ async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "rule":
         _check_tail(args, 2, (), "!help rule <rule>")
         return await ctx.send(_help_rule(ctx, mgr, args[1]))
+    if args and args[0].lower() == "size":
+        _check_tail(args, 2, (), "!help size [<unit>|<number>]")
+        return await ctx.send(_help_size(ctx, mgr, args[1] if len(args) > 1
+                                         else None))
     if args and args[0].lower() == "tag":
         _check_tail(args, 2, (), "!help tag [<tag>]")
         return await ctx.send(_help_tag(ctx, mgr, args[1] if len(args) > 1
                                         else None))
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
+
+
+def _size_scale_lines(scale, decimals: bool) -> List[str]:
+    """One line per size category with the sizes it holds."""
+    out = []
+    for i, (name, start) in enumerate(scale):
+        nxt = scale[i + 1][1] if i + 1 < len(scale) else None
+        if start is None and nxt is None:
+            rng = "every size"
+        elif start is None:
+            rng = f"below {nxt}"
+        elif nxt is None:
+            rng = f"{start} and up"
+        elif decimals:
+            rng = f"{start} up to {nxt}"
+        else:
+            rng = f"{start}-{nxt - 1}" if nxt - 1 > start else f"{start}"
+        out.append(f"{i}. `{name}`: {rng}")
+    return out
+
+
+def _help_size(ctx: ReplyContext, mgr: MatchManager,
+               raw: Optional[str]) -> str:
+    """`!help size [<unit>|<number>]` (#242): the size scale of the
+    channel's match (else its default system), a unit's size breakdown,
+    or a number's category."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    if m is not None:
+        rule = m.rules.get
+    else:
+        sysname = mgr.effective_system_name(ctx.channel_key)
+        s = mgr.systems.get(sysname)
+        if s is None:
+            raise VTTError(f"No system `{sysname}`.")
+        rule = (lambda k, d=None: mgr.system_value(s, k))
+    if not rule("size_enabled", True):
+        return ("Sizes are off here (`size_enabled`): no unit holds a size "
+                "and the size functions refuse.")
+    try:
+        scale = parse_size_scale(str(rule("size_categories", "") or ""))
+    except VTTError:
+        scale = []
+    decimals = bool(rule("size_decimals", False))
+    if raw is None:
+        head = (f"**Sizes** (total mode `{rule('size_total_mode', 'body')}`, "
+                f"an unsized unit is {rule('size_default', 100)}"
+                + (f" + {rule('size_default_per_extra_tile', 0)} per extra "
+                   f"footprint cell" if rule("size_default_per_extra_tile", 0)
+                   else "") + ")")
+        if not scale:
+            return (head + "\nThis system defines no size categories "
+                    "(`size_categories`): sizes are plain numbers.")
+        return "\n".join([head] + _size_scale_lines(scale, decimals))
+    num = None
+    try:
+        num = float(raw)
+    except ValueError:
+        pass
+    if num is not None and math.isfinite(num):
+        n = int(num) if num.is_integer() else num
+        if not scale:
+            return f"{n}: this system defines no size categories."
+        cat = scale[0][0]
+        for name, start in scale[1:]:
+            if n >= start:
+                cat = name
+        rank = [x for x, _s in scale].index(cat)
+        return f"{n} is `{cat}` (rank {rank} of {len(scale) - 1})."
+    if m is None:
+        raise VTTError("No active match in this channel: `!help size "
+                       "<unit>` reads a unit of the channel's match.")
+    eid = _query_eid(ctx, m, raw)
+    e = m.entities[eid]
+    pov = _query_pov(ctx, m)
+    info = m.size_info(e)
+    root = info["root"]
+    num_v, text_v, total_v = m.size_names()
+    dis = (m._effective_disguise(root, pov) if pov is not None else None)
+    if dis is not None:
+        # A disguised body shows only what its decoy vars present.
+        found, t = _entity_path_value(m, root, total_v, pov)
+        if not found or isinstance(t, bool) or not isinstance(t, (int, float)):
+            t = info["total"]
+        cat = m.size_category_of(t)
+        return (f"**`{raw}`** size {t}" + (f" (`{cat}`)" if cat else "") + ".")
+    own = info["own"]
+    lines = [f"**`{e.id}`** size {info['total']}"
+             + (f" (`{info['category']}`)" if info["category"] else "")
+             + (f", the total of body `{root.id}`" if root is not e else "")
+             + "."]
+    if e is root:
+        src = ("its " + num_v if m._size_num(root) is not None
+               else "the default (holds no " + num_v + ")")
+        lines.append(f"Own size: {own}, {src}.")
+    else:
+        if own is None:
+            lines.append(f"Own size: none (holds no {num_v}; adds nothing "
+                         f"to the total).")
+        elif m._size_num(e) is None:
+            lines.append(f"Own size: {own}, inherited from `{root.id}` "
+                         f"(size_parts_inherit).")
+        else:
+            lines.append(f"Own size: {own}.")
+    mode = info["mode"]
+    lines.append(f"Total mode `{mode}`" + {
+        "body": ": the body root's own size alone.",
+        "sum": ": the root's own size plus each living part's.",
+        "max": ": the largest of the root's and its living parts' sizes.",
+    }.get(mode, "."))
+    if mode != "body":
+        parts = [p for p in m.entity_part_subtree(root.id)
+                 if p is not root and p.is_alive
+                 and not _pov_hides(m, pov, p.id)]
+        rows = []
+        for p in parts:
+            n = m._size_num(p)
+            rows.append(f"`{p.id}` {n}" if n is not None
+                        else f"`{p.id}` (none)")
+        if rows:
+            lines.append("Parts: " + ", ".join(rows) + ".")
+    return "\n".join(lines)
 
 
 # What each engine tag means (`!help tag`): the engine declares them.

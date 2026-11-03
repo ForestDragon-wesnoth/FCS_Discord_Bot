@@ -2687,6 +2687,12 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # unit lacks the status (#90); a level-less status reads 1, one
     # without a duration (permanent) reads None.
     "status_level", "status_duration",
+    # Sizes (#242): size_of / size_class / size_is / size_at_least /
+    # size_at_most / size_rank / size_steps take a unit, a corpse or a
+    # number (own=True: the unit's own number); size_range(category),
+    # size_categories().
+    "size_of", "size_class", "size_is", "size_at_least", "size_at_most",
+    "size_rank", "size_steps", "size_range", "size_categories",
     "status_set", "status_del", "status_add", "status_remove",
     # status_apply(eid, name[, level, duration]) -> apply a status via its
     # definition + stack mode (the host-friendly "inflict burn" call),
@@ -3107,6 +3113,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'slot_of', 'slot_riders', 'status_get', 'status_level_data',
     'status_resisted',
     'status_has', 'status_level', 'status_duration',
+    'size_of', 'size_class', 'size_is', 'size_at_least', 'size_at_most',
+    'size_rank', 'size_steps', 'size_range', 'size_categories',
     'status_has_path', 'status_has_tag', 'status_names',
     'status_resist_of', 'status_tags', 'statuses_with_tag',
     'table_roll', 'team_get', 'team_has', 'team_sees_cell',
@@ -3321,7 +3329,7 @@ _HOF_FUNCS: "frozenset[str]" = frozenset({"map_with", "filter_with", "sort_by"})
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
-    "prefab_names",
+    "prefab_names", "size_categories",
     "range",
     "each",
     "keys",
@@ -6026,6 +6034,158 @@ class FormulaEngine:
             blocked_by and the part immune/redirect rules are still honored).
             The 'forced affliction' counterpart to status_apply. Returns True."""
             return _do_status_apply("status_force", eid_t, name, level, duration, True)
+
+        # ---- sizes (#242) ----
+        # A size reference is a unit (its body's total, or with own=True its
+        # own number), a corpse id (the total it died with) or a number. A
+        # category argument is a category name or a number.
+
+        def _sizes_check(fname: str, scale: bool = False) -> None:
+            if not match.sizes_on():
+                raise FormulaError(
+                    f"{fname}(...): sizes are off on this match "
+                    f"(size_enabled).")
+            if scale and not match.size_scale():
+                raise FormulaError(
+                    f"{fname}(...): this system defines no size categories "
+                    f"(size_categories).")
+
+        def _size_ref(x: Any, own: Any, fname: str) -> Any:
+            _sizes_check(fname)
+            if isinstance(x, (int, float)) and not isinstance(x, bool):
+                if not math.isfinite(x):
+                    raise FormulaError(f"{fname}(...): a size must be finite.")
+                return x
+            if x is None or not isinstance(x, str):
+                eid = _eid(x)        # refuses with the usual wording
+            else:
+                eid = ctx.resolve_who(x)
+            e = match.entities.get(eid)
+            if e is not None:
+                info = match.size_info(e)
+                return info["own"] if own else info["total"]
+            if match.find_corpse(eid) is not None:
+                return match.size_of_corpse(eid)
+            raise FormulaError(f"{fname}(...): unknown entity id '{eid}'.")
+
+        def _size_bounds(cat: Any, fname: str) -> Tuple[Any, Any]:
+            """(start, next start) of category `cat` (None at an open end);
+            a number is its own start and end."""
+            if isinstance(cat, (int, float)) and not isinstance(cat, bool):
+                return cat, None
+            if not isinstance(cat, str):
+                raise FormulaError(
+                    f"{fname}(...): a size category is a name or a number, "
+                    f"got {cat!r}.")
+            _sizes_check(fname, scale=True)
+            scale = match.size_scale()
+            idx = match.size_rank_of(cat)
+            if idx is None:
+                raise FormulaError(
+                    f"{fname}(...): `{cat}` isn't a size category (the "
+                    f"scale: {', '.join(n for n, _s in scale)}).")
+            nxt = scale[idx + 1][1] if idx + 1 < len(scale) else None
+            return scale[idx][1], nxt
+
+        def _size_of(x: Any, own: Any = False) -> Any:
+            """size_of(x, own=False): the size number of `x`: a unit's
+            body total (its own number plus its parts' per size_total_mode;
+            a body part answers with its creature's total), a corpse's total
+            at death, or a number given as is. own=True gives the unit's own
+            number (a part without one reads its body root's under
+            size_parts_inherit, else None)."""
+            return _size_ref(x, own, "size_of")
+
+        def _size_class(x: Any, own: Any = False) -> Any:
+            """size_class(x, own=False): the size category `x` falls in
+            (a unit, a corpse or a number, as size_of reads it); None for a
+            size that is None."""
+            _sizes_check("size_class", scale=True)
+            n = _size_ref(x, own, "size_class")
+            return match.size_category_of(n) if n is not None else None
+
+        def _size_is(x: Any, cat: Any, own: Any = False) -> bool:
+            """size_is(x, category, own=False): whether `x`'s size falls in
+            `category` (a name, or a number standing for its category)."""
+            _sizes_check("size_is", scale=True)
+            n = _size_ref(x, own, "size_is")
+            if n is None:
+                return False
+            if isinstance(cat, (int, float)) and not isinstance(cat, bool):
+                cat = match.size_category_of(cat)
+            _size_bounds(cat, "size_is")
+            return match.size_category_of(n) == cat
+
+        def _size_at_least(x: Any, cat: Any, own: Any = False) -> bool:
+            """size_at_least(x, category, own=False): whether `x`'s size is
+            in `category` or above (`size_at_least(target, 'large')`); a
+            number compares as size >= that number."""
+            n = _size_ref(x, own, "size_at_least")
+            lo, _hi = _size_bounds(cat, "size_at_least")
+            if n is None:
+                return False
+            return lo is None or n >= lo
+
+        def _size_at_most(x: Any, cat: Any, own: Any = False) -> bool:
+            """size_at_most(x, category, own=False): whether `x`'s size is
+            in `category` or below; a number compares as size <= that
+            number."""
+            n = _size_ref(x, own, "size_at_most")
+            if isinstance(cat, (int, float)) and not isinstance(cat, bool):
+                return n is not None and n <= cat
+            _lo, hi = _size_bounds(cat, "size_at_most")
+            if n is None:
+                return False
+            return hi is None or n < hi
+
+        def _size_rank(x: Any, own: Any = False) -> Any:
+            """size_rank(x, own=False): the position of `x`'s size category
+            in the scale, 0 for the first (`size_categories()` lists them);
+            None for a size that is None."""
+            _sizes_check("size_rank", scale=True)
+            n = _size_ref(x, own, "size_rank")
+            if n is None:
+                return None
+            return match.size_rank_of(match.size_category_of(n))
+
+        def _size_steps(a: Any, b: Any, own: Any = False) -> Any:
+            """size_steps(a, b, own=False): how many categories `b`'s size
+            sits above `a`'s (negative when below, 0 in the same one): a
+            grapple against a target two sizes larger reads 2. None when
+            either size is None."""
+            _sizes_check("size_steps", scale=True)
+            ra = _size_rank(a, own)
+            rb = _size_rank(b, own)
+            if ra is None or rb is None:
+                return None
+            return rb - ra
+
+        def _size_range(cat: Any) -> list:
+            """size_range(category): [start, next_start] of a size category:
+            the sizes from start (inclusive) up to next_start (exclusive);
+            None for the first category's start and the last's end."""
+            _sizes_check("size_range", scale=True)
+            if not isinstance(cat, str):
+                raise FormulaError(
+                    "size_range(category): category must be a name.")
+            lo, hi = _size_bounds(cat, "size_range")
+            return [lo, hi]
+
+        def _size_categories() -> list:
+            """size_categories(): the size category names, smallest first
+            (loopable)."""
+            _sizes_check("size_categories")
+            return [n for n, _s in match.size_scale()]
+
+        ns["size_of"]         = _size_of
+        ns["size_class"]      = _size_class
+        ns["size_is"]         = _size_is
+        ns["size_at_least"]   = _size_at_least
+        ns["size_at_most"]    = _size_at_most
+        ns["size_rank"]       = _size_rank
+        ns["size_steps"]      = _size_steps
+        ns["size_range"]      = _size_range
+        ns["size_categories"] = _size_categories
 
         ns["status_has"]      = _status_has
         ns["status_level"]    = _status_level_fn

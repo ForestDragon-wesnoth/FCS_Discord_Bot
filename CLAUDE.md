@@ -1062,7 +1062,9 @@ hardcodes**.
   `turnorder_var`).
 - **Var-name rules** (`VAR_NAME_RULES`: hp / max_hp / turnorder / team /
   part_name / footprint width + height / atb_charge / disguise /
-  fog_vision_radius / overlay `_var`; each value one plain var name, an
+  fog_vision_radius / overlay / map_vehicle_death_effect /
+  map_vehicle_wreck / mount_death_effect / tags / size_num / size_text /
+  size_total `_var`; each value one plain var name, an
   identifier that isn't a keyword, x / y / name or `__`-prefixed,
   `check_var_name_rule`): each unit remembers the names it uses
   (protected `Entity.var_names`, saved with it, its corpse and its
@@ -3073,6 +3075,57 @@ The design is `docs/tags_design.md` (built, PRs 1-3) (919-927).
   with where they are once the vocabulary is non-empty
   (`_lint_undeclared_tags`: libraries, the system's matches, its
   prefabs) (926-927).
+
+### 7.21 Sizes
+
+#242 (993-998). One number per unit, a per-system scale of categories,
+and a total per body.
+- **Vars:** the GM writes `size_num` (rule `size_num_var`); the engine
+  keeps `size_total` and `size_text` (`size_total_var` / `size_text_var`)
+  on each BODY ROOT only, derived, written through write_var under the
+  `logic.SIZE_DERIVING` context var (so on_var_* hooks fire on them) and
+  refused to any other write or delete. A root without a number reads
+  `size_default` (100) plus `size_default_per_extra_tile` (0) per
+  footprint cell past the first, live, never stored in size_num.
+- **Writes** (`Match.checked_size_value`, in write_var and at spawn): a
+  finite number, floored unless `size_decimals`; a category name stores
+  per `size_name_write` (refuse / lowest_size: its start, the first
+  category 1 / average_size: the middle, the first category half the
+  second's start, the last its start); a value landing outside the first
+  category becomes the second start - 1 with negatives allowed, else is
+  refused. A negative is refused while `size_allow_negative` is off;
+  turning it off leaves stored negatives (the reply and `!system lint`
+  list them).
+- **Scale** (`size_categories`, `parse_size_scale`, checked by
+  `_FORMAT_RULE_CHECKS`): `tiny, small:25, medium:76, large:150,
+  huge:300, colossal:800`; the first category takes no start, starts rise
+  strictly; a scale whose first category holds only negatives is refused
+  while negatives are off (`_check_size_scale_rules`, either rule).
+- **Totals** (`Match.size_info`): `size_total_mode` (per root
+  `__size_total_mode`) body = the root's own number, sum = plus every
+  living part's own number (unsized parts add 0; `sync_body_size` warns
+  when the unsized set grows), max = the largest. Under body / max an
+  unsized part's own size is the root's (`size_parts_inherit`, per root
+  `__size_parts_inherit`). A part answers reads with its creature's total.
+- **When it derives:** after any write / delete of size_num, a footprint
+  var or the two override vars on any unit of the body (`_size_trigger`,
+  then `sync_body_size`), at spawn, after each command that changed the
+  match (`sync_all_sizes` in `CommandRegistry._run` beside the zone-grant
+  sync, also per `!dry` / `!simulate` step; one children index per sweep)
+  and on a change of any size or footprint rule (`apply_system_rules`).
+  Corpses keep the total they died with; their category follows the scale.
+  `size_enabled` off removes the derived vars from units (size_num stays a
+  plain var) and every size function, selector and `!help size` refuses.
+- **Reads:** `size_of(x, own=False)`, `size_class`, `size_is(x, cat)`,
+  `size_at_least`, `size_at_most`, `size_rank` (0 = first),
+  `size_steps(a, b)`, `size_range(cat)` ([start, next start), None at the
+  open ends), `size_categories()` (loopable); x is a unit, a corpse id or a
+  number, a category argument a name or a number. `!find` / `!foreach`
+  `size:<cat>[+|-]`; roster `{size}` / `{size_class}`; `!help size
+  [<unit>|<number>]`. A disguise's `vars` may present a decoy size_total
+  (the category follows it) to the selector, the placeholders and `!help
+  size`. Templates save the derived vars (engine-kept, like the snake
+  links) and a spawn derives them again.
 
 ---
 

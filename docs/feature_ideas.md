@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -194,16 +194,6 @@ or rejects one, it moves to "Off the list".
   - `flee(eid)` takes a unit out of play into the match's fled list (kept for the report, able to come back), and fires `on_entity_fled`.
   - A rule `off_map_moves: refuse | flee`: with `flee`, a walk off the map's edge makes the unit flee. FCS1: "units can move off the map to flee the match". Solis: a unit "can choose to flee from combat if they are standing next to an edge of the map".
   - Today a walk off the edge is refused ("(1,0) outside 6x3", `names.out`), and the flee action in `solis2.txt` deletes the unit, so nothing remembers that it fled.
-- **#242 Size scale.**
-  - A rule `size_scale` (an ordered list: small, medium, large, huge, colossal) with `size_var`, and functions `size_rank(eid)`, `size_at_most(eid, 'medium')`, `size_compare(a, b)`.
-  - The game need: all three systems test "medium or smaller" and "large or above":
-    - kicks pushing small targets further;
-    - launches and knockbacks that affect medium-or-smaller units;
-    - disorients limited by size;
-    - FCS1 Insect Killer (instakills small targets);
-    - Solis trees that large creatures trample.
-  - Today each test repeats `index_of([...], var_get(t, 'size'))` with the whole list typed out.
-  - Open choice: whether size can also follow from the footprint.
 - **#243 Per-turn scratch vars.**
   - A var root (rule `turn_scratch_root`, default `this_turn`) emptied at the start of each of the unit's turns, after being copied to `last_turn`; `this_round` is emptied at round start.
   - The game need: rules that remember something until the end of the turn.

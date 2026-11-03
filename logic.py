@@ -488,6 +488,11 @@ def touch_match(mid: Optional[str]) -> None:
         seen.add(mid)
 
 
+# Set while the engine writes the derived size vars (size_text_var /
+# size_total_var, #242), which refuse every other write.
+SIZE_DERIVING: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_size_deriving", default=False)
+
 # The workspace (MatchManager) whose command is running: formulas reach the
 # server's saved entity templates through it (summon_template). Set by each
 # CommandRegistry.run; None outside a command.
@@ -926,6 +931,148 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "vehicle, map_carrier), which no var can hold. Read with "
             "unit_tags / unit_has_tag / units_with_tag, `tag:` in `!find`, "
             "`{tags}` in the roster formats."
+        ),
+    },
+    # ---- Sizes (#242) ------------------------------------------------
+    # A unit's size is a number (size_num_var, written by the GM); the
+    # system's categories (size_categories) are ranges over it. The engine
+    # derives, on each body root, the creature's total (size_total_var, per
+    # size_total_mode) and its category (size_text_var). See
+    # Match.sync_body_size and the size_* formula functions.
+    "size_enabled": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether units have sizes (#242). Off: the size functions, "
+            "`!find size:` and the {size} / {size_class} placeholders "
+            "refuse, and the engine stops deriving: every unit and corpse "
+            "loses its size_text_var / size_total_var (the size_num_var "
+            "numbers a GM wrote stay, as plain vars). Back on, everything "
+            "is derived again."
+        ),
+    },
+    "size_categories": {
+        "default": "tiny, small:25, medium:76, large:150, huge:300, "
+                   "colossal:800",
+        "schema": {"type": "str"},
+        "desc": (
+            "The size categories, smallest first: `name:start`, each running "
+            "from its start up to the next one's. The first takes no start "
+            "(it holds every size below the second's); starts rise strictly. "
+            "A size below the first start is the first category, one at or "
+            "above the last start the last. Read by size_class, size_is, "
+            "size_at_least / size_at_most, size_rank, size_steps, "
+            "size_range, `!find size:<name>` and the derived size_text_var. "
+            "Empty = no categories (the category reads refuse)."
+        ),
+    },
+    "size_default": {
+        "default": 100,
+        "schema": {"type": "number"},
+        "desc": (
+            "The size of a unit (a body root) holding no size_num_var, read "
+            "live, never written into the unit, plus "
+            "size_default_per_extra_tile for each footprint cell past the "
+            "first. A body part without a number has none of its own (see "
+            "size_parts_inherit)."
+        ),
+    },
+    "size_default_per_extra_tile": {
+        "default": 0,
+        "schema": {"type": "number"},
+        "desc": (
+            "Added to size_default for each footprint cell past the first of "
+            "a unit holding no size_num_var: at 100, an unsized 2x2 unit is "
+            "size_default + 300."
+        ),
+    },
+    "size_total_mode": {
+        "default": "body",
+        "schema": {"type": "enum", "choices": ["body", "sum", "max"]},
+        "desc": (
+            "How a body's total size (size_total_var, what the size reads "
+            "answer for every unit of the body) follows from its parts: "
+            "`body` = the root's own size; `sum` = the root's own size plus "
+            "the size_num_var of every living part and segment holding one "
+            "(a part without one adds 0, with a warning when it joins); "
+            "`max` = the largest of the root's own size and those parts'. "
+            "Riders never count. A body root's `__size_total_mode` var "
+            "overrides the rule for that body."
+        ),
+    },
+    "size_parts_inherit": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Under size_total_mode `body` and `max`: a body part holding no "
+            "size_num_var reads its body root's own size as its own "
+            "(`own=True` reads). Off, such a part has no size of its own. "
+            "A body root's `__size_parts_inherit` var overrides the rule "
+            "for its body."
+        ),
+    },
+    "size_name_write": {
+        "default": "lowest_size",
+        "schema": {"type": "enum",
+                   "choices": ["refuse", "lowest_size", "average_size"]},
+        "desc": (
+            "What writing a category name into size_num_var stores "
+            "(`!ent set_var orc size_num large`): `refuse` refuses it; "
+            "`lowest_size` stores the category's start (the first "
+            "category: 1); `average_size` the middle of its range ((start + "
+            "next start) / 2; the first category: the second's start / 2; "
+            "the last: its start). Floored unless size_decimals is on. "
+            "Where that value falls outside the first category (a second "
+            "start of 1 or below), the value just under the second start "
+            "when size_allow_negative is on, else the write is refused."
+        ),
+    },
+    "size_decimals": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Off: every size number is floored to a whole number as it is "
+            "written (80.7 stores 80), and so are size_default, derived "
+            "totals and the values a category name writes. On: sizes keep "
+            "their decimals."
+        ),
+    },
+    "size_allow_negative": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Off: a size number below 0 is refused wherever it would be "
+            "stored (a write, a category name's value), and a scale whose "
+            "first category could only hold negative sizes (a second start "
+            "of 0 or below) is refused. Turning it off leaves negative "
+            "sizes units already hold."
+        ),
+    },
+    "size_num_var": {
+        "default": "size_num",
+        "schema": {"type": "str"},
+        "desc": (
+            "Variable name in entity vars holding a unit's own size number "
+            "(#242), the one size var a GM writes. A category name written "
+            "there follows size_name_write."
+        ),
+    },
+    "size_text_var": {
+        "default": "size_text",
+        "schema": {"type": "str"},
+        "desc": (
+            "Variable name the engine keeps a body root's size category in "
+            "(the category of its size_total_var), derived, refused to "
+            "direct writes; var hooks fire when it changes."
+        ),
+    },
+    "size_total_var": {
+        "default": "size_total",
+        "schema": {"type": "str"},
+        "desc": (
+            "Variable name the engine keeps a body root's total size in (per "
+            "size_total_mode), derived, refused to direct writes; var hooks "
+            "fire when it changes."
         ),
     },
     "tag_vocabulary_mode": {
@@ -2277,7 +2424,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "{inventory.sword.damage}. Built-in keys: id, name, x, y, facing, team, "
             "initiative, hp, max_hp, status_csv, statuses (each status with its level and duration, status_line_format), passives_csv, map (the "
             "unit's map), map_shown (the same, but empty while the match has "
-            "one map). Any top-level "
+            "one map), size / size_class (the body's total size and its "
+            "category, empty while sizes are off). Any top-level "
             "entity var is also available by name. Use \\n for newlines."
         ),
     },
@@ -4544,7 +4692,86 @@ def _check_top_vars(key: str, raw: str) -> str:
     return ",".join(got)
 
 
+# The rules a body's derived size reads (#242): a change of one re-derives
+# every body (MatchManager.apply_system_rules).
+SIZE_RULES = ("size_enabled", "size_categories", "size_default",
+              "size_default_per_extra_tile", "size_total_mode",
+              "size_parts_inherit", "size_decimals", "size_num_var",
+              "size_text_var", "size_total_var",
+              "footprint_width_var", "footprint_height_var")
+
+
+def _corpse_vars(corpse: Any) -> Optional[Dict[str, Any]]:
+    """The vars of a corpse's unit snapshot (None when malformed)."""
+    ent = corpse.get("entity") if isinstance(corpse, dict) else None
+    cv = ent.get("vars") if isinstance(ent, dict) else None
+    return cv if isinstance(cv, dict) else None
+
+
+def _size_trigger(match: Any, path: str) -> bool:
+    """Whether a write / delete at `path` can change its body's size: the
+    size number, the footprint vars (an unsized unit's default), the
+    per-body mode / inherit overrides."""
+    if SIZE_DERIVING.get():
+        return False
+    seg0 = path.split(".", 1)[0]
+    r = match.rules
+    return seg0 in (str(r.get("size_num_var", "size_num")),
+                    str(r.get("footprint_width_var", "footprint_w")),
+                    str(r.get("footprint_height_var", "footprint_h")),
+                    "__size_total_mode", "__size_parts_inherit")
+
+
+def parse_size_scale(text: Any) -> List[Tuple[str, Optional[float]]]:
+    """`size_categories` as [(name, start)], smallest first; the first
+    category's start is None (it holds everything below the second's).
+    Raises VTTError on a malformed scale: a name that isn't a plain word, a
+    repeated name, a start on the first category or missing on a later
+    one, starts that don't rise strictly."""
+    out: List[Tuple[str, Optional[float]]] = []
+    raw = str(text or "").strip()
+    if not raw:
+        return out
+    for i, tok in enumerate(t.strip() for t in raw.split(",")):
+        name, colon, num = tok.partition(":")
+        name = name.strip()
+        if not _PLAIN_KEY_RE.fullmatch(name) or name.startswith("__"):
+            raise VTTError(f"size_categories: `{tok}` isn't `name:start` "
+                           f"(a name of letters, digits and _).")
+        if any(n == name for n, _s in out):
+            raise VTTError(f"size_categories: `{name}` is named twice.")
+        if i == 0:
+            if colon:
+                raise VTTError(
+                    f"size_categories: the first category takes no start: "
+                    f"it holds every size below the second's (`{name}, "
+                    f"next:<start>, ...`).")
+            out.append((name, None))
+            continue
+        try:
+            start = float(num)
+        except ValueError:
+            raise VTTError(f"size_categories: `{tok}` needs a number "
+                           f"start (`{name}:<start>`).")
+        if not colon or not math.isfinite(start):
+            raise VTTError(f"size_categories: `{tok}` needs a number "
+                           f"start (`{name}:<start>`).")
+        prev = out[-1][1]
+        if prev is not None and start <= prev:
+            raise VTTError(f"size_categories: starts rise strictly, and "
+                           f"`{name}:{num.strip()}` doesn't rise past "
+                           f"`{out[-1][0]}`.")
+        out.append((name, int(start) if start.is_integer() else start))
+    return out
+
+
+def _check_size_scale(key: str, raw: str) -> str:
+    scale = parse_size_scale(raw)
+    return ", ".join(n if s is None else f"{n}:{s}" for n, s in scale)
+
+
 _FORMAT_RULE_CHECKS = {
+    "size_categories": _check_size_scale,
     "modifier_stat_caps": _check_stat_caps,
     "modifier_op_priority": _check_op_priority,
     "status_resist_op_priority": _check_resist_op_priority,
@@ -4603,6 +4830,16 @@ def _coerce_rule_value(key: str, raw_value: str):
                 extra += " — the bot owner's ceiling"
             raise VTTError(f"Setting '{key}' must be {rng}{extra}, got {v}.")
         return v
+
+    if t == "number":
+        # A finite number, whole or not (a size with size_decimals on).
+        try:
+            v = float(raw_value)
+        except ValueError:
+            raise VTTError(f"Setting '{key}' expects a number.")
+        if not math.isfinite(v):
+            raise VTTError(f"Setting '{key}' expects a finite number.")
+        return int(v) if v.is_integer() else v
 
     if t == "enum":
         choices = spec["choices"]
@@ -7829,6 +8066,11 @@ class Entity:
              match.rules.get("turnorder_var", "initiative")),
             f"`{self.id}`", match.rules.get("team_var", "team"),
             match.rules.get("tags_var", "tags"))
+        # A size number arrives checked (a category name converted, #242).
+        num_v = match.size_names()[0]
+        if match.sizes_on() and num_v in self.vars:
+            self.vars[num_v] = match.checked_size_value(
+                self.vars[num_v], f"`{self.id}`.{num_v}")
 
         # Validate the WHOLE footprint anchored at (x, y): every covered
         # cell in bounds and unoccupied (stackable spawners skip
@@ -7879,8 +8121,11 @@ class Entity:
         # re-runs spawn on a corpse snapshot that already has them)
         # idempotent, and lets a per-entity definition shadow a default.
         match._apply_default_passives(self)
-        log = rename_notes + match.fire_hook("on_entity_spawned",
-                                             target_ids=[self.id])
+        # Its body's size total and category (#242), before the spawn
+        # hooks read them.
+        size_log = match.sync_body_size(self)
+        log = rename_notes + size_log + match.fire_hook(
+            "on_entity_spawned", target_ids=[self.id])
         # Spawn event — but NOT during a revive (the entity sits in the
         # death-suppressed set only across the revive's spawn window), so
         # a revive emits just its own "revive" event, not a duplicate
@@ -8335,6 +8580,24 @@ class Entity:
                         f"Team var '{seg0}' must be text or a number, got "
                         f"{value!r} on `{self.id}`.")
                 value = t
+        size_named = None
+        if self._match is not None:
+            seg0 = path.split(".", 1)[0]
+            num_v, text_v, total_v = self._match.size_names()
+            if seg0 in (text_v, total_v) and not SIZE_DERIVING.get():
+                raise VTTError(
+                    f"`{seg0}` is derived from `{num_v}`: "
+                    f"write the size number there (on `{self.id}`).")
+            if seg0 == num_v and self._match.sizes_on():
+                if "." in path:
+                    raise VTTError(
+                        f"Cannot nest under the size var '{seg0}' (writing "
+                        f"'{path}') on `{self.id}`: a size is one number.")
+                if isinstance(value, str) and value.strip() and \
+                        self._match.size_rank_of(value.strip()) is not None:
+                    size_named = value.strip()
+                value = self._match.checked_size_value(
+                    value, f"`{self.id}`.{seg0}")
         # A dict / list is stored as this unit's own copy. A formula can hand
         # over another unit's live object (`entity[a].inv = entity[b].inv`,
         # var_set(..., var_get(...))), which used to make both vars ONE object:
@@ -8488,6 +8751,19 @@ class Entity:
         # caller sees everything in chronological order.
         event_log = self._fire_var_events(ancestor_events + leaf_events)
         combined = attempt_log + event_log
+        if self._match is not None and self.id in self._match.entities \
+                and _size_trigger(self._match, path):
+            combined += self._match.sync_body_size(self)
+            if size_named is not None and self.id in self._match.entities:
+                info = self._match.size_info(self)
+                if info["category"] != size_named:
+                    root = info["root"]
+                    total = (f"with its parts its total is {info['total']}"
+                             if root is self else
+                             f"its body `{root.id}` totals {info['total']}")
+                    combined.append(self._match.unit_line(self.id, (
+                        f"⚠️ `{self.id}`'s own size is set to {size_named} "
+                        f"({value}); {total} ({info['category']}).")))
         # verbosity 'detailed': annotate a DESTRUCTIVE write — one that
         # replaced an existing subtree, so `inventory = 5` over a populated
         # dict silently drops its keys. NOTE _diff_subtree collapses a
@@ -8632,6 +8908,13 @@ class Entity:
         old = _path_resolve(self.vars, path)
         if old is _MISSING:
             raise NotFound(f"Variable '{path}' not found on entity '{self.id}'.")
+        if self._match is not None and not SIZE_DERIVING.get():
+            num_v, text_v, total_v = self._match.size_names()
+            if path.split(".", 1)[0] in (text_v, total_v) \
+                    and self._match.sizes_on():
+                raise VTTError(
+                    f"`{path}` is derived from `{num_v}`: the "
+                    f"engine keeps it on `{self.id}`.")
         self._del_path(path)
         if VAR_TRACE.get() is not None:
             record_trace("delete", self.id, path, old,
@@ -8642,6 +8925,10 @@ class Entity:
             self._match._body_reshaped(self, path)
         events = _diff_subtree(path, old, _MISSING)
         log = self._fire_var_events(events)
+        if self._match is not None and self.id in self._match.entities \
+                and not SIZE_DERIVING.get() and _size_trigger(self._match,
+                                                              path):
+            log += self._match.sync_body_size(self)
         # Removing the init or team var also dirties turn order — same
         # policy gate as write_var above. Initiative being removed means
         # the entity drops out of turn_order entirely (since
@@ -11245,6 +11532,320 @@ class Match:
             root = self.entities[root.part_of]
             seen.add(root.id)
         return root
+
+    # ---- sizes (#242) -------------------------------------------------
+    # A unit's own size is its size_num_var (or, on a body root holding
+    # none, size_default plus size_default_per_extra_tile per extra
+    # footprint cell); a body's total follows size_total_mode (`body` /
+    # `sum` / `max`, per-body `__size_total_mode`) over its living parts;
+    # the category is the size_categories range the total falls in. The
+    # engine stores the total and the category on the body root
+    # (size_total_var / size_text_var, written through write_var under
+    # SIZE_DERIVING so var hooks fire), at every size write, spawn, and
+    # after each command that changed the match (sync_all_sizes); the read
+    # functions compute live through size_info.
+
+    def size_names(self) -> Tuple[str, str, str]:
+        """(size_num_var, size_text_var, size_total_var) as this match's
+        rules name them."""
+        r = self.rules
+        return (str(r.get("size_num_var", "size_num")),
+                str(r.get("size_text_var", "size_text")),
+                str(r.get("size_total_var", "size_total")))
+
+    def sizes_on(self) -> bool:
+        return bool(self.rules.get("size_enabled", True))
+
+    def size_scale(self) -> List[Tuple[str, Optional[float]]]:
+        """The parsed size_categories (cached by the rule's text)."""
+        text = str(self.rules.get("size_categories", "") or "")
+        cache = getattr(self, "_size_scale_cache", None)
+        if cache is not None and cache[0] == text:
+            return cache[1]
+        try:
+            scale = parse_size_scale(text)
+        except VTTError:
+            scale = []
+        self._size_scale_cache = (text, scale)
+        return scale
+
+    def size_category_of(self, n: Any) -> Optional[str]:
+        """The category size number `n` falls in (None without a scale)."""
+        scale = self.size_scale()
+        if not scale or n is None:
+            return None
+        cat = scale[0][0]
+        for name, start in scale[1:]:
+            if n >= start:
+                cat = name
+        return cat
+
+    def size_rank_of(self, cat: str) -> Optional[int]:
+        for i, (name, _s) in enumerate(self.size_scale()):
+            if name == cat:
+                return i
+        return None
+
+    def _size_round(self, v: Any) -> Any:
+        if v is None:
+            return None
+        if self.rules.get("size_decimals", False):
+            return int(v) if float(v).is_integer() else float(v)
+        return int(math.floor(v))
+
+    def size_value_for_name(self, cat: str) -> Any:
+        """What writing category `cat` into size_num_var stores, per
+        size_name_write (refuse / lowest_size / average_size)."""
+        scale = self.size_scale()
+        idx = self.size_rank_of(cat)
+        if idx is None:
+            names = ", ".join(n for n, _s in scale) or "(none)"
+            raise VTTError(f"`{cat}` isn't a size category (the scale: "
+                           f"{names}).")
+        mode = str(self.rules.get("size_name_write", "lowest_size"))
+        if mode == "refuse":
+            raise VTTError("Write a size number: category names are "
+                           "refused here (size_name_write refuse).")
+        start = scale[idx][1]
+        nxt = scale[idx + 1][1] if idx + 1 < len(scale) else None
+        if idx == 0:
+            v = 1 if mode == "lowest_size" else (
+                nxt / 2 if nxt is not None else 1)
+        elif mode == "lowest_size" or nxt is None:
+            v = start
+        else:
+            v = (start + nxt) / 2
+        v = self._size_round(v)
+        if idx == 0 and nxt is not None and v >= nxt:
+            if not self.rules.get("size_allow_negative", False):
+                raise VTTError(
+                    f"`{cat}` holds only sizes below {nxt}, and "
+                    f"size_allow_negative is off: write a number.")
+            v = self._size_round(nxt - 1)
+        if v < 0 and not self.rules.get("size_allow_negative", False):
+            raise VTTError(f"`{cat}` would store {v}, a negative size "
+                           f"(size_allow_negative is off).")
+        return v
+
+    def checked_size_value(self, value: Any, where: str) -> Any:
+        """`value` ready to store in size_num_var: a finite number (floored
+        unless size_decimals), a category name converted per
+        size_name_write; a negative refused while size_allow_negative is
+        off."""
+        if isinstance(value, str):
+            txt = value.strip()
+            try:
+                value = float(txt)
+            except ValueError:
+                if not self.size_scale():
+                    raise VTTError(f"{where}: a size is a number (this "
+                                   f"system defines no size categories).")
+                value = self.size_value_for_name(txt)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value):
+            raise VTTError(f"{where}: a size is a number or a category "
+                           f"name, got {value!r}.")
+        value = self._size_round(value)
+        if value < 0 and not self.rules.get("size_allow_negative", False):
+            raise VTTError(f"{where}: {value} is a negative size "
+                           f"(size_allow_negative is off).")
+        return value
+
+    def _size_num(self, e: "Entity") -> Any:
+        v = e.vars.get(self.size_names()[0])
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v):
+            return None
+        return v
+
+    def _size_mode(self, root: "Entity") -> str:
+        m = root.vars.get("__size_total_mode")
+        if m in ("body", "sum", "max"):
+            return m
+        return str(self.rules.get("size_total_mode", "body"))
+
+    def _size_inherit(self, root: "Entity") -> bool:
+        v = root.vars.get("__size_parts_inherit")
+        if isinstance(v, bool):
+            return v
+        return bool(self.rules.get("size_parts_inherit", True))
+
+    def _root_own_size(self, root: "Entity") -> Any:
+        n = self._size_num(root)
+        if n is not None:
+            return n
+        try:
+            base = float(self.rules.get("size_default", 100))
+            per = float(self.rules.get("size_default_per_extra_tile", 0))
+        except (TypeError, ValueError):
+            base, per = 100.0, 0.0
+        w, h = self.entity_footprint(root)
+        return self._size_round(base + per * (w * h - 1))
+
+    def _size_subtree(self, root: "Entity",
+                      children: Optional[Dict[str, List["Entity"]]] = None
+                      ) -> List["Entity"]:
+        """`root`'s part subtree; from `children` (parent id -> parts, built
+        once by sync_all_sizes) when given, so a sweep over every body
+        costs one pass over the units."""
+        if children is None:
+            return self.entity_part_subtree(root.id)
+        out: List["Entity"] = []
+        seen = {root.id}
+        frontier = [root.id]
+        while frontier:
+            nxt: List[str] = []
+            for pid in frontier:
+                for child in children.get(pid, ()):
+                    if child.id not in seen:
+                        seen.add(child.id)
+                        out.append(child)
+                        nxt.append(child.id)
+            frontier = nxt
+        return out
+
+    def size_info(self, e: "Entity",
+                  children: Optional[Dict[str, List["Entity"]]] = None
+                  ) -> Dict[str, Any]:
+        """{own, total, category, root, mode, unsized}: `own` the unit's own
+        size (None for a part without one that inherits nothing), `total`
+        its body's total, `category` the total's category, `unsized` the
+        living parts holding no number (they add 0 under `sum`)."""
+        root = self.body_root(e)
+        mode = self._size_mode(root)
+        root_own = self._root_own_size(root)
+        members = [p for p in self._size_subtree(root, children)
+                   if p.is_alive]
+        nums = [(p, self._size_num(p)) for p in members]
+        total = root_own
+        if mode == "sum":
+            total = root_own + sum(n for _p, n in nums if n is not None)
+        elif mode == "max":
+            total = max([root_own] + [n for _p, n in nums if n is not None])
+        total = self._size_round(total)
+        if e is root:
+            own = root_own
+        else:
+            own = self._size_num(e)
+            if own is None and mode in ("body", "max") \
+                    and self._size_inherit(root):
+                own = root_own
+        return {"own": own, "total": total,
+                "category": self.size_category_of(total), "root": root,
+                "mode": mode,
+                "unsized": [p.id for p, n in nums if n is None]}
+
+    def sync_body_size(self, e: "Entity",
+                       children: Optional[Dict[str, List["Entity"]]] = None
+                       ) -> List[str]:
+        """Store the size total and category on `e`'s body root (and take
+        them off its parts) when they changed: write_var under
+        SIZE_DERIVING, so on_var_* hooks fire. With sizes off, take them
+        off every unit of the body. Returns the hook log and warnings."""
+        if e.id not in self.entities:
+            return []
+        root = self.body_root(e)
+        _num, text_v, total_v = self.size_names()
+        log: List[str] = []
+        tok = SIZE_DERIVING.set(True)
+        try:
+            for p in self._size_subtree(root, children):
+                for k in (text_v, total_v):
+                    if k in p.vars and p.id in self.entities:
+                        self._size_changes = getattr(
+                            self, "_size_changes", 0) + 1
+                        log += p.remove_var(k)
+            if root.id not in self.entities:
+                return log
+            if not self.sizes_on():
+                for k in (text_v, total_v):
+                    if k in root.vars and root.id in self.entities:
+                        self._size_changes = getattr(
+                            self, "_size_changes", 0) + 1
+                        log += root.remove_var(k)
+                return log
+            info = self.size_info(root, children)
+            if not same_value(root.vars.get(total_v), info["total"]):
+                self._size_changes = getattr(self, "_size_changes", 0) + 1
+                log += root.write_var(total_v, info["total"])
+            if root.id in self.entities:
+                cat = info["category"]
+                if cat is None:
+                    if text_v in root.vars:
+                        self._size_changes = getattr(
+                            self, "_size_changes", 0) + 1
+                        log += root.remove_var(text_v)
+                elif not same_value(root.vars.get(text_v), cat):
+                    self._size_changes = getattr(self, "_size_changes", 0) + 1
+                    log += root.write_var(text_v, cat)
+        finally:
+            SIZE_DERIVING.reset(tok)
+        # Parts that add 0 to a `sum` body: a warning when the set grows.
+        warned = getattr(self, "_size_unsized_warned", None)
+        if warned is None:
+            warned = self._size_unsized_warned = {}
+        unsized = (frozenset(info["unsized"]) if info["mode"] == "sum"
+                   else frozenset())
+        if unsized - warned.get(root.id, frozenset()):
+            log.append(self.unit_line(root.id, (
+                f"⚠️ `{root.id}`'s size is a sum; "
+                + ", ".join(f"`{u}`" for u in sorted(unsized))
+                + f" hold no {self.size_names()[0]} and add 0.")))
+        warned[root.id] = unsized
+        return log
+
+    def sync_all_sizes(self) -> List[str]:
+        """sync_body_size for every body, and the categories of corpses
+        re-read from their stored totals."""
+        log: List[str] = []
+        roots: List["Entity"] = []
+        children: Dict[str, List["Entity"]] = {}
+        for e in list(self.entities.values()):
+            if e.part_of and e.part_of in self.entities:
+                children.setdefault(e.part_of, []).append(e)
+            if self.body_root(e) is e:
+                roots.append(e)
+        for r in roots:
+            if r.id in self.entities:
+                # A hook a write fired may have moved parts: the index
+                # holds only while nothing changed.
+                before = getattr(self, "_size_changes", 0)
+                log += self.sync_body_size(r, children)
+                if getattr(self, "_size_changes", 0) != before:
+                    children = {}
+                    for u in self.entities.values():
+                        if u.part_of and u.part_of in self.entities:
+                            children.setdefault(u.part_of, []).append(u)
+        _num, text_v, total_v = self.size_names()
+        for _mp, _x, _y, _cid, c in self.every_corpse():
+            cv = _corpse_vars(c)
+            if not isinstance(cv, dict):
+                continue
+            before = (cv.get(text_v), cv.get(total_v))
+            # A corpse keeps the total it died with while sizes are off
+            # (nothing could derive it again); only its category follows
+            # the scale.
+            if self.sizes_on():
+                t = cv.get(total_v)
+                if isinstance(t, (int, float)) and not isinstance(t, bool):
+                    cat = self.size_category_of(t)
+                    if cat is None:
+                        cv.pop(text_v, None)
+                    else:
+                        cv[text_v] = cat
+            if not same_value(before, (cv.get(text_v), cv.get(total_v))):
+                self._size_changes = getattr(self, "_size_changes", 0) + 1
+        return log
+
+    def size_of_corpse(self, cid: str) -> Any:
+        """A corpse's stored total size (None without one)."""
+        found = self.find_corpse(cid)
+        if found is None:
+            return None
+        cv = _corpse_vars(found[2])
+        t = cv.get(self.size_names()[2]) if cv is not None else None
+        return t if isinstance(t, (int, float)) \
+            and not isinstance(t, bool) else None
 
     def maps_carried_by(self, eid: str) -> List["Map"]:
         """The maps unit `eid` carries (its inner maps), in map order."""
@@ -19440,7 +20041,7 @@ class Match:
                 self._rebase(value)
             out = self._dematerialize(value, notes)
             if unit_vars and TEMPLATE_MARKER in out:
-                for k in _ENGINE_STATE_VARS:
+                for k in _ENGINE_STATE_VARS + self.size_names()[1:]:
                     if k in value:
                         out[k] = copy.deepcopy(value[k])
             return out
@@ -19620,7 +20221,7 @@ class Match:
         equals the container's base (or, deleted, that the base lacks)
         leaves the lists — "back to the norm"; a listed parent leaves only
         when its whole subtree matches again."""
-        if TEMPLATE_TRACK_OFF.get():
+        if TEMPLATE_TRACK_OFF.get() or SIZE_DERIVING.get():
             return
         keys = path.split(".")
         cur: Any = e.vars
@@ -19774,13 +20375,15 @@ class Match:
             if path:
                 log += e.write_var(path, live)
             else:
+                derived = set(self.size_names()[1:])
                 keep = set(e.protected_var_names()) | set(_ENGINE_STATE_VARS)
                 keep |= set((self.rules.get("default_entity_vars") or {}))
+                keep |= derived
                 for k in [k for k in e.vars if k not in live
                           and k not in keep and k != TEMPLATE_MARKER]:
                     log += e.remove_var(k)
                 for k, v in live.items():
-                    if k == TEMPLATE_MARKER:
+                    if k == TEMPLATE_MARKER or k in derived:
                         continue
                     if e.id not in self.entities:
                         break
@@ -25680,7 +26283,8 @@ VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "atb_charge_var", "disguise_var", "fog_vision_radius_var",
                   "overlay_var", "map_vehicle_death_effect_var",
                   "map_vehicle_wreck_var", "mount_death_effect_var",
-                  "tags_var")
+                  "tags_var", "size_num_var", "size_text_var",
+                  "size_total_var")
 
 
 # Map-var-name rules: rule -> (the setting it names, the rule giving the
@@ -26746,6 +27350,11 @@ class MatchManager:
         if old and old.get("zone_status_grant_bodies") != m.rules.get(
                 "zone_status_grant_bodies"):
             m.surface_log(m.sync_zone_grants())
+        # A changed size rule re-derives every body's size total and
+        # category (#242), in every match on the system.
+        if old and any(not same_value(old.get(k), m.rules.get(k))
+                       for k in SIZE_RULES):
+            m.surface_log(m.sync_all_sizes())
         return notes
 
     def refresh_match_rules(self, system_name: str,
