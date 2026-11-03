@@ -861,6 +861,20 @@ EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
 # past the float range a size crashed the reads and the default's maths.
 SIZE_LIMIT = 10 ** 15
 
+# Unit history kept in a unit's saved dict (Entity.actions_used) that a
+# NEW unit made from it must not inherit: stripped with the identity keys
+# by templates, statblocks, summon snapshots, prefabs, clones and copies.
+UNIT_HISTORY_KEYS: Tuple[str, ...] = ("actions_used",)
+# At most this many recorded action paths per unit (each distinct path once).
+ACTIONS_USED_MAX = 1000
+
+# The sections of the entity description (`!ent info <id>`), each with an
+# entity_description_<section>_format rule (entity_description_sections
+# orders them).
+DESCRIPTION_SECTIONS: Tuple[str, ...] = (
+    "header", "vitals", "size", "statuses", "tags", "data", "actions",
+    "passives", "parts")
+
 RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # --- Vital variable names (what var keys map to HP / MaxHP / turn-order) ---
     "var_name_collision": {
@@ -2494,12 +2508,186 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
         "schema": {"type": "str"},
         "desc": (
-            "Multi-line template for the !ent info card. Same syntax as "
+            "Multi-line template for the short unit card, `!ent info <id> "
+            "short` (plain `!ent info` prints the description, the "
+            "entity_description_* rules). Same syntax as "
             "entity_line_format. Use \\n for newlines. `{tags}` lists the "
             "unit's tags, `{tags_sourced}` the same with where each came from "
             "(a status, a container path, its team, its root, `engine`). For "
             "complete raw info regardless of template, use !ent dump."
         ),
+    },
+    # ---- the entity description (`!ent info <id>`) ----
+    # Three tiers of reading a unit: the info line (entity_line_format in
+    # !list / !state, entity_info_format in `!ent info <id> short`), the
+    # description below (player-facing: size, readable vars, actions), and
+    # `!ent dump` (the raw data, host-only).
+    "entity_description_sections": {
+        "default": ("header, vitals, size, statuses, tags, data, actions, "
+                    "passives, parts"),
+        "schema": {"type": "str", "word_list": list(DESCRIPTION_SECTIONS)},
+        "desc": (
+            "The sections `!ent info <id>` prints, in this order: "
+            + ", ".join(DESCRIPTION_SECTIONS) + ". Each has its own "
+            "entity_description_<section>_format rule; a section with "
+            "nothing to show (no statuses, sizes off, no readable vars) is "
+            "left out. Drop a word to drop the section."
+        ),
+    },
+    "entity_description_header_format": {
+        "default": "**{name}** (`{id}`){?description?}\\n*{description}*{/?}",
+        "schema": {"type": "str"},
+        "desc": (
+            "The description's first section. Same syntax and placeholders "
+            "as entity_info_format; `{description}` is the unit's "
+            "`description` var (a disguise's own under a disguise)."
+        ),
+    },
+    "entity_description_vitals_format": {
+        "default": (
+            "HP: {hp}/{max_hp}   Position: ({x},{y}){?map_shown?} on "
+            "{map_shown}{/?} facing {facing}{?team?}   Team: {team}{/?}"
+        ),
+        "schema": {"type": "str"},
+        "desc": "The description's vitals section (entity_info_format's "
+                "placeholders).",
+    },
+    "entity_description_size_format": {
+        "default": "Size: {size}{?size_class?} ({size_class}){/?}",
+        "schema": {"type": "str"},
+        "desc": "The description's size section: `{size}` is the body's "
+                "total, `{size_class}` its category (left out while "
+                "size_enabled is off).",
+    },
+    "entity_description_statuses_format": {
+        "default": "**Statuses**\\n{items}",
+        "schema": {"type": "str"},
+        "desc": "The description's status section; `{items}` is one "
+                "entity_description_status_format line per status.",
+    },
+    "entity_description_status_format": {
+        "default": (
+            "- {name}{?level?} (level {level}){/?}{?duration?}, {duration} "
+            "turns left{/?}{?description?}: {description}{/?}"
+        ),
+        "schema": {"type": "str"},
+        "desc": (
+            "One status in the description. Placeholders: `{name}` and the "
+            "instance's fields (level, duration, its data; the definition's "
+            "level entries at its level fill fields the instance lacks), so "
+            "a `description` in the definition's data shows here. A "
+            "permanent status has no duration."
+        ),
+    },
+    "entity_description_tags_format": {
+        "default": "Tags: {tags}",
+        "schema": {"type": "str"},
+        "desc": "The description's tag section: `{tags}`, or "
+                "`{tags_sourced}` with where each tag came from.",
+    },
+    "entity_description_data_format": {
+        "default": "**Details**\\n{items}",
+        "schema": {"type": "str"},
+        "desc": (
+            "The description's section of readable vars; `{items}` is the "
+            "vars as an indented list. Which vars show: "
+            "entity_description_shown_vars and "
+            "entity_description_hidden_vars; `__` keys and action "
+            "dicts never show (actions have their own section). A dict "
+            "with a `description` text shows it after its key."
+        ),
+    },
+    "entity_description_shown_vars": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "A whitelist for the description's data section: comma-"
+            "separated var paths (`stats, inventory, gear.armor`); only "
+            "these and what lies under them show. Empty (the default) = "
+            "every var. entity_description_hidden_vars still applies "
+            "inside them."
+        ),
+    },
+    "entity_description_hidden_vars": {
+        "default": ("@engine, description, slots, modifiers, overlays, "
+                    "*.watchers, *.modifiers, *.action_tags, "
+                    "*.exclude_inherited_action_tags, *.inner_tags, "
+                    "*.exclude_inherited_tags, *.glyph, *.glyphs, *.color, "
+                    "*.sprite, *.sprites, *.sprite_mirror, *.sprite_layer, "
+                    "*.legend, *.allowed_slots"),
+        "schema": {"type": "str"},
+        "desc": (
+            "A blacklist for the description's data section, comma-"
+            "separated: a var path (`stats.secret_dc`) hides it and what "
+            "lies under it; `*.<key>` hides that key at any depth; "
+            "`@engine` hides every var a var-name rule names (hp, max_hp, "
+            "initiative, team, tags, the footprint, the size vars, ...: "
+            "the vitals, size and tag sections show those). `__` keys never "
+            "show."
+        ),
+    },
+    "entity_description_line_limit": {
+        "default": 60,
+        "schema": {"type": "int", "min": 1, "max": 1000},
+        "desc": (
+            "The most lines the description's data section prints; the "
+            "rest are counted in a last line."
+        ),
+    },
+    "entity_description_actions_format": {
+        "default": "**Actions**\\n{items}",
+        "schema": {"type": "str"},
+        "desc": "The description's action section; `{items}` is one "
+                "entity_description_action_format line per action the "
+                "viewer may see (entity_description_action_visibility).",
+    },
+    "entity_description_action_format": {
+        "default": (
+            "- **{name}**{?target?} (target: {target}){/?}"
+            "{?description?}: {description}{/?}"
+            "{?forbidden?} (can't use now: {forbidden}){/?}"
+        ),
+        "schema": {"type": "str"},
+        "desc": (
+            "One action in the description. Placeholders: `{name}`, "
+            "`{target}` (the target type; empty for none), `{description}`, "
+            "`{tags}`, `{path}` (where it lives in the vars), `{forbidden}` "
+            "(what forbids the unit using it now, #234) and `{via}` (the "
+            "vehicle, for an action a rider has through its seat)."
+        ),
+    },
+    "entity_description_action_visibility": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "allies", "used"]},
+        "desc": (
+            "Which units' actions a channel with a team view (`!match bind "
+            "pov=`) sees, in the description and in `!action list` / "
+            "`!action info`: 'all' every unit's; 'allies' only its own "
+            "team's units' (others list none); 'used' its own team's units' "
+            "all, other units' only the actions they have used during this "
+            "match (a successful use; a unit copied or transferred in "
+            "starts with none). A channel without a team view sees every "
+            "action."
+        ),
+    },
+    "entity_description_passives_format": {
+        "default": "Passives: {passives_csv}",
+        "schema": {"type": "str"},
+        "desc": "The description's passive section (left out without "
+                "passives, and under a disguise).",
+    },
+    "entity_description_parts_format": {
+        "default": "**Parts**\\n{items}",
+        "schema": {"type": "str"},
+        "desc": "The description's body-part section; `{items}` is one "
+                "entity_description_part_format line per part the viewer "
+                "can see (left out under a disguise).",
+    },
+    "entity_description_part_format": {
+        "default": "- {name} (`{id}`): HP {hp}/{max_hp}",
+        "schema": {"type": "str"},
+        "desc": "One body part in the description (the part's "
+                "entity_info_format placeholders).",
     },
     ## Var-hook system rules
     "var_hook_recursion_limit": {
@@ -7775,6 +7963,15 @@ class Entity:
     # names. Protected (not a var), saved with the unit and its templates.
     var_names: Dict[str, str] = field(default_factory=dict)
 
+    # The vars paths of the actions this unit has used successfully in this
+    # match, in order of first use (entity_description_action_visibility
+    # `used`). Recorded on the unit HOLDING the action (a vehicle for a
+    # rider's seat action) by run_action. Unit history, never identity:
+    # templates, statblocks, summon snapshots, prefabs, clones and copies /
+    # transfers into another match start without it (UNIT_HISTORY_KEYS); a
+    # corpse keeps it, so a revive does too.
+    actions_used: List[str] = field(default_factory=list)
+
     #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
 
@@ -9154,6 +9351,9 @@ class Entity:
             "mounted_on": self.mounted_on,
             "mount_slot": self.mount_slot,
             "var_names": dict(self.var_names),
+            # Only when there is any: a unit that never acted saves as before.
+            **({"actions_used": list(self.actions_used)}
+               if self.actions_used else {}),
         }
 
     @staticmethod
@@ -9174,6 +9374,9 @@ class Entity:
             mounted_on=data.get("mounted_on", None),
             mount_slot=data.get("mount_slot", None),
             var_names=checked_var_names(data.get("var_names")),
+            actions_used=[str(p) for p in (data.get("actions_used") or [])
+                          if isinstance(p, str)][:ACTIONS_USED_MAX]
+            if isinstance(data.get("actions_used"), list) else [],
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
@@ -20734,7 +20937,7 @@ class Match:
         # A dict naming a parent / vehicle (an old snapshot, a hand-built
         # one) must not attach the new unit to it: parts come through the
         # `parts` key, mounting through mount().
-        for k in ("part_of", "mounted_on", "mount_slot"):
+        for k in ("part_of", "mounted_on", "mount_slot") + UNIT_HISTORY_KEYS:
             d.pop(k, None)
         d["map"] = mp.name
         if "vars" in d and not isinstance(d.get("vars"), dict):
@@ -22201,7 +22404,8 @@ class Match:
         a transform). The returned dict doubles as a transform template, an
         entity_snapshot and a summon template."""
         d = e.to_dict()
-        for k in ("id", "x", "y", "map", "part_of", "mounted_on", "mount_slot"):
+        for k in ("id", "x", "y", "map", "part_of", "mounted_on",
+                  "mount_slot") + UNIT_HISTORY_KEYS:
             d.pop(k, None)
         d["status"] = without_zone_grants(d.get("status"))
         ax, ay = e.x, e.y
@@ -22224,7 +22428,8 @@ class Match:
             # A part stands on its parent's map, wherever that is then, at
             # its offset from the parent's anchor.
             p = {k: v for k, v in part.to_dict().items()
-                 if k not in ("map", "mounted_on", "mount_slot")}
+                 if k not in ("map", "mounted_on", "mount_slot")
+                 + UNIT_HISTORY_KEYS}
             p["status"] = without_zone_grants(p.get("status"))
             p["id"] = local(p.get("id"))
             p["part_of"] = local(p.get("part_of"))
@@ -23916,6 +24121,35 @@ class Match:
         if isinstance(tc, str) and tc in TEXT_COLORS:
             return tc
         return str(team) if str(team) in TEXT_COLORS else None
+
+    def body_team(self, e: "Entity") -> Optional[str]:
+        """The team of `e`'s body root (a body part's is its root's), as
+        text, or None."""
+        root, seen = e, set()
+        while root.part_of and root.part_of in self.entities \
+                and root.id not in seen:
+            seen.add(root.id)
+            root = self.entities[root.part_of]
+        return None if root.team is None else str(root.team)
+
+    def action_visible(self, e: "Entity", path: str,
+                       pov_team: Optional[str],
+                       holder: Optional["Entity"] = None) -> bool:
+        """Whether a viewer on team `pov_team` may see the action at `path`
+        that `e` has (held by `holder`, default `e`; a vehicle for a seat
+        action), per entity_description_action_visibility: everyone sees
+        every action under 'all' and without a team view; the viewer's own
+        team's units always show theirs; otherwise 'allies' shows none and
+        'used' those the holder has used in this match."""
+        if pov_team is None:
+            return True
+        mode = str(self.rules.get("entity_description_action_visibility",
+                                  "all"))
+        if mode == "all" or self.body_team(e) == str(pov_team):
+            return True
+        if mode == "used":
+            return path in (holder or e).actions_used
+        return False
 
     def presented_vars(self, e: "Entity",
                        pov_team: Optional[str] = None) -> Dict[str, Any]:
@@ -26073,6 +26307,8 @@ def check_template(data: Any, name: str,
     dropped = [k for k in _TEMPLATE_IDENTITY_KEYS if k in d]
     for k in dropped:
         d.pop(k)
+    for k in UNIT_HISTORY_KEYS:
+        d.pop(k, None)
     if dropped:
         notes.append(f"Dropped {', '.join(f'`{k}`' for k in dropped)}: a "
                      f"template carries no identity or position (its name is "
@@ -27490,7 +27726,9 @@ class MatchManager:
         into `dest`, anchored at (tx, ty) of its map `dmap`."""
         for oid in order:
             oe = src.entities[oid]
-            ne = Entity.from_dict(dict(oe.to_dict(), id=idmap[oid]))
+            # A unit arriving in another match has used nothing there.
+            ne = Entity.from_dict(dict(oe.to_dict(), id=idmap[oid],
+                                       actions_used=[]))
             # Mount linkage does NOT survive a cross-match copy/transfer: the
             # vehicle lives in the SOURCE match (transferring a vehicle ejects
             # its riders, so the pair can't travel together). Carrying a stale

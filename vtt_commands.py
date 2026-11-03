@@ -2497,37 +2497,43 @@ def _entity_template_context(e: Entity,
         info = e._match.size_info(e)
         ctx["size"] = info["total"]
         ctx["size_class"] = info["category"] or ""
+    dis = (e._match._effective_disguise(e, pov_team)
+           if pov_team is not None and e._match is not None else None)
     # Merge vars — vars win for keys NOT already in the well-known set above.
     # (So a user's `hp` var won't override the computed alias, since `hp` is in ctx.)
-    for k, v in e.vars.items():
-        if k not in ctx:
-            ctx[k] = v
+    # A disguised unit shows only its disguise's vars to a fooled viewer:
+    # `{inventory}` read the real one under any disguise. Its passives
+    # stay hidden too.
+    if dis is None:
+        for k, v in e.vars.items():
+            if k not in ctx:
+                ctx[k] = v
+    else:
+        ctx["passives_csv"] = ""
     # Disguise overlay (116): a non-allied viewer sees the fake name + vars.
     # The disguise's vars win over EVERYTHING (incl. the computed hp/max_hp/
     # team) — that's the point of a fake statblock.
-    if pov_team is not None and e._match is not None:
-        dis = e._match._effective_disguise(e, pov_team)
-        if dis is not None:
-            n = e._match.entity_display_name(e, pov_team)
-            if isinstance(n, str) and n:
-                ctx["name"] = n
-            dvars = dis.get("vars")
-            if isinstance(dvars, dict):
-                for k, v in dvars.items():
-                    ctx[k] = v
-                # The fixed placeholders follow the decoy of the var behind
-                # them, whatever the var-name rules call it.
-                _sn, size_t, size_n = e._match.size_names()
-                for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
-                                   ("initiative", init_var),
-                                   ("team", e._team_var_name())):
-                    if var in dvars:
-                        ctx[alias] = dvars[var]
-                # The size pair as the disguise presents it (V16).
-                if size_n in dvars or size_t in dvars:
-                    pv = e._match.presented_vars(e, pov_team)
-                    ctx["size"] = pv.get(size_n, "")
-                    ctx["size_class"] = pv.get(size_t, "")
+    if dis is not None:
+        n = e._match.entity_display_name(e, pov_team)
+        if isinstance(n, str) and n:
+            ctx["name"] = n
+        dvars = dis.get("vars")
+        if isinstance(dvars, dict):
+            for k, v in dvars.items():
+                ctx[k] = v
+            # The fixed placeholders follow the decoy of the var behind
+            # them, whatever the var-name rules call it.
+            _sn, size_t, size_n = e._match.size_names()
+            for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
+                               ("initiative", init_var),
+                               ("team", e._team_var_name())):
+                if var in dvars:
+                    ctx[alias] = dvars[var]
+            # The size pair as the disguise presents it (V16).
+            if size_n in dvars or size_t in dvars:
+                pv = e._match.presented_vars(e, pov_team)
+                ctx["size"] = pv.get(size_n, "")
+                ctx["size_class"] = pv.get(size_t, "")
     # The unit's full tag set (own, granted, engine), as the viewer's
     # disguise presents it; `tags_sourced` names where each came from.
     if e._match is not None:
@@ -2595,6 +2601,288 @@ def _entity_card(e: Entity, pov_team: Optional[str] = None) -> str:
     if not tmpl:
         tmpl = DEFAULT_SYSTEM_SETTINGS.get("entity_info_format", "")
     return _render_template(tmpl, _entity_template_context(e, pov_team))
+
+
+# ---- the entity description (`!ent info <id>`) ----------------------------
+# Tier 2 of reading a unit, between the short card (entity_info_format,
+# `!ent info <id> short`) and `!ent dump`: a player-facing description in the
+# sections entity_description_sections lists, each rendered by its
+# entity_description_<section>_format rule.
+
+def _description_rule(m: Match, key: str) -> str:
+    v = m.rules.get(key)
+    if not isinstance(v, str):
+        v = DEFAULT_SYSTEM_SETTINGS.get(key, "")
+    return v
+
+
+def _description_paths(text: Any) -> List[str]:
+    """A comma / space separated list of var paths from a rule."""
+    return [w for w in _re.split(r"[\s,]+", str(text or "")) if w]
+
+
+def _description_vars(m: Match, e: Entity, vars_: Dict[str, Any],
+                      engine_vars: bool) -> Dict[str, Any]:
+    """The vars the description's data section shows: `vars_` without `__`
+    keys, action dicts and what entity_description_hidden_vars hides, and
+    only what entity_description_shown_vars names when it names anything.
+    `engine_vars`: the `@engine` word applies (a real unit's vars; a
+    disguise's decoys go through it too)."""
+    shown = _description_paths(m.rules.get("entity_description_shown_vars"))
+    hidden_words = _description_paths(
+        m.rules.get("entity_description_hidden_vars"))
+    hidden_paths = {w for w in hidden_words
+                    if not w.startswith("*.") and w != "@engine"}
+    hidden_keys = {w[2:] for w in hidden_words if w.startswith("*.")}
+    engine: Set[str] = set()
+    if "@engine" in hidden_words and engine_vars:
+        for rule in VAR_NAME_RULES:
+            name = e.var_names.get(rule) or m.rules.get(rule)
+            if isinstance(name, str) and name:
+                engine.add(name)
+
+    def wanted(path: str) -> Tuple[bool, bool]:
+        """(show it, everything under it shows) per the whitelist."""
+        if not shown:
+            return True, True
+        for w in shown:
+            if path == w or path.startswith(w + "."):
+                return True, True
+        return any(w.startswith(path + ".") for w in shown), False
+
+    def walk(node: Dict[str, Any], at: str, inside: bool) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            key = str(k)
+            path = f"{at}.{key}" if at else key
+            if key.startswith("__") or key == "actions" \
+                    or key in hidden_keys or path in hidden_paths \
+                    or (not at and key in engine):
+                continue
+            under = inside
+            if not inside:
+                ok, under = wanted(path)
+                if not ok:
+                    continue
+            if isinstance(v, dict):
+                sub = walk(v, path, under)
+                if not sub:
+                    continue
+                out[key] = sub
+            elif under:
+                out[key] = v
+        return out
+    return walk(vars_, "", False)
+
+
+def _description_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _description_tree(node: Dict[str, Any], depth: int,
+                      out: List[str]) -> None:
+    """`node` as an indented bullet list: `key: value`; a dict of plain
+    values on one line (`stats: str 5, dex 3`); a dict's `description` text
+    after its key; lists of plain values joined with `, `."""
+    pad = "  " * depth + "- "
+    for k, v in node.items():
+        if isinstance(v, dict):
+            desc = v.get("description")
+            desc = desc if isinstance(desc, str) and desc else None
+            rest = {kk: vv for kk, vv in v.items()
+                    if not (kk == "description" and desc is not None)}
+            plain = all(not isinstance(x, (dict, list)) for x in rest.values())
+            if plain and len(rest) <= 6:
+                inner = ", ".join(f"{kk} {_description_value(vv)}"
+                                  for kk, vv in rest.items() if vv is not None)
+                if desc and inner:
+                    out.append(f"{pad}{k}: {desc} ({inner})")
+                else:
+                    out.append(f"{pad}{k}: {desc or inner}")
+                continue
+            out.append(f"{pad}{k}" + (f": {desc}" if desc else ""))
+            _description_tree(rest, depth + 1, out)
+        elif isinstance(v, list):
+            items = [x for x in v if x is not None]
+            if not items:
+                continue
+            if all(not isinstance(x, (dict, list)) for x in items):
+                out.append(f"{pad}{k}: "
+                           + ", ".join(_description_value(x) for x in items))
+                continue
+            out.append(f"{pad}{k}")
+            for i, x in enumerate(items, start=1):
+                if isinstance(x, dict):
+                    _description_tree({str(i): x}, depth + 1, out)
+                elif isinstance(x, list):
+                    out.append("  " * (depth + 1) + "- "
+                               + ", ".join(_description_value(y) for y in x))
+                else:
+                    out.append("  " * (depth + 1) + "- "
+                               + _description_value(x))
+        elif v is not None and v != "":
+            out.append(f"{pad}{k}: {_description_value(v)}")
+
+
+def _visible_actions(m: Match, e: Entity,
+                     pov: Optional[str]) -> Dict[str, List[Any]]:
+    """The actions of `e` (its own, without a seat's) a viewer on `pov`
+    may see, as discover_actions gives them: under a disguise the decoy
+    actions in its `vars`, else those entity_description_action_visibility
+    lets the view see (every one without a team view)."""
+    from types import SimpleNamespace
+    from action import discover_actions
+    dis = m._effective_disguise(e, pov) if pov is not None else None
+    if dis is not None:
+        dvars = dis.get("vars")
+        src: Any = SimpleNamespace(id=None, vars=dvars if isinstance(
+            dvars, dict) else {})
+    else:
+        src = e
+    out: Dict[str, List[Any]] = {}
+    for name, acts in discover_actions(src, m.rules).items():
+        keep = [a for a in acts if m.action_visible(e, a.full_path, pov)]
+        if keep:
+            out[name] = keep
+    return out
+
+
+def _description_actions(m: Match, e: Entity, pov: Optional[str],
+                         dis: Optional[Dict[str, Any]]) -> List[str]:
+    """One entity_description_action_format line per action the viewer may
+    see: the unit's own and, for a rider, those its seat gives it; a
+    disguise's decoy actions under a disguise."""
+    from action import discover_mount_actions
+    fmt = _description_rule(m, "entity_description_action_format")
+    rows: List[Tuple[Any, Optional[Entity], str]] = []
+    found = _visible_actions(m, e, pov)
+    for name in sorted(found):
+        for act in found[name]:
+            rows.append((act, None if dis is not None else e, ""))
+    if dis is None:
+        if e.is_mounted:
+            veh = m.entities.get(e.mounted_on)
+            for name, acts in sorted(
+                    discover_mount_actions(e, m, m.rules).items()):
+                for act in acts:
+                    rows.append((act, veh, e.mounted_on or ""))
+    lines = []
+    for act, holder, via in rows:
+        if via and not m.action_visible(e, act.full_path, pov, holder):
+            continue
+        forbid = (_action_forbid_note(m, e.id, act, via or None)
+                  if holder is not None else "")
+        actx = {
+            "name": act.name,
+            "target": "" if act.target_type == "none" else act.target_type,
+            "description": act.description,
+            "tags": ", ".join(act.tags),
+            "path": act.full_path,
+            "forbidden": forbid,
+            "via": via,
+        }
+        lines.append(_render_template(fmt, actx))
+    return lines
+
+
+def _description_statuses(m: Match, status: Dict[str, Any]) -> List[str]:
+    """One entity_description_status_format line per status (its fields and
+    its definition's level entries at its level as placeholders)."""
+    fmt = _description_rule(m, "entity_description_status_format")
+    lines = []
+    for name in sorted(status, key=str):
+        inst = status[name]
+        sctx: Dict[str, Any] = dict(inst) if isinstance(inst, dict) else {}
+        if isinstance(inst, dict):
+            sctx = merge_layer(m.status_level_data(name,
+                                                   m.status_level(inst))[0],
+                               sctx)
+        sctx = _hide_formula_fields(sctx)
+        sctx["name"] = name
+        lines.append(_render_template(fmt, sctx))
+    return lines
+
+
+def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
+    """The description of `e` (`!ent info <id>`) as a viewer on `pov_team`
+    sees it (None = every unit's whole truth): the sections
+    entity_description_sections lists, a section with nothing to show left
+    out. A disguise presents its own name, statuses, vars and actions to a
+    fooled viewer, and no passives or parts."""
+    m = e._match
+    assert m is not None
+    dis = m._effective_disguise(e, pov_team) if pov_team is not None else None
+    ctx = _entity_template_context(e, pov_team)
+    if dis is None:
+        own = e.vars.get("description")
+    else:
+        dv = dis.get("vars")
+        own = dv.get("description") if isinstance(dv, dict) else None
+    ctx["description"] = own if isinstance(own, str) else ""
+    sections = _description_paths(m.rules.get("entity_description_sections"))
+    out: List[str] = []
+
+    def fmt(sec: str) -> str:
+        return _description_rule(m, f"entity_description_{sec}_format")
+
+    for sec in sections:
+        text = ""
+        if sec in ("header", "vitals"):
+            text = _render_template(fmt(sec), ctx)
+        elif sec == "size":
+            if m.sizes_on() and ctx.get("size") not in (None, ""):
+                text = _render_template(fmt(sec), ctx)
+        elif sec == "tags":
+            if ctx.get("tags"):
+                text = _render_template(fmt(sec), ctx)
+        elif sec == "passives":
+            if ctx.get("passives_csv"):
+                text = _render_template(fmt(sec), ctx)
+        elif sec == "statuses":
+            status = (m.presented_statuses(e, pov_team)
+                      if pov_team is not None else e.status)
+            items = _description_statuses(m, status)
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        elif sec == "data":
+            if dis is None:
+                src = e.vars
+            else:
+                dv = dis.get("vars")
+                src = dv if isinstance(dv, dict) else {}
+            tree = _hide_formula_fields(_description_vars(m, e, src, True))
+            lines: List[str] = []
+            _description_tree(tree, 0, lines)
+            if lines:
+                cap = int(m.rules.get("entity_description_line_limit", 60))
+                if len(lines) > cap:
+                    lines = lines[:cap] + [
+                        f"... ({len(lines) - cap} more lines)"]
+                text = _render_template(fmt(sec),
+                                        {"items": "\n".join(lines)})
+        elif sec == "actions":
+            items = _description_actions(m, e, pov_team, dis)
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        elif sec == "parts":
+            if dis is None:
+                pfmt = _description_rule(m, "entity_description_part_format")
+                items = [_render_template(pfmt,
+                                          _entity_template_context(p, pov_team))
+                         for p in sorted(m.entities.values(),
+                                         key=lambda u: u.id)
+                         if p.part_of == e.id
+                         and not _pov_hides(m, pov_team, p.id)]
+                if items:
+                    text = _render_template(fmt(sec),
+                                            {"items": "\n".join(items)})
+        if text.strip():
+            out.append(text.rstrip("\n"))
+    return "\n".join(out) if out else f"`{e.id}`"
 
 
 def _corpse_template_context(
@@ -2738,6 +3026,9 @@ def _entity_dump(e: Entity) -> str:
         for bp in body:
             role = bp.vars.get(name_var, "?")
             parts.append(f"- `{bp.id}` ({role}): {_part_status_str(m, bp)}")
+    if e.actions_used:
+        parts.append("**actions used:** " + ", ".join(
+            f"`{p}`" for p in e.actions_used))
     return "\n".join(parts)
 
 
@@ -10848,12 +11139,19 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg += "\n" + "\n".join(spawn_log)
         return await ctx.send(msg)
 
-    # --- info (entity card per entity_info_format rule) ---
+    # --- info: the description, or `short` the card (entity_info_format) ---
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
+        if len(args) > 2 and (len(args) > 3 or args[2].lower() != "short"):
+            raise VTTError(f"Unexpected `{' '.join(args[2:])}` — usage: "
+                           f"`!ent info <id> [short]`.")
         eid = _query_eid(ctx, m, args[1])
-        return await ctx.send(_entity_card(m.entities[eid], _query_pov(ctx, m)))
+        if len(args) > 2:
+            return await ctx.send(_entity_card(m.entities[eid],
+                                               _query_pov(ctx, m)))
+        return await ctx.send(_entity_description(m.entities[eid],
+                                                  _query_pov(ctx, m)))
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -11542,6 +11840,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     # Strip / remap relational fields.
                     payload.pop("mounted_on", None)
                     payload.pop("mount_slot", None)
+                    payload.pop("actions_used", None)   # a new unit
                     if oid == src_id:
                         payload.pop("part_of", None)  # root clone is standalone
                     elif payload.get("part_of") in idmap:
@@ -11952,9 +12251,14 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "info",
-    usage="!ent info <id>",
-    desc=("Show an entity card per the game system's entity_info_format rule. "
-          "For complete raw state regardless of template, use !ent dump."),
+    usage="!ent info <id> [short]",
+    desc=("Describe a unit for players: its vitals, size, statuses, tags, "
+          "readable vars, actions, passives and parts, per the "
+          "entity_description_* rules (`!help find entity_description`). "
+          "`short` shows the short card (the entity_info_format rule), the "
+          "unit's state at a glance. A disguise presents its own statblock "
+          "to a fooled viewer. For everything stored on the unit, raw, use "
+          "!ent dump (hosts)."),
 )
 registry.annotate_sub(
     "ent", "dump",
@@ -14374,8 +14678,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             # !action handler uses, so a `!find action:slice` query
             # answer is consistent with "will `!action <eid> slice`
             # find anything?".
-            from action import discover_actions, lookup_action
-            actions = discover_actions(e, m.rules)
+            # Under a team view only the actions that view may see
+            # (entity_description_action_visibility; a disguise's decoys).
+            from action import lookup_action
+            actions = _visible_actions(m, e, pov)
             if not lookup_action(actions, key, m.rules):
                 return False
             continue
@@ -24310,16 +24616,35 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
     appears in multiple containers), and the GM's description if any.
     Empty entries hint at the available subcommands so a confused
     user sees a way forward."""
-    from action import discover_actions, discover_mount_actions
+    from action import discover_mount_actions
     actor = m.entities[actor_id]
-    actions = discover_actions(actor, m.rules)
-    mount_actions = discover_mount_actions(actor, m, m.rules) \
-        if actor.is_mounted else {}
-    bad = _textless_bodies(actor.vars)
+    pov = _query_pov(ctx, m)
+    # A team view sees what entity_description_action_visibility lets it
+    # (a disguise's decoys under a disguise); `limited` = it may not see
+    # them all, so the replies don't tell "none" from "none you can see".
+    disguised = (pov is not None
+                 and m._effective_disguise(actor, pov) is not None)
+    limited = disguised or (
+        pov is not None and m.body_team(actor) != str(pov)
+        and str(m.rules.get("entity_description_action_visibility",
+                            "all")) != "all")
+    actions = _visible_actions(m, actor, pov)
+    mount_actions: Dict[str, List[Any]] = {}
+    if actor.is_mounted and not disguised:
+        veh = m.entities.get(actor.mounted_on or "")
+        for name, acts in discover_mount_actions(actor, m, m.rules).items():
+            keep = [a for a in acts
+                    if m.action_visible(actor, a.full_path, pov, veh)]
+            if keep:
+                mount_actions[name] = keep
+    bad = [] if limited else _textless_bodies(actor.vars)
     notes = [f"⚠️ `{p}` isn't an action: its body is "
              f"{type(v).__name__}, not formula text."
              for p, v in bad]
     if not actions and not mount_actions:
+        if limited:
+            return await ctx.send(f"No actions of `{actor_id}` that this "
+                                  f"channel's view can see.")
         return await ctx.send("\n".join(
             [f"No actions discoverable on `{actor_id}`. Add one by "
              f"setting `<container>.actions.<name>.body` (and "
@@ -24333,7 +24658,8 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
             container = act.container_path or "(entity root)"
             desc = f" — {act.description}" if act.description else ""
             tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
-            forbid = _action_forbid_note(m, actor_id, act)
+            forbid = "" if disguised else _action_forbid_note(m, actor_id,
+                                                              act)
             lines.append(
                 f"- `{act.name}` (target: `{act.target_type}`, at "
                 f"`{container}`{tags}){desc}"
@@ -24409,9 +24735,13 @@ async def _action_info(
     """!action info <eid> <name>: full detail for one action,
     including the body source. Accepts either a bare name (with
     disambiguation menu on collision) or a full vars path."""
-    from action import discover_actions, lookup_action
+    from action import lookup_action
     actor = m.entities[actor_id]
-    actions = discover_actions(actor, m.rules)
+    pov = _query_pov(ctx, m)
+    disguised = (pov is not None
+                 and m._effective_disguise(actor, pov) is not None)
+    # Only what the view may see (entity_description_action_visibility).
+    actions = _visible_actions(m, actor, pov)
     # Full-path first (matches the !action invocation precedence).
     matches: List[Any] = []
     for act_list in actions.values():
@@ -24456,7 +24786,7 @@ async def _action_info(
                      if isinstance(filt, list) else f"`{filt}`")
             lines.append(f"{label} {shown}")
     lines += [f"⚠️ {p}" for p in act.tag_problems]
-    forbid = _action_forbid_note(m, actor_id, act)
+    forbid = "" if disguised else _action_forbid_note(m, actor_id, act)
     if forbid:
         lines.append(f"Forbidden:   {forbid}")
     lines += [

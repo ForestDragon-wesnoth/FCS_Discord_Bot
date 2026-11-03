@@ -173,6 +173,8 @@ def capture_prefab(mgr: Any, m: Match, mp: Map, x1: int, y1: int, x2: int,
                 for u in tree:
                     d = u.to_dict()
                     d.pop("map", None)
+                    for k in logic.UNIT_HISTORY_KEYS:
+                        d.pop(k, None)
                     # A zone's grants come back from the zone (#136).
                     d["status"] = logic.without_zone_grants(d.get("status"))
                     d["x"] = int(d.get("x", u.x)) - xa

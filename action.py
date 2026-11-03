@@ -52,6 +52,7 @@ import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, normalize_tags,
+                   ACTIONS_USED_MAX,
                    check_tag_filter, tag_filter_matches, tag_filter_empty,
                    RULES_REGISTRY)
 
@@ -338,6 +339,10 @@ class Action:
     # parse is kept as written and refuses every target, naming the error.
     target_requires_tags: Any = None
     target_refuses_tags: Any = None
+    # The unit whose vars hold the action (set by discover_actions; a
+    # vehicle for a rider's seat action). run_action records a successful
+    # use on it (Entity.actions_used).
+    holder: Optional[str] = None
 
     @staticmethod
     def from_dict(
@@ -557,9 +562,12 @@ def discover_actions(
     # subdicts at any depth. Note that the walker descends INTO each
     # container but skips the `actions` key when it finds one (no
     # actions-within-actions).
+    # The disguise var holds a decoy statblock (its `vars.actions` are what
+    # a fooled viewer is shown), never the unit's own actions.
+    disguise = str(rules.get("disguise_var", "disguise"))
     for top_key, top_val in entity.vars.items():
-        if top_key == ACTIONS_KEY:
-            continue  # already handled above
+        if top_key == ACTIONS_KEY or top_key == disguise:
+            continue  # already handled above / a decoy
         if not _top_container_allowed(top_key, rules):
             continue
         if not isinstance(top_val, dict):
@@ -568,6 +576,10 @@ def discover_actions(
             top_val, base_path=top_key, out=out,
             chain=root_chain, problems=problems,
         )
+    holder = getattr(entity, "id", None)
+    for acts in out.values():
+        for act in acts:
+            act.holder = holder
     return out
 
 
@@ -1580,6 +1592,14 @@ async def run_action(
             match._choice_answers = []
             match._choice_cursor = 0
 
+    # Successful completion: the holder has now used this action
+    # (entity_description_action_visibility `used`). Recorded before the
+    # hooks, so a hook that kills or removes the holder can't skip it; an
+    # enclosing action that fails rolls it back with everything else.
+    holder = match.entities.get(action.holder) if action.holder else None
+    if holder is not None and action.full_path not in holder.actions_used \
+            and len(holder.actions_used) < ACTIONS_USED_MAX:
+        holder.actions_used.append(action.full_path)
     # Successful completion. Fire the on_action_used hook AFTER the
     # body's writes have settled (so a passive observing this hook
     # sees post-action state).

@@ -472,8 +472,13 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         seen = set(_entity_ids(mgr, ctx))
         if root in ("action", "ent") and (root == "action" or sub == "action"):
             if ent in seen:
-                from action import discover_actions
-                return sorted(discover_actions(m.entities[ent], m.rules))
+                # What the view may see (entity_description_action_visibility).
+                from vtt_commands import _visible_actions
+                try:
+                    pov = _query_pov(ctx, m)
+                except Exception:
+                    pov = None
+                return sorted(_visible_actions(m, m.entities[ent], pov))
             return []
         if root == "ent" and sub == "status":
             own = set(m.entities[ent].status) if ent in seen else set()
