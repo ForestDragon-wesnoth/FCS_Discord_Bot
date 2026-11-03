@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
-from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant
+from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -1251,7 +1251,7 @@ class CommandRegistry:
                     wpre, mgr.matches[mid_now].to_dict(include_history=False))):
             poll = False        # unchanged: the stopped chain keeps waiting
         if poll and mid_now is not None and mid_now in mgr.matches:
-            if mgr.matches[mid_now].watchers:
+            if mgr.matches[mid_now].has_watchers():
                 post_state = None       # a watcher may change it after
             # A watcher's effect is part of this command's journal entry:
             # what it can't replay (transfer_entity) or the prefabs it
@@ -1884,7 +1884,8 @@ def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
                           ("status_definitions", "statuses"),
                           ("zone_definitions", "zone definitions"),
                           ("tables", "tables"), ("macros", "macros"),
-                          ("tag_vocabulary", "tag vocabulary")):
+                          ("tag_vocabulary", "tag vocabulary"),
+                          ("watchers", "watchers")):
             la, lb = a.get(lib) or {}, b.get(lib) or {}
             names = sorted(k for k in set(la) | set(lb)
                            if la.get(k) != lb.get(k))
@@ -2190,6 +2191,7 @@ _HOST_READS: Dict[str, Optional[frozenset]] = {
     "match": frozenset({"list", "info", "channels", "hosts", "outcome",
                         "journal", "links"}),
     "host": frozenset({"list"}),
+    "watch": frozenset({"show", "held"}),
     "map": frozenset({"full"}),
     "list": frozenset({"full"}),
     "state": frozenset({"full"}),
@@ -3588,11 +3590,13 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         kinds = {"aliases": "aliases", "tiles": "tile_templates",
                  "funcs": "formula_functions",
                  "statuses": "status_definitions", "tables": "tables",
-                 "macros": "macros", "zones": "zone_definitions"}
+                 "macros": "macros", "zones": "zone_definitions",
+                 "watchers": "watchers"}
         singular = {"aliases": "alias", "tiles": "tile template",
                     "funcs": "formula function",
                     "statuses": "status definition", "tables": "table",
-                    "macros": "macro", "zones": "zone definition"}
+                    "macros": "macro", "zones": "zone definition",
+                    "watchers": "watcher"}
         kind = args[1].lower()
         if kind not in kinds and kind != "all":
             raise VTTError(f"`{args[1]}` — sync one of: "
@@ -3613,7 +3617,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                "them.")
         _check_tail(["sync", kind] + rest, 3 if kind != "all" else 2, (),
                     "!match sync <aliases|tiles|funcs|statuses|tables|"
-                    "macros|zones> [name] [reapply] [diff] | "
+                    "macros|zones|watchers> [name] [reapply] [diff] | "
                     "!match sync all [reapply] [diff]")
         want = rest[0] if rest else None
         sysobj = mgr.get_system(m.system_name)
@@ -3644,6 +3648,11 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     new = normalize_zone_def(entry)
                     old = mine.get(n)
                     differs = not same_value(old, new)
+                elif lib_name == "watchers":
+                    new = watcher_definition(entry)
+                    old = (watcher_definition(mine[n]) if n in mine
+                           else None)
+                    differs = not same_value(old, new)
                 else:
                     new, old = entry, mine.get(n)
                     differs = not same_value(old, new)
@@ -3653,6 +3662,10 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 (replaced if old is not None else added).append(n)
                 if preview:
                     changes.append(_sync_change(lib_name, n, old, new))
+                elif lib_name == "watchers":
+                    # Armed from now, as `!watch add` (its edge state
+                    # starts over).
+                    m.add_watcher(n, **watcher_add_args(new))
                 else:
                     mine[n] = new
                     # The system's entry: an admin's, no player's record.
@@ -4605,9 +4618,12 @@ async def _owner_ceiling(ctx, args: List[str], mgr: MatchManager):
         for name in list(w.systems):
             w.refresh_match_rules(name)
     if key in OWNER_LIMITS:
+        # Only the chain depth leaves what exceeds it in place; the other
+        # limits apply from the next time they are read.
+        note = (" (existing chains past it keep working; new links are "
+                "held to it)" if key == "system_chain_depth" else "")
         return await ctx.send(f"`{key}` is now {owner_limit(key)} for every "
-                              f"server (existing chains past it keep "
-                              f"working; new links are held to it).")
+                              f"server{note}.")
     return await ctx.send(f"`{key}` is now capped at {rule_max(key)} for "
                           f"every server.")
 
@@ -8398,6 +8414,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_tags(ctx, args, mgr)
     if sub in ("table", "macro"):
         return await _system_text_lib(ctx, args, mgr, sub)
+    if sub == "watch":
+        return await _system_watch(ctx, args, mgr)
 
     # ---- system alias <subcommand> -----------------------------------
     # System-level alias library. These don't affect any currently live
@@ -8602,6 +8620,37 @@ def _lint_one(src: Any, mode: str, known: frozenset,
     return None
 
 
+def _watcher_slots(where: str, spec: Any):
+    """Lint slots of one watcher definition (condition, effect)."""
+    if not isinstance(spec, dict):
+        return
+    yield (f"{where} condition", spec.get("condition"), "eval",
+           frozenset(), False)
+    yield (f"{where} effect", spec.get("effect"), "exec", frozenset(), False)
+
+
+def _status_watchers(sdef: Any) -> List[Tuple[str, Any]]:
+    """The watchers a status definition gives its bearers (#149): in its
+    `data` (copied into instances) and in its level entries, as
+    (where, spec)."""
+    out: List[Tuple[str, Any]] = []
+    if not isinstance(sdef, dict):
+        return out
+    data = sdef.get("data")
+    bundle = data.get("watchers") if isinstance(data, dict) else None
+    for wname, spec in sorted((bundle if isinstance(bundle, dict)
+                               else {}).items()):
+        out.append((f"watcher `{wname}`", spec))
+    levels = sdef.get(STATUS_LEVELS_FIELD)
+    for spec_key, entry in sorted((levels if isinstance(levels, dict)
+                                   else {}).items()):
+        bundle = entry.get("watchers") if isinstance(entry, dict) else None
+        for wname, spec in sorted((bundle if isinstance(bundle, dict)
+                                   else {}).items()):
+            out.append((f"level {spec_key} watcher `{wname}`", spec))
+    return out
+
+
 def _match_formula_slots(m: Match):
     """Every formula match `m` stores, as (where, source, mode, params,
     action_mode): its functions, global / team / unit passives, unit
@@ -8631,6 +8680,21 @@ def _match_formula_slots(m: Match):
                frozenset(), False)
         yield (f"watcher `{wname}` effect", w.get("effect"), "exec",
                frozenset(), False)
+    # Watchers units hold (their own vars, items, statuses, team data).
+    for eid, e in sorted(m.entities.items()):
+        for src, wname, spec, problem in m.held_watchers(e):
+            if problem is None and not src.startswith(("status:", "team:")):
+                yield from _watcher_slots(f"`{eid}` watcher `{wname}` "
+                                          f"(`{src}`)", spec)
+    for team, td in sorted(m.team_data.items()):
+        bundle = td.get("watchers") if isinstance(td, dict) else None
+        for wname, spec in sorted((bundle if isinstance(bundle, dict)
+                                   else {}).items()):
+            yield from _watcher_slots(f"team `{team}` watcher `{wname}`",
+                                      spec)
+    for sname, sdef in sorted(m.status_definitions.items()):
+        for where, spec in _status_watchers(sdef):
+            yield from _watcher_slots(f"status `{sname}` {where}", spec)
     for sname, sdef in sorted(m.status_definitions.items()):
         yield f"status `{sname}` tick", sdef.get("tick"), "exec", frozenset(), False
         hooks = sdef.get("hooks")
@@ -8806,6 +8870,17 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             n += 1
             check(f"status `{sname}` {where}", src, mode, sys_known,
                   soft=True)
+    sys_watch = [(f"watcher `{wname}`", w) for wname, w in sorted(
+        mgr.system_library(s, "watchers").items())]
+    for sname, sdef in sorted(
+            mgr.system_library(s, "status_definitions").items()):
+        sys_watch += [(f"status `{sname}` {where}", spec)
+                      for where, spec in _status_watchers(sdef)]
+    for where, spec in sys_watch:
+        for slot, src, mode, _p, _a in _watcher_slots(where, spec):
+            if isinstance(src, str) and src.strip():
+                n += 1
+                check(slot, src, mode, sys_known, soft=True)
     for zname, zdef in sorted(
             mgr.system_library(s, "zone_definitions").items()):
         zdef = normalize_zone_def(zdef)
@@ -8906,6 +8981,13 @@ def _sync_change(lib_name: str, name: str, old: Any, new: Any) -> str:
     if lib_name == "aliases":
         return (f"  `!{name}`: " + (f"`!{old}` → " if old is not None else "")
                 + f"`!{new}`")
+    if lib_name == "watchers":
+        def _w(d: Any) -> str:
+            return (f"when `{_clip(formula_text(d['condition']), 30)}` do "
+                    f"`{_clip(formula_text(d['effect']), 30)}`"
+                    f"{_watcher_flags(d)}")
+        return (f"  `{name}`: " + (f"{_w(old)} → " if old is not None else "")
+                + _w(new))
     if lib_name in ("tables", "macros"):
         return (f"  `{name}`: "
                 + (f"`{_clip(old, 40)}` → " if old is not None else "")
@@ -9239,6 +9321,115 @@ def _system_scratch(mgr: MatchManager, s: Any) -> Match:
 
 
 _SYSTEM_LIB_DELETES = ("del", "delete", "remove", "rm", "drop")
+
+
+async def _system_watch(ctx: ReplyContext, args: List[str],
+                        mgr: MatchManager):
+    """`!system watch <action> <system> ...` — a system's watchers (#149):
+    added, armed, to every NEW match on it; `!match sync watchers` brings
+    them to a live match."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "watch"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    need = {"list": 3, "show": 4, "info": 4, "promote": 4, "add": 6,
+            **{d: 4 for d in _SYSTEM_LIB_DELETES}}
+    if action not in need:
+        return await _help_fallback(ctx, ["system", "watch"], args[1])
+    if await return_help_if_not_enough_args(ctx, args, need[action],
+                                            "system", "watch"):
+        return
+    lib = mgr.system_library(s, "watchers")
+    own = s.watchers
+    if action == "list":
+        _check_tail(args, 3, (), "!system watch list <system>")
+        if not lib:
+            return await ctx.send(f"No watchers on system `{sys_name}`."
+                                  + "".join("\n" + x for x in
+                                            _system_hidden_line(s, "watchers")))
+        lines = [f"**Watchers on `{sys_name}`:**"]
+        for name in sorted(lib):
+            src = "" if name in own else " (inherited)"
+            lines.append(f"- `{name}`{_watcher_flags(lib[name])}{src}")
+        return await ctx.send("\n".join(lines
+                                        + _system_hidden_line(s, "watchers")))
+    name = args[3]
+    if action in ("show", "info"):
+        _check_tail(args, 4, (), f"!system watch {action} <system> <name>")
+        w = _system_lib_entry(mgr, s, "watchers", name, sys_name, "watcher")
+        src = "" if name in own else " (inherited)"
+        return await ctx.send(
+            f"**watcher `{name}`** on `{sys_name}`{_watcher_flags(w)}{src}\n"
+            f"when: `{formula_text(w.get('condition', ''))}`\n"
+            f"do: ```\n{formula_text(w.get('effect', ''))}\n```")
+    if action in _SYSTEM_LIB_DELETES:
+        _check_tail(args, 4, (), f"!system watch {action} <system> <name>")
+        _system_lib_entry(mgr, s, "watchers", name, sys_name, "watcher")
+        del lib[name]
+        mgr.system_library_write(s, "watchers", lib)
+        return await ctx.send(_system_deleted_line(mgr, s, "watchers",
+                                                   "watcher", name))
+    if action == "promote":
+        _check_tail(args, 4, (), "!system watch promote <system> <name>")
+        m = active_match(mgr, ctx)
+        w = m.watchers.get(name)
+        if w is None:
+            raise NotFound(f"watcher `{name}` isn't defined on match "
+                           f"`{m.id}`.")
+        entry = watcher_definition(w)
+        prior = lib.get(name)
+        lib[name] = entry
+        mgr.system_library_write(s, "watchers", lib)
+        warns = [x for x in (
+            _promote_warning(mgr, s, entry["condition"], "its condition"),
+            _promote_warning(mgr, s, entry["effect"], "its effect")) if x]
+        return await ctx.send("\n".join(
+            [_promoted_line("watcher", f"`{name}`", m.id, sys_name,
+                            prior is not None,
+                            prior is not None and same_entry(prior, entry))]
+            + warns))
+    # add <system> <name> <condition> <effect> [options]
+    cond = normalize_body_source(args[4])
+    effect = normalize_body_source(args[5])
+    opts, refusal = _watch_options(args[6:])
+    if refusal:
+        return await ctx.send(refusal)
+    if opts["once_each"] and not opts["each"]:
+        raise VTTError("`once_each` needs `each` (a watcher read per unit).")
+    if opts["tag"] not in (None, ""):
+        if not opts["each"]:
+            raise VTTError("`tag=` needs `each` (it picks the units read).")
+        try:
+            opts["tag"] = check_tag_filter(opts["tag"])
+        except VTTError as ex:
+            raise VTTError(f"tag=: {ex}")
+    warns = []
+    for src, mode, what in ((cond, "eval", "the condition"),
+                            (effect, "exec", "the effect")):
+        if mode == "eval":
+            try:
+                validate_formula(src, mode="eval", known_funcs=frozenset(
+                    mgr.system_library(s, "formula_functions")))
+            except FormulaError as ex:
+                if not re.match(r"Function '(\w+)' is not allowed\.",
+                                str(ex)):
+                    raise VTTError(
+                        "A watcher condition is an expression (true or "
+                        f"false): {ex}")
+        warn = _system_formula_warning(mgr, s, src, mode,
+                                       f"invalid watcher formula ({what})",
+                                       f"{what} fails")
+        if warn:
+            warns.append(warn)
+    entry = watcher_definition({"condition": cond, "effect": effect,
+                                **opts})
+    prior = lib.get(name)
+    lib[name] = entry
+    mgr.system_library_write(s, "watchers", lib)
+    reply = (f"{'Replaced' if prior is not None else 'Added'} watcher "
+             f"`{name}`{_watcher_flags(entry)} on `{sys_name}`. New matches "
+             f"get it armed; live ones with `!match sync watchers`.")
+    return await ctx.send("\n".join([reply] + warns))
 
 
 def _system_deleted_line(mgr: MatchManager, s: Any, kind: str, what: str,
@@ -9832,6 +10023,23 @@ registry.annotate_sub(
         "stored with a ⚠️."
     ),
 )
+registry.annotate_sub(
+    "system", "watch",
+    usage=("!system watch <list <system> | show <system> <name> | "
+           "info <system> <name> | add <system> <name> <condition> <effect> "
+           "[once | once_each] [each] [tag=<filter>] | del <system> <name> | "
+           "drop <system> <name> | delete <system> <name> | "
+           "remove <system> <name> | rm <system> <name> | "
+           "promote <system> <name>>"),
+    desc=("A GameSystem's watchers, with the options of `!watch add` (the "
+          "system name after the action): every NEW match on the system "
+          "(and the systems inheriting from it) starts with them armed; a "
+          "live match takes them with `!match sync watchers` (which re-arms "
+          "the ones it changes). `promote <sys> <name>` copies one from the "
+          "channel's match. Editing an inherited watcher makes it this "
+          "system's own; deleting one hides it (`!system unset <sys> "
+          "watchers:<name>` brings it back). A formula calling a function "
+          "the system doesn't define is stored with a ⚠️."))
 for _sub, _write, _what, _gram in (
         ("table", "def <system> <name> <spec ...>", "named dice tables",
          "`!table`"),
@@ -21700,7 +21908,7 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                     if cur is not None:
                         if cur._grants_present():
                             cur.surface_log(cur.sync_zone_grants())
-                        if cur.watchers:
+                        if cur.has_watchers():
                             for line in cur.fire_watchers():
                                 sctx.replies.append(str(line))
                 finally:
@@ -22721,26 +22929,97 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 for _subs, _usage in (
-        (('add',), '!watch add <name> <condition> <effect> [once]'),
+        (('add',), '!watch add <name> <condition> <effect> [once | once_each] '
+                   '[each] [tag=<filter>]'),
         (('list',), '!watch list'),
         (('show',), '!watch show <name>'),
+        (('held',), '!watch held <eid>'),
         (('remove',), '!watch remove <name>'),
         (('check',), '!watch check')):
     registry.annotate_sub('watch', *_subs, usage=_usage)
 
 
+def _watch_options(words: List[str]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """The options after a watcher's condition and effect (`!watch add`,
+    `!system watch add`): once / once_each / each / tag=<filter>. Returns
+    (options, refusal)."""
+    opts: Dict[str, Any] = {"once": False, "once_each": False,
+                            "each": False, "tag": None}
+    for w in words:
+        low = w.lower()
+        if low in ("once", "true", "yes"):
+            opts["once"] = True
+        elif low == "once_each":
+            opts["once_each"] = True
+        elif low == "each":
+            opts["each"] = True
+        elif low.startswith("tag="):
+            opts["tag"] = w[4:]
+        else:
+            return opts, (f"❌ `{w}` — after the condition and effect a "
+                          f"watcher takes `once` or `once_each`, `each` and "
+                          f"`tag=<filter>`.")
+    if opts["once"] and opts["once_each"]:
+        return opts, "❌ A watcher takes `once` or `once_each`, not both."
+    return opts, None
+
+
+def _check_watcher_formulas(cond: str, effect: str,
+                            known: frozenset) -> Optional[str]:
+    """A refusal for a watcher's condition / effect, or None."""
+    try:
+        # The condition is evaluated as an expression (fire_watchers):
+        # one validated as a program (`x = 1`) used to be accepted and
+        # then read as not met forever.
+        try:
+            validate_formula(cond, mode="eval", known_funcs=known)
+        except FormulaError:
+            validate_program(cond, known_funcs=known)
+            return ("❌ A watcher condition is an expression (true or "
+                    "false): it can't assign or hold statements — put "
+                    "those in the effect.")
+        validate_program(effect, known_funcs=known)
+    except FormulaError as ex:
+        return f"❌ invalid watcher formula: {ex}"
+    return None
+
+
+def _watcher_flags(w: Dict[str, Any]) -> str:
+    flags = []
+    if w.get("each"):
+        tag = w.get("tag")
+        if isinstance(tag, list):
+            tag = ",".join(str(t) for t in tag)
+        flags.append("each" + (f" tag={tag}" if tag not in (None, "")
+                               else ""))
+    if w.get("once"):
+        flags.append("once")
+    if w.get("once_each"):
+        flags.append("once_each")
+    return f" ({', '.join(flags)})" if flags else ""
+
+
 @registry.command(
     "watch",
-    usage='!watch <add|remove|list|show|check> ...',
+    usage='!watch <add|remove|list|show|held|check> ...',
     desc=(
         "Condition-watchers: edge-triggered triggers re-checked after every "
-        "command (and turn/round). `add <name> \"<condition>\" \"<effect>\" "
-        "[once]` — when the condition FORMULA goes false->true, the effect "
-        "FORMULA runs (this = current entity; use literal ids / this in the "
-        "formulas). `once` removes it after firing. Unlike event passives, a "
-        "watcher fires on the condition's transition regardless of what "
-        "changed it. Also: remove <name> / list / show <name> / check (poll "
-        "now). Per-match, serialized."
+        "command. `add <name> \"<condition>\" \"<effect>\" [once | "
+        "once_each] [each] [tag=<filter>]` — when the condition FORMULA "
+        "goes false->true, the effect FORMULA runs (this = the acting "
+        "unit). `each` reads it once per living unit (body parts too) with "
+        "self = that unit and an edge per unit, so `\"entity[self].hp < 10\"` "
+        "fires for each unit dropping below 10; `tag=` narrows the units "
+        "(`tag=\"not part\"`); a unit read for the first time is recorded "
+        "without firing. `once` removes the watcher after it fires (for "
+        "`each`, on the first unit); `once_each` lets each unit fire once. "
+        "Units HOLD watchers too: a `watchers` dict (name -> {condition, "
+        "effect, once}) in the unit's own vars, in an item under its "
+        "watcher_sources roots, in a status it holds or in its team's data, "
+        "read with self = the holder and `watcher_source` naming where it "
+        "came from (`held <eid>` lists them). Systems hold watchers for "
+        "new matches (`!system watch`). Also: remove <name> / list / show "
+        "<name> / check (poll now). Per-match, serialized."
     ),
 )
 async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -22756,41 +23035,33 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         cond = normalize_body_source(args[2])
         effect = normalize_body_source(args[3])
-        if len(args) >= 5 and args[4].lower() not in ("once", "true", "yes"):
-            # Any other word used to be read as "not once" without a word.
-            return await ctx.send(
-                f"❌ `{args[4]}` — the 4th argument of `!watch add` is `once` "
-                f"or nothing.")
-        once = len(args) >= 5
-        try:
-            # The condition is evaluated as an expression (fire_watchers):
-            # one validated as a program (`x = 1`) used to be accepted and
-            # then read as not met forever.
-            known = frozenset(m.formula_functions.keys())
-            try:
-                validate_formula(cond, mode="eval", known_funcs=known)
-            except FormulaError:
-                validate_program(cond, known_funcs=known)
-                return await ctx.send(
-                    "❌ A watcher condition is an expression (true or false): "
-                    "it can't assign or hold statements — put those in the "
-                    "effect.")
-            validate_program(effect, known_funcs=known)
-        except FormulaError as ex:
-            return await ctx.send(f"❌ invalid watcher formula: {ex}")
+        opts, refusal = _watch_options(args[4:])
+        if refusal:
+            return await ctx.send(refusal)
+        refusal = _check_watcher_formulas(
+            cond, effect, frozenset(m.formula_functions.keys()))
+        if refusal:
+            return await ctx.send(refusal)
         verb = "Replaced" if name in m.watchers else "Added"
         # Edge-triggered from now: a condition that already holds isn't a
         # change, so it fires the next time it becomes true (it used to
         # fire after whatever command came next).
         try:
-            holds = bool(FormulaEngine(m).eval_expression(
-                cond, EvalCtx(this=m.current_entity_id())))
-        except FormulaError:
-            holds = False
-        m.watchers[name] = {"condition": cond, "effect": effect,
-                            "once": once, "last": holds}
+            holds = m.add_watcher(name, cond, effect, **opts)
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        w = m.watchers[name]
+        if opts["each"]:
+            n = len(w.get("units", {}))
+            held = sum(1 for v in w.get("units", {}).values() if v)
+            return await ctx.send(
+                f"{verb} watcher `{name}`{_watcher_flags(w)}, read for each "
+                f"of {n} unit(s). Fires for a unit when the condition "
+                f"becomes true for it"
+                + (f" ({held} hold it now: the next time it turns true for "
+                   f"them)." if held else "."))
         return await ctx.send(
-            f"{verb} watcher `{name}`{' (once)' if once else ''}. Fires when "
+            f"{verb} watcher `{name}`{_watcher_flags(w)}. Fires when "
             f"the condition becomes true"
             + (" (it holds now, so the next time it turns true)." if holds
                else "."))
@@ -22799,7 +23070,7 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not m.watchers:
             return await ctx.send("No watchers defined.")
         return await ctx.send("Watchers: " + ", ".join(
-            f"`{n}`" + ("(once)" if w.get("once") else "")
+            f"`{n}`{_watcher_flags(w)}"
             for n, w in sorted(m.watchers.items())))
 
     if sub == "show":
@@ -22808,11 +23079,45 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         w = m.watchers.get(args[1])
         if w is None:
             return await ctx.send(f"❌ no watcher `{args[1]}`.")
-        return await ctx.send(
-            f"**watcher `{args[1]}`** (once={bool(w.get('once'))}, "
-            f"armed={not w.get('last')})\n"
-            f"when: `{w.get('condition','')}`\n"
-            f"do: ```\n{w.get('effect','')}\n```")
+        lines = [f"**watcher `{args[1]}`**{_watcher_flags(w)}"]
+        if w.get("each"):
+            units = w.get("units") or {}
+            on = [u for u, v in units.items() if v]
+            lines.append(f"read for {len(units)} unit(s); true now for: "
+                         + (", ".join(f"`{u}`" for u in on) or "none"))
+            if w.get("spent"):
+                lines.append("spent (fired once): " + ", ".join(
+                    f"`{u}`" for u in w["spent"]))
+        else:
+            lines.append(f"armed: {not w.get('last')}")
+        lines.append(f"when: `{formula_text(w.get('condition', ''))}`")
+        lines.append(f"do: ```\n{formula_text(w.get('effect', ''))}\n```")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "held":
+        if await return_help_if_not_enough_args(ctx, args, 2, "watch", "held"):
+            return
+        eid = _query_eid(ctx, m, args[1])
+        e = m.entities[eid]
+        held = m.held_watchers(e)
+        if not held:
+            return await ctx.send(f"`{eid}` holds no watchers.")
+        lines = [f"**Watchers `{eid}` holds:**"]
+        for src, wname, spec, problem in held:
+            if problem is not None:
+                lines.append(f"- `{wname or '?'}` from `{src}`: ⚠️ {problem}; "
+                             f"it is never read.")
+                continue
+            st = m.watcher_state.get(json.dumps([eid, src, wname]))
+            state = ("not read yet" if st is None else
+                     "spent" if st.get("spent") else
+                     "true now" if st.get("last") else "armed")
+            once = " (once)" if spec.get("once") else ""
+            lines.append(
+                f"- `{wname}` from `{src}`{once}, {state}: when "
+                f"`{formula_text(spec.get('condition'))}` do "
+                f"`{formula_text(spec.get('effect') or '')}`")
+        return await ctx.send("\n".join(lines))
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "watch", "remove"):

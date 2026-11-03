@@ -2853,6 +2853,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Status-granting zones (#136): zone_grants(zone) reads, zone_grant /
     # zone_ungrant change a zone's own grants.
     "zone_grants", "zone_grant", "zone_ungrant",
+    # Watchers (#149): watch_add / watch_remove change the match's
+    # watchers; watch_exists and watchers_of (what a unit holds) read.
+    "watch_add", "watch_remove", "watch_exists", "watchers_of",
     # Entity-anchored auras: bind a zone to an entity so its cells track
     # the entity's footprint (re-stamped on move). radius 0 = the
     # footprint itself.
@@ -3031,6 +3034,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift", "zone_set", "zone_del", "zone_spawn",
     "zone_anchor", "zone_unanchor", "zone_grant", "zone_ungrant",
+    "watch_add", "watch_remove",
     "mount", "dismount", "switch_slot",
     "damage_part", "damage_spread",
     "team_set", "team_add",
@@ -3042,6 +3046,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    'watch_exists', 'watchers_of',
     'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
     'map_carrier', 'inner_maps', 'outer_map',
     'has_template', 'template_names', 'template_of', 'template_data',
@@ -3485,6 +3490,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # on_mounted / on_dismounted hooks bind `vehicle` + `slot`. None
     # elsewhere.
     "vehicle", "rider", "slot",
+    # Watchers (#149): the firing watcher's name, and for a watcher a unit
+    # holds where it came from (`unit`, `equipped.ring`, `status:poison`,
+    # `team:red`); None elsewhere. Bound in its condition and effect.
+    "watcher_name", "watcher_source",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -8579,6 +8588,69 @@ class FormulaEngine:
         ns["zones_with_tag"]    = _zones_with_tag
         ns["zone_def_of"]       = _zone_def_of
         ns["zone_spawn"]        = _zone_spawn
+        def _watch_add(name: Any, condition: Any, effect: Any = "",
+                       once: Any = False, each: Any = False,
+                       tag: Any = None, once_each: Any = False) -> bool:
+            """watch_add(name, condition, effect='', once=False, each=False,
+            tag=None, once_each=False): add or replace the match watcher
+            `name`, as `!watch add` does: armed from now (a condition
+            holding already fires the next time it turns true); `each`
+            reads it per living unit with self = that unit. Returns whether
+            the condition holds now (for any unit, with `each`)."""
+            from logic import VTTError as _VE
+            for v, what in ((condition, "condition"), (effect, "effect")):
+                if not isinstance(v, str):
+                    raise FormulaError(f"watch_add: the {what} is a formula "
+                                       f"text, not {type(v).__name__}.")
+            known = frozenset(match.formula_functions.keys())
+            try:
+                validate_formula(condition, mode="eval", known_funcs=known)
+                validate_program(effect, known_funcs=known)
+            except FormulaError as ex:
+                raise FormulaError(f"watch_add: {ex}")
+            try:
+                return match.add_watcher(str(name), condition, effect,
+                                         once=bool(once), each=bool(each),
+                                         tag=tag, once_each=bool(once_each))
+            except _VE as ex:
+                raise FormulaError(f"watch_add: {ex}")
+
+        def _watch_remove(name: Any) -> bool:
+            """watch_remove(name): remove the match watcher `name`. Returns
+            True iff there was one."""
+            return match.watchers.pop(str(name), None) is not None
+
+        def _watch_exists(name: Any) -> bool:
+            """watch_exists(name): whether the match has a watcher `name`
+            (`!watch add`, a system's, watch_add); not the ones units
+            hold (watchers_of)."""
+            return str(name) in match.watchers
+
+        def _watchers_of(eid: Any) -> list:
+            """watchers_of(eid): the watchers the unit holds (#149), one
+            dict each: name, source (`unit`, the item's path, `status:<s>`,
+            `team:<t>`), once, and state (`armed`, `true`, `spent`, `new`
+            before its first reading, or `broken` with the reason)."""
+            e = match.entities.get(_eid(eid))
+            if e is None:
+                raise FormulaError(f"watchers_of: unknown entity '{eid}'.")
+            out = []
+            for src, wname, spec, problem in match.held_watchers(e):
+                if problem is not None:
+                    out.append({"name": wname, "source": src,
+                                "state": "broken", "problem": problem})
+                    continue
+                st = match.watcher_state.get(json.dumps([e.id, src, wname]))
+                state = ("new" if st is None else "spent" if st.get("spent")
+                         else "true" if st.get("last") else "armed")
+                out.append({"name": wname, "source": src,
+                            "once": bool(spec.get("once")), "state": state})
+            return out
+
+        ns["watch_add"]         = _watch_add
+        ns["watch_remove"]      = _watch_remove
+        ns["watch_exists"]      = _watch_exists
+        ns["watchers_of"]       = _watchers_of
         ns["zone_grants"]       = _zone_grants
         ns["zone_grant"]        = _zone_grant
         ns["zone_ungrant"]      = _zone_ungrant

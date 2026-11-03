@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14.
@@ -361,7 +361,6 @@ or rejects one, it moves to "Off the list".
 - **#146 "What changed" view.** `!map changes` marks the units and cells that changed since the start of the current turn (or since you last looked), for players catching up on Discord.
 - **#147 Image-map labels.** Optional HP bars, name labels and a row of status icons on sprites, each toggled by a rule.
 - **#148 Live combat log channel.** Event-log lines posted as they happen to a channel bound as `log`, filtered by that channel's POV.
-- **#149 Per-unit watchers.** A watcher evaluated for each unit with its own edge state ("the first time any unit drops below 30%", with `self` bound). Today that takes one watcher per unit.
 - **#150 Independent status stacks.** A definition mode where each application is its own instance with its own duration (three bleeds on three timers). Today one instance per name carries a level.
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
     - `stack: independent`: each application keeps its own level and timer. `stack_effect` decides what the stacks do together:
