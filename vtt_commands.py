@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -1121,6 +1121,7 @@ class CommandRegistry:
             m_arg = mgr.matches[pre_active_mid]
             ftoken = FORMULA_TEXT_HIDDEN.set(
                 _formula_text_hidden(ctx, mgr, pre_active_mid))
+            rtoken = VAR_READER.set(_var_reader(ctx, mgr, pre_active_mid))
             try:
                 args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
             except Exception as e:
@@ -1131,6 +1132,7 @@ class CommandRegistry:
                 return
             finally:
                 FORMULA_TEXT_HIDDEN.reset(ftoken)
+                VAR_READER.reset(rtoken)
 
         # The runs this one nests (an approval, `!again`) report the
         # matches they journaled here; the parent run's set gets ours.
@@ -1148,6 +1150,9 @@ class CommandRegistry:
             _typed_unit_view(ctx, mgr, pre_active_mid))
         ftoken = FORMULA_TEXT_HIDDEN.set(
             _formula_text_hidden(ctx, mgr, pre_active_mid))
+        reader_token = VAR_READER.set(_var_reader(ctx, mgr, pre_active_mid))
+        withheld: List[bool] = []
+        withheld_token = PRIVATE_WITHHELD.set(withheld)
         reveals_token = (_HOST_REVEALS.set([])
                          if _HOST_REVEALS.get() is None else None)
         # The other matches this command reaches, for a crash's note (W9).
@@ -1169,6 +1174,8 @@ class CommandRegistry:
             if touched_token is not None:
                 MATCHES_TOUCHED.reset(touched_token)
             _TYPED_UNIT_VIEW.reset(vtoken)
+            VAR_READER.reset(reader_token)
+            PRIVATE_WITHHELD.reset(withheld_token)
             # The end-of-command settling and the watcher poll print under
             # the same hiding (V15).
             text_hidden = FORMULA_TEXT_HIDDEN.get()
@@ -1195,6 +1202,8 @@ class CommandRegistry:
                 + ", hidden from it: the reply above may reveal "
                 + ("it" if len(revealed) == 1 else "them")
                 + " to the players here (host_reveal_warning).")
+        if withheld:
+            await _private_reminder(ctx, mgr, pre_active_mid)
         # Secret `!remind` reminders that came due wait for a host: they end
         # the reply of the next command a host runs on the match in a
         # channel without a team POV (a POV-bound channel is one players
@@ -2421,11 +2430,21 @@ def _render_template(tmpl: str, ctx: Dict[str, Any],
     # Allow \n in the stored rule string to produce real newlines
     s = tmpl.replace("\\n", "\n").replace("\\t", "\t")
 
+    # A private var the reader may not see (#70; `_PRIVATE_CTX` in the
+    # context, set by _entity_template_context): its conditional holds and
+    # its placeholder prints private_var_text, whether or not the unit has
+    # it, so nothing tells a private var's presence.
+    hidden = ctx.get(_PRIVATE_CTX)
+    hidden_text = str(ctx.get(_PRIVATE_TEXT_CTX, "?"))
+
+    def _is_hidden(path: str) -> bool:
+        return callable(hidden) and hidden(path)
+
     # Pass 1: conditionals
     def _cond_sub(m):
         path, inner = m.group(1), m.group(2)
         found, val = _tmpl_resolve(ctx, path)
-        if not _tmpl_truthy(found, val):
+        if not _tmpl_truthy(found, val) and not _is_hidden(path):
             return ""
         return inner
     # Run multiple times in case conditional bodies become eligible for more (rare).
@@ -2440,9 +2459,26 @@ def _render_template(tmpl: str, ctx: Dict[str, Any],
         path = m.group(1)
         found, val = _tmpl_resolve(ctx, path)
         if not found:
-            return f"<?{path}?>"
+            return hidden_text if _is_hidden(path) else f"<?{path}?>"
         return _tmpl_fmt_value(val, labels, path)
     return _TMPL_PLACE_RE.sub(_place_sub, s)
+
+
+# Context keys a placeholder can't name (not identifiers): the predicate
+# telling which var paths the reader may not see, and what to print then.
+_PRIVATE_CTX = "\x00hidden"
+_PRIVATE_TEXT_CTX = "\x00hidden_text"
+
+
+def _private_ctx(ctx: Dict[str, Any], m: Optional[Match], hidden) -> None:
+    """Mark `ctx` with the reader's hidden-path predicate (None = none) and
+    print the fixed placeholders that read a hidden var as
+    private_var_text."""
+    if m is None or hidden is None:
+        return
+    text = str(m.rules.get("private_var_text", "?"))
+    ctx[_PRIVATE_CTX] = hidden
+    ctx[_PRIVATE_TEXT_CTX] = text
 
 
 def _var_labels(m: Optional[Match]) -> Optional[Dict[str, str]]:
@@ -2528,8 +2564,11 @@ def _entity_template_context(e: Entity,
     # A disguised unit shows only its disguise's vars to a fooled viewer:
     # `{inventory}` read the real one under any disguise. Its passives
     # stay hidden too.
+    # A player-facing read sees only the vars its reader may (#70).
+    reader = VAR_READER.get() if e._match is not None else None
     if dis is None:
-        for k, v in e.vars.items():
+        for k, v in (e._match.reader_vars(e, None, reader)
+                     if reader is not None else e.vars).items():
             if k not in ctx:
                 ctx[k] = v
     else:
@@ -2542,6 +2581,9 @@ def _entity_template_context(e: Entity,
         if isinstance(n, str) and n:
             ctx["name"] = n
         dvars = dis.get("vars")
+        if isinstance(dvars, dict) and reader is not None:
+            dvars = redact_vars(privacy_spec(e._match.rules, dvars, e.vars),
+                                dvars, e._match.body_team(e), reader)[0]
         if isinstance(dvars, dict):
             for k, v in dvars.items():
                 ctx[k] = v
@@ -2562,9 +2604,28 @@ def _entity_template_context(e: Entity,
     # disguise presents it; `tags_sourced` names where each came from.
     if e._match is not None:
         pairs = e._match.unit_tag_sources(e, pov_team)
+        if reader is not None and e._match.var_hidden(
+                e, str(e._match.rules.get("tags_var", "tags")), reader):
+            pairs = [(t, src) for t, src in pairs if src != "own"]
         ctx["tags"] = ", ".join(t for t, _s in pairs)
         ctx["tags_sourced"] = ", ".join(
             t if src == "own" else f"{t} ({src})" for t, src in pairs)
+    if reader is not None and e._match is not None:
+        m = e._match
+        root = (dis.get("vars") if dis is not None
+                and isinstance(dis.get("vars"), dict) else e.vars)
+
+        def hidden(path: str, _e=e, _root=root, _r=reader) -> bool:
+            return m.var_hidden(_e, path, _r, vars_root=_root)
+        _private_ctx(ctx, m, hidden)
+        text = ctx.get(_PRIVATE_TEXT_CTX, "?")
+        _sn, size_t, size_n = m.size_names()
+        for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
+                           ("initiative", init_var),
+                           ("team", e._team_var_name()),
+                           ("size", size_n), ("size_class", size_t)):
+            if hidden(var):
+                ctx[alias] = text
     return ctx
 
 
@@ -2860,12 +2921,17 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
     assert m is not None
     dis = m._effective_disguise(e, pov_team) if pov_team is not None else None
     ctx = _entity_template_context(e, pov_team)
+    reader = VAR_READER.get()
     if dis is None:
         own = e.vars.get("description")
+        hidden_desc = m.var_hidden(e, "description", reader)
     else:
         dv = dis.get("vars")
         own = dv.get("description") if isinstance(dv, dict) else None
-    ctx["description"] = own if isinstance(own, str) else ""
+        hidden_desc = isinstance(dv, dict) and m.var_hidden(
+            e, "description", reader, vars_root=dv)
+    ctx["description"] = (own if isinstance(own, str)
+                          and not hidden_desc else "")
     sections = _description_paths(m.rules.get("entity_description_sections"))
     labels = _var_labels(m)
     out: List[str] = []
@@ -2894,10 +2960,13 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
                 text = _render_template(fmt(sec), {"items": "\n".join(items)})
         elif sec == "data":
             if dis is None:
-                src = e.vars
+                src = m.reader_vars(e, None, reader)
             else:
                 dv = dis.get("vars")
                 src = dv if isinstance(dv, dict) else {}
+                if reader is not None:
+                    src = redact_vars(privacy_spec(m.rules, src, e.vars),
+                                      src, m.body_team(e), reader)[0]
             tree = _hide_formula_fields(_description_vars(m, e, src, True))
             lines: List[str] = []
             _description_tree(tree, 0, lines, labels)
@@ -2971,7 +3040,12 @@ def _corpse_template_context(
     hp_var = m.rules.get("hp_var", "hp")
     max_hp_var = m.rules.get("max_hp_var", "max_hp")
     init_var = m.rules.get("turnorder_var", "initiative")
-    ent_vars = ent.get("vars") or {}
+    raw_vars = ent.get("vars") or {}
+    # The vars the reader may read (#70); a private one prints
+    # private_var_text.
+    reader = VAR_READER.get()
+    ent_vars = (m.corpse_reader_vars(corpse, reader)
+                if reader is not None else raw_vars)
     status = ent.get("status") or {}
     passives = ent.get("passives") or {}
     ctx: Dict[str, Any] = {
@@ -3001,6 +3075,21 @@ def _corpse_template_context(
     for k, v in ent_vars.items():
         if k not in ctx:
             ctx[k] = v
+    if reader is not None and isinstance(raw_vars, dict):
+        team = raw_vars.get(str(m.rules.get("team_var", "team")))
+        spec = privacy_spec(m.rules, raw_vars)
+
+        def hidden(path: str) -> bool:
+            return not reader_sees(path_privacy(spec, raw_vars, path), reader,
+                                   None if team is None else str(team))
+        _private_ctx(ctx, m, hidden)
+        text = ctx.get(_PRIVATE_TEXT_CTX, "?")
+        for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
+                           ("initiative", init_var),
+                           ("team", m.rules.get("team_var", "team")),
+                           ("size", size_n), ("size_class", size_t)):
+            if hidden(str(var)):
+                ctx[alias] = text
     return ctx
 
 
@@ -3028,8 +3117,10 @@ def _part_status_str(m, p: Entity) -> str:
     """Compact one-line summary of a body part's hp + routing knobs, for
     `!part list`."""
     hp_var, mhp_var, _ = p._vital_var_names()
-    hp = p.vars.get(hp_var, 0)
-    mhp = p.vars.get(mhp_var, 0)
+    text = str(m.rules.get("private_var_text", "?"))
+    # A private hp prints private_var_text (#70).
+    hp = text if m.var_hidden(p, hp_var) else p.vars.get(hp_var, 0)
+    mhp = text if m.var_hidden(p, mhp_var) else p.vars.get(mhp_var, 0)
     flags: List[str] = []
     pct = p.vars.get("to_main_percent",
                      m.rules.get("part_to_main_percent_default", 0))
@@ -3237,6 +3328,53 @@ def _formula_text_hidden(ctx: ReplyContext, mgr: MatchManager,
         rule = (mgr.system_value(s, "formula_text_visibility")
                 if s is not None else "all")
     return rule == "host" and (m is None or not _acts_as_host(ctx, m))
+
+
+def _var_reader(ctx: ReplyContext, mgr: MatchManager,
+                mid: Optional[str]) -> Optional[VarReader]:
+    """Who reads unit vars in this command (#70): None (everything) for a
+    host or an administrator outside a team view, else the channel's team
+    view (`!as view`, the binding) and whether the caller hosts, for the
+    private_var_host_reminder."""
+    m = mgr.matches.get(mid) if mid else None
+    if m is None:
+        return None
+    host = ctx_is_admin(ctx) or _acts_as_host(ctx, m)
+    try:
+        pov = _view_pov(ctx, m, [])
+    except VTTError:
+        pov = None
+    if host and pov is None:
+        return None
+    return VarReader(team=pov, host=host)
+
+
+async def _private_reminder(ctx: ReplyContext, mgr: MatchManager,
+                            mid: Optional[str]) -> None:
+    """private_var_host_reminder: a host's command in a team-view channel
+    left out private vars; say so, at most once per
+    private_var_reminder_cooldown minutes per host and channel (real time,
+    runtime-only: a reply, never match state)."""
+    m = mgr.matches.get(mid) if mid else None
+    if m is None or not m.rules.get("private_var_host_reminder", True):
+        return
+    import time as _time
+    key = (ctx.channel_key, str(ctx_user(ctx)))
+    seen = mgr.__dict__.setdefault("_private_reminded", {})
+    now = _time.time()
+    cool = 60 * int(m.rules.get("private_var_reminder_cooldown", 10))
+    if key in seen and now - seen[key] < cool:
+        return
+    seen[key] = now
+    pov = None
+    try:
+        pov = _view_pov(ctx, m, [])
+    except VTTError:
+        pass
+    await ctx.send(
+        f"ℹ️ This channel shows team `{pov}`'s view, which players read, so "
+        f"private vars were left out of the reply above. `!ent dump <id>` "
+        f"or `!ent info <id> full` shows them (private_var_host_reminder).")
 
 
 def _resolve_eid(m, token: str, view: bool = True) -> str:
@@ -11295,15 +11433,29 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
-        if len(args) > 2 and (len(args) > 3 or args[2].lower() != "short"):
+        words = [a.lower() for a in args[2:]]
+        if (len(words) > 2 or len(set(words)) < len(words)
+                or any(w not in ("short", "full") for w in words)):
             raise VTTError(f"Unexpected `{' '.join(args[2:])}` — usage: "
-                           f"`!ent info <id> [short]`.")
+                           f"`!ent info <id> [short] [full]`.")
         eid = _query_eid(ctx, m, args[1])
-        if len(args) > 2:
-            return await ctx.send(_entity_card(m.entities[eid],
-                                               _query_pov(ctx, m)))
-        return await ctx.send(_entity_description(m.entities[eid],
-                                                  _query_pov(ctx, m)))
+        if "full" in words:
+            # A host shows the private vars on purpose (#70), even in a
+            # channel players read.
+            if not (ctx_is_admin(ctx) or _acts_as_host(ctx, m)):
+                raise VTTError("`full` (private vars too) is for hosts.")
+            token = VAR_READER.set(None)
+        else:
+            token = None
+        try:
+            if "short" in words:
+                return await ctx.send(_entity_card(m.entities[eid],
+                                                   _query_pov(ctx, m)))
+            return await ctx.send(_entity_description(m.entities[eid],
+                                                      _query_pov(ctx, m)))
+        finally:
+            if token is not None:
+                VAR_READER.reset(token)
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -12403,13 +12555,15 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "info",
-    usage="!ent info <id> [short]",
+    usage="!ent info <id> [short] [full]",
     desc=("Describe a unit for players: its vitals, size, statuses, tags, "
           "readable vars, actions, passives and parts, per the "
           "entity_description_* rules (`!help find entity_description`). "
           "`short` shows the short card (the entity_info_format rule), the "
           "unit's state at a glance. A disguise presents its own statblock "
-          "to a fooled viewer. For everything stored on the unit, raw, use "
+          "to a fooled viewer. Private vars (private_vars, "
+          "team_private_vars) show only to hosts outside a team-view "
+          "channel; `full` (hosts) shows them anywhere. For everything stored on the unit, raw, use "
           "!ent dump (hosts)."),
 )
 registry.annotate_sub(
@@ -14656,7 +14810,9 @@ def _entity_path_value(m: Match, e: Entity, path: str,
         if seg0 == "name":
             return True, m.entity_display_name(e, pov)
         return True, getattr(e, seg0)
-    found, val = _resolve_dotted_var(m.presented_vars(e, pov), path)
+    # Private vars (#70) read as missing to a reader who may not see them:
+    # a selector, `show:` or `sort:` can't answer what the listing hides.
+    found, val = _resolve_dotted_var(m.reader_vars(e, pov), path)
     if found and path == e._team_var_name() and val is not None:
         val = str(val)      # team 1 and team "1" are one team (Entity.team)
     return found, val
@@ -14775,6 +14931,8 @@ def _find_size_matches(m: Match, e: Entity, cat: str, mod: Optional[str],
     # already, S16), or the total a disguise presents to the query's team.
     root = m.body_root(e)
     _num_v, text_v, total_v = m.size_names()
+    if m.var_hidden(root, total_v) or m.var_hidden(root, text_v):
+        return False        # a private size reads as missing (#70)
     dis = m._effective_disguise(root, pov) if pov is not None else None
     dvars = dis.get("vars") if isinstance(dis, dict) else None
     if isinstance(dvars, dict) and (total_v in dvars or text_v in dvars):
@@ -24407,8 +24565,10 @@ def _eval_all_or_nothing(m: Match, mgr: MatchManager, engine: Any,
     from formula import program_is_read_only
     if program_is_read_only(src):
         # Nothing to put back (X13): a read-only program needs no
-        # serialization of the match, and its refusal changed nothing.
-        return engine.eval_program(src, eval_ctx)
+        # serialization of the match, and its refusal changed nothing. It
+        # reads the vars as its caller may (#70: private vars).
+        with m.private_view(VAR_READER.get()):
+            return engine.eval_program(src, eval_ctx)
     pre = m.to_dict(include_history=False)
     mark = m.history.mark()
     cross: Dict[str, Any] = {"snap": None}
@@ -24510,8 +24670,10 @@ async def assert_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     from formula import validate_arg_safe
     try:
         validate_arg_safe(src)
-        val = FormulaEngine(m).eval_expression(
-            src, EvalCtx(this=m.current_entity_id(), target=self_id))
+        # Read as the caller may read (#70: private vars read as missing).
+        with m.private_view(VAR_READER.get()):
+            val = FormulaEngine(m).eval_expression(
+                src, EvalCtx(this=m.current_entity_id(), target=self_id))
     except FormulaError as ex:
         raise AssertionStop(
             f"Assertion failed: `{src}` couldn't be evaluated ({ex}){suffix}")

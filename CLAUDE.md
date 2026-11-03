@@ -3186,7 +3186,7 @@ and a total per body.
 
 ### 7.22 Reading a unit: line, description, dump
 
-Three tiers (user design, 1008-1013): the info line (entity_line_format in
+Three tiers (user design, 1008-1016): the info line (entity_line_format in
 `!list` / `!state`; entity_info_format in `!ent info <id> short`) is the
 unit's state at a glance; the description (`!ent info <id>`,
 `vtt_commands._entity_description`) is what a player reads about it; `!ent
@@ -3243,8 +3243,34 @@ dump` is the raw data for the GM.
   prints in the card, roster and corpse lines (`_render_template(...,
   labels)`). GM reads (`!ent dump`, `!find show:`, formulas, selectors)
   keep the keys; values are never relabelled.
-- **Not yet:** #70's private vars (the data section must skip them when
-  they ship).
+- **Private vars** (#70, user design, 1014-1016): rules `private_vars`
+  (hosts only) and `team_private_vars` (hosts and the unit's own team's
+  view) take var paths and `*.<key>` (any depth); a unit adds its own in
+  `__private_vars` / `__team_private_vars`, and a container holding
+  `__private_container` yes / true / private (or `team`) is private whole
+  (`logic.privacy_spec`, `path_privacy`, `redact_vars`; a path both name
+  is private). The reader of a command is `logic.VAR_READER`
+  (`vtt_commands._var_reader`, set in `_run` and around the `$()`
+  resolution): None = everything (a host or an administrator outside a
+  team view), else a `VarReader(team, host)` (a player anywhere, a host in
+  a channel with a team view). Player-facing reads go through it: the
+  card, roster, corpse and turn lines and the description
+  (`_entity_template_context` merges `Match.reader_vars`; a placeholder or
+  conditional naming a hidden path prints `private_var_text`, `?`, whether
+  or not the unit holds it, via the `_PRIVATE_CTX` predicate; the fixed
+  hp / max_hp / initiative / team / size placeholders too), death /
+  revive lines (`_announce`), `!part list`'s hp, `!find` / `!foreach`
+  (`_entity_path_value`, `size:`), `$()` / `!assert` / a read-only `!eval`
+  (`Match.private_view`: every unit's and corpse's vars swapped for the
+  redacted copy while the read-only formula runs), Tab var paths, and a
+  disguise's decoys (judged with the real unit's lists too). The lists
+  and the flag never show. `!ent dump`, `!ent info <id> full` (hosts) and
+  every formula the engine runs (passives, action bodies, watchers, a
+  mutating `!eval`) read everything. A host's command in a team-view
+  channel that withheld something (`PRIVATE_WITHHELD`) ends with the
+  `private_var_host_reminder` (default on), at most once per
+  `private_var_reminder_cooldown` minutes (10) per host and channel
+  (runtime, wall clock: a reply, never match state).
 
 ---
 

@@ -14,6 +14,7 @@ import re
 import math
 import random
 import contextvars
+from contextlib import contextmanager
 import keyword
 
 # Lines a formula's changes produced while a command runs (see
@@ -901,6 +902,164 @@ def var_label_for(labels: Dict[str, str], path: str) -> Optional[str]:
         return labels[path]
     key = path.rsplit(".", 1)[-1]
     return labels.get(key)
+
+
+# ---- private vars (#70) ------------------------------------------------
+# A var is private (hosts only, outside a team-view channel) or team-private
+# (hosts and the unit's own team's view) when the private_vars /
+# team_private_vars rules or the unit's own lists name its path (or `*.<key>`
+# its key, at any depth), or when a container on its path holds
+# `__private_container`. Player-facing reads (the card, roster lines, the
+# description, `!find` / `!foreach`, `$()`, Tab) read the vars through
+# `redact_vars` under the command's VAR_READER; `!ent dump` and the formulas
+# the engine runs read them whole.
+PRIVATE_LIST_VARS: Dict[str, str] = {"private": "__private_vars",
+                                     "team": "__team_private_vars"}
+PRIVATE_CONTAINER_KEY = "__private_container"
+
+
+@dataclass(frozen=True)
+class VarReader:
+    """Who reads a unit's vars in this command: `team` the channel's team
+    view (None = none), `host` whether the reader hosts the match (for the
+    private_var_host_reminder). A command with no reader (VAR_READER None)
+    reads everything: a host or an administrator outside a team view."""
+    team: Optional[str]
+    host: bool = False
+
+
+VAR_READER: "contextvars.ContextVar[Optional[VarReader]]" = (
+    contextvars.ContextVar("vtt_var_reader", default=None))
+# Set while a host's command runs: noted when a read withheld a private var
+# from that host (the private_var_host_reminder).
+PRIVATE_WITHHELD: "contextvars.ContextVar[Optional[List[bool]]]" = (
+    contextvars.ContextVar("vtt_private_withheld", default=None))
+
+
+def private_entry_problem(word: Any) -> Optional[str]:
+    """Why `word` can't name private vars (a var path, or `*.<key>`)."""
+    if not isinstance(word, str) or not word:
+        return "empty"
+    path = word[2:] if word.startswith("*.") else word
+    if not path or any(not seg for seg in path.split(".")):
+        return "an empty segment"
+    if word.startswith("*.") and "." in path:
+        return "`*.` takes one key"
+    return None
+
+
+def _private_words(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        words = [str(w).strip() for w in raw if isinstance(w, str)]
+    elif isinstance(raw, str):
+        words = [w for w in re.split(r"[\s,]+", raw) if w]
+    else:
+        return []
+    return [w for w in words if w and private_entry_problem(w) is None]
+
+
+def privacy_spec(rules: Dict[str, Any], *roots: Any
+                 ) -> Dict[str, Tuple[set, set]]:
+    """level -> (paths, keys): the rules' entries plus the per-unit lists
+    held at each vars root in `roots` (a unit's vars; a disguise's decoys
+    take the real unit's too)."""
+    out: Dict[str, Tuple[set, set]] = {}
+    for level, rule in (("private", "private_vars"),
+                        ("team", "team_private_vars")):
+        words = _private_words(rules.get(rule, ""))
+        for root in roots:
+            if isinstance(root, dict):
+                words += _private_words(root.get(PRIVATE_LIST_VARS[level]))
+        paths = {w for w in words if not w.startswith("*.")}
+        keys = {w[2:] for w in words if w.startswith("*.")}
+        out[level] = (paths, keys)
+    return out
+
+
+def _container_level(value: Any) -> Optional[str]:
+    """The level a `__private_container` flag in dict `value` gives."""
+    if not isinstance(value, dict) or PRIVATE_CONTAINER_KEY not in value:
+        return None
+    flag = value.get(PRIVATE_CONTAINER_KEY)
+    if isinstance(flag, str):
+        flag = flag.strip().lower()
+        if flag == "team":
+            return "team"
+        return "private" if flag in ("yes", "true", "private", "1") else None
+    return "private" if flag is True or flag == 1 else None
+
+
+def _level_of(spec: Dict[str, Tuple[set, set]], path: str, key: str,
+              value: Any) -> Optional[str]:
+    found = None
+    for level in ("private", "team"):
+        paths, keys = spec.get(level, (set(), set()))
+        if path in paths or key in keys:
+            found = found or level
+    flag = _container_level(value)
+    if flag == "private" or found == "private":
+        return "private"
+    return found or flag
+
+
+def reader_sees(level: Optional[str], reader: Optional[VarReader],
+                team: Optional[str]) -> bool:
+    """Whether `reader` may read a var of `level` on a unit of `team`."""
+    if level is None or reader is None:
+        return True
+    if level == "team":
+        return (reader.team is not None and team is not None
+                and str(reader.team) == str(team))
+    return False
+
+
+def path_privacy(spec: Dict[str, Tuple[set, set]], vars_root: Any,
+                 path: str) -> Optional[str]:
+    """The level that hides `path` in `vars_root` (its own entry, an
+    ancestor's, or a private container on the way), or None."""
+    level = None
+    node = vars_root
+    at = ""
+    for seg in path.split("."):
+        at = f"{at}.{seg}" if at else seg
+        node = node.get(seg) if isinstance(node, dict) else None
+        lv = _level_of(spec, at, seg, node)
+        if lv == "private":
+            return "private"
+        level = level or lv
+    return level
+
+
+def redact_vars(spec: Dict[str, Tuple[set, set]], vars_root: Dict[str, Any],
+                team: Optional[str], reader: Optional[VarReader]
+                ) -> Tuple[Dict[str, Any], bool]:
+    """(vars `reader` may read, whether anything was left out): a copy of
+    `vars_root` without the private vars it may not see, nor the per-unit
+    lists naming them (their paths would tell what is hidden). `vars_root`
+    itself when nothing applies (no reader)."""
+    if reader is None:
+        return vars_root, False
+    withheld = [False]
+
+    def walk(node: Dict[str, Any], at: str) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            key = str(k)
+            path = f"{at}.{key}" if at else key
+            if not at and key in PRIVATE_LIST_VARS.values():
+                continue
+            if not reader_sees(_level_of(spec, path, key, v), reader, team):
+                withheld[0] = True
+                continue
+            out[k] = walk(v, path) if isinstance(v, dict) else copy.deepcopy(v)
+        return out
+
+    red = walk(vars_root if isinstance(vars_root, dict) else {}, "")
+    if withheld[0] and reader.host:
+        note = PRIVATE_WITHHELD.get()
+        if note is not None:
+            note.append(True)
+    return red, withheld[0]
 
 
 def _checked_actions_seen(raw: Any) -> Dict[str, List[str]]:
@@ -2758,6 +2917,60 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": ("One rider of a vehicle in its description: the RIDER's "
                  "entity_info_format placeholders plus `{slot}`."),
+    },
+    # ---- private vars (#70) ----
+    "private_vars": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Vars only hosts read, in a channel without a team view: comma-"
+            "separated var paths (`stats.secret_dc` hides it and what lies "
+            "under it) and `*.<key>` (that key at any depth, `*.gm_note`). A "
+            "unit adds its own in its `__private_vars` list, and a container "
+            "holding `__private_container` yes / true / private is private "
+            "whole. Players (and a host in a channel bound to a team view) "
+            "never see them: `!ent info` leaves them out of the details and "
+            "a placeholder naming one prints private_var_text; `!find` / "
+            "`!foreach` selectors, `show:`, `sort:` and `$()` read them as "
+            "missing. `!ent dump` and the formulas the engine runs "
+            "(passives, actions, watchers) always see them."
+        ),
+    },
+    "team_private_vars": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Vars hosts and the unit's own team read (a channel whose team "
+            "view is the unit's body's team), private to everyone else: "
+            "the same syntax as private_vars; a unit adds its own in its "
+            "`__team_private_vars` list, and `__private_container: team` "
+            "makes a container team-private. A path both lists name is "
+            "private."
+        ),
+    },
+    "private_var_text": {
+        "default": "?",
+        "schema": {"type": "str"},
+        "desc": ("What a placeholder (the short card, roster lines, the "
+                 "description's formats) prints for a private var its "
+                 "reader may not see."),
+    },
+    "private_var_host_reminder": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "When a host's command in a channel bound to a team view leaves "
+            "out private vars (players read that channel), end its reply "
+            "with a reminder that they were withheld and how to see them "
+            "(`!ent dump`, `!ent info <id> full`). At most once per "
+            "private_var_reminder_cooldown minutes per host and channel."
+        ),
+    },
+    "private_var_reminder_cooldown": {
+        "default": 10,
+        "schema": {"type": "int", "min": 0, "max": 10080},
+        "desc": ("Minutes of real time between two private_var_host_reminder "
+                 "reminders to one host in one channel (0 = every time)."),
     },
     "var_labels_enabled": {
         "default": False,
@@ -5115,7 +5328,20 @@ def _check_size_scale(key: str, raw: str) -> str:
     return ", ".join(n if s is None else f"{n}:{s}" for n, s in scale)
 
 
+def _check_private_paths(key: str, raw: str) -> str:
+    """A private_vars / team_private_vars list: var paths and `*.<key>`."""
+    got = [w for w in re.split(r"[\s,]+", raw) if w]
+    bad = [w for w in got if private_entry_problem(w)]
+    if bad:
+        raise VTTError(f"Setting '{key}' takes var paths (`stats.dc`) and "
+                       f"`*.<key>` entries, comma-separated; not "
+                       + ", ".join(f"`{b}`" for b in bad) + ".")
+    return ", ".join(got)
+
+
 _FORMAT_RULE_CHECKS = {
+    "private_vars": _check_private_paths,
+    "team_private_vars": _check_private_paths,
     "size_categories": _check_size_scale,
     "modifier_stat_caps": _check_stat_caps,
     "modifier_op_priority": _check_op_priority,
@@ -21522,10 +21748,26 @@ class Match:
                  "part_of": part_of or "", "round": self.round_number,
                  "match": self.name}
 
+        # The reader of the running command (#70): a private var prints
+        # private_var_text.
+        reader = VAR_READER.get()
+        spec = (privacy_spec(self.rules, unit_vars)
+                if reader is not None and isinstance(unit_vars, dict) else None)
+        team = fixed["team"]
+
+        def hidden(path: str) -> bool:
+            return spec is not None and not reader_sees(
+                path_privacy(spec, unit_vars, path), reader,
+                None if team in (None, "") else str(team))
+
         def sub(mo):
             key = mo.group(1)
+            if key == "team" and hidden(team_var):
+                return str(self.rules.get("private_var_text", "?"))
             if key in fixed:
                 return str(fixed[key] if fixed[key] is not None else "")
+            if hidden(key):
+                return str(self.rules.get("private_var_text", "?"))
             cur: Any = unit_vars
             for seg in key.split("."):
                 if not isinstance(cur, dict) or seg not in cur:
@@ -24274,6 +24516,81 @@ class Match:
         own = self.body_team(e)
         return sorted(t for t in teams
                       if t == own or self.entity_visible_to(body.id, t))
+
+    # ---- private vars (#70) ----------------------------------------------
+    def unit_privacy(self, e: "Entity") -> Dict[str, Tuple[set, set]]:
+        """The private / team-private entries that apply to `e`'s vars: the
+        rules plus its own lists (privacy_spec)."""
+        return privacy_spec(self.rules, e.vars)
+
+    def var_hidden(self, e: "Entity", path: str,
+                   reader: Optional[VarReader] = None,
+                   vars_root: Optional[Dict[str, Any]] = None) -> bool:
+        """Whether `reader` (default: the command's VAR_READER) may not read
+        `path` on `e` (in `vars_root`, default its vars; a disguise's
+        decoys are judged with the real unit's lists too)."""
+        reader = VAR_READER.get() if reader is None else reader
+        if reader is None:
+            return False
+        root = e.vars if vars_root is None else vars_root
+        spec = privacy_spec(self.rules, root, e.vars)
+        return not reader_sees(path_privacy(spec, root, path), reader,
+                               self.body_team(e))
+
+    def reader_vars(self, e: "Entity", pov_team: Optional[str] = None,
+                    reader: Optional[VarReader] = None) -> Dict[str, Any]:
+        """The vars of `e` a player-facing read shows: presented to
+        `pov_team` (a disguise's decoys) and without what `reader` (default
+        the command's VAR_READER) may not read."""
+        reader = VAR_READER.get() if reader is None else reader
+        pv = self.presented_vars(e, pov_team)
+        if reader is None:
+            return pv
+        spec = privacy_spec(self.rules, pv, e.vars)
+        return redact_vars(spec, pv, self.body_team(e), reader)[0]
+
+    def corpse_reader_vars(self, corpse: Dict[str, Any],
+                           reader: Optional[VarReader] = None
+                           ) -> Dict[str, Any]:
+        """A corpse snapshot's vars as `reader` may read them."""
+        reader = VAR_READER.get() if reader is None else reader
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        cv = ent.get("vars") if isinstance(ent, dict) else None
+        if not isinstance(cv, dict):
+            return {}
+        if reader is None:
+            return cv
+        team = cv.get(str(self.rules.get("team_var", "team")))
+        return redact_vars(privacy_spec(self.rules, cv), cv,
+                           None if team is None else str(team), reader)[0]
+
+    @contextmanager
+    def private_view(self, reader: Optional[VarReader]):
+        """While it lasts, every unit's and corpse's vars are what `reader`
+        may read (a `$()` argument evaluates over this view; read-only, so
+        nothing writes into the copies). No-op without a reader."""
+        swapped: List[Tuple[Any, str, Any]] = []
+        try:
+            if reader is not None:
+                for e in list(self.entities.values()):
+                    red, cut = redact_vars(self.unit_privacy(e), e.vars,
+                                           self.body_team(e), reader)
+                    swapped.append((e, "vars", e.vars))
+                    e.vars = red
+                for _mp, _x, _y, _eid, corpse in self.every_corpse():
+                    ent = corpse.get("entity") if isinstance(corpse,
+                                                            dict) else None
+                    if isinstance(ent, dict) and isinstance(ent.get("vars"),
+                                                            dict):
+                        swapped.append((ent, "__item__", ent["vars"]))
+                        ent["vars"] = self.corpse_reader_vars(corpse, reader)
+            yield
+        finally:
+            for obj, attr, old in reversed(swapped):
+                if attr == "__item__":
+                    obj["vars"] = old
+                else:
+                    setattr(obj, attr, old)
 
     def presented_vars(self, e: "Entity",
                        pov_team: Optional[str] = None) -> Dict[str, Any]:

@@ -382,7 +382,13 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         if slot == "dest_path":
             ent = binds.get("dest_id")
         if m is not None and ent in _entity_ids(mgr, ctx):
-            paths = _var_paths(m.entities[ent].vars, word)
+            # Only the vars this caller may read (#70: private vars).
+            from vtt_commands import _var_reader
+            reader = _var_reader(ctx, mgr, mgr.active_by_channel.get(
+                ctx.channel_key))
+            paths = _var_paths(m.reader_vars(m.entities[ent], None, reader)
+                               if reader is not None
+                               else m.entities[ent].vars, word)
             if slot == "template_ref":
                 paths += _entity_ids(mgr, ctx)
             return paths

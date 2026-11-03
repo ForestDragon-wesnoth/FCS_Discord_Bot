@@ -34223,7 +34223,7 @@ HARNESS-ALLOWS-ERRORS (a stray word after `!ent info <id>` is refused)
 ?! Details
 ?! A sworn sword
 !ent info knight brief
-?? ❌ Unexpected `brief` — usage: `!ent info <id> [short]`.
+?? ❌ Unexpected `brief` — usage: `!ent info <id> [short] [full]`.
 !system set default entity_description_sections "header, actions, data"
 !system set default entity_description_action_format "- {name} [{path}]"
 !ent info knight
@@ -34635,3 +34635,211 @@ the keys. A label can't name a `__` key or a path with an empty segment.
 Tab offers the system's labelled paths for a removal. A child system
 inherits the labels; removing `stats.str` there hides it (the key label
 Brawn then names the guard's `str`) until `!system unset` brings it back. Labels persist across a restart.
+
+SCENARIO 1014 — Private vars: hosts, the unit's own team and other players; rules, per-unit lists, a private container, `?` placeholders
+---------------------------------------------------------------------------------------------------------------------
+!match new pv Pv 10 6
+!match use pv
+!ent add ogre Ogre 30 3 3
+!ent set_var ogre team blue
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent set_var ogre stats.str 8
+!ent set_var ogre stats.weak_spot "left knee"
+!ent set_var ogre gm_note "flees below 10 hp"
+!ent set_var ogre plan "flank the archers"
+!ent set_var ogre gold 12
+!ent set_var ogre bag.__private_container team
+!ent set_var ogre bag.key "iron key"
+!ent set_var ogre __private_vars gold
+!part add ogre ogre_club Club 5 5
+!ent set_var ogre_club cursed true
+!system set default private_vars "stats.weak_spot, *.gm_note, *.cursed"
+!system set default team_private_vars plan
+!ent info ogre
+?? - stats: str 8, weak_spot left knee
+?? - gm_note: flees below 10 hp
+?? - plan: flank the archers
+?? - gold: 12
+!as player pleb
+!as view red
+!ent info ogre
+?? - stats: str 8
+?! weak_spot
+?! gm_note
+?! flank
+?! gold
+?! iron key
+?! __private
+!ent info ogre_club
+?! cursed
+!as view blue
+!ent info ogre
+?? - plan: flank the archers
+?? - bag: key iron key
+?! weak_spot
+?! gm_note
+?! gold
+!as host
+!system set default private_vars "stats.weak_spot, *.gm_note, *.cursed, hp"
+!as player pleb
+!as view red
+!ent info ogre short
+?? HP: ?/30
+!ent info ogre
+?? HP: ?/30
+!as view omniscient
+!ent info ogre
+?? HP: ?/30
+?! gm_note
+!as host
+!ent info ogre
+?? HP: 30/30
+?? - gm_note: flees below 10 hp
+!system unset default private_vars
+!system unset default team_private_vars
+
+Expected: private_vars hides `stats.weak_spot`, every `gm_note` and every
+`cursed` (a body part's too), team_private_vars hides `plan`, the ogre's
+own `__private_vars` list hides `gold`, and `bag.__private_container team`
+makes the bag team-private. The host (no team view) reads them all. A
+player in red's view reads none of them; blue (the ogre's team) reads
+`plan` and the bag but not the private ones; the lists and the container
+flag never show. With `hp` private, the card's and the description's `{hp}`
+print `?` (private_var_text) to the player, in a team view and outside
+one alike; the host reads 30.
+
+SCENARIO 1015 — Private vars read as missing: `!find` / `!foreach` selectors, `show:`, `sort:`, `count`, `$()`, `!assert`, Tab
+---------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS (a player's `$()` naming a private var fails like a missing one)
+!match new ps Ps 10 6
+!match use ps
+!ent add spy Spy 10 2 2
+!ent set_var spy team blue
+!ent set_var spy loyalty 3
+!ent set_var spy stats.dex 4
+!ent set_var spy stats.secret_rank 9
+!ent add guard Guard 10 5 2
+!ent set_var guard team blue
+!ent set_var guard loyalty 7
+!system set default private_vars "loyalty, stats.secret_rank"
+!as player pleb
+!as view red
+!find loyalty>0 count
+?? **0** matches.
+!find nosuchvar>0 count
+?? **0** matches.
+!find team=blue show:loyalty,stats sort:loyalty
+?? loyalty=—, stats={'dex': 4}
+?! secret_rank
+!roll $(entity[spy].stats.dex)
+?? → **4**
+!roll $(len(keys(entity[spy].stats)))
+?? → **1**
+!roll $(entity[spy].loyalty)
+?? ❌ inline $() argument: Variable 'loyalty' is not defined.
+!roll $(entity[spy].nosuch)
+?? ❌ inline $() argument: Variable 'nosuch' is not defined.
+?tab "!ent set_var spy lo"
+?! loyalty
+?tab "!ent set_var spy stats."
+?? candidates: stats.dex
+?! secret_rank
+!as view omniscient
+!find loyalty>0 count
+?? **0** matches.
+!as host
+!find loyalty>0 count
+?? **2** matches.
+!assert "entity[spy].loyalty == 3"
+!roll $(entity[spy].loyalty)
+?? → **3**
+!as view red
+!assert "get(entity[spy].stats, 'secret_rank', -1) == -1"
+?? ✅ Assertion passed
+!system unset default private_vars
+
+Expected: to a player (in red's view, and outside any team view) the
+private `loyalty` and `stats.secret_rank` read as missing everywhere they
+could answer a question: `!find loyalty>0` counts 0, the same as a var no
+unit has; `show:` prints `—` for loyalty and the stats dict without the
+secret key; a `$()` reading `entity[spy].loyalty` fails with the same "has
+no var" wording a missing var gets, `keys(entity[spy].stats)` has one key,
+and Tab offers neither private path. The host reads them outside a team
+view: `!find` counts both units, the assert and the `$()` read 3; in red's
+view its `!assert` reads the redacted vars too (`get(..., 'secret_rank',
+-1)` falls back to -1).
+
+SCENARIO 1016 — Private vars: the host reminder in a team-view channel and its cooldown, `full`, actions reading them, corpses, disguises
+---------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS (a player's `full` is refused)
+!match new pr Pr 10 6
+!match use pr
+!ent add lock Lock 5 2 2
+!ent set_var lock team neutral
+!ent set_var lock lock_dc 15
+!ent set_var lock actions.study.body "entity[self].studied = entity[self].lock_dc + 1"
+!ent add thief Thief 8 5 2
+!ent set_var thief team blue
+!ent set_var thief gold 40
+!ent set_var thief disguise.name Beggar
+!ent set_var thief disguise.vars.gold 1
+!ent set_var thief disguise.vars.alms 2
+!system set default private_vars "lock_dc, gold"
+!system set default corpse_line_format "{name} ({id}) gold {gold} (corpse)"
+!action lock study
+!ent info lock
+?? - lock_dc: 15
+?? - studied: 16
+!as view red
+!ent info lock
+?? - studied: 16
+?! lock_dc
+?? ℹ️ This channel shows team `red`'s view, which players read, so private vars were left out
+!ent info lock
+?! ℹ️
+!ent info thief
+?? **Beggar** (`thief`)
+?? - alms: 2
+?! gold
+!ent info lock full
+?? - lock_dc: 15
+?! ℹ️
+!ent dump lock
+?? "lock_dc": 15
+!system set default private_var_reminder_cooldown 0
+!ent info lock
+?? ℹ️ This channel shows team `red`'s view
+!system set default private_var_host_reminder false
+!ent info lock
+?! ℹ️
+!system set default death_message_format "{name} falls with {gold} gold."
+!ent kill thief
+?? Thief falls with ? gold.
+!as view omniscient
+!as player pleb
+!list
+?? Thief (thief) gold ? (corpse)
+!ent info lock full
+?? ❌ `full` (private vars too) is for hosts.
+!as host
+!list
+?? Thief (thief) gold 40 (corpse)
+!system unset default private_vars
+!system unset default corpse_line_format
+!system unset default private_var_reminder_cooldown
+!system unset default private_var_host_reminder
+!system unset default death_message_format
+
+Expected: an action body reads the private `lock_dc` (the engine's formulas
+see everything): `studied` is 16, and even a player sees that public
+result. A host's `!ent info` in red's view leaves `lock_dc` out and ends
+with the reminder; the next command within the cooldown (10 minutes by
+default, real time) doesn't repeat it. A disguise's decoys follow the same
+rules (the thief's decoy `gold` is private, its `alms` shows). `full`
+shows the private vars to a host anywhere without a reminder, and `!ent
+dump` holds them. With a cooldown of 0 the reminder comes every time; with
+private_var_host_reminder off, never. The death line (death_message_format
+naming `{gold}`) prints `?` in red's view. The dead thief's corpse line prints
+`?` for its private gold to a player and 40 to the host; a player's `full`
+is refused.
