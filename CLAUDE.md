@@ -1005,11 +1005,10 @@ edge cases, naming or scope, ask. They answer fast and read good questions as
 care; they're unhappy having to ask "why does this do X instead of Y?" after a
 merge. Skip questions whose answer is obviously settled.
 
-- **Bounded choices** (which mode, which stat, which enable mechanism): use
-  `AskUserQuestion` with the recommended option first and labelled.
-- **Open-ended direction** ("which idea next", a menu of features): ask in
-  PLAIN PROSE, never the questionnaire — each idea needs room, and the user
-  answers in their own words (directive, restated more than once).
+- **Every question in PLAIN PROSE, never the `AskUserQuestion`
+  questionnaire** (directive, restated more than once, last for bounded
+  design choices too): number the questions, give the options and a
+  recommendation for each, and let the user answer in their own words.
 - **Read free-text answers fully:** they often add requirements beyond the
   options (the template version trash came that way). Confirm the full list
   before building when an answer reshaped the plan.
@@ -2476,7 +2475,12 @@ hardcodes**.
   mtime) and keeps PNGs at most `_SPRITE_MAX_SIDE` px.
 - **Surfaces:** `!map image`, `!map mode text|image` (plain `!map` posts an
   image), `!map autoupdate` boards (Discord, runtime-only), `!map scene
-  [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI).
+  [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI;
+  the map, the log and the input are panes of one vertical `PanedWindow`
+  (`GuiApp._panes`): dragging the bar between two resizes them, and a
+  window resize stretches only the map, so the log and the input keep the
+  height they were dragged to; the Ctrl+R search bar opens inside the
+  input's pane).
 - **Input editing** (gui.py and cli.py): Tab completes (`completion.py`;
   bash-style, a second Tab lists the choices), Up / Down recall this
   session's commands (GUI: only on the input's first / last line, so they

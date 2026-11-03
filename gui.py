@@ -174,9 +174,16 @@ class GuiApp:
         self.map_pick.bind("<<ComboboxSelected>>", self._on_map_pick)
 
         # ---- Widget creation ----
-        # Canvas + scrollbars (the map). Packed LAST (see below) so it's the
-        # widget that gives up / absorbs space on resize.
-        frame = tk.Frame(self.root)
+        # The map, the log and the input are panes of one vertical
+        # PanedWindow: dragging the bar between two panes resizes them (the
+        # log and the input keep their height when the window is resized;
+        # the map takes or gives up the difference).
+        panes = tk.PanedWindow(self.root, orient="vertical", sashwidth=6,
+                               sashrelief="raised", bg="#2a2a32",
+                               borderwidth=0, opaqueresize=True)
+        self._panes = panes
+        # Canvas + scrollbars (the map).
+        frame = tk.Frame(panes)
         self.canvas = tk.Canvas(frame, width=800, height=420,
                                 bg="#141418", highlightthickness=0)
         vbar = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
@@ -188,18 +195,20 @@ class GuiApp:
 
         # Output log: READ-ONLY (disabled except while we insert) so it can't
         # be mistaken for / typed into as the input box.
-        self.log_widget = tk.Text(self.root, height=6, bg="#0e0e12",
+        self.log_widget = tk.Text(panes, height=6, bg="#0e0e12",
                                   fg="#d0d0d0", insertbackground="#d0d0d0",
                                   state="disabled")
 
         # Command input: a MULTI-LINE box so a pasted block of commands runs
         # line-by-line (like the CLI / a Discord !batch). Enter runs every
         # non-empty line in order; Shift+Enter inserts a literal newline.
-        inbar = tk.Frame(self.root)
+        # Its pane also holds the Ctrl+R search bar while one is open.
+        bottom = tk.Frame(panes, bg="#0e0e12")
+        inbar = tk.Frame(bottom)
         tk.Button(inbar, text="Run", command=self._run_input).pack(side="right")
         self.entry = tk.Text(inbar, height=6, bg="#1a1a20", fg="#e0e0e0",
                              insertbackground="#e0e0e0", wrap="word")
-        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.pack(side="left", fill="both", expand=True)
         self.entry.bind("<Return>", self._on_enter)
         self.entry.bind("<Shift-Return>", lambda e: None)  # literal newline
         self.entry.bind("<Control-Return>", self._on_enter)
@@ -225,7 +234,7 @@ class GuiApp:
         self._last_tab: Optional[Tuple[str, str]] = None
 
         # Ctrl+R reverse search: a bar above the input, shown while searching.
-        self._search_bar = tk.Frame(self.root, bg="#0e0e12")
+        self._search_bar = tk.Frame(bottom, bg="#0e0e12")
         self._search_label = tk.Label(self._search_bar, text="",
                                       bg="#0e0e12", fg="#a0a0a0", anchor="w")
         self._search_entry = tk.Entry(self._search_bar, bg="#1a1a20",
@@ -245,15 +254,14 @@ class GuiApp:
         self._inbar = inbar
 
         # ---- Layout / resize priority ----
-        # Pack order = clipping priority (earliest packed keeps its space). We
-        # want, when the window is too short: the INPUT first-class (always
-        # visible), the LOG second-class, and the MAP to shrink to fit. So pack
-        # input then log at the bottom (reserved first), then the canvas frame
-        # last with expand so it absorbs/yields the remaining space.
-        inbar.pack(side="bottom", fill="x")   # very bottom, reserved first
-        self.log_widget.pack(side="bottom", fill="x")  # above input, second
-        frame.pack(side="top", fill="both", expand=True)  # map fills the rest
-        # Don't let the window grow taller than these reservations need.
+        # Map, log, input top to bottom; each pane keeps a minimum height so
+        # a drag can't close it. On a window resize only the map stretches,
+        # so the log and the input keep the height the user dragged them to.
+        inbar.pack(side="bottom", fill="both", expand=True)
+        panes.add(frame, minsize=60, stretch="always")
+        panes.add(self.log_widget, minsize=40, stretch="never")
+        panes.add(bottom, minsize=40, stretch="never")
+        panes.pack(side="top", fill="both", expand=True)
         self.root.minsize(480, 300)
 
         # Pan: left-drag (scan), arrow keys.
