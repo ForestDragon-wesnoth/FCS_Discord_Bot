@@ -6299,12 +6299,19 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
+            # The current value reads through the level entries (user call,
+            # S14): a level entry's `duration: 5` or `charges: 3` counts down
+            # from 5 / 3, and the result is the instance's own key from then
+            # on (an instance key wins over the entries, as for any field).
+            view = _status_read_view(name, e.status[name])
+            if not isinstance(view, dict):
+                view = {}
             if (not absolute and field == "duration"
-                    and e.status[name].get(field) is None):
+                    and view.get(field) is None):
                 # No duration = permanent (shown as ∞): adding to it leaves
                 # it permanent (user call); status_counter_set gives one.
                 return None
-            raw = e.status[name].get(field, 0)
+            raw = view.get(field, 0)
             cur = _coerce_number(raw)
             if cur is None:
                 raise FormulaError(

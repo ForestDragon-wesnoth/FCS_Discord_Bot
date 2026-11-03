@@ -34082,3 +34082,82 @@ leaving two granting zones at once keeps the level of the zone it held
 the status from (5, from `zb`) and lingers for that zone's linger (2
 turns), not the longer linger of `za`.
 HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1006 — Level-entry durations, charges and skips_turn count in the engine's own readers
+--------------------------------------------------------------------------------------------------
+!match new lv LV 12 8
+!match use lv
+!ent add a A 10 1 1 5
+!ent add b B 10 3 1 4
+!status def burn
+!status level burn 3+ duration 5
+!status level burn 1+ charges 3
+!status apply a burn 3
+?? (level=3, duration=5)
+!eval "status_counter_add('a', 'burn', -1)"
+?? = `4`
+!eval "status_counter_add('a', 'burn', -1, 'charges')"
+?? = `2`
+!assert "status_has('a', 'burn') and status_duration('a', 'burn') == 4 and status_get('a', 'burn', 'charges') == 2"
+!status stack burn extend
+!status apply a burn 3 2
+?? duration=6
+!status def stun
+!status level stun 2+ skips_turn true
+!status apply b stun 2
+!turn next
+!turn next
+?? `b`'s turn skipped (stun)
+
+Expected: a level entry's fields count in the counters, the stacking,
+the turn skip and the application reply (user call, read through the
+level view). `burn` at level 3 reads duration 5 from its entry: the
+application reply says 5, a decrement gives 4, and the entry's `charges:
+3` counts down to 2 (it used to start from 0 and remove the status). The
+result is the instance's own key from then on, so a later `extend`
+application adds 2 to the 4 (6). A `stun` whose level-2 entry sets
+`skips_turn` skips `b`'s turn.
+
+SCENARIO 1007 — A disguise faking only the size category presents the number that category stores
+-----------------------------------------------------------------------------------------------------
+!match new dc DC 12 6
+!match use dc
+!ent add mask Mask 10 1 1 5
+!ent set_var mask team blue
+!ent set_var mask size_num 500
+!ent set_var mask disguise.vars.size_text tiny
+!system set default entity_line_format "{name}: {size} ({size_class})"
+!as view red
+!find size:tiny ids
+?? mask
+!find size:huge count
+?? **0** matches.
+!help size mask
+?? size 1 (`tiny`)
+!list
+?? Mask: 1 (tiny)
+!find hp>0 show:size_total,size_text
+?? size_total=1, size_text=tiny
+!as view omniscient
+!system set default size_name_write average_size
+!as view red
+!help size mask
+?? size 12 (`tiny`)
+!as view omniscient
+!system set default size_name_write refuse
+!as view red
+!help size mask
+?? size `tiny`.
+!find size:tiny ids
+?? mask
+!as view omniscient
+!help size mask
+?? size 500 (`huge`)
+
+Expected: a disguise whose `vars` name only the category `tiny` presents,
+to the fooled red view, the number writing `tiny` into `size_num` stores
+(user call): 1 under lowest_size (the default), 12 under average_size;
+`size:`, `!help size`, the roster's `{size}` / `{size_class}` and `show:`
+all read that pair. Under `size_name_write refuse` it presents no number
+(`!help size` prints the category alone) and `size:tiny` still finds it.
+The omniscient view sees the real 500 (huge).

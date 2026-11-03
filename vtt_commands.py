@@ -2520,16 +2520,14 @@ def _entity_template_context(e: Entity,
                 _sn, size_t, size_n = e._match.size_names()
                 for alias, var in (("hp", hp_var), ("max_hp", max_hp_var),
                                    ("initiative", init_var),
-                                   ("team", e._team_var_name()),
-                                   ("size", size_n), ("size_class", size_t)):
+                                   ("team", e._team_var_name())):
                     if var in dvars:
                         ctx[alias] = dvars[var]
-                # A decoy total without a decoy category shows its own.
-                dt = dvars.get(size_n)
-                if size_n in dvars and size_t not in dvars \
-                        and isinstance(dt, (int, float)) \
-                        and not isinstance(dt, bool):
-                    ctx["size_class"] = e._match.size_category_of(dt) or ""
+                # The size pair as the disguise presents it (V16).
+                if size_n in dvars or size_t in dvars:
+                    pv = e._match.presented_vars(e, pov_team)
+                    ctx["size"] = pv.get(size_n, "")
+                    ctx["size_class"] = pv.get(size_t, "")
     # The unit's full tag set (own, granted, engine), as the viewer's
     # disguise presents it; `tags_sourced` names where each came from.
     if e._match is not None:
@@ -14320,16 +14318,19 @@ def _find_size_matches(m: Match, e: Entity, cat: str, mod: Optional[str],
     # The live total (a part that died earlier in the same command counts
     # already, S16), or the total a disguise presents to the query's team.
     root = m.body_root(e)
-    total_v = m.size_names()[2]
+    _num_v, text_v, total_v = m.size_names()
     dis = m._effective_disguise(root, pov) if pov is not None else None
     dvars = dis.get("vars") if isinstance(dis, dict) else None
-    if isinstance(dvars, dict) and total_v in dvars:
-        total = dvars[total_v]
-        if isinstance(total, bool) or not isinstance(total, (int, float)):
-            return False             # a decoy that isn't a number
+    if isinstance(dvars, dict) and (total_v in dvars or text_v in dvars):
+        # The size pair the disguise presents (V16): its category, from a
+        # decoy total or named outright.
+        pv = m.presented_vars(root, pov)
+        have = m.size_rank_of(str(pv.get(text_v)))
+        if have is None:
+            return False
     else:
         total = m.size_info(e)["total"]
-    have = m.size_rank_of(m.size_category_of(total))
+        have = m.size_rank_of(m.size_category_of(total))
     if have is None:
         return False
     if mod == "+":
@@ -20918,10 +20919,12 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pre_reason and same_value(e.status.get(name), pre_inst):
             return await ctx.send(f"`{eid}`: {pre_reason} — no effect.{tail}")
         inst = e.status.get(name, {})
+        # The duration as the status reads it, level entries included (S14).
+        dur = m.status_field(inst, name, "duration")
         return await ctx.send(
             f"{verb} `{name}` to `{eid}` "
             f"(level={inst.get('level', '?')}, "
-            f"duration={inst.get('duration', '∞')}).{tail}"
+            f"duration={'∞' if dur is None else dur}).{tail}"
         )
 
     return await _help_fallback(ctx, ["status"], args[0] if args else None)
@@ -24953,11 +24956,17 @@ def _help_size(ctx: ReplyContext, mgr: MatchManager,
     num_v, text_v, total_v = m.size_names()
     dis = (m._effective_disguise(root, pov) if pov is not None else None)
     if dis is not None:
-        # A disguised body shows only what its decoy vars present.
-        found, t = _entity_path_value(m, root, total_v, pov)
-        if not found or isinstance(t, bool) or not isinstance(t, (int, float)):
-            t = info["total"]
-        cat = m.size_category_of(t)
+        # A disguised body shows only the size pair it presents (V16): a
+        # decoy total, a decoy category's number, or a category alone
+        # (size_name_write refuse), else the real total and category.
+        pv = m.presented_vars(root, pov)
+        t, cat = pv.get(total_v), pv.get(text_v)
+        if not size_number_ok(t):
+            t = None
+        if t is None and not cat:
+            t, cat = info["total"], info["category"]
+        if t is None:
+            return f"**`{raw}`** size `{cat}`."
         return (f"**`{raw}`** size {t}" + (f" (`{cat}`)" if cat else "") + ".")
     own = info["own"]
     lines = [f"**`{e.id}`** size {info['total']}"

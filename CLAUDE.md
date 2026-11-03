@@ -1475,7 +1475,12 @@ hardcodes**.
   layered entries and which spec last set each key; an entry's bundle
   adds records sourced `status:<name>@<spec>.<key>`, a record the
   instance holds under the same key wins), and status_get /
-  status_has_path for a field the instance lacks. Entries can't set
+  status_has_path for a field the instance lacks, and the engine's own
+  readers (user call, S14, 1006): the counters (`status_counter_add` /
+  `set` start from the view's value and write the result into the
+  instance, whose key then wins), the stacking modes' duration, a
+  transfer's duration, the turn skip (`skips_turn` through
+  `status_field`) and the application reply. Entries can't set
   `STATUS_LEVEL_EXCLUDED` (stack, max_level, tags, removes, blocked_by,
   hooks, data, level: how a status arrives or what kind it is). `!status
   level <name> list | <level> drop | <level> del <field> | <level>
@@ -3086,7 +3091,7 @@ The design is `docs/tags_design.md` (built, PRs 1-3) (919-927).
 
 ### 7.21 Sizes
 
-#242 (993-998, 999-1002, 1005). One number per unit, a per-system scale of categories,
+#242 (993-998, 999-1002, 1005, 1007). One number per unit, a per-system scale of categories,
 and a total per body.
 - **Vars:** the GM writes `size_num` (rule `size_num_var`); the engine
   keeps `size_total` and `size_text` (`size_total_var` / `size_text_var`)
@@ -3159,9 +3164,11 @@ and a total per body.
   number, a category argument a name or a number. `!find` / `!foreach`
   `size:<cat>[+|-]` (the live total, or a decoy's); roster `{size}` /
   `{size_class}`; `!help size [<unit>|<number>]`. A disguise's `vars` may
-  present a decoy size_total: `presented_vars` presents its category
-  with it, so the selector, `show:`, `size_text=`, the placeholders and
-  `!help size` agree (V16). Templates save the derived vars (engine-kept, like the snake
+  present a decoy size_total or size_text: `presented_vars` presents
+  them as a pair (a decoy total's category; a decoy category's number
+  as writing that category stores it per `size_name_write`, none under
+  `refuse`, user call), so the selector, `show:`, `size_text=`, the
+  placeholders and `!help size` agree (V16, 1002, 1007). Templates save the derived vars (engine-kept, like the snake
   links) and a spawn derives them again.
 
 ---

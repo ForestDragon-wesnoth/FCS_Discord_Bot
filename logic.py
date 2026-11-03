@@ -17598,7 +17598,10 @@ class Match:
         skip-list rule. The boolean key is `skips_turn`."""
         out = []
         for name, data in e.status.items():
-            if isinstance(data, dict) and bool(data.get("skips_turn", False)):
+            # Read through the level entries (user call, S14): `!status
+            # level stun 2+ skips_turn true` skips from level 2.
+            if isinstance(data, dict) and bool(
+                    self.status_field(data, name, "skips_turn")):
                 out.append(name)
         return out
 
@@ -19126,7 +19129,9 @@ class Match:
             # every stack mode: an application's duration doesn't start it
             # counting down (user call, L38; `status_counter_set` gives it
             # one on purpose).
-            if inst.get("duration") is None:
+            # (The duration reads through the level entries, S14.)
+            cur_duration = self.status_field(inst, name, "duration")
+            if cur_duration is None:
                 new_duration = None
             if mode == "none":
                 pass
@@ -19137,7 +19142,7 @@ class Match:
                     inst["duration"] = new_duration
             elif mode == "extend":
                 if new_duration is not None:
-                    inst["duration"] = (_coerce_number(inst.get("duration", 0)) or 0) + new_duration
+                    inst["duration"] = (_coerce_number(cur_duration) or 0) + new_duration
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1
                 nl = (_coerce_number(inst.get("level", 0)) or 0) + add
@@ -19216,7 +19221,7 @@ class Match:
             return False, []
         inst = copy.deepcopy(src.status[name])
         lv = inst.get("level")
-        du = inst.get("duration")
+        du = self.status_field(inst, name, "duration")      # S14
         lv = int(lv) if isinstance(lv, (int, float)) and not isinstance(lv, bool) else None
         du = int(du) if isinstance(du, (int, float)) and not isinstance(du, bool) else None
         # Leave the source first (it's moving regardless of whether it sticks).
@@ -23926,7 +23931,10 @@ class Match:
         if isinstance(dvars, dict):
             out.update(dvars)
             # The two derived size vars present as a pair (V16): a decoy
-            # total without a decoy category presents its own category.
+            # total without a decoy category presents its own category; a
+            # decoy category without a total presents the number writing
+            # that category stores (size_name_write, user call), none under
+            # `refuse`.
             _n, text_v, total_v = self.size_names()
             t = dvars.get(total_v)
             if total_v in dvars and text_v not in dvars:
@@ -23937,6 +23945,12 @@ class Match:
                     out.pop(text_v, None)
                 else:
                     out[text_v] = cat
+            elif text_v in dvars and total_v not in dvars:
+                try:
+                    out[total_v] = self.size_value_for_name(
+                        str(dvars[text_v]))
+                except VTTError:
+                    out.pop(total_v, None)
         return out
 
     def presented_statuses(self, e: "Entity",
