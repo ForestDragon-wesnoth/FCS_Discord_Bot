@@ -2250,7 +2250,8 @@ hardcodes**.
   (definition data + grant data as `seed_data`; stacking, immunity,
   resistance, blocked_by, hooks; a part's redirected status skipped),
   removes with removed_by `zone`, or with linger leaves the status with a
-  `duration` and `__zone_lingering` (counted down by the GM's tick; a zone
+  `duration` (the linger of the zone it held the status from, the one
+  whose level it took: `_grant_source`, user call, L42) and `__zone_lingering` (counted down by the GM's tick; a zone
   covering it again takes it back). A status without the marker is the
   unit's own: never taken over or removed. A held grant follows its zones (L40, user call, 992): the instance
   records what they give (`ZONE_SPEC_KEY`: the highest level among them
@@ -3085,7 +3086,7 @@ The design is `docs/tags_design.md` (built, PRs 1-3) (919-927).
 
 ### 7.21 Sizes
 
-#242 (993-998, 999-1002). One number per unit, a per-system scale of categories,
+#242 (993-998, 999-1002, 1005). One number per unit, a per-system scale of categories,
 and a total per body.
 - **Vars:** the GM writes `size_num` (rule `size_num_var`); the engine
   keeps `size_total` and `size_text` (`size_total_var` / `size_text_var`)
@@ -3113,11 +3114,16 @@ and a total per body.
   `size_num` holding text). The overrides take only their words
   (`__size_total_mode` body / sum / max, `__size_parts_inherit` a bool).
   A template or prefab unit must hold a size number (`check_size_var`):
-  a category name is the spawning system's.
+  a category name is the spawning system's. The derived vars take no
+  clamp (user call, S15: `derived_clamp_error` in `!clamp add`, `!gclamp
+  add`, template and prefab checks, and `_effective_clamp` ignores one
+  saved earlier); a clamp on `size_num` bounds the size instead.
 - **Scale** (`size_categories`, `parse_size_scale`, checked by
   `_FORMAT_RULE_CHECKS`): `tiny, small:25, medium:75, large:150,
   huge:300, colossal:800`; the first category takes no start, starts rise
-  strictly. While negatives are off, a scale whose first category holds
+  strictly. While `size_decimals` is off, a start between whole sizes
+  (`small:25.5`) is refused, as is turning decimals off under such a
+  scale (user call, L43). While negatives are off, a scale whose first category holds
   only negatives and a negative `size_default` /
   `size_default_per_extra_tile` (both bounded by SIZE_LIMIT) are
   refused, for the system and every system inheriting from it, after any

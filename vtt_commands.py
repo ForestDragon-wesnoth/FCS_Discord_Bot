@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -7980,6 +7980,18 @@ def _size_rule_problems(mgr: MatchManager, name: str) -> List[str]:
         except VTTError as e:
             out.append(f"{who}{e}")
             continue
+        # Whole-number sizes have whole-number starts (user call, L43: with
+        # `small:25.5`, writing `small` stored 25, a tiny size).
+        if not mgr.system_value(sy, "size_decimals"):
+            frac = [f"{n}:{st}" for n, st in scale
+                    if st is not None and st != int(st)]
+            if frac:
+                out.append(
+                    f"{who}size_categories: " + ", ".join(
+                        f"`{f}`" for f in frac)
+                    + (" start" if len(frac) > 1 else " starts")
+                    + " between whole sizes, and size_decimals is off. Use "
+                    "whole-number starts, or turn size_decimals on first.")
         if mgr.system_value(sy, "size_allow_negative"):
             continue
         if len(scale) >= 2 and scale[1][1] <= 0:
@@ -16966,6 +16978,9 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         path = args[2]
+        err = derived_clamp_error(path, m.rules)
+        if err:
+            raise VTTError(f"Can't clamp {err}")
         parsed = _parse_clamp_args(args[3:])
         if "max" not in parsed and "min" not in parsed:
             raise VTTError(
@@ -17101,6 +17116,11 @@ async def gclamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "gclamp", "add"):
             return
         path = args[1]
+        err = derived_clamp_error(path, {
+            k: mgr.system_value(sysobj, k)
+            for k in ("size_num_var", "size_text_var", "size_total_var")})
+        if err:
+            raise VTTError(f"Can't clamp {err}")
         parsed = _parse_clamp_args(args[2:])
         if "max" not in parsed and "min" not in parsed:
             raise VTTError("Clamp must specify at least one of max=... or min=...")

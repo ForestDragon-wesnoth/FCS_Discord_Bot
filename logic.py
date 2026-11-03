@@ -4738,6 +4738,22 @@ def size_number_ok(v: Any) -> bool:
     return abs(v) <= SIZE_LIMIT
 
 
+def derived_clamp_error(path: Any, var_names: Any = None) -> Optional[str]:
+    """Why a clamp can't sit on `path` (None when it can): the derived size
+    vars are the engine's, so a clamp bends them away from their source
+    (user call, S15). `var_names` maps the size var rules to names (a
+    match's rules, a template's var_names); absent ones read the
+    defaults."""
+    vn = var_names if isinstance(var_names, dict) else {}
+    seg0 = str(path).split(".", 1)[0]
+    num_v = str(vn.get("size_num_var") or "size_num")
+    if seg0 in (str(vn.get("size_text_var") or "size_text"),
+                str(vn.get("size_total_var") or "size_total")):
+        return (f"`{seg0}`: it is derived from `{num_v}`, so clamp "
+                f"`{num_v}` instead (the derived size follows it).")
+    return None
+
+
 def check_size_var(vars_: Any, var_names: Any, where: str) -> None:
     """Refuse a stored unit (a template, a prefab unit) whose size number
     isn't one: each spawn would refuse it (L43). A category name is the
@@ -10838,14 +10854,34 @@ class Match:
         return want
 
     def _grant_linger(self, zones: List[str], status: str) -> int:
-        """The longest linger the grants of `status` in `zones` give."""
-        best = 0
+        """The linger of the zone whose grant of `status` the unit holds
+        (the one `_grant_spec` takes the level and data from; user call,
+        L42: leaving a level-5 zone with linger 2 and a level-3 one with
+        linger 5 lingers 2 turns, at level 5)."""
+        zn = self._grant_source(zones, status)
+        if zn is None:
+            return 0
+        g = self.zone_grants_of(self.find_zone(zn)).get(status) or {}
+        lv = g.get("linger")
+        return lv if isinstance(lv, int) and not isinstance(lv, bool) else 0
+
+    def _grant_source(self, zones: List[str], sname: str) -> Optional[str]:
+        """The zone of `zones` whose grant of `sname` a unit holds: the one
+        granting the highest level (the first of those tied), else the
+        first zone."""
+        best_zone, best_level = None, None
         for zn in zones:
-            g = self.zone_grants_of(self.find_zone(zn)).get(status) or {}
-            lv = g.get("linger")
-            if isinstance(lv, int) and not isinstance(lv, bool):
-                best = max(best, lv)
-        return best
+            g = self.zone_grants_of(self.find_zone(zn)).get(sname) or {}
+            lv = g.get("level")
+            if isinstance(lv, bool) or not isinstance(lv, (int, float)):
+                lv = None
+            if best_zone is None or (lv is not None and (
+                    best_level is None or lv > best_level)):
+                if lv is not None or best_zone is None:
+                    best_zone = zn
+                if lv is not None:
+                    best_level = lv
+        return best_zone
 
     def grant_scope(self, eid: str) -> Optional[Set[str]]:
         """The units a move of `eid` can change the zone grants of: its
@@ -10976,7 +11012,7 @@ class Match:
         """One unit's part of _sync_zone_grants_pass, its lines into `log`."""
         per = want.get(eid, {})
         # What a zone holds and none covers any more: removed, or left
-        # lingering for its zones' longest linger.
+        # lingering for the linger of the zone it held it from.
         for sname in sorted(e.status):
             if eid not in self.entities:
                 break
@@ -17638,6 +17674,10 @@ class Match:
         path (replace, not field-by-field merge). See ClampSpec docstring.
         Returns None if neither level defines a clamp for this path.
         """
+        # A clamp on a derived size var (saved before they were refused)
+        # applies to nothing (S15).
+        if derived_clamp_error(path, self.rules) is not None:
+            return None
         # Entity-level override wins
         if path in entity.clamps:
             return entity.clamps[path]
@@ -26057,6 +26097,10 @@ def check_template(data: Any, name: str,
             pe = Entity.from_dict(trial)
             checked_unit_vars(pe.vars, ("hp", "max_hp", "initiative"), what)
             check_size_var(pe.vars, spec.get("var_names"), what)
+            for cpath in (pe.clamps or {}):
+                err = derived_clamp_error(cpath, spec.get("var_names"))
+                if err:
+                    raise VTTError(f"{what}: can't clamp {err}")
         except VTTError:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as ex:

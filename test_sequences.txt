@@ -34037,3 +34037,48 @@ crashes is rolled back with the request put back in the queue, which the
 reply names. With command autosaves and the journal both off, a crash
 says that what the command changed before it stays.
 HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1005 — Whole-number size starts, no clamps on derived sizes, the linger of the zone a grant came from
+-----------------------------------------------------------------------------------------------------------------
+!match new sw SW 12 8
+!match use sw
+!system set default size_categories "tiny, small:25.5, medium:76"
+?? `small:25.5` starts between whole sizes, and size_decimals is off
+!system set default size_decimals true
+!system set default size_categories "tiny, small:25.5, medium:76"
+!system set default size_decimals false
+?? `small:25.5` starts between whole sizes
+!system set default size_categories "tiny, small:25, medium:75"
+!system set default size_decimals false
+!ent add a A 10 1 1 5
+!clamp add a size_total max=120 mode=hard
+?? Can't clamp `size_total`: it is derived from `size_num`, so clamp `size_num` instead
+!gclamp add size_text max=1
+?? Can't clamp `size_text`
+!template import t1 {"name": "T", "vars": {"hp": 5, "max_hp": 5}, "clamps": {"size_total": {"path": "size_total", "max": 5}}}
+?? can't clamp `size_total`
+!clamp add a size_num max=120 mode=hard
+!ent set_var a size_num 410
+!assert "entity[a].size_num == 120 and entity[a].size_total == 120 and entity[a].size_text == 'medium'"
+!status def bless
+!zone new za
+!zone fill za 1 3 6 3
+!zone grant za bless level=3 linger=5
+!zone new zb
+!zone fill zb 1 3 6 3
+!zone grant zb bless level=5 linger=2
+!ent add u U 10 2 3 5
+!assert "status_level('u', 'bless') == 5"
+!ent tp u 2 6
+!assert "status_level('u', 'bless') == 5 and status_get('u', 'bless', 'duration') == 2"
+
+Expected: while size_decimals is off, a scale with a start between whole
+sizes (`small:25.5`) is refused, and so is turning decimals off under
+such a scale; whole-number starts go through. A clamp on the derived
+`size_total` or `size_text` is refused (by `!clamp add`, `!gclamp add`
+and a template import), pointing at `size_num`; a clamp on `size_num`
+bounds the size and the derived pair follows (410 → 120, medium). A unit
+leaving two granting zones at once keeps the level of the zone it held
+the status from (5, from `zb`) and lingers for that zone's linger (2
+turns), not the longer linger of `za`.
+HARNESS-ALLOWS-ERRORS

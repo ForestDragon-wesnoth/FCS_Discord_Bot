@@ -539,6 +539,10 @@ def _check_unit_dict(u: Any, name: str, where: str) -> None:
     if "var_names" in u:
         u["var_names"] = logic.check_var_names_field(u["var_names"], who)
     logic.check_size_var(u.get("vars"), u.get("var_names"), who)
+    for cpath in (u.get("clamps") or {}):
+        err = logic.derived_clamp_error(cpath, u.get("var_names"))
+        if err:
+            raise VTTError(f"{who}: can't clamp {err}")
     f = u.get("facing")
     if f is not None and (not isinstance(f, str)
                           or f not in logic.FACING_VECTORS):
