@@ -2829,7 +2829,11 @@ hardcodes**.
   and `template_data` in `$()` (the view's `Match._view_reader`) without
   the private vars of the channel's rules and the template's own lists
   (`logic.reader_template`, the derived size pair too), and a non-host's
-  `show` / `diff` open with a note saying so. `!template private <name>
+  `show` / `diff` open with a note saying so. A host in a team-view
+  channel gets a note on every template read there (`_template_read_note`:
+  list, show, diff, tags, trash, and a missing template's refusal, whether
+  or not it exists, so it is no oracle); it clears the cooldown
+  reminder's mark for that command. `!template private <name>
   [on|off]` (saver / admin; the `private` key, `TEMPLATE_PRIVATE_KEY`,
   library metadata kept by a re-save and stripped at spawn) makes a
   template host-only: to any reader it reads as missing in list / show /

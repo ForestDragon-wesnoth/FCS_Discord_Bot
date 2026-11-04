@@ -35241,6 +35241,18 @@ SCENARIO 1025 — A private template: hosts only; to anyone else it reads as mis
 !template spawn lichking 7 7
 ?? Spawned `lichking` from template `lichking`
 !assert "not var_has('lichking', 'private') and entity[lichking].hp == 80"
+!match bind pov=red
+!template show lichking
+?? ❌ No template `lichking` (`!template list`).
+?? ℹ️ This channel shows team `red`'s view, which players read, so private vars and private templates (`!template private`) aren't shown here
+!template show nosuch
+?? ℹ️ This channel shows team `red`'s view
+!template list
+?? ℹ️ This channel shows team `red`'s view
+?! lichking
+?! reply above
+!match unbind
+!match use tps
 !template private lichking off
 ?? 🔓 Template `lichking` is readable by everyone.
 !as player bob
@@ -35256,5 +35268,10 @@ bob's `!template list` leaves it out, and `show` and `diff` answer as for a
 template that doesn't exist; `template_names()` in `$()` counts one
 template and Tab offers only `orc`. The host's list marks it 🔒 and `show`
 says it is private. Saving over it keeps it private, and a spawn from it
-carries no `private` var (library metadata). Turned off, bob reads it
-again. An import whose `private` isn't true or false is refused.
+carries no `private` var (library metadata). A host in a channel bound to
+red's view reads it as missing too, and every template read there opens
+(or, for a missing template, ends) with a note that the channel is
+player-visible and leaves private vars and templates out; the note comes
+for a template that doesn't exist as well, so it tells the players nothing,
+and it replaces the cooldown reminder (no second line). Turned off, bob
+reads it again. An import whose `private` isn't true or false is refused.

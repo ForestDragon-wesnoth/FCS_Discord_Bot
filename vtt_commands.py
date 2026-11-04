@@ -6128,8 +6128,12 @@ def _readable_template(ctx: ReplyContext, mgr: MatchManager,
     read gets the missing template's reply."""
     name = check_template_name(raw)
     tpl = mgr.templates.get(name)
-    if tpl is None or _template_hidden(_template_reader(ctx, mgr), tpl):
-        raise VTTError(f"No template `{name}` (`!template list`).")
+    reader = _template_reader(ctx, mgr)
+    if tpl is None or _template_hidden(reader, tpl):
+        note = (_template_read_note(reader)
+                if reader is not None and reader.host else [])
+        raise VTTError("\n".join([f"No template `{name}` (`!template "
+                                  f"list`)."] + note))
     return name, tpl
 
 
@@ -6147,11 +6151,23 @@ def _reader_expanded(expanded: Any, tpl: Dict[str, Any],
 
 
 def _template_read_note(reader: Optional[VarReader]) -> List[str]:
-    """The line that opens a non-host's template read."""
-    if reader is None or reader.host:
+    """The line that opens a template read by a reader: a non-host's, or a
+    host's in a channel with a team view. A host gets it on every template
+    read there, a missing template's reply included, whatever the library
+    holds, so players reading the channel learn nothing from it; it takes
+    the place of the cooldown reminder for this command."""
+    if reader is None:
         return []
-    return ["ℹ️ You aren't a host here, so a template's private vars "
-            "(private_vars, team_private_vars) aren't shown."]
+    if not reader.host:
+        return ["ℹ️ You aren't a host here, so a template's private vars "
+                "(private_vars, team_private_vars) aren't shown."]
+    note = PRIVATE_WITHHELD.get()
+    if note is not None:
+        note.clear()
+    return [f"ℹ️ This channel shows team `{reader.team}`'s view, which "
+            f"players read, so private vars and private templates "
+            f"(`!template private`) aren't shown here; read them from a "
+            f"channel without a team view."]
 
 
 def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
@@ -6737,8 +6753,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         library = {n: t for n, t in mgr.templates.items()
                    if not _template_hidden(reader, t)}
         if not library:
-            return await ctx.send("This server has no saved templates "
-                                  "(`!template save <unit> [name]`).")
+            return await ctx.send("\n".join(_template_read_note(reader) + [
+                "This server has no saved templates "
+                "(`!template save <unit> [name]`)."]))
         resolver = _template_resolver(mgr, ctx, library=True)
         tags = {n: _template_tags(t, resolver)
                 for n, t in library.items()}
@@ -6753,14 +6770,18 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                  and (tag_filter is None
                       or tag_filter_matches(tags[n], tag_filter))]
         if not names:
-            return await ctx.send("No template matches those filters.")
+            return await ctx.send("\n".join(_template_read_note(reader) + [
+                "No template matches those filters."]))
         filtered = len(names) != len(library)
-        lines = [f"**Templates ({len(names)}"
-                 + (f" of {len(library)}" if filtered else "") + "):**"]
-        lines += [f"- {_template_summary(n, reader_template(mgr.templates[n], trules, reader), tags[n])}"
-                  + (" 🔒" if mgr.templates[n].get(TEMPLATE_PRIVATE_KEY)
-                     else "")
-                  for n in names]
+        rows = [f"- {_template_summary(n, reader_template(mgr.templates[n], trules, reader), tags[n])}"
+                + (" 🔒" if mgr.templates[n].get(TEMPLATE_PRIVATE_KEY)
+                   else "")
+                for n in names]
+        # The note after the rows: it settles the reminder their
+        # redaction noted.
+        lines = _template_read_note(reader) + [
+            f"**Templates ({len(names)}"
+            + (f" of {len(library)}" if filtered else "") + "):**"] + rows
         return await ctx.send("\n".join(lines))
 
     if sub == "diff":
@@ -7028,9 +7049,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         raw = " ".join(args[2:]).strip()
         if not raw:
             have = _template_tags(tpl, resolver)
-            return await ctx.send(
-                f"Template `{name}` tags: " + (", ".join(have) if have
-                                               else "(none)"))
+            return await ctx.send("\n".join(
+                _template_read_note(_template_reader(ctx, mgr)) + [
+                    f"Template `{name}` tags: " + (", ".join(have) if have
+                                                   else "(none)")]))
         _require_saver(ctx, name, tpl, "edit")
         new = copy.deepcopy(tpl)
         if _is_partial(tpl):
@@ -7277,9 +7299,11 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         want = check_template_name(args[1]) if len(args) > 1 else None
         entries = st.template_trash(mgr.guild_key, want)
         if not entries:
-            return await ctx.send(
-                "No old template versions"
-                + (f" of `{want}`" if want else "") + " from the last 24 hours.")
+            return await ctx.send("\n".join(
+                _template_read_note(_template_reader(ctx, mgr)) + [
+                    "No old template versions"
+                    + (f" of `{want}`" if want else "")
+                    + " from the last 24 hours."]))
         now = time.time()
         index: Dict[str, int] = {}
         reader = _template_reader(ctx, mgr)
@@ -7306,10 +7330,11 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             rows.append(f"- `{tname}` #{index[tname]} — "
                         f"{_fmt_age(now - stamp)} ago ({desc})")
         if not rows:
-            return await ctx.send(
+            return await ctx.send("\n".join(_template_read_note(reader) + [
                 "No old template versions"
-                + (f" of `{want}`" if want else "") + " from the last 24 hours.")
-        lines = [f"**Old template versions ({len(rows)}, kept 24 hours):**"]
+                + (f" of `{want}`" if want else "") + " from the last 24 hours."]))
+        lines = _template_read_note(reader) + [
+            f"**Old template versions ({len(rows)}, kept 24 hours):**"]
         lines += rows[:40]
         if len(rows) > 40:
             lines.append(f"…and {len(rows) - 40} more.")
