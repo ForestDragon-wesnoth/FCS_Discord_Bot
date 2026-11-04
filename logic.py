@@ -20627,7 +20627,7 @@ class Match:
             return strip_markers(self.template_materialize(
                 tpl.get("data") or {}, root=True))
         out = {k: copy.deepcopy(v) for k, v in tpl.items()
-               if k not in ("saved_by", "saved_by_name")}
+               if k not in _TEMPLATE_LIBRARY_KEYS}
         out["vars"] = strip_markers(self.template_materialize(
             out.get("vars") or {},
             names=self.unit_names_for(out.get("var_names"))))
@@ -20655,7 +20655,7 @@ class Match:
         self.check_unit_room(self._body_count(template), f"`{name}`")
         pre = self.to_dict(include_history=False)
         root = {k: copy.deepcopy(v) for k, v in template.items()
-                if k not in ("parts",) + _TEMPLATE_META_KEYS}
+                if k not in ("parts",) + _TEMPLATE_LIBRARY_KEYS}
         if not root.get("name"):
             root["name"] = name
         try:
@@ -24786,6 +24786,7 @@ class Match:
         swapped: List[Tuple[Any, str, Any]] = []
         size_hidden: Dict[str, str] = {}
         prev_hidden = getattr(self, "_view_size_hidden", None)
+        prev_reader = getattr(self, "_view_reader", None)
         try:
             if reader is not None:
                 # Only the units holding something private get a redacted
@@ -24844,10 +24845,14 @@ class Match:
             # The bodies whose size the reader can't read (the size
             # functions answer per private_size_display).
             self._view_size_hidden = size_hidden
+            # The reader of the view: the library reads (template_data,
+            # template_names, has_template) answer as it may read them.
+            self._view_reader = reader
             yield
         finally:
             if reader is not None:
                 self._view_size_hidden = prev_hidden
+                self._view_reader = prev_reader
             for obj, attr, old in reversed(swapped):
                 if attr == "__item__":
                     obj["vars"] = old
@@ -26743,6 +26748,11 @@ LOCAL_WORKSPACE = "local"
 # (see Match.capture_template); its NAME is the id spawned units take.
 TEMPLATE_ROOT = "@root"
 _TEMPLATE_META_KEYS = ("saved_by", "saved_by_name")
+# A template only hosts may read (`!template private`): a non-host reads it
+# as missing in the library reads and `$()`. Library metadata, never copied
+# into a unit.
+TEMPLATE_PRIVATE_KEY = "private"
+_TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,)
 _TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
                            "mount_slot")
 
@@ -26761,7 +26771,63 @@ def check_template_name(name: Any, legacy: bool = False) -> str:
 
 
 _PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags",
-                 "var_names")
+                 "var_names", TEMPLATE_PRIVATE_KEY)
+
+
+def _check_template_private(d: Dict[str, Any], where: str) -> None:
+    """The `private` flag: true (kept) or false (dropped)."""
+    if TEMPLATE_PRIVATE_KEY not in d:
+        return
+    if not isinstance(d[TEMPLATE_PRIVATE_KEY], bool):
+        raise VTTError(f"{where}: `{TEMPLATE_PRIVATE_KEY}` is true or false, "
+                       f"got {d[TEMPLATE_PRIVATE_KEY]!r}.")
+    if not d[TEMPLATE_PRIVATE_KEY]:
+        del d[TEMPLATE_PRIVATE_KEY]
+
+
+def reader_template(tpl: Dict[str, Any], rules: Dict[str, Any],
+                    reader: Optional[VarReader]) -> Dict[str, Any]:
+    """A template (stored or expanded; a partial as `{"kind": "partial",
+    "data": ...}`) as `reader` may read it: each unit's vars (the template's and
+    its parts') without the private vars `rules` and the template's own
+    lists name, the derived size pair per private_size_display, and no
+    per-unit lists. The template itself without a reader."""
+    if reader is None or not isinstance(tpl, dict):
+        return tpl
+    team_v = str(rules.get("team_var", "team"))
+    num, text_v, total_v = (str(rules.get("size_num_var", "size_num")),
+                            str(rules.get("size_text_var", "size_text")),
+                            str(rules.get("size_total_var", "size_total")))
+    mode = str(rules.get("private_size_display", "category"))
+
+    def view(vars_: Any) -> Any:
+        if not isinstance(vars_, dict):
+            return vars_
+        spec = privacy_spec(rules, vars_)
+        team = vars_.get(team_v)
+        team = None if team is None else str(team)
+        red = redact_vars(spec, vars_, team, reader)[0]
+        if mode in ("category", "hide") and not reader_sees(
+                path_privacy(spec, vars_, num), reader, team):
+            drop = [total_v] + ([text_v] if mode == "hide" else [])
+            red = {k: v for k, v in red.items() if k not in drop}
+        return red
+
+    out = dict(tpl)
+    if tpl.get("kind") == "partial":
+        out["data"] = view(tpl.get("data"))
+        return out
+    out["vars"] = view(tpl.get("vars"))
+    parts = tpl.get("parts")
+    if isinstance(parts, list):
+        out["parts"] = [dict(p, vars=view(p.get("vars")))
+                        if isinstance(p, dict) and "vars" in p else p
+                        for p in parts]
+    elif isinstance(parts, dict):
+        out["parts"] = {k: (dict(p, vars=view(p.get("vars")))
+                            if isinstance(p, dict) and "vars" in p else p)
+                        for k, p in parts.items()}
+    return out
 
 
 def _check_file_markers(value: Any, where: str) -> None:
@@ -27000,6 +27066,7 @@ def check_template(data: Any, name: str,
         for k in ("saved_by", "saved_by_name"):
             if k in d and d[k] is not None and not isinstance(d[k], str):
                 d[k] = str(d[k])
+        _check_template_private(d, f"Partial template `{name}`")
         if library is not None:
             check_template_refs(name, d, library)
         json_text(d)
@@ -27019,6 +27086,7 @@ def check_template(data: Any, name: str,
     for k in _TEMPLATE_META_KEYS:
         if k in d and d[k] is not None and not isinstance(d[k], str):
             d[k] = str(d[k])
+    _check_template_private(d, f"Template `{name}`")
 
     def probe(spec: Dict[str, Any], what: str) -> None:
         check_unit_form(spec, what)

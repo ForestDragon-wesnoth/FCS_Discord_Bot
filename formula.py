@@ -395,7 +395,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, TEMPLATE_PRIVATE_KEY, reader_template
 
 
 class FormulaError(VTTError):
@@ -7833,6 +7833,17 @@ class FormulaEngine:
             ws = CURRENT_WORKSPACE.get()
             return getattr(ws, "templates", None) or {}
 
+        def _readable_templates() -> Dict[str, Any]:
+            """The library as the reader of a `$()` view may read it: a
+            private template (`!template private`) left out. The engine's
+            own formulas read it whole."""
+            lib = _workspace_templates()
+            if getattr(match, "_view_reader", None) is None:
+                return lib
+            return {k: v for k, v in lib.items()
+                    if not (isinstance(v, dict)
+                            and v.get(TEMPLATE_PRIVATE_KEY))}
+
         def _template_spawn(fn: str, name: Any, x: Any, y: Any,
                             radius: Any, mv: Any = None) -> str:
             if not isinstance(name, str):
@@ -7879,7 +7890,7 @@ class FormulaEngine:
             """has_template(name): True when this server has a saved template
             of that name."""
             return isinstance(name, str) and \
-                name.strip().lower() in _workspace_templates()
+                name.strip().lower() in _readable_templates()
 
         def _template_data(name: Any, path: Any = "") -> Any:
             """template_data(name, path=""): the server's saved template
@@ -7890,10 +7901,11 @@ class FormulaEngine:
                 raise FormulaError("template_data(name, path): name and "
                                    "path must be text.")
             key_name = name.strip().lower()
-            tpl = _workspace_templates().get(key_name)
+            tpl = _readable_templates().get(key_name)
             if tpl is None:
                 raise FormulaError(f"template_data: this server has no "
                                    f"template `{name}`.")
+            view_reader = getattr(match, "_view_reader", None)
             # The expansion is made once per command (kept with the
             # command's partial cache, which any template edit clears) and
             # each call copies only the value at `path`; what the calls
@@ -7903,13 +7915,22 @@ class FormulaEngine:
             ckey = ("template_data", getattr(CURRENT_WORKSPACE.get(),
                                              "guild_key", None),
                     match.id, bool(match.rules.get("template_pinning", False)),
-                    key_name)
+                    key_name, view_reader)
             data = cache.get(ckey) if cache is not None else None
             if data is None:
                 try:
                     data = match.expand_template(tpl)
                 except (VTTError, NotFound) as ex:
                     raise FormulaError(f"template_data: {ex}")
+                # Without the private vars the reader can't read (#70).
+                if view_reader is not None:
+                    if tpl.get("kind") == "partial":
+                        data = reader_template(
+                            {"kind": "partial", "data": data}, match.rules,
+                            view_reader)["data"]
+                    else:
+                        data = reader_template(data, match.rules,
+                                               view_reader)
                 if cache is not None:
                     cache[ckey] = data
             node: Any = data
@@ -7934,7 +7955,7 @@ class FormulaEngine:
         def _template_names() -> List[str]:
             """template_names(): the server's saved template names, sorted.
             Loopable."""
-            return sorted(_workspace_templates())
+            return sorted(_readable_templates())
 
         def _give_template(eid_t: Any, path: Any, name: Any) -> bool:
             """give_template(eid, path, name): build partial template `name`

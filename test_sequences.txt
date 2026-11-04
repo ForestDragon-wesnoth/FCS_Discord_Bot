@@ -35161,3 +35161,100 @@ category var shows. Under `hide` the category goes too (`?`, the selector
 doesn't match, size_class None). Under `show` the size can't be hidden:
 the number reads 640 everywhere. The corpse keeps its category under
 `category` and hides its total.
+
+SCENARIO 1024 — Template reads follow private vars: a non-host's `!template show` / `diff` / `template_data` leave them out, after a warning
+---------------------------------------------------------------------------------------------------------------------------------------
+!match new tpv TplPriv 10 10
+!match use tpv
+!ent add boss Boss 50 6 6 5
+!ent set_var boss secret_dc 77731
+!ent set_var boss lore "An old wyrm."
+!template save boss bosst
+!ent set_var boss secret_dc 88842
+!template save boss bosst2
+!system set default private_vars secret_dc
+!as player bob
+!template show bosst
+?? ℹ️ You aren't a host here, so a template's private vars (private_vars, team_private_vars) aren't shown.
+?? "lore": "An old wyrm."
+?! 77731
+!template show bosst vars.secret_dc
+?? has nothing at `vars.secret_dc`
+!template diff bosst bosst2
+?? ℹ️ You aren't a host here
+?? are the same
+!roll "$(len(template_data('bosst', 'vars.lore')))"
+?? → **12**
+!roll "$(template_data('bosst', 'vars.secret_dc'))"
+?? has nothing at `vars.secret_dc`
+HARNESS-ALLOWS-ERRORS
+!as host
+!template show bosst vars.secret_dc
+?? 77731
+?! ℹ️
+!template diff bosst bosst2
+?? 77731
+!assert "template_data('bosst', 'vars.secret_dc') == 77731"
+!system unset default private_vars
+
+Expected: with `secret_dc` private, player bob reads the boss template
+without it: `!template show` opens with the warning that a non-host sees no
+private vars and shows `lore` but not the 77731, a path into the private
+var reads as missing, `!template diff` of two saves that differ only in
+`secret_dc` reads "the same", and `template_data` in `$()` answers as the
+library holds it minus the private var. The host in an unbound channel
+reads everything, with no warning, and the engine's own formulas (`!assert`
+as host) read the private value.
+
+SCENARIO 1025 — A private template: hosts only; to anyone else it reads as missing in the library reads, `$()` and Tab
+-------------------------------------------------------------------------------------------------------------------
+!match new tps TplSecret 10 10
+!match use tps
+!ent add lich Lich 90 3 3 5
+!template save lich lichking
+!ent add orc Orc 10 5 5 5
+!template save orc orc
+!template private lichking on
+?? 🔒 Template `lichking` is private: only hosts read it.
+!as player bob
+!template list
+?? Templates (1)
+?! lichking
+!template show lichking
+?? ❌ No template `lichking` (`!template list`).
+!template diff orc lichking
+?? ❌ No template `lichking`
+!roll "$(len(template_names()))"
+?? → **1**
+?tab "!template show "
+?? candidates: orc
+?! lichking
+!as host
+!template list
+?? `lichking` — Lich, hp 90, saved by cli 🔒
+!template show lichking
+?? 🔒 private
+!ent set_var lich hp 80
+!template save lich lichking
+!template private lichking
+?? Template `lichking` is private: only hosts read it.
+!template spawn lichking 7 7
+?? Spawned `lichking` from template `lichking`
+!assert "not var_has('lichking', 'private') and entity[lichking].hp == 80"
+!template private lichking off
+?? 🔓 Template `lichking` is readable by everyone.
+!as player bob
+!template show lichking
+?? **template `lichking`**
+!as host
+!template import oops {"name": "O", "vars": {"hp": 1}, "private": "yes"}
+?? `private` is true or false
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!template private lichking on` makes the template host-only. Player
+bob's `!template list` leaves it out, and `show` and `diff` answer as for a
+template that doesn't exist; `template_names()` in `$()` counts one
+template and Tab offers only `orc`. The host's list marks it 🔒 and `show`
+says it is private. Saving over it keeps it private, and a spawn from it
+carries no `private` var (library metadata). Turned off, bob reads it
+again. An import whose `private` isn't true or false is refused.

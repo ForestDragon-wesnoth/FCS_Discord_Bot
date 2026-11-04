@@ -2823,7 +2823,18 @@ hardcodes**.
   `rename`, `copy`, `delete`, `trash [name]`, `restore <name> [n]`. Changing
   or deleting a template needs its saver (`saved_by`) or an admin; an
   admin's edit keeps the saver; a copy is the copier's. Reads are open to
-  everyone (user call).
+  everyone (user call), through private vars (user call, 1024-1025): the
+  template reader (`_template_reader`: the channel match's VAR_READER,
+  else non-host unless an admin) reads `show` / `diff` / `list` / `trash`
+  and `template_data` in `$()` (the view's `Match._view_reader`) without
+  the private vars of the channel's rules and the template's own lists
+  (`logic.reader_template`, the derived size pair too), and a non-host's
+  `show` / `diff` open with a note saying so. `!template private <name>
+  [on|off]` (saver / admin; the `private` key, `TEMPLATE_PRIVATE_KEY`,
+  library metadata kept by a re-save and stripped at spawn) makes a
+  template host-only: to any reader it reads as missing in list / show /
+  diff / tags / trash, template_names / has_template / template_data and
+  Tab (`_readable_template`, `completion._readable_template_names`).
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
