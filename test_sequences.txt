@@ -14923,7 +14923,7 @@ SCENARIO 572 — bot-wide commands need a server administrator
 
 Expected: `bob` created and hosts `bobm`, but hosting a match is NOT enough
 for bot-wide state. `!system set`, `!defvar add`, `!store save`, `!run` and
-`!history export` all reply "Only a server administrator can do that" and
+`!history export` all reply "Only a server administrator or a role with the ... capability can do that" and
 change nothing — `!store`/`!run`/`history export` touch the host's disk, and
 system edits reach every match on that system in every server. Wrapping the
 edit in `!batch` doesn't help: the check also runs on the ungated inner-command
@@ -19588,7 +19588,7 @@ SCENARIO 707 — !server wipe: typed confirmation, refusals, undo
 ?? only run when typed on their own
 !as player pip
 !server wipe all
-?? Only a server administrator can do that
+?? Only a server administrator or a role with the `server` capability (`!server perms`) can do that
 !as host
 !server wipe confirm wipe all of local
 ?? There's no wipe of yours waiting
@@ -20118,9 +20118,9 @@ SCENARIO 721 — Template ownership: the saver or an administrator
 ?? saved by bob
 !as player cara
 !template save knight knight
-?? was saved by bob: only they or a server administrator can replace it
+?? was saved by bob: only they, a server administrator or a role with the `templates` capability can replace it
 !template delete knight
-?? only they or a server administrator can delete it
+?? only they, a server administrator or a role with the `templates` capability can delete it
 !template save knight knight_cara
 ?? Saved template `knight_cara`
 !as player dan
@@ -20337,7 +20337,7 @@ SCENARIO 726 — Template edits: only the saver or an administrator
 !template save knight knight
 !as player cara
 !template set knight vars.hp 99
-?? only they or a server administrator can edit it
+?? only they, a server administrator or a role with the `templates` capability can edit it
 !template unset knight vars.initiative
 ?? can edit it
 !template rename knight kn
@@ -20522,7 +20522,7 @@ SCENARIO 729 — Partial templates: resync after a library edit, detach, forced 
 ?? `axe_common` is referenced by `raider`
 !as player bob
 !template delete axe_common force
-?? only they or a server administrator can delete it
+?? only they, a server administrator or a role with the `templates` capability can delete it
 !template import trinket {"kind": "partial", "data": {"shine": 1}}
 !template import bauble {"kind": "partial", "data": {"__template": "trinket"}}
 !template delete trinket force
@@ -22846,7 +22846,7 @@ SCENARIO 773 — Per-player access overrides (!host access ... user=)
 ?? needs host approval
 !as host
 !host access set @bob all
-?? ❌ Name the player with user=, not in the key.
+?? ❌ Name the player with user= (a role with role=), not in the key.
 !host access clear ent user=bob
 ?? No override for `ent` for `bob`.
 
@@ -22955,9 +22955,9 @@ SCENARIO 775 — !system undo refusals: blocking matches, var collisions, rename
 ?? ❌ There's no server-wide edit to undo.
 !as player bob
 !system history
-?? ❌ Only a server administrator can read that
+?? ❌ Only a server administrator or a role with the `systems` capability (`!server perms`) can read that
 !system undo
-?? ❌ Only a server administrator can do that
+?? ❌ Only a server administrator or a role with the `systems` capability (`!server perms`) can do that
 
 Expected: HARNESS-ALLOWS-ERRORS. An undo that would remove a system a
 match uses now is refused with the match named. Under
@@ -23194,7 +23194,7 @@ SCENARIO 780 — !match replay refusals and journal limits
 ?? ❌ `j780` keeps no journal
 !as player bob
 !match replay j780.json as=j780c
-?? ❌ Only a server administrator can do that
+?? ❌ Only a server administrator or a role with the `files` capability (`!server perms`) can do that
 
 Expected: HARNESS-ALLOWS-ERRORS. A replay is refused when the match id
 is taken (`as=` picks another), when a system a match here uses differs
@@ -35275,3 +35275,241 @@ player-visible and leaves private vars and templates out; the note comes
 for a template that doesn't exist as well, so it tells the players nothing,
 and it replaces the cooldown reminder (no second line). Turned off, bob
 reads it again. An import whose `private` isn't true or false is refused.
+
+SCENARIO 1026 — `!server perms`: grant / revoke / list capabilities by role; administrators edit, anyone reads; saved, audited, kept across a wipe
+------------------------------------------------------------------------------------------------------------------------------------------------------
+!server perms
+?? `systems` (edit the game systems
+?? no role
+!server perms grant systems gm
+?? ✅ Role `gm` now holds `systems`
+!server perms grant systems gm
+?? Role `gm` already holds `systems`.
+!server perms grant powers gm
+?? ❌ `powers` isn't a capability; the capabilities: `systems`, `templates`, `prefabs`, `host`, `gm`, `files`, `server`.
+!server perms grant files <@&archivist>
+?? ✅ Role `archivist` now holds `files`
+!as player bob roles=gm
+!server perms list
+?? `!log format`)): `gm`
+?? `!match journal export`)): `archivist`
+!server perms revoke systems gm
+?? ❌ Only a server administrator can change which roles hold which capabilities.
+!whoami
+?? **Capabilities:** `systems` (from your roles, `!server perms`)
+!as host
+!as restart
+!server perms
+?? `!match journal export`)): `archivist`
+!server wipe all
+!server wipe confirm wipe all of local
+!server perms
+?? `!log format`)): `gm`
+!server wipe undo
+!server perms
+?? `!log format`)): `gm`
+?tab "!server perms grant "
+?? candidates: files  gm  host  prefabs  server  systems  templates
+!server perms revoke files archivist
+?? ✅ Role `archivist` no longer holds `files`.
+!server perms revoke files archivist
+?? Role `archivist` doesn't hold `files`.
+!server audit 4
+?? revoked `files` from role `archivist`
+?? granted `files` to role `archivist`
+HARNESS-ALLOWS-ERRORS
+
+Expected: a fresh server lists every capability with no role. An
+administrator grants `systems` to role `gm` (a second grant says it already
+holds it), refuses an unknown capability naming the seven, and takes a role
+mention (`<@&archivist>`) as the role. Player bob, given role `gm` with `!as
+player bob roles=gm`, reads the list but can't revoke, and `!whoami` names
+the capability his role gives him. The map survives a restart, a `!server
+wipe all` and its undo. Revoking twice says the role no longer holds it, and
+`!server audit` names each grant and revoke. Tab offers the capabilities
+after `grant`.
+
+SCENARIO 1027 — Capabilities in real use: systems, files, server, templates and prefabs for role members who aren't administrators
+--------------------------------------------------------------------------------------------------------------------------------------
+!match new cap1 Caps 8 8
+!match use cap1
+!ent add orc Orc 10 2 2 5
+!template save orc orcy
+!server perms grant systems gm
+!server perms grant files archivist
+!server perms grant server ops
+!server perms grant templates smith
+!server perms grant prefabs mason
+!host access set template all
+!host access set prefab all
+!as player bob roles=gm
+!system set default turn_start_message_format "Turn of {name}"
+?? `default`.turn_start_message_format
+!defvar add armor 1
+!template set orcy vars.hp 12
+?? ❌ Template `orcy` was saved by cli: only they, a server administrator or a role with the `templates` capability can edit it.
+!store save capsave
+?? ❌ Only a server administrator or a role with the `files` capability (`!server perms`) can do that
+!server audit
+?? ❌ Only a server administrator can read that
+!as player dana roles=smith
+!template set orcy vars.hp 12
+!template save orc danaorc
+!as player bob roles=gm
+!template delete danaorc
+?? ❌ Template `danaorc` was saved by dana
+!as player ed roles=archivist
+!store save capsave
+?! ❌
+!server backups
+?? ❌ Only a server administrator or a role with the `server` capability (`!server perms`) can do that
+!as player fay roles=ops
+!server backups
+?! ❌
+!as player gil roles=mason
+!prefab save gate 1 1 3 3
+?! ❌
+!as player hal
+!prefab save gate2 1 1 3 3
+?? ❌ Saving a prefab needs a host of this channel's match, a server administrator or a role with the `prefabs` capability (`!server perms`).
+!as host
+!assert "rule_get('turn_start_message_format') == 'Turn of {name}' and template_data('orcy', 'vars.hp') == 12 and has_template('danaorc')"
+!defvar list
+?? armor
+!host access clear template
+!host access clear prefab
+!as player dana roles=smith
+!template copy orcy orcz
+?! approval
+!as player hal
+!template copy orcy orcw
+?? approval
+HARNESS-ALLOWS-ERRORS
+
+Expected: bob's role `gm` holds `systems`: his `!system set` and `!defvar
+add` run without hosting the match, while a template someone else saved,
+`!store` and `!server audit` (administrators only) stay closed to him. The
+host opened `!template` and `!prefab` to players with `!host access`, so
+the refusals below come from the library's own rules. dana's role `smith`
+holds `templates`: she edits the template cli saved and saves one without
+hosting the match, which bob can't delete. ed (`files`) saves the server to
+the saves folder, fay (`server`) lists the backups, gil (`prefabs`) saves a
+prefab while hal, with no role, is refused naming the three ways to that
+right. With the overrides cleared, dana's library edits still skip the
+match's approval queue (they change the library, not the match), while
+hal's copy waits for a host.
+
+SCENARIO 1028 — The `host` capability limits match creation; `gm` is a host of every match, short of its owner
+---------------------------------------------------------------------------------------------------------------
+!server perms grant host builders
+?? From now on only the members of roles holding `host` and administrators can create matches here.
+!server perms grant gm gms
+!as player bob
+!match new g2 Bob 5 5
+?? ❌ Creating matches on this server is limited to roles with the `host` capability and server administrators (`!server perms list`).
+!as host
+!match new g1 Gm 8 8
+!match use g1
+!ent add hero Hero 20 2 2 5
+!system set default private_vars secret
+!ent set_var hero secret 42
+!as player gina roles=gms
+!match clone g3
+?? ❌ Creating matches on this server is limited
+!whoami
+?? **Your role:** host (the `gm` capability)
+!ent hp hero -5
+?? Damaged `hero` by 5.
+!find show:secret
+?? 42
+!host add bob
+?? ❌ Only the match owner can do that.
+!match delete g1
+?? ❌ Only the owner
+!macro set heal "!ent hp hero +1"
+!macro list
+?! not a host
+!as host
+!system set default pause_affects_hosts true
+!match pause
+!as player gina roles=gms
+!ent hp hero -1
+!as host
+!match resume
+?? ▶ `!ent hp hero -1` (gina)
+?! no longer a host
+!as player bob
+!ent hp hero -5
+?? approval
+!as player carl roles=builders
+!match new g2 Carl 5 5
+?? Created match `Carl` with id `g2`
+!as host
+!match use g1
+!assert "entity[hero].hp == 14"
+!server perms revoke host builders
+?? No role holds `host` now: anyone can create matches again.
+!match unbind
+!as player bob
+!match new g4 Bob 5 5
+?? Created match `Bob` with id `g4`
+HARNESS-ALLOWS-ERRORS
+
+Expected: once role `builders` holds `host`, bob (no role) can't create a
+match (in a channel without one, where nothing gates it) and gina, whose
+role holds only `gm`, can't clone one; the administrator creates g1. gina hosts g1
+through `gm` (`!whoami` says so): her `!ent hp` runs without approval and
+`!find` shows the private var, but `!host add` and `!match delete` stay the
+owner's, and the macro she writes isn't marked as a player's. Held during a
+pause with pause_affects_hosts on, her command runs at the resume as hers.
+bob's `!ent hp` waits for approval. carl (`builders`) creates a match
+from g1's channel without waiting for its host (it doesn't change g1);
+hero ends at 14 (20 - 5 - 1). With the last `host` grant revoked, anyone
+creates matches again.
+
+SCENARIO 1029 — `!host access ... role=`: overrides for a role's members, the most open of several roles, a player's own override first
+----------------------------------------------------------------------------------------------------------------------------------------
+!match new ra RoleAccess 6 6
+!match use ra
+!ent add orc Orc 50 2 2
+!host access set ent all role=scouts
+?? Access override set: `ent` → all for role `scouts` only.
+!host access set "ent hp" host_only role=rookies
+!host access list
+?? `ent` → all (for role `scouts` only)
+?? `ent hp` → host_only (for role `rookies` only)
+!as player bob roles=scouts
+!ent hp orc -1
+?! approval
+!as player cal roles=rookies
+!ent hp orc -1
+?? ❌ Only a host can do that.
+!as player dee roles=scouts,rookies
+!ent hp orc -1
+?? ❌ Only a host can do that.
+!as host
+!host access set "ent hp" all role=scouts
+!host access set "ent hp" host user=eve
+!as player dee roles=scouts,rookies
+!ent hp orc -1
+?! ❌
+?! approval
+!as player eve roles=scouts
+!ent hp orc -1
+?? approval
+!as host
+!host access clear "ent hp" role=rookies
+?? Cleared access override for `ent hp` for role `rookies`.
+!host access set ent all user=eve role=scouts
+?? ❌ An override is for one player (user=) or one role (role=), not both.
+!assert "entity[orc].hp == 48"
+HARNESS-ALLOWS-ERRORS
+
+Expected: role overrides apply to the role's members only and are listed
+with the role. bob (`scouts`: `ent` all) runs `!ent hp` directly; cal
+(`rookies`: `ent hp` host_only) is refused; dee holds both, and the more
+precise key (`ent hp`) decides, so she is refused too. Once `scouts` also
+opens `ent hp`, dee gets the more open of her two roles' levels and runs it.
+eve's own override (`ent hp` host) wins over her role's, so hers waits for
+approval. An override names one player or one role, not both. orc ends at
+48 (bob's and dee's hits; eve's waits).

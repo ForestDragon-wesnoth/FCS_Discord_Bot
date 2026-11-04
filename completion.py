@@ -36,7 +36,8 @@ _FREE_SLOTS = {
     "phrase", "condition", "effect", "new_name", "new_id", "init", "field",
     "base", "op", "0-100", "MB", "csv", "row", "legend", "char", "color",
     "r,g,b", "predicate", "selector", "selector_a", "selector_b", "reason",
-    "args", "tokens", "label", "user", "server", "metric",
+    "args", "tokens", "label", "user", "server", "metric", "role",
+    "role,...",
     "anchor", "word", "type", "template_text", "winner", "stat", "pid",
     "passive_id", "path", "var.path", "key", "dest_path", "stash_path",
     "shape args", "cmd1", "cmd2", "file", "seed", "pos", "new_map", "ref",
@@ -366,6 +367,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return []                      # a new name, or `=n` / `+n`
     if (root in ("approve", "deny") and slot == "id") or slot == "request id":
         return sorted(m.pending_requests) if m is not None else []
+    if slot == "capability":
+        return list(logic.CAPABILITIES)
     if root == "help" and slot == "sub":
         meta = registry._help.get((binds.get("command") or "").lower()) or {}
         return sorted(meta.get("subs") or {})

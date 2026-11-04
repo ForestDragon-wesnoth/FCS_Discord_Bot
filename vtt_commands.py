@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, reader_template
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -64,6 +64,14 @@ def ctx_user(ctx: "ReplyContext") -> Optional[str]:
     return uid if isinstance(uid, str) and uid else None
 
 
+def ctx_role_ids(ctx: "ReplyContext") -> Tuple[str, ...]:
+    """The ids of the caller's server roles (Discord: the member's roles;
+    the CLI / harness: `!as player <name> roles=...`). Empty when the
+    surface carries none."""
+    raw = getattr(ctx, "role_ids", None) or ()
+    return tuple(str(r) for r in raw if str(r))
+
+
 def ctx_user_name(ctx: "ReplyContext") -> str:
     """A human-friendly sender name for messages (falls back to the id,
     then to 'someone')."""
@@ -97,6 +105,20 @@ def ctx_is_bot_owner(ctx: "ReplyContext") -> bool:
     return bool(getattr(ctx, "is_bot_owner", False))
 
 
+def ctx_can(ctx: "ReplyContext", cap: str) -> bool:
+    """Whether the caller holds capability `cap` (logic.CAPABILITIES): a
+    server administrator holds all of them, anyone else through the roles
+    `!server perms` gave it on this server."""
+    return cap in caller_capabilities(ctx)
+
+
+def caller_hosts(ctx: "ReplyContext", m: "Match") -> bool:
+    """Whether the caller is a host of `m`: its owner, a co-host, or a
+    holder of the `gm` capability (host of every match on the server)."""
+    user = ctx_user(ctx)
+    return (user is not None and m.is_host(user)) or ctx_can(ctx, "gm")
+
+
 def require_target_host(ctx: "ReplyContext", m: "Match", action: str,
                         *, owner: bool = False) -> None:
     """Raise unless the sender is a host (or, with owner=True, the owner) of
@@ -117,7 +139,7 @@ def require_target_host(ctx: "ReplyContext", m: "Match", action: str,
         return
     if owner and not m.is_owner(user):
         raise VTTError(f"Only the owner of `{m.id}` can {action}.")
-    if not owner and not m.is_host(user):
+    if not owner and not caller_hosts(ctx, m):
         raise VTTError(
             f"Only a host of `{m.id}` can {action}. A host can run "
             f"`!match bind {m.id}` in this channel to connect it.")
@@ -164,7 +186,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "remind":     frozenset({"list"}),
     "reveal_fog": frozenset({"list"}),
     "schedule":   frozenset({"list"}),
-    "server":     frozenset({"storage"}),
+    "server":     frozenset({"storage", "perms"}),
     "status":     frozenset({"list", "info"}),
     "system":     frozenset({"list", "info", "diff"}),
     # `!table roll <name>` only rolls a stored table (advances the RNG, no
@@ -248,12 +270,19 @@ _ADMIN_READ_MSG = ("❌ Only a server administrator can read that — it "
 
 def _admin_msg(name: str, args: List[str]) -> str:
     sub = args[0].lower() if args else ""
+    need = _capability_needed(name, args)
+    who = ("a server administrator" if need in (None, "admin") else
+           f"a server administrator or a role with the `{need}` capability "
+           f"(`!server perms`)")
     if (name, sub) in (("server", "audit"), ("system", "history")):
-        return _ADMIN_READ_MSG
+        return _ADMIN_READ_MSG.replace("a server administrator", who)
     if (name, sub) == ("server", "errors"):
         return ("❌ Only a server administrator can read that — it shows "
                 "the server's crash reports and the commands behind them.")
-    return _ADMIN_MSG
+    if (name, sub) == ("server", "perms"):
+        return ("❌ Only a server administrator can change which roles hold "
+                "which capabilities.")
+    return _ADMIN_MSG.replace("a server administrator", who)
 
 
 # `!server` (wipe) runs only when typed as its own command: never inside a
@@ -288,6 +317,10 @@ def _note_other_match(mgr: "MatchManager", mid: Optional[str]) -> None:
     pre[mid] = mgr.matches[mid].to_dict(include_history=False)
 
 
+# Access levels from the most open to the most closed: of several role
+# overrides that apply, the first in this order wins.
+_ACCESS_OPENNESS = ("all", "host", "host_only", "owner")
+
 _GATE_LINES: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_gate_lines", default=False)
 
@@ -301,11 +334,74 @@ def _is_system_undo(name: str, args: List[str]) -> bool:
 
 def _admin_required(name: str, args: List[str]) -> bool:
     """True iff this invocation changes server-wide state (see _ADMIN_MSG)."""
+    return _capability_needed(name, args) is not None
+
+
+def _caller_may(ctx: ReplyContext, need: Optional[str]) -> bool:
+    """Whether the caller may run a command needing `need` (from
+    _capability_needed): an administrator always, a capability's holders
+    for the commands it covers."""
+    if need is None or ctx_is_admin(ctx):
+        return True
+    return need != "admin" and ctx_can(ctx, need)
+
+
+def _capability_needed(name: str, args: List[str]) -> Optional[str]:
+    """What a server-wide invocation needs: None (nothing: not server-wide),
+    `admin` (a server administrator only) or the capability
+    (logic.CAPABILITIES) whose holders may run it too."""
     sub = args[0].lower() if args else ""
     if name in ("store", "run"):
-        return True
+        return "files"
     if name == "server":
-        return sub in ("wipe", "audit", "backups", "recover", "errors")
+        if sub in ("wipe", "backups", "recover"):
+            return "server"
+        if sub in ("audit", "errors"):
+            return "admin"
+        if sub == "perms":
+            return ("admin" if len(args) > 1 and args[1].lower()
+                    in ("grant", "revoke") else None)
+        return None
+    cap = _systems_capability(name, sub, args)
+    if cap:
+        return "systems"
+    if name == "history":
+        return "files" if sub in ("export", "import") else None
+    if name == "match":
+        # `!match replay <file>` reads a saves file and builds systems,
+        # templates and a match; `!match journal export` writes a file.
+        return ("files" if sub == "replay" or (
+            sub == "journal" and len(args) > 1
+            and args[1].lower() == "export") else None)
+    return None
+
+
+# The invocations a capability's holder runs past the channel match's
+# access gate and pause, since they never change that match: library edits
+# (`templates` / `prefabs`; spawns, stamps, gives, resyncs and detaches act
+# on the match and stay gated) and creating another match (`host`).
+_LIBRARY_EDITS = {
+    "match": ("host", frozenset({"new"})),
+    "template": ("templates", frozenset({
+        "save", "import", "set", "unset", "part", "rename", "copy",
+        "delete", "restore", "private", "tags"})),
+    "prefab": ("prefabs", frozenset({
+        "save", "import", "rename", "copy", "delete", "restore", "tags"})),
+}
+
+
+def _library_edit_ok(ctx: ReplyContext, name: str, args: List[str]) -> bool:
+    """Whether the invocation is one the caller's capability lets past the
+    match's gate (see _LIBRARY_EDITS)."""
+    entry = _LIBRARY_EDITS.get(name)
+    if entry is None or not args or str(args[0]).lower() not in entry[1]:
+        return False
+    return ctx_can(ctx, entry[0])
+
+
+def _systems_capability(name: str, sub: str, args: List[str]) -> bool:
+    """Whether the invocation edits the game systems (the `systems`
+    capability)."""
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
         if name == "defvar" and sub == "map":
@@ -322,13 +418,6 @@ def _admin_required(name: str, args: List[str]) -> bool:
             return len(args) < 2 or args[1].lower() not in ("list", "info",
                                                             "show")
         return True
-    if name == "history":
-        return sub in ("export", "import")  # host disk I/O
-    if name == "match":
-        # `!match replay <file>` reads a saves file and builds systems,
-        # templates and a match; `!match journal export` writes a file.
-        return sub == "replay" or (sub == "journal" and len(args) > 1
-                                   and args[1].lower() == "export")
     if name == "log":
         # `!log format <type> ...` sets/resets a template ON THE GAME SYSTEM
         # (every match on it refreshes); bare `!log format` only lists.
@@ -595,7 +684,7 @@ class CommandRegistry:
         # Server-wide commands need an admin even here: this path is ungated
         # (batch / macro / foreach / run lines, action cmd()), so without the
         # check a host could wrap `!system set` in a `!batch`.
-        if _admin_required(name, args) and not ctx_is_admin(ctx):
+        if not _caller_may(ctx, _capability_needed(name, args)):
             await ctx.send(_admin_msg(name, args))
             return
         # A line a caller typed into `!batch` / `!foreach` runs only if the
@@ -646,12 +735,14 @@ class CommandRegistry:
         return result
 
     def _effective_access(self, name: str, args: List[str],
-                          m: "Any", user: Optional[str] = None) -> str:
+                          m: "Any", user: Optional[str] = None,
+                          roles: Tuple[str, ...] = ()) -> str:
         """Resolve the access level for this invocation: the command's
         base level, downgraded to 'all' for a read-only subcommand, then
         overridden by the active match's command_access rule. `m` is the
         active Match (or None); `user` (the caller's id) picks up the
-        per-player overrides `!host access ... user=` stores."""
+        per-player overrides `!host access ... user=` stores, `roles` (the
+        caller's role ids) the per-role ones of `role=`."""
         if name == "again":
             # `!again` carries no authority of its own: the command it replays
             # goes through this gate itself. Gating `again` too would queue
@@ -698,6 +789,18 @@ class CommandRegistry:
                     return str(mine[pre + sub_key])
                 if pre + name in mine:
                     return str(mine[pre + name])
+            # Then a per-role override (`@&<role id> <key>`): of the
+            # caller's roles' overrides for the most precise key, the most
+            # open one wins (a member holding two roles gets the better).
+            if roles and mine:
+                for key in ((sub_key, name) if sub_key is not None
+                            else (name,)):
+                    found = [str(mine[f"@&{r} {key}"]) for r in roles
+                             if f"@&{r} {key}" in mine]
+                    if found:
+                        return min(found, key=lambda v: (
+                            _ACCESS_OPENNESS.index(v)
+                            if v in _ACCESS_OPENNESS else 99))
             for table in ({k: v for k, v in mine.items()
                            if not k.startswith("@")},
                           m.rules.get("command_access")):
@@ -759,7 +862,7 @@ class CommandRegistry:
         user = ctx_user(ctx)
         if user is None:
             return False
-        return not m.is_host(user)
+        return not caller_hosts(ctx, m)
 
     @staticmethod
     def _has_inline_token(args: List[str]) -> bool:
@@ -775,6 +878,8 @@ class CommandRegistry:
         mid = mgr.active_by_channel.get(ctx.channel_key)
         m = mgr.matches.get(mid) if mid is not None else None
         if m is None:
+            return "allow"
+        if _library_edit_ok(ctx, name, args):
             return "allow"
         # Single-operator surfaces (the local CLI) carry no host-approval
         # infrastructure — there's no second person to approve a queued
@@ -794,11 +899,12 @@ class CommandRegistry:
             # Identity-less surface (shouldn't happen for our contexts) —
             # don't gate, preserving pre-host-system behavior.
             return "allow"
-        access = self._effective_access(name, args, m, user)
+        access = self._effective_access(name, args, m, user,
+                                        ctx_role_ids(ctx))
         if access == "all":
             return "allow"
         is_owner = m.is_owner(user)
-        is_host = m.is_host(user)
+        is_host = caller_hosts(ctx, m)
         if access == "owner":
             return "allow" if is_owner else "reject_owner"
         if access == "host_only":
@@ -822,7 +928,9 @@ class CommandRegistry:
         entry = {"user": ctx_user(ctx), "user_name": ctx_user_name(ctx),
                  "channel_key": ctx.channel_key, "name": name,
                  "args": list(args), "admin": ctx_is_admin(ctx),
-                 "bot_owner": ctx_is_bot_owner(ctx)}
+                 "bot_owner": ctx_is_bot_owner(ctx),
+                 "caps": sorted(caller_capabilities(ctx)),
+                 "roles": list(ctx_role_ids(ctx))}
         m.held_commands.append(entry)
         offer = getattr(ctx, "offer_resume", None)
         if callable(offer):
@@ -1021,8 +1129,9 @@ class CommandRegistry:
         # Server-wide commands: an administrator, checked BEFORE the per-match
         # gate (which is a no-op without an active match) and not subject to
         # its overrides. Rejected outright — no match host can approve them.
-        admin_cmd = _admin_required(name, args)
-        if admin_cmd and not ctx_is_admin(ctx):
+        need = _capability_needed(name, args)
+        admin_cmd = need is not None
+        if not _caller_may(ctx, need):
             await ctx.send(_admin_msg(name, args))
             return
 
@@ -1045,10 +1154,10 @@ class CommandRegistry:
         # A paused table: non-hosts' state-changing commands are refused
         # (not queued — the table is on a break), and with
         # pause_affects_hosts a host's are held for `!match resume`.
-        if not admin_cmd:
+        if not admin_cmd and not _library_edit_ok(ctx, name, args):
             pm = self._paused_match(ctx, mgr)
             if pm is not None and self._effective_access(
-                    name, args, pm, ctx_user(ctx)) != "all":
+                    name, args, pm, ctx_user(ctx), ctx_role_ids(ctx)) != "all":
                 if gate == "queue":
                     return await ctx.send(_paused_msg(pm))
                 if (bool(pm.rules.get("pause_affects_hosts", False))
@@ -1493,7 +1602,10 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
              "hash": state_hash(post),
              # The author's server authority: a replay runs the command with
              # no more than this (lines it refused live stay refused).
-             "auth": [ctx_is_admin(ctx), ctx_is_bot_owner(ctx)]}
+             "auth": _auth_record(ctx)}
+    if ctx_role_ids(ctx):
+        # The author's roles: per-role access overrides judge them again.
+        entry["roles"] = list(ctx_role_ids(ctx))
     answers = _INTERACTIVE_ANSWERS.get()
     if answers and name == "action":
         # Answers typed at a prompt replay as `answer=` tokens.
@@ -3884,6 +3996,15 @@ def _map_info_row(m: "Match", mp: "Map", view: Optional[str]) -> str:
 
 
 # ---- Commands ----------------------------------------------------------------
+def _require_match_creator(ctx: ReplyContext, mgr: MatchManager) -> None:
+    """Once a role holds the `host` capability (#190), only its members and
+    server administrators create matches; before that, anyone does."""
+    if mgr.role_perms.get("host") and not ctx_can(ctx, "host"):
+        raise VTTError("Creating matches on this server is limited to roles "
+                       "with the `host` capability and server "
+                       "administrators (`!server perms list`).")
+
+
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
 async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args or args[0].lower() == "list":
@@ -3955,7 +4076,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # Whoever held it must still host the match (a co-host may have
             # been removed while the table was paused).
             if m.owner is not None and h.get("user") is not None \
-                    and not m.is_host(h["user"]):
+                    and not m.is_host(h["user"]) \
+                    and "gm" not in (h.get("caps") or ()):
                 await ctx.send(f"⏭ Skipped `{cmd}` — {h['user_name']} is no "
                                f"longer a host.")
                 continue
@@ -3977,6 +4099,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "new":# and len(args) >= 5:
         if await return_help_if_not_enough_args(ctx, args, 5, "match", "new"):
             return
+        _require_match_creator(ctx, mgr)
         match_id, name = args[1], args[2]
         try:
             w, h = int(args[3]), int(args[4])
@@ -4201,6 +4324,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # The channel keeps showing the original.
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "clone"):
             return
+        _require_match_creator(ctx, mgr)
         src = active_match(mgr, ctx)
         new_name = " ".join(args[2:]) or None
         c = mgr.clone_match(src.id, args[1], new_name,
@@ -4800,8 +4924,11 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         VALID = {"all", "host", "host_only", "owner"}
         # user=<mention|id>: the override applies to that player only
         # (stored as `@<id> <key>` among the match's overrides).
+        # role=<mention|id|name>: for that role's members only (stored as
+        # `@&<role id> <key>`; #190).
         who = None
         who_raw = ""
+        role_raw = None
         plain = []
         for tok in args:
             if tok.lower().startswith("user="):
@@ -4809,12 +4936,21 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 who = _normalize_user_token(who_raw)
                 if not who:
                     raise VTTError("user= names a player (a mention or id).")
+            elif tok.lower().startswith("role="):
+                role_raw = tok.split("=", 1)[1]
             else:
                 plain.append(tok)
         args = plain
         asub = args[1].lower() if len(args) >= 2 else "list"
+        if who and role_raw is not None:
+            raise VTTError("An override is for one player (user=) or one "
+                           "role (role=), not both.")
         if who and asub == "set":
             who = _user_target(ctx, who_raw)
+        role_label = ""
+        if role_raw is not None:
+            rid, role_label = _role_ref(ctx, role_raw)
+            who = "&" + rid
         if asub == "list":
             if not m.access_overrides:
                 return await ctx.send(
@@ -4823,7 +4959,13 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 )
             lines = [f"**{m.name}** command-access overrides:"]
             for k in sorted(m.access_overrides.keys()):
-                if k.startswith("@"):
+                if k.startswith("@&"):
+                    rid, _, key = k[2:].partition(" ")
+                    label = _role_label(ctx, rid) or (
+                        f"a role deleted from the server (`{rid}`)")
+                    lines.append(f"- `{key}` → {m.access_overrides[k]} "
+                                 f"(for role {label} only)")
+                elif k.startswith("@"):
                     uid, _, key = k[1:].partition(" ")
                     lines.append(f"- `{key}` → {m.access_overrides[k]} "
                                  f"(for {_mention(uid)} only)")
@@ -4840,11 +4982,13 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ level must be one of: {', '.join(sorted(VALID))}."
                 )
             if key.startswith("@"):
-                raise VTTError("Name the player with user=, not in the key.")
+                raise VTTError("Name the player with user= (a role with "
+                               "role=), not in the key.")
             m.access_overrides[f"@{who} {key}" if who else key] = level
             return await ctx.send(
                 f"Access override set: `{key}` → {level}"
-                + (f" for {_mention(who)} only." if who else "."))
+                + (f" for {_override_whom(who, role_label)} only."
+                   if who else "."))
         if asub == "clear":
             if await return_help_if_not_enough_args(ctx, args, 3, "host", "access"):
                 return
@@ -4853,10 +4997,12 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if m.access_overrides.pop(full, None) is None:
                 return await ctx.send(
                     f"No override for `{key}`"
-                    + (f" for {_mention(who)}." if who else "."))
+                    + (f" for {_override_whom(who, role_label)}."
+                       if who else "."))
             return await ctx.send(
                 f"Cleared access override for `{key}`"
-                + (f" for {_mention(who)}." if who else "."))
+                + (f" for {_override_whom(who, role_label)}."
+                   if who else "."))
         return await _help_fallback(ctx, ["host", "access"], args[1] if len(args) > 1 else None)
 
     if sub in ("add", "remove"):
@@ -4882,6 +5028,123 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Removed co-host {_mention(target)} from **{m.name}**.")
 
     return await _help_fallback(ctx, ["host"], args[0] if args else None)
+
+
+def _override_whom(who: str, role_label: str) -> str:
+    """Whom a `!host access` override is for: a player, or a role."""
+    return f"role {role_label}" if who.startswith("&") else _mention(who)
+
+
+def _role_ref(ctx: ReplyContext, text: str) -> Tuple[str, str]:
+    """A role a command names (#190): (its id, how to show it). Discord
+    resolves a mention, an id or a name (`resolve_role`); elsewhere a
+    role is the word itself (`!as player <name> roles=...`)."""
+    t = text.strip()
+    if not t:
+        raise VTTError("Name a role: a mention, its id or its name.")
+    res = getattr(ctx, "resolve_role", None)
+    if callable(res):
+        return res(t)
+    if t.startswith("<@&") and t.endswith(">"):
+        t = t[3:-1]
+    return t, f"`{t}`"
+
+
+def _role_label(ctx: ReplyContext, rid: str) -> Optional[str]:
+    """How to show role `rid`: its current name (Discord), the word itself
+    elsewhere, or None when the server no longer has it."""
+    namer = getattr(ctx, "role_name", None)
+    if callable(namer):
+        return namer(rid)
+    return f"`{rid}`"
+
+
+async def _server_perms(ctx: ReplyContext, args: List[str],
+                        mgr: MatchManager) -> None:
+    """`!server perms [list] | grant | revoke`: the capabilities the
+    server's roles hold (#190)."""
+    action = args[1].lower() if len(args) > 1 else "list"
+    usage = ("!server perms [list] | grant <capability> <role ...> | revoke "
+             "<capability> <role ...>")
+    if action == "list":
+        _check_tail(args, 2, (), "!server perms [list]")
+        lines = ["**Capabilities** (a server administrator holds all of "
+                 "them):"]
+        gone = 0
+        for cap, desc in CAPABILITIES.items():
+            ids = mgr.role_perms.get(cap) or []
+            shown = []
+            for rid in ids:
+                label = _role_label(ctx, rid)
+                if label is None:
+                    gone += 1
+                    label = f"a role deleted from the server (`{rid}`)"
+                shown.append(label)
+            lines.append(f"- `{cap}` ({desc}): "
+                         + (", ".join(shown) if shown else "no role"))
+        if mgr.role_perms.get("host"):
+            lines.append("Only the members of roles holding `host` and "
+                         "administrators create matches here.")
+        if gone:
+            lines.append(f"{gone} deleted role(s) drop out at the next "
+                         f"`grant` or `revoke`.")
+        return await ctx.send("\n".join(lines))
+    if action not in ("grant", "revoke"):
+        return await _help_fallback(ctx, ["server", "perms"], args[1])
+    if len(args) < 4:
+        raise VTTError(f"Usage: `{usage}`.")
+    cap = args[2].lower()
+    if cap not in CAPABILITIES:
+        raise VTTError(f"`{args[2]}` isn't a capability; the capabilities: "
+                       + ", ".join(f"`{c}`" for c in CAPABILITIES) + ".")
+    rid, label = _role_ref(ctx, " ".join(args[3:]))
+    # Roles deleted from the server leave the map with any edit.
+    dropped = []
+    for c, ids in list(mgr.role_perms.items()):
+        keep = []
+        for i in ids:
+            if _role_label(ctx, i) is None:
+                dropped.append(f"`{i}` ({c})")
+            else:
+                keep.append(i)
+        if keep:
+            mgr.role_perms[c] = keep
+        else:
+            mgr.role_perms.pop(c, None)
+    ids = list(mgr.role_perms.get(cap) or [])
+    lines = []
+    if action == "grant":
+        if rid in ids:
+            lines.append(f"Role {label} already holds `{cap}`.")
+        else:
+            first_host = cap == "host" and not ids
+            mgr.role_perms[cap] = sorted(ids + [rid])
+            audit_note(f"granted `{cap}` to role {label}")
+            lines.append(f"✅ Role {label} now holds `{cap}`: "
+                         f"{CAPABILITIES[cap]}.")
+            if first_host:
+                lines.append("From now on only the members of roles "
+                             "holding `host` and administrators can create "
+                             "matches here.")
+    else:
+        if rid not in ids:
+            lines.append(f"Role {label} doesn't hold `{cap}`.")
+        else:
+            ids.remove(rid)
+            if ids:
+                mgr.role_perms[cap] = ids
+            else:
+                mgr.role_perms.pop(cap, None)
+            audit_note(f"revoked `{cap}` from role {label}")
+            lines.append(f"✅ Role {label} no longer holds `{cap}`.")
+            if cap == "host" and not ids:
+                lines.append("No role holds `host` now: anyone can create "
+                             "matches again.")
+    if dropped:
+        audit_note("dropped deleted roles: " + ", ".join(dropped))
+        lines.append("Dropped role(s) deleted from the server: "
+                     + ", ".join(dropped) + ".")
+    return await ctx.send("\n".join(lines))
 
 
 def _user_target(ctx, tok: str) -> str:
@@ -4925,7 +5188,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -5013,17 +5276,34 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if role in ("host", "owner"):
         ctx.user_id = "cli"
         ctx.user_name = "cli"
+        ctx.role_ids = ()
         return await ctx.send("You are now the owner identity `cli`.")
     if role == "player":
-        name = args[1] if len(args) >= 2 else "player"
+        # roles=a,b: the server roles the player holds (#190), by the ids
+        # `!server perms` and `!host access ... role=` name (here, any word).
+        roles: Tuple[str, ...] = ()
+        rest = []
+        for tok in args[1:]:
+            if tok.lower().startswith("roles="):
+                roles = tuple(r.strip() for r in tok.split("=", 1)[1].split(",")
+                              if r.strip())
+            else:
+                rest.append(tok)
+        _check_tail(rest, 1, (), "!as player [<name>] [roles=<role,...>]")
+        name = rest[0] if rest else "player"
         ctx.user_id = name
         ctx.user_name = name
+        ctx.role_ids = roles
         tail = ("" if getattr(ctx, "auto_approve", False)
                 else " — mutating commands are held for host approval")
-        return await ctx.send(f"You are now player `{name}` (non-host){tail}.")
+        held = (f" with role(s) {', '.join(f'`{r}`' for r in roles)}"
+                if roles else "")
+        return await ctx.send(f"You are now player `{name}` (non-host)"
+                              f"{held}{tail}.")
     # Treat any other token as a literal identity to assume.
     ctx.user_id = role
     ctx.user_name = role
+    ctx.role_ids = ()
     return await ctx.send(f"You are now `{role}`.")
 
 
@@ -5045,6 +5325,11 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     lines = [f"**You:** {who}"
              + (" · server administrator" if ctx_is_admin(ctx) else "")
              + (" · bot owner" if ctx_is_bot_owner(ctx) else "")]
+    caps = caller_capabilities(ctx)
+    if caps and not ctx_is_admin(ctx):
+        lines.append("**Capabilities:** " + ", ".join(
+            f"`{c}`" for c in CAPABILITIES if c in caps)
+            + " (from your roles, `!server perms`)")
     if getattr(mgr, "guild_key", LOCAL_WORKSPACE) != LOCAL_WORKSPACE:
         lines.append(f"**Server workspace:** {mgr.guild_name} "
                      f"(`{mgr.guild_key}`)")
@@ -5062,6 +5347,8 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         role = "owner"
     elif user is not None and m.is_host(user):
         role = "co-host"
+    elif ctx_can(ctx, "gm"):
+        role = "host (the `gm` capability)"
     else:
         role = "player"
     lines.append(f"**Your role:** {role}")
@@ -5451,7 +5738,7 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
 
 @registry.command(
     "server", snapshot=False,
-    usage="!server <wipe|storage|audit|errors|backups|recover> ...",
+    usage="!server <wipe|storage|audit|errors|backups|recover|perms> ...",
     desc=(
         "This server's data. `!server storage` shows how much disk it uses "
         "against its limit. `!server wipe matches|all` (server "
@@ -5459,7 +5746,9 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
         "systems to a fresh `default` and empties the saves folder and the "
         "entity templates; sprites are kept. It asks you to type a confirmation phrase naming the "
         "server within 2 minutes; the wiped data is kept 24 hours, and "
-        "`!server wipe undo` brings it back. Only runs typed on its own."
+        "`!server wipe undo` brings it back. Only runs typed on its own. "
+        "`!server perms` lists which roles hold which capabilities "
+        "(administrators grant and revoke them)."
     ),
 )
 async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -5468,6 +5757,8 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     sub = args[0].lower()
     st = storage_of(mgr)
+    if sub == "perms":
+        return await _server_perms(ctx, args, mgr)
     if sub == "storage":
         _check_tail(args, 1, (), "!server storage")
         if st is None:
@@ -5881,6 +6172,17 @@ registry.annotate_sub("server", "recover",
                            "(their units' vars take its names), after a "
                            "preview. Matches whose files carry a backup are "
                            "rebuilt from it either way. Administrators only.")
+registry.annotate_sub(
+    "server", "perms",
+    usage=("!server perms [list] | !server perms grant <capability> "
+           "<role ...> | !server perms revoke <capability> <role ...>"),
+    desc=("Which Discord roles hold which capabilities on this server (#190): "
+          + "; ".join(f"`{c}`: {d}" for c, d in CAPABILITIES.items())
+          + ". A server administrator holds every one. `grant` / `revoke` "
+          "(administrators) take a role mention, id or name; roles are kept "
+          "by id, so a renamed role keeps its capabilities, and one deleted "
+          "from the server drops out at the next grant or revoke. Anyone can "
+          "list them. Changes show in `!server audit`."))
 registry.annotate_sub("server", "storage", usage="!server storage",
                       desc="This server's disk use against its storage limit, broken down largest first: each match and its undo history, templates, old template versions, saves, sprites, corrupt files and the workspace / systems files.")
 registry.annotate_sub("server", "errors",
@@ -6035,38 +6337,55 @@ def split_command_line(line: str) -> List[str]:
                                            parts[1] if len(parts) > 1 else "")
 
 
-def _template_saver_ok(ctx: ReplyContext, tpl: Dict[str, Any]) -> bool:
-    """Whether the caller may replace or delete `tpl`: its saver, or a server
-    administrator."""
-    if ctx_is_admin(ctx):
+def _auth_record(ctx: ReplyContext) -> List[Any]:
+    """A journal entry's record of its author's server authority: the
+    administrator and bot-owner flags, plus the capabilities its roles
+    gave it when it held some without being an administrator."""
+    out: List[Any] = [ctx_is_admin(ctx), ctx_is_bot_owner(ctx)]
+    caps = caller_capabilities(ctx)
+    if caps and not out[0]:
+        out.append(sorted(caps))
+    return out
+
+
+def _template_saver_ok(ctx: ReplyContext, tpl: Dict[str, Any],
+                       cap: str = "templates") -> bool:
+    """Whether the caller may replace or delete `tpl`: its saver, a server
+    administrator, or a holder of `cap` (templates / prefabs)."""
+    if ctx_can(ctx, cap):
         return True
     user = ctx_user(ctx)
     return user is not None and tpl.get("saved_by") == user
 
 
-def _template_may_save(ctx: ReplyContext, mgr: MatchManager) -> None:
-    """Saving a template needs a host of this channel's match (or a server
-    administrator), and an identity to record as its saver."""
+def _template_may_save(ctx: ReplyContext, mgr: MatchManager,
+                       cap: str = "templates") -> None:
+    """Saving a template (prefab) needs a host of this channel's match, a
+    server administrator or a holder of `cap`, and an identity to record as
+    its saver."""
+    what = "Templates" if cap == "templates" else "Prefabs"
     if ctx_user(ctx) is None:
-        raise VTTError("Templates can only be saved with an identity to "
+        raise VTTError(f"{what} can only be saved with an identity to "
                        "record as the saver (a command a person runs, or an "
                        "action they run with `template` on "
                        "action_cmd_allowlist).")
-    if ctx_is_admin(ctx):
+    if ctx_can(ctx, cap):
         return
     mid = mgr.get_active_for_channel(ctx.channel_key)
     m = mgr.matches.get(mid) if mid else None
-    if m is None or not m.is_host(ctx_user(ctx)):
-        raise VTTError("Saving a template needs a host of this channel's "
-                       "match (or a server administrator).")
+    if m is None or not caller_hosts(ctx, m):
+        raise VTTError(f"Saving a {what[:-1].lower()} needs a host of this "
+                       f"channel's match, a server administrator or a role "
+                       f"with the `{cap}` capability (`!server perms`).")
 
 
 def _require_saver(ctx: ReplyContext, name: str, tpl: Dict[str, Any],
                    verb: str) -> None:
     if not _template_saver_ok(ctx, tpl):
         who = tpl.get("saved_by_name") or tpl.get("saved_by") or "someone"
-        raise VTTError(f"Template `{name}` was saved by {who}: only they or "
-                       f"a server administrator can {verb} it.")
+        raise VTTError(f"Template `{name}` was saved by {who}: only they, "
+                       f"a server administrator or a role with the "
+                       f"`templates` capability can {verb} it.")
 
 
 def _get_template(mgr: MatchManager, raw: str) -> Tuple[str, Dict[str, Any]]:
@@ -6093,13 +6412,19 @@ def _template_reader(ctx: ReplyContext,
     """Who reads the template library in this command: the command's
     reader on the channel's match (None for a host outside a team view),
     else, in a channel without a match, None for an administrator and a
-    non-host reader for anyone else."""
+    non-host reader for anyone else. Outside a team view a holder of the
+    `templates` or `gm` capability reads everything, as a host does."""
     mid = mgr.active_by_channel.get(ctx.channel_key)
     if mid is not None and mid in mgr.matches:
-        return VAR_READER.get()
-    if ctx_is_admin(ctx):
+        reader = VAR_READER.get()
+    elif ctx_is_admin(ctx):
         return None
-    return VarReader(team=None, host=False)
+    else:
+        reader = VarReader(team=None, host=False)
+    if reader is not None and reader.team is None and (
+            ctx_can(ctx, "templates") or ctx_can(ctx, "gm")):
+        return None
+    return reader
 
 
 def _template_rules(ctx: ReplyContext, mgr: MatchManager) -> Dict[str, Any]:
@@ -7137,9 +7462,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"`{name}` is referenced by {', '.join(f'`{d}`' for d in deps)}."
                 f" `!template rename {name} {new_name} force` (a server "
                 f"administrator) renames it and updates those references.")
-        if deps and not ctx_is_admin(ctx):
+        if deps and not ctx_can(ctx, "templates"):
             raise VTTError("Renaming a referenced partial needs a server "
-                           "administrator.")
+                           "administrator or a role with the `templates` "
+                           "capability.")
         old = mgr.templates.get(new_name)
         if old is not None:
             _require_saver(ctx, new_name, old, "replace")
@@ -7210,9 +7536,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f" `!template delete {name} force` (a server administrator) "
                 f"deletes it and writes its current contents into those "
                 f"templates in place of the reference.")
-        if deps and not ctx_is_admin(ctx):
+        if deps and not ctx_can(ctx, "templates"):
             raise VTTError("Deleting a referenced partial needs a server "
-                           "administrator.")
+                           "administrator or a role with the `templates` "
+                           "capability.")
         resolver = _template_resolver(mgr, ctx, library=True)
         inlined: Dict[str, Dict[str, Any]] = {}
 
@@ -7629,10 +7956,11 @@ def _get_prefab(mgr: MatchManager, raw: str,
 
 def _require_prefab_saver(ctx: ReplyContext, name: str, pf: Dict[str, Any],
                           verb: str) -> None:
-    if not _template_saver_ok(ctx, pf):
+    if not _template_saver_ok(ctx, pf, "prefabs"):
         who = pf.get("saved_by_name") or pf.get("saved_by") or "someone"
-        raise VTTError(f"Prefab `{name}` was saved by {who}: only they or a "
-                       f"server administrator can {verb} it.")
+        raise VTTError(f"Prefab `{name}` was saved by {who}: only they, a "
+                       f"server administrator or a role with the `prefabs` "
+                       f"capability can {verb} it.")
 
 
 def _store_prefab(ctx: ReplyContext, mgr: MatchManager, name: str,
@@ -7887,7 +8215,7 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
                 for a in args[6:] if "=" in a}
         _check_tail(args, 6, ("map", "only", "definitions"), usage)
-        _template_may_save(ctx, mgr)
+        _template_may_save(ctx, mgr, "prefabs")
         m = active_match(mgr, ctx)
         smp = _one_map(ctx, m, opts.get("map"))
         name = check_prefab_name(args[1])
@@ -8537,10 +8865,19 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                 # The lower of the author's recorded authority and the
                 # replaying admin's (an entry without a record has none).
                 auth = e.get("auth")
-                auth = auth if isinstance(auth, list) and len(auth) == 2 \
+                auth = auth if isinstance(auth, list) and len(auth) in (2, 3) \
                     else [False, False]
                 rctx.is_admin = bool(auth[0]) and ctx_is_admin(ctx)
                 rctx.is_bot_owner = bool(auth[1]) and ctx_is_bot_owner(ctx)
+                # The capabilities its roles gave it (#190), again no more
+                # than the replayer holds.
+                rctx.capabilities = [
+                    c for c in (auth[2] if len(auth) == 3
+                                and isinstance(auth[2], list) else [])
+                    if isinstance(c, str) and ctx_can(ctx, c)]
+                roles = e.get("roles")
+                rctx.role_ids = tuple(str(r) for r in roles) \
+                    if isinstance(roles, list) else ()
                 # Each entry was a top-level command with its own partial
                 # cache, whose template_data budget it spent alone.
                 cache_token = PARTIAL_CACHE.set({})
@@ -8610,6 +8947,12 @@ class _HolderCtx:
         self.user_name = held.get("user_name") or held.get("user")
         self.is_admin = bool(held.get("admin", False))
         self.is_bot_owner = bool(held.get("bot_owner", False))
+        caps = held.get("caps")
+        self.capabilities = ([c for c in caps if isinstance(c, str)]
+                             if isinstance(caps, list) else [])
+        roles = held.get("roles")
+        self.role_ids = (tuple(str(r) for r in roles)
+                         if isinstance(roles, list) else ())
         # A single-operator surface's held command keeps its blanket
         # authority only when it was held there.
         self.auto_approve = bool(getattr(inner, "auto_approve", False)
@@ -8720,14 +9063,17 @@ registry.annotate_sub(
 registry.annotate_sub(
     "host", "access",
     usage=("!host access <set <cmd> <level> | clear <cmd> | list> "
-           "[user=<player>]"),
+           "[user=<player>] [role=<role>]"),
     desc=(
         "Per-match overrides of the command-access gate (owner only). "
         "With `user=<mention or id>` an override applies to that player "
         "only and wins over the match-wide ones: `!host access set ent all "
         "user=@bob` lets bob run `!ent` without approval while everyone "
         "else still needs it. Stored by user id, so a nickname change "
-        "keeps it. "
+        "keeps it. `role=<mention, id or name>` makes it apply to that "
+        "role's members, after a player's own override and before the "
+        "match-wide ones; a member of several such roles gets the most "
+        "open level. Stored by role id, so renaming the role keeps it. "
         "`set <cmd> <level>` keys on a command (\"find\") or "
         "command+sub (\"ent dump\"); levels: all / host / host_only / "
         "owner. Tighten a normally-free read so it needs host approval in "
@@ -13435,13 +13781,13 @@ def _pov_hides(m: "Match", pov: Optional[str], eid: str) -> bool:
 
 
 def _acts_as_host(ctx: ReplyContext, m: "Match") -> bool:
-    """Whether the caller has host authority on `m` — or the gate doesn't
-    apply at all (auto-approve surface, open match, no identity), the same
-    no-op shape as the access gate."""
+    """Whether the caller has host authority on `m` (a host, or a holder of
+    the `gm` capability) — or the gate doesn't apply at all (auto-approve
+    surface, open match, no identity), the same no-op shape as the access
+    gate."""
     if getattr(ctx, "auto_approve", False) or getattr(m, "owner", None) is None:
         return True
-    user = ctx_user(ctx)
-    return user is None or m.is_host(user)
+    return ctx_user(ctx) is None or caller_hosts(ctx, m)
 
 
 _VISIBILITY_RULES = ("entity_visibility_condition", "tile_visibility_condition",
@@ -14670,7 +15016,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                   f"[hide=<layers>] [coords=on|off] "
                                   f"[legend=on|off]`.")
         want_full = bool(sub) and sub[0].lower() == "full"
-        if want_full and not m.is_host(ctx_user(ctx)):
+        if want_full and not caller_hosts(ctx, m):
             return await ctx.send("❌ `!map image full` (omniscient) is host-only.")
         pov = _view_pov(ctx, m, sub)
         hook = getattr(ctx, "post_scene_image", None)
@@ -24046,7 +24392,9 @@ def _set_author(m: "Match", kind: str, name: str, ctx: ReplyContext) -> None:
     """Record who wrote entry `name` (none on a surface with no identity)."""
     authors = getattr(m, _AUTHORED[kind][1])
     user = ctx_user(ctx)
-    if user is None or getattr(ctx, "auto_approve", False):
+    if user is None or getattr(ctx, "auto_approve", False) or (
+            not m.is_host(user) and ctx_can(ctx, "gm")):
+        # A `gm` holder writes as a host, and no record says so later.
         authors.pop(name, None)
     else:
         authors[name] = str(user)

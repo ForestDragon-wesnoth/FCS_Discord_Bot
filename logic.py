@@ -533,6 +533,68 @@ CURRENT_WORKSPACE: "contextvars.ContextVar[Optional[Any]]" = (
 PLACEMENT_IGNORE: "contextvars.ContextVar[Tuple[str, ...]]" = (
     contextvars.ContextVar("vtt_placement_ignore", default=()))
 
+# Discord-role capabilities (#190): what a server's administrators let the
+# members of a role do beyond a player's reach. A fixed set (user call, "for
+# now"); MatchManager.role_perms maps each to role ids (`!server perms`). A
+# server administrator holds every one; the CLI / GUI operator is one.
+CAPABILITIES: Dict[str, str] = {
+    "systems": "edit the game systems and their defaults (`!system` edits, "
+               "`!defvar`, `!defpassive`, `!gclamp`, `!log format`)",
+    "templates": "save, import, edit and delete entity and partial "
+                 "templates, other people's included",
+    "prefabs": "save, import, edit and delete prefabs, other people's "
+               "included",
+    "host": "create matches (`!match new`, `!match clone`); once a role "
+            "holds it, only its members and administrators can",
+    "gm": "act as a host of every match on the server (not as its owner: "
+          "deleting it, `!host add` and the like stay the owner's)",
+    "files": "read and write the server's saves folder (`!store`, `!run`, "
+             "`!history export / import`, `!match replay`, `!match journal "
+             "export`)",
+    "server": "`!server wipe`, `!server backups`, `!server recover`",
+}
+# The capabilities an action body's cmd() lines keep (action._BufferCtx):
+# per-match authority, like a host's identity. The server-wide ones stay
+# out, as the administrator flag does.
+MATCH_CAPABILITIES = frozenset({"templates", "prefabs", "host", "gm"})
+
+
+def caller_capabilities(ctx: Any) -> "frozenset[str]":
+    """The capabilities of a command's caller: all of them for a server
+    administrator (or a single-operator surface), a fixed set when the
+    context carries one (a held command, a journal replay, an action's
+    cmd() lines), else those its roles hold on the running workspace."""
+    if getattr(ctx, "auto_approve", False) or getattr(ctx, "is_admin", False):
+        return frozenset(CAPABILITIES)
+    fixed = getattr(ctx, "capabilities", None)
+    if fixed is not None:
+        return frozenset(c for c in fixed if c in CAPABILITIES)
+    # Outside a command (a Discord button) the surface's own workspace.
+    mgr = CURRENT_WORKSPACE.get() or getattr(ctx, "_mgr", None)
+    perms = getattr(mgr, "role_perms", None) or {}
+    roles = {str(r) for r in (getattr(ctx, "role_ids", None) or ())}
+    if not roles or not perms:
+        return frozenset()
+    return frozenset(c for c, ids in perms.items()
+                     if c in CAPABILITIES and roles.intersection(ids))
+
+
+def check_role_perms(raw: Any) -> Dict[str, List[str]]:
+    """A saved role_perms map, cleaned: known capabilities only, each a
+    sorted list of distinct role ids (text)."""
+    out: Dict[str, List[str]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for cap, ids in raw.items():
+        if cap not in CAPABILITIES or not isinstance(ids, list):
+            continue
+        clean = sorted({str(i) for i in ids if isinstance(i, (str, int))
+                        and not isinstance(i, bool) and str(i)})
+        if clean:
+            out[cap] = clean
+    return out
+
+
 # Partial templates resolved during the running command, by (server, match
 # id, pinning, name). The library can't change mid-command except through a
 # template command, which clears it (invalidate_partial_cache). Set by each
@@ -27938,6 +28000,10 @@ class MatchManager:
         # is refused and nothing is saved until an administrator recovers
         # it (storage.Storage.load_server). Not saved.
         self.recovery: Optional[Dict[str, Any]] = None
+        # Discord-role capabilities (#190, `!server perms`): capability ->
+        # role ids. Saved in workspace.json; kept across `!server wipe`
+        # and `!store load` (it is who may do what, not game data).
+        self.role_perms: Dict[str, List[str]] = {}
 
     # ----- server-wide undo and audit -----
     def server_state(self) -> Dict[str, Any]:

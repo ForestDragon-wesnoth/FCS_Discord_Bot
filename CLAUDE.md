@@ -458,6 +458,35 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   by `!host access` / `command_access`, and it skips the per-match gate once
   passed. Action bodies can't run them at all (`_BufferCtx` carries no admin
   flag — default-deny).
+- **Role capabilities** (#190, user design; 1026-1029): `MatchManager.
+  role_perms` (capability -> Discord role ids, saved in workspace.json,
+  kept across `!server wipe`, its undo and `!store load`) gives a role's
+  members one of the fixed `logic.CAPABILITIES` (user call, "for now"):
+  `systems`, `templates`, `prefabs`, `host`, `gm`, `files`, `server`.
+  `!server perms [list] | grant | revoke <capability> <role>` (edits
+  administrator-only, recorded with `audit_note`, outside `!system
+  undo`; anyone lists). A server administrator holds every one (so is a
+  host of every match). `_capability_needed` maps each server-wide
+  invocation to `admin` (only administrators: `!server audit / errors /
+  perms` edits) or the capability whose holders may run it too, checked
+  by `_caller_may` at both admin checks. `logic.caller_capabilities(ctx)`:
+  all for an administrator, a fixed `capabilities` list when the context
+  carries one (a held command, a journal replay's `auth[2]`, an action's
+  `_BufferCtx`, which keeps only `MATCH_CAPABILITIES`), else from
+  `ctx.role_ids` (Discord: the member's roles; CLI / harness `!as player
+  <name> roles=a,b`). A held command and a journal entry also record the
+  caller's role ids (`roles`), so a resume or a replay judges per-role
+  access overrides as the caller met them. `templates` / `prefabs`: save without hosting and
+  edit anyone's entries (`_template_may_save`, `_template_saver_ok`, a
+  forced partial rename / delete), and read the library as a host
+  outside a team view. `host`: once any role holds it, only its holders
+  and administrators create matches (`_require_match_creator`: `!match
+  new` / `clone`). `gm`: a host of every match (`caller_hosts`, behind
+  `_acts_as_host`, the gate, `require_target_host`, the Discord buttons),
+  never its owner; what a `gm` writes records no player author.
+  Roles are kept by id: Discord's `resolve_role` takes a mention, id or
+  name, `role_name` shows the current name (None = deleted; dropped at
+  the next grant / revoke).
 - **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
   `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
   (`require_target_host`) — the access gate only checks the CHANNEL's match,
@@ -2362,7 +2391,9 @@ hardcodes**.
   `command_access` rule (`!system access`, per system). Per-player
   overrides (`!host access ... user=<player>`) live in the same dict as
   `@<user id> <key>` and win over both (`_effective_access(..., user)`)
-  (773). No-op without an
+  (773); per-role ones (`!host access ... role=<role>`, `@&<role id>
+  <key>`) come next, the more precise key first, the most open level of
+  the caller's roles for it (`_ACCESS_OPENNESS`) (1029). No-op without an
   active match, identity or owner — hence the separate admin and
   target-host checks.
 - **Approval queue:** `Match.add_pending_request` (runtime-only; carried
@@ -2370,7 +2401,10 @@ hardcodes**.
   buttons. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
   `_channel_pointed_at`).
-- **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner only).
+- **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner
+  only), plus every holder of the `gm` capability (§3 "Role
+  capabilities"; `caller_hosts`). A check on the caller's host authority
+  goes through `caller_hosts` / `_acts_as_host`, never `m.is_host(user)`.
   Pause (§7.3).
 - **POV:** a channel's view is its binding's `pov` (`!match bind pov=<team>`;
   absent = omniscient), or a CLI `!as view` preview, or a host's one-off
