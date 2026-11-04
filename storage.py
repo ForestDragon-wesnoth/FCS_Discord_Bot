@@ -57,7 +57,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name, legacy_template_fixes,
-                   LEGACY_IDS_OK, owner_limit, unreachable_id)
+                   LEGACY_IDS_OK, owner_limit, unreachable_id,
+                   check_role_perms)
 from match_history import MatchHistory, HistoryError, _now_iso
 from journal import start_header
 
@@ -677,6 +678,7 @@ class Storage:
         mgr.default_system_name = "default" if "default" in systems \
             else sorted(systems)[0]
         mgr.default_system_per_channel = {}
+        mgr.role_perms = {}
         pointers: Dict[str, Any] = {}
         ws_path = os.path.join(sdir, "workspace.json")
         if os.path.exists(ws_path):
@@ -695,6 +697,7 @@ class Storage:
                     str(k): str(v) for k, v in
                     (raw.get("default_system_per_channel") or {}).items()
                     if v in systems}
+                mgr.role_perms = check_role_perms(raw.get("role_perms"))
             except Exception as ex:  # noqa: BLE001
                 notes.append(self._quarantine(key, ws_path, type(ex).__name__))
         # Matches.
@@ -936,7 +939,9 @@ class Storage:
     def _workspace_dict(mgr: MatchManager) -> Dict[str, Any]:
         return {"active_by_channel": dict(mgr.active_by_channel),
                 "default_system_name": mgr.default_system_name,
-                "default_system_per_channel": dict(mgr.default_system_per_channel)}
+                "default_system_per_channel": dict(mgr.default_system_per_channel),
+                "role_perms": {c: list(ids) for c, ids in
+                               sorted(mgr.role_perms.items())}}
 
     @staticmethod
     def _systems_dict(mgr: MatchManager) -> Dict[str, Any]:
@@ -1641,7 +1646,15 @@ class Storage:
         ws_dest = os.path.join(sdir, "workspace.json")
         if os.path.exists(ws_src):
             if scope == "all" or not os.path.exists(ws_dest):
-                shutil.copy2(ws_src, ws_dest)
+                # The role capabilities stay as they are now: a wipe kept
+                # them, and edits made since aren't undone with it.
+                try:
+                    old = self._read_json(ws_src)
+                    old["role_perms"] = {c: list(ids) for c, ids in
+                                         sorted(mgr.role_perms.items())}
+                    _write_text(ws_dest, json.dumps(old, sort_keys=True))
+                except (OSError, ValueError, AttributeError):
+                    shutil.copy2(ws_src, ws_dest)
             else:
                 # A matches-only wipe kept the defaults; restore the channel
                 # pointers alone.

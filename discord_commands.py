@@ -223,6 +223,12 @@ DM_REFUSAL = ("❌ This bot only works in servers: each server keeps its own "
               "the bot there.")
 
 
+def _role_ids(member) -> tuple:
+    """A guild member's role ids, as text (none for a non-member)."""
+    return tuple(str(r.id) for r in (getattr(member, "roles", None) or ())
+                 if getattr(r, "id", None) is not None)
+
+
 class DiscordCtxWrapper:
     # Discord renders ANSI colors inside ```ansi code blocks, so the
     # colorized map renderer is enabled for this surface.
@@ -258,8 +264,46 @@ class DiscordCtxWrapper:
         # guild Administrator permission — see vtt_commands.ctx_is_admin.
         self.is_admin = _is_guild_admin(author)
         self.is_bot_owner = _is_bot_owner(author, mgr)
+        # The author's roles (#190: `!server perms` capabilities, `!host
+        # access ... role=` overrides), by id.
+        self.role_ids = _role_ids(author)
+        self._guild = getattr(ctx, "guild", None)
         self._sent = 0
         self._dropped = 0
+
+    def resolve_role(self, text: str) -> tuple:
+        """A role a command names (`!server perms`, `!host access ...
+        role=`): a mention, an id or a name (any case). (id, label)."""
+        guild = self._guild
+        roles = list(getattr(guild, "roles", None) or ())
+        t = text.strip()
+        if t.startswith("<@&") and t.endswith(">"):
+            t = t[3:-1]
+        if t.isdigit():
+            for r in roles:
+                if str(r.id) == t:
+                    return str(r.id), f"**@{r.name}**"
+            raise vtt_commands.VTTError(
+                f"This server has no role with id `{t}`.")
+        name = t[1:] if t.startswith("@") else t
+        found = [r for r in roles if r.name.lower() == name.lower()]
+        if not found:
+            raise vtt_commands.VTTError(
+                f"This server has no role named `{name}` (mention it, or "
+                f"give its id).")
+        if len(found) > 1:
+            raise vtt_commands.VTTError(
+                f"{len(found)} roles are named `{name}`: mention the one you "
+                f"mean, or give its id.")
+        return str(found[0].id), f"**@{found[0].name}**"
+
+    def role_name(self, rid: str):
+        """Role `rid` as listings show it, None when the server no longer
+        has it."""
+        for r in (getattr(self._guild, "roles", None) or ()):
+            if str(r.id) == str(rid):
+                return f"**@{r.name}**"
+        return None
 
     def _reply_cap(self, rule: str = "reply_message_cap",
                    default: int = 8) -> int:
@@ -464,6 +508,8 @@ class _InteractionCtx(DiscordCtxWrapper):
         user = interaction.user
         self.is_admin = _is_guild_admin(user)
         self.is_bot_owner = _is_bot_owner(user, mgr)
+        self.role_ids = _role_ids(user)
+        self._guild = guild
         self.user_id = str(getattr(user, "id", "")) or "unknown"
         self.user_name = (
             getattr(user, "display_name", None)
@@ -537,7 +583,7 @@ class _ApprovalView(discord.ui.View):
     async def _require_host(self, interaction) -> bool:
         m = self._match()
         ictx = _InteractionCtx(interaction, self._mgr)
-        if m is None or not m.is_host(ictx.user_id):
+        if m is None or not vtt_commands.caller_hosts(ictx, m):
             await interaction.response.send_message(
                 "❌ Only a host can resolve this request.", ephemeral=True
             )
@@ -642,7 +688,8 @@ class _ResumeView(discord.ui.View):
     async def _require_host(self, interaction) -> bool:
         m = self._match()
         ictx = _InteractionCtx(interaction, self._mgr)
-        if m is None or (m.owner is not None and not m.is_host(ictx.user_id)):
+        if m is None or (m.owner is not None
+                         and not vtt_commands.caller_hosts(ictx, m)):
             await interaction.response.send_message(
                 "❌ Only a host can resume the match.", ephemeral=True)
             return False

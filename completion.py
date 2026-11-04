@@ -36,7 +36,8 @@ _FREE_SLOTS = {
     "phrase", "condition", "effect", "new_name", "new_id", "init", "field",
     "base", "op", "0-100", "MB", "csv", "row", "legend", "char", "color",
     "r,g,b", "predicate", "selector", "selector_a", "selector_b", "reason",
-    "args", "tokens", "label", "user", "server", "metric",
+    "args", "tokens", "label", "user", "server", "metric", "role",
+    "role,...",
     "anchor", "word", "type", "template_text", "winner", "stat", "pid",
     "passive_id", "path", "var.path", "key", "dest_path", "stash_path",
     "shape args", "cmd1", "cmd2", "file", "seed", "pos", "new_map", "ref",
@@ -341,6 +342,22 @@ def _declared_tags(mgr, ctx) -> List[str]:
     return sorted(set(vocab) | set(logic.ENGINE_TAGS))
 
 
+def _readable_template_names(mgr: Any, ctx: Any) -> List[str]:
+    """The library's names the caller may read: a private template
+    (`!template private`) left out for a non-host (the same reader as
+    `!template list`)."""
+    from vtt_commands import _var_reader
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    if mid is not None and mid in mgr.matches:
+        reader = _var_reader(ctx, mgr, mid)
+    else:
+        from vtt_commands import ctx_is_admin
+        reader = None if ctx_is_admin(ctx) else logic.VarReader(None, False)
+    return sorted(n for n, t in mgr.templates.items()
+                  if reader is None or not (isinstance(t, dict) and t.get(
+                      logic.TEMPLATE_PRIVATE_KEY)))
+
+
 def _slot_names(slot: str, root: str, sub: Optional[str],
                 binds: Dict[str, str], word: str, mgr, ctx) -> List[str]:
     """The candidates for one placeholder, from its name and command."""
@@ -350,6 +367,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return []                      # a new name, or `=n` / `+n`
     if (root in ("approve", "deny") and slot == "id") or slot == "request id":
         return sorted(m.pending_requests) if m is not None else []
+    if slot == "capability":
+        return list(logic.CAPABILITIES)
     if root == "help" and slot == "sub":
         meta = registry._help.get((binds.get("command") or "").lower()) or {}
         return sorted(meta.get("subs") or {})
@@ -411,10 +430,10 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return _corpse_ids(mgr, ctx)
     if slot in ("template", "template_ref") or (
             root == "template" and slot in ("other", "prefix")):
-        return sorted(mgr.templates)
+        return _readable_template_names(mgr, ctx)
     if slot == "partial":
-        return sorted(n for n, t in mgr.templates.items()
-                      if isinstance(t, dict) and t.get("kind") == "partial")
+        return [n for n in _readable_template_names(mgr, ctx)
+                if mgr.templates[n].get("kind") == "partial"]
     if slot in ("system", "dest_match") or (root == "match" and slot == "id"):
         return sorted(mgr.systems if slot == "system" else mgr.matches)
     if slot == "rule":
@@ -468,7 +487,7 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(getattr(mgr, "prefabs", {}) or {})
     if slot == "name":
         if root == "template":
-            return sorted(mgr.templates)
+            return _readable_template_names(mgr, ctx)
         if root == "system" and sub in _SYSTEM_LIBS:
             # A library entry: the system's (inherited ones too), plus the
             # channel's match's for `promote`.

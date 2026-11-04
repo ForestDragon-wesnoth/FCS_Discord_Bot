@@ -14923,7 +14923,7 @@ SCENARIO 572 — bot-wide commands need a server administrator
 
 Expected: `bob` created and hosts `bobm`, but hosting a match is NOT enough
 for bot-wide state. `!system set`, `!defvar add`, `!store save`, `!run` and
-`!history export` all reply "Only a server administrator can do that" and
+`!history export` all reply "Only a server administrator or a role with the ... capability can do that" and
 change nothing — `!store`/`!run`/`history export` touch the host's disk, and
 system edits reach every match on that system in every server. Wrapping the
 edit in `!batch` doesn't help: the check also runs on the ungated inner-command
@@ -19588,7 +19588,7 @@ SCENARIO 707 — !server wipe: typed confirmation, refusals, undo
 ?? only run when typed on their own
 !as player pip
 !server wipe all
-?? Only a server administrator can do that
+?? Only a server administrator or a role with the `server` capability (`!server perms`) can do that
 !as host
 !server wipe confirm wipe all of local
 ?? There's no wipe of yours waiting
@@ -20118,9 +20118,9 @@ SCENARIO 721 — Template ownership: the saver or an administrator
 ?? saved by bob
 !as player cara
 !template save knight knight
-?? was saved by bob: only they or a server administrator can replace it
+?? was saved by bob: only they, a server administrator or a role with the `templates` capability can replace it
 !template delete knight
-?? only they or a server administrator can delete it
+?? only they, a server administrator or a role with the `templates` capability can delete it
 !template save knight knight_cara
 ?? Saved template `knight_cara`
 !as player dan
@@ -20337,7 +20337,7 @@ SCENARIO 726 — Template edits: only the saver or an administrator
 !template save knight knight
 !as player cara
 !template set knight vars.hp 99
-?? only they or a server administrator can edit it
+?? only they, a server administrator or a role with the `templates` capability can edit it
 !template unset knight vars.initiative
 ?? can edit it
 !template rename knight kn
@@ -20522,7 +20522,7 @@ SCENARIO 729 — Partial templates: resync after a library edit, detach, forced 
 ?? `axe_common` is referenced by `raider`
 !as player bob
 !template delete axe_common force
-?? only they or a server administrator can delete it
+?? only they, a server administrator or a role with the `templates` capability can delete it
 !template import trinket {"kind": "partial", "data": {"shine": 1}}
 !template import bauble {"kind": "partial", "data": {"__template": "trinket"}}
 !template delete trinket force
@@ -22846,7 +22846,7 @@ SCENARIO 773 — Per-player access overrides (!host access ... user=)
 ?? needs host approval
 !as host
 !host access set @bob all
-?? ❌ Name the player with user=, not in the key.
+?? ❌ Name the player with user= (a role with role=), not in the key.
 !host access clear ent user=bob
 ?? No override for `ent` for `bob`.
 
@@ -22955,9 +22955,9 @@ SCENARIO 775 — !system undo refusals: blocking matches, var collisions, rename
 ?? ❌ There's no server-wide edit to undo.
 !as player bob
 !system history
-?? ❌ Only a server administrator can read that
+?? ❌ Only a server administrator or a role with the `systems` capability (`!server perms`) can read that
 !system undo
-?? ❌ Only a server administrator can do that
+?? ❌ Only a server administrator or a role with the `systems` capability (`!server perms`) can do that
 
 Expected: HARNESS-ALLOWS-ERRORS. An undo that would remove a system a
 match uses now is refused with the match named. Under
@@ -23194,7 +23194,7 @@ SCENARIO 780 — !match replay refusals and journal limits
 ?? ❌ `j780` keeps no journal
 !as player bob
 !match replay j780.json as=j780c
-?? ❌ Only a server administrator can do that
+?? ❌ Only a server administrator or a role with the `files` capability (`!server perms`) can do that
 
 Expected: HARNESS-ALLOWS-ERRORS. A replay is refused when the match id
 is taken (`as=` picks another), when a system a match here uses differs
@@ -34843,3 +34843,673 @@ private_var_host_reminder off, never. The death line (death_message_format
 naming `{gold}`) prints `?` in red's view. The dead thief's corpse line prints
 `?` for its private gold to a player and 40 to the host; a player's `full`
 is refused.
+
+SCENARIO 1017 — A var hook that keeps changing the size settles within SIZE_SYNC_PASSES; a hook chain stops at var_hook_recursion_limit without crashing
+----------------------------------------------------------------------------------------------------------------------------------------------------
+!match new hk Hooks 10 10
+!match use hk
+!ent add a A 10 2 2 5
+!ent set_var a size_num 50
+!passive add a bump on_var_changed "if changed_key == 'size_total':\n    entity[self].size_num = entity[self].size_num + 1"
+!ent set_var a size_num 100
+?? ⚠️ `a`'s size didn't settle after 8 passes: a var hook keeps changing what it derives from.
+?! 💥
+!assert "entity[a].size_num < 130"
+!passive remove a bump
+!ent add b B 10 4 4 5
+!passive add b loop on_var_changed "if changed_key == 'k':\n    entity[self].k = entity[self].k + 1"
+!ent set_var b k 1
+!ent set_var b k 2
+?? ⚠️ var-hook recursion limit (64) reached
+?! 💥
+!assert "entity[b].k == 66"
+!help rule var_hook_recursion_limit
+?? Default: `64`
+
+Expected: a passive that bumps `size_num` whenever the derived `size_total`
+changes used to recurse until Python's stack ran out (the bot hung past a
+hook limit of about 90). The derivation now syncs one body at a time: the
+nested sync a hook sets off returns, and the running one re-reads, so the
+write ends after 8 passes with a warning (the end-of-command sweep runs its
+own 8), and `size_num` stays under 130. A hook that rewrites its own var
+stops at var_hook_recursion_limit, whose default is now 64 (below the
+depth Python's stack holds on this path): `k` ends at 66 with the limit's
+warning and no crash.
+
+SCENARIO 1018 — Private vars and whole-board reads: `!log` and `!history` host-only, a corpse in `!tile info`, dicts in lists, the rules' entries hidden
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new pv Priv 10 10
+!match use pv
+!ent add hero Hero 20 2 2 5
+!ent set_var hero team red
+!ent add boss Boss 50 6 6 5
+!ent set_var boss team blue
+!ent set_var boss secret_dc 77731
+!ent hp boss -7
+!as player bob
+!log 3
+?? Boss (`boss`) took 7 damage
+!as host
+!eval "entity[boss].traps = [{'dc': 66613, 'kind': 'pit'}, {'kind': 'web', '__private_container': 'yes'}]"
+!system set default private_vars hp,max_hp,secret_dc,*.dc
+!match bind pov=red
+!as player bob
+!log 3
+?? ❌ `!log` is host-only while this channel's view is fogged, filtered or holds private vars
+!history list command
+?? ❌ `!history list <kind>` is host-only
+!history diff command:1 command:5
+?? ❌ `!history diff` is host-only
+!ent info boss
+?? - 1: kind pit
+?! 66613
+?! web
+!help rule private_vars
+?? On match `pv`: `(hidden)`
+!as host
+!batch ent set_var boss pub 3 ; assert "entity[boss].pub == 3" ; ent set_var boss pub 4 ; assert "entity[boss].pub == 4"
+?! Assertion failed
+!assert "not var_has('boss', 'secret_dc')"
+!ent kill boss
+!as player bob
+!tile info 6 6
+?? "kind": "pit"
+?! 77731
+?! 66613
+!as host
+!match unbind
+!match use pv
+!tile info 6 6
+?? 77731
+!log 3
+?? took 7 damage
+!system unset default private_vars
+
+Expected: before any private rule a player reads the log as usual. With hp,
+max_hp, secret_dc and `*.dc` private, a player in red's view gets `!log`,
+`!history list command` and `!history diff` refused (the log prints hp
+before and after, a diff and a history label the values a command set).
+`!ent info boss` shows the pit trap without its `dc` and leaves out the
+web trap whose dict holds `__private_container`: a list's dicts are read
+like the dicts around them. A player's `!help rule private_vars` shows the
+rule's value as `(hidden)` (it names what is private). A host in red's view
+reads through the same rules, and the per-command memo of redacted vars
+drops a unit when a write reaches it: each `assert` in the batch sees the
+`pub` written just before it. The boss's corpse in `!tile info` shows its
+vars without the private ones to the player; the host in an unbound channel
+(after `!match use pv`) reads them all, and the log.
+
+SCENARIO 1019 — An action body's `cmd('assert ...')` reads private vars like the body; a size echo is cut short
+---------------------------------------------------------------------------------------------------------------
+!match new pa PrivAct 10 10
+!match use pa
+!ent add hero Hero 20 2 2 5
+!ent set_var hero team red
+!ent add boss Boss 50 4 4 5
+!ent set_var boss team blue
+!ent set_var boss secret_dc 7
+!ent set_var hero actions.probe.target entity
+!ent set_var hero actions.probe.body "cmd('assert \"entity[boss].secret_dc < 10\"')\nentity[self].probed = 1"
+!system set default private_vars secret_dc
+!system set default action_cmd_allowlist ent,assert
+!match bind pov=red
+!as player bob
+!action hero probe boss
+!as host
+!approve r1
+?! Assertion failed
+!assert "entity[hero].probed == 1"
+!template import huge {"name": "Huge", "vars": {"hp": 5, "max_hp": 5, "size_num": 1000000000000000000000000000000000000000000000000000000000000}}
+?? characters)
+?! 1000000000000000000000000000000000000000000000000000000000000
+HARNESS-ALLOWS-ERRORS
+!system unset default private_vars
+!system unset default action_cmd_allowlist
+
+Expected: the probe action's body runs `cmd('assert ...')` on the boss's
+private `secret_dc` (`assert` added to action_cmd_allowlist). A player's
+request, approved by the host in red's view
+(a reader that leaves private vars out), runs it. Every formula an action
+runs reads everything, its cmd() lines too, so the assert passes and the
+body goes on (`probed` 1); it used to read through the reader and fail its
+assertion. A template whose size number is past the bound is
+refused with the number cut to its first characters and its length, where
+the refusal used to echo all 61 digits.
+
+SCENARIO 1020 — Hooks run outside the engine's scopes: a resync's hooks are tracked for partial templates, a stamped rider's spawn hooks can't stack units
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new sc Scopes 12 12
+!match use sc
+!template import obase {"kind": "partial", "data": {"reach": 1, "carry": 10}}
+!ent add o O 10 2 2 5
+!ent add q Q 10 4 4 5
+!template give obase o stats
+!template give obase q stats
+!passive add o echo on_var_changed "if changed_key == 'stats.carry':\n    entity[q].stats.carry = 99"
+!template import obase {"kind": "partial", "data": {"reach": 1, "carry": 20}}
+!template resync o
+!template refs q
+?? `stats` ← `obase`: changed `carry`
+!template save q qsave
+!template spawn qsave 9 9
+!assert "entity[qsave].stats.carry == 99"
+!ent add cart Cart 10 2 8 5
+!ent set_var cart slots.seat.capacity 1
+!ent add pil Pil 5 3 8 5
+!mount pil cart seat
+!ent add g G 5 10 10 5
+!prefab save camp 2 8 3 8
+!gpassive add hop on_entity_spawned "if entity[self].name == 'Pil':\n    move_entity('g', entity[self].x, entity[self].y)"
+!prefab stamp camp 7 7
+?? FAILED: Cell (7,7) already occupied
+!assert "entity[g].x == 10 and entities_at(7, 7) == ['cart2']"
+
+Expected: `!template resync o` rebuilds o's stats (carry 10 -> 20), which
+fires o's passive writing q's carry. The resync's own writes go untracked,
+and the hooks they fire now run outside that scope: q's marker records
+`carry` changed, and a template saved from q spawns with 99 (it used to
+say "unchanged" and spawn with 20). Stamping the prefab spawns its rider
+`pil2` onto the cart's cell, ignoring the cart for occupancy; the rider's
+on_entity_spawned hook runs outside that scope, so its move of `g` onto
+the cart's cell is refused, and `g` stays at (10,10).
+
+SCENARIO 1021 — A batch that switches to another match gives that match its own undo step and watcher poll
+--------------------------------------------------------------------------------------------------------
+!match new m2 Other 10 10
+!match use m2
+!ent add b B 10 2 2 5
+!watch add low "entity[b].hp < 5" "entity[b].alarm = 1"
+!match new m1 Here 10 10
+!match use m1
+!ent add a A 10 2 2 5
+!batch match use m2 ; ent hp b 1 ; match use m1
+!match use m2
+!assert "entity[b].alarm == 1"
+!history list command
+?? before '!batch match use m2 ; ent hp b 1 ; match use m1'
+!undo command
+?? Reverted past `!batch match use m2 ; ent hp b 1 ; match use m1`.
+!assert "entity[b].hp == 10 and not var_has('b', 'alarm')"
+!match use m1
+!history list command
+?! batch
+
+Expected: the batch runs in m1's channel and changes m2 through `!match use`.
+m2 gets its own undo step labelled with the batch, and its watcher `low`
+fires in the same command (alarm 1). Before, the change folded into m2's
+previous undo step and the watcher waited for the next command there. One
+`!undo command` on m2 takes back the batch's change with the watcher's.
+m1's history has no step for the batch: m1 is as it was.
+
+SCENARIO 1022 — private_container_effects: a private container's actions, modifiers and granted tags shown without their paths (show) or left out (hide)
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+!match new pce Effects 10 10
+!match use pce
+!ent add hero Hero 20 2 2 5
+!ent set_var hero team red
+!ent add boss Boss 50 6 6 5
+!ent set_var boss team blue
+!ent set_var boss inventory.wand.actions.zap.body "entity[self].z = 1"
+!ent set_var boss inventory.wand.actions.zap.description "A spark."
+!ent set_var boss equipped.ring.grants_unit_tags armed
+!ent set_var boss equipped.ring.modifiers.r1.stat atk
+!ent set_var boss equipped.ring.modifiers.r1.op add
+!ent set_var boss equipped.ring.modifiers.r1.value 7
+!system set default private_vars inventory,equipped
+!match bind pov=red
+!as player bob
+!ent info boss
+?? Tags: armed
+?? - **zap**: A spark.
+!action list boss
+?? - `zap` (target: `none`, at `?`) — A spark.
+!action info boss zap
+?? Path:        `?`
+?! entity[self].z
+!mod show boss atk 0
+?? add 7 (pri 0) [?]
+?? → base 0 becomes 7
+!find tag:armed
+?? Boss (boss)
+!as host
+!system set default private_container_effects hide
+!as player bob
+!ent info boss
+?! armed
+?! zap
+!action list boss
+?? No actions of `boss` that this channel's view can see.
+!find action:zap
+?? No entities match.
+!mod show boss atk 0
+?? (none active)
+?? → base 0 becomes 0
+!find tag:armed
+?? No entities match.
+!as host
+!match unbind
+!match use pce
+!action list boss
+?? at `inventory.wand`
+!mod show boss atk 0
+?? [equipped.ring.r1]
+!system unset default private_vars
+!system unset default private_container_effects
+
+Expected: with `inventory` and `equipped` private, the boss's wand gives it
+`zap`, its ring the tag `armed` and an attack modifier. Under the default
+`show` a player in red's view reads what they do: the description lists
+`armed` and `zap`, `!action list` and `!action info` show the action with
+`?` in place of its path (and of its body), `!mod show` the record with
+`?` as its source, and `!find tag:armed` finds the boss. Under `hide` all of
+it is left out, as if the containers weren't there: no tag, no action (the
+refusals read like a view that sees none), no modifier, and the fold reads
+0. The host in an unbound channel reads the paths.
+
+SCENARIO 1023 — private_size_display: a private size number shows its category (category), hides it too (hide) or can't be hidden (show)
+-------------------------------------------------------------------------------------------------------------------------------------
+!match new psd Sizes 10 10
+!match use psd
+!ent add hero Hero 20 2 2 5
+!ent set_var hero team red
+!ent add boss Boss 50 6 6 5
+!ent set_var boss team blue
+!ent set_var boss size_num 640
+!system set default private_vars size_num
+!match bind pov=red
+!as player bob
+!ent info boss
+?? Size: ? (huge)
+!help size boss
+?? **`boss`** size `huge` (the number is private).
+!find size:huge
+?? Boss (boss)
+!roll "$(size_rank('boss'))"
+?? → **4**
+!as host
+!assert "size_of('boss') == None and size_class('boss') == 'huge' and size_is('boss', 'huge') and size_at_least('boss', 'large')"
+!assert "not var_has('boss', 'size_total') and var_get('boss', 'size_text') == 'huge'"
+!system set default private_size_display hide
+!as player bob
+!ent info boss
+?? Size: ? (?)
+!help size boss
+?? its size is private.
+!find size:huge
+?? No entities match.
+!as host
+!assert "size_class('boss') == None and not size_is('boss', 'huge')"
+!system set default private_size_display show
+!as player bob
+!ent info boss
+?? Size: 640 (huge)
+!as host
+!assert "size_of('boss') == 640 and entity[boss].size_num == 640"
+!ent kill boss
+!system set default private_size_display category
+!assert "size_of('boss') == None and size_class('boss') == 'huge'"
+!system unset default private_vars
+!system unset default private_size_display
+
+Expected: with `size_num` private and the default `category`, a player in
+red's view reads the boss's category and no number: the description prints
+`Size: ? (huge)`, `!help size` names the category only, `size:huge` matches
+and `size_rank` reads 4. The host in red's view reads through the same
+reader in `$()`: size_of is None, size_class `huge`, size_is and
+size_at_least answer from the category, the total is missing and the
+category var shows. Under `hide` the category goes too (`?`, the selector
+doesn't match, size_class None). Under `show` the size can't be hidden:
+the number reads 640 everywhere. The corpse keeps its category under
+`category` and hides its total.
+
+SCENARIO 1024 — Template reads follow private vars: a non-host's `!template show` / `diff` / `template_data` leave them out, after a warning
+---------------------------------------------------------------------------------------------------------------------------------------
+!match new tpv TplPriv 10 10
+!match use tpv
+!ent add boss Boss 50 6 6 5
+!ent set_var boss secret_dc 77731
+!ent set_var boss lore "An old wyrm."
+!template save boss bosst
+!ent set_var boss secret_dc 88842
+!template save boss bosst2
+!system set default private_vars secret_dc
+!as player bob
+!template show bosst
+?? ℹ️ You aren't a host here, so a template's private vars (private_vars, team_private_vars) aren't shown.
+?? "lore": "An old wyrm."
+?! 77731
+!template show bosst vars.secret_dc
+?? has nothing at `vars.secret_dc`
+!template diff bosst bosst2
+?? ℹ️ You aren't a host here
+?? are the same
+!roll "$(len(template_data('bosst', 'vars.lore')))"
+?? → **12**
+!roll "$(template_data('bosst', 'vars.secret_dc'))"
+?? has nothing at `vars.secret_dc`
+HARNESS-ALLOWS-ERRORS
+!as host
+!template show bosst vars.secret_dc
+?? 77731
+?! ℹ️
+!template diff bosst bosst2
+?? 77731
+!assert "template_data('bosst', 'vars.secret_dc') == 77731"
+!system unset default private_vars
+
+Expected: with `secret_dc` private, player bob reads the boss template
+without it: `!template show` opens with the warning that a non-host sees no
+private vars and shows `lore` but not the 77731, a path into the private
+var reads as missing, `!template diff` of two saves that differ only in
+`secret_dc` reads "the same", and `template_data` in `$()` answers as the
+library holds it minus the private var. The host in an unbound channel
+reads everything, with no warning, and the engine's own formulas (`!assert`
+as host) read the private value.
+
+SCENARIO 1025 — A private template: hosts only; to anyone else it reads as missing in the library reads, `$()` and Tab
+-------------------------------------------------------------------------------------------------------------------
+!match new tps TplSecret 10 10
+!match use tps
+!ent add lich Lich 90 3 3 5
+!template save lich lichking
+!ent add orc Orc 10 5 5 5
+!template save orc orc
+!template private lichking on
+?? 🔒 Template `lichking` is private: only hosts read it.
+!as player bob
+!template list
+?? Templates (1)
+?! lichking
+!template show lichking
+?? ❌ No template `lichking` (`!template list`).
+!template diff orc lichking
+?? ❌ No template `lichking`
+!roll "$(len(template_names()))"
+?? → **1**
+?tab "!template show "
+?? candidates: orc
+?! lichking
+!as host
+!template list
+?? `lichking` — Lich, hp 90, saved by cli 🔒
+!template show lichking
+?? 🔒 private
+!ent set_var lich hp 80
+!template save lich lichking
+!template private lichking
+?? Template `lichking` is private: only hosts read it.
+!template spawn lichking 7 7
+?? Spawned `lichking` from template `lichking`
+!assert "not var_has('lichking', 'private') and entity[lichking].hp == 80"
+!match bind pov=red
+!template show lichking
+?? ❌ No template `lichking` (`!template list`).
+?? ℹ️ This channel shows team `red`'s view, which players read, so private vars and private templates (`!template private`) aren't shown here
+!template show nosuch
+?? ℹ️ This channel shows team `red`'s view
+!template list
+?? ℹ️ This channel shows team `red`'s view
+?! lichking
+?! reply above
+!match unbind
+!match use tps
+!template private lichking off
+?? 🔓 Template `lichking` is readable by everyone.
+!as player bob
+!template show lichking
+?? **template `lichking`**
+!as host
+!template import oops {"name": "O", "vars": {"hp": 1}, "private": "yes"}
+?? `private` is true or false
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!template private lichking on` makes the template host-only. Player
+bob's `!template list` leaves it out, and `show` and `diff` answer as for a
+template that doesn't exist; `template_names()` in `$()` counts one
+template and Tab offers only `orc`. The host's list marks it 🔒 and `show`
+says it is private. Saving over it keeps it private, and a spawn from it
+carries no `private` var (library metadata). A host in a channel bound to
+red's view reads it as missing too, and every template read there opens
+(or, for a missing template, ends) with a note that the channel is
+player-visible and leaves private vars and templates out; the note comes
+for a template that doesn't exist as well, so it tells the players nothing,
+and it replaces the cooldown reminder (no second line). Turned off, bob
+reads it again. An import whose `private` isn't true or false is refused.
+
+SCENARIO 1026 — `!server perms`: grant / revoke / list capabilities by role; administrators edit, anyone reads; saved, audited, kept across a wipe
+------------------------------------------------------------------------------------------------------------------------------------------------------
+!server perms
+?? `systems` (edit the game systems
+?? no role
+!server perms grant systems gm
+?? ✅ Role `gm` now holds `systems`
+!server perms grant systems gm
+?? Role `gm` already holds `systems`.
+!server perms grant powers gm
+?? ❌ `powers` isn't a capability; the capabilities: `systems`, `templates`, `prefabs`, `host`, `gm`, `files`, `server`.
+!server perms grant files <@&archivist>
+?? ✅ Role `archivist` now holds `files`
+!as player bob roles=gm
+!server perms list
+?? `!log format`)): `gm`
+?? `!match journal export`)): `archivist`
+!server perms revoke systems gm
+?? ❌ Only a server administrator can change which roles hold which capabilities.
+!whoami
+?? **Capabilities:** `systems` (from your roles, `!server perms`)
+!as host
+!as restart
+!server perms
+?? `!match journal export`)): `archivist`
+!server wipe all
+!server wipe confirm wipe all of local
+!server perms
+?? `!log format`)): `gm`
+!server wipe undo
+!server perms
+?? `!log format`)): `gm`
+?tab "!server perms grant "
+?? candidates: files  gm  host  prefabs  server  systems  templates
+!server perms revoke files archivist
+?? ✅ Role `archivist` no longer holds `files`.
+!server perms revoke files archivist
+?? Role `archivist` doesn't hold `files`.
+!server audit 4
+?? revoked `files` from role `archivist`
+?? granted `files` to role `archivist`
+HARNESS-ALLOWS-ERRORS
+
+Expected: a fresh server lists every capability with no role. An
+administrator grants `systems` to role `gm` (a second grant says it already
+holds it), refuses an unknown capability naming the seven, and takes a role
+mention (`<@&archivist>`) as the role. Player bob, given role `gm` with `!as
+player bob roles=gm`, reads the list but can't revoke, and `!whoami` names
+the capability his role gives him. The map survives a restart, a `!server
+wipe all` and its undo. Revoking twice says the role no longer holds it, and
+`!server audit` names each grant and revoke. Tab offers the capabilities
+after `grant`.
+
+SCENARIO 1027 — Capabilities in real use: systems, files, server, templates and prefabs for role members who aren't administrators
+--------------------------------------------------------------------------------------------------------------------------------------
+!match new cap1 Caps 8 8
+!match use cap1
+!ent add orc Orc 10 2 2 5
+!template save orc orcy
+!server perms grant systems gm
+!server perms grant files archivist
+!server perms grant server ops
+!server perms grant templates smith
+!server perms grant prefabs mason
+!host access set template all
+!host access set prefab all
+!as player bob roles=gm
+!system set default turn_start_message_format "Turn of {name}"
+?? `default`.turn_start_message_format
+!defvar add armor 1
+!template set orcy vars.hp 12
+?? ❌ Template `orcy` was saved by cli: only they, a server administrator or a role with the `templates` capability can edit it.
+!store save capsave
+?? ❌ Only a server administrator or a role with the `files` capability (`!server perms`) can do that
+!server audit
+?? ❌ Only a server administrator can read that
+!as player dana roles=smith
+!template set orcy vars.hp 12
+!template save orc danaorc
+!as player bob roles=gm
+!template delete danaorc
+?? ❌ Template `danaorc` was saved by dana
+!as player ed roles=archivist
+!store save capsave
+?! ❌
+!server backups
+?? ❌ Only a server administrator or a role with the `server` capability (`!server perms`) can do that
+!as player fay roles=ops
+!server backups
+?! ❌
+!as player gil roles=mason
+!prefab save gate 1 1 3 3
+?! ❌
+!as player hal
+!prefab save gate2 1 1 3 3
+?? ❌ Saving a prefab needs a host of this channel's match, a server administrator or a role with the `prefabs` capability (`!server perms`).
+!as host
+!assert "rule_get('turn_start_message_format') == 'Turn of {name}' and template_data('orcy', 'vars.hp') == 12 and has_template('danaorc')"
+!defvar list
+?? armor
+!host access clear template
+!host access clear prefab
+!as player dana roles=smith
+!template copy orcy orcz
+?! approval
+!as player hal
+!template copy orcy orcw
+?? approval
+HARNESS-ALLOWS-ERRORS
+
+Expected: bob's role `gm` holds `systems`: his `!system set` and `!defvar
+add` run without hosting the match, while a template someone else saved,
+`!store` and `!server audit` (administrators only) stay closed to him. The
+host opened `!template` and `!prefab` to players with `!host access`, so
+the refusals below come from the library's own rules. dana's role `smith`
+holds `templates`: she edits the template cli saved and saves one without
+hosting the match, which bob can't delete. ed (`files`) saves the server to
+the saves folder, fay (`server`) lists the backups, gil (`prefabs`) saves a
+prefab while hal, with no role, is refused naming the three ways to that
+right. With the overrides cleared, dana's library edits still skip the
+match's approval queue (they change the library, not the match), while
+hal's copy waits for a host.
+
+SCENARIO 1028 — The `host` capability limits match creation; `gm` is a host of every match, short of its owner
+---------------------------------------------------------------------------------------------------------------
+!server perms grant host builders
+?? From now on only the members of roles holding `host` and administrators can create matches here.
+!server perms grant gm gms
+!as player bob
+!match new g2 Bob 5 5
+?? ❌ Creating matches on this server is limited to roles with the `host` capability and server administrators (`!server perms list`).
+!as host
+!match new g1 Gm 8 8
+!match use g1
+!ent add hero Hero 20 2 2 5
+!system set default private_vars secret
+!ent set_var hero secret 42
+!as player gina roles=gms
+!match clone g3
+?? ❌ Creating matches on this server is limited
+!whoami
+?? **Your role:** host (the `gm` capability)
+!ent hp hero -5
+?? Damaged `hero` by 5.
+!find show:secret
+?? 42
+!host add bob
+?? ❌ Only the match owner can do that.
+!match delete g1
+?? ❌ Only the owner
+!macro set heal "!ent hp hero +1"
+!macro list
+?! not a host
+!as host
+!system set default pause_affects_hosts true
+!match pause
+!as player gina roles=gms
+!ent hp hero -1
+!as host
+!match resume
+?? ▶ `!ent hp hero -1` (gina)
+?! no longer a host
+!as player bob
+!ent hp hero -5
+?? approval
+!as player carl roles=builders
+!match new g2 Carl 5 5
+?? Created match `Carl` with id `g2`
+!as host
+!match use g1
+!assert "entity[hero].hp == 14"
+!server perms revoke host builders
+?? No role holds `host` now: anyone can create matches again.
+!match unbind
+!as player bob
+!match new g4 Bob 5 5
+?? Created match `Bob` with id `g4`
+HARNESS-ALLOWS-ERRORS
+
+Expected: once role `builders` holds `host`, bob (no role) can't create a
+match (in a channel without one, where nothing gates it) and gina, whose
+role holds only `gm`, can't clone one; the administrator creates g1. gina hosts g1
+through `gm` (`!whoami` says so): her `!ent hp` runs without approval and
+`!find` shows the private var, but `!host add` and `!match delete` stay the
+owner's, and the macro she writes isn't marked as a player's. Held during a
+pause with pause_affects_hosts on, her command runs at the resume as hers.
+bob's `!ent hp` waits for approval. carl (`builders`) creates a match
+from g1's channel without waiting for its host (it doesn't change g1);
+hero ends at 14 (20 - 5 - 1). With the last `host` grant revoked, anyone
+creates matches again.
+
+SCENARIO 1029 — `!host access ... role=`: overrides for a role's members, the most open of several roles, a player's own override first
+----------------------------------------------------------------------------------------------------------------------------------------
+!match new ra RoleAccess 6 6
+!match use ra
+!ent add orc Orc 50 2 2
+!host access set ent all role=scouts
+?? Access override set: `ent` → all for role `scouts` only.
+!host access set "ent hp" host_only role=rookies
+!host access list
+?? `ent` → all (for role `scouts` only)
+?? `ent hp` → host_only (for role `rookies` only)
+!as player bob roles=scouts
+!ent hp orc -1
+?! approval
+!as player cal roles=rookies
+!ent hp orc -1
+?? ❌ Only a host can do that.
+!as player dee roles=scouts,rookies
+!ent hp orc -1
+?? ❌ Only a host can do that.
+!as host
+!host access set "ent hp" all role=scouts
+!host access set "ent hp" host user=eve
+!as player dee roles=scouts,rookies
+!ent hp orc -1
+?! ❌
+?! approval
+!as player eve roles=scouts
+!ent hp orc -1
+?? approval
+!as host
+!host access clear "ent hp" role=rookies
+?? Cleared access override for `ent hp` for role `rookies`.
+!host access set ent all user=eve role=scouts
+?? ❌ An override is for one player (user=) or one role (role=), not both.
+!assert "entity[orc].hp == 48"
+HARNESS-ALLOWS-ERRORS
+
+Expected: role overrides apply to the role's members only and are listed
+with the role. bob (`scouts`: `ent` all) runs `!ent hp` directly; cal
+(`rookies`: `ent hp` host_only) is refused; dee holds both, and the more
+precise key (`ent hp`) decides, so she is refused too. Once `scouts` also
+opens `ent hp`, dee gets the more open of her two roles' levels and runs it.
+eve's own override (`ent hp` host) wins over her role's, so hers waits for
+approval. An override names one player or one role, not both. orc ends at
+48 (bob's and dee's hits; eve's waits).

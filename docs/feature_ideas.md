@@ -18,7 +18,8 @@ or rejects one, it moves to "Off the list".
 #75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
-`docs/zones_prefabs_design.md`), parts of #14.
+`docs/zones_prefabs_design.md`), parts of #14, parts of #190 (Discord-role
+capabilities `!server perms` and per-role `!host access ... role=`).
 
 **Off the list:**
 - Rejected: edge-aware boarding.
@@ -385,9 +386,9 @@ or rejects one, it moves to "Off the list".
   - `time_per_turn` / `time_per_round` rules, `game_time()`, and `!time advance 8h`.
   - Schedules and status durations can key on game time, for torches burning out, 10-minute spells and travel between fights.
   - The engine only counts time; what it means stays with the GM.
-- **#190 Spectators and table roles.**
+- **#190 Spectators** (the role part shipped: `!server perms` capabilities and `!host access ... role=`).
   - A spectator binding: a read-only channel with a POV that refuses every state-changing command outright, without queuing it.
-  - Named roles (e.g. an assistant GM) carry their own access map.
+  - Capabilities are a fixed set for now (user call); custom capability sets per role are open.
 - **#191 Tiled map import.** A Tiled JSON map becomes tiles through a GID → tile-template legend, and its object layer becomes template spawns. Sprite users can build maps in a real editor.
 - **#192 Optional var schemas.** A system can declare types and bounds (`mana: int, min 0`) and refuse writes of the wrong type. Today a string stored where a number belongs fails later and quietly inside a formula.
 - **#193 Partial references in statuses and passives** (§8; you said "discuss after partial templates shipped"). Today only var subtrees can reference partials; statuses and passives stay owned by the template.

@@ -51,7 +51,7 @@ import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, normalize_tags,
+from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, VAR_READER, normalize_tags, caller_capabilities, MATCH_CAPABILITIES,
                    ACTIONS_USED_MAX,
                    check_tag_filter, tag_filter_matches, tag_filter_empty,
                    RULES_REGISTRY)
@@ -98,9 +98,15 @@ class _BufferCtx:
 
     @classmethod
     def for_ctx(cls, ctx: Any) -> "_BufferCtx":
-        return cls(getattr(ctx, "channel_key", "CLI"),
-                   getattr(ctx, "user_id", None),
-                   getattr(ctx, "user_name", None))
+        out = cls(getattr(ctx, "channel_key", "CLI"),
+                  getattr(ctx, "user_id", None),
+                  getattr(ctx, "user_name", None))
+        # The runner's per-match capabilities (#190: `gm` hosts every
+        # match, `templates`...) carry over like its identity; the
+        # server-wide ones don't, as the administrator flag doesn't.
+        out.capabilities = sorted(caller_capabilities(ctx)
+                                  & MATCH_CAPABILITIES)
+        return out
 
     async def send(self, message: str) -> None:
         self.out.append(message)
@@ -1523,6 +1529,10 @@ async def run_action(
                 guard_token = CROSS_MATCH_GUARD.set(_guard_cross)
                 levels_token = _CROSS_LEVELS.set(_CROSS_LEVELS.get()
                                                  + (cross,))
+                # A body reads every var, private ones included (#70), its
+                # cmd() lines too: `cmd('assert ...')` read through the
+                # caller's reader, so the outcome hung on who ran it (L45).
+                reader_token = VAR_READER.set(None)
                 try:
                     engine.eval_program(
                         action.body, eval_ctx,
@@ -1530,6 +1540,7 @@ async def run_action(
                         action_bindings=bindings,
                     )
                 finally:
+                    VAR_READER.reset(reader_token)
                     _CROSS_LEVELS.reset(levels_token)
                     CROSS_MATCH_GUARD.reset(guard_token)
             except ChoiceNeeded as nc:

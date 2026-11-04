@@ -458,6 +458,35 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   by `!host access` / `command_access`, and it skips the per-match gate once
   passed. Action bodies can't run them at all (`_BufferCtx` carries no admin
   flag — default-deny).
+- **Role capabilities** (#190, user design; 1026-1029): `MatchManager.
+  role_perms` (capability -> Discord role ids, saved in workspace.json,
+  kept across `!server wipe`, its undo and `!store load`) gives a role's
+  members one of the fixed `logic.CAPABILITIES` (user call, "for now"):
+  `systems`, `templates`, `prefabs`, `host`, `gm`, `files`, `server`.
+  `!server perms [list] | grant | revoke <capability> <role>` (edits
+  administrator-only, recorded with `audit_note`, outside `!system
+  undo`; anyone lists). A server administrator holds every one (so is a
+  host of every match). `_capability_needed` maps each server-wide
+  invocation to `admin` (only administrators: `!server audit / errors /
+  perms` edits) or the capability whose holders may run it too, checked
+  by `_caller_may` at both admin checks. `logic.caller_capabilities(ctx)`:
+  all for an administrator, a fixed `capabilities` list when the context
+  carries one (a held command, a journal replay's `auth[2]`, an action's
+  `_BufferCtx`, which keeps only `MATCH_CAPABILITIES`), else from
+  `ctx.role_ids` (Discord: the member's roles; CLI / harness `!as player
+  <name> roles=a,b`). A held command and a journal entry also record the
+  caller's role ids (`roles`), so a resume or a replay judges per-role
+  access overrides as the caller met them. `templates` / `prefabs`: save without hosting and
+  edit anyone's entries (`_template_may_save`, `_template_saver_ok`, a
+  forced partial rename / delete), and read the library as a host
+  outside a team view. `host`: once any role holds it, only its holders
+  and administrators create matches (`_require_match_creator`: `!match
+  new` / `clone`). `gm`: a host of every match (`caller_hosts`, behind
+  `_acts_as_host`, the gate, `require_target_host`, the Discord buttons),
+  never its owner; what a `gm` writes records no player author.
+  Roles are kept by id: Discord's `resolve_role` takes a mention, id or
+  name, `role_name` shows the current name (None = deleted; dropped at
+  the next grant / revoke).
 - **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
   `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
   (`require_target_host`) — the access gate only checks the CHANNEL's match,
@@ -1201,8 +1230,14 @@ hardcodes**.
   bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
   extras carry changed_key / old_value / new_value / intended_value /
   was_clamped. Status hooks bind `self` = the affected unit. Recursion capped
-  by `var_hook_recursion_limit`; `var_hook_warning_verbosity` (off / minimal /
-  detailed).
+  by `var_hook_recursion_limit` (default 64: past about 90 levels Python's
+  stack runs out first, and `_run_passive` turns that RecursionError into
+  a ⚠️ ending the chain, no crash entry, X22); `var_hook_warning_verbosity`
+  (off / minimal / detailed). The hooks an engine write or spawn fires run
+  outside the engine's own scopes (`_outside_derivation` resets
+  SIZE_DERIVING, TEMPLATE_TRACK_OFF and PLACEMENT_IGNORE): a resync's hooks'
+  writes are tracked, a stamped rider's spawn hooks can't place a unit on
+  its vehicle (S15, S17, 1020).
 - **Turn / round hooks** fire for the acting unit; its attached parts fire
   only their OWN passives (`own_only_targets`). Movement hooks per footprint
   cell (`fire_footprint_tile_*` / `fire_footprint_zone_*`) plus
@@ -2356,7 +2391,9 @@ hardcodes**.
   `command_access` rule (`!system access`, per system). Per-player
   overrides (`!host access ... user=<player>`) live in the same dict as
   `@<user id> <key>` and win over both (`_effective_access(..., user)`)
-  (773). No-op without an
+  (773); per-role ones (`!host access ... role=<role>`, `@&<role id>
+  <key>`) come next, the more precise key first, the most open level of
+  the caller's roles for it (`_ACCESS_OPENNESS`) (1029). No-op without an
   active match, identity or owner — hence the separate admin and
   target-host checks.
 - **Approval queue:** `Match.add_pending_request` (runtime-only; carried
@@ -2364,7 +2401,10 @@ hardcodes**.
   buttons. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
   `_channel_pointed_at`).
-- **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner only).
+- **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner
+  only), plus every holder of the `gm` capability (§3 "Role
+  capabilities"; `caller_hosts`). A check on the caller's host authority
+  goes through `caller_hosts` / `_acts_as_host`, never `m.is_host(user)`.
   Pause (§7.3).
 - **POV:** a channel's view is its binding's `pov` (`!match bind pov=<team>`;
   absent = omniscient), or a CLI `!as view` preview, or a host's one-off
@@ -2630,7 +2670,12 @@ hardcodes**.
   `_is_transfer_label`) (824). `!ent copy|transfer ... map=<map>` names
   the destination's map (`MatchManager.copy_entity(dest_map=)`); an id
   the destination can't create (a legacy id) is remapped like a
-  collision (`rider` -> `rider_2`, 874).
+  collision (`rider` -> `rider_2`, 874). A batch, macro or `!run` file
+  whose lines run on another match (`!match use` inside it) gives that
+  match its own undo step, labelled with the command, and its watcher
+  poll at the end of the command (`_OTHER_MATCH_PRE`, the pre-state taken
+  before its first line, `_note_other_match` in `dispatch_no_snapshot`;
+  S18, 1021).
 - **Links and transfer_entity** (step 2d): `transfer_entity(eid, match,
   x=None, y=None, map=None)` (mutating; a coordinate works as x) moves a
   unit with its whole body into another match of the server, but only one
@@ -2812,7 +2857,22 @@ hardcodes**.
   `rename`, `copy`, `delete`, `trash [name]`, `restore <name> [n]`. Changing
   or deleting a template needs its saver (`saved_by`) or an admin; an
   admin's edit keeps the saver; a copy is the copier's. Reads are open to
-  everyone (user call).
+  everyone (user call), through private vars (user call, 1024-1025): the
+  template reader (`_template_reader`: the channel match's VAR_READER,
+  else non-host unless an admin) reads `show` / `diff` / `list` / `trash`
+  and `template_data` in `$()` (the view's `Match._view_reader`) without
+  the private vars of the channel's rules and the template's own lists
+  (`logic.reader_template`, the derived size pair too), and a non-host's
+  `show` / `diff` open with a note saying so. A host in a team-view
+  channel gets a note on every template read there (`_template_read_note`:
+  list, show, diff, tags, trash, and a missing template's refusal, whether
+  or not it exists, so it is no oracle); it clears the cooldown
+  reminder's mark for that command. `!template private <name>
+  [on|off]` (saver / admin; the `private` key, `TEMPLATE_PRIVATE_KEY`,
+  library metadata kept by a re-save and stripped at spawn) makes a
+  template host-only: to any reader it reads as missing in list / show /
+  diff / tags / trash, template_names / has_template / template_data and
+  Tab (`_readable_template`, `completion._readable_template_names`).
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
@@ -3115,7 +3175,10 @@ and a total per body.
   tracked for partial templates, refused on the derived vars and
   re-derive; `sync_body_size` re-reads the root after each store (at
   most `SIZE_SYNC_PASSES`, then a ⚠️), so the pair ends consistent
-  (S15). A root without a number reads
+  (S15). A body syncs once at a time (`Match._size_syncing`): the sync a
+  hook's write sets off for a body already syncing returns, and the
+  running one re-reads (X22: each nested level looped on its own and a
+  bumping hook hung the bot, 1017). A root without a number reads
   `size_default` (100) plus `size_default_per_extra_tile` (0) per
   footprint cell past the first, live, never stored in size_num.
 - **Writes** (`Match.checked_size_value`, in write_var and at spawn,
@@ -3261,16 +3324,47 @@ dump` is the raw data for the GM.
   hp / max_hp / initiative / team / size placeholders too), death /
   revive lines (`_announce`), `!part list`'s hp, `!find` / `!foreach`
   (`_entity_path_value`, `size:`), `$()` / `!assert` / a read-only `!eval`
-  (`Match.private_view`: every unit's and corpse's vars swapped for the
-  redacted copy while the read-only formula runs), Tab var paths, and a
-  disguise's decoys (judged with the real unit's lists too). The lists
+  (`Match.private_view`: the vars of every unit and corpse holding
+  something private swapped for the redacted copy while the read-only
+  formula runs; `privacy_applies` decides, walking without copying, and
+  `logic.PRIVATE_SCAN` memoizes per top-level command which units need a
+  copy and the copy itself, dropped by a write to the unit or a replaced
+  vars dict, X21), `!tile info`'s corpse snapshots
+  (`_reader_tile_data`), Tab var paths, and a disguise's decoys (judged
+  with the real unit's lists too). A list's dicts are read like the dicts
+  around them (`*.<key>` and a container flag hide there too; an item's
+  index is a path segment). While anything on the match is private
+  (`_match_has_private`), `!log` and the `!history` reads are host-only
+  for a reader, as under fog (`_whole_board_read_blocked`, V17, 1018).
+  Both rules are SECRET_RULES: their entries name what is hidden.
+  What a private container gives the unit follows
+  `private_container_effects` (user call, V17, 1022): `show` (default)
+  lists its actions, modifiers and granted tags with private_var_text in
+  place of the path (and of an action's body), `hide` leaves them out of
+  the description, `!action list` / `info`, `!find action:` / `tag:`,
+  the tag placeholders, Tab and `!mod show` (gathered and folded in the
+  reader's view); helpers `_path_private`, `_effects_hidden`,
+  `_reader_tag_pairs`. A private size number follows
+  `private_size_display` (user call, 1023): `category` (default) shows
+  the category and hides the numbers (`{size}` `?`, size_of None,
+  size_class / size_is / size_rank / size_at_least on a name answering
+  from the category), `hide` hides the category too, `show` exempts the
+  size number from privacy (`privacy_spec` drops it). Judged per body on
+  the root and its parts (`Match.size_hidden`); `reader_vars`,
+  `private_view` (its `_view_size_hidden`, read by the size functions)
+  and `corpse_reader_vars` drop the derived pair to match. The lists
   and the flag never show. `!ent dump`, `!ent info <id> full` (hosts) and
-  every formula the engine runs (passives, action bodies, watchers, a
-  mutating `!eval`) read everything. A host's command in a team-view
+  every formula the engine runs (passives, action bodies with their
+  `cmd()` lines: `run_action` clears VAR_READER around the body, L45,
+  1019; watchers, a mutating `!eval`) read everything. A host's command in a team-view
   channel that withheld something (`PRIVATE_WITHHELD`) ends with the
   `private_var_host_reminder` (default on), at most once per
   `private_var_reminder_cooldown` minutes (10) per host and channel
   (runtime, wall clock: a reply, never match state).
+  Scope (user call): private vars hide the obvious where players expect
+  to look; they needn't be airtight. A player working around them (a
+  mutating `!eval` through an access override, a clamp's path in `!clamp
+  list`) is an honor-system matter for the GM, not a leak to close.
 
 ---
 
@@ -3328,7 +3422,9 @@ rejected already. Update this section in the PR that resolves an item.
   match before its body (its rollback state; X13's action half, open: a
   200-unit `!foreach` of `!action` on a filled 300x300 takes ~57 s), and
   every formula evaluation builds its namespace (~2 ms; only the
-  `entity[self].<path> <op> <number>` shape skips it).
+  `entity[self].<path> <op> <number>` shape skips it). `!template resync`
+  serializes the match for its rollback the same way (X20: a `!foreach`
+  of 200 resyncs on a filled 300x300 takes ~42 s).
 
 ### Ask between tasks
 
