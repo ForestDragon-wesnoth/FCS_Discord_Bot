@@ -997,6 +997,11 @@ def privacy_spec(rules: Dict[str, Any], *roots: Any
                 words += _private_words(root.get(PRIVATE_LIST_VARS[level]))
         paths = {w for w in words if not w.startswith("*.")}
         keys = {w[2:] for w in words if w.startswith("*.")}
+        if str(rules.get("private_size_display", "category")) == "show":
+            # The size can't be hidden: the size number is never private.
+            num = str(rules.get("size_num_var", "size_num"))
+            paths.discard(num)
+            keys.discard(num)
         out[level] = (paths, keys)
     return out
 
@@ -3062,6 +3067,36 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "int", "min": 0, "max": 10080},
         "desc": ("Minutes of real time between two private_var_host_reminder "
                  "reminders to one host in one channel (0 = every time)."),
+    },
+    "private_container_effects": {
+        "default": "show",
+        "schema": {"type": "enum", "choices": ["show", "hide"]},
+        "desc": (
+            "What a reader who can't see a private container (or a private "
+            "var path) reads of what its contents give the unit. `show`: "
+            "the actions, modifiers and granted tags still show, without "
+            "the path they come from (`private_var_text` in its place) or "
+            "an action's body. `hide`: they are left out too, as if the "
+            "container weren't there: the description, `!action list` / "
+            "`info`, `!find action:` / `tag:`, the tag placeholders and "
+            "`!mod show` (whose result folds without them). Formulas in "
+            "`$()` read the container as missing either way; the engine's "
+            "own formulas always use it."
+        ),
+    },
+    "private_size_display": {
+        "default": "category",
+        "schema": {"type": "enum", "choices": ["category", "hide", "show"]},
+        "desc": (
+            "What a reader who can't see a body's size number (size_num_var "
+            "named by private_vars / team_private_vars, on the body root or "
+            "a part) reads of its size. `category`: the category shows, the "
+            "numbers (the size number and the derived total) read as "
+            "private (`?`; size_of reads None, size_class the category). "
+            "`hide`: the category hides too (`size:` selectors don't match, "
+            "size_class reads None). `show`: the size can't be hidden: the "
+            "size number is never private."
+        ),
     },
     "var_labels_enabled": {
         "default": False,
@@ -24676,7 +24711,47 @@ class Match:
         if reader is None:
             return pv
         spec = privacy_spec(self.rules, pv, e.vars)
-        return redact_vars(spec, pv, self.body_team(e), reader)[0]
+        red = redact_vars(spec, pv, self.body_team(e), reader)[0]
+        return self._without_hidden_size(e, red, reader)
+
+    def size_hidden(self, e: "Entity",
+                    reader: Optional[VarReader] = None) -> Optional[str]:
+        """How private_size_display hides the size of `e`'s body from
+        `reader` (default the command's VAR_READER): `category` (numbers
+        hidden), `hide` (category too) or None (shown). Hidden when the
+        reader can't read the size number on the body root or any part."""
+        reader = VAR_READER.get() if reader is None else reader
+        if reader is None:
+            return None
+        mode = str(self.rules.get("private_size_display", "category"))
+        if mode not in ("category", "hide"):
+            return None
+        root = self.body_root(e)
+        num = self.size_names()[0]
+        for u in [root] + self.entity_part_subtree(root.id):
+            if self.var_hidden(u, num, reader):
+                return mode
+        return None
+
+    def _without_hidden_size(self, e: "Entity", vars_: Dict[str, Any],
+                             reader: Optional[VarReader]) -> Dict[str, Any]:
+        """`vars_` (a reader's view of `e`) without the derived size vars
+        private_size_display hides: the total under `category`, both under
+        `hide`. A copy when anything goes."""
+        mode = self.size_hidden(e, reader)
+        if mode is None:
+            return vars_
+        _num, text_v, total_v = self.size_names()
+        drop = [total_v] + ([text_v] if mode == "hide" else [])
+        if not any(k in vars_ for k in drop):
+            return vars_
+        out = dict(vars_)
+        for k in drop:
+            out.pop(k, None)
+        note = PRIVATE_WITHHELD.get()
+        if note is not None and reader is not None and reader.host:
+            note.append(True)
+        return out
 
     def corpse_reader_vars(self, corpse: Dict[str, Any],
                            reader: Optional[VarReader] = None
@@ -24690,8 +24765,18 @@ class Match:
         if reader is None:
             return cv
         team = cv.get(str(self.rules.get("team_var", "team")))
-        return redact_vars(privacy_spec(self.rules, cv), cv,
-                           None if team is None else str(team), reader)[0]
+        team = None if team is None else str(team)
+        spec = privacy_spec(self.rules, cv)
+        red = redact_vars(spec, cv, team, reader)[0]
+        # The size a corpse died with, as private_size_display hides it.
+        mode = str(self.rules.get("private_size_display", "category"))
+        num, text_v, total_v = self.size_names()
+        if mode in ("category", "hide") and not reader_sees(
+                path_privacy(spec, cv, num), reader, team):
+            drop = [total_v] + ([text_v] if mode == "hide" else [])
+            if any(k in red for k in drop):
+                red = {k: v for k, v in red.items() if k not in drop}
+        return red
 
     @contextmanager
     def private_view(self, reader: Optional[VarReader]):
@@ -24699,35 +24784,51 @@ class Match:
         may read (a `$()` argument evaluates over this view; read-only, so
         nothing writes into the copies). No-op without a reader."""
         swapped: List[Tuple[Any, str, Any]] = []
+        size_hidden: Dict[str, str] = {}
+        prev_hidden = getattr(self, "_view_size_hidden", None)
         try:
             if reader is not None:
                 # Only the units holding something private get a redacted
                 # copy (X21: every unit's vars were copied per `$()`).
                 memo = PRIVATE_SCAN.get()
                 rules_key = (str(self.rules.get("private_vars", "")),
-                             str(self.rules.get("team_private_vars", "")))
+                             str(self.rules.get("team_private_vars", "")),
+                             str(self.rules.get("private_size_display", "")),
+                             self.sizes_on())
                 # Per unit: (its vars dict's id, the redacted copy or None
                 # when nothing of it is private), kept for the command and
                 # dropped by a write to the unit (private_scan_forget).
-                units: Dict[str, Tuple[int, Any]] = {}
+                units: Dict[str, Tuple[int, Any, Optional[str]]] = {}
                 if memo is not None:
                     key = (id(self), reader)
                     held = memo.get(key)
                     if held is None or held[0] != rules_key:
                         held = memo[key] = (rules_key, {})
                     units = held[1]
+                # Every unit read on its real vars first: a body's size
+                # privacy reads its parts' lists, which a swapped part's
+                # redacted copy no longer holds.
+                pending: List[Tuple["Entity", Any]] = []
                 for e in list(self.entities.values()):
                     # Keyed on the vars dict too: a transform or a spawn
                     # replaces it whole, without a write_var.
                     seen = units.get(e.id)
                     if seen is None or seen[0] != id(e.vars):
-                        red = None
+                        red = e.vars
                         if privacy_applies(self.unit_privacy(e), e.vars):
                             red = redact_vars(self.unit_privacy(e), e.vars,
                                               self.body_team(e), reader)[0]
-                            if red is e.vars:
-                                red = None
-                        seen = units[e.id] = (id(e.vars), red)
+                        mode = (self.size_hidden(e, reader)
+                                if self.sizes_on() and not e.part_of
+                                else None)
+                        if mode is not None:
+                            red = self._without_hidden_size(e, red, reader)
+                        seen = units[e.id] = (
+                            id(e.vars), None if red is e.vars else red, mode)
+                    pending.append((e, seen))
+                for e, seen in pending:
+                    if seen[2] is not None:
+                        size_hidden[e.id] = seen[2]
                     if seen[1] is not None:
                         swapped.append((e, "vars", e.vars))
                         e.vars = seen[1]
@@ -24740,8 +24841,13 @@ class Match:
                         if red is not ent["vars"]:
                             swapped.append((ent, "__item__", ent["vars"]))
                             ent["vars"] = red
+            # The bodies whose size the reader can't read (the size
+            # functions answer per private_size_display).
+            self._view_size_hidden = size_hidden
             yield
         finally:
+            if reader is not None:
+                self._view_size_hidden = prev_hidden
             for obj, attr, old in reversed(swapped):
                 if attr == "__item__":
                     obj["vars"] = old

@@ -35040,3 +35040,124 @@ fires in the same command (alarm 1). Before, the change folded into m2's
 previous undo step and the watcher waited for the next command there. One
 `!undo command` on m2 takes back the batch's change with the watcher's.
 m1's history has no step for the batch: m1 is as it was.
+
+SCENARIO 1022 — private_container_effects: a private container's actions, modifiers and granted tags shown without their paths (show) or left out (hide)
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+!match new pce Effects 10 10
+!match use pce
+!ent add hero Hero 20 2 2 5
+!ent set_var hero team red
+!ent add boss Boss 50 6 6 5
+!ent set_var boss team blue
+!ent set_var boss inventory.wand.actions.zap.body "entity[self].z = 1"
+!ent set_var boss inventory.wand.actions.zap.description "A spark."
+!ent set_var boss equipped.ring.grants_unit_tags armed
+!ent set_var boss equipped.ring.modifiers.r1.stat atk
+!ent set_var boss equipped.ring.modifiers.r1.op add
+!ent set_var boss equipped.ring.modifiers.r1.value 7
+!system set default private_vars inventory,equipped
+!match bind pov=red
+!as player bob
+!ent info boss
+?? Tags: armed
+?? - **zap**: A spark.
+!action list boss
+?? - `zap` (target: `none`, at `?`) — A spark.
+!action info boss zap
+?? Path:        `?`
+?! entity[self].z
+!mod show boss atk 0
+?? add 7 (pri 0) [?]
+?? → base 0 becomes 7
+!find tag:armed
+?? Boss (boss)
+!as host
+!system set default private_container_effects hide
+!as player bob
+!ent info boss
+?! armed
+?! zap
+!action list boss
+?? No actions of `boss` that this channel's view can see.
+!find action:zap
+?? No entities match.
+!mod show boss atk 0
+?? (none active)
+?? → base 0 becomes 0
+!find tag:armed
+?? No entities match.
+!as host
+!match unbind
+!match use pce
+!action list boss
+?? at `inventory.wand`
+!mod show boss atk 0
+?? [equipped.ring.r1]
+!system unset default private_vars
+!system unset default private_container_effects
+
+Expected: with `inventory` and `equipped` private, the boss's wand gives it
+`zap`, its ring the tag `armed` and an attack modifier. Under the default
+`show` a player in red's view reads what they do: the description lists
+`armed` and `zap`, `!action list` and `!action info` show the action with
+`?` in place of its path (and of its body), `!mod show` the record with
+`?` as its source, and `!find tag:armed` finds the boss. Under `hide` all of
+it is left out, as if the containers weren't there: no tag, no action (the
+refusals read like a view that sees none), no modifier, and the fold reads
+0. The host in an unbound channel reads the paths.
+
+SCENARIO 1023 — private_size_display: a private size number shows its category (category), hides it too (hide) or can't be hidden (show)
+-------------------------------------------------------------------------------------------------------------------------------------
+!match new psd Sizes 10 10
+!match use psd
+!ent add hero Hero 20 2 2 5
+!ent set_var hero team red
+!ent add boss Boss 50 6 6 5
+!ent set_var boss team blue
+!ent set_var boss size_num 640
+!system set default private_vars size_num
+!match bind pov=red
+!as player bob
+!ent info boss
+?? Size: ? (huge)
+!help size boss
+?? **`boss`** size `huge` (the number is private).
+!find size:huge
+?? Boss (boss)
+!roll "$(size_rank('boss'))"
+?? → **4**
+!as host
+!assert "size_of('boss') == None and size_class('boss') == 'huge' and size_is('boss', 'huge') and size_at_least('boss', 'large')"
+!assert "not var_has('boss', 'size_total') and var_get('boss', 'size_text') == 'huge'"
+!system set default private_size_display hide
+!as player bob
+!ent info boss
+?? Size: ? (?)
+!help size boss
+?? its size is private.
+!find size:huge
+?? No entities match.
+!as host
+!assert "size_class('boss') == None and not size_is('boss', 'huge')"
+!system set default private_size_display show
+!as player bob
+!ent info boss
+?? Size: 640 (huge)
+!as host
+!assert "size_of('boss') == 640 and entity[boss].size_num == 640"
+!ent kill boss
+!system set default private_size_display category
+!assert "size_of('boss') == None and size_class('boss') == 'huge'"
+!system unset default private_vars
+!system unset default private_size_display
+
+Expected: with `size_num` private and the default `category`, a player in
+red's view reads the boss's category and no number: the description prints
+`Size: ? (huge)`, `!help size` names the category only, `size:huge` matches
+and `size_rank` reads 4. The host in red's view reads through the same
+reader in `$()`: size_of is None, size_class `huge`, size_is and
+size_at_least answer from the category, the total is missing and the
+category var shows. Under `hide` the category goes too (`?`, the selector
+doesn't match, size_class None). Under `show` the size can't be hidden:
+the number reads 640 everywhere. The corpse keeps its category under
+`category` and hides its total.

@@ -2654,10 +2654,7 @@ def _entity_template_context(e: Entity,
     # The unit's full tag set (own, granted, engine), as the viewer's
     # disguise presents it; `tags_sourced` names where each came from.
     if e._match is not None:
-        pairs = e._match.unit_tag_sources(e, pov_team)
-        if reader is not None and e._match.var_hidden(
-                e, str(e._match.rules.get("tags_var", "tags")), reader):
-            pairs = [(t, src) for t, src in pairs if src != "own"]
+        pairs = _reader_tag_pairs(e._match, e, pov_team)
         ctx["tags"] = ", ".join(t for t, _s in pairs)
         ctx["tags_sourced"] = ", ".join(
             t if src == "own" else f"{t} ({src})" for t, src in pairs)
@@ -2677,6 +2674,13 @@ def _entity_template_context(e: Entity,
                            ("size", size_n), ("size_class", size_t)):
             if hidden(var):
                 ctx[alias] = text
+        # A hidden size number hides the body's total, and under `hide`
+        # its category (private_size_display).
+        mode = m.size_hidden(e, reader) if m.sizes_on() else None
+        if mode is not None:
+            ctx["size"] = text
+            if mode == "hide":
+                ctx["size_class"] = text
     return ctx
 
 
@@ -2883,6 +2887,57 @@ def _description_tree(node: Dict[str, Any], depth: int,
             out.append(f"{pad}{k}: {_description_value(v)}")
 
 
+def _reader_tag_pairs(m: Match, e: Entity,
+                      pov: Optional[str]) -> List[Tuple[str, str]]:
+    """`e`'s (tag, source) pairs as the command's reader reads them: its own
+    tags left out while the tags var is private; a tag a private container
+    grants keeps its tag with the source as private_var_text, or is left
+    out under private_container_effects hide."""
+    pairs = m.unit_tag_sources(e, pov)
+    if VAR_READER.get() is None:
+        return pairs
+    root = m.presented_vars(e, pov)
+    if _path_private(m, e, str(m.rules.get("tags_var", "tags")), root):
+        pairs = [(t, src) for t, src in pairs if src != "own"]
+    hide = _effects_hidden(m)
+    out: List[Tuple[str, str]] = []
+    for t, src in pairs:
+        if src not in ("own", "engine") and " " not in src \
+                and _path_private(m, e, src, root):
+            if hide:
+                continue
+            src = _private_text(m)
+        out.append((t, src))
+    return out
+
+
+def _effects_hidden(m: Match) -> bool:
+    """private_container_effects `hide`: what a private container gives
+    (actions, modifiers, granted tags) is left out of a reader's reads."""
+    return (VAR_READER.get() is not None and str(m.rules.get(
+        "private_container_effects", "show")) == "hide")
+
+
+def _path_private(m: Match, holder: Optional[Entity], path: str,
+                  vars_root: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether the command's reader can't read `path` on `holder` (its
+    vars, or `vars_root`: a disguise's decoys). Noted for the host
+    reminder when it hides something from a host."""
+    reader = VAR_READER.get()
+    if reader is None or holder is None or not path:
+        return False
+    if not m.var_hidden(holder, path, reader, vars_root=vars_root):
+        return False
+    note = PRIVATE_WITHHELD.get()
+    if note is not None and reader.host:
+        note.append(True)
+    return True
+
+
+def _private_text(m: Match) -> str:
+    return str(m.rules.get("private_var_text", "?"))
+
+
 def _visible_actions(m: Match, e: Entity,
                      pov: Optional[str]) -> Dict[str, List[Any]]:
     """The actions of `e` (its own, without a seat's) a viewer on `pov`
@@ -2899,8 +2954,11 @@ def _visible_actions(m: Match, e: Entity,
     else:
         src = e
     out: Dict[str, List[Any]] = {}
+    hide = _effects_hidden(m)
+    droot = src.vars if dis is not None else None
     for name, acts in discover_actions(src, m.rules).items():
-        keep = [a for a in acts if m.action_visible(e, a.full_path, pov)]
+        keep = [a for a in acts if m.action_visible(e, a.full_path, pov)
+                and not (hide and _path_private(m, e, a.full_path, droot))]
         if keep:
             out[name] = keep
     return out
@@ -2926,8 +2984,14 @@ def _description_actions(m: Match, e: Entity, pov: Optional[str],
                 for act in acts:
                     rows.append((act, veh, e.mounted_on or ""))
     lines = []
+    droot = (dis.get("vars") if dis is not None
+             and isinstance(dis.get("vars"), dict) else None)
     for act, holder, via in rows:
         if via and not m.action_visible(e, act.full_path, pov, holder):
+            continue
+        private = _path_private(m, holder or e, act.full_path,
+                                None if via else droot)
+        if private and via and _effects_hidden(m):
             continue
         forbid = (_action_forbid_note(m, e.id, act, via or None)
                   if holder is not None else "")
@@ -2936,7 +3000,7 @@ def _description_actions(m: Match, e: Entity, pov: Optional[str],
             "target": "" if act.target_type == "none" else act.target_type,
             "description": act.description,
             "tags": ", ".join(act.tags),
-            "path": act.full_path,
+            "path": _private_text(m) if private else act.full_path,
             "forbidden": forbid,
             "via": via,
         }
@@ -3119,6 +3183,13 @@ def _corpse_template_context(
     _sn, size_t, size_n = m.size_names()
     ctx["size"] = ent_vars.get(size_n, "") if m.sizes_on() else ""
     ctx["size_class"] = ent_vars.get(size_t, "") if m.sizes_on() else ""
+    if m.sizes_on() and isinstance(raw_vars, dict):
+        # A size the reader's view dropped (private_size_display).
+        ptext = str(m.rules.get("private_var_text", "?"))
+        if size_n in raw_vars and size_n not in ent_vars:
+            ctx["size"] = ptext
+        if size_t in raw_vars and size_t not in ent_vars:
+            ctx["size_class"] = ptext
     pairs = m.corpse_tag_sources(corpse)
     ctx["tags"] = ", ".join(t for t, _s in pairs)
     ctx["tags_sourced"] = ", ".join(
@@ -15032,7 +15103,7 @@ def _find_size_matches(m: Match, e: Entity, cat: str, mod: Optional[str],
     # already, S16), or the total a disguise presents to the query's team.
     root = m.body_root(e)
     _num_v, text_v, total_v = m.size_names()
-    if m.var_hidden(root, total_v) or m.var_hidden(root, text_v):
+    if m.var_hidden(root, text_v) or m.size_hidden(root) == "hide":
         return False        # a private size reads as missing (#70)
     dis = m._effective_disguise(root, pov) if pov is not None else None
     dvars = dis.get("vars") if isinstance(dis, dict) else None
@@ -15076,7 +15147,8 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
                 return False
             continue
         if kind == "tag":
-            if not tag_filter_matches(m.unit_tags(e, pov), key):
+            if not tag_filter_matches(
+                    [t for t, _s in _reader_tag_pairs(m, e, pov)], key):
                 return False
             continue
         if kind == "size":
@@ -21906,7 +21978,12 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     pass
             tags.append(tok)
         problems: List[str] = []
-        mods = m.gather_modifiers(eid, stat, tags, {}, problems)
+        # private_container_effects hide: the records of what a reader
+        # can't read are left out, the fold too (the reader's view).
+        view = (m.private_view(VAR_READER.get()) if _effects_hidden(m)
+                else contextlib.nullcontext())
+        with view:
+            mods = m.gather_modifiers(eid, stat, tags, {}, problems)
         tagstr = f" [{', '.join(tags)}]" if tags else ""
         lines = [f"Modifiers on `{eid}` for `{stat}`{tagstr}:"]
         if not mods:
@@ -21915,13 +21992,22 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for md in mods:
             tg = (" tags=" + ",".join(md["tags"])) if md["tags"] else ""
             ntg = (" not=" + ",".join(md["not_tags"])) if md["not_tags"] else ""
-            src = f" [{md['source']}]" if md.get("source") else ""
+            src_text = str(md.get("source") or "")
+            if src_text and not src_text.startswith(
+                    ("status:", "team:", "map:", "match.")) \
+                    and src_text != "match" \
+                    and _path_private(m, m.entities[eid], src_text):
+                src_text = _private_text(m)
+            src = f" [{src_text}]" if src_text else ""
             bad = " ⚠️" if md["op"] not in MODIFIER_OPS else ""
             lines.append(
                 f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}{src}{bad}")
         if base is not None:
             try:
-                result = m.apply_modifiers(eid, stat, base, tags, {})
+                view = (m.private_view(VAR_READER.get())
+                        if _effects_hidden(m) else contextlib.nullcontext())
+                with view:
+                    result = m.apply_modifiers(eid, stat, base, tags, {})
                 lines.append(f"  → base {base:g} becomes {result:g}")
             except VTTError as ex:
                 lines.append(str(ex))
@@ -25039,7 +25125,7 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
     # them all, so the replies don't tell "none" from "none you can see".
     disguised = (pov is not None
                  and m._effective_disguise(actor, pov) is not None)
-    limited = disguised or (
+    limited = disguised or _effects_hidden(m) or (
         pov is not None and m.body_team(actor) != str(pov)
         and str(m.rules.get("entity_description_action_visibility",
                             "all")) != "all")
@@ -25049,7 +25135,9 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
         veh = m.entities.get(actor.mounted_on or "")
         for name, acts in discover_mount_actions(actor, m, m.rules).items():
             keep = [a for a in acts
-                    if m.action_visible(actor, a.full_path, pov, veh)]
+                    if m.action_visible(actor, a.full_path, pov, veh)
+                    and not (_effects_hidden(m)
+                             and _path_private(m, veh, a.full_path))]
             if keep:
                 mount_actions[name] = keep
     bad = [] if limited else _textless_bodies(actor.vars)
@@ -25068,9 +25156,16 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
     total = sum(len(v) for v in actions.values()) + \
         sum(len(v) for v in mount_actions.values())
     lines = [f"**Actions on `{actor_id}`** ({total} total):"]
+    dvars = None
+    if disguised:
+        dis = m._effective_disguise(actor, pov)
+        dvars = dis.get("vars") if isinstance(dis, dict) and isinstance(
+            dis.get("vars"), dict) else {}
     for name in sorted(actions.keys()):
         for act in actions[name]:
             container = act.container_path or "(entity root)"
+            if _path_private(m, actor, act.full_path, dvars):
+                container = _private_text(m)
             desc = f" — {act.description}" if act.description else ""
             tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
             forbid = "" if disguised else _action_forbid_note(m, actor_id,
@@ -25089,9 +25184,12 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
                 tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
                 forbid = _action_forbid_note(m, actor_id, act,
                                              actor.mounted_on)
+                where = (_private_text(m) if _path_private(
+                    m, m.entities.get(actor.mounted_on or ""),
+                    act.full_path) else act.full_path)
                 lines.append(
                     f"- `{act.name}` (target: `{act.target_type}`, at "
-                    f"`{act.full_path}`{tags}){desc}"
+                    f"`{where}`{tags}){desc}"
                     + (f" 🚫 {forbid}" if forbid else "")
                 )
     await ctx.send("\n".join(lines + notes))
@@ -25117,15 +25215,18 @@ def _textless_bodies(vars_: Any, at: str = "") -> List[Tuple[str, Any]]:
     return out
 
 
-def _action_tags_text(act: Any) -> str:
-    """An action's final tags, each with where it came from."""
+def _action_tags_text(act: Any, private_in: Optional[Match] = None) -> str:
+    """An action's final tags, each with where it came from (a private
+    container's path as private_var_text, when `private_in` is its match)."""
     if not act.tags:
         return "(none)"
     out = []
     for t in act.tags:
         src = act.tag_sources.get(t, "")
         where = ("own" if src == act.full_path
-                 else f"from `{src}`" if src else "from the vars root")
+                 else (f"from `{_private_text(private_in)}`"
+                       if private_in is not None else f"from `{src}`")
+                 if src else "from the vars root")
         out.append(f"`{t}` ({where})")
     return ", ".join(out)
 
@@ -25185,12 +25286,23 @@ async def _action_info(
     act = matches[0]
     container = act.container_path or "(entity root)"
     desc = act.description or "(no description)"
+    dvars = None
+    if disguised:
+        dis = m._effective_disguise(actor, pov)
+        dvars = dis.get("vars") if isinstance(dis, dict) and isinstance(
+            dis.get("vars"), dict) else {}
+    # A private container's action shows what it does, without where it
+    # lives or its body (private_container_effects show).
+    private = _path_private(m, actor, act.full_path, dvars)
+    shown_path = _private_text(m) if private else act.full_path
+    if private:
+        container = _private_text(m)
     lines = [
         f"**`{act.name}`** on `{actor_id}`",
-        f"Path:        `{act.full_path}`",
+        f"Path:        `{shown_path}`",
         f"Container:   `{container}`",
         f"Target type: `{act.target_type}`",
-        f"Tags:        {_action_tags_text(act)}",
+        f"Tags:        {_action_tags_text(act, m if private else None)}",
         f"Description: {desc}",
     ]
     for key, label in (("target_requires_tags", "Target must match:"),
@@ -25207,7 +25319,7 @@ async def _action_info(
     lines += [
         "Body:",
         "```",
-        formula_text(act.body),
+        _private_text(m) if private else formula_text(act.body),
         "```",
     ]
     await ctx.send("\n".join(lines))
@@ -25713,6 +25825,13 @@ def _help_size(ctx: ReplyContext, mgr: MatchManager,
         if t is None:
             return f"**`{raw}`** size `{cat}`."
         return (f"**`{raw}`** size {t}" + (f" (`{cat}`)" if cat else "") + ".")
+    mode = m.size_hidden(e) if VAR_READER.get() is not None else None
+    if mode == "hide":
+        return f"**`{raw}`**: its size is private."
+    if mode == "category":
+        cat = root.vars.get(text_v)
+        return (f"**`{raw}`** size `{cat}` (the number is private)."
+                if cat else f"**`{raw}`**: its size is private.")
     own = info["own"]
     lines = [f"**`{e.id}`** size {info['total']}"
              + (f" (`{info['category']}`)" if info["category"] else "")

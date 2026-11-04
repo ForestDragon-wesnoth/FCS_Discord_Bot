@@ -3287,7 +3287,23 @@ dump` is the raw data for the GM.
   index is a path segment). While anything on the match is private
   (`_match_has_private`), `!log` and the `!history` reads are host-only
   for a reader, as under fog (`_whole_board_read_blocked`, V17, 1018).
-  Both rules are SECRET_RULES: their entries name what is hidden. The lists
+  Both rules are SECRET_RULES: their entries name what is hidden.
+  What a private container gives the unit follows
+  `private_container_effects` (user call, V17, 1022): `show` (default)
+  lists its actions, modifiers and granted tags with private_var_text in
+  place of the path (and of an action's body), `hide` leaves them out of
+  the description, `!action list` / `info`, `!find action:` / `tag:`,
+  the tag placeholders, Tab and `!mod show` (gathered and folded in the
+  reader's view); helpers `_path_private`, `_effects_hidden`,
+  `_reader_tag_pairs`. A private size number follows
+  `private_size_display` (user call, 1023): `category` (default) shows
+  the category and hides the numbers (`{size}` `?`, size_of None,
+  size_class / size_is / size_rank / size_at_least on a name answering
+  from the category), `hide` hides the category too, `show` exempts the
+  size number from privacy (`privacy_spec` drops it). Judged per body on
+  the root and its parts (`Match.size_hidden`); `reader_vars`,
+  `private_view` (its `_view_size_hidden`, read by the size functions)
+  and `corpse_reader_vars` drop the derived pair to match. The lists
   and the flag never show. `!ent dump`, `!ent info <id> full` (hosts) and
   every formula the engine runs (passives, action bodies with their
   `cmd()` lines: `run_action` clears VAR_READER around the body, L45,
