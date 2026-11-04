@@ -51,7 +51,7 @@ import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, normalize_tags,
+from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, VAR_READER, normalize_tags,
                    ACTIONS_USED_MAX,
                    check_tag_filter, tag_filter_matches, tag_filter_empty,
                    RULES_REGISTRY)
@@ -1523,6 +1523,10 @@ async def run_action(
                 guard_token = CROSS_MATCH_GUARD.set(_guard_cross)
                 levels_token = _CROSS_LEVELS.set(_CROSS_LEVELS.get()
                                                  + (cross,))
+                # A body reads every var, private ones included (#70), its
+                # cmd() lines too: `cmd('assert ...')` read through the
+                # caller's reader, so the outcome hung on who ran it (L45).
+                reader_token = VAR_READER.set(None)
                 try:
                     engine.eval_program(
                         action.body, eval_ctx,
@@ -1530,6 +1534,7 @@ async def run_action(
                         action_bindings=bindings,
                     )
                 finally:
+                    VAR_READER.reset(reader_token)
                     _CROSS_LEVELS.reset(levels_token)
                     CROSS_MATCH_GUARD.reset(guard_token)
             except ChoiceNeeded as nc:

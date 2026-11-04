@@ -1201,8 +1201,14 @@ hardcodes**.
   bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
   extras carry changed_key / old_value / new_value / intended_value /
   was_clamped. Status hooks bind `self` = the affected unit. Recursion capped
-  by `var_hook_recursion_limit`; `var_hook_warning_verbosity` (off / minimal /
-  detailed).
+  by `var_hook_recursion_limit` (default 64: past about 90 levels Python's
+  stack runs out first, and `_run_passive` turns that RecursionError into
+  a ⚠️ ending the chain, no crash entry, X22); `var_hook_warning_verbosity`
+  (off / minimal / detailed). The hooks an engine write or spawn fires run
+  outside the engine's own scopes (`_outside_derivation` resets
+  SIZE_DERIVING, TEMPLATE_TRACK_OFF and PLACEMENT_IGNORE): a resync's hooks'
+  writes are tracked, a stamped rider's spawn hooks can't place a unit on
+  its vehicle (S15, S17, 1020).
 - **Turn / round hooks** fire for the acting unit; its attached parts fire
   only their OWN passives (`own_only_targets`). Movement hooks per footprint
   cell (`fire_footprint_tile_*` / `fire_footprint_zone_*`) plus
@@ -2630,7 +2636,12 @@ hardcodes**.
   `_is_transfer_label`) (824). `!ent copy|transfer ... map=<map>` names
   the destination's map (`MatchManager.copy_entity(dest_map=)`); an id
   the destination can't create (a legacy id) is remapped like a
-  collision (`rider` -> `rider_2`, 874).
+  collision (`rider` -> `rider_2`, 874). A batch, macro or `!run` file
+  whose lines run on another match (`!match use` inside it) gives that
+  match its own undo step, labelled with the command, and its watcher
+  poll at the end of the command (`_OTHER_MATCH_PRE`, the pre-state taken
+  before its first line, `_note_other_match` in `dispatch_no_snapshot`;
+  S18, 1021).
 - **Links and transfer_entity** (step 2d): `transfer_entity(eid, match,
   x=None, y=None, map=None)` (mutating; a coordinate works as x) moves a
   unit with its whole body into another match of the server, but only one
@@ -3115,7 +3126,10 @@ and a total per body.
   tracked for partial templates, refused on the derived vars and
   re-derive; `sync_body_size` re-reads the root after each store (at
   most `SIZE_SYNC_PASSES`, then a ⚠️), so the pair ends consistent
-  (S15). A root without a number reads
+  (S15). A body syncs once at a time (`Match._size_syncing`): the sync a
+  hook's write sets off for a body already syncing returns, and the
+  running one re-reads (X22: each nested level looped on its own and a
+  bumping hook hung the bot, 1017). A root without a number reads
   `size_default` (100) plus `size_default_per_extra_tile` (0) per
   footprint cell past the first, live, never stored in size_num.
 - **Writes** (`Match.checked_size_value`, in write_var and at spawn,
@@ -3261,12 +3275,23 @@ dump` is the raw data for the GM.
   hp / max_hp / initiative / team / size placeholders too), death /
   revive lines (`_announce`), `!part list`'s hp, `!find` / `!foreach`
   (`_entity_path_value`, `size:`), `$()` / `!assert` / a read-only `!eval`
-  (`Match.private_view`: every unit's and corpse's vars swapped for the
-  redacted copy while the read-only formula runs), Tab var paths, and a
-  disguise's decoys (judged with the real unit's lists too). The lists
+  (`Match.private_view`: the vars of every unit and corpse holding
+  something private swapped for the redacted copy while the read-only
+  formula runs; `privacy_applies` decides, walking without copying, and
+  `logic.PRIVATE_SCAN` memoizes per top-level command which units need a
+  copy and the copy itself, dropped by a write to the unit or a replaced
+  vars dict, X21), `!tile info`'s corpse snapshots
+  (`_reader_tile_data`), Tab var paths, and a disguise's decoys (judged
+  with the real unit's lists too). A list's dicts are read like the dicts
+  around them (`*.<key>` and a container flag hide there too; an item's
+  index is a path segment). While anything on the match is private
+  (`_match_has_private`), `!log` and the `!history` reads are host-only
+  for a reader, as under fog (`_whole_board_read_blocked`, V17, 1018).
+  Both rules are SECRET_RULES: their entries name what is hidden. The lists
   and the flag never show. `!ent dump`, `!ent info <id> full` (hosts) and
-  every formula the engine runs (passives, action bodies, watchers, a
-  mutating `!eval`) read everything. A host's command in a team-view
+  every formula the engine runs (passives, action bodies with their
+  `cmd()` lines: `run_action` clears VAR_READER around the body, L45,
+  1019; watchers, a mutating `!eval`) read everything. A host's command in a team-view
   channel that withheld something (`PRIVATE_WITHHELD`) ends with the
   `private_var_host_reminder` (default on), at most once per
   `private_var_reminder_cooldown` minutes (10) per host and channel
@@ -3332,7 +3357,9 @@ rejected already. Update this section in the PR that resolves an item.
   match before its body (its rollback state; X13's action half, open: a
   200-unit `!foreach` of `!action` on a filled 300x300 takes ~57 s), and
   every formula evaluation builds its namespace (~2 ms; only the
-  `entity[self].<path> <op> <number>` shape skips it).
+  `entity[self].<path> <op> <number>` shape skips it). `!template resync`
+  serializes the match for its rollback the same way (X20: a `!foreach`
+  of 200 resyncs on a filled 300x300 takes ~42 s).
 
 ### Ask between tasks
 

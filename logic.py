@@ -501,17 +501,25 @@ SIZE_DERIVING: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def _outside_derivation():
-    """Run the var hooks a derived size write fires as ordinary code: a
-    hook's own writes are tracked for partial templates, refused on the
-    derived vars and re-derive, like any other write (S15)."""
-    if not SIZE_DERIVING.get():
+    """Run the hooks an engine write or spawn fires as ordinary code, out of
+    the scopes the engine set for its own write: SIZE_DERIVING (a hook's
+    writes are tracked for partial templates, refused on the derived vars
+    and re-derive, S15), TEMPLATE_TRACK_OFF (a resync's hooks' writes are
+    tracked, S17) and PLACEMENT_IGNORE (a stamped rider's spawn hooks can't
+    place a unit on its vehicle's cell, S17)."""
+    if not (SIZE_DERIVING.get() or TEMPLATE_TRACK_OFF.get()
+            or PLACEMENT_IGNORE.get()):
         yield
         return
-    tok = SIZE_DERIVING.set(False)
+    t1 = SIZE_DERIVING.set(False)
+    t2 = TEMPLATE_TRACK_OFF.set(False)
+    t3 = PLACEMENT_IGNORE.set(())
     try:
         yield
     finally:
-        SIZE_DERIVING.reset(tok)
+        PLACEMENT_IGNORE.reset(t3)
+        TEMPLATE_TRACK_OFF.reset(t2)
+        SIZE_DERIVING.reset(t1)
 
 # The workspace (MatchManager) whose command is running: formulas reach the
 # server's saved entity templates through it (summon_template). Set by each
@@ -930,6 +938,23 @@ class VarReader:
 
 VAR_READER: "contextvars.ContextVar[Optional[VarReader]]" = (
     contextvars.ContextVar("vtt_var_reader", default=None))
+# One top-level command's memo of which units hold anything private
+# (privacy_applies), per match: a `!foreach` of `$()` reads scans each unit
+# once, not once per line (X21). write_var / remove_var drop the written
+# unit's entry. Set by CommandRegistry._run_top; None = no memo.
+PRIVATE_SCAN: "contextvars.ContextVar[Optional[Dict[Any, Any]]]" = (
+    contextvars.ContextVar("vtt_private_scan", default=None))
+
+
+def private_scan_forget(match: Any, eid: str) -> None:
+    """A write changed `eid`'s vars: the command's memo reads it again."""
+    memo = PRIVATE_SCAN.get()
+    if memo:
+        for key, held in memo.items():
+            if key[0] == id(match):
+                held[1].pop(eid, None)
+
+
 # Set while a host's command runs: noted when a read withheld a private var
 # from that host (the private_var_host_reminder).
 PRIVATE_WITHHELD: "contextvars.ContextVar[Optional[List[bool]]]" = (
@@ -1013,6 +1038,44 @@ def reader_sees(level: Optional[str], reader: Optional[VarReader],
     return False
 
 
+def privacy_applies(spec: Dict[str, Tuple[set, set]], vars_root: Any) -> bool:
+    """Whether anything in `vars_root` is private or team-private under
+    `spec`: a path or `*.<key>` entry it holds, a per-unit list, or a
+    `__private_container` flag (dicts inside lists included). A walk that
+    copies nothing, so a unit without private vars costs a read (X21)."""
+    if not isinstance(vars_root, dict):
+        return False
+    if any(vars_root.get(k) for k in PRIVATE_LIST_VARS.values()):
+        return True
+    paths = set().union(*(spec.get(lv, (set(), set()))[0]
+                          for lv in ("private", "team")))
+    keys = set().union(*(spec.get(lv, (set(), set()))[1]
+                         for lv in ("private", "team")))
+    for path in paths:
+        node: Any = vars_root
+        for seg in path.split("."):
+            node = node.get(seg, _MISSING) if isinstance(node, dict) \
+                else _MISSING
+            if node is _MISSING:
+                break
+        else:
+            return True
+    stack: List[Any] = [vars_root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if PRIVATE_CONTAINER_KEY in node:
+                return True
+            for k, v in node.items():
+                if keys and str(k) in keys:
+                    return True
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        else:
+            stack.extend(v for v in node if isinstance(v, (dict, list)))
+    return False
+
+
 def path_privacy(spec: Dict[str, Tuple[set, set]], vars_root: Any,
                  path: str) -> Optional[str]:
     """The level that hides `path` in `vars_root` (its own entry, an
@@ -1022,7 +1085,13 @@ def path_privacy(spec: Dict[str, Tuple[set, set]], vars_root: Any,
     at = ""
     for seg in path.split("."):
         at = f"{at}.{seg}" if at else seg
-        node = node.get(seg) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            node = node.get(seg)
+        elif isinstance(node, list) and seg.isdigit() \
+                and int(seg) < len(node):
+            node = node[int(seg)]
+        else:
+            node = None
         lv = _level_of(spec, at, seg, node)
         if lv == "private":
             return "private"
@@ -1037,7 +1106,7 @@ def redact_vars(spec: Dict[str, Tuple[set, set]], vars_root: Dict[str, Any],
     `vars_root` without the private vars it may not see, nor the per-unit
     lists naming them (their paths would tell what is hidden). `vars_root`
     itself when nothing applies (no reader)."""
-    if reader is None:
+    if reader is None or not privacy_applies(spec, vars_root):
         return vars_root, False
     withheld = [False]
 
@@ -1051,8 +1120,26 @@ def redact_vars(spec: Dict[str, Tuple[set, set]], vars_root: Dict[str, Any],
             if not reader_sees(_level_of(spec, path, key, v), reader, team):
                 withheld[0] = True
                 continue
-            out[k] = walk(v, path) if isinstance(v, dict) else copy.deepcopy(v)
+            out[k] = sub(v, path)
         return out
+
+    def sub(v: Any, path: str) -> Any:
+        # A list's dicts are read like the dicts around them: a `*.<key>`
+        # entry or a container flag inside one hides there too (V17); an
+        # item's index is a path segment (`traps.0.dc`).
+        if isinstance(v, dict):
+            return walk(v, path)
+        if isinstance(v, list):
+            out_l: List[Any] = []
+            for i, item in enumerate(v):
+                ipath = f"{path}.{i}"
+                if isinstance(item, dict) and not reader_sees(
+                        _level_of(spec, ipath, str(i), item), reader, team):
+                    withheld[0] = True
+                    continue
+                out_l.append(sub(item, ipath))
+            return out_l
+        return copy.deepcopy(v)
 
     red = walk(vars_root if isinstance(vars_root, dict) else {}, "")
     if withheld[0] and reader.host:
@@ -2922,6 +3009,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     "private_vars": {
         "default": "",
         "schema": {"type": "str"},
+        # Its entries name what players can't read (L45).
+        "secret": True,
         "desc": (
             "Vars only hosts read, in a channel without a team view: comma-"
             "separated var paths (`stats.secret_dc` hides it and what lies "
@@ -2939,6 +3028,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     "team_private_vars": {
         "default": "",
         "schema": {"type": "str"},
+        # Its entries name what players can't read (L45).
+        "secret": True,
         "desc": (
             "Vars hosts and the unit's own team read (a channel whose team "
             "view is the unit's body's team), private to everyone else: "
@@ -2991,7 +3082,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     ## Var-hook system rules
     "var_hook_recursion_limit": {
-        "default": 128,
+        "default": 64,
         "schema": {"type": "int", "min": 1, "max": 1024, "ceiling": True},
         "desc": (
             "Maximum depth of var-event recursion before further hook firing "
@@ -2999,8 +3090,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "which triggers more events. If a chain exceeds this depth a "
             "warning is logged and further hooks in the chain don't fire — the "
             "underlying writes still happen, only event-firing is suppressed. "
-            "Default 128 is plenty for legitimate cascades; if you hit it, "
-            "you almost certainly have an infinite loop."
+            "Default 64 is plenty for legitimate cascades; if you hit it, "
+            "you almost certainly have an infinite loop. Past about 90 "
+            "levels Python's own stack runs out first: the chain then stops "
+            "with a warning on the passive that went too deep."
         ),
     },
     "var_hook_warning_verbosity": {
@@ -5250,9 +5343,11 @@ def check_size_var(vars_: Any, var_names: Any, where: str) -> None:
     key = str(vn.get("size_num_var") or "size_num")
     if isinstance(vars_, dict) and key in vars_ \
             and not size_number_ok(vars_[key]):
+        got = repr(vars_[key])
+        if len(got) > 40:       # a 400-digit number echoed whole (L45)
+            got = got[:20] + f"… ({len(got)} characters)"
         raise VTTError(f"{where}: `{key}` is a size number (finite, at "
-                       f"most {SIZE_LIMIT} either way), got "
-                       f"{vars_[key]!r}.")
+                       f"most {SIZE_LIMIT} either way), got {got}.")
 
 
 def _corpse_vars(corpse: Any) -> Optional[Dict[str, Any]]:
@@ -6897,6 +6992,12 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str,
         return f"⚙️ {label} fired on `{target_id}` ({p.when}) → {result!r}"
     except FormulaError as ex:
         return f"⚠️ {label} on `{target_id}` ({p.when}) FAILED: {ex}"
+    except RecursionError:
+        # Hooks that keep setting each other off past what Python's stack
+        # holds (a var_hook_recursion_limit raised past ~90 levels): the
+        # chain stops here, as at the limit; no crash entry, nothing broke.
+        return (f"⚠️ {label} on `{target_id}` ({p.when}) stopped: hooks set "
+                f"each other off too deep (lower var_hook_recursion_limit).")
     except Exception as ex:
         # Defensive: programmer-error or unexpected bug shouldn't nuke a turn.
         ref = crash_ref(f"{label} on `{target_id}` ({p.when})", ex)
@@ -8723,8 +8824,10 @@ class Entity:
         # Its body's size total and category (#242), before the spawn
         # hooks read them.
         size_log = match.sync_body_size(self)
-        log = rename_notes + size_log + match.fire_hook(
-            "on_entity_spawned", target_ids=[self.id])
+        with _outside_derivation():
+            spawn_log = match.fire_hook("on_entity_spawned",
+                                        target_ids=[self.id])
+        log = rename_notes + size_log + spawn_log
         # Spawn event — but NOT during a revive (the entity sits in the
         # death-suppressed set only across the revive's spawn window), so
         # a revive emits just its own "revive" event, not a duplicate
@@ -9143,6 +9246,8 @@ class Entity:
         newly-created level along the path, matching the documented "top-down
         for creation" semantics.
         """
+        if self._match is not None:
+            private_scan_forget(self._match, self.id)
         check_store_path(path, "Variable path")
         if self._match is not None:
             msg = reserved_var_path_error(path, f"Writing '{path}' on `{self.id}`")
@@ -9502,6 +9607,8 @@ class Entity:
         If the removed value was a subtree, every level inside it fires its
         own removal event (bottom-up: leaves first, then containers).
         """
+        if self._match is not None:
+            private_scan_forget(self._match, self.id)
         if not path:
             raise VTTError("Variable path cannot be empty.")
         if (not allow_protected and self._match is not None
@@ -9578,6 +9685,8 @@ class Entity:
         """Remove the var at `path` without firing any hooks. The escape
         hatch for cleanup operations where cascading effects would be
         unwanted. No log lines returned (none generated)."""
+        if self._match is not None:
+            private_scan_forget(self._match, self.id)
         if not path:
             raise VTTError("Variable path cannot be empty.")
         if _path_resolve(self.vars, path) is _MISSING:
@@ -12402,6 +12511,26 @@ class Match:
         if e.id not in self.entities:
             return []
         root = self.body_root(e)
+        # A hook this derivation fires that changes a size input syncs the
+        # same body again from inside its own write: that nested sync only
+        # returns, and the running loop re-reads the root on its next pass,
+        # so a hook that keeps changing the size runs SIZE_SYNC_PASSES
+        # times in all (X22: each nested level looped on its own and a
+        # bumping hook recursed to Python's stack limit).
+        syncing = getattr(self, "_size_syncing", None)
+        if syncing is None:
+            syncing = self._size_syncing = set()
+        if root.id in syncing:
+            return []
+        syncing.add(root.id)
+        try:
+            return self._sync_body_size(root, children, warn)
+        finally:
+            syncing.discard(root.id)
+
+    def _sync_body_size(self, root: "Entity",
+                        children: Optional[Dict[str, List["Entity"]]],
+                        warn: bool) -> List[str]:
         _num, text_v, total_v = self.size_names()
         log: List[str] = []
         info = None
@@ -24572,18 +24701,45 @@ class Match:
         swapped: List[Tuple[Any, str, Any]] = []
         try:
             if reader is not None:
+                # Only the units holding something private get a redacted
+                # copy (X21: every unit's vars were copied per `$()`).
+                memo = PRIVATE_SCAN.get()
+                rules_key = (str(self.rules.get("private_vars", "")),
+                             str(self.rules.get("team_private_vars", "")))
+                # Per unit: (its vars dict's id, the redacted copy or None
+                # when nothing of it is private), kept for the command and
+                # dropped by a write to the unit (private_scan_forget).
+                units: Dict[str, Tuple[int, Any]] = {}
+                if memo is not None:
+                    key = (id(self), reader)
+                    held = memo.get(key)
+                    if held is None or held[0] != rules_key:
+                        held = memo[key] = (rules_key, {})
+                    units = held[1]
                 for e in list(self.entities.values()):
-                    red, cut = redact_vars(self.unit_privacy(e), e.vars,
-                                           self.body_team(e), reader)
-                    swapped.append((e, "vars", e.vars))
-                    e.vars = red
+                    # Keyed on the vars dict too: a transform or a spawn
+                    # replaces it whole, without a write_var.
+                    seen = units.get(e.id)
+                    if seen is None or seen[0] != id(e.vars):
+                        red = None
+                        if privacy_applies(self.unit_privacy(e), e.vars):
+                            red = redact_vars(self.unit_privacy(e), e.vars,
+                                              self.body_team(e), reader)[0]
+                            if red is e.vars:
+                                red = None
+                        seen = units[e.id] = (id(e.vars), red)
+                    if seen[1] is not None:
+                        swapped.append((e, "vars", e.vars))
+                        e.vars = seen[1]
                 for _mp, _x, _y, _eid, corpse in self.every_corpse():
                     ent = corpse.get("entity") if isinstance(corpse,
                                                             dict) else None
                     if isinstance(ent, dict) and isinstance(ent.get("vars"),
                                                             dict):
-                        swapped.append((ent, "__item__", ent["vars"]))
-                        ent["vars"] = self.corpse_reader_vars(corpse, reader)
+                        red = self.corpse_reader_vars(corpse, reader)
+                        if red is not ent["vars"]:
+                            swapped.append((ent, "__item__", ent["vars"]))
+                            ent["vars"] = red
             yield
         finally:
             for obj, attr, old in reversed(swapped):

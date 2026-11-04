@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -270,6 +270,24 @@ _SYSTEM_UNDO_TYPED_ONLY = ("❌ `!system undo` only runs when typed on its own "
 
 # True while a `!batch` / `!foreach` dispatches the lines its caller typed:
 # each passes the access gate as the caller (dispatch_no_snapshot).
+# The matches other than the channel's that a top-level command's lines ran
+# on (a batch, macro or `!run` file that switches with `!match use`), with
+# their state before the first such line: each gets its own undo step and
+# watcher poll at the end of the command (S18). None outside a command;
+# the channel's own match maps to None.
+_OTHER_MATCH_PRE: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = (
+    contextvars.ContextVar("vtt_other_match_pre", default=None))
+
+
+def _note_other_match(mgr: "MatchManager", mid: Optional[str]) -> None:
+    """A line is about to run on match `mid`: keep its pre-state when it is
+    not the command's own match and has none yet."""
+    pre = _OTHER_MATCH_PRE.get()
+    if pre is None or mid is None or mid in pre or mid not in mgr.matches:
+        return
+    pre[mid] = mgr.matches[mid].to_dict(include_history=False)
+
+
 _GATE_LINES: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_gate_lines", default=False)
 
@@ -611,6 +629,7 @@ class CommandRegistry:
                     # and anything uncaught here escaped run() with no reply at all.
                     await ctx.send(f"❌ inline $() argument: {e}")
                     return
+        _note_other_match(mgr, mid)
         vtoken = _TYPED_UNIT_VIEW.set(_typed_unit_view(ctx, mgr, mid))
         try:
             result = await h(ctx, args, mgr)
@@ -890,6 +909,9 @@ class CommandRegistry:
         cache_token = PARTIAL_CACHE.set(PARTIAL_CACHE.get()
                                         if PARTIAL_CACHE.get() is not None
                                         else {})
+        # Which units hold private vars, memoized for this command (X21).
+        scan_token = (PRIVATE_SCAN.set({}) if PRIVATE_SCAN.get() is None
+                      else None)
         # Lines about one unit (deaths, revives) carry a tag naming it; every
         # reply of this command drops those its channel's view can't see
         # and strips the tag from the rest.
@@ -964,6 +986,8 @@ class CommandRegistry:
             COMMAND_POV.reset(pov_token)
             COMMAND_USER.reset(user_token)
             PARTIAL_CACHE.reset(cache_token)
+            if scan_token is not None:
+                PRIVATE_SCAN.reset(scan_token)
             CURRENT_WORKSPACE.reset(ws_token)
             FORMULA_LOG_SINK.reset(sink_token)
             _RUN_DEPTH.reset(depth_token)
@@ -1158,6 +1182,11 @@ class CommandRegistry:
         # The other matches this command reaches, for a crash's note (W9).
         touched_token = (MATCHES_TOUCHED.set(set())
                          if MATCHES_TOUCHED.get() is None else None)
+        other_pre: Dict[str, Any] = {}
+        if pre_active_mid is not None:
+            other_pre[pre_active_mid] = None
+        other_token = (_OTHER_MATCH_PRE.set(other_pre)
+                       if _OTHER_MATCH_PRE.get() is None else None)
         try:
             result = await h(ctx, args, mgr)
         except VTTError as e:
@@ -1173,6 +1202,8 @@ class CommandRegistry:
         finally:
             if touched_token is not None:
                 MATCHES_TOUCHED.reset(touched_token)
+            if other_token is not None:
+                _OTHER_MATCH_PRE.reset(other_token)
             _TYPED_UNIT_VIEW.reset(vtoken)
             VAR_READER.reset(reader_token)
             PRIVATE_WITHHELD.reset(withheld_token)
@@ -1303,6 +1334,26 @@ class CommandRegistry:
                 if swept:
                     post_state = None
                     await ctx.send("\n".join(swept))
+        # The other matches the command's lines ran on (S18): their own
+        # undo step and watcher poll.
+        if other_token is not None:
+            for omid, opre in other_pre.items():
+                om = mgr.matches.get(omid)
+                if opre is None or om is None:
+                    continue
+                if _differs_in_undo_state(
+                        opre, om.to_dict(include_history=False)):
+                    om.history.record_command(
+                        om, _command_label(name, args), pre_state=opre,
+                        by=COMMAND_USER.get() or "")
+                    if om.has_watchers():
+                        hide_tok = FORMULA_TEXT_HIDDEN.set(text_hidden)
+                        try:
+                            for line in om.fire_watchers():
+                                await ctx.send(line)
+                            await _flush_formula_log(ctx)
+                        finally:
+                            FORMULA_TEXT_HIDDEN.reset(hide_tok)
         if jpre is not None:
             _journal_command(mgr, ctx, jm, pre_active_mid, name, typed,
                              typed_args, jpre, jrng, jmine,
@@ -13151,8 +13202,15 @@ def _whole_board_read_blocked(ctx: ReplyContext, m: "Match") -> bool:
     pov_filters_queries on. Such a report can't be filtered line by line
     (an old entry may name a unit that is hidden now, or was then), so it
     is host-only while hiding is in play."""
+    if _acts_as_host(ctx, m):
+        return False
+    # A player reads under the private-var rules in any channel: the log
+    # prints hp before and after, a diff or a history label the values a
+    # command set (V17).
+    if VAR_READER.get() is not None and _match_has_private(m):
+        return True
     pov = _query_pov(ctx, m)
-    if pov is None or _acts_as_host(ctx, m):
+    if pov is None:
         return False
     if any(m.fog_on(mp) for mp in m.maps.values()) or any(
             str(m.rules.get(r, "") or "").strip() for r in _VISIBILITY_RULES):
@@ -13163,6 +13221,24 @@ def _whole_board_read_blocked(ctx: ReplyContext, m: "Match") -> bool:
     return any(_pov_hides(m, pov, e.id)
                or m._effective_disguise(e, pov) is not None
                for e in m.entities.values())
+
+
+def _match_has_private(m: "Match") -> bool:
+    """Whether anything on `m` is private or team-private: a rule entry, or
+    a unit or corpse holding its own lists or a private container."""
+    if any(str(m.rules.get(r, "") or "").strip()
+           for r in ("private_vars", "team_private_vars")):
+        return True
+    if any(privacy_applies(m.unit_privacy(e), e.vars)
+           for e in m.entities.values()):
+        return True
+    for _mp, _x, _y, _eid, corpse in m.every_corpse():
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        cv = ent.get("vars") if isinstance(ent, dict) else None
+        if isinstance(cv, dict) and privacy_applies(
+                privacy_spec(m.rules, cv), cv):
+            return True
+    return False
 
 
 def _team_data_readable(ctx: ReplyContext, m: "Match", team: str) -> bool:
@@ -13340,6 +13416,31 @@ def _visible_tile_data(m, x: int, y: int, pov: Optional[str],
     if seen:
         view["corpses"] = seen
     return view or None
+
+
+def _reader_tile_data(m, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Tile data with each corpse snapshot's vars (and its parts') as the
+    command's reader may read them (private vars, V17)."""
+    reader = VAR_READER.get()
+    corpses = data.get("corpses")
+    if reader is None or not isinstance(corpses, dict):
+        return data
+    view = dict(data)
+    view["corpses"] = {}
+    for cid, c in corpses.items():
+        if not isinstance(c, dict):
+            view["corpses"][cid] = c
+            continue
+        c2 = dict(c)
+        if isinstance(c.get("entity"), dict):
+            c2["entity"] = dict(c["entity"])
+            c2["entity"]["vars"] = m.corpse_reader_vars(c, reader)
+        if isinstance(c.get("parts"), list):
+            c2["parts"] = [
+                dict(pd, vars=m.corpse_reader_vars({"entity": pd}, reader))
+                if isinstance(pd, dict) else pd for pd in c["parts"]]
+        view["corpses"][cid] = c2
+    return view
 
 
 def _cell_spec_source(m, x: int, y: int, key: str,
@@ -16133,7 +16234,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if _whole_board_read_blocked(ctx, m):
                 return await ctx.send(
                     "❌ `!history list <kind>` is host-only while this "
-                    "channel's view is fogged or filtered — its labels quote "
+                    "channel's view is fogged, filtered or holds private vars — its labels quote "
                     "commands on hidden units (pov_filters_queries).")
             if kind in ("rounds", "round"):
                 if not m.history.round_saves:
@@ -16491,7 +16592,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if _whole_board_read_blocked(ctx, m):
             return await ctx.send(
                 "❌ `!history diff` is host-only while this channel's view is "
-                "fogged or filtered — it would report hidden units' changes "
+                "fogged, filtered or holds private vars — it would report hidden units' changes "
                 "(pov_filters_queries).")
         snap_a = _resolve_snapshot_selector(m, args[1])
         snap_b = _resolve_snapshot_selector(m, args[2])
@@ -16539,7 +16640,7 @@ async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
     if _whole_board_read_blocked(ctx, m):
         return await ctx.send(
             "❌ undo preview is host-only while this channel's view is "
-            "fogged or filtered — it would report hidden units' changes "
+            "fogged, filtered or holds private vars — it would report hidden units' changes "
             "(pov_filters_queries).")
     from types import SimpleNamespace
     now = SimpleNamespace(state=m.to_dict(include_history=False))
@@ -18418,8 +18519,8 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # ones included (pov_filters_queries).
     if _whole_board_read_blocked(ctx, m):
         return await ctx.send(
-            "❌ `!log` is host-only while this channel's view is fogged or "
-            "filtered — the log reports hidden units' events "
+            "❌ `!log` is host-only while this channel's view is fogged, "
+            "filtered or holds private vars — the log reports hidden units' events "
             "(pov_filters_queries).")
     if not m.event_log:
         return await ctx.send("Event log is empty.")
@@ -18690,7 +18791,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if data is None:
             return await ctx.send(f"tile ({x},{y}): no data.")
         tags = m.tile_tags(x, y, mp)
-        data = _hide_formula_fields(data)
+        data = _hide_formula_fields(_reader_tile_data(m, data))
         return await ctx.send(
             f"**tile ({x},{y})**\n```json\n{json.dumps(data, indent=2, sort_keys=True)}\n```"
             + (f"\nTags (its template's and its own): {', '.join(tags)}"
