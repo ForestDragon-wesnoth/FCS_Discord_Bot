@@ -229,6 +229,12 @@ def _role_ids(member) -> tuple:
                  if getattr(r, "id", None) is not None)
 
 
+def _role_text(role) -> str:
+    """A role as listings show it: its current name, with one `@`."""
+    name = str(getattr(role, "name", ""))
+    return f"**{name}**" if name.startswith("@") else f"**@{name}**"
+
+
 class DiscordCtxWrapper:
     # Discord renders ANSI colors inside ```ansi code blocks, so the
     # colorized map renderer is enabled for this surface.
@@ -277,12 +283,17 @@ class DiscordCtxWrapper:
         guild = self._guild
         roles = list(getattr(guild, "roles", None) or ())
         t = text.strip()
+        if t.lower() in ("@everyone", "everyone"):
+            # Discord names that role `@everyone` (L46).
+            found = [r for r in roles if r.name == "@everyone"]
+            if found:
+                return str(found[0].id), _role_text(found[0])
         if t.startswith("<@&") and t.endswith(">"):
             t = t[3:-1]
         if t.isdigit():
             for r in roles:
                 if str(r.id) == t:
-                    return str(r.id), f"**@{r.name}**"
+                    return str(r.id), _role_text(r)
             raise vtt_commands.VTTError(
                 f"This server has no role with id `{t}`.")
         name = t[1:] if t.startswith("@") else t
@@ -295,14 +306,14 @@ class DiscordCtxWrapper:
             raise vtt_commands.VTTError(
                 f"{len(found)} roles are named `{name}`: mention the one you "
                 f"mean, or give its id.")
-        return str(found[0].id), f"**@{found[0].name}**"
+        return str(found[0].id), _role_text(found[0])
 
     def role_name(self, rid: str):
         """Role `rid` as listings show it, None when the server no longer
         has it."""
         for r in (getattr(self._guild, "roles", None) or ()):
             if str(r.id) == str(rid):
-                return f"**@{r.name}**"
+                return _role_text(r)
         return None
 
     def _reply_cap(self, rule: str = "reply_message_cap",

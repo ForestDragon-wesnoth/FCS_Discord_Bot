@@ -485,8 +485,11 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   `_acts_as_host`, the gate, `require_target_host`, the Discord buttons),
   never its owner; what a `gm` writes records no player author.
   Roles are kept by id: Discord's `resolve_role` takes a mention, id or
-  name, `role_name` shows the current name (None = deleted; dropped at
-  the next grant / revoke).
+  name (`@everyone` too), `role_name` shows the current name (None =
+  deleted; dropped at the next grant / revoke); a grant / revoke takes
+  several roles, one per word, and the CLI's roles are single words.
+  `!match replay` builds a match, so it passes `_require_match_creator`
+  too (1031).
 - **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
   `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
   (`require_target_host`) — the access gate only checks the CHANNEL's match,
@@ -2432,7 +2435,10 @@ hardcodes**.
   hidden units it named (`_HOST_REVEALS`). A glued part shows while the
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
-  (`_whole_board_read_blocked`). `team_data_visibility` (own / all / host)
+  (`_whole_board_read_blocked`); a host's in a channel with a team view
+  is refused while the match holds private vars, since players read the
+  channel (`_host_private_read_refusal`: `!log`, `!history diff` / list
+  kinds, undo preview, `!match journal`, `!dry`'s change list; 1032). `team_data_visibility` (own / all / host)
   filters `!team list/get`. `formula_text_visibility` (all / host, user
   call): under `host` a caller who is neither an administrator nor a host
   of the channel's match reads every GM formula as `(hidden)` (names,
@@ -2527,7 +2533,9 @@ hardcodes**.
   still move through a multi-line block; an unsent draft comes back past
   the newest), Ctrl+R reverse search (GUI: a bar above the input, Enter
   takes the match for editing, Esc restores the draft, clicking away takes
-  the match), and in the GUI Esc clears the input and Ctrl+L the log; the
+  the match; the bar is packed before the input row, so it takes its
+  height in the input's pane, I1), and in the GUI Esc clears the input and
+  Ctrl+L the log; the
   first / last line is a screen ROW, so Up / Down still move through a long
   wrapped line; keypad Enter runs like Enter. A line whose quote is still
   open continues on the next line not starting with `!` (a multi-line
@@ -2872,7 +2880,16 @@ hardcodes**.
   library metadata kept by a re-save and stripped at spawn) makes a
   template host-only: to any reader it reads as missing in list / show /
   diff / tags / trash, template_names / has_template / template_data and
-  Tab (`_readable_template`, `completion._readable_template_names`).
+  Tab (`_readable_template`, `completion._readable_template_names`), and
+  in the edits and restore (`_require_saver` answers as for a missing one
+  unless the caller is its saver or may edit it). A reference to it from
+  a public template reads, for such a reader, as `(private)`
+  (`logic.mask_private_refs`, `PRIVATE_REF_TEXT`: raw JSON, summaries,
+  `template_of`) and resolves to nothing (`logic.private_templates_hidden`:
+  `Match._template_library` / `partial_data` give its data as empty, pins
+  unread, with a fresh partial cache; around list / show / diff / tags
+  and `template_data`) (V19, 1030). A JSON import over a private template
+  keeps it private unless the JSON says `"private": false`.
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server

@@ -613,6 +613,13 @@ def _command_candidates(words: List[str], word: str, mgr, ctx) -> List[str]:
                                        mgr, ctx))
             except Exception:
                 pass             # a name source that can't be read: skip
+    if "full" in out and m is not None and root in ("ent", "map", "state",
+                                                     "list"):
+        # `full` (omniscient, or private vars too) is for hosts: a player
+        # is refused it, so it isn't offered (L46).
+        from vtt_commands import _acts_as_host
+        if not _acts_as_host(ctx, m):
+            out.discard("full")
     if root == "map" and not args and m is not None:
         out |= set(_map_names(m, ctx))   # `!map <name>` renders that map
     if "=" not in word:
@@ -653,7 +660,23 @@ def complete(text: str, mgr, ctx) -> Tuple[int, List[str]]:
     start = len(text) - len(word)
     if not words and start == lead:
         start += 1                      # the `!` stays
-    cands = _command_candidates(words, word, mgr, ctx)
+    # Completion runs outside a command: read as the command would (the
+    # caller's private-var reader, the workspace), so what a read hides
+    # (a private container's actions under private_container_effects
+    # hide) isn't offered either (L46).
+    from vtt_commands import _var_reader
+    try:
+        reader = _var_reader(ctx, mgr, mgr.active_by_channel.get(
+            getattr(ctx, "channel_key", None)))
+    except Exception:
+        reader = None
+    t1 = logic.VAR_READER.set(reader)
+    t2 = logic.CURRENT_WORKSPACE.set(mgr)
+    try:
+        cands = _command_candidates(words, word, mgr, ctx)
+    finally:
+        logic.CURRENT_WORKSPACE.reset(t2)
+        logic.VAR_READER.reset(t1)
     low = word.lower()
     return start, [c for c in cands if c.lower().startswith(low)]
 

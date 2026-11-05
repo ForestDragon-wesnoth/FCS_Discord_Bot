@@ -35513,3 +35513,174 @@ opens `ent hp`, dee gets the more open of her two roles' levels and runs it.
 eve's own override (`ent hp` host) wins over her role's, so hers waits for
 approval. An override names one player or one role, not both. orc ends at
 48 (bob's and dee's hits; eve's waits).
+
+SCENARIO 1030 — A private partial behind public templates: a reader who may not read it gets its references masked and resolved to nothing; edits and restores of it answer as for a missing template
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new tr Tpl 8 8
+!match use tr
+!ent add ga G 10 2 2
+!ent set_var ga gear.zqxcode 4242
+!ent set_var ga gear.dmg 9
+!template save ga secretp path=gear
+!template private secretp on
+!template import pub {"name": "Pub", "vars": {"hp": 5, "gear": {"__template": "secretp", "extra": 1}}}
+!template import pub2 {"kind": "partial", "data": {"__template": "secretp", "extra": 1}}
+!template import pub3 {"name": "Pub3", "vars": {"__template": "secretp", "hp": 7}}
+!template spawn pub 5 5
+!host access set template all
+!as player bob
+!template show pub expanded
+?? "__template": "(private)"
+?! zqxcode
+?! secretp
+!template show pub2
+?? extends `(private)`, saved by cli
+!template list
+?? `pub3` — Pub3, based on `(private)`, hp 7, saved by cli
+?! secretp
+!template diff pub pub3
+?! zqxcode
+!roll "$(len(keys(template_data('pub2'))))"
+?? → **1**
+!roll 1 "$(template_of('pub', 'gear'))"
+?? (private)
+!template delete secretp
+?? ❌ No template `secretp` (`!template list`).
+!template restore secretp
+?? ❌ No old version of `secretp` from the last 24 hours.
+!as host
+!template show pub expanded
+?? "zqxcode": 4242
+!assert "template_of('pub', 'gear') == 'secretp' and template_data('pub2', 'zqxcode') == 4242"
+!template import secretp {"kind": "partial", "data": {"zqxcode": 4343, "dmg": 9}}
+?? 🔒 still private
+!template show secretp
+?? 🔒 private
+!template import secretp {"kind": "partial", "data": {"zqxcode": 4343, "dmg": 9}, "private": false}
+?! still private
+!template private secretp on
+!as player bob
+!template show pub2 expanded
+?! 4343
+HARNESS-ALLOWS-ERRORS
+
+Expected: `secretp` is a private partial; `pub`, `pub2` and `pub3` are
+public templates built on it. Player bob (the host opened `!template` to
+players) reads each public one with the reference named `(private)` and
+resolved to nothing: `show ... expanded`, the list's summaries, `diff`,
+`template_data` (one field left, pub2's own) and `template_of` on the unit
+spawned from `pub` give no data or name of `secretp`. Deleting or
+restoring it answers as for a missing template, so the saver's name no
+longer tells that it exists. The host reads everything as before. A JSON
+import over the private partial keeps it private (the reply says so)
+unless the JSON says `"private": false`.
+
+SCENARIO 1031 — Access and capability edges: several roles in one grant, one user= / role= per override, a per-player override closing a sweep's read, role words, replays under `host`, Tab
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!server perms grant files arc1 arc2
+?? ✅ Role `arc1` now holds `files`
+?? ✅ Role `arc2` now holds `files`
+!server perms revoke files arc1 arc2
+?? ✅ Role `arc2` no longer holds `files`.
+!server perms grant gm "game master"
+?? ❌ `game master` isn't one role
+!as player bob roles="a b"
+?? ❌ A role here is one word
+!as host
+!match new ac Acc 6 6
+!match use ac
+!ent add orc Orc 10 2 2
+!ent set_var orc __private_container true
+!host access set ent all role=r1 role=r2
+?? ❌ Name one `role=` per override
+!host access set ent all user=amy user=bob
+?? ❌ Name one `user=` per override
+!host access set "ent info" host user=bob
+!as player bob
+!foreach hp>0 ; ent info $id
+?? needs host approval
+?! can't run inside a batch
+!as player cal
+!foreach hp>0 ; ent info $id
+?? **Orc** (`orc`)
+?tab "!ent info orc "
+?? candidates: short
+?! full
+!as host
+?tab "!ent info orc "
+?? full
+!match journal export j1031
+!server perms grant host builders
+!server perms grant files arc
+!as player dee roles=arc
+!match replay j1031 as=copy
+?? ❌ Creating matches on this server is limited to roles with the `host` capability
+!as player dee roles=arc,builders
+!match replay j1031 as=copy
+?? Replayed
+HARNESS-ALLOWS-ERRORS
+
+Expected: one grant names several roles, each its own word, and one
+revoke takes them back; a role name with a space in it is refused at the
+CLI, where a role is one word (`roles=a,b` too). A second `role=` or
+`user=` in one `!host access` is refused (it used to replace the first).
+With `ent info` closed to bob alone, his read-only sweep of it waits for a
+host like any gated sweep, where it used to start and refuse every line;
+cal's runs. Tab doesn't offer `full` after `!ent info <id>` to a player
+(a host gets it). With `host` limited to `builders`, a `files` holder
+without it can't replay a journal into a new match; with both roles the
+replay builds it.
+
+SCENARIO 1032 — Private vars in a team-view channel: a host's whole-board reads refused there; an imported snapshot's name; sizes off across a transform; Tab and a hidden private container
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new pw PW 6 6
+!match use pw
+!ent add hero Hero 10 2 2
+!system set default private_vars secret
+!ent set_var hero secret 42
+!ent set_vars hero team=red
+!history export latest:command snap1032
+!history import snap1032
+?? as manual save `imported-
+!history list manual
+?? imported-3
+!history restore imported-3 confirm
+?! Unknown option
+!match bind pov=red
+!log
+?? ❌ `!log` prints private vars, and this channel shows team `red`'s view, which players read: run it in a channel without a team view.
+!history diff latest:command now
+?? ❌ `!history diff` prints private vars
+!match journal
+?? ❌ `!match journal` prints private vars
+!match unbind
+!match use pw
+!log
+?! ❌
+!system set default private_vars ""
+!system set default private_container_effects hide
+!ent set_var hero bag.__private_container true
+!ent set_var hero bag.actions.zap.target none
+!ent set_var hero bag.actions.zap.body "pass"
+!as player bob
+?tab "!action hero "
+?! zap
+!as host
+?tab "!action hero "
+?? zap
+!ent add b B 7 4 4
+!ent store_entity_into_var b hero forms.og
+!system set default size_enabled false
+!ent transform hero forms.og st2
+!assert "not var_has('hero', 'size_total') and not var_has('hero', 'size_text')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: while a private var exists, a host in a channel bound to red's
+view is refused `!log`, `!history diff` and `!match journal` with where to
+read them, as template reads there hide private templates; unbound, `!log`
+reads. A command snapshot whose label holds `=` (`!ent set_vars hero
+team=red`) imports under the plain name `imported-<seq>`, which restore
+and delete can take back. Under `private_container_effects hide`, Tab
+offers a player nothing from the private container (the host still gets
+`zap`). With sizes off, transforming into a form captured while sizes were
+on doesn't bring the derived size vars back.

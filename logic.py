@@ -11000,8 +11000,8 @@ class Match:
     # Counts the changes syncs made (the command layer tells from it whether
     # its end-of-command sync changed the match).
     _grant_changes: int = field(default=0, repr=False)
-    # The condition errors shown during the running command (its log sink's
-    # id, the lines).
+    # The condition errors shown during the running command (its log sink,
+    # the lines).
     _grant_warned: Tuple[Any, Set[str]] = field(
         default_factory=lambda: (None, set()), repr=False)
     # Buffer of warning log lines accumulated during a var-event chain.
@@ -11686,10 +11686,12 @@ class Match:
         # formula engine.)
         errors.pop(None, None)
         if errors and self.command_pov() is None:
+            # Keyed by the sink object itself: a new command's sink could
+            # take a freed one's id() and read as the same command, so its
+            # warning was left out (L46).
             sink = FORMULA_LOG_SINK.get()
-            key = id(sink) if sink is not None else None
-            if self._grant_warned[0] != key or key is None:
-                self._grant_warned = (key, set())
+            if self._grant_warned[0] is not sink or sink is None:
+                self._grant_warned = (sink, set())
             for zname, (first, units) in sorted(
                     (k, v) for k, v in errors.items() if k is not None):
                 # Hidden formula text leaves the error out (V15).
@@ -20747,13 +20749,27 @@ class Match:
     # ---- partial templates (see TEMPLATE_MARKER for the two forms) ----------
     def _template_library(self) -> Dict[str, Any]:
         ws = CURRENT_WORKSPACE.get()
-        return getattr(ws, "templates", None) or {}
+        lib = getattr(ws, "templates", None) or {}
+        if TEMPLATE_HIDE_PRIVATE.get() and private_template_names(lib):
+            # A reader who may not read a private partial resolves it as
+            # one with no data (V19).
+            return {n: ({"kind": "partial", "data": {}}
+                        if isinstance(t, dict) and t.get(TEMPLATE_PRIVATE_KEY)
+                        and t.get("kind") == "partial" else t)
+                    for n, t in lib.items()}
+        return lib
 
     def partial_data(self, name: str) -> Optional[Dict[str, Any]]:
         """The FILE-form data of partial `name` as this match sees it: its pin
         when template_pinning is on (pinned on first use), else the
         library's. None when there is no such partial."""
         pinning = bool(self.rules.get("template_pinning", False))
+        if TEMPLATE_HIDE_PRIVATE.get():
+            real = getattr(CURRENT_WORKSPACE.get(), "templates", None) or {}
+            t = real.get(name)
+            if isinstance(t, dict) and t.get(TEMPLATE_PRIVATE_KEY):
+                # Private for this reader: no data, its pin unread too.
+                return {} if t.get("kind") == "partial" else None
         if pinning and name in self.template_pins:
             return self.template_pins[name].get("data")
         t = self._template_library().get(name)
@@ -23330,6 +23346,12 @@ class Match:
             new_vars.pop(k, None)
             if k in e.vars:
                 new_vars[k] = copy.deepcopy(e.vars[k])
+        if not self.sizes_on():
+            # A form captured while sizes were on carries the derived pair;
+            # with sizes off nothing derives it, so it doesn't come back
+            # (L46), as a summon of the form drops it.
+            for k in self.size_names()[1:]:
+                new_vars.pop(k, None)
         # Checked BEFORE the old parts go, so a bad statblock changes nothing.
         new_vars = checked_unit_vars(new_vars, (hp_var, max_hp_var, turnorder_var),
                                      "transform", self.rules.get("team_var", "team"),
@@ -26815,6 +26837,66 @@ _TEMPLATE_META_KEYS = ("saved_by", "saved_by_name")
 # into a unit.
 TEMPLATE_PRIVATE_KEY = "private"
 _TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,)
+# What a reader who may not read a private template sees in place of a
+# reference to it (V19).
+PRIVATE_REF_TEXT = "(private)"
+# Set while a reader who may not read private templates resolves partials:
+# a private partial then expands to nothing (V19).
+TEMPLATE_HIDE_PRIVATE: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_template_hide_private", default=False))
+
+
+@contextmanager
+def private_templates_hidden(hide: bool):
+    """Resolve partials as a reader who may not read private templates
+    (V19): inside, a private partial's data reads as empty, and the
+    command's partial cache is set aside so nothing resolved either way
+    crosses over."""
+    if not hide:
+        yield
+        return
+    t1 = TEMPLATE_HIDE_PRIVATE.set(True)
+    t2 = PARTIAL_CACHE.set({})
+    try:
+        yield
+    finally:
+        PARTIAL_CACHE.reset(t2)
+        TEMPLATE_HIDE_PRIVATE.reset(t1)
+
+
+def private_template_names(library: Dict[str, Any]) -> "set[str]":
+    """The names of the library's private templates."""
+    return {n for n, t in (library or {}).items()
+            if isinstance(t, dict) and t.get(TEMPLATE_PRIVATE_KEY)}
+
+
+def mask_private_refs(value: Any, private: "set[str]") -> Any:
+    """`value` (template data, file or live form) with every reference to
+    a template in `private` named PRIVATE_REF_TEXT (V19). Returns `value`
+    itself when nothing changes."""
+    if not private:
+        return value
+    if isinstance(value, dict):
+        out = None
+        for k, v in value.items():
+            nv = v
+            if k == TEMPLATE_MARKER:
+                if isinstance(v, str) and v in private:
+                    nv = PRIVATE_REF_TEXT
+                elif isinstance(v, dict) and v.get("name") in private:
+                    nv = {**v, "name": PRIVATE_REF_TEXT}
+            else:
+                nv = mask_private_refs(v, private)
+            if nv is not v:
+                if out is None:
+                    out = dict(value)
+                out[k] = nv
+        return value if out is None else out
+    if isinstance(value, list):
+        items = [mask_private_refs(v, private) for v in value]
+        return (value if all(a is b for a, b in zip(items, value))
+                else items)
+    return value
 _TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
                            "mount_slot")
 

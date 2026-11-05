@@ -395,7 +395,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, TEMPLATE_PRIVATE_KEY, reader_template
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, TEMPLATE_PRIVATE_KEY, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT
 
 
 class FormulaError(VTTError):
@@ -7919,7 +7919,10 @@ class FormulaEngine:
             data = cache.get(ckey) if cache is not None else None
             if data is None:
                 try:
-                    data = match.expand_template(tpl)
+                    # A private partial it references reads as empty to
+                    # a reader who may not read it (V19).
+                    with private_templates_hidden(view_reader is not None):
+                        data = match.expand_template(tpl)
                 except (VTTError, NotFound) as ex:
                     raise FormulaError(f"template_data: {ex}")
                 # Without the private vars the reader can't read (#70).
@@ -7989,7 +7992,12 @@ class FormulaEngine:
             for k in ([] if path in ("", ".") else path.split(".")):
                 node = node.get(k) if isinstance(node, dict) else None
             mk = node.get(TEMPLATE_MARKER) if isinstance(node, dict) else None
-            return mk.get("name") if isinstance(mk, dict) else None
+            got = mk.get("name") if isinstance(mk, dict) else None
+            if got is not None and getattr(match, "_view_reader", None) \
+                    is not None and got in private_template_names(
+                        _workspace_templates()):
+                return PRIVATE_REF_TEXT   # V19: a private template's name
+            return got
 
         ns["give_template"]        = _give_template
         ns["template_of"]          = _template_of
