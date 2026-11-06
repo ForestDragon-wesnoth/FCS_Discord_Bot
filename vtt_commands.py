@@ -1889,7 +1889,7 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
 
 # Subcommands of a command registered without undo snapshots that change
 # the match and take a command snapshot of their own.
-_SNAPSHOT_SUBS = frozenset({("turn", "set")})
+_SNAPSHOT_SUBS = frozenset({("turn", "set"), ("turn", "grant")})
 
 # Commands that only read the match (no undo snapshot either): the journal
 # doesn't serialize it around them.
@@ -3746,12 +3746,12 @@ def _format_vars_blob(vars_dict: dict) -> str:
 
 
 def _passive_opts(tokens: List[str]):
-    """The leading `target=` / `scope=` / `priority=` options of a passive
-    add, then the formula's words: (target, scope, priority, words). An
-    option-shaped word that is the last one is the formula (`x=1`), and a
-    mistyped option is refused, since it would otherwise start the formula
-    and fail as a bare "Syntax error"."""
-    target, scope, prio = "", "deep", 0
+    """The leading `target=` / `scope=` / `priority=` / `extra_turns=`
+    options of a passive add, then the formula's words: (target, scope,
+    priority, extra_turns, words). An option-shaped word that is the last
+    one is the formula (`x=1`), and a mistyped option is refused, since it
+    would otherwise start the formula and fail as a bare "Syntax error"."""
+    target, scope, prio, xturns = "", "deep", 0, None
     rest = list(tokens)
     while len(rest) > 1 and re.fullmatch(r"[A-Za-z_]\w*=\S*", rest[0]):
         key, _, val = rest.pop(0).partition("=")
@@ -3761,15 +3761,40 @@ def _passive_opts(tokens: List[str]):
             scope = val.lower()
         elif key == "priority":
             prio = checked_priority(val, "priority=")
+        elif key == "extra_turns":
+            xturns = _extra_turns_word(val, "extra_turns=")
         else:
             raise VTTError(f"Unknown option `{key}=` (it takes: `target=`, "
-                           f"`scope=`, `priority=`).")
-    return target, scope, prio, rest
+                           f"`scope=`, `priority=`, `extra_turns=`).")
+    return target, scope, prio, xturns, rest
+
+
+def _extra_turns_word(word: str, what: str) -> Optional[bool]:
+    """A passive's extra-turn setting (#224): on / off, or `default` (the
+    extra_turn_passives rule decides)."""
+    w = str(word).strip().lower()
+    if w in ("default", "rule", "-"):
+        return None
+    try:
+        return _parse_bool(w)
+    except VTTError:
+        raise VTTError(f"`{what}` takes on, off or default (the "
+                       f"extra_turn_passives rule), not `{word}`.")
+
+
+def _extra_turns_text(v: Optional[bool]) -> str:
+    return ("default (extra_turn_passives)" if v is None
+            else ("on" if v else "off"))
 
 
 def _priority_text(p) -> str:
-    """` pri N` for a passive with a priority (0 shows nothing)."""
-    return f" pri {p.priority}" if getattr(p, "priority", 0) else ""
+    """` pri N` for a passive with a priority (0 shows nothing), and its
+    extra-turn setting when it has one (#224)."""
+    out = f" pri {p.priority}" if getattr(p, "priority", 0) else ""
+    xt = getattr(p, "extra_turns", None)
+    if xt is not None:
+        out += f" extra_turns {'on' if xt else 'off'}"
+    return out
 
 
 def _format_passive_line(label: str, p) -> str:
@@ -4031,9 +4056,9 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m = active_match(mgr, ctx)
         pov = _query_pov(ctx, m)
         view = _view_pov(ctx, m, [])
-        cur = (m.turn_order[m.active_index]
-               if m.round_started and 0 <= m.active_index < len(m.turn_order)
-               else None)
+        cur = (m.current_entity_id() if m.round_started and (
+            m.extra_turn is not None
+            or 0 <= m.active_index < len(m.turn_order)) else None)
         if cur is None:
             turn = "not started"
         elif _pov_hides(m, pov, cur):
@@ -13768,7 +13793,11 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 order_lines.append(
                     f"{mark} `{eid[:8]}` **{m.entity_display_name(e, pov)}** "
                     f"({init_label} {e.initiative})")
-        return await ctx.send("Turn order:\n" + ("\n".join(order_lines) or "(empty)"))
+        out = "Turn order:\n" + ("\n".join(order_lines) or "(empty)")
+        extra = _extra_turn_lines(m, pov)
+        if extra:
+            out += "\n" + "\n".join(extra)
+        return await ctx.send(out)
     sub = args[0].lower()
     if sub == "next":
         eid, fire_log = m.next_turn()
@@ -13798,7 +13827,9 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             tctx = _entity_template_context(e, pov)
             tctx.update({"short_id": eid[:8], "round": m.round_number})
-            fmt = str(m.rules.get("turn_start_message_format", "") or "")
+            fmt = str(m.rules.get(
+                "extra_turn_message_format" if m.extra_turn == eid
+                else "turn_start_message_format", "") or "")
             now = _render_template(fmt, tctx) if fmt else ""
         # In the order things happened: the turn-end / round lines and hook
         # output first, whose turn it now is last.
@@ -13829,8 +13860,61 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         log = m.set_turn(eid)
         lines = list(log) + [f"It is now `{eid}`'s turn (set by `!turn set`)."]
         return await ctx.send("\n".join(lines))
+    if sub == "grant":
+        return await ctx.send(_turn_grant(ctx, m, args[1:]))
     # Fallback: show authoritative help
     return await _help_fallback(ctx, ["turn"], args[0] if args else None)
+
+
+def _extra_turn_lines(m: Match, pov: Optional[str]) -> List[str]:
+    """The extra turn under way and the queued ones (#224), as the view
+    `pov` sees them: a unit it can't see is left out."""
+    out: List[str] = []
+    def name(eid: str) -> Optional[str]:
+        e = m.entities.get(eid)
+        if e is None or _pov_hides(m, pov, eid):
+            return None
+        return f"`{eid[:8]}` **{m.entity_display_name(e, pov)}**"
+    if m.extra_turn:
+        shown = name(m.extra_turn)
+        if shown:
+            out.append(f"⏩ now taking an extra turn: {shown}")
+    queued = [x for x in (name(eid) for eid in m.extra_turns) if x]
+    if queued:
+        out.append("Extra turns queued (after the turn under way): "
+                   + ", ".join(queued))
+    return out
+
+
+def _turn_grant(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
+    """`!turn grant <id> [n] | list | clear [id]` (#224)."""
+    if not rest:
+        raise VTTError("Usage: `!turn grant <id> [n] | list | clear [id]`.")
+    word = rest[0].lower()
+    if word == "list":
+        pov = _query_pov(ctx, m)
+        lines = _extra_turn_lines(m, pov)
+        return "\n".join(lines) if lines else "No extra turns queued."
+    if word == "clear":
+        eid = _resolve_eid(m, rest[1]) if len(rest) > 1 else None
+        n = m.clear_extra_turns(eid)
+        whose = f" of `{eid}`" if eid else ""
+        return (f"Dropped {n} queued extra turn(s){whose}." if n else
+                f"No extra turns{whose} were queued.")
+    eid = _resolve_eid(m, rest[0])
+    n = 1
+    if len(rest) > 1:
+        try:
+            n = int(rest[1])
+        except ValueError:
+            raise VTTError(f"`{rest[1]}` isn't a number of turns.")
+    m.grant_extra_turns(eid, n)
+    if m.round_started:
+        when = "after the turn under way"
+    else:
+        when = "after the first turn"
+    return (f"⏩ `{eid}` gets {n} extra turn(s), {when} "
+            f"({len(m.extra_turns)} queued in all).")
 def _turn_forecast_text(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
     """`!turn forecast [n]`: Match.turn_forecast through the channel's
     view (turn_forecast_hidden_units)."""
@@ -13866,12 +13950,15 @@ def _turn_forecast_text(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
             lines.append(f"— Round {last_round} —")
         mark = "➡️ now:" if ent["now"] else f"{k}."
         if hidden:
-            lines.append(f"{mark} {hidden_text}")
+            lines.append(f"{mark} {hidden_text}"
+                         + (" (extra)" if ent.get("extra") else ""))
             continue
         tctx = _entity_template_context(e, pov)
         tctx.update({"short_id": eid[:8],
                      "round": "" if ent["round"] is None else ent["round"]})
         line = f"{mark} {_render_template(fmt, tctx)}"
+        if ent.get("extra"):
+            line += " (extra)"
         if ent["skip"]:
             line += f" — skipped ({', '.join(ent['skip'])})"
         lines.append(line)
@@ -13904,6 +13991,25 @@ registry.annotate_sub(
           "turn_forecast_hidden_text (turn_forecast_hidden_units). Under "
           "ATB it extends the charge bars at their rates now, an "
           "estimate. The formula function next_turns gives the ids.")
+)
+registry.annotate_sub(
+    "turn", "grant",
+    usage="!turn grant <id> [n] | list | clear [id]",
+    desc=("Extra turns: give unit <id> [n] (default 1) extra turns. They "
+          "run right after the turn under way ends (before the first turn, "
+          "after the first), queued in grant order, then play goes on "
+          "where the order was: the unit's regular turn this round stays "
+          "(a unit granted one during its own turn acts twice in a row), "
+          "and under ATB no charge bar moves. Any living unit can take "
+          "one, in the turn order or not (not a glued or region body part "
+          "outside it). What fires follows extra_turn_passives (a "
+          "passive's own `extra_turns`), extra_turn_status_ticks (a "
+          "status's `extra_turn_ticks`), extra_turn_schedules and "
+          "extra_turn_skippable; formulas read the `extra_turn` binding; "
+          "the turn's line is extra_turn_message_format. A unit that dies "
+          "or leaves loses its turns; `!turn set` keeps the queue. `list` "
+          "shows the queue, `clear [id]` empties it (of <id> only). The "
+          "formula grant_turn(eid, n=1) grants from an action.")
 )
 registry.annotate_sub(
     "turn", "set",
@@ -15652,7 +15758,7 @@ async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
             return await _help_fallback(ctx, ["list"], a)
     pov = _view_pov(ctx, m, args)
     es = m.entities_in_turn_order()
-    active_id = m.turn_order[m.active_index] if m.turn_order else None
+    active_id = m.current_entity_id()
     lines: List[str] = []
     # Filter out entities hidden from this POV (omniscient pov=None keeps
     # all). The viewer's own team is never hidden, as in `!turn` and the
@@ -17801,10 +17907,15 @@ _DIFF_SKIP_KEYS = frozenset({
     "global_passives", "groups", "maps", "map_order", "vars", "team_data",
     "outcome", "event_log", "turns_elapsed", "turn_vacated", "round_started",
     "rng_seed", "rng_pos", "round_acted", "turn_order_dirty",
+    "extra_turns", "extra_turn",
 })
 
 
 def _active_id(state: Dict[str, Any]) -> Optional[str]:
+    xt = state.get("extra_turn")
+    if isinstance(xt, str):
+        # An extra turn under way (#224).
+        return xt or None
     order = state.get("turn_order") or []
     idx = state.get("active_index")
     if isinstance(idx, int) and 0 <= idx < len(order):
@@ -17855,6 +17966,9 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     elif not same_value(sa.get("turn_order"), sb.get("turn_order")):
         lines.append(f"- turn order: {sa.get('turn_order')} -> "
                      f"{sb.get('turn_order')}")
+    if not same_value(sa.get("extra_turns") or [], sb.get("extra_turns") or []):
+        lines.append(f"- extra turns queued: {sa.get('extra_turns') or []} "
+                     f"-> {sb.get('extra_turns') or []}")
     if not same_value(sa.get("outcome"), sb.get("outcome")):
         lines.append(f"- outcome: {sa.get('outcome')!r} -> {sb.get('outcome')!r}")
     # Rule changes: report at the key level (one line per changed rule).
@@ -18299,7 +18413,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "add":
         # Syntax:
-        #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"
+        #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] "<formula>"
         #
         # target/scope are optional and only meaningful for var hooks
         # (on_var_*). For other hooks they're stored but ignored at fire time.
@@ -18317,7 +18431,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # the formula. Named args may appear in any order but must all
         # come before any formula content so simple cases stay terse
         # (`!pas add ... <formula>` without typing target=/scope=).
-        target_val, scope_val, prio, formula_parts = _passive_opts(args[4:])
+        target_val, scope_val, prio, xturns, formula_parts = _passive_opts(args[4:])
         # Translate `\n`/`\t` so a multi-line body typed at the CLI
         # (where shlex preserves literal backslash-n) compiles. See
         # formula.normalize_body_source.
@@ -18341,6 +18455,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e.passives[pid] = Passive(
             id=pid, when=when, formula=formula,
             target=target_val, scope=scope_val, priority=prio,
+            extra_turns=xturns,
         )
         # Mention target/scope in the ack only for var hooks where they apply
         scope_note = ""
@@ -18362,6 +18477,21 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         p.priority = checked_priority(args[3], "priority")
         return await ctx.send(f"Passive `{eid}.{p.id}` now has priority "
                               f"{p.priority} (higher runs first).")
+
+    if sub == "extra_turns":
+        if await return_help_if_not_enough_args(ctx, args, 4, "passive", "extra_turns"):
+            return
+        _check_tail(args, 4, (),
+                    "!passive extra_turns <entity_id> <passive_id> <on|off|default>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        p = m.entities[eid].passives.get(args[2])
+        if p is None:
+            raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
+        p.extra_turns = _extra_turns_word(args[3], "extra_turns")
+        return await ctx.send(f"Passive `{eid}.{p.id}` on extra turns: "
+                              f"{_extra_turns_text(p.extra_turns)}.")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 3, "passive", "remove"):
@@ -18420,7 +18550,9 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"**Passive `{eid}.{pid}`**\n"
             f"Hook: `{p.when}`\n"
-            + (f"Priority: {p.priority}\n" if p.priority else "") +
+            + (f"Priority: {p.priority}\n" if p.priority else "")
+            + (f"On extra turns: {_extra_turns_text(p.extra_turns)}\n"
+               if p.extra_turns is not None else "") +
             f""
             f"{scope_block}"
             f"Formula:\n```\n{formula_text(p.formula)}\n```"
@@ -18430,7 +18562,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "passive", "add",
-    usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
+    usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] "<formula>"',
     desc=(
         "Attach a passive to an entity. <when> must be one of the hook names "
         "(see `!passive hooks`). Formula is run as a program when the hook fires; "
@@ -18441,8 +18573,16 @@ registry.annotate_sub(
         "scope=exact (only this exact path), children (one segment deeper), "
         "or deep (this path or any descendant). Defaults: target=root, scope=deep "
         "(catches every var-event on the entity). Inside a var-hook formula you "
-        "also have access to: changed_key, old_value, new_value, hook_name."
+        "also have access to: changed_key, old_value, new_value, hook_name. "
+        "extra_turns=on|off decides whether an on_turn_* passive fires on "
+        "extra turns (#224; default: the extra_turn_passives rule)."
     ),
+)
+registry.annotate_sub(
+    "passive", "extra_turns",
+    usage="!passive extra_turns <entity_id> <passive_id> <on|off|default>",
+    desc=("Whether this passive fires on an extra turn's on_turn_start / on_turn_end (#224): on, off, or default (the extra_turn_passives rule decides)."
+          + (" Reaches entities created from now on." if "passive" == "defpassive" else "")),
 )
 registry.annotate_sub(
     "passive", "priority",
@@ -18495,7 +18635,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "add":
         # Syntax:
-        #   !gpassive add <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"
+        #   !gpassive add <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] "<formula>"
         #
         # See passive_cmd `add` for the rationale on the named-arg parsing.
         # Globals follow the same per-entity iteration model — for var hooks,
@@ -18506,7 +18646,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         pid = args[1]
         when = args[2].lower()
 
-        target_val, scope_val, prio, formula_parts = _passive_opts(args[3:])
+        target_val, scope_val, prio, xturns, formula_parts = _passive_opts(args[3:])
         # Same `\n`/`\t` normalization as entity-scoped !passive add.
         formula = normalize_body_source(" ".join(formula_parts).strip())
 
@@ -18525,6 +18665,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m.global_passives[pid] = Passive(
             id=pid, when=when, formula=formula,
             target=target_val, scope=scope_val, priority=prio,
+            extra_turns=xturns,
         )
         scope_note = ""
         from logic import VAR_HOOKS
@@ -18542,6 +18683,18 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         p.priority = checked_priority(args[2], "priority")
         return await ctx.send(f"Global passive `{p.id}` now has priority "
                               f"{p.priority} (higher runs first).")
+
+    if sub == "extra_turns":
+        if await return_help_if_not_enough_args(ctx, args, 3, "gpassive", "extra_turns"):
+            return
+        _check_tail(args, 3, (),
+                    "!gpassive extra_turns <passive_id> <on|off|default>")
+        p = m.global_passives.get(args[1])
+        if p is None:
+            raise NotFound(f"Global passive '{args[1]}' not found.")
+        p.extra_turns = _extra_turns_word(args[2], "extra_turns")
+        return await ctx.send(f"Global passive `{p.id}` on extra turns: "
+                              f"{_extra_turns_text(p.extra_turns)}.")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "gpassive", "remove"):
@@ -18577,7 +18730,9 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"**Global passive `{pid}`**\n"
             f"Hook: `{p.when}`\n"
-            + (f"Priority: {p.priority}\n" if p.priority else "") +
+            + (f"Priority: {p.priority}\n" if p.priority else "")
+            + (f"On extra turns: {_extra_turns_text(p.extra_turns)}\n"
+               if p.extra_turns is not None else "") +
             f""
             f"{scope_block}"
             f"Formula:\n```\n{formula_text(p.formula)}\n```"
@@ -18587,7 +18742,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "gpassive", "add",
-    usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
+    usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] "<formula>"',
     desc=(
         "Add a global passive. Fires once per entity in turn order on the given "
         "hook. Inside the formula: `self` = the entity being iterated, "
@@ -18598,6 +18753,12 @@ registry.annotate_sub(
         "deeper), or deep (this path or any descendant). Defaults: target=root, "
         "scope=deep (catches every var-event)."
     ),
+)
+registry.annotate_sub(
+    "gpassive", "extra_turns",
+    usage="!gpassive extra_turns <passive_id> <on|off|default>",
+    desc=("Whether this passive fires on an extra turn's on_turn_start / on_turn_end (#224): on, off, or default (the extra_turn_passives rule decides)."
+          + (" Reaches entities created from now on." if "gpassive" == "defpassive" else "")),
 )
 registry.annotate_sub(
     "gpassive", "priority",
@@ -18930,7 +19091,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         pid = args[1]
         when = args[2].lower()
-        target_val, scope_val, prio, formula_parts = _passive_opts(args[3:])
+        target_val, scope_val, prio, xturns, formula_parts = _passive_opts(args[3:])
         formula = normalize_body_source(" ".join(formula_parts).strip())
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
@@ -18944,6 +19105,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         spec = Passive(
             id=pid, when=when, formula=formula,
             target=target_val, scope=scope_val, priority=prio,
+            extra_turns=xturns,
         )
         existing = _read_specs()
         if any(isinstance(s, dict) and s.get("id") == pid for s in existing):
@@ -18991,6 +19153,33 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
             f"entities keep their copy.")
 
+    if sub == "extra_turns":
+        if await return_help_if_not_enough_args(ctx, args, 3, "defpassive", "extra_turns"):
+            return
+        _check_tail(args, 3, (), "!defpassive extra_turns <id> <on|off|default>")
+        pid = args[1]
+        xt = _extra_turns_word(args[2], "extra_turns")
+        existing = _read_specs()
+        if not any(isinstance(sp, dict) and sp.get("id") == pid
+                   for sp in existing):
+            raise NotFound(
+                f"No default passive '{pid}' in system '{sys_name}'.")
+        new_list = []
+        for spec in existing:
+            if isinstance(spec, dict) and spec.get("id") == pid:
+                spec = dict(spec)
+                if xt is None:
+                    spec.pop("extra_turns", None)
+                else:
+                    spec["extra_turns"] = xt
+            new_list.append(spec)
+        refreshed = _write_specs(new_list)
+        return await ctx.send(
+            f"Default passive `{pid}` of system `{sys_name}` on extra turns: "
+            f"{_extra_turns_text(xt)} [refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
+            f"entities keep their copy.")
+
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "defpassive", "remove"):
             return
@@ -19032,7 +19221,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "defpassive", "add",
-    usage='!defpassive add <id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
+    usage='!defpassive add <id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] "<formula>"',
     desc=(
         "Add a default passive to the game system: it is copied onto every "
         "entity at creation (add / summon / revive), applied before "
@@ -19041,6 +19230,12 @@ registry.annotate_sub(
         "entity). <when> must be a hook name (see !defpassive hooks). "
         "Removable per-entity afterward; not re-enforced."
     ),
+)
+registry.annotate_sub(
+    "defpassive", "extra_turns",
+    usage="!defpassive extra_turns <id> <on|off|default>",
+    desc=("Whether this passive fires on an extra turn's on_turn_start / on_turn_end (#224): on, off, or default (the extra_turn_passives rule decides)."
+          + (" Reaches entities created from now on." if "defpassive" == "defpassive" else "")),
 )
 registry.annotate_sub(
     "defpassive", "priority",
@@ -25413,7 +25608,7 @@ for _subs, _usage in (
         (('get',), '!team get <team> <path>'),
         (('list',), '!team list [team]'),
         (('clear',), '!team clear <team> [path]'),
-        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n>>')):
+        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n> | extra_turns <team> <pid> <on|off|default>>')):
     registry.annotate_sub('team', *_subs, usage=_usage)
 
 
@@ -25522,7 +25717,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if await return_help_if_not_enough_args(ctx, args, 6, "team", "passive"):
                 return
             team, pid, when = args[2], args[3], args[4]
-            target_val, scope_val, prio, words = _passive_opts(args[5:])
+            target_val, scope_val, prio, xturns, words = _passive_opts(args[5:])
             formula = normalize_body_source(" ".join(words).strip())
             if when not in HOOK_NAMES and not is_event_hook(when):
                 return await ctx.send(
@@ -25539,7 +25734,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"❌ team `{team}` already has passive `{pid}`.")
             bucket[pid] = Passive(id=pid, when=when, formula=formula,
                                   target=target_val, scope=scope_val,
-                                  priority=prio)
+                                  priority=prio, extra_turns=xturns)
             return await ctx.send(f"Added team passive `{pid}` ({when}) to `{team}`.")
         if psub == "priority":
             if await return_help_if_not_enough_args(ctx, args, 5, "team", "passive"):
@@ -25553,6 +25748,18 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             p.priority = checked_priority(args[4], "priority")
             return await ctx.send(f"Team passive `{team}.{pid}` now has "
                                   f"priority {p.priority} (higher runs first).")
+        if psub == "extra_turns":
+            if await return_help_if_not_enough_args(ctx, args, 5, "team", "passive"):
+                return
+            _check_tail(args, 5, (), "!team passive extra_turns <team> "
+                                     "<passive_id> <on|off|default>")
+            team, pid = args[2], args[3]
+            p = m.team_passives.get(team, {}).get(pid)
+            if p is None:
+                return await ctx.send(f"❌ team `{team}` has no passive `{pid}`.")
+            p.extra_turns = _extra_turns_word(args[4], "extra_turns")
+            return await ctx.send(f"Team passive `{team}.{pid}` on extra "
+                                  f"turns: {_extra_turns_text(p.extra_turns)}.")
         if psub in ("remove", "del", "rm"):
             if await return_help_if_not_enough_args(ctx, args, 4, "team", "passive"):
                 return
@@ -25571,7 +25778,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             for pid, p in bucket.items():
                 lines.append(_format_passive_line(pid, p))
             return await ctx.send("\n".join(lines))
-        return await ctx.send("❌ Usage: `!team passive <add|remove|list|priority> ...`")
+        return await ctx.send("❌ Usage: `!team passive <add|remove|list|priority|extra_turns> ...`")
 
     return await _help_fallback(ctx, ["team"], args[0] if args else None)
 

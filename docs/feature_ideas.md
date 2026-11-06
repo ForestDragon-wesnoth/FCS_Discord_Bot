@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14, parts of #190 (Discord-role
@@ -146,11 +146,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
     - "an Alpha Wolf may have two wolves at a time" (NCS);
     - "a Bandit Ringleader can't summon while its last summon lives" (FCS1).
   - Removes L10; possession can then make a possessed unit's summons possessed in a hook (Solis, FCS1).
-- **#224 Extra turns.**
-  - `grant_turn(eid)` (and `!turn grant <eid>`) inserts one extra turn for `eid` right after the current one. An option says whether its turn-start passives and status ticks run (default: passives yes, ticks no, so a bonus turn doesn't burn twice). Under ATB the unit acts next and its charge bar is untouched.
-  - The game need: NCS's planned Agility Potion ("gain an instant bonus turn").
-  - Today `turn set` restarts the turn and re-runs everything (L11).
-  - With turnorder_change_policy `deferred` it also covers "jump, then jump back" (user): a unit takes a turn out of order and play then resumes where it was. `!turn set` under `deferred` deliberately sends the units it jumped over after the units ahead, since some games skip over units on purpose.
 - **#225 `schedule_on` counting skipped turns.**
   - `schedule_on(eid, delay, body, name, count_skipped=False)`, or a rule. With it on, a stunned or charging unit's delayed effect counts the turns it skips, as status ticks already do.
   - Today the delay waits for turns the unit actually starts (L12), so a charged action built from a `skips_turn` status plus `schedule_on` never fires (`fcs1b.out`: still charging after four rounds).

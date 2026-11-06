@@ -5181,6 +5181,63 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "nothing)."
         ),
     },
+    "extra_turn_message_format": {
+        "default": "It is now **{name}**'s extra turn (id `{short_id}`).",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line `!turn next` ends with when the turn it starts is an "
+            "extra turn (`!turn grant`, grant_turn), with the placeholders "
+            "of turn_start_message_format. A channel whose view can't see "
+            "the unit gets turn_start_hidden_message_format instead. Empty "
+            "= no line."
+        ),
+    },
+    "extra_turn_passives": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether an extra turn (`!turn grant`, grant_turn) fires the "
+            "on_turn_start / on_turn_end passives of its unit (global, team "
+            "and own) and the tiles' and zones' turn time hooks. A passive's "
+            "own `extra_turns` setting (`extra_turns=on|off` when added, "
+            "`!passive extra_turns`) overrides this for that passive. "
+            "Every formula can read the `extra_turn` binding (True during "
+            "an extra turn) to tell the two apart."
+        ),
+    },
+    "extra_turn_status_ticks": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether an extra turn ticks its unit's statuses at turn_start "
+            "/ turn_end (off by default: a poison counting down per turn "
+            "doesn't run down faster for a unit granted more turns). A "
+            "status whose data holds `extra_turn_ticks` (true / false; "
+            "`!status data <name> extra_turn_ticks true`, per level too) "
+            "overrides this for that status. A stun with `skips_turn` "
+            "paired with `extra_turn_ticks true` wears off one turn sooner "
+            "when its unit is granted an extra turn it then can't take."
+        ),
+    },
+    "extra_turn_schedules": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether an extra turn counts down its unit's turn schedules "
+            "(schedule_on) at its start, as a regular turn does. Off by "
+            "default: a schedule counts the unit's regular turns."
+        ),
+    },
+    "extra_turn_skippable": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a unit holding a `skips_turn` status loses an extra "
+            "turn too (on, default: the skip fires on_turn_skipped and the "
+            "statuses that tick on extra turns tick, as for a skipped "
+            "regular turn). Off = an extra turn ignores skip statuses."
+        ),
+    },
     "death_message_format": {
         "default": "💀 **{name}** (`{id}`) died.",
         "schema": {"type": "str"},
@@ -5332,6 +5389,23 @@ def team_text(v: Any) -> Any:
         if v != v or v in (float("inf"), float("-inf")):
             return str(v)
         return str(int(v)) if v.is_integer() else str(v)
+    return None
+
+
+def flag_value(v: Any) -> Optional[bool]:
+    """A stored on / off setting: a bool, a number, or text _parse_bool
+    reads; None when unset or unreadable (the caller's default applies)."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        try:
+            return _parse_bool(v)
+        except VTTError:
+            return None
     return None
 
 
@@ -6599,11 +6673,17 @@ class Passive:
     # Order within one hook firing: highest first, across global, team and
     # own passives (Match._ordered_passives); ties keep that order.
     priority: float = 0
+    # Extra turns (#224): whether this passive fires on an extra turn's
+    # on_turn_start / on_turn_end. None = the extra_turn_passives rule.
+    extra_turns: Optional[bool] = None
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not self.id.strip():
             raise VTTError("Passive id must be a non-empty string.")
         self.priority = checked_priority(self.priority, "Passive priority")
+        if self.extra_turns is not None and \
+                not isinstance(self.extra_turns, bool):
+            raise VTTError("Passive extra_turns must be true, false or unset.")
         if self.when not in HOOK_NAMES and not is_event_hook(self.when):
             allowed = ", ".join(sorted(HOOK_NAMES))
             raise VTTError(
@@ -6658,6 +6738,8 @@ class Passive:
         }
         if self.priority:
             d["priority"] = self.priority
+        if self.extra_turns is not None:
+            d["extra_turns"] = self.extra_turns
         return d
 
     @staticmethod
@@ -6672,6 +6754,8 @@ class Passive:
             target=d.get("target", ""),
             scope=d.get("scope", "deep"),
             priority=d.get("priority", 0),
+            extra_turns=(d.get("extra_turns")
+                         if isinstance(d.get("extra_turns"), bool) else None),
         )
 
 
@@ -8069,6 +8153,11 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
                 "forecast`, next_turns) may list; a longer forecast is cut "
                 "there with a note.",
     },
+    "extra_turn_queue_limit": {
+        "default": 100, "min": 1, "max": 10000,
+        "desc": "How many extra turns (`!turn grant`, grant_turn) a match "
+                "may hold queued at once; a grant past it is refused.",
+    },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
         "desc": "How deep maps may nest: a map a unit carries (`!map "
@@ -9077,6 +9166,12 @@ class Entity:
                 m.active_index = max(0, len(m.turn_order) - 1)
             elif m.active_index > idx:
                 m.active_index = max(0, m.active_index - 1)
+        # Extra turns (#224): a gone unit's queued extra turns go with it,
+        # and an extra turn under way ends with nothing to fire on.
+        if self.id in m.extra_turns:
+            m.extra_turns = [x for x in m.extra_turns if x != self.id]
+        if m.extra_turn == self.id:
+            m.extra_turn = ""
         m._scrub_entity_from_groups(self.id)
         # Drop any entity-attached scheduled effects bound to this entity
         # — a dead/despawned entity's pending turn-delayed effects don't
@@ -10763,6 +10858,16 @@ class Match:
     # that grants a unit another turn this round (`!turn set` does) takes
     # it out or bypasses the check.
     round_acted: List[str] = field(default_factory=list)
+    # Extra turns (#224): `extra_turns` is the queue of units granted a turn
+    # (`!turn grant`, grant_turn), in grant order; they run one by one after
+    # the turn under way ends, then play goes on from where the order was.
+    # `extra_turn` is the unit taking an extra turn now ("" when it left
+    # mid-turn, None during a regular turn); current_entity_id() names it.
+    # An extra turn isn't the unit's turn of the round (round_acted keeps
+    # it), and the regular pointer stays on the unit whose turn ended.
+    # Serialized and undo state.
+    extra_turns: List[str] = field(default_factory=list)
+    extra_turn: Optional[str] = None
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
 
@@ -17857,12 +17962,18 @@ class Match:
 
         upcoming: List[Tuple[int, str]] = []
         ptr = min(max(self.active_index, 0), len(order) - 1)
+        # An extra turn under way (#224) is the turn now; the regular
+        # actor's turn ended before it.
+        if self.round_started and self.extra_turn:
+            out.append({"eid": self.extra_turn, "round": rnd, "now": True,
+                        "skip": [], "extra": True})
         if not self.round_started:
             upcoming.append((rnd, order[ptr]))
             acted.add(order[ptr])
         elif self.turn_vacated is None:
-            out.append({"eid": order[ptr], "round": rnd, "now": True,
-                        "skip": []})
+            if self.extra_turn is None:
+                out.append({"eid": order[ptr], "round": rnd, "now": True,
+                            "skip": []})
             acted.add(order[ptr])
         elif self.turn_vacated == "wrap":
             ptr = len(order) - 1
@@ -17877,6 +17988,10 @@ class Match:
             upcoming.append((rnd, order[d]))
             acted.add(order[d])
             ptr = d
+        # Queued extra turns come right after the turn under way (before
+        # the first turn, after it). Marked by the -1 round placeholder.
+        at = 0 if self.round_started else min(1, len(upcoming))
+        upcoming[at:at] = [(-1, eid) for eid in self.extra_turns]
         want = n
         if want is None:
             # To the end of the next round (round 1 before the first turn).
@@ -17897,7 +18012,12 @@ class Match:
             notes.append(f"Cut at {limit} turns (owner limit "
                          f"turn_forecast_limit).")
         for r, eid in upcoming[:want]:
-            out.append({"eid": eid, "round": r, "now": False, "skip": []})
+            if r == -1:
+                out.append({"eid": eid, "round": rnd, "now": False,
+                            "skip": [], "extra": True})
+            else:
+                out.append({"eid": eid, "round": r, "now": False,
+                            "skip": []})
         self._mark_forecast_skips(out)
         return out, notes
 
@@ -17906,8 +18026,9 @@ class Match:
         if mode == "none":
             return
         seen: set = set()
+        extra_skips = bool(self.rules.get("extra_turn_skippable", True))
         for ent in out:
-            if ent["now"]:
+            if ent["now"] or (ent.get("extra") and not extra_skips):
                 continue
             e = self.entities.get(ent["eid"])
             if e is None or (mode == "next" and ent["eid"] in seen):
@@ -17938,22 +18059,35 @@ class Match:
             rate = self._atb_charge_rate(e)
             if rate > 0:
                 bars[eid] = [self._atb_charge(e), rate]
-        if (self.round_started and self.turn_vacated is None
+        if self.round_started and self.extra_turn:
+            out.append({"eid": self.extra_turn, "round": None, "now": True,
+                        "skip": [], "extra": True})
+        elif (self.round_started and self.extra_turn is None
+                and self.turn_vacated is None
                 and 0 <= self.active_index < len(self.turn_order)):
             out.append({"eid": self.turn_order[self.active_index],
                         "round": None, "now": True, "skip": []})
+        picks: List[Dict[str, Any]] = []
         if not bars:
             notes.append("No unit has a positive charge rate: no one acts.")
-            return out, notes
-        for _ in range(n):
-            pick = min(bars.items(), key=lambda kv: (
-                max(0.0, (thr - kv[1][0]) / kv[1][1]), -kv[1][1], kv[0]))
-            t = max(0.0, (thr - pick[1][0]) / pick[1][1])
-            for v in bars.values():
-                v[0] += v[1] * t
-            pick[1][0] -= thr
-            out.append({"eid": pick[0], "round": None, "now": False,
-                        "skip": []})
+        else:
+            for _ in range(n):
+                pick = min(bars.items(), key=lambda kv: (
+                    max(0.0, (thr - kv[1][0]) / kv[1][1]), -kv[1][1],
+                    kv[0]))
+                t = max(0.0, (thr - pick[1][0]) / pick[1][1])
+                for v in bars.values():
+                    v[0] += v[1] * t
+                pick[1][0] -= thr
+                picks.append({"eid": pick[0], "round": None, "now": False,
+                              "skip": []})
+        # Queued extra turns (#224) first (before the first turn, after
+        # it); the bars don't move for them.
+        at = 0 if self.round_started else min(1, len(picks))
+        picks[at:at] = [{"eid": eid, "round": None, "now": False,
+                         "skip": [], "extra": True}
+                        for eid in self.extra_turns]
+        out.extend(picks[:n])
         self._mark_forecast_skips(out)
         return out, notes
 
@@ -18026,6 +18160,10 @@ class Match:
         self._rebuild_turn_order()
 
     def current_entity_id(self) -> Optional[str]:
+        """The unit whose turn it is: during an extra turn (#224) the unit
+        taking it (None once it left), else the unit at active_index."""
+        if self.extra_turn is not None:
+            return self.extra_turn or None
         if not self.turn_order:
             return None
         return self.turn_order[self.active_index]
@@ -18070,7 +18208,8 @@ class Match:
         the entity already at active_index, marking the match as started.
         Subsequent calls run the normal end → advance → start cycle.
         """
-        if not self.turn_order:
+        if not self.turn_order and self.extra_turn is None \
+                and not (self.extra_turns and self.round_started):
             return (None, [])
         # Active Time Battle: rounds are disabled — selection is by charge
         # bar, not turn-order cycling. Whole separate path.
@@ -18107,10 +18246,13 @@ class Match:
             self._begin_turn()
             return (cur, log)
 
-        # Normal transition. If the acting unit was removed mid-turn, its
-        # turn-end surface has nothing to fire on (the unit now at
-        # active_index hasn't had its turn yet).
-        if not self.turn_vacated:
+        # Normal transition. An extra turn under way ends (#224); the
+        # regular actor's turn ended before it. If the acting unit was
+        # removed mid-turn, its turn-end surface has nothing to fire on (the
+        # unit now at active_index hasn't had its turn yet).
+        if self.extra_turn is not None:
+            self._end_extra_turn(log)
+        elif not self.turn_vacated and self.turn_order:
             cur = self.turn_order[self.active_index]
             log.extend(self.fire_status_tick("turn_end"))
             log.extend(self.fire_tile_time_hooks("on_turn_end"))
@@ -18118,6 +18260,11 @@ class Match:
             log.extend(self.fire_hook(
                 "on_turn_end", target_ids=[cur],
                 own_only_targets=self._attached_tick_parts([cur])))
+        # Queued extra turns run before the order moves on (a turn_vacated
+        # marker waits for the regular advance after them).
+        if self._start_extra_turn(log) is not None:
+            self._begin_turn()
+            return (self.extra_turn, log)
         # A turn_end hook/tick may have removed the last entity (e.g. a
         # lethal DoT — directly, or routed to a parent via a part tick).
         # With no one left, end here rather than advancing into an empty
@@ -18147,6 +18294,150 @@ class Match:
         self._begin_turn()
         return (new_cur, log)
 
+    # ---- Extra turns (#224) ------------------------------------------------
+    # An extra turn runs right after the turn under way ends, queued in grant
+    # order; then play goes on from where the order was (the regular pointer
+    # never moves for one). It isn't the unit's turn of the round, so a
+    # unit granted one before its regular turn still has that turn.
+    #
+    # What fires on an extra turn is the GM's choice: the rules
+    # extra_turn_passives (on_turn_* passives, tile / zone turn hooks),
+    # extra_turn_status_ticks and extra_turn_schedules, a passive's own
+    # `extra_turns` setting and a status's `extra_turn_ticks` data key; every
+    # formula reads the `extra_turn` binding.
+    #
+    # GM recommendation: a unit holding a `skips_turn` stun loses an extra
+    # turn too (extra_turn_skippable). Give the stun `extra_turn_ticks true`
+    # (`!status data stun extra_turn_ticks true`) and the lost extra turn
+    # still ticks it, so granting a stunned unit an extra turn makes the
+    # stun wear off one turn sooner instead of doing nothing.
+
+    def extra_turn_problem(self, eid: str) -> Optional[str]:
+        """Why `eid` can't be granted an extra turn (None = it can): any
+        living unit can, in the turn order or not, except a glued or region
+        body part outside the turn order (it can't act by itself)."""
+        e = self.entities.get(eid)
+        if e is None:
+            return f"Entity '{eid}' not found."
+        if not e.is_alive:
+            return f"`{eid}` is dead: only a living unit takes a turn."
+        if (e.is_glued_part or e.is_region_part) \
+                and eid not in self.turn_order:
+            kind = "glued" if e.is_glued_part else "region"
+            return (f"`{eid}` is a {kind} body part of "
+                    f"`{self.body_root(e).id}`: it doesn't act by itself.")
+        return None
+
+    def grant_extra_turns(self, eid: str, n: int = 1) -> None:
+        """Queue `n` extra turns for `eid` after those already queued."""
+        problem = self.extra_turn_problem(eid)
+        if problem:
+            raise VTTError(problem)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise VTTError("An extra-turn grant needs a whole number of "
+                           "turns, at least 1.")
+        limit = owner_limit("extra_turn_queue_limit")
+        if len(self.extra_turns) + n > limit:
+            raise VTTError(
+                f"At most {limit} extra turns can wait in the queue (owner "
+                f"limit extra_turn_queue_limit); {len(self.extra_turns)} "
+                f"already do.")
+        self.extra_turns.extend([eid] * n)
+
+    def clear_extra_turns(self, eid: Optional[str] = None) -> int:
+        """Drop the queued extra turns (of `eid` only, when given); returns
+        how many went. An extra turn under way isn't touched."""
+        before = len(self.extra_turns)
+        self.extra_turns = ([] if eid is None else
+                            [x for x in self.extra_turns if x != eid])
+        return before - len(self.extra_turns)
+
+    def _extra_passive_filter(self):
+        rule = bool(self.rules.get("extra_turn_passives", True))
+        return lambda p: rule if p.extra_turns is None else p.extra_turns
+
+    def _extra_turn_phase(self, eid: str, when: str) -> List[str]:
+        """One phase (turn_start / turn_end) of the extra turn `eid` is
+        taking (self.extra_turn == eid): the on_turn_* passives that fire on
+        extra turns, the tiles' and zones' turn hooks under
+        extra_turn_passives, the statuses that tick on extra turns
+        (fire_status_tick filters them) and, at the start, the turn
+        schedules under extra_turn_schedules. Attached parts ride along as
+        on a regular turn."""
+        hook = "on_" + when
+        parts = self._attached_tick_parts([eid])
+        log: List[str] = []
+        hooks_on = bool(self.rules.get("extra_turn_passives", True))
+        flt = self._extra_passive_filter()
+        if when == "turn_start":
+            log.extend(self.fire_hook(hook, target_ids=[eid],
+                                      own_only_targets=parts,
+                                      passive_filter=flt))
+        log.extend(self.fire_status_tick(when))
+        if hooks_on:
+            log.extend(self.fire_tile_time_hooks(hook))
+            log.extend(self.fire_zone_time_hooks(hook))
+        if when == "turn_end":
+            log.extend(self.fire_hook(hook, target_ids=[eid],
+                                      own_only_targets=parts,
+                                      passive_filter=flt))
+        if when == "turn_start" and \
+                bool(self.rules.get("extra_turn_schedules", False)):
+            log.extend(self.fire_scheduled_turn(eid))
+            for pid in parts:
+                log.extend(self.fire_scheduled_turn(pid))
+        return log
+
+    def _end_extra_turn(self, log: List[str]) -> None:
+        """End the extra turn under way: its turn_end phase (unless its unit
+        left), then back to the regular state."""
+        xe = self.extra_turn
+        if xe and xe in self.entities:
+            log.extend(self._extra_turn_phase(xe, "turn_end"))
+        self.extra_turn = None
+
+    def _start_extra_turn(self, log: List[str]) -> Optional[str]:
+        """Start the next queued extra turn that can be taken. A unit gone
+        or dead loses its queued turn; one holding a skips_turn status loses
+        it under extra_turn_skippable (on_turn_skipped fires and its statuses
+        that tick on extra turns tick); one that dies to its own turn-start
+        effects never holds it. Returns the unit taking the extra turn, or
+        None when the queue ran out (the caller goes on with the regular
+        order)."""
+        while self.extra_turns:
+            eid = self.extra_turns.pop(0)
+            e = self.entities.get(eid)
+            if e is None:
+                continue
+            if not e.is_alive:
+                log.append(self.unit_line(
+                    eid, f"⏭ `{eid}` is dead and loses its extra turn."))
+                continue
+            self.extra_turn = eid
+            skipping = (self._skipping_statuses(e)
+                        if self.rules.get("extra_turn_skippable", True)
+                        else [])
+            if skipping:
+                matched = ", ".join(sorted(skipping))
+                log.append(self.unit_line(
+                    eid, f"⏭️ `{eid}`'s extra turn skipped ({matched})."))
+                log.extend(self.fire_hook(
+                    "on_turn_skipped", target_ids=[eid],
+                    extras={"skip_status": matched}))
+                for when in ("turn_start", "turn_end"):
+                    if self.extra_turn == eid and eid in self.entities:
+                        log.extend(self.fire_status_tick(when))
+                self.extra_turn = None
+                continue
+            log.extend(self._extra_turn_phase(eid, "turn_start"))
+            e = self.entities.get(eid)
+            if e is not None and e.is_alive and self.extra_turn == eid:
+                return eid
+            self.extra_turn = None
+            self._pull_surfaced(log)
+            log.append("⏭ The extra turn ends before it began.")
+        return None
+
     def set_turn(self, eid: str) -> List[str]:
         """`!turn set <id>` as a real turn change: the acting unit's turn
         ends (turn_end ticks, hooks), the turn goes to `eid` and starts
@@ -18163,7 +18454,11 @@ class Match:
             return self.next_turn()[1]
         log: List[str] = []
         vacated, self.turn_vacated = self.turn_vacated, None
-        if (self.round_started and not vacated
+        if self.extra_turn is not None:
+            # An extra turn under way ends; the queue stays for after
+            # `eid`'s turn (#224).
+            self._end_extra_turn(log)
+        elif (self.round_started and not vacated
                 and 0 <= self.active_index < len(self.turn_order)):
             cur = self.turn_order[self.active_index]
             if cur in self.entities:
@@ -18597,13 +18892,21 @@ class Match:
         # If its turn was skipped, only its status ticks fire (decay), not
         # its action surface (act=not _atb_last_skipped).
         vacated, self.turn_vacated = self.turn_vacated, None
-        if (self.round_started and not vacated
+        was_started = self.round_started
+        if self.extra_turn is not None:
+            self._end_extra_turn(log)
+        elif (self.round_started and not vacated
                 and 0 <= self.active_index < len(self.turn_order)):
             cur = self.turn_order[self.active_index]
             if cur in self.entities:
                 log.extend(self._atb_turn_phase(
                     cur, "turn_end", act=not self._atb_last_skipped))
         self.round_started = True
+        # Queued extra turns (#224) come first; the bars don't move for
+        # them. Before the first turn the queue waits for it.
+        if was_started and self._start_extra_turn(log) is not None:
+            self._begin_turn()
+            return (self.extra_turn, log)
         if not self.turn_order:
             self._begin_turn()
             return (None, log)
@@ -20419,11 +20722,14 @@ class Match:
         # Targeting depends only on `when`: a turn tick hits the entity
         # whose turn it is; a round tick hits everyone in turn order.
         if when in ("turn_start", "turn_end"):
-            if not self.turn_order:
+            if self.extra_turn is not None:
+                cur = self.extra_turn or None
+            elif not self.turn_order:
                 return []
-            cur = self.turn_order[self.active_index] if (
-                0 <= self.active_index < len(self.turn_order)
-            ) else None
+            else:
+                cur = self.turn_order[self.active_index] if (
+                    0 <= self.active_index < len(self.turn_order)
+                ) else None
             if cur is None:
                 return []
             targets = [cur]
@@ -20441,6 +20747,10 @@ class Match:
         global_active = (global_when == when and isinstance(global_src, str)
                          and bool(global_src.strip()))
 
+        # During an extra turn (#224) a turn tick runs only for the
+        # statuses that tick on extra turns (_ticks_on_extra_turn).
+        extra = (self.extra_turn is not None
+                 and when in ("turn_start", "turn_end"))
         from formula import FormulaEngine, EvalCtx, FormulaError
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -20452,6 +20762,9 @@ class Match:
             # Snapshot status names so status_remove during the tick
             # doesn't break iteration.
             for sname in list(e.status.keys()):
+                if extra and sname in e.status and \
+                        not self._ticks_on_extra_turn(e.status[sname], sname):
+                    continue
                 # A PRIOR status's tick may have killed/removed this entity
                 # (e.g. a lethal DoT). Its remaining statuses must not tick
                 # from beyond the grave — same invariant the ghost-passive
@@ -20501,6 +20814,15 @@ class Match:
                 finally:
                     STATUS_TICKING.reset(ticking)
         return log
+
+    def _ticks_on_extra_turn(self, inst: Any, sname: str) -> bool:
+        """Whether status `sname` ticks during an extra turn: its
+        `extra_turn_ticks` (instance, definition, level entries), else the
+        extra_turn_status_ticks rule."""
+        v = flag_value(self.status_field(inst, sname, "extra_turn_ticks"))
+        if v is None:
+            return bool(self.rules.get("extra_turn_status_ticks", False))
+        return v
 
     def fire_status_event(
         self, when: str, entity_id: str, status_name: str,
@@ -23966,9 +24288,12 @@ class Match:
 
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None,
                   own_only_targets: Optional[List[str]] = None,
-                  extras: Optional[Dict[str, Any]] = None) -> List[str]:
+                  extras: Optional[Dict[str, Any]] = None,
+                  passive_filter: Any = None) -> List[str]:
         """
-        Fire every passive matching `when` for each target entity.
+        Fire every passive matching `when` for each target entity
+        (and `passive_filter(passive)`, when given: an extra turn's
+        on_turn_* passives, #224).
 
         target_ids defaults to entities currently in `turn_order` (alive and
         with initiative). For each target, fires global passives first (in
@@ -23996,6 +24321,12 @@ class Match:
             target_ids = list(self.turn_order)
         this_id = self.current_entity_id()
         engine = FormulaEngine(self)
+        if passive_filter is None:
+            def pred(p):
+                return p.when == when
+        else:
+            def pred(p):
+                return p.when == when and passive_filter(p)
 
         for tid in target_ids:
             e = self.entities.get(tid)
@@ -24004,14 +24335,14 @@ class Match:
             ctx = EvalCtx(this=this_id, target=tid, extras=extras)
             # Globals, team and own passives by priority; a passive that
             # removed this entity stops its own passives firing afterward.
-            self._run_ordered(engine, ctx, tid, lambda p: p.when == when, log)
+            self._run_ordered(engine, ctx, tid, pred, log)
         # Attached parts riding the parent's clock: own passives only.
         for tid in (own_only_targets or ()):
             e = self.entities.get(tid)
             if e is None:
                 continue
             ctx = EvalCtx(this=this_id, target=tid, extras=extras)
-            self._run_ordered(engine, ctx, tid, lambda p: p.when == when, log,
+            self._run_ordered(engine, ctx, tid, pred, log,
                               globals_=False, team=False)
         return log
 
@@ -24611,6 +24942,8 @@ class Match:
             "round_started": self.round_started,
             "turn_vacated": self.turn_vacated,
             "round_acted": list(self.round_acted),
+            "extra_turns": list(self.extra_turns),
+            "extra_turn": self.extra_turn,
             # Saved only while set: whether the current ATB turn is a
             # skipped one (its end fires no action surface, T7), and a
             # watcher chain waiting for a change (L28).
@@ -24819,6 +25152,11 @@ class Match:
         ra = d.get("round_acted")
         m.round_acted = ([str(x) for x in ra if isinstance(x, str)]
                          if isinstance(ra, list) else [])
+        xq = d.get("extra_turns")
+        m.extra_turns = ([x for x in xq if isinstance(x, str) and x]
+                         if isinstance(xq, list) else [])
+        xt = d.get("extra_turn")
+        m.extra_turn = xt if isinstance(xt, str) else None
         m._atb_last_skipped = d.get("atb_turn_skipped") is True
         m._turn_order_dirty = d.get("turn_order_dirty") is True
         m._watcher_backlog = d.get("watcher_backlog") is True

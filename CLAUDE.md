@@ -1377,10 +1377,9 @@ hardcodes**.
   skip loop). Under `deferred` it is the first after the pointer, else
   the first before it, so units `!turn set` jumped over act after the
   units ahead (user call: jumping over is a mechanic some games want; a
-  "jump, then jump back" belongs to extra turns, #224). A future feature granting another turn this
-  round (extra turns, #224) takes the unit out of `round_acted` or goes
-  through `set_turn`, which gives the turn whatever the memory says. A
-  saved enum rule value this build lacks is dropped at load
+  "jump, then jump back" belongs to extra turns, #224). An extra turn
+  (below) leaves `round_acted` alone; `set_turn` gives the turn whatever
+  the memory says. A saved enum rule value this build lacks is dropped at load
   (`GameSystem.from_dict`, a console note), so the default applies.
 - **Joining and leaving under `deferred`** (user call, 1038, 1040): a
   structural rebuild mid-round (`_rebuild_turn_order` without `full`:
@@ -1421,6 +1420,44 @@ hardcodes**.
   (`_reshuffles_each_round`), after `round_number` goes up, so ties use
   the new round's seed (before, a round kept the last order until
   something changed it).
+- **Extra turns** (#224, user design, 1046-1050): `!turn grant <id>
+  [n] | list | clear [id]` (an undo step, `_SNAPSHOT_SUBS`) and the
+  formulas `grant_turn(eid, n=1)` / `clear_extra_turns(eid=None)`
+  (mutating) queue turns in `Match.extra_turns` (saved, undo state; at
+  most the owner limit `extra_turn_queue_limit`); `extra_turn_queue()`
+  reads it. After the turn under way ends (before the first turn, after
+  the first), `next_turn` / `_atb_next_turn` run the queue
+  (`_start_extra_turn`) before the regular advance: `Match.extra_turn`
+  names the unit taking one ("" once it left, `Entity.remove` scrubs the
+  queue), `current_entity_id()` returns it, the regular pointer stays on
+  the unit whose turn ended (a `turn_vacated` marker waits for the
+  advance after the extra turns), `round_acted` is untouched (the
+  unit's regular turn stays; one granted during its own turn acts twice
+  in a row), under ATB no bar moves, and `turns_elapsed` / the turn
+  autosave advance as for any turn. Any living unit may take one, in
+  the turn order or not; a glued or region part outside it is refused
+  (`extra_turn_problem`). What fires (`_extra_turn_phase`): on_turn_*
+  passives where `Passive.extra_turns` (saved when set;
+  `extra_turns=on|off` on every passive add, `!passive / !gpassive /
+  !defpassive / !team passive extra_turns`) else the rule
+  `extra_turn_passives` (default on) says so (`fire_hook(passive_filter=)`),
+  tile / zone turn hooks under that rule, status ticks per the status's
+  `extra_turn_ticks` (`status_field`) else `extra_turn_status_ticks`
+  (off; `fire_status_tick` filters while `extra_turn` is set), turn
+  schedules under `extra_turn_schedules` (off). Attached parts ride
+  along. Every formula reads the `extra_turn` binding (a
+  HOOK_CONTEXT_NAMES entry defaulting to whether an extra turn is under
+  way). `extra_turn_skippable` (on): a skips_turn status costs the extra
+  turn (on_turn_skipped, the extra-ticking statuses tick; the code
+  comment recommends `extra_turn_ticks` on stuns). A unit dead or gone
+  loses its queued turns; one dying or removed at or during its extra
+  turn hands play back to the order. `!turn set` ends an extra turn
+  under way and keeps the queue. The reply line is
+  `extra_turn_message_format` (the hidden-unit line still applies); bare
+  `!turn`, `!turn grant list` and the forecast (entries marked `extra`,
+  shown "(extra)", included in next_turns) show the queue through the
+  channel's view; `!match info`, `!list` and the history diff name the
+  extra turn's unit as the current one.
 - **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
   unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
   schedules, the turn autosave); under ATB <id>'s bar resets as if it had

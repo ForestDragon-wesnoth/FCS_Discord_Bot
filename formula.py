@@ -2907,6 +2907,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # in the round's turn order. For cadence checks ('every N rounds',
     # 'first turn of the round') and round-measured cooldowns.
     "round_number", "turn_index", "turns_elapsed", "next_turns",
+    # Extra turns (#224): grant_turn / clear_extra_turns change the queue,
+    # extra_turn_queue reads it.
+    "grant_turn", "clear_extra_turns", "extra_turn_queue",
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
     "atb_threshold", "atb_rate",
@@ -3034,6 +3037,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
 # (min/max/roll/distance/band/...) are all read-only and always permitted.
 ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "map_var_set", "map_var_del", "transfer_entity",
+    "grant_turn", "clear_extra_turns",
     "group_add", "group_remove",
     "tile_set", "tile_del", "tile_clear", "tile_place",
     "tile_face", "zone_face",
@@ -3123,7 +3127,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'team_sees_entity', 'team_sees_entity_losonly',
     'team_sees_entity_rangeonly', 'tile_get', 'tile_has', 'tile_keys',
     'tile_template_of', 'tile_facing', 'zone_facing',
-    'turn_index', 'turns_elapsed', 'next_turns', 'var_count', 'var_get',
+    'turn_index', 'turns_elapsed', 'next_turns', 'extra_turn_queue',
+    'var_count', 'var_get',
     'var_has', 'var_has_key',
     'var_keys', 'var_max_key', 'var_min_key', 'var_pick_random',
     'var_sum', 'var_sum_field', 'zone_anchor_of', 'zone_cells',
@@ -3330,7 +3335,7 @@ _HOF_FUNCS: "frozenset[str]" = frozenset({"map_with", "filter_with", "sort_by"})
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
-    "prefab_names", "size_categories", "next_turns",
+    "prefab_names", "size_categories", "next_turns", "extra_turn_queue",
     "range",
     "each",
     "keys",
@@ -3547,6 +3552,11 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # holds where it came from (`unit`, `equipped.ring`, `status:poison`,
     # `team:red`); None elsewhere. Bound in its condition and effect.
     "watcher_name", "watcher_source",
+    # Extra turns (#224): True while the turn under way is an extra turn
+    # (`!turn grant`, grant_turn), in every formula (its on_turn_*
+    # passives, status ticks, tile / zone turn hooks, action bodies); False
+    # during a regular turn.
+    "extra_turn",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -4748,6 +4758,8 @@ class FormulaEngine:
         _CONTEXT_DEFAULTS = {"was_clamped": False, "args": {}}
         for name in HOOK_CONTEXT_NAMES:
             val = extras.get(name, _CONTEXT_DEFAULTS.get(name))
+            if name == "extra_turn" and name not in extras:
+                val = getattr(self._match, "extra_turn", None) is not None
             # `args` binding is wrapped in an ArgsProxy so passives can
             # use the same `args.<key>` attribute-access pattern that
             # action bodies use. Action mode overrides this binding
@@ -9040,6 +9052,45 @@ class FormulaEngine:
             return [ent["eid"] for ent in entries
                     if not ent["now"] and not ent["skip"]]
         ns["next_turns"] = _next_turns
+
+        def _grant_turn(eid_t: Any, n: Any = 1) -> int:
+            """grant_turn(eid, n=1): give unit eid n extra turns (#224, as
+            `!turn grant`). They run right after the turn under way ends
+            (before the first turn, after it), queued in grant order; then
+            play goes on where the order was, the unit's regular turn
+            kept. Any living unit (not a glued or region part outside the
+            turn order). Returns how many extra turns wait in the queue.
+            Example, an action granting its target another turn:
+            `grant_turn(target)`."""
+            eid, _e = _resolve_entity(eid_t, "grant_turn")
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise FormulaError("grant_turn(eid, n=1): n must be a whole "
+                                   "number of turns.")
+            try:
+                match.grant_extra_turns(eid, n)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            return len(match.extra_turns)
+
+        def _clear_extra_turns(eid_t: Any = None) -> int:
+            """clear_extra_turns(eid=None): drop the queued extra turns (of
+            unit eid only, when given; as `!turn grant clear`). An extra
+            turn under way isn't touched. Returns how many went."""
+            eid = None
+            if eid_t is not None:
+                eid, _e = _resolve_entity(eid_t, "clear_extra_turns")
+            return match.clear_extra_turns(eid)
+
+        def _extra_turn_queue() -> List[str]:
+            """extra_turn_queue(): the ids of the queued extra turns, in
+            the order they run (a unit granted two appears twice); the
+            extra turn under way isn't in it (`current_id()` names that
+            one, the `extra_turn` binding tells it is one). Loopable."""
+            return list(match.extra_turns)
+
+        ns["grant_turn"] = _grant_turn
+        ns["clear_extra_turns"] = _clear_extra_turns
+        ns["extra_turn_queue"] = _extra_turn_queue
 
         def _turn_index() -> int:
             """turn_index(): the 0-based position of the acting entity

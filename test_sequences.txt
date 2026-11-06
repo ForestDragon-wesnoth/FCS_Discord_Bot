@@ -36466,3 +36466,371 @@ lists no rounds. Six turns run exactly as next_turns(6) predicted
 under way it is listed as now. A custom atb_reset_formula adds a note
 that the forecast resets bars by subtracting the threshold.
 next_turns() without a number is refused under ATB too.
+
+SCENARIO 1046 — Extra turns (#224): !turn grant runs a unit's extra turn right after the turn under way, play goes on where the order was, the regular turn kept; list, clear, undo, the forecast marking them
+---------------------------------------------------------------------------------------------------------------------
+!match new xt XT 8 8
+!match use xt
+!ent add a Alpha 10 1 1 30
+!ent add b Beta 10 3 1 20
+!ent add c Gamma 10 5 1 10
+!eval "match_var_set('seen', [])"
+!gpassive add log on_turn_start "match_var_set('seen', match_var_get('seen') + [[self, extra_turn]])"
+!turn grant c
+?? after the first turn (1 queued in all)
+!turn forecast
+?? 1. `a` **Alpha**
+?? 2. `c` **Gamma** (extra)
+?? 3. `b` **Beta**
+?? 4. `c` **Gamma**
+!turn next
+?? It is now **Alpha**'s turn
+!turn next
+?? It is now **Gamma**'s extra turn (id `c`).
+!turn
+?? ➡️ `a` **Alpha**
+?? ⏩ now taking an extra turn: `c` **Gamma**
+!turn forecast
+?? ➡️ now: `c` **Gamma** (extra)
+?? 1. `b` **Beta**
+?? 2. `c` **Gamma**
+!assert "current_id() == 'c' and extra_turn"
+!turn next
+?? It is now **Beta**'s turn (id `b`)
+!turn grant b
+!turn grant b 2
+?? (3 queued in all)
+!turn grant list
+?? Extra turns queued (after the turn under way): `b` **Beta**, `b` **Beta**, `b` **Beta**
+!assert "extra_turn_queue() == ['b', 'b', 'b'] and next_turns(2) == ['b', 'b']"
+!turn next
+?? It is now **Beta**'s extra turn (id `b`).
+!turn grant clear b
+?? Dropped 2 queued extra turn(s) of `b`.
+!undo command
+!turn grant list
+?? `b` **Beta**, `b` **Beta**
+!turn grant clear
+!turn grant list
+?! Extra turns queued
+!turn next
+?? It is now **Gamma**'s turn (id `c`)
+!turn next
+?? — Round 2 —
+!assert "match_var_get('seen') == [['a', False], ['c', True], ['b', False], ['b', True], ['c', False], ['a', False]]"
+!assert "round_number() == 2"
+!turn grant a
+!turn next
+?? It is now **Alpha**'s extra turn
+!turn next
+?? It is now **Beta**'s turn
+!turn grant b 0
+?? ❌ An extra-turn grant needs a whole number of turns, at least 1.
+!turn grant b x
+?? ❌ `x` isn't a number of turns.
+!turn grant zz
+?? ❌ Entity 'zz' not found.
+HARNESS-ALLOWS-ERRORS
+
+Expected: a grant before the first turn waits for it: the forecast lists
+Alpha, then Gamma's extra turn (marked), then Beta and Gamma's regular
+turn. The extra turn starts right after Alpha's turn with
+extra_turn_message_format; bare `!turn` keeps the pointer on Alpha and
+names the extra turn under way; the forecast lists it as now. Play then
+goes on from Alpha (Beta), and Gamma still has its regular turn this
+round. A unit granted turns during its own turn acts again at once (Beta
+twice in a row); three queued in grant order show in `!turn grant list`,
+extra_turn_queue() and next_turns. `clear b` drops Beta's two left,
+`!undo command` brings them back (a grant / clear is an undo step), and a
+bare `clear` empties the queue. The on_turn_start log records each turn
+with the extra_turn binding: a, c (extra), b, b (extra), c, then round 2.
+Alpha granted a turn during its own acts twice in a row and the round
+goes on to Beta. Bad counts and a missing unit are refused.
+
+SCENARIO 1047 — Extra turns: the rules and the per-passive / per-status overrides deciding what fires; the extra_turn binding; grant_turn and clear_extra_turns in formulas, refused in $()
+---------------------------------------------------------------------------------------------------------------------
+!match new xt XT 8 8
+!match use xt
+!ent add a Alpha 10 1 1 30
+!ent add b Beta 10 3 1 20
+!status def poison
+!status tick poison "status_counter_add(self, 'poison', -1)"
+!status def regen
+!status tick regen "status_counter_add(self, 'regen', -1)"
+!status data regen extra_turn_ticks true
+!status apply a poison 1 5
+!status apply a regen 1 5
+!gpassive add g1 on_turn_start "match_var_set('g1', match_var_get('g1', 0) + 1)"
+!gpassive add g2 on_turn_start extra_turns=on "match_var_set('g2', match_var_get('g2', 0) + 1)"
+!system set default extra_turn_passives false
+!gpassive list
+?? - `g2` (on_turn_start extra_turns on)
+!gpassive info g2
+?? On extra turns: on
+!turn next
+!turn grant a
+!turn next
+?? It is now **Alpha**'s extra turn
+?! global passive `g1`
+!assert "[match_var_get('g1'), match_var_get('g2'), status_duration('a', 'poison'), status_duration('a', 'regen')] == [1, 2, 4, 4]"
+!assert "extra_turn and current_id() == 'a' and extra_turn_queue() == []"
+!gpassive extra_turns g2 off
+?? Global passive `g2` on extra turns: off.
+!passive add a mine on_turn_end extra_turns=yes "match_var_set('mine', extra_turn)"
+!passive info a mine
+?? On extra turns: on
+!turn next
+?? passive `a.mine` fired on `a` (on_turn_end) → True
+!assert "[match_var_get('g1'), match_var_get('g2'), status_duration('a', 'poison'), status_duration('a', 'regen')] == [2, 3, 4, 3]"
+!assert "not extra_turn and current_id() == 'b'"
+!passive extra_turns a mine default
+?? on extra turns: default (extra_turn_passives)
+!passive extra_turns a mine maybe
+?? ❌ `extra_turns` takes on, off or default
+!defpassive add dp on_turn_start extra_turns=off "match_var_set('dp', 1)"
+!defpassive extra_turns dp on
+?? on extra turns: on
+!team passive add red tp on_turn_start extra_turns=on "match_var_set('tp', 1)"
+!team passive extra_turns red tp off
+?? Team passive `red.tp` on extra turns: off.
+!system set default extra_turn_passives true
+!system set default extra_turn_status_ticks true
+!system set default extra_turn_schedules true
+!eval "schedule_on('a', 1, 'match_var_set(\"sched\", extra_turn)')"
+!eval "grant_turn('a')"
+?? = `1`
+!turn next
+?? It is now **Alpha**'s extra turn
+!assert "match_var_get('sched') == True and match_var_get('g1') == 3"
+!turn next
+!assert "status_duration('a', 'poison') == 3 and status_duration('a', 'regen') == 2"
+!eval "grant_turn('b', 2)"
+?? = `2`
+!eval "clear_extra_turns('b')"
+?? = `2`
+!eval "grant_turn('zz')"
+?? ❌ grant_turn: unknown entity id 'zz'.
+!ent set_var a x $(grant_turn('a'))
+?? banned in a $() inline argument
+!assert "extra_turn_queue() == []"
+!ent set_var a qlen $(len(extra_turn_queue()))
+!assert "entity['a'].qlen == 0"
+HARNESS-ALLOWS-ERRORS
+
+Expected: with extra_turn_passives off, Alpha's extra turn fires only g2
+(its own `extra_turns=on` wins over the rule) and g1 stays at 1; poison
+(no override, extra_turn_status_ticks off) doesn't tick at the extra
+turn's end, regen (`extra_turn_ticks true` in its data) does: both at 4
+after the regular turn ended, then 4 / 3. A passive's setting shows in
+`!gpassive list` / `info` and changes with `!passive / !gpassive /
+!defpassive / !team passive extra_turns`; `default` hands it back to the
+rule, a junk word is refused. With every rule on, an extra turn counts
+down a schedule_on schedule (which reads extra_turn True), fires g1 and
+ticks both statuses. grant_turn / clear_extra_turns return the queue size
+and the count dropped; an unknown unit is refused; grant_turn in a `$()`
+argument is refused as a mutator and queues nothing; extra_turn_queue is
+read-only, allowed in `$()`.
+
+SCENARIO 1048 — Extra turns and skip statuses: a stunned unit loses its extra turn, a stun ticking on extra turns wears off sooner, extra_turn_skippable off; a unit removed mid-turn; !turn set keeps the queue; refusals
+---------------------------------------------------------------------------------------------------------------------
+!match new xt XT 8 8
+!match use xt
+!ent add a Alpha 10 1 1 30
+!ent add b Beta 10 3 1 20
+!ent add c Gamma 10 5 1 10
+!status def stun
+!status data stun skips_turn true
+!status tick stun "status_counter_add(self, 'stun', -1)"
+!status apply c stun 1 2
+!turn next
+!turn grant c
+!turn forecast
+?? 1. `c` **Gamma** (extra) — skipped (stun)
+!turn next
+?? ⏭️ `c`'s extra turn skipped (stun).
+?? It is now **Beta**'s turn (id `b`)
+!assert "status_duration('c', 'stun') == 2"
+!eval "status_remove('c', 'stun')"
+!status data stun extra_turn_ticks true
+!status apply c stun 1 2
+!turn grant c
+!turn next
+?? ⏭️ `c`'s extra turn skipped (stun).
+?? ⏭️ `c`'s turn skipped (stun).
+?? — Round 2 —
+!assert "not status_has('c', 'stun')"
+!status apply c stun 1 2
+!system set default extra_turn_skippable false
+!turn grant c
+!turn next
+?? It is now **Gamma**'s extra turn (id `c`).
+!turn grant a
+!turn next
+?? It is now **Alpha**'s extra turn (id `a`).
+!ent remove b
+!turn
+?? ⏩ now taking an extra turn: `a` **Alpha**
+!turn next
+?? ⏭️ `c`'s turn skipped (stun).
+?? — Round 3 —
+!turn grant a 2
+!turn next
+?? It is now **Alpha**'s extra turn
+!ent remove a
+!turn
+?! extra turn
+!turn next
+?? It is now **Gamma**'s turn
+!ent add a Alpha 10 1 1 30
+!turn grant a 2
+!turn next
+?? It is now **Alpha**'s extra turn
+!turn set c
+?? It is now `c`'s turn (set by `!turn set`).
+!turn grant list
+?? Extra turns queued (after the turn under way): `a` **Alpha**
+!turn next
+?? It is now **Alpha**'s extra turn
+!turn next
+?? — Round 4 —
+!part add c arm Arm 5 5
+!turn grant arm
+?? ❌ `arm` is a glued body part of `c`: it doesn't act by itself.
+!ent hp c 0
+!turn grant c
+?? ❌ Entity 'c' not found.
+HARNESS-ALLOWS-ERRORS
+
+Expected: Gamma's stun skips its extra turn too (the forecast marks it
+skipped); without `extra_turn_ticks` the stun doesn't tick there (2
+left). Given `extra_turn_ticks true` (applied after the data change, so
+the instance carries it), the lost extra turn ticks the stun and the
+regular skipped turn ticks it again: gone by round 2, one turn sooner.
+With extra_turn_skippable off a stunned Gamma takes its extra turn (its
+regular turn still skips). Removing Beta, who hadn't acted, during
+Alpha's extra turn leaves the order to go on without it: Gamma's turn
+(skipped), round 3. Removing Alpha during its extra turn drops its queued
+second one, `!turn` names no extra turn, and play returns to the order
+(Gamma). `!turn set c`
+during an extra turn ends it and keeps the queue: Alpha's remaining
+extra turn runs after Gamma's turn. A glued part and a dead unit (its
+corpse) are refused.
+
+SCENARIO 1049 — Extra turns in real use: an action granting one (grant_turn(target)), a 2x2 body whose glued part rides the extra turn, ATB leaving the bars alone, a death at an extra turn's start, a restart mid extra turn
+---------------------------------------------------------------------------------------------------------------------
+!match new xt XT 8 8
+!match use xt
+!ent add a Alpha 10 1 1 30
+!ent add b Beta 10 4 1 20
+!ent set_vars b footprint_w=2 footprint_h=2
+!part add b arm Arm 5 5
+!passive add arm armtick on_turn_start "match_var_set('arm', match_var_get('arm', 0) + 1)"
+!ent set_var b actions.haste.target entity
+!ent set_var b actions.haste.body "grant_turn(target)"
+!turn next
+!action b haste a
+!turn grant list
+?? `a` **Alpha**
+!turn next
+?? It is now **Alpha**'s extra turn
+!turn next
+?? passive `arm.armtick` fired on `arm` (on_turn_start) → 1
+!turn grant b
+!turn next
+?? passive `arm.armtick` fired on `arm` (on_turn_start) → 2
+?? It is now **Beta**'s extra turn (id `b`).
+!as restart
+!turn
+?? ⏩ now taking an extra turn: `b` **Beta**
+!assert "current_id() == 'b' and extra_turn"
+!turn next
+?? — Round 2 —
+!passive add b doom on_turn_start "if extra_turn:\n    remove_entity(self)"
+!turn grant b
+!turn next
+?? ⏭ The extra turn ends before it began.
+?? — Round 3 —
+?? It is now **Alpha**'s turn
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].spd"
+!match new fa FAtb 8 8
+!match use fa
+!ent add q Quick 10 1 1 1
+!ent set_var q spd 30
+!ent add s Slow 10 3 1 1
+!ent set_var s spd 10
+!turn grant s
+!turn forecast 4
+?? 2. `s` **Slow** (extra)
+!turn next
+?? It is now **Quick**'s turn
+!eval "match_var_set('bars', [entity['q'].atb_charge, entity['s'].atb_charge])"
+!turn next
+?? It is now **Slow**'s extra turn (id `s`).
+!assert "match_var_get('bars') == [entity['q'].atb_charge, entity['s'].atb_charge]"
+!turn forecast 2
+?? ➡️ now: `s` **Slow** (extra)
+!turn next
+?? It is now **Quick**'s turn
+!assert "not extra_turn"
+
+Expected: Beta's haste action grants Alpha an extra turn through
+grant_turn(target): it runs right after the turn under way (Alpha's own),
+before Beta's. Beta is a 2x2 body with a glued arm: the arm's own
+on_turn_start passive fires on Beta's regular turn and again on its
+extra turn, as attached parts ride the body's clock. A restart in the
+middle of Beta's extra turn keeps it (the extra turn and queue are
+saved); the next turn opens round 2. A passive removing Beta at the
+start of the extra turn granted during Alpha's turn ends it before it
+began; play goes back to the order, Beta's slot gone, so round 3 opens
+at Alpha. Under ATB a queued
+extra turn runs after the first turn without moving any charge bar, and
+the ATB forecast lists it.
+
+SCENARIO 1050 — Extra turns through a team view: a hidden unit's extra turn left out of !turn, the queue and the forecast, its turn line the hidden one; a player reads the queue through bare !turn
+---------------------------------------------------------------------------------------------------------------------
+!match new xv XView 8 8
+!match use xv
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or not status_has(self, 'invisible')"
+!ent add hero Hero 30 1 1 9
+!ent set_var hero team red
+!ent add sneak Sneak 20 5 5 6
+!ent set_var sneak team blue
+!ent status sneak add invisible
+!ent add brute Brute 25 3 3 3
+!ent set_var brute team blue
+!turn next
+!turn grant sneak
+!turn grant brute
+!as view red
+!turn grant list
+?? `brute` **Brute**
+?! sneak
+!turn forecast 3
+?? 1. `brute` **Brute** (extra)
+?! sneak
+!turn next
+?? It is now an unseen unit's turn.
+?! Sneak
+!turn
+?! extra turn: `sneak`
+?? Extra turns queued (after the turn under way): `brute` **Brute**
+!as player pia
+!turn
+?? Extra turns queued (after the turn under way): `brute` **Brute**
+?! sneak
+!turn grant hero
+?? approval
+!as host
+!as view omniscient
+!turn
+?? ⏩ now taking an extra turn: `sneak` **Sneak**
+
+Expected: from red's view the invisible Sneak's queued extra turn is
+left out of `!turn grant list` and of the forecast (Brute's shows,
+marked extra); when Sneak's extra turn starts red's channel gets
+turn_start_hidden_message_format, and bare `!turn` names neither the
+hidden extra turn under way nor Sneak in the queue. A player reads the
+queue through bare `!turn` (a read anyone has); a player's grant is a
+host command and waits for approval. The omniscient view names Sneak's
+extra turn.
