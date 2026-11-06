@@ -137,6 +137,13 @@ def _command_lines(content: str, prefix: str) -> List[str]:
     in the GUI."""
     out: List[str] = []
     for ln in content.splitlines():
+        if (out and vtt_commands.shape_command(
+                _strip_prefix(out[-1].split("\n", 1)[0], prefix))
+                and not (prefix and ln.strip().startswith(prefix))):
+            # A shape mask's rows: indentation kept (a space is a void
+            # cell), blank rows too.
+            out[-1] += "\n" + ln.rstrip()
+            continue
         if _is_comment_or_blank(ln):
             continue
         s = ln.strip()

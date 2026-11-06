@@ -23673,7 +23673,7 @@ SCENARIO 789 — Which map a command means: strict edits and placements, map= li
 ?? This match has 2 maps (`main`, `cellar`): add `map=<name>`, `map=a,b` or `map=all`.
 !tile fill 1 1 9 9 wet true map=all
 ?? Map `main`:
-?? Set `wet` = True on 24 tile(s) (fill 1,1 → 9,9). (57 off-grid cell(s) skipped)
+?? Set `wet` = True on 24 tile(s) (fill 1,1 → 9,9). (57 off-grid or void cell(s) skipped)
 ?? Map `cellar`:
 ?? Set `wet` = True on 15 tile(s)
 !tile set 6 4 deep true map=main,cellar
