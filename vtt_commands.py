@@ -15203,6 +15203,29 @@ registry.annotate_sub(
          "depth is the owner's map_nesting_depth limit.")
 registry.annotate_sub("map", "detach", usage="!map detach <map>",
                       desc="Make a carried map a map of its own again.")
+registry.annotate_sub(
+    "map", "void", usage=_VOID_USAGE,
+    desc="Void cells: cells of the map's rectangle that don't exist, so a "
+         "map can take any shape. Nothing stands, moves, lies or is placed "
+         "there, area and line searches leave them out, and they draw as "
+         "void_glyph / void_sprite. `list` draws the shape (`.` a cell, a "
+         "space a void; players read it unless void_under_fog hides voids). "
+         "`add` / `remove` a cell, a `rect` or a `line`; `remove all` "
+         "clears them. A unit on a cell turning void follows "
+         "map_void_occupied_mode (refuse, or kill); dropping tile data, "
+         "corpses or zone cells there, or a kill, needs `confirm`. Sight "
+         "crosses a void unless void_blocks_sight (or the map var of that "
+         "name) is on. Formulas: is_void, void_cells, void_add, "
+         "void_remove.")
+registry.annotate_sub(
+    "map", "shape", usage="!map shape <map> <mask ...>",
+    desc="Give a map the shape a mask draws, laid from its top-left cell: "
+         "one character per cell, a space for a void, any other character "
+         "a cell; cells past a short row or below the last row are void. "
+         "Rows go on their own lines (in a ``` block on Discord, so the "
+         "spaces stay) or, on one line, between `/`. Add `confirm` after "
+         "the mask when the reshape drops something (as `!map void add`). "
+         "`!map new <name> shape=<mask>` makes a map the mask's size.")
 # Every `!map` subcommand word is a reserved map name, so `!map <name>`
 # (render that map) can never shadow one.
 _unreserved = set(registry._help["map"]["subs"]) - MAP_RESERVED_NAMES

@@ -36942,3 +36942,244 @@ in range. Its extra turn is forecast right after the Bard's turn; it
 runs after the Bard's turn, then the round goes on: the Archer, then
 the Knight's own regular turn (the extra one didn't use it up). The
 turn-start log records each turn with the extra_turn binding.
+
+SCENARIO 1053 — Void cells in real use: an irregular board drawn as a mask (the user's map, labels as cells); a 2x2 knight stops at a void, a walk and a teleport onto one are refused, a push stops before one, and sight crosses a void unless void_blocks_sight (rule, per-map override)
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new vb Board 4 4
+!match use vb
+!map new board shape=     ..\n     ..G\n   .......\n  ..........\n ..  ..S.....\n........   .    ......\n........   ...........\n...  S.......P........\n...   ...........\n........  ....\n .......  ...S....\n .S...........   .\n   ...G....      .\n      ....\n      ...
+?? Created map `board` (22x15, 157 cells, 173 void)
+!map delete main
+!assert "grid_width() == 22 and grid_height() == 15 and len(void_cells()) == 173"
+!assert "is_void(4, 5) and not in_bounds(4, 5) and in_bounds(8, 5) and not is_void(30, 30)"
+!tile set 8 2 label G2
+!tile set 6 8 label S3
+!tile set 14 8 label PG1
+!tile set 7 13 label G1
+!ent add knight Knight 20 7 4
+!ent set_vars knight footprint_w=2 footprint_h=2
+!ent move knight 1 left
+?? Moved `knight` 1 step(s) to (6,4)
+!ent move knight 1 left
+?? (5,5) is a void cell
+!ent tp knight 9 6
+?? is a void cell
+!assert "entity['knight'].x == 6 and entity['knight'].y == 4"
+!ent add scout Scout 10 6 8
+!ent move scout 1 down
+?? (6,9) is a void cell
+!ent add brute Brute 10 6 7
+!ent push brute right 4
+?? Pushed `brute` 2 cell(s) to (8,7)
+!ent add archer Archer 10 7 13
+!assert "has_los(6, 8, 7, 13) and cells_in_line(6, 8, 7, 13) == [[6, 8], [6, 10], [7, 11], [7, 12], [7, 13]]"
+!system set default void_blocks_sight true
+!assert "not has_los(6, 8, 7, 13) and first_opaque(6, 8, 7, 13) == [6, 9]"
+!map var set void_blocks_sight off
+!assert "has_los(6, 8, 7, 13)"
+!map var del void_blocks_sight
+!assert "not has_los(8, 5, 14, 8)"
+!map
+?? 6 . . . . . . . .       .         . . . . . .
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!map new board shape=<mask>` builds a map the mask's size
+(22x15: the widest row, the row count): every space is a void cell, any
+other character a cell, so the labels (G, S, P) are ordinary cells. 173
+of the 330 cells are void, 157 exist. A void is in the rectangle (is_void) but is
+no cell (in_bounds False); a coordinate off the rectangle isn't a void.
+The 2x2 knight at (7,4) steps left to (6,4); one more step would put
+its lower-left cell on the void (5,5), so it is refused naming that
+cell, as is a teleport whose body would cover a void. The scout on S3
+can't walk down into the void (6,9). The brute pushed 4 to the right
+from (6,7) stops after 2 cells, before the hole at (9,7). Sight from S3
+to G1 crosses the void (6,9): with void_blocks_sight off (default) it
+passes over it, and the line lists only the cells it crosses that
+exist. With the rule on, the void stops it (first_opaque names (6,9));
+the board's own `void_blocks_sight` map var set off overrides the rule,
+and once deleted the rule applies again (S4 to PG1 crosses the hole at
+x 9-11 and is blocked). The ASCII map draws voids as spaces.
+
+SCENARIO 1054 — Void edits: !map void add / remove (cell, rect, remove all), units in the way (refuse, then kill with confirm), tile data and zone cells dropped only with confirm, a collapsing-floor action through void_add, undo, and a map left with no cell refused
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new ve Edit 6 4
+!match use ve
+!ent add a A 10 2 2
+!ent add b B 10 5 3
+!tile set 4 2 lava true
+!zone new pit
+!zone fill pit 3 1 4 2
+!map void add 2 2
+?? Units stand on cells that would become void: `a`
+!assert "not is_void(2, 2)"
+!map void add rect 3 2 4 2
+?? drops the tile data of 1 cell(s), cuts cells from zones `pit`
+!assert "not is_void(3, 2) and zone_size('pit') == 4"
+!map void add rect 3 2 4 2 confirm
+?? 2 cell(s) of rect (3,2)-(4,2) made void (2 void, 22 cells)
+!assert "is_void(3, 2) and is_void(4, 2) and zone_size('pit') == 2 and tile_keys(4, 2) == []"
+!map void list
+?? ..  ..
+!ent set_var b actions.collapse.target location
+!ent set_var b actions.collapse.body "void_add(target.x, target.y, confirm=True)"
+!action b collapse 2 2
+?? Units stand on cells that would become void: `a`
+!assert "not is_void(2, 2) and 'a' in entities_within('b', 10)"
+!system set default map_void_occupied_mode kill
+!action b collapse 2 2
+?? A** (`a`) died
+!assert "is_void(2, 2) and not has_corpse('a') and len(void_cells()) == 3"
+!map void remove 3 2
+?? 1 void cell(s) of (3,2) made cells again
+!undo command
+!assert "is_void(3, 2)"
+!map void add rect 1 1 6 4
+?? would have no cell left
+!map void remove all
+?? 3 void cell(s) of every void made cells again (0 void, 24 cells)
+!assert "void_cells() == []"
+HARNESS-ALLOWS-ERRORS
+
+Expected: making the cell under `a` void is refused while
+map_void_occupied_mode is refuse (default), naming the unit; nothing
+changes. Voiding (3,2)-(4,2) would drop the lava tile's data and cut two
+cells from zone `pit`, so the first run only lists that and asks for
+`confirm`; with it the two cells go, the zone keeps its other two cells
+and the tile data is gone. `!map void list` draws the shape (`.` a cell,
+a space a void). The `collapse` action voids its target cell through
+void_add(target.x, target.y, confirm=True): on `a`'s cell under refuse
+the action fails (rolled back, `a` still there); under kill `a` dies and
+its corpse goes with the cell (has_corpse False). Making (3,2) a cell
+again and undoing that puts the void back. Voiding the whole map is
+refused (at least one cell must exist); `remove all` clears every void.
+
+SCENARIO 1055 — Void rendering: void_glyph in ASCII; void_under_fog show (a void outside sight still shows) vs fog (it reads as fog, the scene leaves it out, `!map void list` refused to a team view); the void sprite in the scene; voids survive a restart
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new vr Render 5 3
+!match use vr
+!map shape main ...../.. ../.....
+?? Map `main` reshaped: 1 void cell(s), 14 cell(s)
+!map
+?? 2 . .   . .
+!system set default void_glyph #
+!map
+?? 2 . . # . .
+!ent add r R 10 1 1
+!ent set_vars r team=red fog_vision_radius=1
+!match fog on
+!map as=red
+?? 2 . . # ? ?
+!map scene list as=red
+?? 1 void cell(s)
+!system set default void_under_fog fog
+!map as=red
+?? 2 . . ? ? ?
+!map scene list as=red
+?! void cell(s)
+!match bind pov=red
+!as player bob
+!map void list
+?? hidden under fog
+!as host
+!system set default void_under_fog show
+!as player bob
+!map void list
+?? 1 void cell(s), 14 cell(s)
+!as host
+!match bind pov=omniscient
+!system set default void_sprite hole
+!map scene list
+?? 1 void cell(s) (sprite hole)
+!as restart
+!match use vr
+!assert "is_void(3, 2) and len(void_cells()) == 1"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a single-line mask separates rows with `/`: (3,2) is the only
+void. ASCII draws it with void_glyph (a space by default, `#` once
+set). Under red's fogged view `r` sees radius 1 around (1,1): with
+void_under_fog show (default) the void still shows as `#` though it is
+out of sight, while unseen cells show fog; the scene lists it. With
+void_under_fog fog it reads as fog like any unseen cell, and the scene
+no longer lists it, so the shape stays secret; a player in red's channel
+is refused `!map void list` then, and reads it again once the rule is
+back to show. The scene names the void sprite. After a restart the void
+is still there (saved with the map).
+
+SCENARIO 1056 — Voids in prefabs: a saved room keeps its shape; `!prefab show` and `!map new from=` (turned) take it; an overlay stamp keeps the map's shape and refuses a unit landing on a void; a replace stamp carves the prefab's shape; imports with content on a void or no cell left are refused
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new vp Pre 8 6
+!match use vp
+!map shape main ```\n........\n.. .....\n.. .....\n........\n```
+!tile set 1 1 wet true
+!ent add a A 10 1 2
+!prefab save room 1 1 4 3
+!prefab show room
+?? 2 > .   .
+!map new r2 from=room rotate=90
+?? Created map `r2` (3x4)
+!assert "is_void(1, 3, map='r2') and is_void(2, 3, map='r2') and len(void_cells(map='r2')) == 2"
+!prefab stamp room 5 3 map=main
+?? Stamped prefab `room` at (5,3)
+!assert "not is_void(7, 4, map='main')"
+!prefab stamp room 5 4 map=main
+?? would land on a void cell at (5,5)
+!ent add z Z 10 7 4 map=main
+!prefab stamp room 5 3 map=main mode=replace confirm
+?? Cleared first: `a3`, `z`
+!assert "is_void(7, 4, map='main') and is_void(7, 5, map='main') and in_bounds(5, 5, map='main') and in_bounds(8, 5, map='main')"
+!prefab import bad {"kind":"prefab","width":2,"height":2,"system":"default","voids":[[0,0]],"tiles":[[0,0,{"a":1}]]}
+?? a tile at (0,0) is on one of its void cells
+!prefab import bad2 {"kind":"prefab","width":2,"height":1,"system":"default","voids":[[0,0],[1,0]]}
+?? its voids leave no cell
+HARNESS-ALLOWS-ERRORS
+
+Expected: the main map has voids at (3,2) and (3,3) and the two rows
+below the mask (5 and 6). The prefab `room` (1,1)-(4,3) records its void
+cells, so `!prefab show` draws them as spaces, and a map made from it
+turned 90° carries them turned: (1,3) and (2,3). An overlay stamp at
+(5,3) lands on cells only (its unit is `a3`: `a2` went to `r2`), and the
+map's shape stays ((7,4) remains a cell though the prefab has a void
+there). At (5,4) the stamped unit
+would stand on the void (5,5): refused. A replace stamp at (5,3) (with
+confirm: it clears `a3` and `z`, the new unit taking `a3` again) gives the rectangle the prefab's
+shape: (7,4) and (7,5) become voids, (5,5) and (8,5) cells. An import
+with a tile on one of its own voids, or with no cell left, is refused.
+
+SCENARIO 1057 — Void cells in formulas: void_cells / is_void reads, the area builders and random / free cells leave voids out, $() reads is_void but refuses void_add, void_remove, and a resize shifts voids with the anchor
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new vf Form 7 5
+!match use vf
+!map void add rect 3 2 5 4
+!assert "len(void_cells()) == 9 and get(void_cells(), 0) == [3, 2]"
+!assert "cells_in_burst(4, 3, 1) == [] and len(cells_in_rect(1, 1, 7, 5)) == 26"
+!assert "cells_in_line(1, 3, 7, 3) == [[1, 3], [2, 3], [6, 3], [7, 3]]"
+!assert "random_cell(3, 2, 5, 4) == None and free_cell_near(4, 3, 1) == None"
+!assert "not is_void(get(free_cell_near(4, 3, 2), 0), get(free_cell_near(4, 3, 2), 1))"
+!ent add a A 10 4 1
+!ent tp a 4 3
+?? (4,3) is a void cell
+!ent set_var a seen $(is_void(4,3))
+!assert "entity['a'].seen == True"
+!ent set_var a x $(void_add(1,1))
+?? banned in a $() inline argument
+!assert "not is_void(1, 1)"
+!eval "void_add(9, 9)"
+?? outside the 7x5 map
+!map resize 9 7 center
+!assert "is_void(5, 4) and not is_void(3, 2) and len(void_cells()) == 9"
+!eval "void_remove(5, 4)"
+?? = `True`
+!assert "in_bounds(5, 4) and len(void_cells()) == 8"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a 3x3 hole in the middle of a 7x5 map. void_cells lists it
+by row ([3, 2] first). A radius-1 burst at the hole's centre has no
+cell; the whole-map rectangle has 35 - 9 = 26; a line through the hole
+lists only the cells on either side. random_cell over the hole and
+free_cell_near within radius 1 of its centre find nothing; with radius
+2 the cell found exists. A teleport into the hole is refused. In `$()`
+is_void is a read (stored True), while void_add is banned and changes
+nothing; void_add off the rectangle is refused. A center resize to 9x7
+shifts everything by (1,1), the hole too; void_remove makes (5,4) a
+cell again.
