@@ -308,6 +308,24 @@ class DiscordCtxWrapper:
                 f"mean, or give its id.")
         return str(found[0].id), _role_text(found[0])
 
+    async def member_authority(self, user_id: str):
+        """A member's authority now, for a held command's resume (G8):
+        (administrator, role ids), (False, ()) for someone no longer on the
+        server, None when Discord can't say (the recorded authority holds
+        then)."""
+        guild = self._guild
+        if guild is None or not str(user_id).isdigit():
+            return None
+        member = guild.get_member(int(user_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except discord.NotFound:
+                return (False, ())
+            except Exception:
+                return None
+        return (_is_guild_admin(member), _role_ids(member))
+
     def role_name(self, rid: str):
         """Role `rid` as listings show it, None when the server no longer
         has it."""

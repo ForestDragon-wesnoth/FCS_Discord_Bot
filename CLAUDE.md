@@ -474,9 +474,18 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   carries one (a held command, a journal replay's `auth[2]`, an action's
   `_BufferCtx`, which keeps only `MATCH_CAPABILITIES`), else from
   `ctx.role_ids` (Discord: the member's roles; CLI / harness `!as player
-  <name> roles=a,b`). A held command and a journal entry also record the
-  caller's role ids (`roles`), so a resume or a replay judges per-role
-  access overrides as the caller met them. `templates` / `prefabs`: save without hosting and
+  <name> roles=a,b`). A journal entry also records the caller's role ids
+  (`roles`), so a replay judges per-role access overrides as the caller
+  met them. A held command runs at `!match resume` with its holder's
+  authority as it is THEN (user call, G8): the surface's async
+  `member_authority(user_id)` gives (administrator, role ids) now
+  (Discord: the member, fetched if uncached; (False, ()) once they left;
+  None when Discord can't say, and the authority recorded at the hold
+  applies), and the capabilities follow the role map as it stands; the
+  harness answers from the roles `!as player <name> roles=` last gave
+  that name (1033). `files` covers `!store save`, `!run` and the
+  exports; `!store load` replaces every match and system, so it needs
+  `server` (user call, 1033). `templates` / `prefabs`: save without hosting and
   edit anyone's entries (`_template_may_save`, `_template_saver_ok`, a
   forced partial rename / delete), and read the library as a host
   outside a team view. `host`: once any role holds it, only its holders
@@ -1374,7 +1383,9 @@ hardcodes**.
   resume` runs them (`resume drop` discards); held commands are saved with
   the match (`paused.held`), so a restart keeps them; never an undo step;
   `!dry` runs during a pause (637-638, 822). A held command records its
-  holder's admin / bot-owner flags and runs at the resume as the holder
+  holder's admin / bot-owner flags (and capabilities, roles; the resume
+  reads the holder's current ones where the surface can, §3 "Role
+  capabilities", G8) and runs at the resume as the holder
   (`_HolderCtx`, COMMAND_USER: handler checks and the log judge and name
   the holder, G7); `!match use / new / bind / unbind / clone` and `!map
   use` aren't held (`_pause_control`, L39) (988).
@@ -2708,7 +2719,8 @@ hardcodes**.
   export`) refuse to replace an existing file unless `overwrite` is given
   (`_check_overwrite`; `overwrite` in the file name's place is refused)
   (824).
-- **Whole-server saves:** `!store save/load <name>` (admin, saves folder;
+- **Whole-server saves:** `!store save/load <name>` (admin or a role with
+  `files` for a save, `server` for a load; saves folder;
   load is all-or-nothing); `!history export/import` (a snapshot from another
   match restores only the board: the match keeps its id, name, hosts and
   system, and the units take its var names).

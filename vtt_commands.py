@@ -351,6 +351,10 @@ def _capability_needed(name: str, args: List[str]) -> Optional[str]:
     `admin` (a server administrator only) or the capability
     (logic.CAPABILITIES) whose holders may run it too."""
     sub = args[0].lower() if args else ""
+    if name == "store" and sub == "load":
+        # A load replaces every match and system of the server, as a wipe
+        # does (user call, G9).
+        return "server"
     if name in ("store", "run"):
         return "files"
     if name == "server":
@@ -4079,19 +4083,28 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                        f"command(s).")
         for h in held:
             cmd = "!" + h["name"] + (" " + " ".join(h["args"]) if h["args"] else "")
+            # As the holder (G7), with the authority they hold NOW where
+            # the surface can tell (user call, G8: a role revoked during
+            # the pause no longer acts through a held command): the checks
+            # the handler makes (a host of another match, a template's
+            # saver, an administrator, a capability) judge the holder, and
+            # the log names them; the replies come here.
+            now = None
+            probe = getattr(ctx, "member_authority", None)
+            if callable(probe) and h.get("user") is not None:
+                try:
+                    now = await probe(str(h["user"]))
+                except Exception:
+                    now = None
+            run_ctx = _HolderCtx(ctx, h, now)
             # Whoever held it must still host the match (a co-host may have
-            # been removed while the table was paused).
+            # been removed while the table was paused, a `gm` role taken).
             if m.owner is not None and h.get("user") is not None \
-                    and not m.is_host(h["user"]) \
-                    and "gm" not in (h.get("caps") or ()):
+                    and not caller_hosts(run_ctx, m):
                 await ctx.send(f"⏭ Skipped `{cmd}` — {h['user_name']} is no "
                                f"longer a host.")
                 continue
             await ctx.send(f"▶ `{cmd}` ({h['user_name']})")
-            # As the holder (G7): the checks the handler makes (a host of
-            # another match, a template's saver, an administrator) judge
-            # the holder, and the log names them; the replies come here.
-            run_ctx = _HolderCtx(ctx, h)
             utoken = COMMAND_USER.set(h.get("user_name") or "")
             try:
                 # Against THIS match, even if the holder's channel now
@@ -5320,6 +5333,11 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ctx.user_id = name
         ctx.user_name = name
         ctx.role_ids = roles
+        known = getattr(ctx, "known_member_roles", None)
+        if isinstance(known, dict):
+            # The harness's stand-in for a member's current roles (a held
+            # command's resume reads them, G8).
+            known[name] = roles
         tail = ("" if getattr(ctx, "auto_approve", False)
                 else " — mutating commands are held for host approval")
         held = (f" with role(s) {', '.join(f'`{r}`' for r in roles)}"
@@ -9031,22 +9049,31 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
 
 class _HolderCtx:
     """The resumer's context running a command a host held while the match
-    was paused: the holder's identity and authority (recorded when it was
-    held) and channel, the resumer's replies (G7)."""
+    was paused: the holder's identity and channel, the resumer's replies
+    (G7), and the holder's authority: as it is now when the surface could
+    tell (`now`: (administrator, role ids), the capabilities then read
+    from the server's role map as it stands; G8), else as recorded when
+    the command was held."""
 
-    def __init__(self, inner: ReplyContext, held: Dict[str, Any]):
+    def __init__(self, inner: ReplyContext, held: Dict[str, Any],
+                 now: Optional[Tuple[bool, Any]] = None):
         self._inner = inner
         self.channel_key = held.get("channel_key") or inner.channel_key
         self.user_id = held.get("user")
         self.user_name = held.get("user_name") or held.get("user")
-        self.is_admin = bool(held.get("admin", False))
         self.is_bot_owner = bool(held.get("bot_owner", False))
-        caps = held.get("caps")
-        self.capabilities = ([c for c in caps if isinstance(c, str)]
-                             if isinstance(caps, list) else [])
-        roles = held.get("roles")
-        self.role_ids = (tuple(str(r) for r in roles)
-                         if isinstance(roles, list) else ())
+        if now is not None:
+            self.is_admin = bool(now[0])
+            self.capabilities = None      # read from the roles below
+            self.role_ids = tuple(str(r) for r in (now[1] or ()))
+        else:
+            self.is_admin = bool(held.get("admin", False))
+            caps = held.get("caps")
+            self.capabilities = ([c for c in caps if isinstance(c, str)]
+                                 if isinstance(caps, list) else [])
+            roles = held.get("roles")
+            self.role_ids = (tuple(str(r) for r in roles)
+                             if isinstance(roles, list) else ())
         # A single-operator surface's held command keeps its blanket
         # authority only when it was held there.
         self.auto_approve = bool(getattr(inner, "auto_approve", False)

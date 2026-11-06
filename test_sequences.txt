@@ -35684,3 +35684,58 @@ and delete can take back. Under `private_container_effects hide`, Tab
 offers a player nothing from the private container (the host still gets
 `zap`). With sizes off, transforming into a form captured while sizes were
 on doesn't bring the derived size vars back.
+
+SCENARIO 1033 — A held command runs with its holder's authority at the resume; `!store load` needs `server`
+-------------------------------------------------------------------------------------------------------------
+!match new hm H 6 6
+!match use hm
+!ent add boss Boss 50 2 2
+!server perms grant gm gms
+!system set default pause_affects_hosts true
+!match pause
+!as player bob roles=gms
+!ent hp boss -5
+?? is held
+!as player amy roles=gms
+!ent hp boss -1
+!as host
+!server perms revoke gm gms
+!match resume
+?? ⏭ Skipped `!ent hp boss -5` — bob is no longer a host.
+?? ⏭ Skipped `!ent hp boss -1` — amy is no longer a host.
+!assert "entity[boss].hp == 50"
+!server perms grant gm gms
+!match pause
+!as player bob roles=gms
+!ent hp boss -2
+!as player amy roles=gms
+!ent hp boss -3
+!as player bob
+!as host
+!match resume
+?? ⏭ Skipped `!ent hp boss -2` — bob is no longer a host.
+?? ▶ `!ent hp boss -3` (amy)
+!assert "entity[boss].hp == 47"
+!server perms grant files arc
+!as player tam roles=arc
+!store save s1033
+?? Saved to `saves/s1033`
+!store load s1033
+?? ❌ Only a server administrator or a role with the `server` capability (`!server perms`) can do that
+!as player tam roles=arc,ops
+!as host
+!server perms grant server ops
+!as player tam roles=arc,ops
+!store load s1033
+?? Loaded from `saves/s1033`
+HARNESS-ALLOWS-ERRORS
+
+Expected: bob and amy hold `gm` through role `gms` when their commands
+are held by the pause. An administrator revokes `gm` from the role before
+the resume, and both commands are skipped: a resume judges the holder's
+authority as it is then, not as it was recorded (user call). The second
+time bob loses the role himself (the harness's `!as player bob` with no
+roles stands for his Discord roles changing), so only his command is
+skipped and amy's runs: boss ends at 47. `!store save` stays with `files`,
+while `!store load`, which replaces every match and system, needs
+`server` (user call).

@@ -548,10 +548,11 @@ CAPABILITIES: Dict[str, str] = {
             "holds it, only its members and administrators can",
     "gm": "act as a host of every match on the server (not as its owner: "
           "deleting it, `!host add` and the like stay the owner's)",
-    "files": "read and write the server's saves folder (`!store`, `!run`, "
-             "`!history export / import`, `!match replay`, `!match journal "
-             "export`)",
-    "server": "`!server wipe`, `!server backups`, `!server recover`",
+    "files": "read and write the server's saves folder (`!store save`, "
+             "`!run`, `!history export / import`, `!match replay`, `!match "
+             "journal export`)",
+    "server": "`!server wipe`, `!server backups`, `!server recover`, "
+              "`!store load` (it replaces every match and system)",
 }
 # The capabilities an action body's cmd() lines keep (action._BufferCtx):
 # per-match authority, like a host's identity. The server-wide ones stay
