@@ -344,18 +344,12 @@ def _declared_tags(mgr, ctx) -> List[str]:
 
 def _readable_template_names(mgr: Any, ctx: Any) -> List[str]:
     """The library's names the caller may read: a private template
-    (`!template private`) left out for a non-host (the same reader as
+    (`!template private`) it may not read left out (the same viewer as
     `!template list`)."""
-    from vtt_commands import _var_reader
-    mid = mgr.active_by_channel.get(ctx.channel_key)
-    if mid is not None and mid in mgr.matches:
-        reader = _var_reader(ctx, mgr, mid)
-    else:
-        from vtt_commands import ctx_is_admin
-        reader = None if ctx_is_admin(ctx) else logic.VarReader(None, False)
+    from vtt_commands import _template_viewer
+    viewer = _template_viewer(ctx, mgr)
     return sorted(n for n, t in mgr.templates.items()
-                  if reader is None or not (isinstance(t, dict) and t.get(
-                      logic.TEMPLATE_PRIVATE_KEY)))
+                  if not logic.template_hidden(t, viewer))
 
 
 def _slot_names(slot: str, root: str, sub: Optional[str],

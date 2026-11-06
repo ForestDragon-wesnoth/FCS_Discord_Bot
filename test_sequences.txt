@@ -22820,6 +22820,11 @@ SCENARIO 773 — Per-player access overrides (!host access ... user=)
 !ent hp a 7
 ?? Set `a` hp to 7
 !ent dump a
+?? ❌ Only a host can do that.
+!as host
+!host access set "ent dump" all user=bob
+!as player bob
+!ent dump a
 ?? **vars (full json):**
 !as player carol
 !ent hp a 1
@@ -22851,11 +22856,12 @@ SCENARIO 773 — Per-player access overrides (!host access ... user=)
 ?? No override for `ent` for `bob`.
 
 Expected: HARNESS-ALLOWS-ERRORS. `!host access ... user=<player>` sets an
-override for one player, which wins over the match-wide overrides and
-the system rule (a precise `ent dump` key beats a bare `ent` within the
-player's own overrides): bob runs `!ent` and even `!ent dump` without
-approval while carol's hp change queues and her dump is refused; a
-per-player `ent dump` host_only then closes the dump to bob alone.
+override for one player, which wins over the match-wide override of the
+same key and the system rule, while a precise key anywhere beats a bare
+one (user call): bob's `ent` all lets him change hp without approval,
+but the match-wide `ent dump` host_only still closes his dump until he
+gets his own `ent dump` all; carol's hp change queues and her dump is
+refused; a per-player `ent dump` host_only then closes it to bob again.
 Clearing bob's `ent` override puts him back under the match-wide rules.
 
 SCENARIO 774 — Server-wide undo (!system history / !system undo) on a multi-tile unit
@@ -35260,7 +35266,7 @@ SCENARIO 1025 — A private template: hosts only; to anyone else it reads as mis
 ?? **template `lichking`**
 !as host
 !template import oops {"name": "O", "vars": {"hp": 1}, "private": "yes"}
-?? `private` is true or false
+?? `private` is true, false, "hosts" or "creator"
 HARNESS-ALLOWS-ERRORS
 
 Expected: `!template private lichking on` makes the template host-only. Player
@@ -35274,7 +35280,8 @@ red's view reads it as missing too, and every template read there opens
 player-visible and leaves private vars and templates out; the note comes
 for a template that doesn't exist as well, so it tells the players nothing,
 and it replaces the cooldown reminder (no second line). Turned off, bob
-reads it again. An import whose `private` isn't true or false is refused.
+reads it again. An import whose `private` isn't true, false, "hosts" or
+"creator" is refused.
 
 SCENARIO 1026 — `!server perms`: grant / revoke / list capabilities by role; administrators edit, anyone reads; saved, audited, kept across a wipe
 ------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -35502,6 +35509,15 @@ SCENARIO 1029 — `!host access ... role=`: overrides for a role's members, the 
 ?? Cleared access override for `ent hp` for role `rookies`.
 !host access set ent all user=eve role=scouts
 ?? ❌ An override is for one player (user=) or one role (role=), not both.
+!host access set ent all role=rangers
+!host access set "ent hp" host_only
+!as player fay roles=rangers
+!ent hp orc -1
+?? ❌ Only a host can do that.
+!ent face orc left
+?! ❌
+?! approval
+!as host
 !assert "entity[orc].hp == 48"
 HARNESS-ALLOWS-ERRORS
 
@@ -35511,8 +35527,11 @@ with the role. bob (`scouts`: `ent` all) runs `!ent hp` directly; cal
 precise key (`ent hp`) decides, so she is refused too. Once `scouts` also
 opens `ent hp`, dee gets the more open of her two roles' levels and runs it.
 eve's own override (`ent hp` host) wins over her role's, so hers waits for
-approval. An override names one player or one role, not both. orc ends at
-48 (bob's and dee's hits; eve's waits).
+approval. An override names one player or one role, not both. A precise
+key in any layer beats a bare key in every layer: with `rangers` holding
+`ent` all and the match closing `ent hp` (host_only) for everyone, fay
+(a ranger) turns the orc but can't hit it. orc ends at 48 (bob's and
+dee's hits; eve's waits).
 
 SCENARIO 1030 — A private partial behind public templates: a reader who may not read it gets its references masked and resolved to nothing; edits and restores of it answer as for a missing template
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -35739,3 +35758,87 @@ roles stands for his Discord roles changing), so only his command is
 skipped and amy's runs: boss ends at 47. `!store save` stays with `files`,
 while `!store load`, which replaces every match and system, needs
 `server` (user call).
+
+SCENARIO 1034 — A creator-level private template: only its saver and server administrators read it; other hosts and the `templates` role read it as missing, and references to it as `(private)`
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new cp CreatorPriv 8 8
+!match use cp
+!host add alice
+!host add bob
+!ent add orc Orc 10 2 2
+!ent set_var orc gear.zqxwip 77
+!as player alice
+!template save orc wip
+!template save orc wipgear path=gear
+!template private wip creator
+?? 🔒 Template `wip` is private: only its saver (alice) and server administrators read it.
+!template private wipgear creator
+!template import pubg {"name": "P", "vars": {"hp": 5, "gear": {"__template": "wipgear"}}}
+!template list
+?? `wip` — Orc, hp 10, saved by alice 🔒 (creator only)
+!template show wipgear
+?? 🔒 private (creator only)
+!as player bob
+!template list
+?! wip`
+!template show wip
+?? ❌ No template `wip` (`!template list`).
+!template show pubg expanded
+?? "__template": "(private)"
+?! zqxwip
+!roll "$(1 if has_template('wip') else 0)"
+?? → **0**
+?tab "!template show w"
+?! wip
+!as host
+!server perms grant templates gms
+!as player bob roles=gms
+!template delete wip
+?? ❌ No template `wip` (`!template list`).
+!template private wip hosts
+?? ❌ No template `wip` (`!template list`).
+!template list
+?! wip`
+!as host
+!template show wip
+?? 🔒 private (creator only)
+!assert "has_template('wip') and template_data('pubg', 'vars.gear.zqxwip') == 77"
+!match bind pov=red
+!as player alice
+!template show wip
+?? ❌ No template `wip`
+!as host
+!match unbind
+!match use cp
+!as player alice
+!roll "$(1 if has_template('wip') else 0)"
+?? → **1**
+!template private wip hosts
+?? 🔒 Template `wip` is private: only hosts read it.
+!as player bob
+!template show wip
+?? 🔒 private
+!as player carol
+!template show wip
+?? ❌ No template `wip` (`!template list`).
+!as player alice
+!template private wip
+?? Template `wip` is private: only hosts read it.
+!template import wip2 {"name": "W", "vars": {"hp": 3}, "private": "creator"}
+!template private wip2
+?? only its saver (alice)
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!template private <name> creator` keeps a template to its saver
+and the server's administrators (user call). alice, a co-host, saves `wip`
+and a partial `wipgear`, makes both creator-level and imports a public
+`pubg` built on `wipgear`; her list marks `wip` 🔒 (creator only). bob, a
+co-host too, doesn't see `wip` in the list, `show` answers as for a
+missing template, a reference to `wipgear` reads `(private)` with its data
+left out, `has_template` is False and Tab doesn't offer it. Holding the
+`templates` capability changes nothing: his delete and his level change
+answer as for a missing template. The administrator reads both (the
+assert expands `pubg` through `wipgear`). In a channel with a team view
+alice reads as a player, so `wip` is missing there. Lowered to `hosts`,
+bob reads it again while carol, a player, still doesn't. An import may
+set `"private": "creator"`.

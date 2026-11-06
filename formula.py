@@ -395,7 +395,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, TEMPLATE_PRIVATE_KEY, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT
 
 
 class FormulaError(VTTError):
@@ -7838,11 +7838,11 @@ class FormulaEngine:
             private template (`!template private`) left out. The engine's
             own formulas read it whole."""
             lib = _workspace_templates()
-            if getattr(match, "_view_reader", None) is None:
+            hidden = private_template_names(
+                lib, getattr(match, "_view_templates", None))
+            if not hidden:
                 return lib
-            return {k: v for k, v in lib.items()
-                    if not (isinstance(v, dict)
-                            and v.get(TEMPLATE_PRIVATE_KEY))}
+            return {k: v for k, v in lib.items() if k not in hidden}
 
         def _template_spawn(fn: str, name: Any, x: Any, y: Any,
                             radius: Any, mv: Any = None) -> str:
@@ -7915,13 +7915,15 @@ class FormulaEngine:
             ckey = ("template_data", getattr(CURRENT_WORKSPACE.get(),
                                              "guild_key", None),
                     match.id, bool(match.rules.get("template_pinning", False)),
-                    key_name, view_reader)
+                    key_name, view_reader,
+                    getattr(match, "_view_templates", None))
             data = cache.get(ckey) if cache is not None else None
             if data is None:
                 try:
                     # A private partial it references reads as empty to
                     # a reader who may not read it (V19).
-                    with private_templates_hidden(view_reader is not None):
+                    with private_templates_hidden(
+                            getattr(match, "_view_templates", None)):
                         data = match.expand_template(tpl)
                 except (VTTError, NotFound) as ex:
                     raise FormulaError(f"template_data: {ex}")
@@ -7993,9 +7995,9 @@ class FormulaEngine:
                 node = node.get(k) if isinstance(node, dict) else None
             mk = node.get(TEMPLATE_MARKER) if isinstance(node, dict) else None
             got = mk.get("name") if isinstance(mk, dict) else None
-            if got is not None and getattr(match, "_view_reader", None) \
-                    is not None and got in private_template_names(
-                        _workspace_templates()):
+            if got is not None and got in private_template_names(
+                    _workspace_templates(),
+                    getattr(match, "_view_templates", None)):
                 return PRIVATE_REF_TEXT   # V19: a private template's name
             return got
 
@@ -10952,8 +10954,9 @@ def resolve_arg_token(token: str, match, self_id: Optional[str] = None) -> str:
     # A player's `$()` reads the vars as that player may (#70): every unit's
     # and corpse's private vars read as missing, a dict without them.
     reader = _VAR_READER.get()
+    # The view also reads the library as the command's template viewer.
     view = (match.private_view(reader)
-            if reader is not None and hasattr(match, "private_view")
+            if hasattr(match, "private_view")
             else contextlib.nullcontext())
     try:
         with view:

@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -783,34 +783,31 @@ class CommandRegistry:
             base = "all"
         if m is not None:
             sub_key = f"{name} {args[0].lower()}" if args else None
-            # A per-player override (`@<user id> <key>` in access_overrides)
-            # wins over the per-match host overrides, which win over the
-            # system-level rule, which wins over the default. Within each
-            # layer, a precise "name sub" key beats a bare "name" key.
+            # The match's overrides come in three layers: per player
+            # (`@<user id> <key>`), per role (`@&<role id> <key>`) and
+            # match-wide (a plain key). A precise "name sub" key in ANY of
+            # them beats a bare "name" key in all of them (user call): a
+            # host who closed `ent hp` for everyone isn't overridden by a
+            # role's `ent all`. Within one key the player's layer beats the
+            # roles' (of those, the most open level wins: a member holding
+            # two roles gets the better), which beat the match-wide one.
+            # The system's command_access rule comes last, precise first.
             mine = getattr(m, "access_overrides", None) or {}
-            if user and mine:
-                pre = f"@{user} "
-                if sub_key is not None and pre + sub_key in mine:
-                    return str(mine[pre + sub_key])
-                if pre + name in mine:
-                    return str(mine[pre + name])
-            # Then a per-role override (`@&<role id> <key>`): of the
-            # caller's roles' overrides for the most precise key, the most
-            # open one wins (a member holding two roles gets the better).
-            if roles and mine:
-                for key in ((sub_key, name) if sub_key is not None
-                            else (name,)):
-                    found = [str(mine[f"@&{r} {key}"]) for r in roles
-                             if f"@&{r} {key}" in mine]
-                    if found:
-                        return min(found, key=lambda v: (
-                            _ACCESS_OPENNESS.index(v)
-                            if v in _ACCESS_OPENNESS else 99))
-            for table in ({k: v for k, v in mine.items()
-                           if not k.startswith("@")},
-                          m.rules.get("command_access")):
-                if not isinstance(table, dict) or not table:
-                    continue
+            for key in ((sub_key, name) if sub_key is not None else (name,)):
+                if not mine:
+                    break
+                if user and f"@{user} {key}" in mine:
+                    return str(mine[f"@{user} {key}"])
+                found = [str(mine[f"@&{r} {key}"]) for r in roles
+                         if f"@&{r} {key}" in mine]
+                if found:
+                    return min(found, key=lambda v: (
+                        _ACCESS_OPENNESS.index(v)
+                        if v in _ACCESS_OPENNESS else 99))
+                if key in mine:
+                    return str(mine[key])
+            table = m.rules.get("command_access")
+            if isinstance(table, dict) and table:
                 if sub_key is not None and sub_key in table:
                     return str(table[sub_key])
                 if name in table:
@@ -1265,6 +1262,7 @@ class CommandRegistry:
             ftoken = FORMULA_TEXT_HIDDEN.set(
                 _formula_text_hidden(ctx, mgr, pre_active_mid))
             rtoken = VAR_READER.set(_var_reader(ctx, mgr, pre_active_mid))
+            ttoken = TEMPLATE_VIEWER.set(_template_viewer(ctx, mgr))
             try:
                 args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
             except Exception as e:
@@ -1276,6 +1274,7 @@ class CommandRegistry:
             finally:
                 FORMULA_TEXT_HIDDEN.reset(ftoken)
                 VAR_READER.reset(rtoken)
+                TEMPLATE_VIEWER.reset(ttoken)
 
         # The runs this one nests (an approval, `!again`) report the
         # matches they journaled here; the parent run's set gets ours.
@@ -1294,6 +1293,7 @@ class CommandRegistry:
         ftoken = FORMULA_TEXT_HIDDEN.set(
             _formula_text_hidden(ctx, mgr, pre_active_mid))
         reader_token = VAR_READER.set(_var_reader(ctx, mgr, pre_active_mid))
+        viewer_token = TEMPLATE_VIEWER.set(_template_viewer(ctx, mgr))
         withheld: List[bool] = []
         withheld_token = PRIVATE_WITHHELD.set(withheld)
         reveals_token = (_HOST_REVEALS.set([])
@@ -1325,6 +1325,7 @@ class CommandRegistry:
                 _OTHER_MATCH_PRE.reset(other_token)
             _TYPED_UNIT_VIEW.reset(vtoken)
             VAR_READER.reset(reader_token)
+            TEMPLATE_VIEWER.reset(viewer_token)
             PRIVATE_WITHHELD.reset(withheld_token)
             # The end-of-command settling and the watcher poll print under
             # the same hiding (V15).
@@ -6424,12 +6425,25 @@ def _template_may_save(ctx: ReplyContext, mgr: MatchManager,
                        f"with the `{cap}` capability (`!server perms`).")
 
 
+def _private_mark(tpl: Any) -> str:
+    """A list row's privacy mark."""
+    level = template_private_level(tpl)
+    if level == TEMPLATE_CREATOR_ONLY:
+        return " 🔒 (creator only)"
+    return " 🔒" if level else ""
+
+
 def _require_saver(ctx: ReplyContext, name: str, tpl: Dict[str, Any],
                    verb: str) -> None:
+    mgr = CURRENT_WORKSPACE.get()
+    if (mgr is not None and template_private_level(tpl)
+            == TEMPLATE_CREATOR_ONLY and _template_hidden(ctx, mgr, tpl)):
+        # Only its saver and administrators know a creator-level template
+        # exists, a `templates` holder included.
+        raise VTTError(f"No template `{name}` (`!template list`).")
     if not _template_saver_ok(ctx, tpl):
         mgr = CURRENT_WORKSPACE.get()
-        if mgr is not None and _template_hidden(_template_reader(ctx, mgr),
-                                                tpl):
+        if mgr is not None and _template_hidden(ctx, mgr, tpl):
             # A private template the caller may not read is refused like
             # a missing one: the saver's name told them it exists (L46).
             raise VTTError(f"No template `{name}` (`!template list`).")
@@ -6491,11 +6505,26 @@ def _template_rules(ctx: ReplyContext, mgr: MatchManager) -> Dict[str, Any]:
     return {k: mgr.system_value(s, k) for k in _TEMPLATE_PRIVACY_RULES}
 
 
-def _template_hidden(reader: Optional[VarReader], tpl: Any) -> bool:
-    """A private template (`!template private`) reads as missing to a
-    reader."""
-    return (reader is not None and isinstance(tpl, dict)
-            and bool(tpl.get(TEMPLATE_PRIVATE_KEY)))
+def _template_viewer(ctx: ReplyContext,
+                     mgr: MatchManager) -> Optional[TemplateViewer]:
+    """Who reads the private templates in this command (None = all of
+    them: an administrator outside a team view). Hosts-level ones read for
+    whoever `_template_reader` reads everything for; creator-level ones
+    for their saver outside a team view."""
+    reader = _template_reader(ctx, mgr)
+    team_view = reader is not None and reader.team is not None
+    if ctx_is_admin(ctx) and not team_view:
+        return None
+    user = ctx_user(ctx)
+    return TemplateViewer(hosts=reader is None,
+                          user=None if team_view or user is None
+                          else str(user))
+
+
+def _template_hidden(ctx: ReplyContext, mgr: MatchManager, tpl: Any) -> bool:
+    """A private template (`!template private`) the caller may not read
+    reads as missing."""
+    return template_hidden(tpl, _template_viewer(ctx, mgr))
 
 
 def _readable_template(ctx: ReplyContext, mgr: MatchManager,
@@ -6505,7 +6534,7 @@ def _readable_template(ctx: ReplyContext, mgr: MatchManager,
     name = check_template_name(raw)
     tpl = mgr.templates.get(name)
     reader = _template_reader(ctx, mgr)
-    if tpl is None or _template_hidden(reader, tpl):
+    if tpl is None or _template_hidden(ctx, mgr, tpl):
         note = (_template_read_note(reader)
                 if reader is not None and reader.host else [])
         raise VTTError("\n".join([f"No template `{name}` (`!template "
@@ -6527,14 +6556,14 @@ def _reader_expanded(expanded: Any, tpl: Dict[str, Any],
 
 
 def _reader_view(tpl: Any, trules: Dict[str, Any],
-                 reader: Optional[VarReader], mgr: MatchManager) -> Any:
+                 reader: Optional[VarReader], mgr: MatchManager,
+                 viewer: Optional[TemplateViewer]) -> Any:
     """A stored template as `reader` reads it: without the private vars it
-    may not read, and with its references to private templates masked
-    (V19)."""
-    if reader is None:
-        return tpl
-    return mask_private_refs(reader_template(tpl, trules, reader),
-                             private_template_names(mgr.templates))
+    may not read, and with its references to the private templates
+    `viewer` may not read masked (V19)."""
+    out = tpl if reader is None else reader_template(tpl, trules, reader)
+    return mask_private_refs(out, private_template_names(mgr.templates,
+                                                         viewer))
 
 
 def _template_read_note(reader: Optional[VarReader]) -> List[str]:
@@ -7137,14 +7166,15 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                       else None)
         prefix = words[0].lower() if words else ""
         reader = _template_reader(ctx, mgr)
+        viewer = _template_viewer(ctx, mgr)
         library = {n: t for n, t in mgr.templates.items()
-                   if not _template_hidden(reader, t)}
+                   if not template_hidden(t, viewer)}
         if not library:
             return await ctx.send("\n".join(_template_read_note(reader) + [
                 "This server has no saved templates "
                 "(`!template save <unit> [name]`)."]))
         resolver = _template_resolver(mgr, ctx, library=True)
-        with private_templates_hidden(reader is not None):
+        with private_templates_hidden(viewer):
             tags = {n: _template_tags(t, resolver)
                     for n, t in library.items()}
         trules = _template_rules(ctx, mgr)
@@ -7161,9 +7191,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("\n".join(_template_read_note(reader) + [
                 "No template matches those filters."]))
         filtered = len(names) != len(library)
-        rows = [f"- {_template_summary(n, _reader_view(mgr.templates[n], trules, reader, mgr), tags[n])}"
-                + (" 🔒" if mgr.templates[n].get(TEMPLATE_PRIVATE_KEY)
-                   else "")
+        rows = [f"- {_template_summary(n, _reader_view(mgr.templates[n], trules, reader, mgr, viewer), tags[n])}"
+                + _private_mark(mgr.templates[n])
                 for n in names]
         # The note after the rows: it settles the reminder their
         # redaction noted.
@@ -7179,13 +7208,13 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         words, opts = _template_options(args, 1, usage, allowed=("unit",))
         name, tpl = _readable_template(ctx, mgr, words[0] if words else "")
         reader = _template_reader(ctx, mgr)
+        viewer = _template_viewer(ctx, mgr)
         trules = _template_rules(ctx, mgr)
         if ("unit" in opts) == (len(words) == 2) or len(words) > 2:
             raise VTTError(f"Compare with one other template or one unit — "
                            f"usage: `{usage}`.")
         resolver = _template_resolver(mgr, ctx, library=True)
-        hide = private_templates_hidden(reader is not None)
-        with hide:
+        with private_templates_hidden(viewer):
             a = _reader_expanded(resolver.expand_template(tpl), tpl, trules,
                                  reader)
         if "unit" in opts:
@@ -7204,7 +7233,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             oname, otpl = _readable_template(ctx, mgr, words[1])
             other = f"`{oname}`"
-            with private_templates_hidden(reader is not None):
+            with private_templates_hidden(viewer):
                 b = _reader_expanded(resolver.expand_template(otpl), otpl,
                                      trules, reader)
         rows = _template_diff_lines(_hide_formula_fields(a),
@@ -7235,12 +7264,13 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                            f"`{usage}`.")
         name, tpl = _readable_template(ctx, mgr, args[1])
         reader = _template_reader(ctx, mgr)
+        viewer = _template_viewer(ctx, mgr)
         trules = _template_rules(ctx, mgr)
         raw = {k: v for k, v in tpl.items()
                if k not in ("saved_by", "saved_by_name")}
-        views = [("", _reader_view(raw, trules, reader, mgr))]
+        views = [("", _reader_view(raw, trules, reader, mgr, viewer))]
         if "expanded" in flags:
-            with private_templates_hidden(reader is not None):
+            with private_templates_hidden(viewer):
                 views.append(("expanded", _reader_expanded(
                     _expanded_template(tpl, _template_resolver(
                         mgr, ctx, library=True)), tpl, trules, reader)))
@@ -7272,8 +7302,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         elif part is None:
             # The summary names the saver, as `!template list` does.
             label += (f" ({_template_summary(name, {**views[0][1], **{k: tpl[k] for k in ('saved_by', 'saved_by_name') if k in tpl}})})"
-                      + (" 🔒 private" if tpl.get(TEMPLATE_PRIVATE_KEY)
-                         else ""))
+                      + (_private_mark(tpl).replace(" 🔒", " 🔒 private")
+                         if template_private_level(tpl) else ""))
         return await ctx.send("\n".join(_template_read_note(reader)
                                         + [label] + out))
 
@@ -7311,8 +7341,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             data = m.capture_template(e, notes=notes)
         old = mgr.templates.get(name)
         if isinstance(old, dict) and old.get(TEMPLATE_PRIVATE_KEY):
-            # A re-save keeps a private template private.
-            data[TEMPLATE_PRIVATE_KEY] = True
+            # A re-save keeps a private template private, at its level.
+            data[TEMPLATE_PRIVATE_KEY] = old[TEMPLATE_PRIVATE_KEY]
         data, _ = check_template(data, name, mgr.templates)
         if m.rules.get("template_pinning", False):
             # The save diffed against this match's pins; say where the
@@ -7355,7 +7385,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 and old.get(TEMPLATE_PRIVATE_KEY):
             # Replacing a private template keeps it private unless the
             # JSON says otherwise, as a save over it does (L47).
-            data[TEMPLATE_PRIVATE_KEY] = True
+            data[TEMPLATE_PRIVATE_KEY] = old[TEMPLATE_PRIVATE_KEY]
         if "var_names" not in data:
             # The var names it is written in: the channel's, as a save
             # records the unit's, so a later var-name rename moves its vars
@@ -7415,33 +7445,44 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "template",
                                                 "private"):
             return
+        usage = "!template private <name> [on|off|hosts|creator]"
+        levels = {"on": True, "hosts": True, "creator": TEMPLATE_CREATOR_ONLY,
+                  "off": None}
         if len(args) > 3 or (len(args) == 3
-                             and args[2].lower() not in ("on", "off")):
+                             and args[2].lower() not in levels):
             raise VTTError(f"Unexpected `{' '.join(args[2:])}` — usage: "
-                           f"`!template private <name> [on|off]`.")
+                           f"`{usage}`.")
         name, tpl = _readable_template(ctx, mgr, args[1])
+
+        def said(level: Optional[str]) -> str:
+            if level == TEMPLATE_CREATOR_ONLY:
+                who = (tpl.get("saved_by_name") or tpl.get("saved_by")
+                       or "its saver")
+                return (f"private: only its saver ({who}) and server "
+                        f"administrators read it")
+            return ("private: only hosts read it" if level
+                    else "readable by everyone")
+        level = template_private_level(tpl)
         if len(args) < 3:
-            return await ctx.send(
-                f"Template `{name}` is "
-                + ("private: only hosts read it." if tpl.get(
-                    TEMPLATE_PRIVATE_KEY) else "readable by everyone."))
+            return await ctx.send(f"Template `{name}` is {said(level)}.")
         _require_saver(ctx, name, tpl, "edit")
-        on = args[2].lower() == "on"
-        if bool(tpl.get(TEMPLATE_PRIVATE_KEY)) == on:
+        want = levels[args[2].lower()]
+        want_level = template_private_level({TEMPLATE_PRIVATE_KEY: want})
+        if want_level == level:
             return await ctx.send(f"Template `{name}` is already "
-                                  + ("private." if on else "readable by "
-                                     "everyone."))
+                                  f"{said(level)}.")
         new = copy.deepcopy(tpl)
-        if on:
-            new[TEMPLATE_PRIVATE_KEY] = True
+        if want:
+            new[TEMPLATE_PRIVATE_KEY] = want
         else:
             new.pop(TEMPLATE_PRIVATE_KEY, None)
         new, _ = check_template(new, name, mgr.templates)
         _verb, notes = _store_template(
             ctx, mgr, name, new,
             saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
-        msg = (f"🔒 Template `{name}` is private: only hosts read it."
-               if on else f"🔓 Template `{name}` is readable by everyone.")
+        msg = (f"🔒 Template `{name}` is {said(want_level)}."
+               if want_level else
+               f"🔓 Template `{name}` is readable by everyone.")
         return await ctx.send("\n".join([msg] + notes))
 
     if sub == "tags":
@@ -7451,8 +7492,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         resolver = _template_resolver(mgr, ctx, library=True)
         raw = " ".join(args[2:]).strip()
         if not raw:
-            with private_templates_hidden(
-                    _template_reader(ctx, mgr) is not None):
+            with private_templates_hidden(_template_viewer(ctx, mgr)):
                 have = _template_tags(tpl, resolver)
             return await ctx.send("\n".join(
                 _template_read_note(_template_reader(ctx, mgr)) + [
@@ -7716,6 +7756,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         now = time.time()
         index: Dict[str, int] = {}
         reader = _template_reader(ctx, mgr)
+        viewer = _template_viewer(ctx, mgr)
         trules = _template_rules(ctx, mgr)
         rows: List[str] = []
         for stamp, tname, path in entries:
@@ -7727,12 +7768,12 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 old = None
             # A private template's old versions (or one now private) read
             # as missing to a non-host.
-            if _template_hidden(reader, old) or _template_hidden(
-                    reader, mgr.templates.get(tname)):
+            if template_hidden(old, viewer) or template_hidden(
+                    mgr.templates.get(tname), viewer):
                 continue
             try:
                 desc = _template_summary(
-                    tname, _reader_view(old, trules, reader, mgr)
+                    tname, _reader_view(old, trules, reader, mgr, viewer)
                 ).split(" — ", 1)[1]
             except (AttributeError, IndexError, TypeError):
                 desc = "unreadable"
@@ -7769,9 +7810,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # The versions a reader may not read (a private one, or any of a
         # template private now) read as absent unless the caller may
         # restore them anyway, as `!template trash` lists them (L46).
-        reader = _template_reader(ctx, mgr)
-        if reader is not None and entries:
-            cur_hidden = _template_hidden(reader, mgr.templates.get(name))
+        viewer = _template_viewer(ctx, mgr)
+        if viewer is not None and entries:
+            cur = mgr.templates.get(name)
+            cur_hidden = template_hidden(cur, viewer)
             shown = []
             for e in entries:
                 try:
@@ -7779,8 +7821,17 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         ver = json.load(f)
                 except (OSError, ValueError):
                     ver = None
-                hidden = cur_hidden or _template_hidden(reader, ver)
-                shown.append(not hidden or (isinstance(ver, dict)
+                hidden = cur_hidden or template_hidden(ver, viewer)
+                # A creator-level one stays hidden from a `templates`
+                # holder who isn't its saver: only the saver and
+                # administrators know of it.
+                creator = (template_hidden(cur, viewer) and
+                           template_private_level(cur) == TEMPLATE_CREATOR_ONLY
+                           ) or (template_hidden(ver, viewer) and
+                                 template_private_level(ver)
+                                 == TEMPLATE_CREATOR_ONLY)
+                shown.append(not hidden or (not creator
+                                            and isinstance(ver, dict)
                                             and _template_saver_ok(ctx, ver)))
             if not any(shown):
                 raise VTTError(f"No old version of `{name}` from the last "
@@ -7976,13 +8027,17 @@ for _subs, _usage, _desc in (
          "spawned units carry them), a partial's a `tags` field of its own "
          "(units built from it don't take them). No tags shows them, `-` "
          "clears them. Its saver or an administrator."),
-        (("private",), "!template private <name> [on|off]",
-         "A template only hosts may read: to anyone else it reads as "
+        (("private",), "!template private <name> [on|off|hosts|creator]",
+         "A template only some may read: to anyone else it reads as "
          "missing (`!template list` / `show` / `diff` / `tags` / `trash`, "
          "and template_names / has_template / template_data in `$()`), "
-         "a secret boss's statblock kept from its players. Without on / "
-         "off shows whether it is private. Its saver or an "
-         "administrator; a re-save keeps it."),
+         "and a public template's reference to it reads `(private)`. "
+         "`on` / `hosts`: only hosts (a secret boss's statblock kept from "
+         "its players); `creator`: only its saver and server "
+         "administrators, other hosts and the `templates` role included "
+         "(work in progress, a surprise for the other GMs). In a channel "
+         "with a team view everyone reads as a player. No word shows the "
+         "level. Its saver or an administrator; a re-save keeps it."),
         (("diff",), "!template diff <name> <other | unit=<id>>",
          "The paths where two templates differ, or a template and a unit of "
          "this channel's match (host only, it shows the unit's vars), with "

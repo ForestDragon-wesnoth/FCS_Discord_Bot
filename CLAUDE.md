@@ -2404,10 +2404,12 @@ hardcodes**.
   per match, kept out of `rules` so a refresh can't wipe it) beat the
   `command_access` rule (`!system access`, per system). Per-player
   overrides (`!host access ... user=<player>`) live in the same dict as
-  `@<user id> <key>` and win over both (`_effective_access(..., user)`)
-  (773); per-role ones (`!host access ... role=<role>`, `@&<role id>
-  <key>`) come next, the more precise key first, the most open level of
-  the caller's roles for it (`_ACCESS_OPENNESS`) (1029). No-op without an
+  `@<user id> <key>`, per-role ones (`!host access ... role=<role>`)
+  as `@&<role id> <key>` (773, 1029). Precedence (user call): a precise
+  `name sub` key in any of the three match layers beats a bare `name`
+  key in all of them; for one key the player's layer comes first, then
+  the most open level among the caller's roles (`_ACCESS_OPENNESS`),
+  then the match-wide key; the system rule last, precise first. No-op without an
   active match, identity or owner — hence the separate admin and
   target-host checks.
 - **Approval queue:** `Match.add_pending_request` (runtime-only; carried
@@ -2888,20 +2890,32 @@ hardcodes**.
   list, show, diff, tags, trash, and a missing template's refusal, whether
   or not it exists, so it is no oracle); it clears the cooldown
   reminder's mark for that command. `!template private <name>
-  [on|off]` (saver / admin; the `private` key, `TEMPLATE_PRIVATE_KEY`,
-  library metadata kept by a re-save and stripped at spawn) makes a
-  template host-only: to any reader it reads as missing in list / show /
-  diff / tags / trash, template_names / has_template / template_data and
-  Tab (`_readable_template`, `completion._readable_template_names`), and
-  in the edits and restore (`_require_saver` answers as for a missing one
-  unless the caller is its saver or may edit it). A reference to it from
-  a public template reads, for such a reader, as `(private)`
+  [on|off|hosts|creator]` (saver / admin; the `private` key,
+  `TEMPLATE_PRIVATE_KEY`: true = hosts level, `"creator"`; library
+  metadata kept at its level by a re-save and an import, stripped at
+  spawn) makes a template private. Who reads one is the command's
+  `logic.TemplateViewer` (`_template_viewer`; None = an administrator
+  outside a team view, reads all; `logic.template_hidden`): hosts level,
+  whoever `_template_reader` reads everything for (a host or a
+  `templates` / `gm` holder outside a team view); creator level (user
+  call, 1034), only its saver and administrators, outside a team view
+  (other hosts and the `templates` / `gm` roles don't, and their edits
+  and restores answer as for a missing template). To anyone else it
+  reads as missing in list / show / diff / tags / trash, template_names /
+  has_template / template_data and Tab (`_readable_template`,
+  `completion._readable_template_names`), and in the edits and restore
+  (`_require_saver` answers as for a missing one unless, at hosts level,
+  the caller is its saver or may edit it). The dispatcher sets
+  `logic.TEMPLATE_VIEWER` beside VAR_READER; `Match.private_view` records
+  it as `_view_templates`, which the formula library reads use (the
+  engine's own formulas read everything). A reference to it from a
+  public template reads, for such a reader, as `(private)`
   (`logic.mask_private_refs`, `PRIVATE_REF_TEXT`: raw JSON, summaries,
-  `template_of`) and resolves to nothing (`logic.private_templates_hidden`:
-  `Match._template_library` / `partial_data` give its data as empty, pins
-  unread, with a fresh partial cache; around list / show / diff / tags
-  and `template_data`) (V19, 1030). A JSON import over a private template
-  keeps it private unless the JSON says `"private": false`.
+  `template_of`) and resolves to nothing (`logic.private_templates_hidden
+  (viewer)`: `Match._template_library` / `partial_data` give its data as
+  empty, pins unread, with a fresh partial cache; around list / show /
+  diff / tags and `template_data`) (V19, 1030). A JSON import over a
+  private template keeps its level unless the JSON says `"private"`.
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
