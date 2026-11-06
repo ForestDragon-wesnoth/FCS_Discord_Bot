@@ -76,6 +76,20 @@ not new engine code. Add a shortcut only when GMs would write the same
 composition over and over (lowest_var / highest_var exist because every
 targeting formula needed the same accumulator loop).
 
+### Privacy keeps the mystery for players; hosts are trusted
+
+Private vars, private templates, fog, POV filters and formula-text hiding
+exist to preserve an element of mystery for the PLAYERS (user call). They
+need not be airtight, and they need not cover hosts: a server that lets
+someone host already trusts them, so hosts (and the `gm` / `templates`
+roles) read nearly everything. The one host-facing layer is a creator-level
+private template (§7.17), a GM's work in progress, which the user asked
+for. A host's read is refused or trimmed only where PLAYERS would see the
+reply (a team-view channel). When an audit finding is "a player can reach
+X by a roundabout route", weigh it against this: hide the obvious places
+players look, and treat a deliberate workaround as an honor-system matter
+for the GM. Ask before adding restrictions on hosts.
+
 ### The square grid is fundamental
 
 The map is a grid of square cells and stays that way: every geometry
