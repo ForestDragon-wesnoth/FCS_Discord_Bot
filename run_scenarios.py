@@ -103,6 +103,7 @@ class _Ctx:
         self.user_id = "cli"
         self.user_name = "cli"
         self.guild_key = LOCAL_WORKSPACE
+        self.known_member_roles: Dict[str, Tuple[str, ...]] = {}
 
     @property
     def is_admin(self) -> bool:
@@ -116,6 +117,13 @@ class _Ctx:
     def is_bot_owner(self) -> bool:
         # Same stand-in for the bot owner (the `!owner` commands).
         return self.user_id == "cli"
+
+    async def member_authority(self, user_id: str):
+        """A member's authority now, for a held command's resume (G8): the
+        stand-in administrator, and the roles `!as player <name> roles=`
+        last gave that name."""
+        return (user_id == "cli",
+                tuple(getattr(self, "known_member_roles", {}).get(user_id, ())))
 
     async def send(self, message: str) -> None:
         self.out.append(message)

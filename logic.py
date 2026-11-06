@@ -548,10 +548,11 @@ CAPABILITIES: Dict[str, str] = {
             "holds it, only its members and administrators can",
     "gm": "act as a host of every match on the server (not as its owner: "
           "deleting it, `!host add` and the like stay the owner's)",
-    "files": "read and write the server's saves folder (`!store`, `!run`, "
-             "`!history export / import`, `!match replay`, `!match journal "
-             "export`)",
-    "server": "`!server wipe`, `!server backups`, `!server recover`",
+    "files": "read and write the server's saves folder (`!store save`, "
+             "`!run`, `!history export / import`, `!match replay`, `!match "
+             "journal export`)",
+    "server": "`!server wipe`, `!server backups`, `!server recover`, "
+              "`!store load` (it replaces every match and system)",
 }
 # The capabilities an action body's cmd() lines keep (action._BufferCtx):
 # per-match authority, like a host's identity. The server-wide ones stay
@@ -11000,8 +11001,8 @@ class Match:
     # Counts the changes syncs made (the command layer tells from it whether
     # its end-of-command sync changed the match).
     _grant_changes: int = field(default=0, repr=False)
-    # The condition errors shown during the running command (its log sink's
-    # id, the lines).
+    # The condition errors shown during the running command (its log sink,
+    # the lines).
     _grant_warned: Tuple[Any, Set[str]] = field(
         default_factory=lambda: (None, set()), repr=False)
     # Buffer of warning log lines accumulated during a var-event chain.
@@ -11686,10 +11687,12 @@ class Match:
         # formula engine.)
         errors.pop(None, None)
         if errors and self.command_pov() is None:
+            # Keyed by the sink object itself: a new command's sink could
+            # take a freed one's id() and read as the same command, so its
+            # warning was left out (L46).
             sink = FORMULA_LOG_SINK.get()
-            key = id(sink) if sink is not None else None
-            if self._grant_warned[0] != key or key is None:
-                self._grant_warned = (key, set())
+            if self._grant_warned[0] is not sink or sink is None:
+                self._grant_warned = (sink, set())
             for zname, (first, units) in sorted(
                     (k, v) for k, v in errors.items() if k is not None):
                 # Hidden formula text leaves the error out (V15).
@@ -20747,13 +20750,30 @@ class Match:
     # ---- partial templates (see TEMPLATE_MARKER for the two forms) ----------
     def _template_library(self) -> Dict[str, Any]:
         ws = CURRENT_WORKSPACE.get()
-        return getattr(ws, "templates", None) or {}
+        lib = getattr(ws, "templates", None) or {}
+        viewer = TEMPLATE_HIDE_PRIVATE.get()
+        hidden = private_template_names(lib, viewer)
+        if hidden:
+            # A reader who may not read a private partial resolves it as
+            # one with no data (V19).
+            return {n: ({"kind": "partial", "data": {}}
+                        if n in hidden and isinstance(t, dict)
+                        and t.get("kind") == "partial" else t)
+                    for n, t in lib.items()}
+        return lib
 
     def partial_data(self, name: str) -> Optional[Dict[str, Any]]:
         """The FILE-form data of partial `name` as this match sees it: its pin
         when template_pinning is on (pinned on first use), else the
         library's. None when there is no such partial."""
         pinning = bool(self.rules.get("template_pinning", False))
+        viewer = TEMPLATE_HIDE_PRIVATE.get()
+        if viewer is not None:
+            real = getattr(CURRENT_WORKSPACE.get(), "templates", None) or {}
+            t = real.get(name)
+            if isinstance(t, dict) and template_hidden(t, viewer):
+                # Private for this reader: no data, its pin unread too.
+                return {} if t.get("kind") == "partial" else None
         if pinning and name in self.template_pins:
             return self.template_pins[name].get("data")
         t = self._template_library().get(name)
@@ -23330,6 +23350,12 @@ class Match:
             new_vars.pop(k, None)
             if k in e.vars:
                 new_vars[k] = copy.deepcopy(e.vars[k])
+        if not self.sizes_on():
+            # A form captured while sizes were on carries the derived pair;
+            # with sizes off nothing derives it, so it doesn't come back
+            # (L46), as a summon of the form drops it.
+            for k in self.size_names()[1:]:
+                new_vars.pop(k, None)
         # Checked BEFORE the old parts go, so a bad statblock changes nothing.
         new_vars = checked_unit_vars(new_vars, (hp_var, max_hp_var, turnorder_var),
                                      "transform", self.rules.get("team_var", "team"),
@@ -24849,6 +24875,7 @@ class Match:
         size_hidden: Dict[str, str] = {}
         prev_hidden = getattr(self, "_view_size_hidden", None)
         prev_reader = getattr(self, "_view_reader", None)
+        prev_templates = getattr(self, "_view_templates", None)
         try:
             if reader is not None:
                 # Only the units holding something private get a redacted
@@ -24908,13 +24935,15 @@ class Match:
             # functions answer per private_size_display).
             self._view_size_hidden = size_hidden
             # The reader of the view: the library reads (template_data,
-            # template_names, has_template) answer as it may read them.
+            # template_names, has_template) answer as the command's
+            # template viewer may read them.
             self._view_reader = reader
+            self._view_templates = TEMPLATE_VIEWER.get()
             yield
         finally:
-            if reader is not None:
-                self._view_size_hidden = prev_hidden
-                self._view_reader = prev_reader
+            self._view_size_hidden = prev_hidden
+            self._view_reader = prev_reader
+            self._view_templates = prev_templates
             for obj, attr, old in reversed(swapped):
                 if attr == "__item__":
                     obj["vars"] = old
@@ -26810,11 +26839,117 @@ LOCAL_WORKSPACE = "local"
 # (see Match.capture_template); its NAME is the id spawned units take.
 TEMPLATE_ROOT = "@root"
 _TEMPLATE_META_KEYS = ("saved_by", "saved_by_name")
-# A template only hosts may read (`!template private`): a non-host reads it
-# as missing in the library reads and `$()`. Library metadata, never copied
-# into a unit.
+# A private template (`!template private`): library metadata, never copied
+# into a unit. `true` = hosts level (a non-host, or anyone in a team-view
+# channel, reads it as missing in the library reads and `$()`);
+# "creator" = only its saver and server administrators read it, outside a
+# team view (user call).
 TEMPLATE_PRIVATE_KEY = "private"
+TEMPLATE_CREATOR_ONLY = "creator"
 _TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,)
+# What a reader who may not read a private template sees in place of a
+# reference to it (V19).
+PRIVATE_REF_TEXT = "(private)"
+
+
+@dataclass(frozen=True)
+class TemplateViewer:
+    """Who reads the template library: `hosts` reads hosts-level private
+    templates; `user` (None in a team view) reads the creator-level ones it
+    saved, `admin` (an administrator outside a team view) all of them."""
+    hosts: bool
+    user: Optional[str] = None
+    admin: bool = False
+
+
+def template_private_level(tpl: Any) -> Optional[str]:
+    """"hosts", "creator" or None (a public template)."""
+    if not isinstance(tpl, dict):
+        return None
+    v = tpl.get(TEMPLATE_PRIVATE_KEY)
+    if v == TEMPLATE_CREATOR_ONLY:
+        return TEMPLATE_CREATOR_ONLY
+    return "hosts" if v else None
+
+
+def template_hidden(tpl: Any, viewer: Optional[TemplateViewer]) -> bool:
+    """True when `viewer` may not read `tpl` (None = the engine, reads
+    everything)."""
+    if viewer is None:
+        return False
+    level = template_private_level(tpl)
+    if level is None:
+        return False
+    if level == TEMPLATE_CREATOR_ONLY:
+        return not (viewer.admin or (viewer.user is not None
+                                     and str(tpl.get("saved_by"))
+                                     == str(viewer.user)))
+    return not viewer.hosts
+
+
+# The template viewer of the command (set by the dispatcher beside
+# VAR_READER): a `$()` / read-only formula reads the library as it may.
+TEMPLATE_VIEWER: "contextvars.ContextVar[Optional[TemplateViewer]]" = (
+    contextvars.ContextVar("vtt_template_viewer", default=None))
+# Set while a reader who may not read some private templates resolves
+# partials: such a partial then expands to nothing (V19).
+TEMPLATE_HIDE_PRIVATE: "contextvars.ContextVar[Optional[TemplateViewer]]" = (
+    contextvars.ContextVar("vtt_template_hide_private", default=None))
+
+
+@contextmanager
+def private_templates_hidden(viewer: Optional[TemplateViewer]):
+    """Resolve partials as `viewer` (V19): inside, a private partial it
+    may not read has empty data, and the command's partial cache is set
+    aside so nothing resolved either way crosses over. None = no hiding."""
+    if viewer is None:
+        yield
+        return
+    t1 = TEMPLATE_HIDE_PRIVATE.set(viewer)
+    t2 = PARTIAL_CACHE.set({})
+    try:
+        yield
+    finally:
+        PARTIAL_CACHE.reset(t2)
+        TEMPLATE_HIDE_PRIVATE.reset(t1)
+
+
+def private_template_names(library: Dict[str, Any],
+                           viewer: Optional[TemplateViewer]) -> "set[str]":
+    """The names of the library's templates `viewer` may not read."""
+    if viewer is None:
+        return set()
+    return {n for n, t in (library or {}).items()
+            if template_hidden(t, viewer)}
+
+
+def mask_private_refs(value: Any, private: "set[str]") -> Any:
+    """`value` (template data, file or live form) with every reference to
+    a template in `private` named PRIVATE_REF_TEXT (V19). Returns `value`
+    itself when nothing changes."""
+    if not private:
+        return value
+    if isinstance(value, dict):
+        out = None
+        for k, v in value.items():
+            nv = v
+            if k == TEMPLATE_MARKER:
+                if isinstance(v, str) and v in private:
+                    nv = PRIVATE_REF_TEXT
+                elif isinstance(v, dict) and v.get("name") in private:
+                    nv = {**v, "name": PRIVATE_REF_TEXT}
+            else:
+                nv = mask_private_refs(v, private)
+            if nv is not v:
+                if out is None:
+                    out = dict(value)
+                out[k] = nv
+        return value if out is None else out
+    if isinstance(value, list):
+        items = [mask_private_refs(v, private) for v in value]
+        return (value if all(a is b for a, b in zip(items, value))
+                else items)
+    return value
 _TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
                            "mount_slot")
 
@@ -26837,12 +26972,17 @@ _PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags",
 
 
 def _check_template_private(d: Dict[str, Any], where: str) -> None:
-    """The `private` flag: true (kept) or false (dropped)."""
+    """The `private` flag: true or "hosts" (kept as true), "creator"
+    (kept), false (dropped)."""
     if TEMPLATE_PRIVATE_KEY not in d:
         return
-    if not isinstance(d[TEMPLATE_PRIVATE_KEY], bool):
-        raise VTTError(f"{where}: `{TEMPLATE_PRIVATE_KEY}` is true or false, "
-                       f"got {d[TEMPLATE_PRIVATE_KEY]!r}.")
+    v = d[TEMPLATE_PRIVATE_KEY]
+    if v == "hosts":
+        d[TEMPLATE_PRIVATE_KEY] = True
+    elif not (isinstance(v, bool) or v == TEMPLATE_CREATOR_ONLY):
+        raise VTTError(f"{where}: `{TEMPLATE_PRIVATE_KEY}` is true, false, "
+                       f"\"hosts\" or \"{TEMPLATE_CREATOR_ONLY}\", got "
+                       f"{v!r}.")
     if not d[TEMPLATE_PRIVATE_KEY]:
         del d[TEMPLATE_PRIVATE_KEY]
 

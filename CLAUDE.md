@@ -76,6 +76,20 @@ not new engine code. Add a shortcut only when GMs would write the same
 composition over and over (lowest_var / highest_var exist because every
 targeting formula needed the same accumulator loop).
 
+### Privacy keeps the mystery for players; hosts are trusted
+
+Private vars, private templates, fog, POV filters and formula-text hiding
+exist to preserve an element of mystery for the PLAYERS (user call). They
+need not be airtight, and they need not cover hosts: a server that lets
+someone host already trusts them, so hosts (and the `gm` / `templates`
+roles) read nearly everything. The one host-facing layer is a creator-level
+private template (§7.17), a GM's work in progress, which the user asked
+for. A host's read is refused or trimmed only where PLAYERS would see the
+reply (a team-view channel). When an audit finding is "a player can reach
+X by a roundabout route", weigh it against this: hide the obvious places
+players look, and treat a deliberate workaround as an honor-system matter
+for the GM. Ask before adding restrictions on hosts.
+
 ### The square grid is fundamental
 
 The map is a grid of square cells and stays that way: every geometry
@@ -474,9 +488,18 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   carries one (a held command, a journal replay's `auth[2]`, an action's
   `_BufferCtx`, which keeps only `MATCH_CAPABILITIES`), else from
   `ctx.role_ids` (Discord: the member's roles; CLI / harness `!as player
-  <name> roles=a,b`). A held command and a journal entry also record the
-  caller's role ids (`roles`), so a resume or a replay judges per-role
-  access overrides as the caller met them. `templates` / `prefabs`: save without hosting and
+  <name> roles=a,b`). A journal entry also records the caller's role ids
+  (`roles`), so a replay judges per-role access overrides as the caller
+  met them. A held command runs at `!match resume` with its holder's
+  authority as it is THEN (user call, G8): the surface's async
+  `member_authority(user_id)` gives (administrator, role ids) now
+  (Discord: the member, fetched if uncached; (False, ()) once they left;
+  None when Discord can't say, and the authority recorded at the hold
+  applies), and the capabilities follow the role map as it stands; the
+  harness answers from the roles `!as player <name> roles=` last gave
+  that name (1033). `files` covers `!store save`, `!run` and the
+  exports; `!store load` replaces every match and system, so it needs
+  `server` (user call, 1033). `templates` / `prefabs`: save without hosting and
   edit anyone's entries (`_template_may_save`, `_template_saver_ok`, a
   forced partial rename / delete), and read the library as a host
   outside a team view. `host`: once any role holds it, only its holders
@@ -485,8 +508,11 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   `_acts_as_host`, the gate, `require_target_host`, the Discord buttons),
   never its owner; what a `gm` writes records no player author.
   Roles are kept by id: Discord's `resolve_role` takes a mention, id or
-  name, `role_name` shows the current name (None = deleted; dropped at
-  the next grant / revoke).
+  name (`@everyone` too), `role_name` shows the current name (None =
+  deleted; dropped at the next grant / revoke); a grant / revoke takes
+  several roles, one per word, and the CLI's roles are single words.
+  `!match replay` builds a match, so it passes `_require_match_creator`
+  too (1031).
 - **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
   `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
   (`require_target_host`) — the access gate only checks the CHANNEL's match,
@@ -1371,7 +1397,9 @@ hardcodes**.
   resume` runs them (`resume drop` discards); held commands are saved with
   the match (`paused.held`), so a restart keeps them; never an undo step;
   `!dry` runs during a pause (637-638, 822). A held command records its
-  holder's admin / bot-owner flags and runs at the resume as the holder
+  holder's admin / bot-owner flags (and capabilities, roles; the resume
+  reads the holder's current ones where the surface can, §3 "Role
+  capabilities", G8) and runs at the resume as the holder
   (`_HolderCtx`, COMMAND_USER: handler checks and the log judge and name
   the holder, G7); `!match use / new / bind / unbind / clone` and `!map
   use` aren't held (`_pause_control`, L39) (988).
@@ -2390,10 +2418,12 @@ hardcodes**.
   per match, kept out of `rules` so a refresh can't wipe it) beat the
   `command_access` rule (`!system access`, per system). Per-player
   overrides (`!host access ... user=<player>`) live in the same dict as
-  `@<user id> <key>` and win over both (`_effective_access(..., user)`)
-  (773); per-role ones (`!host access ... role=<role>`, `@&<role id>
-  <key>`) come next, the more precise key first, the most open level of
-  the caller's roles for it (`_ACCESS_OPENNESS`) (1029). No-op without an
+  `@<user id> <key>`, per-role ones (`!host access ... role=<role>`)
+  as `@&<role id> <key>` (773, 1029). Precedence (user call): a precise
+  `name sub` key in any of the three match layers beats a bare `name`
+  key in all of them; for one key the player's layer comes first, then
+  the most open level among the caller's roles (`_ACCESS_OPENNESS`),
+  then the match-wide key; the system rule last, precise first. No-op without an
   active match, identity or owner — hence the separate admin and
   target-host checks.
 - **Approval queue:** `Match.add_pending_request` (runtime-only; carried
@@ -2432,7 +2462,10 @@ hardcodes**.
   hidden units it named (`_HOST_REVEALS`). A glued part shows while the
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
-  (`_whole_board_read_blocked`). `team_data_visibility` (own / all / host)
+  (`_whole_board_read_blocked`); a host's in a channel with a team view
+  is refused while the match holds private vars, since players read the
+  channel (`_host_private_read_refusal`: `!log`, `!history diff` / list
+  kinds, undo preview, `!match journal`, `!dry`'s change list; 1032). `team_data_visibility` (own / all / host)
   filters `!team list/get`. `formula_text_visibility` (all / host, user
   call): under `host` a caller who is neither an administrator nor a host
   of the channel's match reads every GM formula as `(hidden)` (names,
@@ -2527,7 +2560,9 @@ hardcodes**.
   still move through a multi-line block; an unsent draft comes back past
   the newest), Ctrl+R reverse search (GUI: a bar above the input, Enter
   takes the match for editing, Esc restores the draft, clicking away takes
-  the match), and in the GUI Esc clears the input and Ctrl+L the log; the
+  the match; the bar is packed before the input row, so it takes its
+  height in the input's pane, I1), and in the GUI Esc clears the input and
+  Ctrl+L the log; the
   first / last line is a screen ROW, so Up / Down still move through a long
   wrapped line; keypad Enter runs like Enter. A line whose quote is still
   open continues on the next line not starting with `!` (a multi-line
@@ -2700,7 +2735,8 @@ hardcodes**.
   export`) refuse to replace an existing file unless `overwrite` is given
   (`_check_overwrite`; `overwrite` in the file name's place is refused)
   (824).
-- **Whole-server saves:** `!store save/load <name>` (admin, saves folder;
+- **Whole-server saves:** `!store save/load <name>` (admin or a role with
+  `files` for a save, `server` for a load; saves folder;
   load is all-or-nothing); `!history export/import` (a snapshot from another
   match restores only the board: the match keeps its id, name, hosts and
   system, and the units take its var names).
@@ -2868,11 +2904,32 @@ hardcodes**.
   list, show, diff, tags, trash, and a missing template's refusal, whether
   or not it exists, so it is no oracle); it clears the cooldown
   reminder's mark for that command. `!template private <name>
-  [on|off]` (saver / admin; the `private` key, `TEMPLATE_PRIVATE_KEY`,
-  library metadata kept by a re-save and stripped at spawn) makes a
-  template host-only: to any reader it reads as missing in list / show /
-  diff / tags / trash, template_names / has_template / template_data and
-  Tab (`_readable_template`, `completion._readable_template_names`).
+  [on|off|hosts|creator]` (saver / admin; the `private` key,
+  `TEMPLATE_PRIVATE_KEY`: true = hosts level, `"creator"`; library
+  metadata kept at its level by a re-save and an import, stripped at
+  spawn) makes a template private. Who reads one is the command's
+  `logic.TemplateViewer` (`_template_viewer`; None = an administrator
+  outside a team view, reads all; `logic.template_hidden`): hosts level,
+  whoever `_template_reader` reads everything for (a host or a
+  `templates` / `gm` holder outside a team view); creator level (user
+  call, 1034), only its saver and administrators, outside a team view
+  (other hosts and the `templates` / `gm` roles don't, and their edits
+  and restores answer as for a missing template). To anyone else it
+  reads as missing in list / show / diff / tags / trash, template_names /
+  has_template / template_data and Tab (`_readable_template`,
+  `completion._readable_template_names`), and in the edits and restore
+  (`_require_saver` answers as for a missing one unless, at hosts level,
+  the caller is its saver or may edit it). The dispatcher sets
+  `logic.TEMPLATE_VIEWER` beside VAR_READER; `Match.private_view` records
+  it as `_view_templates`, which the formula library reads use (the
+  engine's own formulas read everything). A reference to it from a
+  public template reads, for such a reader, as `(private)`
+  (`logic.mask_private_refs`, `PRIVATE_REF_TEXT`: raw JSON, summaries,
+  `template_of`) and resolves to nothing (`logic.private_templates_hidden
+  (viewer)`: `Match._template_library` / `partial_data` give its data as
+  empty, pins unread, with a fresh partial cache; around list / show /
+  diff / tags and `template_data`) (V19, 1030). A JSON import over a
+  private template keeps its level unless the JSON says `"private"`.
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server

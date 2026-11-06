@@ -408,7 +408,10 @@ class GuiApp:
             self._draft = self._input_text()
         self._search_entry.delete(0, "end")
         self._search_idx = None
-        self._search_bar.pack(side="bottom", fill="x", after=self._inbar)
+        # Packed before the input row, so it takes its height first: the
+        # input pane starts exactly as tall as the input row, and a bar
+        # packed after it got no space and never showed (I1).
+        self._search_bar.pack(side="top", fill="x", before=self._inbar)
         self._search_entry.focus_set()
         self._search_show()
         return "break"
