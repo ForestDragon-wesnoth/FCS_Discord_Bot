@@ -13814,9 +13814,13 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.turn_order:
             raise NotFound(f"Entity '{eid}' not in turn order.")
         if quiet:
-            # A silent correction: only the pointer moves.
+            # A silent correction: only the pointer moves (the unit's
+            # turn is the one under way, so it counts as its turn this
+            # round under the one-turn-a-round policies).
             m.active_index = m.turn_order.index(eid)
             m.turn_vacated = None
+            if m.round_started:
+                m._mark_acted(eid)
             return await ctx.send(f"Active turn set to `{eid}` (round "
                                   f"{m.round_number}; no turn hooks ran).")
         log = m.set_turn(eid)
@@ -13840,8 +13844,12 @@ registry.annotate_sub(
           "and the turn autosave, as if `!turn next` had landed on it "
           "(under ATB its charge bar resets as if it had filled; before "
           "the first turn it starts round 1 at <id>). Skip statuses don't "
-          "move the turn past a unit chosen this way. `quiet` only moves "
-          "the pointer, a silent correction with no hooks.")
+          "move the turn past a unit chosen this way, and it takes the "
+          "turn even if it already acted this round; under "
+          "turnorder_change_policy deferred / once_per_round the units "
+          "that haven't acted still get their turns before the round "
+          "wraps. `quiet` only moves the pointer, a silent correction "
+          "with no hooks.")
 )
 
 

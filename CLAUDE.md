@@ -1354,7 +1354,26 @@ hardcodes**.
   a teamless unit, user call, 960). A write to the tiebreak var and a changed
   `turnorder_*` rule (`apply_system_rules`) re-sort it like an initiative
   write (770). Before the first `!turn next` the pointer sits at
-  the top of the order.
+  the top of the order, and every change re-sorts at once (no round to
+  defer).
+- **One turn a round** (user call, T3; 1037-1039):
+  `turnorder_change_policy` is `deferred` (default: a value change
+  waits for the round wrap), `once_per_round` (re-sort at once) or
+  `immediate` (re-sort at once with no memory, so a unit crossing the
+  pointer gains or loses a turn). Under the first two
+  (`Match._turn_once_per_round`) `Match.round_acted` (serialized, undo
+  state, cleared at each wrap) lists the units that had their turn this
+  round (started one, were skipped, or got it from `!turn set` /
+  `quiet`): `_advance_index` goes to `_next_due_index` (the first unit
+  after the pointer that hasn't acted, else the first before it), wraps
+  only when everyone has, and `_skip_to_eligible` passes over an acted
+  unit the pointer lands on. A unit joining mid-round behind the pointer
+  is added to it at the rebuild (it waits a round); one ahead acts. A
+  structural rebuild under `deferred` also applies stashed value
+  changes, and the memory keeps that from giving a second turn. A
+  future feature granting another turn this round (extra turns, on the
+  feature list) takes the unit out of `round_acted` or goes through
+  `set_turn`, which gives the turn whatever the memory says.
 - **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
   unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
   schedules, the turn autosave); under ATB <id>'s bar resets as if it had
@@ -3514,15 +3533,6 @@ Design questions the user wants raised when no other task is in flight
 options and a recommendation, when a task has just finished and the user
 hasn't named the next.
 
-- **T3, initiative changes mid-round** (pass 43): under
-  `turnorder_change_policy: immediate` the order re-sorts at once and the
-  pointer follows the acting unit, so a unit crossing the pointer gains or
-  loses a turn that round. Measured: A 10 / B 5 / C 1, A acts, B acts, A's
-  initiative drops to 0 -> round 1 runs A, B, C, A (A twice); A acts and
-  C's rises to 20 -> round 1 runs A, B and C waits for round 2. Options:
-  remember who has acted this round (each unit exactly one turn a round,
-  a saved set undo restores; recommended), keep it as the documented
-  meaning of `immediate`, or make `deferred` the default.
 - **Live vs materialized definition fields** (user, at #136: "for now
   live, but later we should discuss what is live and materialized"): a
   zone reads its definition's hooks, look fields, tags and grants live,

@@ -1986,21 +1986,31 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "turnorder_change_policy": {
-        "default": "immediate",
-        "schema": {"type": "enum", "choices": ["immediate", "deferred"]},
+        "default": "deferred",
+        "schema": {"type": "enum",
+                   "choices": ["deferred", "once_per_round", "immediate"]},
         "desc": (
             "When a write to an entity's turnorder_var or team_var "
             "occurs mid-round (typically from a formula or a passive's "
-            "side effect), should turn order rebuild immediately? "
-            "'immediate' (default): rebuild on the spot. The currently "
-            "acting entity keeps acting — active_index follows them to "
-            "their new position. 'deferred': leave this round's order "
-            "untouched; emit a warning and stash the change. The "
-            "rebuild happens at round end (after on_round_end fires, "
-            "before on_round_start fires for the next round). "
-            "Structural changes (spawn, death, removal) always rebuild "
-            "immediately regardless of this rule — only value-driven "
-            "changes are deferrable."
+            "side effect), when does the turn order rebuild? "
+            "'deferred' (default): leave this round's order untouched; "
+            "emit a warning and stash the change. The rebuild happens "
+            "at round end (after on_round_end fires, before "
+            "on_round_start fires for the next round). "
+            "'once_per_round': rebuild on the spot (the acting unit "
+            "keeps acting), and each unit still takes exactly one turn "
+            "this round: a unit that has acted is passed over if the "
+            "new order puts it ahead again, and one that hasn't acted "
+            "gets its turn before the round ends even if the new order "
+            "put it behind the acting unit. 'immediate': rebuild on the "
+            "spot with no such memory, so a unit crossing the acting "
+            "unit gains or loses a turn that round. Under 'deferred' "
+            "and 'once_per_round' a unit that joins mid-round (a spawn, "
+            "a revive) behind the acting unit waits for the next round, "
+            "one ahead of it acts this round. Structural changes "
+            "(spawn, death, removal) always rebuild immediately "
+            "regardless of this rule. `!turn set` gives the turn to a "
+            "unit whether it has acted or not."
         ),
     },
     # ---- Active Time Battle (ATB) ----
@@ -10691,6 +10701,15 @@ class Match:
     # the next unit's turn without advancing past it. None otherwise.
     # Serialized, so an undo or reload keeps it.
     turn_vacated: Optional[str] = None
+    # The units that have had their turn this round (acted, or were
+    # skipped), in that order: under turnorder_change_policy deferred /
+    # once_per_round a re-sorted order passes over them, and units that
+    # haven't acted take their turn before the round wraps. A unit that
+    # joins mid-round behind the pointer is added (it waits a round).
+    # Cleared at each round wrap. Serialized and undo state. A feature
+    # that grants a unit another turn this round (`!turn set` does) takes
+    # it out or bypasses the check.
+    round_acted: List[str] = field(default_factory=list)
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
 
@@ -17482,6 +17501,7 @@ class Match:
         prev_current_id = None
         if 0 <= self.active_index < len(self.turn_order):
             prev_current_id = self.turn_order[self.active_index]
+        prev_order = set(self.turn_order)
 
         candidates = [
             e for e in self.entities.values()
@@ -17650,10 +17670,41 @@ class Match:
             self.active_index = self.turn_order.index(prev_current_id)
         else:
             self.active_index = 0
+        # A unit joining mid-round (a spawn, a revive) behind the acting
+        # unit waits for the next round; one ahead of it acts this round.
+        if self.round_started and self._turn_once_per_round():
+            for i, eid in enumerate(self.turn_order):
+                if (eid not in prev_order and i <= self.active_index
+                        and eid not in self.round_acted):
+                    self.round_acted.append(eid)
 
         # Whatever triggered this rebuild, we've now applied it — the
         # deferred flag is no longer meaningful.
         self._turn_order_dirty = False
+
+    def _turn_once_per_round(self) -> bool:
+        """Whether each unit takes one turn a round however the order
+        changes (turnorder_change_policy deferred / once_per_round; ATB
+        has no rounds)."""
+        return (not self.rules.get("atb_enabled")
+                and self.rules.get("turnorder_change_policy", "deferred")
+                in ("deferred", "once_per_round"))
+
+    def _mark_acted(self, eid: Optional[str]) -> None:
+        if eid is not None and eid not in self.round_acted:
+            self.round_acted.append(eid)
+
+    def _next_due_index(self) -> Optional[int]:
+        """The next unit that hasn't had its turn this round: the first
+        after the pointer, else the first before it (one a re-sort put
+        behind the acting unit). None when everyone has acted."""
+        acted = set(self.round_acted)
+        n = len(self.turn_order)
+        for j in list(range(self.active_index + 1, n)) + list(
+                range(0, min(self.active_index + 1, n))):
+            if self.turn_order[j] not in acted:
+                return j
+        return None
 
     def _mark_turn_order_dirty(self, reason: str) -> None:
         """Called when a value change (turnorder_var or team_var) wants
@@ -17666,8 +17717,10 @@ class Match:
         through this — they call _rebuild_turn_order directly because
         a dead entity in the turn list would otherwise still get
         turns under the deferred policy."""
-        policy = self.rules.get("turnorder_change_policy", "immediate")
-        if policy == "deferred":
+        policy = self.rules.get("turnorder_change_policy", "deferred")
+        # Before the first turn no round is under way: nothing to defer,
+        # and setting up initiatives must re-sort at once.
+        if policy == "deferred" and self.round_started:
             if not self._turn_order_dirty:
                 # First defer this round — explain the policy once so
                 # the GM doesn't think the change was dropped.
@@ -17684,7 +17737,8 @@ class Match:
                 )
             self._turn_order_dirty = True
             return
-        # 'immediate' (default).
+        # 'immediate' / 'once_per_round': rebuild now (the second passes
+        # over units that have acted when the turn advances).
         self._rebuild_turn_order()
 
     def current_entity_id(self) -> Optional[str]:
@@ -17836,6 +17890,8 @@ class Match:
             self._begin_turn()
             return log
         self.active_index = self.turn_order.index(eid)
+        # The GM gave it the turn, whether it had acted or not.
+        self._mark_acted(eid)
         if atb:
             log.extend(self._atb_reset_actor(self.entities[eid]))
             self._atb_last_skipped = False
@@ -17905,6 +17961,7 @@ class Match:
                          f"round(s); `{cur}` is the first able to act."))
             order_before = list(self.turn_order)
             idx = self.active_index
+            self._mark_acted(cur)
             log.extend(self.fire_hook(
                 "on_turn_start", target_ids=[cur],
                 own_only_targets=self._attached_tick_parts([cur])))
@@ -18311,6 +18368,14 @@ class Match:
             return
         new_index = (self.active_index + 1) % len(self.turn_order)
         wrapped = (new_index == 0)
+        if self._turn_once_per_round():
+            # One turn per unit a round: the next unit that hasn't acted,
+            # wherever a re-sort put it; the round wraps once all have.
+            due = self._next_due_index()
+            if due is not None:
+                self.active_index = due
+                return
+            new_index, wrapped = 0, True
         if wrapped:
             log.extend(self.fire_hook(
                 "on_round_end",
@@ -18329,6 +18394,7 @@ class Match:
                 new_index = 0
         self.active_index = new_index
         if wrapped:
+            self.round_acted = []
             self.round_number += 1
             line = self.round_start_line()
             if line:
@@ -18404,6 +18470,12 @@ class Match:
             if self.active_index >= len(self.turn_order):
                 self.active_index = 0
             cur = self.turn_order[self.active_index]
+            if self._turn_once_per_round() and cur in self.round_acted:
+                # Had its turn this round already (a re-sort, a removal
+                # or a revive put it here again): pass over it.
+                self._advance_index(log)
+                steps += 1
+                continue
             e = self.entities.get(cur)
             if e is None:
                 return True
@@ -18414,6 +18486,8 @@ class Match:
                 return False
             seen.add(cur)
             matched = ", ".join(sorted(skipping))
+            # A skipped turn is this round's turn.
+            self._mark_acted(cur)
             log.append(self.unit_line(
                 cur, f"⏭️ `{cur}`'s turn skipped ({matched})."))
             log.extend(self.fire_hook(
@@ -24234,6 +24308,7 @@ class Match:
             "rng_pos": self.rng_position(),
             "round_started": self.round_started,
             "turn_vacated": self.turn_vacated,
+            "round_acted": list(self.round_acted),
             # Saved only while set: whether the current ATB turn is a
             # skipped one (its end fires no action surface, T7), and a
             # watcher chain waiting for a change (L28).
@@ -24436,6 +24511,9 @@ class Match:
         m.round_started = bool(d.get("round_started", False))
         m.turn_vacated = d.get("turn_vacated") if d.get("turn_vacated") in (
             "same", "wrap") else None
+        ra = d.get("round_acted")
+        m.round_acted = ([str(x) for x in ra if isinstance(x, str)]
+                         if isinstance(ra, list) else [])
         m._atb_last_skipped = d.get("atb_turn_skipped") is True
         m._watcher_backlog = d.get("watcher_backlog") is True
         m.global_passives = {

@@ -4234,8 +4234,8 @@ tiles intact — hero on the restored match takes 7 damage from
 the (4,4) flame via the restored template hook.
 
 
-SCENARIO 190 — Turn order: immediate rebuild on initiative change (default)
-----------------------------------------------------------------------------
+SCENARIO 190 — Turn order: an initiative change before the first turn rebuilds at once
+--------------------------------------------------------------------------------------
 
 !match new mto1 TurnImm 8 8
 !match use mto1
@@ -4248,14 +4248,13 @@ SCENARIO 190 — Turn order: immediate rebuild on initiative change (default)
 
 Expected: Default turn order with three entities is bob(20),
 carol(15), alice(10) — sorted by initiative descending. The
-default `turnorder_change_policy` is `immediate`, so
-`!ent init alice 99` (which routes through `write_var` on the
-initiative variable) triggers an inline `_rebuild_turn_order()`.
-The post-rebuild order is alice(99), bob(20), carol(15) — the
-new order is reflected by `!list` immediately, no round wait
-required. This is also the path a formula like
-`entity[X].initiative = N` takes: any var write to the
-configured `turnorder_var` triggers the same policy.
+default `turnorder_change_policy` is `deferred`, but before the
+first turn no round is under way, so `!ent init alice 99`
+(which routes through `write_var` on the initiative variable)
+rebuilds the order at once under every policy. The post-rebuild
+order is alice(99), bob(20), carol(15), shown by `!list` right
+away. A formula like `entity[X].initiative = N` takes the same
+path: any var write to the configured `turnorder_var`.
 
 
 SCENARIO 191 — Turn order: deferred rebuild waits for round end
@@ -4274,7 +4273,6 @@ SCENARIO 191 — Turn order: deferred rebuild waits for round end
 !list
 !turn next
 !list
-!system set default turnorder_change_policy immediate
 
 Expected: Under `deferred` policy, writing to an entity's
 initiative emits a `⏳ turn order change deferred` warning AND
@@ -4286,12 +4284,6 @@ just-ended round's order), and before `on_round_start` fires
 (which sees the new order). A `🔄 deferred turn-order rebuild
 applied at round end.` log line confirms the flush. The
 final `!list` shows alice(999), bob(20).
-
-The trailing `!system set ... immediate` restores the global
-default so subsequent scenarios run with the original behavior.
-(Test scenarios share global GameSystem state — leaving
-`deferred` set would change every later scenario's turn-order
-semantics.)
 
 
 SCENARIO 192 — Turn order: lowest_first inverts the sort
@@ -4550,7 +4542,6 @@ SCENARIO 200 — Turn order: structural changes always rebuild immediately
 !list
 !ent hp alice -999
 !list
-!system set default turnorder_change_policy immediate
 
 Expected: Even with `deferred` policy active, STRUCTURAL
 changes — spawn, removal, death/revive — rebuild
@@ -25438,7 +25429,8 @@ SCENARIO 827 — !turn set is a turn change; quiet moves only the marker
 ?? no turn hooks ran
 !assert "entity[b].ends == 0 and entity[a].starts == 0"
 !turn next
-!assert "entity[a].ends == 1 and entity[b].starts == 2"
+?? Round 2
+!assert "entity[a].ends == 1 and entity[a].starts == 1 and entity[b].starts == 1"
 !turn set b loud
 ?? ❌ `loud` isn't an option of `!turn set` (only `quiet`).
 !system set default atb_enabled true
@@ -25456,8 +25448,10 @@ SCENARIO 827 — !turn set is a turn change; quiet moves only the marker
 Expected: HARNESS-ALLOWS-ERRORS. Before the first turn, `!turn set c`
 starts round 1 at c (its turn_start hook runs, one turn has elapsed).
 `!turn set b` ends c's turn (turn_end) and starts b's. `quiet` only
-moves the marker: no hook runs. `!turn next` then ends a's turn and
-passes on to b. A word other than `quiet` is refused. Under ATB the
+moves the marker: no hook runs. `!turn next` then ends a's turn; c, b
+and a have all had their turn this round (the default
+turnorder_change_policy `deferred` gives each unit one turn a round), so
+round 2 starts at a. A word other than `quiet` is refused. Under ATB the
 chosen unit's bar resets as if it had filled, so the next turn goes to
 the other unit instead of q acting twice in a row.
 
@@ -35972,3 +35966,142 @@ command it reverted past by its round, since its text can quote a
 private value (L49); outside the team view it quotes the command. An
 import that keeps the snapshot's own label next to a save of that name
 takes `mark-2`; one given the name with `as` replaces it and says so.
+
+SCENARIO 1037 — turnorder_change_policy once_per_round: a re-sort mid-round gives no unit a second turn and takes none away
+--------------------------------------------------------------------------------------------------------------------------
+!system set default turnorder_change_policy once_per_round
+!match new op OnePer 8 8
+!match use op
+!ent add a A 10 1 1 10
+!ent add b B 10 2 2 5
+!ent add c C 10 3 3 1
+!ent set_vars a starts=0
+!ent set_vars b starts=0
+!ent set_vars c starts=0
+!gpassive add st on_turn_start "entity[self].starts = entity[self].starts + 1"
+!turn next
+!turn next
+!ent init a 0
+!turn next
+?? It is now **C**'s turn
+!turn next
+?? Round 2
+?? It is now **B**'s turn
+!assert "entity[a].starts == 1 and entity[b].starts == 2 and entity[c].starts == 1"
+!match new op2 OnePer2 8 8
+!match use op2
+!ent add a A 10 1 1 10
+!ent add b B 10 2 2 5
+!ent add c C 10 3 3 1
+!turn next
+!ent init c 20
+!turn next
+?? It is now **B**'s turn
+!turn next
+?? It is now **C**'s turn
+?! Round 2
+!turn next
+?? Round 2
+?? It is now **C**'s turn
+!assert "round_number() == 2"
+
+Expected: under `once_per_round` the order re-sorts as soon as an
+initiative changes, and each unit still takes one turn a round. A
+drops to initiative 0 after acting: the order becomes B, C, A, and
+round 1 runs A, B, C without giving A a second turn; round 2 opens
+with B (A started once, B twice, C once). In the second match C rises
+to 20 during A's turn: the order becomes C, A, B, and C, now behind
+the acting unit, still takes its turn before round 1 ends (A, B, C);
+round 2 opens with C.
+
+SCENARIO 1038 — One turn a round: units joining mid-round, skipped turns, the deferred default and a spawn's rebuild
+------------------------------------------------------------------------------------------------------------------
+!match new jn Join 10 10
+!match use jn
+!ent add a A 10 1 1 10
+!ent add b B 10 3 1 5
+!ent add big Big 10 5 5 3
+!ent set_vars big footprint_w=2 footprint_h=2
+!ent add c C 10 8 1 1
+!ent set_vars a starts=0
+!ent set_vars b starts=0
+!ent set_vars c starts=0
+!ent set_vars big starts=0
+!gpassive add st on_turn_start "entity[self].starts = entity[self].starts + 1"
+!turn next
+!turn next
+?? It is now **B**'s turn
+!ent init a 0
+?? deferred
+!ent add late Late 10 1 8 20
+!ent add slow Slow 10 2 8 2
+!ent set_vars late starts=0
+!ent set_vars slow starts=0
+!turn next
+?? It is now **Big**'s turn
+!turn next
+?? It is now **Slow**'s turn
+!status def stun
+!status data stun skips_turn true
+!status apply c stun
+!turn next
+?? `c`'s turn skipped (stun)
+?? Round 2
+?? It is now **Late**'s turn
+!assert "entity[a].starts == 1 and entity[b].starts == 1 and entity[big].starts == 1 and entity[c].starts == 0 and entity[late].starts == 1"
+
+Expected: the default policy is `deferred`, which also gives each unit
+one turn a round. During B's turn A drops to 0 (deferred, with the ⏳
+warning). Two units join: Late (initiative 20) and Slow (2). A spawn
+rebuilds the order at once, which also applies A's stashed 0: the order
+becomes Late, B, Big, Slow, C, A. A has acted, so it gets no second
+turn; Late joined behind the acting unit, so it waits for round 2; Slow
+joined ahead of it and acts this round. The 2x2 Big acts once. C's turn
+is skipped by its stun, which counts as its turn, and round 2 opens with
+Late.
+
+SCENARIO 1039 — turnorder_change_policy immediate keeps the plain re-sort; the round's memory survives undo and restart
+---------------------------------------------------------------------------------------------------------------------
+!system set default turnorder_change_policy immediate
+!match new im Imm 8 8
+!match use im
+!ent add a A 10 1 1 10
+!ent add b B 10 2 2 5
+!ent add c C 10 3 3 1
+!turn next
+!turn next
+!ent init a 0
+!turn next
+?? It is now **C**'s turn
+!turn next
+?? It is now **A**'s turn
+?! Round 2
+!system set default turnorder_change_policy once_per_round
+!match new rm Mem 8 8
+!match use rm
+!ent add a A 10 1 1 10
+!ent add b B 10 2 2 5
+!ent add c C 10 3 3 1
+!turn next
+!turn next
+!ent init a 0
+!as restart
+!match use rm
+!turn next
+?? It is now **C**'s turn
+!undo command
+!turn next
+?? It is now **C**'s turn
+!turn next
+?? Round 2
+?? It is now **A**'s turn
+HARNESS-ALLOWS-ERRORS
+
+Expected: under `immediate` the order re-sorts with no memory of the
+round, so A, dropped behind the acting unit after its turn, acts again
+in round 1 (A, B, C, A). Under `once_per_round` the round's memory
+(`round_acted`) is saved with the match: after a restart A still
+counts as having acted, so C follows B. `!undo command` takes back the
+initiative change and the turn advance after it, memory included (A and
+B have acted): the next turn is C's again, and round 2 opens with A,
+whose initiative is 10 again.
