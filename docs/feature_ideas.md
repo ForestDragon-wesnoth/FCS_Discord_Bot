@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #261). Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #262). Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
@@ -83,7 +83,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#124 Initiative reroll every round.** A rule that re-runs #59's formula at each round start.
 - **#128 `!whisper <team> <text>`.** A host posts to every channel bound with that team's POV (handouts, secret info).
 - **#129 `!ent export <id>` / `!ent import <json>`.** A unit with its parts as JSON pasted in chat, to share between matches or bots without file access. Import goes through the template checks.
-- **#131 `!turn order [n]`.** The next n turns in round mode with skips marked; the round-mode twin of #27.
+- **#131 `!turn order [n]`.** The next n turns in round mode with skips marked; the round-mode twin of #27. The user wants it (a turn queue forecast, as in FFX or Octopath Traveler): under turnorder_change_policy `live` the units still to act in sorted order, then the next round; under `deferred` this round's order, then the re-sorted one. Open: how far to predict skip statuses whose duration a GM tick counts down.
 - **#133 `!map around=<eid> [r]`.** A one-off window centered on a unit; the channel camera stays where it is.
 - **#134 `!history note <text>`.** Labels the latest snapshot, so `!history list` and undo previews say what it was.
 - **#135 Pending-request expiry rule.** A queued player command expires after N minutes, so a stale request can't be approved hours later.
@@ -151,6 +151,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - `grant_turn(eid)` (and `!turn grant <eid>`) inserts one extra turn for `eid` right after the current one. An option says whether its turn-start passives and status ticks run (default: passives yes, ticks no, so a bonus turn doesn't burn twice). Under ATB the unit acts next and its charge bar is untouched.
   - The game need: NCS's planned Agility Potion ("gain an instant bonus turn").
   - Today `turn set` restarts the turn and re-runs everything (L11).
+  - With turnorder_change_policy `deferred` it also covers "jump, then jump back" (user): a unit takes a turn out of order and play then resumes where it was. `!turn set` under `deferred` deliberately sends the units it jumped over after the units ahead, since some games skip over units on purpose.
 - **#225 `schedule_on` counting skipped turns.**
   - `schedule_on(eid, delay, body, name, count_skipped=False)`, or a rule. With it on, a stunned or charging unit's delayed effect counts the turns it skips, as status ticks already do.
   - Today the delay waits for turns the unit actually starts (L12), so a charged action built from a `skips_turn` status plus `schedule_on` never fires (`fcs1b.out`: still charging after four rounds).
@@ -455,6 +456,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - `!match report`, and automatically after `declare_winner`: per unit damage dealt and taken, kills, statuses applied, turns taken, fled or dead.
   - A GM `report_formula` per unit adds the system's own lines: FCS1 XP (an enemy's XP value scaled by comparing the gear tier with the match tier), FCS1 loot rolls, Solis value points ("fleeing hunters won't get any value points").
   - Builds on #239 and #241.
+- **#262 Side phases (IGOUGO).** As in Wesnoth, Fire Emblem, Advance Wars, XCOM: a whole team takes its phase, its player activating its units in any order, then the next team. Team grouping already keeps a side together and orders sides; the missing part is a phase in which any of the side's units still to act can take the turn (`!turn next <eid>`, or a unit acting starting its turn), with turn hooks per unit and a `on_phase_start` / `on_phase_end` pair per side. Alternating activation (Kill Team, Descent, Lancer) is the variant where a side activates one unit and play passes to the other side; design both together.
 - **#249 Definitions as text.**
   - `!match export defs` prints a match's definitions (status definitions, global and team passives, functions, tables, tile templates, watchers, macros, aliases) as one JSON block. `!match import defs <json>` loads them into another match, on any server, through the same checks as each command.
   - This is how `!template import` already moves units between servers, and a step toward #162 system packs without the packaging.
