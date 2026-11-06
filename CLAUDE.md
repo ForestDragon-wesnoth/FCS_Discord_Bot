@@ -1420,7 +1420,7 @@ hardcodes**.
   (`_reshuffles_each_round`), after `round_number` goes up, so ties use
   the new round's seed (before, a round kept the last order until
   something changed it).
-- **Extra turns** (#224, user design, 1046-1051): `!turn grant <id>
+- **Extra turns** (#224, user design, 1046-1052): `!turn grant <id>
   [n] | list | clear [id]` (an undo step, `_SNAPSHOT_SUBS`) and the
   formulas `grant_turn(eid, n=1)` / `clear_extra_turns(eid=None)`
   (mutating) queue turns in `Match.extra_turns` (saved, undo state; at

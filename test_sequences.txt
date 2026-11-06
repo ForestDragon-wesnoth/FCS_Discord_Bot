@@ -36890,3 +36890,55 @@ extra_turn_skip_warning off silences the warning (hold wears off).
 With extra_turn_status_ticks on every status ticks on extra turns: no
 warning, and snare's last turn goes on the extra turn, before the
 regular skip.
+
+SCENARIO 1052 — Extra turns in an action: a Bard's inspire gives an ally within 2 tiles an extra turn (range to a 2x2 ally's nearest cell); an enemy or a far ally is refused and nothing is queued
+---------------------------------------------------------------------------------------------------------------------
+!match new xb XBard 8 8
+!match use xb
+!ent add bard Bard 10 5 5 30
+!ent set_var bard team red
+!ent add knight Knight 20 2 2 10
+!ent set_vars knight footprint_w=2 footprint_h=2 team=red
+!ent add archer Archer 10 8 8 20
+!ent set_var archer team red
+!ent add orc Orc 15 6 5 5
+!ent set_var orc team blue
+!ent set_var bard actions.inspire.target entity
+!ent set_var bard actions.inspire.description "An ally within 2 tiles takes an extra turn after this one."
+!ent set_var bard actions.inspire.body "if is_hostile(self, target):\n    fail('Inspire needs an ally.')\nif target == self:\n    fail('The bard cannot inspire itself.')\nif entity_distance(self, target) > 2:\n    fail('Out of range: inspire reaches 2 tiles.')\ngrant_turn(target)"
+!eval "match_var_set('seen', [])"
+!gpassive add log on_turn_start "match_var_set('seen', match_var_get('seen') + [[self, extra_turn]])"
+!turn next
+?? It is now **Bard**'s turn
+!action bard inspire orc
+?? Inspire needs an ally.
+!action bard inspire archer
+?? Out of range: inspire reaches 2 tiles.
+!action bard inspire bard
+?? The bard cannot inspire itself.
+!assert "extra_turn_queue() == [] and entity_distance('bard', 'archer') == 3"
+!assert "entity_distance('bard', 'knight') == 2"
+!action bard inspire knight
+?? `bard` used action `inspire`.
+!turn forecast 3
+?? 1. `knight` **Knight** (extra)
+?? 2. `archer` **Archer**
+!turn next
+?? It is now **Knight**'s extra turn (id `knight`).
+!turn next
+?? It is now **Archer**'s turn
+!turn next
+?? It is now **Knight**'s turn
+!assert "match_var_get('seen') == [['bard', False], ['knight', True], ['archer', False], ['knight', False]]"
+HARNESS-ALLOWS-ERRORS
+
+Expected: the Bard's `inspire` action checks the target in its own body
+and grants through grant_turn(target). An orc (another team), the far
+archer (3 tiles) and the bard itself are refused by fail(), and the
+queue stays empty. The knight is a 2x2 body anchored at (2,2): its
+anchor is 3 tiles from the bard at (5,5), but its nearest cell (3,3) is
+2, and entity_distance measures to the nearest cell, so the knight is
+in range. Its extra turn is forecast right after the Bard's turn; it
+runs after the Bard's turn, then the round goes on: the Archer, then
+the Knight's own regular turn (the extra one didn't use it up). The
+turn-start log records each turn with the extra_turn binding.
