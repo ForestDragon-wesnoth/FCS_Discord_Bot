@@ -81,8 +81,10 @@ targeting formula needed the same accumulator loop).
 Private vars, private templates, fog, POV filters and formula-text hiding
 exist to preserve an element of mystery for the PLAYERS (user call). They
 need not be airtight, and they need not cover hosts: a server that lets
-someone host already trusts them, so hosts (and the `gm` / `templates`
-roles) read nearly everything. The one host-facing layer is a creator-level
+someone host already trusts them, so hosts (and the `gm`, `templates`,
+`prefabs` and `files` roles, which an administrator grants: a prefab of
+a fogged region, an export or a replay of a fogged match read whole,
+user call V18) read nearly everything. The one host-facing layer is a creator-level
 private template (§7.17), a GM's work in progress, which the user asked
 for. A host's read is refused or trimmed only where PLAYERS would see the
 reply (a team-view channel). When an audit finding is "a player can reach
@@ -1352,7 +1354,39 @@ hardcodes**.
   a teamless unit, user call, 960). A write to the tiebreak var and a changed
   `turnorder_*` rule (`apply_system_rules`) re-sort it like an initiative
   write (770). Before the first `!turn next` the pointer sits at
-  the top of the order.
+  the top of the order, and every change re-sorts at once (no round to
+  defer).
+- **One turn a round** (user call, T3; 1037-1041):
+  `turnorder_change_policy` is `deferred` (default: a value change
+  waits for the round wrap), `once_per_round` (re-sort at once) or
+  `immediate` (re-sort at once with no memory, so a unit crossing the
+  pointer gains or loses a turn). Under the first two
+  (`Match._turn_once_per_round`) `Match.round_acted` (serialized, undo
+  state, cleared at each wrap) lists the units that had their turn this
+  round (started one, were skipped, or got it from `!turn set` /
+  `quiet`): `_advance_index` goes to `_next_due_index` (the first unit
+  after the pointer that hasn't acted, else the first before it), wraps
+  only when everyone has, and `_skip_to_eligible` passes over an acted
+  unit the pointer lands on. A future feature granting another turn
+  this round (extra turns, on the feature list) takes the unit out of
+  `round_acted` or goes through `set_turn`, which gives the turn
+  whatever the memory says.
+- **Joining and leaving mid-round** (user call, 1038-1041): under
+  `deferred` a structural rebuild mid-round (`_rebuild_turn_order`
+  without `full`: spawn, revive, death, removal, transform) only drops
+  the gone and places the new, keeping the rest of the round's order;
+  the wrap re-sorts with `full=True`. `turnorder_join_position` places a
+  joiner (`Match._place_joiners`, also after a `once_per_round`
+  re-sort): `after_current` (default) after the turn's slot, before the
+  first unit still to act that the full sort puts after it (so it acts
+  this round, by initiative among those left); `by_initiative` before
+  the first unit the full sort puts after it, counted as acted when that
+  is behind the slot. The slot is the acting unit's; after the acting
+  unit's removal (`turn_vacated` same) the slot's new holder, which a
+  joiner can take; with `wrap`, the end. An order left out of its sorted
+  form sets `_turn_order_dirty`, saved with the match
+  (`turn_order_dirty`), so the wrap re-sorts it ("🔄 turn order
+  re-sorted at round end.") after a restart too.
 - **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
   unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
   schedules, the turn autosave); under ATB <id>'s bar resets as if it had
@@ -1760,6 +1794,11 @@ hardcodes**.
   puts back only the matches it reached (`logic.MATCHES_TOUCHED`:
   `MatchManager.get`, `copy_entity`, `require_target_host`) plus any
   deleted or replaced; every match goes back once at the end (X16).
+  The report reads the board as the caller may (V21, 1035): units and
+  corpses the query view hides are left out (a run ending with a unit out
+  of sight shows only that), vars through the reader (private ones out,
+  a disguise's decoys), and `until=` / `tally=` run in the reader's
+  `private_view`.
 - **`!again`** reruns the caller's last top-level command in the channel
   (runtime-only `mgr._last_commands`; never records `again` / `as` / clicks;
   refused inside dispatch_no_snapshot; always player-available) (639, 646).
@@ -2507,7 +2546,9 @@ hardcodes**.
   template's, a zone's field (`!zone legend`), a disguise's key, a
   corpse's snapshot var: `false` leaves it out, a text replaces the label;
   `Match.legend_label_*`, shared by both renderers; a disguised unit's
-  label comes only from the disguise; both legends are built from what
+  label comes only from the disguise; a `legend` var the reader may not
+  read labels nothing, the name stands in (L50; Discord boards render as
+  their channel's team, `_apply_board`); both legends are built from what
   the view actually draws, so nothing hidden, fogged or invisible to the
   POV is ever listed) (781), coordinate rulers
   (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
@@ -2758,6 +2799,10 @@ hardcodes**.
   the history to a mark taken before it (`MatchHistory.mark` / `rewind`):
   autosaves of turns that never happened go, autosaves pruned meanwhile
   come back (816). `!alias`, `!table` and `!turn set` are undo steps.
+  A command undo's reply names the command by its round where the
+  board's history is withheld from the channel (L49); `!history import`
+  never replaces a save under a name it picked (`<name>-2`), and one
+  named with `as` says it replaced the old one (1036).
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -2914,7 +2959,12 @@ hardcodes**.
   `templates` / `gm` holder outside a team view); creator level (user
   call, 1034), only its saver and administrators, outside a team view
   (other hosts and the `templates` / `gm` roles don't, and their edits
-  and restores answer as for a missing template). To anyone else it
+  and restores answer as for a missing template). What those others may
+  do with one by name is the rule `creator_template_use` (user call,
+  V20; `_usable_template`, the reference check in `_store_template`):
+  `none` (default), spawn / give / copy / a new reference answer as for
+  a missing template; `use`, they spawn, give and reference it without
+  reading it, and a copy is refused. To anyone else it
   reads as missing in list / show / diff / tags / trash, template_names /
   has_template / template_data and Tab (`_readable_template`,
   `completion._readable_template_names`), and in the edits and restore
@@ -2930,6 +2980,12 @@ hardcodes**.
   empty, pins unread, with a fresh partial cache; around list / show /
   diff / tags and `template_data`) (V19, 1030). A JSON import over a
   private template keeps its level unless the JSON says `"private"`.
+  The hidden set and the reader's library view are built once per
+  command and viewer, in the command's partial cache, which every
+  library write clears (X23: a scan per partial resolution made a
+  player's `!template list` quadratic, 13 s at 4,000 templates). Writing
+  onto the name of a template the caller can't read (import, copy, save,
+  rename) answers "The name is taken" (V20).
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
@@ -3490,15 +3546,6 @@ Design questions the user wants raised when no other task is in flight
 options and a recommendation, when a task has just finished and the user
 hasn't named the next.
 
-- **T3, initiative changes mid-round** (pass 43): under
-  `turnorder_change_policy: immediate` the order re-sorts at once and the
-  pointer follows the acting unit, so a unit crossing the pointer gains or
-  loses a turn that round. Measured: A 10 / B 5 / C 1, A acts, B acts, A's
-  initiative drops to 0 -> round 1 runs A, B, C, A (A twice); A acts and
-  C's rises to 20 -> round 1 runs A, B and C waits for round 2. Options:
-  remember who has acted this round (each unit exactly one turn a round,
-  a saved set undo restores; recommended), keep it as the documented
-  meaning of `immediate`, or make `deferred` the default.
 - **Live vs materialized definition fields** (user, at #136: "for now
   live, but later we should discuss what is live and materialized"): a
   zone reads its definition's hooks, look fields, tags and grants live,
