@@ -1420,7 +1420,7 @@ hardcodes**.
   (`_reshuffles_each_round`), after `round_number` goes up, so ties use
   the new round's seed (before, a round kept the last order until
   something changed it).
-- **Extra turns** (#224, user design, 1046-1050): `!turn grant <id>
+- **Extra turns** (#224, user design, 1046-1051): `!turn grant <id>
   [n] | list | clear [id]` (an undo step, `_SNAPSHOT_SUBS`) and the
   formulas `grant_turn(eid, n=1)` / `clear_extra_turns(eid=None)`
   (mutating) queue turns in `Match.extra_turns` (saved, undo state; at
@@ -1449,7 +1449,10 @@ hardcodes**.
   HOOK_CONTEXT_NAMES entry defaulting to whether an extra turn is under
   way). `extra_turn_skippable` (on): a skips_turn status costs the extra
   turn (on_turn_skipped, the extra-ticking statuses tick; the code
-  comment recommends `extra_turn_ticks` on stuns). A unit dead or gone
+  comment recommends `extra_turn_ticks` on stuns). A skip by a status
+  with a turn tick (`_has_turn_tick`) that didn't run there adds a ⚠️
+  naming it and how to make it tick, unless `extra_turn_skip_warning`
+  (on) is off. A unit dead or gone
   loses its queued turns; one dying or removed at or during its extra
   turn hands play back to the order. `!turn set` ends an extra turn
   under way and keeps the queue. The reply line is

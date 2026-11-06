@@ -5228,6 +5228,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "default: a schedule counts the unit's regular turns."
         ),
     },
+    "extra_turn_skip_warning": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a skipped extra turn (extra_turn_skippable) adds a ⚠️ "
+            "naming the skip statuses whose turn tick it didn't run: their "
+            "duration wasn't reduced, since a status ticks on extra turns "
+            "only with `extra_turn_ticks true` (or extra_turn_status_ticks "
+            "on). A status without a turn tick adds no warning. False = no "
+            "warning."
+        ),
+    },
     "extra_turn_skippable": {
         "default": True,
         "schema": {"type": "bool"},
@@ -18421,6 +18433,20 @@ class Match:
                 matched = ", ".join(sorted(skipping))
                 log.append(self.unit_line(
                     eid, f"⏭️ `{eid}`'s extra turn skipped ({matched})."))
+                stale = [n for n in sorted(skipping)
+                         if self._has_turn_tick(e, n)
+                         and not self._ticks_on_extra_turn(e.status.get(n), n)]
+                if stale and self.rules.get("extra_turn_skip_warning", True):
+                    names = ", ".join(f"`{n}`" for n in stale)
+                    log.append(self.unit_line(
+                        eid,
+                        f"⚠️ `{eid}`'s extra turn was skipped whole by "
+                        f"{names}, which doesn't tick on extra turns: its "
+                        f"duration wasn't reduced. Give the status "
+                        f"`extra_turn_ticks true` (`!status data {stale[0]} "
+                        f"extra_turn_ticks true`, for applications from "
+                        f"then on) or turn extra_turn_status_ticks on to "
+                        f"tick it; extra_turn_skip_warning off hides this."))
                 log.extend(self.fire_hook(
                     "on_turn_skipped", target_ids=[eid],
                     extras={"skip_status": matched}))
@@ -20814,6 +20840,21 @@ class Match:
                 finally:
                     STATUS_TICKING.reset(ticking)
         return log
+
+    def _has_turn_tick(self, e: "Entity", sname: str) -> bool:
+        """Whether status `sname` on `e` ticks on turns (turn_start /
+        turn_end): its definition's tick at its level, else the global
+        status_tick_formula at status_tick_when."""
+        turn_whens = ("turn_start", "turn_end")
+        if sname in self.status_definitions:
+            view = self.status_def_view(
+                sname, self.status_level(e.status.get(sname)))
+            body = view.get("tick")
+            return (isinstance(body, str) and bool(body.strip())
+                    and (view.get("tick_when") or "turn_end") in turn_whens)
+        src = self.rules.get("status_tick_formula", "")
+        return (isinstance(src, str) and bool(src.strip())
+                and self.rules.get("status_tick_when", "never") in turn_whens)
 
     def _ticks_on_extra_turn(self, inst: Any, sname: str) -> bool:
         """Whether status `sname` ticks during an extra turn: its
