@@ -4281,8 +4281,8 @@ leaves `turn_order` untouched for the rest of the round.
 alice). The rebuild happens automatically at the next round
 wrap — after `on_round_end` fires (which runs against the
 just-ended round's order), and before `on_round_start` fires
-(which sees the new order). A `🔄 deferred turn-order rebuild
-applied at round end.` log line confirms the flush. The
+(which sees the new order). A `🔄 turn order re-sorted at
+round end.` log line confirms the flush. The
 final `!list` shows alice(999), bob(20).
 
 
@@ -36014,8 +36014,8 @@ to 20 during A's turn: the order becomes C, A, B, and C, now behind
 the acting unit, still takes its turn before round 1 ends (A, B, C);
 round 2 opens with C.
 
-SCENARIO 1038 — One turn a round: units joining mid-round, skipped turns, the deferred default and a spawn's rebuild
-------------------------------------------------------------------------------------------------------------------
+SCENARIO 1038 — One turn a round: units joining mid-round act after the acting unit by initiative, skipped turns, the deferred default
+-------------------------------------------------------------------------------------------------------------------------------------------
 !match new jn Join 10 10
 !match use jn
 !ent add a A 10 1 1 10
@@ -36038,6 +36038,8 @@ SCENARIO 1038 — One turn a round: units joining mid-round, skipped turns, the 
 !ent set_vars late starts=0
 !ent set_vars slow starts=0
 !turn next
+?? It is now **Late**'s turn
+!turn next
 ?? It is now **Big**'s turn
 !turn next
 ?? It is now **Slow**'s turn
@@ -36046,19 +36048,27 @@ SCENARIO 1038 — One turn a round: units joining mid-round, skipped turns, the 
 !status apply c stun
 !turn next
 ?? `c`'s turn skipped (stun)
+?? 🔄 turn order re-sorted at round end.
 ?? Round 2
 ?? It is now **Late**'s turn
-!assert "entity[a].starts == 1 and entity[b].starts == 1 and entity[big].starts == 1 and entity[c].starts == 0 and entity[late].starts == 1"
+!assert "entity[a].starts == 1 and entity[b].starts == 1 and entity[big].starts == 1 and entity[c].starts == 0 and entity[slow].starts == 1 and entity[late].starts == 2"
+!turn next
+?? It is now **B**'s turn
+!turn next
+!turn next
+?? It is now **Slow**'s turn
 
 Expected: the default policy is `deferred`, which also gives each unit
 one turn a round. During B's turn A drops to 0 (deferred, with the ⏳
-warning). Two units join: Late (initiative 20) and Slow (2). A spawn
-rebuilds the order at once, which also applies A's stashed 0: the order
-becomes Late, B, Big, Slow, C, A. A has acted, so it gets no second
-turn; Late joined behind the acting unit, so it waits for round 2; Slow
-joined ahead of it and acts this round. The 2x2 Big acts once. C's turn
-is skipped by its stun, which counts as its turn, and round 2 opens with
-Late.
+warning). Two units join: Late (initiative 20) and Slow (2). Under the
+default turnorder_join_position `after_current` the rest of this round's
+order stays (A's 0 waits for the round end) and each joiner goes after
+the acting unit, placed by initiative among the units still to act
+(Big 3, C 1): Late, higher than both, right after B; Slow between Big
+and C. Round 1 runs A, B, Late, Big, Slow, C (C's turn skipped by its
+stun, which counts as its turn). The round end re-sorts (🔄 line): round
+2 runs Late, B, Big, Slow, C, A, so A's 0 applies and Late, which acted
+in both rounds, has 2 starts. The 2x2 Big acts once a round.
 
 SCENARIO 1039 — turnorder_change_policy immediate keeps the plain re-sort; the round's memory survives undo and restart
 ---------------------------------------------------------------------------------------------------------------------
@@ -36105,3 +36115,93 @@ counts as having acted, so C follows B. `!undo command` takes back the
 initiative change and the turn advance after it, memory included (A and
 B have acted): the next turn is C's again, and round 2 opens with A,
 whose initiative is 10 again.
+
+SCENARIO 1040 — Joining mid-round: after a removed actor, a revived 2x2 body, a pending re-sort kept across a restart
+-----------------------------------------------------------------------------------------------------------------------
+!match new jd Joins 12 12
+!match use jd
+!ent add a A 10 1 1 10
+!ent add b B 10 3 1 5
+!ent add big Big 10 5 5 3
+!ent set_vars big footprint_w=2 footprint_h=2
+!ent add c C 10 8 1 1
+!turn next
+!ent kill big
+!turn next
+?? It is now **B**'s turn
+!ent revive big
+!turn next
+?? It is now **Big**'s turn
+!ent remove big
+!ent add x X 10 1 9 8
+!turn next
+?? It is now **X**'s turn
+!ent init a 0
+?? deferred
+!as restart
+!match use jd
+!turn next
+?? It is now **C**'s turn
+!turn next
+?? 🔄 turn order re-sorted at round end.
+?? Round 2
+?? It is now **X**'s turn
+!turn next
+?? It is now **B**'s turn
+
+Expected: the 2x2 Big (initiative 3) dies during A's turn and is revived
+during B's: it rejoins after the acting unit, ahead of C (1), and acts
+this round. Removed during its own turn, Big leaves the turn's slot to
+C; X (8) joins then, outranks C, so it takes the slot and the next turn
+is X's. A's initiative drops to 0 during X's turn (deferred); the
+pending re-sort is saved with the match (`turn_order_dirty`), so after a
+restart round 2 still opens re-sorted: X, B, C, A.
+
+SCENARIO 1041 — turnorder_join_position by_initiative, and after_current under once_per_round
+-------------------------------------------------------------------------------------------
+!system set default turnorder_join_position by_initiative
+!match new bi ByInit 10 10
+!match use bi
+!ent add a A 10 1 1 10
+!ent add b B 10 3 1 5
+!ent add c C 10 5 1 1
+!turn next
+!turn next
+?? It is now **B**'s turn
+!ent add late Late 10 1 8 20
+!ent add slow Slow 10 2 8 2
+!turn next
+?? It is now **Slow**'s turn
+!turn next
+?? It is now **C**'s turn
+!turn next
+?! re-sorted
+?? Round 2
+?? It is now **Late**'s turn
+!system set default turnorder_join_position after_current
+!system set default turnorder_change_policy once_per_round
+!match new op Once 10 10
+!match use op
+!ent add a A 10 1 1 10
+!ent add b B 10 3 1 5
+!ent add c C 10 5 1 1
+!turn next
+!turn next
+?? It is now **B**'s turn
+!ent add late Late 10 1 8 20
+!turn next
+?? It is now **Late**'s turn
+!turn next
+?? It is now **C**'s turn
+!turn next
+?? 🔄 turn order re-sorted at round end.
+?? Round 2
+?? It is now **Late**'s turn
+
+Expected: under `by_initiative` (policy deferred) a joiner takes its
+initiative's place: Late (20) lands ahead of A, behind the acting unit
+B, and waits for round 2; Slow (2) lands between B and C and acts this
+round. The order is then already sorted, so the round end has nothing
+to re-sort. Under `once_per_round` with `after_current` the order is
+re-sorted at once, but Late, sorted behind the acting unit, is placed
+right after it and acts next; the round end puts it back first.

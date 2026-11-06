@@ -17731,7 +17731,7 @@ _DIFF_SKIP_KEYS = frozenset({
     "round_number", "active_index", "turn_order", "rules", "entities",
     "global_passives", "groups", "maps", "map_order", "vars", "team_data",
     "outcome", "event_log", "turns_elapsed", "turn_vacated", "round_started",
-    "rng_seed", "rng_pos",
+    "rng_seed", "rng_pos", "round_acted", "turn_order_dirty",
 })
 
 

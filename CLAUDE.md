@@ -1356,7 +1356,7 @@ hardcodes**.
   write (770). Before the first `!turn next` the pointer sits at
   the top of the order, and every change re-sorts at once (no round to
   defer).
-- **One turn a round** (user call, T3; 1037-1039):
+- **One turn a round** (user call, T3; 1037-1041):
   `turnorder_change_policy` is `deferred` (default: a value change
   waits for the round wrap), `once_per_round` (re-sort at once) or
   `immediate` (re-sort at once with no memory, so a unit crossing the
@@ -1367,13 +1367,26 @@ hardcodes**.
   `quiet`): `_advance_index` goes to `_next_due_index` (the first unit
   after the pointer that hasn't acted, else the first before it), wraps
   only when everyone has, and `_skip_to_eligible` passes over an acted
-  unit the pointer lands on. A unit joining mid-round behind the pointer
-  is added to it at the rebuild (it waits a round); one ahead acts. A
-  structural rebuild under `deferred` also applies stashed value
-  changes, and the memory keeps that from giving a second turn. A
-  future feature granting another turn this round (extra turns, on the
-  feature list) takes the unit out of `round_acted` or goes through
-  `set_turn`, which gives the turn whatever the memory says.
+  unit the pointer lands on. A future feature granting another turn
+  this round (extra turns, on the feature list) takes the unit out of
+  `round_acted` or goes through `set_turn`, which gives the turn
+  whatever the memory says.
+- **Joining and leaving mid-round** (user call, 1038-1041): under
+  `deferred` a structural rebuild mid-round (`_rebuild_turn_order`
+  without `full`: spawn, revive, death, removal, transform) only drops
+  the gone and places the new, keeping the rest of the round's order;
+  the wrap re-sorts with `full=True`. `turnorder_join_position` places a
+  joiner (`Match._place_joiners`, also after a `once_per_round`
+  re-sort): `after_current` (default) after the turn's slot, before the
+  first unit still to act that the full sort puts after it (so it acts
+  this round, by initiative among those left); `by_initiative` before
+  the first unit the full sort puts after it, counted as acted when that
+  is behind the slot. The slot is the acting unit's; after the acting
+  unit's removal (`turn_vacated` same) the slot's new holder, which a
+  joiner can take; with `wrap`, the end. An order left out of its sorted
+  form sets `_turn_order_dirty`, saved with the match
+  (`turn_order_dirty`), so the wrap re-sorts it ("🔄 turn order
+  re-sorted at round end.") after a restart too.
 - **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
   unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
   schedules, the turn autosave); under ATB <id>'s bar resets as if it had
