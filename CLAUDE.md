@@ -2115,7 +2115,8 @@ hardcodes**.
   geometric; a diagonal step between two void corners is allowed (user
   call: corners never block a step). Commands: `!map void list | add |
   remove <x> <y> | rect | line | remove all [confirm]` (`list` is a
-  player read, refused to a team view under void_under_fog fog), `!map
+  player read, refused to a team view under void_under_fog fog, where
+  `!map cell` answers an unseen void as any unseen cell), `!map
   shape <map> <mask> [confirm]`, `!map new <name> shape=<mask>`; a mask
   is one character per cell, a space a void (`_parse_shape_mask`: rows on
   lines or `/`-separated, a ``` fence dropped), kept as typed by

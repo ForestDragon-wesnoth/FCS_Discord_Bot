@@ -14564,13 +14564,19 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
         if "=" not in a:
             raise VTTError(f"Unexpected `{a}`. Usage: `!map cell <x> <y> "
                            f"[for=<eid>]`.")
+    pov = _view_pov(ctx, m, args[3:])
     if not mp.in_bounds(x, y):
         if mp.in_rect(x, y):
+            if (m.rules.get("void_under_fog", "show") == "fog"
+                    and m.fog_on(mp)
+                    and not m._fog_terrain_visible(pov, x, y, mp)):
+                # A void fog covers reads as any unseen cell.
+                return (_as_note(args[3:]) + f"📍 **Cell ({x}, {y})**"
+                        f"{_on_map(m, mp)} — unseen (fog).")
             raise VTTError(f"({x}, {y}) is a void cell of the "
                            f"map{_on_map(m, mp).replace(' on ', ' ')}.")
         raise VTTError(f"({x}, {y}) is off the {mp.grid_width}×{mp.grid_height} "
                        f"map{_on_map(m, mp).replace(' on ', ' ')}.")
-    pov = _view_pov(ctx, m, args[3:])
     mover = None
     move: Dict[str, Any] = {"move_dir": None, "from_x": None, "from_y": None}
     for a in args[3:]:

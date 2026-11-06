@@ -37080,6 +37080,10 @@ SCENARIO 1055 — Void rendering: void_glyph in ASCII; void_under_fog show (a vo
 !as player bob
 !map void list
 ?? hidden under fog
+!map cell 3 2
+?? Cell (3, 2)** — unseen (fog).
+!map cell 4 2
+?? Cell (4, 2)** — unseen (fog).
 !as host
 !system set default void_under_fog show
 !as player bob
@@ -37102,8 +37106,9 @@ void_under_fog show (default) the void still shows as `#` though it is
 out of sight, while unseen cells show fog; the scene lists it. With
 void_under_fog fog it reads as fog like any unseen cell, and the scene
 no longer lists it, so the shape stays secret; a player in red's channel
-is refused `!map void list` then, and reads it again once the rule is
-back to show. The scene names the void sprite. After a restart the void
+is refused `!map void list` then, and `!map cell` answers the unseen
+void (3,2) as it answers the unseen cell (4,2); the player reads the
+list again once the rule is back to show. The scene names the void sprite. After a restart the void
 is still there (saved with the map).
 
 SCENARIO 1056 — Voids in prefabs: a saved room keeps its shape; `!prefab show` and `!map new from=` (turned) take it; an overlay stamp keeps the map's shape and refuses a unit landing on a void; a replace stamp carves the prefab's shape; imports with content on a void or no cell left are refused
