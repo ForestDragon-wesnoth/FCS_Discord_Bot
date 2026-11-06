@@ -33,7 +33,8 @@ from sprite_render import (
 
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
-from vtt_commands import registry, _view_pov, split_command_line, quote_unclosed
+from vtt_commands import (registry, _view_pov, split_command_line,
+                          quote_unclosed, shape_command)
 from completion import apply_completion, format_candidates
 
 
@@ -612,6 +613,12 @@ class GuiApp:
         lines: List[str] = []
         for raw in block.splitlines():
             ln = raw.strip()
+            if (lines and not ln.startswith("!")
+                    and shape_command(lines[-1].split("\n", 1)[0])):
+                # A shape mask's rows keep their indentation (a space is a
+                # void cell), blank rows too.
+                lines[-1] += "\n" + raw.rstrip()
+                continue
             if not ln:
                 continue        # a blank line (in pasted JSON too) is nothing
             if (lines and not ln.startswith("!")

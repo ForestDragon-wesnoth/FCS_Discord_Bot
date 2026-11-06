@@ -238,7 +238,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
                       "legend", "autoupdate", "background", "border", "mode",
                       "coords", "new", "delete", "rename", "copy", "use",
-                      "var", "unseen", "attach", "detach"}),
+                      "var", "unseen", "attach", "detach", "void", "shape"}),
     "list": frozenset({"full"}),
     # `!log` reads for anyone, but `clear` wipes the match's event log.
     "log": frozenset({"clear"}),
@@ -248,7 +248,8 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
 # `!map teamcolor list` only SHOW settings, so they stay open while the
 # setting-changing forms of the same subcommand are host-gated.
 _ELEVATED_READ_FORMS = frozenset({("map", "layer", "list"),
-                                  ("map", "teamcolor", "list")})
+                                  ("map", "teamcolor", "list"),
+                                  ("map", "void", "list")})
 # Elevated subcommands whose BARE form only reports (`!map use` names the
 # channel's map). Map vars are the GM's data, so `!map var` stays host-gated
 # like `!match var` (user call).
@@ -1637,14 +1638,17 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
         handled.add(post_m.id)
 
 
-def _grid_box(mp: "Map", x1: int, y1: int, x2: int, y2: int) -> set:
-    """The on-grid cells of map `mp` in the rectangle between two corners.
-    Clipped while it is built, so a typo'd radius (`!reveal_fog red at 1 1
-    1000000`) costs at most the grid instead of trillions of off-grid
-    cells."""
+def _grid_box(mp: "Map", x1: int, y1: int, x2: int, y2: int,
+              keep_voids: bool = False) -> set:
+    """The on-grid cells of map `mp` in the rectangle between two corners,
+    void cells left out unless `keep_voids` (a reveal covers them, so fog
+    over voids lifts with it, void_under_fog). Clipped while it is built,
+    so a typo'd radius (`!reveal_fog red at 1 1 1000000`) costs at most
+    the grid instead of trillions of off-grid cells."""
     lx, hx = max(1, min(x1, x2)), min(mp.grid_width, max(x1, x2))
     ly, hy = max(1, min(y1, y2)), min(mp.grid_height, max(y1, y2))
-    return {(x, y) for x in range(lx, hx + 1) for y in range(ly, hy + 1)}
+    return {(x, y) for x in range(lx, hx + 1) for y in range(ly, hy + 1)
+            if keep_voids or (x, y) not in mp.voids}
 
 
 # Entity vars the engine reads as one of a fixed set of words, mapped to the
@@ -6287,6 +6291,15 @@ _RAW_JSON_TAIL = re.compile(r"^\s*(import)\s+(\S+)\s+(.+?)\s*$",
                             re.IGNORECASE | re.DOTALL)
 
 
+# `!map shape <map> <mask> [confirm]` and `!map new <name> shape=<mask>`
+# keep the mask as typed: its spaces are void cells.
+_RAW_SHAPE_TAIL = re.compile(
+    r"^\s*shape[ \t]+(\S+)[ \t]*(.*?\S.*?)(?:[ \t]+(confirm))?[ \t]*$",
+    re.IGNORECASE | re.DOTALL)
+_RAW_NEW_SHAPE_TAIL = re.compile(r"^\s*new[ \t]+(\S+)[ \t]+shape=(.*)$",
+                                 re.IGNORECASE | re.DOTALL)
+
+
 def _split_semicolons(text: str) -> List[str]:
     """`text` cut at every `;` standing as a word of its own outside quotes
     (the separator `!batch` / `!foreach` use), as raw text pieces."""
@@ -6342,6 +6355,16 @@ def split_command_args(root: str, tail: str) -> List[str]:
             if piece:
                 out += split_command_line(piece.lstrip("!"))
         return out
+    if low == "map":
+        # A shape mask: spaces are void cells, so the rest of the line is
+        # kept as typed (rows on lines, a ``` fence; _parse_shape_mask).
+        m = _RAW_SHAPE_TAIL.match(tail)
+        if m:
+            return ["shape", m.group(1), m.group(2)] + (
+                ["confirm"] if m.group(3) else [])
+        m = _RAW_NEW_SHAPE_TAIL.match(tail)
+        if m:
+            return ["new", m.group(1), "shape=" + m.group(2)]
     if low in ("template", "prefab"):
         m = _RAW_JSON_TAIL.match(tail)
         if m:
@@ -6378,10 +6401,26 @@ def quote_unclosed(line: str) -> bool:
     return False
 
 
+_SHAPE_HEAD = re.compile(r"!?\s*map\s+(?:shape\s+\S+|new\s+\S+\s+shape=)(.*)\Z",
+                         re.I | re.S)
+
+
+def shape_command(line: str) -> bool:
+    """Whether `line` is a `!map shape` / `!map new ... shape=` command,
+    whose mask continues on the lines after it that don't start a command
+    (indentation kept: a space is a void cell)."""
+    return bool(_SHAPE_HEAD.match(line.lstrip()))
+
+
 def import_unfinished(line: str) -> bool:
     """Whether `line` is a `template import` whose JSON is still open (a `{`
     / `[` not yet closed outside strings, or a ``` fence not yet closed):
-    its pasted JSON continues on the next lines (the CLI, `!run` files)."""
+    its pasted JSON continues on the next lines (the CLI, `!run` files).
+    A shape mask (`!map shape`) whose ``` fence is still open continues
+    the same way."""
+    sm = _SHAPE_HEAD.match(line.lstrip())
+    if sm:
+        return sm.group(1).count("```") % 2 == 1
     m = _IMPORT_HEAD.match(line.strip())
     if not m:
         return False
@@ -8276,7 +8315,7 @@ def _prefab_scratch(mgr: MatchManager, ctx: ReplyContext, name: str,
     token = STORED_TAGS.set(None)     # a throwaway: nothing is stored
     try:
         res = stamp_prefab(mgr, sc, name, shown, 1, 1, sc.get_map(),
-                           mode="overlay")
+                           mode="overlay", carve=True)
     finally:
         STORED_TAGS.reset(token)
     return sc, res
@@ -12999,7 +13038,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 )
             if not cmap.in_bounds(x, y):
                 return await ctx.send(
-                    f"❌ ({x},{y}) outside {cmap.grid_width}x{cmap.grid_height}"
+                    f"❌ ({x},{y}) {cmap.off_text(x, y)}"
                     f"{_on_map(m, cmap)}."
                 )
             if (x, y) in seen_cells or (not src_stackable
@@ -14525,10 +14564,19 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
         if "=" not in a:
             raise VTTError(f"Unexpected `{a}`. Usage: `!map cell <x> <y> "
                            f"[for=<eid>]`.")
+    pov = _view_pov(ctx, m, args[3:])
     if not mp.in_bounds(x, y):
+        if mp.in_rect(x, y):
+            if (m.rules.get("void_under_fog", "show") == "fog"
+                    and m.fog_on(mp)
+                    and not m._fog_terrain_visible(pov, x, y, mp)):
+                # A void fog covers reads as any unseen cell.
+                return (_as_note(args[3:]) + f"📍 **Cell ({x}, {y})**"
+                        f"{_on_map(m, mp)} — unseen (fog).")
+            raise VTTError(f"({x}, {y}) is a void cell of the "
+                           f"map{_on_map(m, mp).replace(' on ', ' ')}.")
         raise VTTError(f"({x}, {y}) is off the {mp.grid_width}×{mp.grid_height} "
                        f"map{_on_map(m, mp).replace(' on ', ' ')}.")
-    pov = _view_pov(ctx, m, args[3:])
     mover = None
     move: Dict[str, Any] = {"move_dir": None, "from_x": None, "from_y": None}
     for a in args[3:]:
@@ -14721,7 +14769,7 @@ def _preview_cells(ctx, m, toks: List[str],
     limit = int(m.rules.get("formula_cell_limit", 100000))
     # Clipped to the map while building, like the formula functions, so
     # the cost follows the map, not the numbers typed.
-    bounds = (mp.grid_width, mp.grid_height)
+    bounds = (mp.grid_width, mp.grid_height, mp.voids)
     shape = toks[0].lower()
 
     def done(i: int, maxn: int) -> None:
@@ -14938,6 +14986,178 @@ def _color_guide() -> str:
     )
 
 
+_VOID_USAGE = ("!map void <list | <add|remove> <x> <y> | <add|remove> "
+               "<rect|line> <x1> <y1> <x2> <y2> | remove all> [confirm] "
+               "[map=<map>]")
+
+
+def _parse_shape_mask(raw: str) -> List[str]:
+    """The rows of a `!map shape` / `!map new ... shape=` mask: one
+    character per cell, a space for a void, any other character a cell.
+    Rows are lines (a ``` fence and its language word dropped, leading and
+    trailing blank lines too), or, on a single line, separated by `/`."""
+    text = raw.replace("\r", "")
+    st = text.strip()
+    if st.startswith("```"):
+        body = text[text.index("```") + 3:]
+        nl = body.find("\n")
+        body = body[nl + 1:] if nl >= 0 else ""
+        end = body.rfind("```")
+        text = body[:end] if end >= 0 else body
+    elif len(st) >= 2 and st[0] == st[-1] and st[0] in "'\"":
+        text = st[1:-1]
+    if "\t" in text:
+        raise VTTError("A shape mask can't hold tabs: use spaces for void "
+                       "cells.")
+    rows = text.split("\n") if "\n" in text else text.split("/")
+    rows = [r.rstrip() for r in rows]
+    while rows and not rows[0].strip():
+        rows.pop(0)
+    while rows and not rows[-1].strip():
+        rows.pop()
+    if not rows:
+        raise VTTError("The shape mask is empty: give one character per "
+                       "cell (a space for a void), rows on their own lines "
+                       "or separated by `/`.")
+    return rows
+
+
+def _mask_voids(rows: List[str], w: int, h: int) -> Set[Tuple[int, int]]:
+    """The void cells of a w x h map shaped by mask `rows` laid at (1, 1):
+    spaces, and every cell past a short row or below the last row."""
+    out = set()
+    for y in range(1, h + 1):
+        row = rows[y - 1] if y <= len(rows) else ""
+        for x in range(1, w + 1):
+            if x > len(row) or row[x - 1] == " ":
+                out.add((x, y))
+    return out
+
+
+def _shape_text(mp: "Map") -> str:
+    """Map `mp`'s shape as a mask (`.` a cell, a space a void) in a code
+    block, or as void row runs when the map is too big to draw."""
+    if mp.grid_width * mp.grid_height > 4000 or mp.grid_width > 120:
+        from logic import _cells_to_runs
+        runs = _cells_to_runs(mp.voids)
+        shown = ", ".join(f"y{r[0]}: {r[1]}-{r[2]}" if r[1] != r[2]
+                          else f"({r[1]},{r[0]})" for r in runs[:60])
+        more = f" ... ({len(runs) - 60} more runs)" if len(runs) > 60 else ""
+        return f"Void cells by row: {shown}{more}"
+    rows = []
+    for y in range(1, mp.grid_height + 1):
+        rows.append("".join(" " if (x, y) in mp.voids else "."
+                            for x in range(1, mp.grid_width + 1)).rstrip())
+    return "```\n" + "\n".join(rows) + "\n```"
+
+
+def _void_summary(m: "Match", mp: "Map", res: Dict[str, Any]) -> List[str]:
+    lines = []
+    if res["killed"]:
+        lines.append("Killed " + ", ".join(f"`{i}`" for i in res["killed"])
+                     + " (map_void_occupied_mode kill).")
+    if res["dropped_tiles"]:
+        lines.append(f"Dropped the tile data of {res['dropped_tiles']} "
+                     f"cell(s).")
+    if res["dropped_corpses"]:
+        lines.append("Dropped the corpses of " + ", ".join(
+            f"`{c}`" for c in res["dropped_corpses"]) + ".")
+    if res["clipped_zone_cells"]:
+        lines.append(f"Cut {res['clipped_zone_cells']} zone cell(s).")
+    return lines
+
+
+async def _map_void(ctx: ReplyContext, m: "Match", args: List[str],
+                    mp: "Map"):
+    """`!map void list | add | remove ...`: the map's void cells."""
+    words = list(args[1:])
+    confirm = bool(words) and words[-1].lower() == "confirm"
+    if confirm:
+        words = words[:-1]
+    op = words[0].lower() if words else "list"
+    if op == "list":
+        if len(words) > 1 or confirm:
+            raise VTTError(f"Usage: `{_VOID_USAGE}`.")
+        if (m.rules.get("void_under_fog", "show") == "fog"
+                and _query_pov(ctx, m) is not None
+                and not _acts_as_host(ctx, m)):
+            raise VTTError("The map's shape is hidden under fog here "
+                           "(void_under_fog fog).")
+        return await ctx.send(
+            f"Map `{mp.name}` ({mp.size_text()}): {len(mp.voids)} void "
+            f"cell(s), {mp.cell_count()} cell(s).\n" + _shape_text(mp))
+    if op not in ("add", "remove"):
+        raise VTTError(f"Usage: `{_VOID_USAGE}`.")
+    rest = words[1:]
+    if op == "remove" and [r.lower() for r in rest] == ["all"]:
+        cells: Set[Tuple[int, int]] = set(mp.voids)
+        what = "every void"
+    else:
+        kind = "cell"
+        if rest and rest[0].lower() in ("rect", "line"):
+            kind, rest = rest[0].lower(), rest[1:]
+        want = 2 if kind == "cell" else 4
+        if len(rest) != want:
+            raise VTTError(f"Usage: `{_VOID_USAGE}`.")
+        try:
+            nums = [int(r) for r in rest]
+        except ValueError:
+            raise VTTError("Coordinates must be whole numbers.")
+        if kind == "cell":
+            x, y = nums
+            if not mp.in_rect(x, y):
+                raise OutOfBounds(f"({x},{y}) outside {mp.size_text()}")
+            cells = {(x, y)}
+            what = f"({x},{y})"
+        elif kind == "rect":
+            x1, y1, x2, y2 = nums
+            cells = _grid_box(mp, x1, y1, x2, y2, keep_voids=True)
+            what = f"rect ({x1},{y1})-({x2},{y2})"
+        else:
+            x1, y1, x2, y2 = nums
+            m._check_line_budget(x1, y1, x2, y2, "line")
+            from logic import line_cells
+            cells = set(line_cells(x1, y1, x2, y2,
+                                         (mp.grid_width, mp.grid_height)))
+            what = f"line ({x1},{y1})-({x2},{y2})"
+        if not cells:
+            raise VTTError(f"The {what} has no cell on the "
+                           f"{mp.size_text()} map.")
+    target = (mp.voids | cells) if op == "add" else (mp.voids - cells)
+    res, log = m.set_voids(mp, target, confirm=confirm)
+    n = res["added"] if op == "add" else res["removed"]
+    head = (f"{n} cell(s) of {what} made void" if op == "add"
+            else f"{n} void cell(s) of {what} made cells again")
+    return await ctx.send("\n".join(
+        [f"Map `{mp.name}`: {head} ({len(mp.voids)} void, "
+         f"{mp.cell_count()} cells)."] + _void_summary(m, mp, res) + log))
+
+
+async def _map_shape(ctx: ReplyContext, m: "Match", args: List[str]):
+    """`!map shape <map> <mask>`: give a map the shape a mask draws."""
+    usage = "!map shape <map> <mask ...>"
+    if len(args) < 3:
+        raise VTTError(f"Usage: `{usage}` (`!map void list` shows a "
+                       f"map's shape).")
+    if len(args) > 4 or (len(args) == 4 and args[3].lower() != "confirm"):
+        raise VTTError(f"Usage: `{usage} [confirm]`; a multi-line mask "
+                       f"goes in a ``` block.")
+    mp = m.get_map(args[1])
+    rows = _parse_shape_mask(args[2])
+    W, H = max(len(r) for r in rows), len(rows)
+    if W > mp.grid_width or H > mp.grid_height:
+        raise VTTError(f"The mask is {W}x{H}, larger than the "
+                       f"{mp.size_text()} map `{mp.name}`: `!map resize` it "
+                       f"first.")
+    res, log = m.set_voids(mp, _mask_voids(rows, mp.grid_width,
+                                           mp.grid_height),
+                           confirm=len(args) == 4)
+    return await ctx.send("\n".join(
+        [f"Map `{mp.name}` reshaped: {len(mp.voids)} void cell(s), "
+         f"{mp.cell_count()} cell(s) ({res['added']} made void, "
+         f"{res['removed']} made cells)."] + _void_summary(m, mp, res) + log))
+
+
 for _sub, _usage in (
         ("colors", "!map colors"),
         ("cell", "!map cell <x> <y> [for=<eid>] [dir=<dir>] [as=<team>] [map=<map>]"),
@@ -14960,7 +15180,8 @@ for _sub, _usage in (
         ("center", "!map center <eid | <x> <y>> [map=<map>]"),
         ("view", "!map view <reset | <x> <y>> [map=<map>]"),
         ("new", "!map new <new_map> <w> <h> | !map new <new_map> "
-                "from=<prefab> [rotate=<deg>] [flip=<h|v>] [team=<team>]"),
+                "from=<prefab> [rotate=<deg>] [flip=<h|v>] [team=<team>] | "
+                "!map new <new_map> shape=<mask ...>"),
         ("list", "!map list"),
         ("delete", "!map delete <map>"),
         ("rename", "!map rename <map> <new_map>"),
@@ -14968,7 +15189,9 @@ for _sub, _usage in (
         ("use", "!map use [<map> | clear]"),
         ("var", "!map var <set <path> <value> | get <path> | del <path> | list> [map=<map>]"),
         ("attach", "!map attach <map> <eid>"),
-        ("detach", "!map detach <map>")):
+        ("detach", "!map detach <map>"),
+        ("void", _VOID_USAGE),
+        ("shape", "!map shape <map> <mask ...>")):
     registry.annotate_sub("map", _sub, usage=_usage)
 # Nested maps: the help a host reads, with the composed boarding pattern.
 registry.annotate_sub(
@@ -14986,6 +15209,29 @@ registry.annotate_sub(
          "depth is the owner's map_nesting_depth limit.")
 registry.annotate_sub("map", "detach", usage="!map detach <map>",
                       desc="Make a carried map a map of its own again.")
+registry.annotate_sub(
+    "map", "void", usage=_VOID_USAGE,
+    desc="Void cells: cells of the map's rectangle that don't exist, so a "
+         "map can take any shape. Nothing stands, moves, lies or is placed "
+         "there, area and line searches leave them out, and they draw as "
+         "void_glyph / void_sprite. `list` draws the shape (`.` a cell, a "
+         "space a void; players read it unless void_under_fog hides voids). "
+         "`add` / `remove` a cell, a `rect` or a `line`; `remove all` "
+         "clears them. A unit on a cell turning void follows "
+         "map_void_occupied_mode (refuse, or kill); dropping tile data, "
+         "corpses or zone cells there, or a kill, needs `confirm`. Sight "
+         "crosses a void unless void_blocks_sight (or the map var of that "
+         "name) is on. Formulas: is_void, void_cells, void_add, "
+         "void_remove.")
+registry.annotate_sub(
+    "map", "shape", usage="!map shape <map> <mask ...>",
+    desc="Give a map the shape a mask draws, laid from its top-left cell: "
+         "one character per cell, a space for a void, any other character "
+         "a cell; cells past a short row or below the last row are void. "
+         "Rows go on their own lines (in a ``` block on Discord, so the "
+         "spaces stay) or, on one line, between `/`. Add `confirm` after "
+         "the mask when the reshape drops something (as `!map void add`). "
+         "`!map new <name> shape=<mask>` makes a map the mask's size.")
 # Every `!map` subcommand word is a reserved map name, so `!map <name>`
 # (render that map) can never shadow one.
 _unreserved = set(registry._help["map"]["subs"]) - MAP_RESERVED_NAMES
@@ -15023,7 +15269,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
         mp = m.add_map(args[1], w, h)
         try:
             res = stamp_prefab(mgr, m, name, pf, 1, 1, mp, mode="overlay",
-                               rotate=rotate, flip=flip,
+                               carve=True, rotate=rotate, flip=flip,
                                team=opts.get("team"))
         except Exception:
             from action import _rollback_match
@@ -15034,6 +15280,23 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
              f"({len(m.maps)} maps) from prefab `{name}`: "
              + (", ".join(f"`{u}`" for u in res["units"]) or "no units")
              + "."] + res["notes"] + res["log"]))
+    if sub == "new" and len(args) == 3 and args[2].lower().startswith(
+            "shape="):
+        # A map the mask's size, shaped by it.
+        rows = _parse_shape_mask(args[2][6:])
+        w, h = max(len(r) for r in rows), len(rows)
+        pre = m.to_dict(include_history=False)
+        mp = m.add_map(args[1], w, h)
+        try:
+            m.set_voids(mp, _mask_voids(rows, w, h), confirm=True)
+        except Exception:
+            from action import _rollback_match
+            _rollback_match(m, None, pre)
+            raise
+        return await ctx.send(
+            f"Created map `{mp.name}` ({mp.size_text()}, {mp.cell_count()} "
+            f"cells, {len(mp.voids)} void) on **{m.name}** "
+            f"({len(m.maps)} maps).")
     if sub == "new":
         _check_tail(args, 4, (), "!map new <name> <w> <h>")
         if len(args) < 4:
@@ -15229,11 +15492,17 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sub = args[0].lower() if args else ""
     if sub in _MAP_MANAGE_SUBS:
         return await _map_manage(ctx, m, mgr, args, mapspec)
+    if sub == "shape":
+        if mapspec is not None:
+            raise VTTError("`!map shape <map> <mask>` names its map first.")
+        return await _map_shape(ctx, m, args)
     # Which map: a setting change is a per-map edit (a match with several
     # maps names them; a list or `all` runs it on each); anything else
     # reads or renders one map by the hierarchy (`!map center <eid>`
     # frames that unit's map).
     writes = (sub == "resize"
+              or (sub == "void" and len(args) >= 2
+                  and args[1].lower() != "list")
               or (sub in ("background", "border", "unseen") and len(args) >= 2)
               or (sub == "layer" and len(args) >= 2
                   and args[1].lower() != "list"))
@@ -15255,6 +15524,8 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(_color_guide())
     if args and args[0].lower() == "cell":
         return await ctx.send(_map_cell(ctx, m, args, mp))
+    if sub == "void":
+        return await _map_void(ctx, m, args, mp)
     if args and args[0].lower() == "preview":
         return await _map_preview(ctx, m, args[1:], mp)
     if args and args[0].lower() == "ent_sight":
@@ -15410,7 +15681,11 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"{len(scene['placements'])} placement(s) [{breakdown}], "
             f"{len(scene['fog'])} fogged cell(s)"
             + (f" (sprite {fog_key or 'none'})" if scene["fog"] else "") + ", "
-            f"background={bg['sprite'] if bg else 'none'}, "
+            + (f"{len(scene['voids'])} void cell(s)"
+               + (f" (sprite {scene['void_sprite']})"
+                  if scene.get("void_sprite") else "") + ", "
+               if scene.get("voids") else "")
+            + f"background={bg['sprite'] if bg else 'none'}, "
             f"borders={'on' if scene['borders']['show'] else 'off'}, "
             f"coords={'on' if scene.get('coords') else 'off'}, "
             f"unit outline {scene['unit_style']['outline_width']}px at "
@@ -16728,10 +17003,10 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             cx, cy, r = int(rest[0]), int(rest[1]), int(rest[2])
             if r < 0:
                 return await ctx.send(f"❌ the radius must be 0 or more, got {r}.")
-            cells = _grid_box(mp, cx - r, cy - r, cx + r, cy + r)
+            cells = _grid_box(mp, cx - r, cy - r, cx + r, cy + r, keep_voids=True)
         elif form == "rect":
             x1, y1, x2, y2 = (int(rest[i]) for i in range(4))
-            cells = _grid_box(mp, x1, y1, x2, y2)
+            cells = _grid_box(mp, x1, y1, x2, y2, keep_voids=True)
         elif form == "around":
             eid = _resolve_eid(m, rest[0])
             e = m.entities.get(eid)
@@ -16741,7 +17016,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if r < 0:
                 return await ctx.send(f"❌ the radius must be 0 or more, got {r}.")
             for (ex, ey) in m.entity_cells(e):
-                cells |= _grid_box(mp, ex - r, ey - r, ex + r, ey + r)
+                cells |= _grid_box(mp, ex - r, ey - r, ex + r, ey + r, keep_voids=True)
         elif form in ("cone", "line"):
             from formula import _cells_in_cone, _cells_in_line
             limit = int(m.rules.get("formula_cell_limit", 100_000))
@@ -19806,7 +20081,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         _check_tail(args, 4, (), "!tile face <x> <y> <dir|cw|ccw|->")
         x, y = _parse_xy(args)
         if not mp.in_bounds(x, y):
-            raise OutOfBounds(f"({x},{y}) outside {mp.size_text()}")
+            raise OutOfBounds(f"({x},{y}) {mp.off_text(x, y)}")
         if args[3] in _FACING_CLEAR:
             if FACING_FIELD in (mp.tiles.get((x, y)) or {}):
                 mp.tile_del_path(x, y, FACING_FIELD)
@@ -19914,6 +20189,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise VTTError("Usage: `!tile copy <x1> <y1> <x2> <y2> [move]`.")
         move = extra == ["move"]
         if not mp.in_bounds(x2, y2):
+            if mp.in_rect(x2, y2):
+                raise VTTError(f"({x2}, {y2}) is a void cell.")
             raise VTTError(f"({x2}, {y2}) is off the {mp.grid_width}×"
                            f"{mp.grid_height} map.")
         if (x1, y1) == (x2, y2):
@@ -20480,7 +20757,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             for i, emp in enumerate(maps)
             for x in range(1, emp.grid_width + 1)
             for y in range(1, emp.grid_height + 1)
-            if _tile_empty(emp, x, y)
+            if (x, y) not in emp.voids and _tile_empty(emp, x, y)
         ]
         if len(empty) < count:
             return await ctx.send(
@@ -20650,7 +20927,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             mp.tile_set_path(c[0], c[1], path, value)
             n += 1
         skipped = (len(cells) if sub == "line" else area) - n
-        tail = f" ({skipped} off-grid cell(s) skipped)" if skipped else ""
+        tail = (f" ({skipped} off-grid or void cell(s) skipped)"
+                if skipped else "")
         return await ctx.send(
             f"Set `{path}` = {value!r} on {n} tile(s) "
             f"({sub} {x1},{y1} → {x2},{y2}).{tail}"

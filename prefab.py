@@ -13,6 +13,8 @@ The agreed design is docs/zones_prefabs_design.md §5-§9. A prefab holds:
                                             their saved ids, vars in the
                                             partial-template FILE form
    "groups": {group: [saved id, ...]},
+   "voids": [[dx, dy], ...],                the rectangle's void cells (only
+                                            when it has some)
    "definitions": {library: {name: entry}}, the match-level definitions the
                                             contents use (§8)
    "saved_by": ..., "saved_by_name": ...,
@@ -48,7 +50,7 @@ PREFAB_LIBRARIES: Tuple[str, ...] = ("tile_templates", "status_definitions",
 _FOOTPRINT_RULES = ("footprint_width_var", "footprint_height_var")
 _PREFAB_KEYS = ("kind", "width", "height", "system", "definitions_all",
                 "var_names", "tiles", "corpses", "zones", "units", "groups",
-                "definitions", "saved_by", "saved_by_name", "tags")
+                "definitions", "saved_by", "saved_by_name", "tags", "voids")
 
 
 def check_prefab_name(name: Any) -> str:
@@ -128,7 +130,7 @@ def capture_prefab(mgr: Any, m: Match, mp: Map, x1: int, y1: int, x2: int,
     xa, xb = sorted((int(x1), int(x2)))
     ya, yb = sorted((int(y1), int(y2)))
     for cx, cy in ((xa, ya), (xb, yb)):
-        if not mp.in_bounds(cx, cy):
+        if not mp.in_rect(cx, cy):
             raise VTTError(f"({cx},{cy}) is off the {mp.size_text()} map "
                            f"`{mp.name}`.")
     kinds = set(PREFAB_KINDS) if not only else set(only)
@@ -146,6 +148,11 @@ def capture_prefab(mgr: Any, m: Match, mp: Map, x1: int, y1: int, x2: int,
         "tiles": [], "corpses": [], "zones": {}, "units": [], "groups": {},
         "definitions": {},
     }
+    # The map's shape inside the rectangle goes whatever `only` says.
+    voids = sorted(([vx - xa, vy - ya] for vx, vy in mp.voids
+                    if inside(vx, vy)), key=lambda c: (c[1], c[0]))
+    if voids:
+        data["voids"] = voids
     saved_ids: Set[str] = set()
     if "units" in kinds:
         tops = [e for e in m.entities.values()
@@ -384,11 +391,34 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                                            engine_ok=True)
         if not d["tags"]:
             del d["tags"]
+    voids: Set[Tuple[int, int]] = set()
+    if "voids" in d:
+        if not isinstance(d["voids"], list):
+            raise VTTError(f"Prefab `{name}`: `voids` must be a list of "
+                           f"[dx, dy] cells.")
+        for c in d["voids"]:
+            if not (isinstance(c, list) and len(c) == 2):
+                raise VTTError(f"Prefab `{name}`: a void entry is [dx, dy].")
+            cell(c[0], c[1], "a void cell")
+            voids.add((c[0], c[1]))
+        if len(voids) >= w * h:
+            raise VTTError(f"Prefab `{name}`: its voids leave no cell.")
+        d["voids"] = sorted(([vx, vy] for vx, vy in voids),
+                            key=lambda c: (c[1], c[0]))
+        if not d["voids"]:
+            del d["voids"]
+
+    def not_void(dx: Any, dy: Any, what: str) -> None:
+        if (dx, dy) in voids:
+            raise VTTError(f"Prefab `{name}`: {what} at ({dx},{dy}) is on "
+                           f"one of its void cells.")
+
     for t in d["tiles"]:
         if not (isinstance(t, list) and len(t) == 3 and isinstance(t[2], dict)):
             raise VTTError(f"Prefab `{name}`: a tile entry is [dx, dy, "
                            f"{{data}}].")
         cell(t[0], t[1], "a tile")
+        not_void(t[0], t[1], "a tile")
         if "corpses" in t[2]:
             raise VTTError(f"Prefab `{name}`: tile data can't hold "
                            f"`corpses` (corpses are listed under "
@@ -410,6 +440,7 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
             raise VTTError(f"Prefab `{name}`: a corpse entry is [dx, dy, "
                            f"id, {{\"entity\": ...}}].")
         cell(c[0], c[1], f"corpse `{c[2]}`")
+        not_void(c[0], c[1], f"corpse `{c[2]}`")
         # A corpse is read by the roster and rebuilt by a revive: its body
         # and parts must be units (a malformed one crashed `!list`).
         parts = c[3].get("parts", [])
@@ -468,6 +499,7 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                 raise VTTError(f"Prefab `{name}`: zone `{zname}` cells are "
                                f"[dx, dy] pairs.")
             cell(c[0], c[1], f"a cell of zone `{zname}`")
+            not_void(c[0], c[1], f"a cell of zone `{zname}`")
         _check_grant_condition(z, f"Prefab `{name}`: zone `{zname}`")
         if z.get("anchor") and z["anchor"] not in ids:
             raise VTTError(f"Prefab `{name}`: zone `{zname}` is anchored to "
@@ -883,14 +915,17 @@ class NeedsConfirm(VTTError):
 def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
                  y: int, mp: Map, mode: Optional[str] = None,
                  rotate: int = 0, flip: Optional[str] = None,
-                 team: Optional[str] = None, confirm: bool = False
-                 ) -> Dict[str, Any]:
+                 team: Optional[str] = None, confirm: bool = False,
+                 carve: Optional[bool] = None) -> Dict[str, Any]:
     """Stamp prefab `pf` (named `name`) with its top-left cell at (x, y) of
     map `mp`. All or nothing: any refusal leaves the match as it was.
     Returns {"units": new root ids, "all_units", "zones": new zone names,
     "renamed": {saved zone: new name}, "log": lines, "notes": ⚠️ lines}.
     A replace stamp that deletes something raises NeedsConfirm (its text
-    lists what goes) unless `confirm`."""
+    lists what goes) unless `confirm`. The prefab's void cells carve the
+    map (its rectangle takes the prefab's shape) when `carve`, by default
+    in replace mode; otherwise the map's shape stays and content landing
+    on one of its voids refuses the stamp."""
     from action import _rollback_match
     mode = mode or str(m.rules.get("prefab_stamp_mode", "overlay"))
     if mode not in STAMP_MODES:
@@ -900,7 +935,9 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
         raise VTTError(refusal)
     turn = Turn(int(pf["width"]), int(pf["height"]), rotate, flip)
     W, H = turn.size
-    if not (mp.in_bounds(x, y) and mp.in_bounds(x + W - 1, y + H - 1)):
+    if carve is None:
+        carve = mode == "replace"
+    if not (mp.in_rect(x, y) and mp.in_rect(x + W - 1, y + H - 1)):
         raise VTTError(f"Prefab `{name}` is {W}x{H}"
                        + (" turned" if turn.steps or turn.flip else "")
                        + f": placed at ({x},{y}) it reaches past the "
@@ -921,6 +958,11 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
                 f"A replace stamp of `{name}` at ({x},{y}) clears its "
                 f"{W}x{H} rectangle first, deleting " + " and ".join(bits)
                 + ". Run it again with `confirm` to go ahead.")
+
+    stamped_voids = {(x + p[0], y + p[1]) for p in
+                     (turn.point(c[0], c[1]) for c in pf.get("voids") or [])}
+    if not carve:
+        _check_void_landing(m, mp, pf, turn, x, y, name)
 
     units = [copy.deepcopy(u) for u in pf.get("units") or []]
     for u in units:
@@ -969,9 +1011,15 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
         for dy in range(h):
             for dx in range(w):
                 cx, cy = x + u["x"] + dx, y + u["y"] + dy
-                if not mp.in_bounds(cx, cy):
+                if carve and mp.in_rect(cx, cy) \
+                        and (cx, cy) not in stamped_voids:
+                    pass                  # the carve makes it a cell
+                elif not mp.in_bounds(cx, cy):
                     raise VTTError(f"Stamped unit `{idmap[u['id']]}` would "
-                                   f"reach past the map at ({cx},{cy}).")
+                                   + ("land on a void cell"
+                                      if mp.in_rect(cx, cy) else
+                                      "reach past the map")
+                                   + f" at ({cx},{cy}).")
                 if uv.get("__cell_stackable"):
                     continue
                 if mode != "replace":
@@ -996,6 +1044,13 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
     try:
         if mode == "replace":
             _clear_rect(m, mp, x, y, W, H, victims, log)
+        if carve:
+            rect = {(cx, cy) for cx in range(x, x + W)
+                    for cy in range(y, y + H)}
+            want = (mp.voids - rect) | stamped_voids
+            if want != mp.voids:
+                _, vlog = m.set_voids(mp, want, confirm=True)
+                log.extend(vlog)
         _merge_definitions(m, pf, notes)
         _stamp_tiles(m, mp, pf, turn, x, y, mode, notes)
         _stamp_corpses(m, mp, pf, turn, x, y, idmap, notes)
@@ -1017,6 +1072,37 @@ def stamp_prefab(mgr: Any, m: Match, name: str, pf: Dict[str, Any], x: int,
     return {"units": roots, "all_units": all_units, "zones": new_zones,
             "renamed": renamed, "log": log, "notes": notes,
             "removed": victims, "size": (W, H)}
+
+
+def _check_void_landing(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
+                        x: int, y: int, name: str) -> None:
+    """Refuse a stamp that keeps the map's shape when a tile, corpse or
+    zone cell of the prefab lands on one of the map's void cells (units
+    are checked with their bodies in the placement pre-check)."""
+    hits: Set[Tuple[int, int]] = set()
+
+    def at(dx: int, dy: int) -> None:
+        nx, ny = turn.point(dx, dy)
+        if (x + nx, y + ny) in mp.voids:
+            hits.add((x + nx, y + ny))
+
+    for t in pf.get("tiles") or []:
+        at(t[0], t[1])
+    for c in pf.get("corpses") or []:
+        at(c[0], c[1])
+    for zd in (pf.get("zones") or {}).values():
+        if not zd.get("anchor"):
+            for c in zd.get("cells") or []:
+                at(c[0], c[1])
+    if hits:
+        cells = sorted(hits, key=lambda c: (c[1], c[0]))
+        raise VTTError(
+            f"Prefab `{name}` would put tiles, corpses or zone cells on "
+            f"void cells of map `{mp.name}`: "
+            + ", ".join(f"({cx},{cy})" for cx, cy in cells[:10])
+            + (" ..." if len(cells) > 10 else "")
+            + ". Stamp it elsewhere, or use `mode=replace`, which gives the "
+              "rectangle the prefab's shape.")
 
 
 def _clear_rect(m: Match, mp: Map, x: int, y: int, w: int, h: int,

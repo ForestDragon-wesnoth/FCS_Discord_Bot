@@ -344,11 +344,25 @@ class SceneRenderer:
             # `!map background <sprite>` always wins.
             self._draw_default_ground(canvas, ox, oy, cols, rows)
 
+        # Void cells (no cell there): the ground taken back out, then the
+        # void sprite when one is set; no border is drawn round them.
+        voids = {(int(c[0]), int(c[1])) for c in scene.get("voids") or []
+                 if in_window(int(c[0]), int(c[1]))}
+        if voids:
+            blank = Image.new("RGBA", (cell, cell), _BG_FILL)
+            vimg = self.loader.get(scene.get("void_sprite")) \
+                if scene.get("void_sprite") else None
+            piece = vimg.resize((cell, cell)) if vimg is not None else None
+            for gx, gy in voids:
+                canvas.paste(blank, px(gx, gy))
+                if piece is not None:
+                    canvas.alpha_composite(piece, px(gx, gy))
+
         # Grid border lines: drawn ABOVE the ground/background but BELOW tiles,
         # zones, and entities (so they aid alignment without occluding content).
         borders = scene.get("borders") or {}
         if borders.get("show"):
-            self._draw_borders(canvas, borders, ox, oy, cols, rows)
+            self._draw_borders(canvas, borders, ox, oy, cols, rows, voids)
 
         for p in sorted(scene.get("placements", []),
                         key=lambda d: d.get("layer", 0)):
@@ -775,7 +789,8 @@ class SceneRenderer:
             d.rectangle([x0, y0, x0 + cell - 1, y0 + cell - 1], fill=(r, g, b, a))
         canvas.alpha_composite(overlay)
 
-    def _draw_borders(self, canvas, borders, ox, oy, cols, rows):
+    def _draw_borders(self, canvas, borders, ox, oy, cols, rows,
+                      voids=frozenset()):
         cell = self.cell
         base_color = borders.get("color", "white")
         base_op = int(borders.get("opacity", 100))
@@ -790,6 +805,8 @@ class SceneRenderer:
 
         for gy in range(oy, oy + rows):
             for gx in range(ox, ox + cols):
+                if (gx, gy) in voids:
+                    continue
                 ov = overrides.get(f"{gx},{gy}") or {}
                 color = ov.get("color", base_color)
                 op = ov.get("opacity", base_op)

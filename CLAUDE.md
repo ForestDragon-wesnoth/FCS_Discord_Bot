@@ -98,7 +98,9 @@ The map is a grid of square cells and stays that way: every geometry
 primitive, footprint, LOS walk, region, renderer and coordinate convention
 assumes it. Hex grids were proposed and rejected by the user (a refactor
 touching everything, harder maths and rendering, and they make hex games in
-Battle for Wesnoth). Don't propose other grid shapes.
+Battle for Wesnoth). Don't propose other grid shapes. A map's OUTLINE can
+be any shape: void cells (§7.8) are cells of the rectangle that don't
+exist.
 
 ### Backwards compat is irrelevant this early
 
@@ -2091,6 +2093,37 @@ hardcodes**.
   corpses, zones, fog memory and reveals, camera views, snake trail vars);
   a shrink that pushes units off follows `map_resize_shrink_mode` (block /
   kill, looping until nothing is off-grid).
+- **Void cells** (user design, 1053-1057): a map's rectangle can hold
+  cells that don't exist (`Map.voids`, saved as row runs only when
+  non-empty), so a map takes any shape; the grid stays square cells.
+  `Map.in_bounds` is False on a void, so everything gated by it
+  (placement, walks, pushes, teleports, footprints, tile / zone writes,
+  zone fills, aura stamps, ring searches `_ring_cells`, random cells, the
+  area builders via the third item of their `bounds`, `line_cells`
+  listings) treats a void as off the map; `Map.in_rect` keeps the
+  rectangle for coordinates, rulers, resize, prefab corners and the cell
+  limits (`match_cell_limit` counts the rectangle). Refusals name a void
+  as one (`Map.off_text`). `Match.set_voids(mp, target, confirm)` is the
+  one edit: units on a cell turning void follow `map_void_occupied_mode`
+  (refuse / kill, the resize kill loop), and dropping tile data,
+  corpses, zone cells or a kill needs `confirm` (NeedsConfirm listing
+  them); fog memory and reveals there drop silently; no cell left is
+  refused. Resize shifts voids with the anchor (grown cells are
+  ordinary); `!map copy` carries them. Sight: `cell_opaque` reads a void
+  per `void_blocks_sight` (map var named by `map_void_blocks_sight_var`,
+  else the rule; default off: sight passes over a void). Distance stays
+  geometric; a diagonal step between two void corners is allowed (user
+  call: corners never block a step). Commands: `!map void list | add |
+  remove <x> <y> | rect | line | remove all [confirm]` (`list` is a
+  player read, refused to a team view under void_under_fog fog, where
+  `!map cell` answers an unseen void as any unseen cell), `!map
+  shape <map> <mask> [confirm]`, `!map new <name> shape=<mask>`; a mask
+  is one character per cell, a space a void (`_parse_shape_mask`: rows on
+  lines or `/`-separated, a ``` fence dropped), kept as typed by
+  `split_command_args` (`_RAW_SHAPE_TAIL`) and by the Discord / GUI line
+  grouping (`shape_command`) and the CLI (`import_unfinished` with an
+  open fence). Formulas `is_void`, `void_cells` (loopable), `void_add(x,
+  y, confirm=False)` / `void_remove` (mutating, zone grants settle).
 - **Movement verbs:** `!ent tp` / `move` (count first, `allow_diagonal_movement`)
   / `push` / `pull` / `swap`, group moves (`group:<name>`,
   `mount_group_move_mode`), formula `move_entity` / `move_step` (a real
@@ -2706,8 +2739,11 @@ hardcodes**.
   are a translucent fill; a unit's colour is an outline around its sprite;
   the image legend lists every look in the window (ASCII only top-layer
   glyphs); layer order follows `sprite_layer_*`; the acting unit is bold
-  (or named under a plain map) in ASCII and outlined in images.
-  Everything else must agree
+  (or named under a plain map) in ASCII and outlined in images; a void
+  cell is `void_glyph` (a space) in ASCII and nothing in images (no
+  ground, border or fog; `void_sprite` when set), and under
+  `void_under_fog fog` a void the view can't see is fog in both (the
+  scene leaves it out of `voids`). Everything else must agree
   (§2 parity pass) (530-535, 711-717).
 
 ### 7.16 Matches, history and the table
@@ -3249,6 +3285,13 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
   Size limits cut old prefab versions with old template versions;
   `!server storage` lists both. Renaming or deleting a partial names the
   prefabs whose units reference it.
+- **Voids:** a prefab records the void cells of its rectangle (`voids`,
+  offsets; `check_prefab` refuses content on one and a prefab with no
+  cell). A stamp with `carve` (default: replace mode; `!map new from=`
+  and `!prefab show` too) gives the rectangle the prefab's shape
+  (`set_voids` after the clearing); overlay / keep keep the map's shape
+  and refuse a tile, corpse, zone cell or unit landing on a void
+  (`_check_void_landing`, the placement pre-check).
 - **Elsewhere:** `!map new <name> from=<prefab> [rotate=] [flip=] [team=]`
   makes a map the turned prefab's size and stamps it; `!dry !prefab stamp`
   previews a stamp. Formulas: `stamp_prefab(name, x, y, map=, mode=,

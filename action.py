@@ -791,6 +791,8 @@ def _check_on_map(match: Any, x: int, y: int,
     home = match.map_of(ae) if ae is not None else match.get_map()
     mp = home if map_name is None else match.get_map(map_name)
     if not mp.in_bounds(x, y):
+        if mp.in_rect(x, y):
+            raise VTTError(f"location ({x},{y}) is a void cell.")
         raise VTTError(f"location ({x},{y}) is off the map "
                        f"({mp.size_text()}).")
     return Coord(x, y, mp.name, named=mp is not home)

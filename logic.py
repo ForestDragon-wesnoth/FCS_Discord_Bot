@@ -4069,6 +4069,70 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Only the first character is used."
         ),
     },
+    "void_glyph": {
+        "default": " ",
+        "schema": {"type": "str"},
+        "desc": (
+            "ASCII: the character drawn on a void cell (a cell of the map's "
+            "rectangle that doesn't exist, `!map void`). Default a space, so "
+            "the map shows its shape. Only the first character is used; "
+            "empty = a space."
+        ),
+    },
+    "void_sprite": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Graphics: the sprite KEY drawn on a void cell. Empty (default) "
+            "draws nothing there: no background, border or fog, so the "
+            "image shows the map's shape."
+        ),
+    },
+    "void_under_fog": {
+        "default": "show",
+        "schema": {"type": "enum", "choices": ["show", "fog"]},
+        "desc": (
+            "Whether fog covers void cells. 'show' (default): a void always "
+            "shows as a void, so players see the map's shape as on a table. "
+            "'fog': a void the team can't see is drawn as fog like any "
+            "unseen cell (a secret shape); one it sees, or remembers under "
+            "fog memory, shows as a void."
+        ),
+    },
+    "void_blocks_sight": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a void cell blocks sight lines that cross it. Off "
+            "(default): a void is nothing, so sight passes over it (place "
+            "opaque tiles for a wall). On: a void is opaque to every "
+            "viewer, with the los_corner_mode corner rules. Each map can "
+            "override it (`!map var set void_blocks_sight on map=<name>`, "
+            "the map var named by map_void_blocks_sight_var)."
+        ),
+    },
+    "map_void_blocks_sight_var": {
+        "default": "void_blocks_sight",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding whether the map's void cells block sight (on / "
+            "off). A map without the var uses the void_blocks_sight rule. "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_void_occupied_mode": {
+        "default": "refuse",
+        "schema": {"type": "enum", "choices": ["refuse", "kill"]},
+        "desc": (
+            "What `!map void add`, `!map shape` and void_add do when a unit "
+            "covers a cell turning void. 'refuse' (default): nothing "
+            "changes and the reply names the units. 'kill': they are "
+            "killed (the configured kill function and death pipeline), "
+            "their corpses going with the cell; this asks for `confirm` "
+            "first, as dropping tile data, corpses or zone cells on the "
+            "new voids does."
+        ),
+    },
     # ---- graphics / sprite rendering ----
     # The engine stays pixel-agnostic: a sprite is referenced by a KEY string
     # stored in entity/tile/zone data (mirroring glyphs), resolved by the same
@@ -5916,7 +5980,8 @@ MAP_RESERVED_NAMES = frozenset({
     "colors", "cell", "preview", "ent_sight", "background", "border", "mode",
     "scene", "image", "color", "teamcolor", "resize", "layer", "autoupdate",
     "legend", "coords", "pan", "center", "new", "list", "delete", "rename",
-    "copy", "use", "var", "fog", "unseen", "attach", "detach"})
+    "copy", "use", "var", "fog", "unseen", "attach", "detach", "void",
+    "shape"})
 
 
 def check_map_name(name: Any) -> None:
@@ -9343,7 +9408,7 @@ class Entity:
                 # the path (push/pull) pass None to avoid re-checking.
                 for cx, cy in m.entity_cells(self, nx, ny):
                     if not mp.in_bounds(cx, cy):
-                        raise OutOfBounds(f"({cx},{cy}) outside {mp.size_text()}")
+                        raise OutOfBounds(f"({cx},{cy}) {mp.off_text(cx, cy)}")
                 if block_mode is not None:
                     for cx, cy in m.entity_cells(self, nx, ny):
                         if m._check_block(self.id, cx, cy, block_mode,
@@ -10206,16 +10271,20 @@ def line_span(x1: int, y1: int, x2: int, y2: int, width: int, height: int
 
 
 def line_cells(x1: int, y1: int, x2: int, y2: int,
-               bounds: Optional[Tuple[int, int]] = None
+               bounds: Optional[tuple] = None
                ) -> List[Tuple[int, int]]:
     """The ordered cells the segment between the centres of (x1,y1) and
     (x2,y2) passes through, near->far: every cell it crosses, with one
     diagonal step where it passes exactly through a corner (the line every
     sight check walks, Match._line_cells). With `bounds` (width, height)
     only the cells on that map are listed and only the map's part of the
-    line is walked; without, every cell (the caller bounds the length)."""
+    line is walked; without, every cell (the caller bounds the length).
+    A third item of `bounds`, a set of void cells, leaves those out too."""
+    voids = bounds[2] if bounds is not None and len(bounds) > 2 else ()
+
     def inside(cx: int, cy: int) -> bool:
-        return bounds is None or (1 <= cx <= bounds[0] and 1 <= cy <= bounds[1])
+        return bounds is None or (1 <= cx <= bounds[0] and 1 <= cy <= bounds[1]
+                                  and (cx, cy) not in voids)
 
     if (x1, y1) == (x2, y2):
         return [(x1, y1)] if inside(x1, y1) else []
@@ -10293,12 +10362,40 @@ class Map:
     # The unit carrying this map (nested maps, `!map attach`): its map
     # vehicle. None for a map of its own.
     vehicle: Optional[str] = None
+    # Void cells: cells of the width x height rectangle that don't exist
+    # (`!map void`, `!map shape`), so a map can take any shape. in_bounds
+    # answers False for them, so placement, moves, footprints, tile and
+    # zone writes, area builders and searches treat them as off the map;
+    # the rectangle (in_rect) stays the frame for coordinates, rulers,
+    # resize and the cell limits. Saved as row runs.
+    voids: Set[Tuple[int, int]] = field(default_factory=set)
 
     def size_text(self) -> str:
         return f"{self.grid_width}x{self.grid_height}"
 
-    def in_bounds(self, x: int, y: int) -> bool:
+    def in_rect(self, x: int, y: int) -> bool:
+        """Whether (x, y) lies in the map's rectangle, void or not."""
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
+
+    def in_bounds(self, x: int, y: int) -> bool:
+        """Whether (x, y) is a cell of the map: in its rectangle and no
+        void."""
+        return (1 <= x <= self.grid_width and 1 <= y <= self.grid_height
+                and (x, y) not in self.voids)
+
+    def is_void(self, x: int, y: int) -> bool:
+        return (x, y) in self.voids
+
+    def off_text(self, x: int, y: int) -> str:
+        """Why (x, y) is no cell of the map, for a refusal after the
+        coordinates: "is a void cell" or "outside WxH"."""
+        if self.in_rect(x, y) and (x, y) in self.voids:
+            return "is a void cell"
+        return f"outside {self.size_text()}"
+
+    def cell_count(self) -> int:
+        """The cells that exist: the rectangle minus its voids."""
+        return self.grid_width * self.grid_height - len(self.voids)
 
     # ---- tile data helpers --------------------------------------------
     # Tiles live in self.tiles keyed by (x, y) tuples. These methods are
@@ -10314,7 +10411,7 @@ class Map:
         creating off-grid tiles would mask GM typos."""
         if not self.in_bounds(x, y):
             raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+                f"({x},{y}) {self.off_text(x, y)}"
             )
         return self.tiles.setdefault((x, y), {})
 
@@ -10326,7 +10423,7 @@ class Map:
         the bare 'tile data dict' isn't a useful thing to expose."""
         if not self.in_bounds(x, y):
             raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+                f"({x},{y}) {self.off_text(x, y)}"
             )
         if not path:
             raise VTTError("tile path cannot be empty.")
@@ -10376,7 +10473,7 @@ class Map:
         (we don't silently clobber a scalar with a dict)."""
         if not self.in_bounds(x, y):
             raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+                f"({x},{y}) {self.off_text(x, y)}"
             )
         check_store_path(path, "tile path")
         if path.split(".")[0] == "corpses":
@@ -10559,7 +10656,7 @@ class Map:
         rejected."""
         if not self.in_bounds(x, y):
             raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+                f"({x},{y}) {self.off_text(x, y)}"
             )
         z = self.zones.get(name)
         if z is None:
@@ -10749,12 +10846,18 @@ class Map:
                        for r in recs]
                 for team, recs in self.fog_reveals.items()
             },
+            # Only a map with voids carries the key.
+            **({"voids": _cells_to_runs(self.voids)} if self.voids else {}),
         }
 
     @staticmethod
     def from_dict(name: str, d: Dict[str, Any]) -> "Map":
         mp = Map(name=name, grid_width=int(d["grid_width"]),
                  grid_height=int(d["grid_height"]))
+        raw_voids = d.get("voids")
+        if isinstance(raw_voids, list):
+            mp.voids = _runs_to_cells(raw_voids, mp.grid_width,
+                                      mp.grid_height)
         raw_vars = d.get("vars")
         mp.vars = copy.deepcopy(raw_vars) if isinstance(raw_vars, dict) else {}
         veh = d.get("vehicle")
@@ -13542,12 +13645,137 @@ class Match:
             if isinstance(off, (list, tuple)) and len(off) == 2:
                 views[mp.name] = [off[0] + ox, off[1] + oy]
 
+        # Voids shift with the content; cells a grow adds are ordinary.
+        mp.voids = {(x + ox, y + oy) for (x, y) in mp.voids
+                    if in_new(x + ox, y + oy)}
         mp.grid_width, mp.grid_height = new_w, new_h
         return ({"offset": (ox, oy), "anchor": key, "killed": killed,
                  "dropped_tiles": dropped_tiles,
                  "dropped_corpses": dropped_corpses,
                  "clipped_zone_cells": clipped_cells}, log)
 
+
+    # ---- void cells ---------------------------------------------------
+    def set_voids(self, mp: "Map", target: Set[Tuple[int, int]],
+                  confirm: bool = False
+                  ) -> Tuple[Dict[str, Any], List[str]]:
+        """Make map `mp`'s void cells exactly `target` (cells inside its
+        rectangle; the caller clips). A cell turning void must hold
+        nothing that can't go: units covering one follow the
+        map_void_occupied_mode rule (refuse, default: raises naming their
+        bodies and changes nothing; kill: they die and their corpses go
+        with the cell). Tile data, corpses and zone cells on new voids are
+        dropped, which needs `confirm` (the first run raises NeedsConfirm
+        listing them, killed units included); fog memory and reveals there
+        are dropped silently. A cell leaving the voids is an ordinary
+        empty cell. Refused when no cell of the map would be left.
+        Returns (summary, log)."""
+        from prefab import NeedsConfirm
+        target = {c for c in target if mp.in_rect(*c)}
+        added = target - mp.voids
+        removed = mp.voids - target
+        if len(target) >= mp.grid_width * mp.grid_height:
+            raise VTTError(
+                f"Map `{mp.name}` would have no cell left; at least one "
+                f"cell must exist.")
+
+        def cut_ids() -> List[str]:
+            return sorted(e.id for e in self.entities.values()
+                          if e.map == mp.name
+                          and any(c in added for c in self.entity_cells(e)))
+
+        cut = cut_ids()
+        mode = str(self.rules.get("map_void_occupied_mode", "refuse"))
+        roots = sorted({self.body_root(self.entities[i]).id for i in cut})
+        if cut and mode != "kill":
+            raise VTTError(
+                f"Units stand on cells that would become void: "
+                + ", ".join(f"`{i}`" for i in roots)
+                + ". Move them first, or set map_void_occupied_mode=kill "
+                  "to kill them instead.")
+        lost_tiles = sorted(c for c in added
+                            if any(k != "corpses"
+                                   for k in (mp.tiles.get(c) or {})))
+        lost_corpses = sorted(
+            str(cid) for c in added
+            for cid in ((mp.tiles.get(c) or {}).get("corpses") or {}))
+        lost_zones = sorted(name for name, z in mp.zones.items()
+                            if not z.get("anchor")
+                            and any(c in added for c in z.get("cells", ())))
+        if (roots or lost_tiles or lost_corpses or lost_zones) \
+                and not confirm:
+            bits = []
+            if roots:
+                bits.append("kills " + ", ".join(f"`{i}`" for i in roots)
+                            + " (map_void_occupied_mode kill)")
+            if lost_tiles:
+                bits.append(f"drops the tile data of {len(lost_tiles)} "
+                            f"cell(s)")
+            if lost_corpses:
+                bits.append("drops the corpses of "
+                            + ", ".join(f"`{c}`" for c in lost_corpses))
+            if lost_zones:
+                bits.append("cuts cells from zones "
+                            + ", ".join(f"`{z}`" for z in lost_zones))
+            raise NeedsConfirm(
+                f"Voiding {len(added)} cell(s) of map `{mp.name}` "
+                + ", ".join(bits)
+                + ". Run it again with `confirm` to go ahead.")
+        log: List[str] = []
+        killed: List[str] = []
+        # As a resize kills: a death hook may summon onto a cell turning
+        # void, so repeat until nothing stands there; a unit still there
+        # after its kill (a destroyed part, a revived unit) is removed.
+        handled: Set[str] = set()
+        while cut:
+            for eid in cut:
+                e = self.entities.get(eid)
+                if e is None:
+                    continue
+                if eid in handled:
+                    log.extend(e.remove())
+                    continue
+                handled.add(eid)
+                _, klog = self.kill_entity(eid)
+                log.extend(klog)
+                killed.append(eid)
+            cut = cut_ids()
+        dropped_corpses = sorted(
+            str(cid) for c in added
+            for cid in ((mp.tiles.get(c) or {}).get("corpses") or {}))
+        dropped_tiles = 0
+        for c in added:
+            cell = mp.tiles.pop(c, None)
+            if isinstance(cell, dict) and any(k != "corpses" for k in cell):
+                dropped_tiles += 1
+        clipped = 0
+        for z in mp.zones.values():
+            cells = z.get("cells")
+            if isinstance(cells, set) and cells & added:
+                clipped += len(cells & added)
+                z["cells"] = cells - added
+        for team in list(mp.explored):
+            mp.explored[team] -= added
+        for team in list(mp.fog_reveals):
+            recs = []
+            for r in mp.fog_reveals[team]:
+                cells = set(r.get("cells", ())) - added
+                if cells:
+                    recs.append({**r, "cells": cells})
+            if recs:
+                mp.fog_reveals[team] = recs
+            else:
+                del mp.fog_reveals[team]
+        mp.voids = set(target)
+        return ({"added": len(added), "removed": len(removed),
+                 "killed": killed, "dropped_tiles": dropped_tiles,
+                 "dropped_corpses": dropped_corpses,
+                 "clipped_zone_cells": clipped}, log)
+
+    def void_blocks_sight(self, mp: "Map") -> bool:
+        """Whether map `mp`'s void cells block sight: its map var named by
+        map_void_blocks_sight_var, else the void_blocks_sight rule."""
+        return self._switch(self.map_setting(mp, "void_blocks_sight"))
 
     # ---- entity-anchored auras --------------------------------------
     # An aura is a zone bound to an entity: its `anchor` field holds the
@@ -13589,7 +13817,7 @@ class Match:
         for (fx, fy) in self.entity_cells(e):
             for yy in range(max(1, fy - r), min(mp.grid_height, fy + r) + 1):
                 for xx in range(max(1, fx - r), min(mp.grid_width, fx + r) + 1):
-                    if (xx, yy) in new:
+                    if (xx, yy) in new or (xx, yy) in mp.voids:
                         continue
                     if self._within_radius(fx, fy, xx, yy, r, metric):
                         new.add((xx, yy))
@@ -15897,7 +16125,10 @@ class Match:
         walks skip it, see _line_span)."""
         mp = self._viewer_map(mp, viewer_id)
         if not mp.in_bounds(x, y):
-            return False
+            # A void cell blocks per void_blocks_sight (its map var else
+            # the rule); off the rectangle nothing does.
+            return (mp.in_rect(x, y) and (x, y) in mp.voids
+                    and self.void_blocks_sight(mp))
         if self._eval_opaque_spec(self._tile_opaque_spec(x, y, mp), viewer_id,
                                   {"tile_x": x, "tile_y": y,
                                    "tile_map": mp.name}):
@@ -16039,7 +16270,7 @@ class Match:
         if clip:
             mp = mp or self.get_map()
             return line_cells(x1, y1, x2, y2,
-                              (mp.grid_width, mp.grid_height))
+                              (mp.grid_width, mp.grid_height, mp.voids))
         self._check_line_budget(x1, y1, x2, y2)
         return line_cells(x1, y1, x2, y2, None)
 
@@ -16494,6 +16725,8 @@ class Match:
         cells: List[Tuple[int, int]] = []
         for y in range(y0, y1 + 1):
             for x in range(x0, x1 + 1):
+                if (x, y) in mp.voids:
+                    continue
                 for vx, vy in body:
                     # One unit per range check (a big body tests every cell
                     # pair), plus the length of each sight line walked.
@@ -16759,7 +16992,7 @@ class Match:
             raise NotFound(f"tile template '{name}' not found.")
         mp = mp or self.get_map()
         if not mp.in_bounds(x, y):
-            raise OutOfBounds(f"({x},{y}) outside {mp.size_text()}")
+            raise OutOfBounds(f"({x},{y}) {mp.off_text(x, y)}")
         if not replace and (x, y) in mp.tiles:
             raise DuplicateId(
                 f"tile ({x},{y}) already has data; pass replace=True "
@@ -17211,7 +17444,7 @@ class Match:
         cells = self.entity_cells(e, ax, ay)
         for cx, cy in cells:
             if not mp.in_bounds(cx, cy):
-                raise OutOfBounds(f"({cx},{cy}) outside {mp.size_text()}")
+                raise OutOfBounds(f"({cx},{cy}) {mp.off_text(cx, cy)}")
         # GLUED body parts ride on the parent's cell and never collide
         # (non-occupying), so they skip the occupancy gate like a stackable
         # entity. A LOCATED part (own cell) DOES get the occupancy check.
@@ -22321,7 +22554,7 @@ class Match:
             if not self.footprint_in_bounds(e, place_x, place_y, mp):
                 raise OutOfBounds(
                     f"summon: footprint anchored at ({place_x},{place_y}) is "
-                    f"off-grid ({mp.size_text()})."
+                    f"off-grid ({mp.size_text()}) or on a void cell."
                 )
             if not stackable_template and any(
                     self.cell_occupant(cx, cy, mp=mp) is not None
@@ -22468,7 +22701,7 @@ class Match:
         whole (2r+1)² square for it made a radius-500 search ~10⁸ steps)."""
         w, h = mp.grid_width, mp.grid_height
         if r == 0:
-            return [(x, y)] if 1 <= x <= w and 1 <= y <= h else []
+            return [(x, y)] if mp.in_bounds(x, y) else []
         out: List[Tuple[int, int]] = []
         for cy in range(max(1, y - r), min(h, y + r) + 1):
             if abs(cy - y) == r:
@@ -22476,6 +22709,8 @@ class Match:
                                                     min(w, x + r) + 1))
             else:
                 out.extend((cx, cy) for cx in (x - r, x + r) if 1 <= cx <= w)
+        if mp.voids:
+            out = [c for c in out if c not in mp.voids]
         return out
 
     def free_cell_near(self, x: int, y: int, radius: int,
@@ -26450,6 +26685,12 @@ class Match:
         meanings: Optional[List[List[Optional[str]]]] = None
         if legend:
             meanings = [[None for _ in range(gw + 1)] for _ in range(gh + 1)]
+        # Void cells show void_glyph (no cell is there, so no layer draws
+        # on them: every layer below tests in_bounds).
+        vg = str(self.rules.get("void_glyph", " ") or " ")[0]
+        for (vx, vy) in mp.voids:
+            if mp.in_rect(vx, vy):
+                grid[vy][vx] = vg
 
         # Zone layer (lowest): a single-char `glyph` paints all the zone's
         # cells; a `color` tints them (the glyph if present, else the '.').
@@ -26572,8 +26813,11 @@ class Match:
             # Only the cells the window shows: a fogged read costs the
             # window, never the whole map (X11).
             fx0, fy0, fx1, fy1 = _window_bounds(viewport, gw, gh)
+            fog_voids = self.rules.get("void_under_fog", "show") == "fog"
             for yy in range(fy0, fy1 + 1):
                 for xx in range(fx0, fx1 + 1):
+                    if (xx, yy) in mp.voids and not fog_voids:
+                        continue
                     if not self._fog_terrain_visible(pov_team, xx, yy, mp):
                         grid[yy][xx] = fg
                         colors[yy][xx] = None
@@ -27073,11 +27317,26 @@ class Match:
             fog_op = max(0, min(100, fog_op))
             fx0, fy0, fx1, fy1 = _window_bounds(viewport, mp.grid_width,
                                                 mp.grid_height)
+            fog_voids = self.rules.get("void_under_fog", "show") == "fog"
             for yy in range(fy0, fy1 + 1):
                 for xx in range(fx0, fx1 + 1):
+                    if (xx, yy) in mp.voids and not fog_voids:
+                        continue
                     if not self._fog_terrain_visible(pov_team, xx, yy, mp):
                         fog.append({"x": xx, "y": yy,
                                     "sprite": fog_sprite, "opacity": fog_op})
+
+        # Void cells in the window: drawn as nothing (no ground, border or
+        # fog under void_under_fog show), or void_sprite when set.
+        wx0, wy0, wx1, wy1 = _window_bounds(viewport, mp.grid_width,
+                                            mp.grid_height)
+        # A void fog covers (void_under_fog fog) is drawn as fog alone, so
+        # the scene doesn't tell where the shape's holes are.
+        fogged = {(f["x"], f["y"]) for f in fog}
+        voids = sorted(([vx, vy] for vx, vy in mp.voids
+                        if wx0 <= vx <= wx1 and wy0 <= vy <= wy1
+                        and (vx, vy) not in fogged),
+                       key=lambda c: (c[1], c[0]))
 
         # The acting unit's placements carry `active` (active_unit_highlight;
         # the same unit the ASCII map makes bold).
@@ -27095,6 +27354,9 @@ class Match:
             "grid_width": mp.grid_width, "grid_height": mp.grid_height,
             "viewport": vp, "background": self.background_layer(mp),
             "placements": placements, "fog": fog,
+            "voids": voids,
+            "void_sprite": (str(self.rules.get("void_sprite", "") or "")
+                            .strip() or None),
             "borders": self._scene_borders(mp),
             "coords": self.coords_on(),
             "sprite_cell_size": self._layer_rule("sprite_cell_size", 100),
@@ -28520,6 +28782,7 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
     "map_unseen_var": ("unseen", "unseen_map_display"),
     "map_nested_vehicle_moves_var": ("nested_vehicle_moves",
                                      "nested_vehicle_moves"),
+    "map_void_blocks_sight_var": ("void_blocks_sight", "void_blocks_sight"),
 }
 # setting -> its rule
 MAP_SETTING_RULES: Dict[str, str] = {v[0]: k for k, v in MAP_VAR_NAME_RULES.items()}
@@ -28542,7 +28805,8 @@ def map_setting_value(setting: str, value: Any) -> Any:
             raise VTTError(f"The unseen setting is one of "
                            f"{', '.join(UNSEEN_MAP_MODES)}, got `{value}`.")
         return word
-    if setting in ("fog", "fog_memory", "borders", "nested_vehicle_moves"):
+    if setting in ("fog", "fog_memory", "borders", "nested_vehicle_moves",
+                   "void_blocks_sight"):
         word = str(value).strip().lower()
         if isinstance(value, bool):
             return value

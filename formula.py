@@ -1688,6 +1688,15 @@ def _clip_range(x_lo: int, x_hi: int, y_lo: int, y_hi: int,
     return range(x_lo, x_hi + 1), range(y_lo, y_hi + 1)
 
 
+def _drop_voids(cells: list, bounds: Optional[tuple]) -> list:
+    """`cells` without the map's void cells (the third item of `bounds`,
+    when given): a void is no cell of the map."""
+    if bounds is None or len(bounds) < 3 or not bounds[2]:
+        return cells
+    voids = bounds[2]
+    return [c for c in cells if c not in voids]
+
+
 def _cells_in_burst(x: Any, y: Any, r: Any,
                     mode: Any = "square_radius_distance", *,
                     limit: int = _DEFAULT_CELL_LIMIT,
@@ -1716,7 +1725,7 @@ def _cells_in_burst(x: Any, y: Any, r: Any,
             # matches what distance()/entities_within consider "within r".
             if _distance(cx0, cy0, cx, cy, mode) <= r:
                 out.append((cx, cy))
-    return out
+    return _drop_voids(out, bounds)
 
 
 def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any, *,
@@ -1812,7 +1821,7 @@ def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
                 diff = 360.0 - diff
             if diff <= half_angle:
                 out.append((cx, cy))
-    return out
+    return _drop_voids(out, bounds)
 
 
 def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any, *,
@@ -1836,7 +1845,7 @@ def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any, *,
     for cx in xs:
         for cy in ys:
             out.append((cx, cy))
-    return out
+    return _drop_voids(out, bounds)
 
 
 # ---- directional / facing-relative geometry -------------------------------
@@ -2910,6 +2919,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Extra turns (#224): grant_turn / clear_extra_turns change the queue,
     # extra_turn_queue reads it.
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
+    # Void cells: cells of a map's rectangle that don't exist.
+    "is_void", "void_cells", "void_add", "void_remove",
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
     "atb_threshold", "atb_rate",
@@ -3038,6 +3049,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
 ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "map_var_set", "map_var_del", "transfer_entity",
     "grant_turn", "clear_extra_turns",
+    "void_add", "void_remove",
     "group_add", "group_remove",
     "tile_set", "tile_del", "tile_clear", "tile_place",
     "tile_face", "zone_face",
@@ -3077,6 +3089,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    "is_void", "void_cells",
     'watch_exists', 'watchers_of',
     'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
     'map_carrier', 'inner_maps', 'outer_map',
@@ -3173,7 +3186,7 @@ _TUPLE_FREE_FUNCS = frozenset(_MATCH_FUNC_NAMES) | frozenset(_ALLOWED_FUNCS)
 _MAP_CELL_RESULT_FUNCS: "frozenset[str]" = frozenset({
     "first_opaque", "raycast", "free_cell_near", "clip_cells",
     "cells_in_burst", "cells_in_line", "cells_in_cone", "cells_in_rect",
-    "tiles_with_tag",
+    "tiles_with_tag", "void_cells",
 })
 # Unit searches taking `tag=` (a tag filter the units' tags must match).
 _TAG_ARG_FUNCS: "frozenset[str]" = frozenset({
@@ -3191,7 +3204,7 @@ _GRANT_SETTLE_FUNCS: "frozenset[str]" = frozenset({
     "summon", "summon_near", "summon_from", "summon_template",
     "summon_template_near", "stamp_prefab", "remove_entity", "kill",
     "revive", "transform", "revert", "mount", "dismount", "switch_slot",
-    "damage_part", "damage_spread",
+    "damage_part", "damage_spread", "void_add", "void_remove",
 })
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
@@ -3202,6 +3215,7 @@ _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "cell_opaque", "cell_blocked", "in_bounds", "grid_width", "grid_height",
     "team_sees_cell", "team_sees_cell_rangeonly", "team_sees_cell_losonly",
     "can_see", "can_see_rangeonly", "can_see_losonly", "has_los",
+    "is_void", "void_add", "void_remove",
 })
 assert _MAP_ARG_FUNCS <= _TUPLE_FREE_FUNCS, (
     _MAP_ARG_FUNCS - _TUPLE_FREE_FUNCS)
@@ -3336,6 +3350,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
     "prefab_names", "size_categories", "next_turns", "extra_turn_queue",
+    "void_cells",
     "range",
     "each",
     "keys",
@@ -4678,7 +4693,7 @@ class FormulaEngine:
             if self._match is None:
                 return None
             gm = _cur_map()
-            return (gm.grid_width, gm.grid_height)
+            return (gm.grid_width, gm.grid_height, gm.voids)
         # The namespace is the formula's globals AND locals: one dict, so
         # a lambda body (#174) resolves names (`__read`, locals, a !func's
         # parameters) where its formula does; with separate globals a nested
@@ -10033,6 +10048,55 @@ class FormulaEngine:
         ns["grid_width"] = _grid_width
         ns["grid_height"] = _grid_height
         ns["in_bounds"] = _in_bounds
+
+        def _is_void(x: Any, y: Any) -> bool:
+            """is_void(x, y): whether (x, y) is a void cell of the map: in
+            its rectangle, but no cell (`!map void`). in_bounds is False
+            there, as off the map."""
+            return _cur_map().is_void(_cell_arg(x, "is_void", "x"),
+                                      _cell_arg(y, "is_void", "y"))
+
+        def _void_cells() -> list:
+            """void_cells(): the map's void cells as [x, y], by row then
+            column. Loopable."""
+            return [[x, y] for x, y in sorted(_cur_map().voids,
+                                              key=lambda c: (c[1], c[0]))]
+
+        def _void_edit(fname: str, x: Any, y: Any, add: bool,
+                       confirm: Any) -> bool:
+            mp = _cur_map()
+            cx, cy = _cell_arg(x, fname, "x"), _cell_arg(y, fname, "y")
+            if not mp.in_rect(cx, cy):
+                raise FormulaError(f"{fname}: ({cx},{cy}) is outside the "
+                                   f"{mp.size_text()} map.")
+            if mp.is_void(cx, cy) == add:
+                return False
+            target = (mp.voids | {(cx, cy)}) if add else \
+                (mp.voids - {(cx, cy)})
+            try:
+                _res, log = match.set_voids(mp, target, confirm=bool(confirm))
+            except VTTError as ex:
+                raise FormulaError(f"{fname}: {ex}")
+            match.surface_log(log)
+            return True
+
+        def _void_add(x: Any, y: Any, confirm: Any = False) -> bool:
+            """void_add(x, y, confirm=False): make (x, y) a void cell, as
+            `!map void add` (a collapsing floor). A unit standing there
+            follows map_void_occupied_mode (refuse: an error; kill: it
+            dies); tile data, corpses or zone cells there, or a kill, need
+            confirm=True. Returns True when the cell changed."""
+            return _void_edit("void_add", x, y, True, confirm)
+
+        def _void_remove(x: Any, y: Any) -> bool:
+            """void_remove(x, y): make void cell (x, y) an ordinary empty
+            cell again. Returns True when the cell changed."""
+            return _void_edit("void_remove", x, y, False, False)
+
+        ns["is_void"] = _is_void
+        ns["void_cells"] = _void_cells
+        ns["void_add"] = _void_add
+        ns["void_remove"] = _void_remove
         ns["entity_distance"] = _entity_distance
         ns["cell_blocked"] = _cell_blocked
         ns["cell_opaque"] = _cell_opaque
@@ -10247,8 +10311,9 @@ class FormulaEngine:
                 if x1 > x2 or y1 > y2:
                     return set()
                 _cell_budget((x2 - x1 + 1) * (y2 - y1 + 1), fname, cell_limit)
+                voids = _cur_map().voids
                 return {(x, y) for y in range(y1, y2 + 1)
-                        for x in range(x1, x2 + 1)}
+                        for x in range(x1, x2 + 1) if (x, y) not in voids}
             raise FormulaError(
                 f"{fname}(...): give a zone name or x1, y1, x2, y2.")
 
