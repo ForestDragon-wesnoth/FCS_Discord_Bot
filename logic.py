@@ -3161,6 +3161,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "size number is never private."
         ),
     },
+    "creator_template_use": {
+        "default": "none",
+        "schema": {"type": "enum", "choices": ["none", "use"]},
+        "desc": (
+            "What a host who can't read a creator-level private template "
+            "(`!template private <name> creator`: only its saver and "
+            "server administrators read it) may still do with it by name. "
+            "`none`: nothing; spawning, giving, copying and referencing it "
+            "from another template answer as for a template that doesn't "
+            "exist. `use`: spawn it, give it and build templates on it "
+            "without reading it (its reads still answer as missing); "
+            "copying it stays refused, since the copy would be theirs to "
+            "read. Read from the channel's match, else the channel's "
+            "default system."
+        ),
+    },
     "var_labels_enabled": {
         "default": False,
         "schema": {"type": "bool"},

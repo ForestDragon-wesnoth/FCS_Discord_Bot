@@ -6533,6 +6533,44 @@ def _template_viewer(ctx: ReplyContext,
                           else str(user))
 
 
+def _creator_template_use(ctx: ReplyContext, mgr: MatchManager) -> str:
+    """The creator_template_use rule as this channel reads it: its match's
+    value, else its default system's."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    if m is not None:
+        return str(m.rules.get("creator_template_use", "none"))
+    s = mgr.systems.get(mgr.effective_system_name(ctx.channel_key))
+    return (str(mgr.system_value(s, "creator_template_use"))
+            if s is not None else "none")
+
+
+def _creator_hidden(ctx: ReplyContext, mgr: MatchManager, tpl: Any) -> bool:
+    """`tpl` is a creator-level template the caller can't read."""
+    return (template_private_level(tpl) == TEMPLATE_CREATOR_ONLY
+            and _template_hidden(ctx, mgr, tpl))
+
+
+def _usable_template(ctx: ReplyContext, mgr: MatchManager, raw: str,
+                     use: str) -> Tuple[str, Dict[str, Any]]:
+    """_get_template for a use of the template by name (`use`: spawn, give,
+    copy): a creator-level one the caller can't read answers as missing,
+    unless creator_template_use is `use` and this isn't a copy (V20)."""
+    name = check_template_name(raw)
+    tpl = mgr.templates.get(name)
+    if tpl is not None and _creator_hidden(ctx, mgr, tpl):
+        if _creator_template_use(ctx, mgr) != "use":
+            tpl = None
+        elif use == "copy":
+            raise VTTError(f"`{name}` is private to its creator: you can "
+                           f"spawn it and give it, not copy it.")
+    if tpl is None:
+        if use == "give":
+            raise VTTError(f"There is no partial template `{name}`.")
+        raise VTTError(f"No template `{name}` (`!template list`).")
+    return name, tpl
+
+
 def _template_hidden(ctx: ReplyContext, mgr: MatchManager, tpl: Any) -> bool:
     """A private template (`!template private`) the caller may not read
     reads as missing."""
@@ -6608,6 +6646,17 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
     old = mgr.templates.get(name)
     if old is not None and check_saver:
         _require_saver(ctx, name, old, "replace")
+    if _creator_template_use(ctx, mgr) != "use":
+        # A new reference to a creator-level partial the caller can't read
+        # is refused as one to a missing partial (V20); one the template
+        # already held stays.
+        had = set(template_refs_of(old)) if isinstance(old, dict) else set()
+        for r in template_refs_of(data):
+            if r not in had and _creator_hidden(ctx, mgr,
+                                                mgr.templates.get(r)):
+                raise VTTError(f"Template `{name}` references `{r}`, which "
+                               f"isn't a partial template in this server's "
+                               f"library.")
     if old is not None and _is_partial(old) and not _is_partial(data):
         deps = _template_dependents(mgr, name)
         if deps:
@@ -7564,7 +7613,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "template", sub):
             return
         _check_tail(args, 3, (), "!template copy <name> <new_name>")
-        name, tpl = _get_template(mgr, args[1])
+        name, tpl = _usable_template(ctx, mgr, args[1], "copy")
         new_name = check_template_name(args[2])
         if new_name == name:
             raise VTTError(f"`{new_name}` is already this template's name.")
@@ -7886,7 +7935,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m = active_match(mgr, ctx)
         args, mapspec = _pop_map_opt(args)
         smp = _one_map(ctx, m, mapspec, strict=True)
-        name, tpl = _get_template(mgr, args[1])
+        name, tpl = _usable_template(ctx, mgr, args[1], "spawn")
         if _is_partial(tpl):
             raise VTTError(f"`{name}` is a partial template: hand it to a unit "
                            f"with `!template give {name} <unit> <path>`, or "
@@ -7938,6 +7987,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise VTTError("A partial is given into a var path (`inventory.axe`"
                            "); a whole unit is built from one through an "
                            "entity template whose vars reference it.")
+        if name in mgr.templates:
+            _usable_template(ctx, mgr, name, "give")
         log = m.give_partial(e, args[3], name)
         return await ctx.send("\n".join(
             [f"🎁 Gave `{e.id}` a `{name}` at `{args[3]}`."] + [str(x) for x in log]))

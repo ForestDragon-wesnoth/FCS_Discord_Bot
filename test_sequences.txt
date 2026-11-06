@@ -35801,6 +35801,30 @@ SCENARIO 1034 — A creator-level private template: only its saver and server ad
 ?? ❌ The name `wip` is taken; choose another.
 !template list
 ?! wip`
+!template spawn wip 6 6
+?? ❌ No template `wip` (`!template list`).
+!template give wipgear orc gear2
+?? ❌ There is no partial template `wipgear`.
+!template copy wip bobc
+?? ❌ No template `wip` (`!template list`).
+!template import bobref {"name": "B", "vars": {"hp": 2, "g": {"__template": "wipgear"}}}
+?? ❌ Template `bobref` references `wipgear`, which isn't a partial template
+!as host
+!system set default creator_template_use use
+!as player bob roles=gms
+!template spawn wip 6 6
+?? Spawned `wip` from template `wip`
+!template give wipgear orc gear2
+?? Gave `orc` a `wipgear` at `gear2`.
+!template copy wip bobc
+?? ❌ `wip` is private to its creator: you can spawn it and give it, not copy it.
+!template import bobref {"name": "B", "vars": {"hp": 2, "g": {"__template": "wipgear"}}}
+?? Saved template `bobref`
+!template show wip
+?? ❌ No template `wip` (`!template list`).
+!as host
+!system set default creator_template_use none
+!as player bob roles=gms
 !as host
 !template show wip
 ?? 🔒 private (creator only)
@@ -35840,7 +35864,11 @@ missing template, a reference to `wipgear` reads `(private)` with its data
 left out, `has_template` is False and Tab doesn't offer it. Holding the
 `templates` capability changes nothing: his delete and his level change
 answer as for a missing template, and an import onto the name says the
-name is taken. The administrator reads both (the
+name is taken. Spawning `wip`, giving `wipgear`, copying `wip` and
+importing a template built on `wipgear` answer as for missing ones
+under the default `creator_template_use none` (user call); with `use`
+he spawns, gives and builds on them without reading them (`show` still
+answers as missing) and the copy is refused. The administrator reads both (the
 assert expands `pubg` through `wipgear`). In a channel with a team view
 alice reads as a player, so `wip` is missing there. Lowered to `hosts`,
 bob reads it again while carol, a player, still doesn't. An import may

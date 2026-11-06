@@ -81,8 +81,10 @@ targeting formula needed the same accumulator loop).
 Private vars, private templates, fog, POV filters and formula-text hiding
 exist to preserve an element of mystery for the PLAYERS (user call). They
 need not be airtight, and they need not cover hosts: a server that lets
-someone host already trusts them, so hosts (and the `gm` / `templates`
-roles) read nearly everything. The one host-facing layer is a creator-level
+someone host already trusts them, so hosts (and the `gm`, `templates`,
+`prefabs` and `files` roles, which an administrator grants: a prefab of
+a fogged region, an export or a replay of a fogged match read whole,
+user call V18) read nearly everything. The one host-facing layer is a creator-level
 private template (§7.17), a GM's work in progress, which the user asked
 for. A host's read is refused or trimmed only where PLAYERS would see the
 reply (a team-view channel). When an audit finding is "a player can reach
@@ -2925,7 +2927,12 @@ hardcodes**.
   `templates` / `gm` holder outside a team view); creator level (user
   call, 1034), only its saver and administrators, outside a team view
   (other hosts and the `templates` / `gm` roles don't, and their edits
-  and restores answer as for a missing template). To anyone else it
+  and restores answer as for a missing template). What those others may
+  do with one by name is the rule `creator_template_use` (user call,
+  V20; `_usable_template`, the reference check in `_store_template`):
+  `none` (default), spawn / give / copy / a new reference answer as for
+  a missing template; `use`, they spawn, give and reference it without
+  reading it, and a copy is refused. To anyone else it
   reads as missing in list / show / diff / tags / trash, template_names /
   has_template / template_data and Tab (`_readable_template`,
   `completion._readable_template_names`), and in the edits and restore
