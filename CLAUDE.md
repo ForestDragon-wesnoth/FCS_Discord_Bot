@@ -1349,7 +1349,7 @@ hardcodes**.
   (direction, `turnorder_tiebreak_var` / `_direction` (a GM var such as
   `dex` or `stats.agi`; a unit without a number there goes after), then
   tiebreaker incl. `random_stable`, team grouping, change policy
-  immediate / deferred; under team grouping the tiebreak var also orders
+  live / deferred; under team grouping the tiebreak var also orders
   tied team slots, read on each team's leading member, and a slot against
   a teamless unit, user call, 960). A write to the tiebreak var and a changed
   `turnorder_*` rule (`apply_system_rules`) re-sort it like an initiative
@@ -1357,36 +1357,40 @@ hardcodes**.
   the top of the order, and every change re-sorts at once (no round to
   defer).
 - **One turn a round** (user call, T3; 1037-1041):
-  `turnorder_change_policy` is `deferred` (default: a value change
-  waits for the round wrap), `once_per_round` (re-sort at once) or
-  `immediate` (re-sort at once with no memory, so a unit crossing the
-  pointer gains or loses a turn). Under the first two
-  (`Match._turn_once_per_round`) `Match.round_acted` (serialized, undo
-  state, cleared at each wrap) lists the units that had their turn this
-  round (started one, were skipped, or got it from `!turn set` /
-  `quiet`): `_advance_index` goes to `_next_due_index` (the first unit
-  after the pointer that hasn't acted, else the first before it), wraps
-  only when everyone has, and `_skip_to_eligible` passes over an acted
-  unit the pointer lands on. A future feature granting another turn
-  this round (extra turns, on the feature list) takes the unit out of
-  `round_acted` or goes through `set_turn`, which gives the turn
-  whatever the memory says.
-- **Joining and leaving mid-round** (user call, 1038-1041): under
-  `deferred` a structural rebuild mid-round (`_rebuild_turn_order`
-  without `full`: spawn, revive, death, removal, transform) only drops
-  the gone and places the new, keeping the rest of the round's order;
-  the wrap re-sorts with `full=True`. `turnorder_join_position` places a
-  joiner (`Match._place_joiners`, also after a `once_per_round`
-  re-sort): `after_current` (default) after the turn's slot, before the
-  first unit still to act that the full sort puts after it (so it acts
-  this round, by initiative among those left); `by_initiative` before
-  the first unit the full sort puts after it, counted as acted when that
-  is behind the slot. The slot is the acting unit's; after the acting
-  unit's removal (`turn_vacated` same) the slot's new holder, which a
-  joiner can take; with `wrap`, the end. An order left out of its sorted
-  form sets `_turn_order_dirty`, saved with the match
-  (`turn_order_dirty`), so the wrap re-sorts it ("🔄 turn order
-  re-sorted at round end.") after a restart too.
+  `turnorder_change_policy` is `live` (default) or `deferred`;
+  `immediate` (a re-sort with no memory: a unit crossing the pointer
+  gained or lost a turn) and `once_per_round` (a pointer-forward scan
+  that sent a unit raised past the acting unit to the end of the round)
+  were dropped (user call). Round-based matches
+  (`Match._one_turn_a_round`, all but ATB) keep `Match.round_acted`
+  (serialized, undo state, cleared at each wrap): the units that had
+  their turn this round (started one, were skipped, or got it from
+  `!turn set` / `quiet`). `_advance_index` goes to `_next_due_index`
+  and wraps only when everyone has acted; `_skip_to_eligible` passes
+  over an acted unit. Under `live` (`_live_turns`) the order is
+  re-sorted on every change and the next turn is the FIRST unit of it
+  that hasn't acted, so a haste / slow on a unit still to act, a unit
+  raised past the acting one and a joiner all act this round by
+  initiative among the units left, and a unit `!turn set` jumped over
+  acts next; a removed actor's turn (`turn_vacated` same / wrap) goes the
+  same way (`_advance_index` in next_turn, `_start_current_turn` and the
+  skip loop). Under `deferred` it is the first after the pointer, else
+  the first before it. A future feature granting another turn this
+  round (extra turns, #224) takes the unit out of `round_acted` or goes
+  through `set_turn`, which gives the turn whatever the memory says. A
+  saved enum rule value this build lacks is dropped at load
+  (`GameSystem.from_dict`, a console note), so the default applies.
+- **Joining and leaving under `deferred`** (user call, 1038, 1040): a
+  structural rebuild mid-round (`_rebuild_turn_order` without `full`:
+  spawn, revive, death, removal, transform) only drops the gone and
+  places the new (`Match._place_joiners`): after the turn's slot,
+  before the first unit still to act that the full sort puts after it.
+  The slot is the acting unit's; after the acting unit's removal
+  (`turn_vacated` same) the slot's new holder, which a joiner can take;
+  with `wrap`, the end. An order left out of its sorted form sets
+  `_turn_order_dirty`, saved with the match (`turn_order_dirty`), so the
+  wrap re-sorts it with `full=True` ("🔄 turn order re-sorted at round
+  end.") after a restart too.
 - **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
   unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
   schedules, the turn autosave); under ATB <id>'s bar resets as if it had

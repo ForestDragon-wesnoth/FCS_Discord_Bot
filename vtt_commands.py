@@ -13845,10 +13845,10 @@ registry.annotate_sub(
           "(under ATB its charge bar resets as if it had filled; before "
           "the first turn it starts round 1 at <id>). Skip statuses don't "
           "move the turn past a unit chosen this way, and it takes the "
-          "turn even if it already acted this round; under "
-          "turnorder_change_policy deferred / once_per_round the units "
-          "that haven't acted still get their turns before the round "
-          "wraps. `quiet` only moves the pointer, a silent correction "
+          "turn even if it already acted this round; the units it "
+          "jumped over still get their turns this round (under "
+          "turnorder_change_policy live next, by initiative; under "
+          "deferred after the units ahead). `quiet` only moves the pointer, a silent correction "
           "with no hooks.")
 )
 
