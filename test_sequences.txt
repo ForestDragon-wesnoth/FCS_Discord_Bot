@@ -36235,3 +36235,234 @@ during A's turn and, revived during B's, acts next, ahead of C (1).
 Removed during its own turn, Big hands the turn on; X (8) joins then,
 outranks C and acts first. Round 2 opens with A (10).
 
+
+
+SCENARIO 1042 — !turn forecast under live: the turn under way, the rest of the round with a skip marked, the next round; next_turns in a formula and in $(); bad lengths
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new fc Forecast 12 12
+!match use fc
+!ent add a A 10 1 1 10
+!ent add b B 10 3 1 5
+!ent add big Big 10 5 5 3
+!ent set_vars big footprint_w=2 footprint_h=2
+!ent add c C 10 8 1 1
+!turn forecast
+?? — Round 1 —
+?? 1. `a` **A**
+?? 4. `c` **C**
+?! Round 2
+!turn next
+!turn next
+!status def stun
+!status data stun skips_turn true
+!status apply c stun
+!turn forecast
+?? ➡️ now: `b` **B**
+?? 1. `big` **Big**
+?? 2. `c` **C** — skipped (stun)
+?? — Round 2 —
+?? 6. `c` **C**
+?! 6. `c` **C** — skipped
+!assert "next_turns() == ['big', 'a', 'b', 'big', 'c']"
+!assert "next_turns(2) == ['big']"
+!ent add late Late 10 1 8 20
+!turn forecast 3
+?? 1. `late` **Late**
+?? 2. `big` **Big**
+!assert "get(next_turns(1), 0) == 'late'"
+!roll "$(len(next_turns(4)))"
+?? → **3**
+!system set default turn_forecast_skips all
+!turn forecast
+?? 8. `c` **C** — skipped (stun)
+!system set default turn_forecast_skips none
+!turn forecast 3
+?? 3. `c` **C**
+?! skipped
+!system set default turn_forecast_line_format "{name} ({initiative}, round {round})"
+!turn forecast 1
+?? 1. Late (20, round 1)
+!turn forecast 0
+?? ❌ A forecast needs at least 1 turn.
+!turn forecast x
+?? ❌ `x` isn't a number of turns.
+!turn forecast 101
+?? ❌ A forecast lists at most 100 turns (owner limit turn_forecast_limit).
+!eval "next_turns(1.5)"
+?? whole number
+!turn next
+?? It is now **Late**'s turn
+HARNESS-ALLOWS-ERRORS
+
+Expected: before the first turn the forecast lists round 1 (A, B, the
+2x2 Big, C) and stops there. During B's turn, with C stunned, it shows
+the turn under way, the rest of round 1 with C's turn marked skipped
+(turn_forecast_skips `next`: only its next turn), then round 2 in full,
+the default length. next_turns leaves out the turn under way and the
+skipped one. Late (initiative 20) joining is forecast to act next, as
+`live` runs it. `$()` reads next_turns. Under `all` every turn of C is
+marked; under `none` none is. turn_forecast_line_format words each
+line. A length of 0, a word or one past turn_forecast_limit is refused,
+as is a fraction in next_turns.
+
+SCENARIO 1043 — The forecast against the turns that follow: deferred with a pending change and a joiner, then random_stable ties reshuffling each round
+------------------------------------------------------------------------------------------------------------------------------------------------------
+!system set default turnorder_change_policy deferred
+!match new fd FDef 12 12
+!match use fd
+!ent add a A 10 1 1 10
+!ent add b B 10 3 1 5
+!ent add c C 10 5 1 1
+!eval "match_var_set('seen', [])"
+!gpassive add log on_turn_start "match_var_set('seen', match_var_get('seen') + [self])"
+!turn next
+!turn next
+!ent init a 0
+!ent add late Late 10 1 8 20
+!turn forecast
+?? 1. `late` **Late**
+?? 2. `c` **C**
+?? — Round 2 —
+?? 3. `late` **Late**
+?? 6. `a` **A**
+!eval "match_var_set('want', next_turns(8))"
+!eval "match_var_set('seen', [])"
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!assert "match_var_get('seen') == match_var_get('want')"
+!system set default turnorder_tiebreaker random_stable
+!system set default turnorder_change_policy live
+!match new fr FRand 12 12
+!match use fr
+!ent add a A 10 1 1 5
+!ent add b B 10 2 1 5
+!ent add c C 10 3 1 5
+!ent add d D 10 4 1 5
+!ent add e E 10 5 1 5
+!eval "match_var_set('seen', [])"
+!gpassive add log on_turn_start "match_var_set('seen', match_var_get('seen') + [self])"
+!eval "match_var_set('want', next_turns(15))"
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!assert "match_var_get('seen') == match_var_get('want')"
+!assert "take(match_var_get('seen'), 5) != slice(match_var_get('seen'), 5, 10) or slice(match_var_get('seen'), 5, 10) != slice(match_var_get('seen'), 10, 15)"
+
+Expected: under `deferred`, during B's turn A drops to 0 (stashed) and
+Late (20) joins after B. The forecast shows the rest of round 1 in its
+frozen order (Late, C) and round 2 re-sorted with A's 0 (Late, B, C,
+A). A global passive logs every turn start: the next 8 turns run
+exactly as next_turns(8) predicted them. Under `random_stable` with
+five tied units, the round wrap now re-sorts the ties with the new
+round's number (it used to keep round 1's order until something
+changed the order); the 15 turns of three rounds run as forecast, and
+the rounds don't all come out in one order.
+
+SCENARIO 1044 — The forecast through a team view: a hidden unit's turn left out or shown as text; next_turns sees every unit
+-------------------------------------------------------------------------------------------------------------------------
+!match new fv FView 8 8
+!match use fv
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or not status_has(self, 'invisible')"
+!ent add hero Hero 30 1 1 9
+!ent set_var hero team red
+!ent add sneak Sneak 20 5 5 6
+!ent set_var sneak team blue
+!ent status sneak add invisible
+!ent add brute Brute 25 3 3 3
+!ent set_var brute team blue
+!turn next
+!as view red
+!turn forecast
+?? ➡️ now: `hero` **Hero**
+?? 1. `brute` **Brute**
+?! sneak
+?! out of sight
+!system set default turn_forecast_hidden_units text
+!turn forecast
+?? 1. (a unit out of sight)
+?? 2. `brute` **Brute**
+?! sneak
+!system set default turn_forecast_hidden_text "❓ someone"
+!turn forecast 1
+?? 1. ❓ someone
+!as player pia
+!turn forecast 1
+?? Turn forecast
+?! approval
+!as host
+!as view omniscient
+!turn forecast 1
+?? 1. `sneak` **Sneak**
+!assert "next_turns(2) == ['sneak', 'brute']"
+
+Expected: from red's view the invisible Sneak's turn is left out of
+the forecast by default (turn_forecast_hidden_units `omit`), and the
+numbers count only the turns shown, so no gap gives it away. Under `text` its turn shows
+turn_forecast_hidden_text, which a system can reword. The omniscient
+view names it, and next_turns, a formula, sees every unit. A player
+reads the forecast without a host's approval.
+
+SCENARIO 1045 — The ATB forecast: a number needed, the estimate warning every time, the predicted turns run as forecast
+--------------------------------------------------------------------------------------------------------------------
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].spd"
+!match new fa FAtb 8 8
+!match use fa
+!ent add q Quick 10 1 1 1
+!ent set_var q spd 30
+!ent add s Slow 10 3 1 1
+!ent set_var s spd 10
+!ent add m Mid 10 5 1 1
+!ent set_var m spd 20
+!turn forecast
+?? ❌ Under ATB a forecast needs a number of turns
+!turn forecast 6
+?? Turn forecast (ATB):
+?? 1. `q` **Quick**
+?? ⚠️ Under ATB this is an estimate from the charge rates as they stand: actions, rate changes and skipped turns change the turn order.
+?! Round
+!eval "match_var_set('seen', [])"
+!gpassive add log on_turn_start "match_var_set('seen', match_var_get('seen') + [self])"
+!eval "match_var_set('want', next_turns(6))"
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!assert "match_var_get('seen') == match_var_get('want')"
+!turn forecast 2
+?? ➡️ now:
+?? ⚠️ Under ATB this is an estimate
+!system set default atb_reset_formula "entity[self].atb_charge = 0"
+!turn forecast 1
+?? this system's atb_reset_formula may differ
+!eval "next_turns()"
+?? needs a number of turns
+HARNESS-ALLOWS-ERRORS
+
+Expected: under ATB the forecast refuses a missing number (bars never
+wrap into rounds) and every forecast carries the estimate warning; it
+lists no rounds. Six turns run exactly as next_turns(6) predicted
+(Quick charging three times as fast as Slow acts most). Once a turn is
+under way it is listed as now. A custom atb_reset_formula adds a note
+that the forecast resets bars by subtracting the threshold.
+next_turns() without a number is refused under ATB too.

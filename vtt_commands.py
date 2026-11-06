@@ -203,6 +203,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "tile":       frozenset({"list", "info"}),
     "watch":      frozenset({"list"}),
     "zone":       frozenset({"list", "info", "cells"}),
+    "turn":       frozenset({"forecast"}),
 }
 # `dump` is intentionally NOT in the set above: `!ent dump` reveals an
 # entity's full var tree (including GM-hidden data), so it stays host-
@@ -13803,6 +13804,8 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # output first, whose turn it now is last.
         lines = list(fire_log) + ([now] if now else [])
         return await ctx.send("\n".join(lines) if lines else "✅")
+    if sub == "forecast":
+        return await ctx.send(_turn_forecast_text(ctx, m, args[1:]))
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 2, "turn", "set"):
             return
@@ -13828,6 +13831,56 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("\n".join(lines))
     # Fallback: show authoritative help
     return await _help_fallback(ctx, ["turn"], args[0] if args else None)
+def _turn_forecast_text(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
+    """`!turn forecast [n]`: Match.turn_forecast through the channel's
+    view (turn_forecast_hidden_units)."""
+    n = None
+    if rest:
+        try:
+            n = int(rest[0])
+        except ValueError:
+            raise VTTError(f"`{rest[0]}` isn't a number of turns.")
+    entries, notes = m.turn_forecast(n)
+    pov = _query_pov(ctx, m)
+    hidden_mode = m.rules.get("turn_forecast_hidden_units", "omit")
+    hidden_text = str(m.rules.get("turn_forecast_hidden_text", "") or "")
+    fmt = str(m.rules.get("turn_forecast_line_format", "") or "") \
+        or "`{short_id}` **{name}**"
+    atb = bool(m.rules.get("atb_enabled"))
+    lines: List[str] = []
+    last_round = None
+    k = 0
+    for ent in entries:
+        eid = ent["eid"]
+        e = m.entities.get(eid)
+        if e is None:
+            continue
+        hidden = _pov_hides(m, pov, eid)
+        if hidden and hidden_mode != "text":
+            # Left out whole: no number or round break gives it away.
+            continue
+        if not ent["now"]:
+            k += 1
+        if ent["round"] is not None and ent["round"] != last_round:
+            last_round = ent["round"]
+            lines.append(f"— Round {last_round} —")
+        mark = "➡️ now:" if ent["now"] else f"{k}."
+        if hidden:
+            lines.append(f"{mark} {hidden_text}")
+            continue
+        tctx = _entity_template_context(e, pov)
+        tctx.update({"short_id": eid[:8],
+                     "round": "" if ent["round"] is None else ent["round"]})
+        line = f"{mark} {_render_template(fmt, tctx)}"
+        if ent["skip"]:
+            line += f" — skipped ({', '.join(ent['skip'])})"
+        lines.append(line)
+    head = "Turn forecast" + (" (ATB)" if atb else
+                              f" ({m._turn_policy()} turn order)") + ":"
+    body = "\n".join(lines) or "(no turns to forecast)"
+    return "\n".join([head, body] + notes)
+
+
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "turn", "next",
@@ -13835,6 +13888,22 @@ registry.annotate_sub(
     desc=("Advance to the next entity's turn. When the cycle wraps "
           "(every entity has acted), increments the match's round_number "
           "and fires on_round_end / on_round_start hooks.")
+)
+registry.annotate_sub(
+    "turn", "forecast",
+    usage="!turn forecast [n]",
+    desc=("The coming turns as the rules would run them from the board "
+          "as it stands: the turn under way, then the next [n] turns "
+          "(default: to the end of the next round; under ATB a number is "
+          "needed), with round breaks. It follows "
+          "turnorder_change_policy (live: the units still to act by "
+          "initiative; deferred: this round's frozen order) and assumes "
+          "no initiative changes and no unit joining or leaving. A unit "
+          "holding a skips_turn status is marked per turn_forecast_skips; "
+          "a unit this channel's view can't see is left out or shown as "
+          "turn_forecast_hidden_text (turn_forecast_hidden_units). Under "
+          "ATB it extends the charge bars at their rates now, an "
+          "estimate. The formula function next_turns gives the ids.")
 )
 registry.annotate_sub(
     "turn", "set",

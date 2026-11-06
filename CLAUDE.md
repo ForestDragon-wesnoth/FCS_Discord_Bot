@@ -1393,6 +1393,34 @@ hardcodes**.
   `_turn_order_dirty`, saved with the match (`turn_order_dirty`), so the
   wrap re-sorts it with `full=True` ("🔄 turn order re-sorted at round
   end.") after a restart too.
+- **Turn forecast** (#131 / #27, user design, 1042-1045): `!turn
+  forecast [n]` (players read it) and `next_turns(n=None)` (read-only,
+  loopable, sees every unit) over `Match.turn_forecast`: the turn under
+  way, then n upcoming turns as the rules would run them from the board
+  as it stands (no initiative change, no unit joining or leaving): under
+  `live` the units still to act in sorted order, under `deferred` the
+  frozen order (pointer forward, then units `!turn set` jumped over),
+  then each later round (`_sorted_turn_ids(round)` where the wrap would
+  re-sort: a pending change, or `random_stable`, re-sorted per round).
+  Default length: to the end of the next round (round 1 before the first
+  turn); at most the owner limit `turn_forecast_limit` (100). Under ATB
+  (`_atb_forecast`) n is required and the bars are extended at their
+  rates now, resetting by the threshold; every ATB forecast carries an
+  estimate warning (user call), plus a note when atb_reset_formula is
+  custom. Rules: `turn_forecast_skips` (next default / all / none: which
+  turns of a unit holding a skips_turn status are marked skipped;
+  next_turns leaves marked turns out), `turn_forecast_hidden_units`
+  (omit default / text, with `turn_forecast_hidden_text`: a turn the
+  channel's view can't see; the numbers count only lines shown),
+  `turn_forecast_line_format`. A random-board differential of forecast
+  against the turns that followed (both policies, every tiebreaker, team
+  grouping, joins, removals of the actor, `!turn set`, ATB) matched
+  1500 / 1500.
+- **`random_stable` reshuffles each round:** the round wrap re-sorts the
+  order when a change is pending OR the tiebreaker is `random_stable`
+  (`_reshuffles_each_round`), after `round_number` goes up, so ties use
+  the new round's seed (before, a round kept the last order until
+  something changed it).
 - **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
   unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
   schedules, the turn autosave); under ATB <id>'s bar resets as if it had

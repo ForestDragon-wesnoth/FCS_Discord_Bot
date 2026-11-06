@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14, parts of #190 (Discord-role
@@ -83,7 +83,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#124 Initiative reroll every round.** A rule that re-runs #59's formula at each round start.
 - **#128 `!whisper <team> <text>`.** A host posts to every channel bound with that team's POV (handouts, secret info).
 - **#129 `!ent export <id>` / `!ent import <json>`.** A unit with its parts as JSON pasted in chat, to share between matches or bots without file access. Import goes through the template checks.
-- **#131 `!turn order [n]`.** The next n turns in round mode with skips marked; the round-mode twin of #27. The user wants it (a turn queue forecast, as in FFX or Octopath Traveler): under turnorder_change_policy `live` the units still to act in sorted order, then the next round; under `deferred` this round's order, then the re-sorted one. Open: how far to predict skip statuses whose duration a GM tick counts down.
 - **#133 `!map around=<eid> [r]`.** A one-off window centered on a unit; the channel camera stays where it is.
 - **#134 `!history note <text>`.** Labels the latest snapshot, so `!history list` and undo previews say what it was.
 - **#135 Pending-request expiry rule.** A queued player command expires after N minutes, so a stale request can't be approved hours later.
@@ -321,7 +320,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - NCS: block, then resistances up to 50%, then weaknesses.
   - An ordered list of GM formulas per system fits all three; #216 makes each step readable.
 - **#26 Ready / delay a turn.** `!turn delay <after_eid>` moves the current unit to act after another unit this round.
-- **#27 ATB turn forecast.** `!turn forecast 8` lists the next eight turns; bare `!turn` shows each unit's charge %.
 - **#28 Player-controlled units.** A `controllers` list on a unit; a player's commands on their own unit skip approval.
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
     - A `controllers` list per unit (user ids; `!ent control <eid> <@player ...> | clear`). Saved with the unit, stripped from templates and transfers like other identity data.

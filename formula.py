@@ -2906,7 +2906,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # (1-based); turn_index() -> 0-based position of the acting entity
     # in the round's turn order. For cadence checks ('every N rounds',
     # 'first turn of the round') and round-measured cooldowns.
-    "round_number", "turn_index", "turns_elapsed",
+    "round_number", "turn_index", "turns_elapsed", "next_turns",
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
     "atb_threshold", "atb_rate",
@@ -3123,8 +3123,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'team_sees_entity', 'team_sees_entity_losonly',
     'team_sees_entity_rangeonly', 'tile_get', 'tile_has', 'tile_keys',
     'tile_template_of', 'tile_facing', 'zone_facing',
-    'turn_index', 'turns_elapsed', 'var_count', 'var_get', 'var_has',
-    'var_has_key',
+    'turn_index', 'turns_elapsed', 'next_turns', 'var_count', 'var_get',
+    'var_has', 'var_has_key',
     'var_keys', 'var_max_key', 'var_min_key', 'var_pick_random',
     'var_sum', 'var_sum_field', 'zone_anchor_of', 'zone_cells',
     'zone_exists', 'zone_get', 'zone_has', 'zone_keys', 'zone_names',
@@ -3330,7 +3330,7 @@ _HOF_FUNCS: "frozenset[str]" = frozenset({"map_with", "filter_with", "sort_by"})
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
-    "prefab_names", "size_categories",
+    "prefab_names", "size_categories", "next_turns",
     "range",
     "each",
     "keys",
@@ -9019,6 +9019,27 @@ class FormulaEngine:
             >= 3`."""
             return int(match.turns_elapsed)
         ns["turns_elapsed"] = _turns_elapsed
+
+        def _next_turns(n=None) -> List[str]:
+            """next_turns(n=None): the ids of the next n turns as the turn
+            forecast predicts them (`!turn forecast`): the board as it
+            stands, nobody's initiative changing. Leaves out the turn under
+            way and turns the turn_forecast_skips rule marks as skipped;
+            sees every unit, fog or not. n defaults to the end of the next
+            round (before the first turn, round 1); under ATB n is
+            required. Example: the unit acting after me ->
+            `get(next_turns(1), 0)`."""
+            if n is not None and (isinstance(n, bool)
+                                  or not isinstance(n, int)):
+                raise FormulaError("next_turns(n): n must be a whole "
+                                   "number of turns.")
+            try:
+                entries, _notes = match.turn_forecast(n)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            return [ent["eid"] for ent in entries
+                    if not ent["now"] and not ent["skip"]]
+        ns["next_turns"] = _next_turns
 
         def _turn_index() -> int:
             """turn_index(): the 0-based position of the acting entity

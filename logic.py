@@ -5138,6 +5138,49 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "nothing). Empty = no line."
         ),
     },
+    "turn_forecast_line_format": {
+        "default": "`{short_id}` **{name}**",
+        "schema": {"type": "str"},
+        "desc": (
+            "How `!turn forecast` names each unit in its list (the unit "
+            "placeholders of turn_start_message_format, `{short_id}` and "
+            "`{round}`, the round of that turn, empty under ATB)."
+        ),
+    },
+    "turn_forecast_skips": {
+        "default": "next",
+        "schema": {"type": "enum", "choices": ["next", "all", "none"]},
+        "desc": (
+            "How the turn forecast (`!turn forecast`, next_turns) treats a "
+            "unit holding a skips_turn status. The engine can't know when "
+            "a GM's tick removes the status, so: 'next' (default) marks "
+            "only the unit's next forecast turn as skipped and assumes "
+            "nothing after it; 'all' marks every forecast turn of it as "
+            "skipped; 'none' ignores skip statuses. A turn marked skipped "
+            "still takes its place in the forecast, and next_turns leaves "
+            "it out."
+        ),
+    },
+    "turn_forecast_hidden_units": {
+        "default": "omit",
+        "schema": {"type": "enum", "choices": ["omit", "text"]},
+        "desc": (
+            "How `!turn forecast` shows a turn of a unit the channel's view "
+            "can't see: 'omit' (default) leaves the turn out, as bare "
+            "`!turn` does; 'text' shows turn_forecast_hidden_text in its "
+            "place, so players learn that something unseen acts then. "
+            "next_turns, a formula function, sees every unit."
+        ),
+    },
+    "turn_forecast_hidden_text": {
+        "default": "(a unit out of sight)",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line `!turn forecast` shows for a hidden unit's turn under "
+            "turn_forecast_hidden_units 'text' (no placeholders: it names "
+            "nothing)."
+        ),
+    },
     "death_message_format": {
         "default": "💀 **{name}** (`{id}`) died.",
         "schema": {"type": "str"},
@@ -8019,6 +8062,12 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
                 "per-unit (`each`) watcher's units and every watcher units "
                 "hold counted together (~1 ms each); past it the rest keep "
                 "their state until the next command, with a warning.",
+    },
+    "turn_forecast_limit": {
+        "default": 100, "min": 1, "max": 10000,
+        "desc": "How many upcoming turns one turn forecast (`!turn "
+                "forecast`, next_turns) may list; a longer forecast is cut "
+                "there with a note.",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -17480,37 +17529,12 @@ class Match:
         self._rng = None
         self._rng_seed = None
 
-    def _rebuild_turn_order(self, full: bool = False):
-        """Sort the alive, initiative-bearing entities into `self.turn_order`
-        according to the active rules. Preserves the currently-acting
-        entity's identity: if they're still eligible, active_index points
-        at their new position. Clears the deferred-rebuild flag.
-
-        Five rules drive this:
-          - turnorder_direction       (highest_first | lowest_first)
-          - turnorder_team_grouping   (none | highest_per_team | average_per_team)
-          - turnorder_teamless_position (interleaved | first | last)
-          - turnorder_tiebreaker      (name | id | insertion_order | random_stable)
-          - turnorder_change_policy   handled OUTSIDE this method by
-                                      _mark_turn_order_dirty; once we
-                                      get here we just rebuild.
-
-        Structural rebuilds (spawn / remove / death / revive) call this
-        directly because membership changes can't usefully be deferred —
-        a dead entity sitting in turn_order would otherwise still take
-        turns. Mid-round under 'deferred' (and without `full`) such a
-        rebuild only drops the gone units and places the joiners
-        (`_place_joiners`); the round wrap re-sorts with full=True.
-        Value-driven rebuilds (init/team writes from formulas or the !ent
-        initiative command) route through _mark_turn_order_dirty so they
-        respect the policy rule.
-        """
-        prev_current_id = None
-        if 0 <= self.active_index < len(self.turn_order):
-            prev_current_id = self.turn_order[self.active_index]
-        prev_list = list(self.turn_order)
-        prev_order = set(prev_list)
-
+    def _sorted_turn_ids(self, round_no: Optional[int] = None) -> List[str]:
+        """The alive, initiative-bearing units sorted by the turnorder_*
+        rules (see _rebuild_turn_order), as ids, without touching the
+        order. `round_no` seeds the random_stable tiebreaker (default: the
+        round now), so the turn forecast can sort a later round."""
+        rn = self.round_number if round_no is None else round_no
         candidates = [
             e for e in self.entities.values()
             if e.initiative is not None and e.is_alive
@@ -17543,7 +17567,7 @@ class Match:
                 # another id. Using a hash of the seed + entity id keeps
                 # it deterministic without needing a stored permutation.
                 import hashlib
-                seed = f"{self._tie_salt()}:{self.round_number}:{e.id}"
+                seed = f"{self._tie_salt()}:{rn}:{e.id}"
                 return (hashlib.sha256(seed.encode()).hexdigest(),)
             # default 'name'
             return (e.name.lower(), e.id)
@@ -17573,7 +17597,7 @@ class Match:
 
         if grouping == "none":
             ordered = sorted(candidates, key=member_key)
-            self.turn_order = [e.id for e in ordered]
+            result = [e.id for e in ordered]
         else:
             # Partition into teamed groups and teamless. team_var on
             # Entity already returns None for "no team" (absent or
@@ -17613,7 +17637,7 @@ class Match:
                     return (earliest, team_name)
                 if tiebreaker == "random_stable":
                     import hashlib
-                    seed = (f"{self._tie_salt()}:{self.round_number}:"
+                    seed = (f"{self._tie_salt()}:{rn}:"
                             f"team:{team_name}")
                     return (hashlib.sha256(seed.encode()).hexdigest(),)
                 return (team_name.lower(), team_name)
@@ -17667,7 +17691,42 @@ class Match:
                     ))
                 interleaved_entries.sort(key=lambda t: (t[0], t[1]))
                 ordered = [m for _, _, members, _ in interleaved_entries for m in members]
-            self.turn_order = [e.id for e in ordered]
+            result = [e.id for e in ordered]
+
+        return result
+
+    def _rebuild_turn_order(self, full: bool = False):
+        """Sort the alive, initiative-bearing entities into `self.turn_order`
+        according to the active rules. Preserves the currently-acting
+        entity's identity: if they're still eligible, active_index points
+        at their new position. Clears the deferred-rebuild flag.
+
+        Five rules drive this:
+          - turnorder_direction       (highest_first | lowest_first)
+          - turnorder_team_grouping   (none | highest_per_team | average_per_team)
+          - turnorder_teamless_position (interleaved | first | last)
+          - turnorder_tiebreaker      (name | id | insertion_order | random_stable)
+          - turnorder_change_policy   handled OUTSIDE this method by
+                                      _mark_turn_order_dirty; once we
+                                      get here we just rebuild.
+
+        Structural rebuilds (spawn / remove / death / revive) call this
+        directly because membership changes can't usefully be deferred —
+        a dead entity sitting in turn_order would otherwise still take
+        turns. Mid-round under 'deferred' (and without `full`) such a
+        rebuild only drops the gone units and places the joiners
+        (`_place_joiners`); the round wrap re-sorts with full=True.
+        Value-driven rebuilds (init/team writes from formulas or the !ent
+        initiative command) route through _mark_turn_order_dirty so they
+        respect the policy rule.
+        """
+        prev_current_id = None
+        if 0 <= self.active_index < len(self.turn_order):
+            prev_current_id = self.turn_order[self.active_index]
+        prev_list = list(self.turn_order)
+        prev_order = set(prev_list)
+
+        self.turn_order = self._sorted_turn_ids()
 
         # Before the first turn nobody is acting yet, so the order's top
         # opens the match. Keeping the pointer on whoever happened to be
@@ -17750,6 +17809,159 @@ class Match:
             self.active_index = order.index(anchor_id)
         else:
             self.active_index = 0
+
+    def turn_forecast(self, n: Optional[int] = None
+                      ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """The coming turns as the rules would run them from the board as
+        it stands (nobody's initiative changing, no unit joining or
+        leaving): a list of {eid, round, now, skip} entries (`now` = the
+        turn under way, listed first and not counted in `n`; `skip` = the
+        skip statuses the turn_forecast_skips rule marks it with; `round`
+        None under ATB) and notes for the reader. Round mode follows the
+        turn policy: under 'live' the units still to act in sorted order,
+        under 'deferred' this round's frozen order (forward from the
+        pointer, then units `!turn set` jumped over), then each later
+        round's order (re-sorted at the wrap when a change is pending or
+        the tiebreaker is random_stable, sorted with that round's
+        number). `n` upcoming turns; None = to the end of the next round
+        (before the first turn, round 1). ATB needs `n`: it extends the
+        charge bars at their rates now. Read-only."""
+        limit = owner_limit("turn_forecast_limit")
+        notes: List[str] = []
+        if n is not None:
+            n = int(n)
+            if n < 1:
+                raise VTTError("A forecast needs at least 1 turn.")
+            if n > limit:
+                raise VTTError(
+                    f"A forecast lists at most {limit} turns "
+                    f"(owner limit turn_forecast_limit).")
+        if self.rules.get("atb_enabled"):
+            if n is None:
+                raise VTTError(
+                    "Under ATB a forecast needs a number of turns: the bars "
+                    "never wrap into rounds.")
+            return self._atb_forecast(n, notes)
+        out: List[Dict[str, Any]] = []
+        order = list(self.turn_order)
+        if not order:
+            return out, notes
+        acted = set(self.round_acted)
+        live = self._turn_policy() == "live"
+        rnd = self.round_number
+
+        def due(ptr: int) -> Optional[int]:
+            idx = range(len(order)) if live else (
+                list(range(ptr + 1, len(order))) + list(range(0, ptr + 1)))
+            return next((j for j in idx if order[j] not in acted), None)
+
+        upcoming: List[Tuple[int, str]] = []
+        ptr = min(max(self.active_index, 0), len(order) - 1)
+        if not self.round_started:
+            upcoming.append((rnd, order[ptr]))
+            acted.add(order[ptr])
+        elif self.turn_vacated is None:
+            out.append({"eid": order[ptr], "round": rnd, "now": True,
+                        "skip": []})
+            acted.add(order[ptr])
+        elif self.turn_vacated == "wrap":
+            ptr = len(order) - 1
+        elif not live and order[ptr] not in acted:
+            # "same": the unit holding the gone actor's slot goes next.
+            upcoming.append((rnd, order[ptr]))
+            acted.add(order[ptr])
+        while True:
+            d = due(ptr)
+            if d is None:
+                break
+            upcoming.append((rnd, order[d]))
+            acted.add(order[d])
+            ptr = d
+        want = n
+        if want is None:
+            # To the end of the next round (round 1 before the first turn).
+            want = len(upcoming) + (len(order) if self.round_started else 0)
+        cut = want > limit
+        want = min(want, limit)
+        prev = order
+        r = rnd
+        while len(upcoming) < want:
+            r += 1
+            if self._turn_order_dirty and r == rnd + 1 \
+                    or self._reshuffles_each_round():
+                prev = self._sorted_turn_ids(r)
+            upcoming.extend((r, eid) for eid in prev)
+            if not prev:
+                break
+        if cut:
+            notes.append(f"Cut at {limit} turns (owner limit "
+                         f"turn_forecast_limit).")
+        for r, eid in upcoming[:want]:
+            out.append({"eid": eid, "round": r, "now": False, "skip": []})
+        self._mark_forecast_skips(out)
+        return out, notes
+
+    def _mark_forecast_skips(self, out: List[Dict[str, Any]]) -> None:
+        mode = self.rules.get("turn_forecast_skips", "next")
+        if mode == "none":
+            return
+        seen: set = set()
+        for ent in out:
+            if ent["now"]:
+                continue
+            e = self.entities.get(ent["eid"])
+            if e is None or (mode == "next" and ent["eid"] in seen):
+                continue
+            seen.add(ent["eid"])
+            ent["skip"] = sorted(self._skipping_statuses(e))
+
+    def _atb_forecast(self, n: int, notes: List[str]
+                      ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """The next `n` ATB turns: every chargeable unit's bar extended at
+        its rate now to the soonest fill (ties: higher rate, then id, as
+        _atb_select), the actor's bar then losing the threshold."""
+        notes.append(
+            "⚠️ Under ATB this is an estimate from the charge rates as they "
+            "stand: actions, rate changes and skipped turns change the "
+            "turn order.")
+        if str(self.rules.get("atb_reset_formula", "")).strip():
+            notes.append("⚠️ The forecast resets a bar by subtracting the "
+                         "threshold; this system's atb_reset_formula may "
+                         "differ.")
+        out: List[Dict[str, Any]] = []
+        thr = self._atb_threshold_value()
+        bars: Dict[str, List[float]] = {}
+        for eid in self.turn_order:
+            e = self.entities.get(eid)
+            if e is None or not e.is_alive:
+                continue
+            rate = self._atb_charge_rate(e)
+            if rate > 0:
+                bars[eid] = [self._atb_charge(e), rate]
+        if (self.round_started and self.turn_vacated is None
+                and 0 <= self.active_index < len(self.turn_order)):
+            out.append({"eid": self.turn_order[self.active_index],
+                        "round": None, "now": True, "skip": []})
+        if not bars:
+            notes.append("No unit has a positive charge rate: no one acts.")
+            return out, notes
+        for _ in range(n):
+            pick = min(bars.items(), key=lambda kv: (
+                max(0.0, (thr - kv[1][0]) / kv[1][1]), -kv[1][1], kv[0]))
+            t = max(0.0, (thr - pick[1][0]) / pick[1][1])
+            for v in bars.values():
+                v[0] += v[1] * t
+            pick[1][0] -= thr
+            out.append({"eid": pick[0], "round": None, "now": False,
+                        "skip": []})
+        self._mark_forecast_skips(out)
+        return out, notes
+
+    def _reshuffles_each_round(self) -> bool:
+        """Whether a new round re-sorts the order on its own: the
+        random_stable tiebreaker reshuffles ties per round (seeded by the
+        round number, also for tied team slots)."""
+        return self.rules.get("turnorder_tiebreaker") == "random_stable"
 
     def _turn_policy(self) -> str:
         """turnorder_change_policy: 'deferred', else 'live'."""
@@ -18469,19 +18681,21 @@ class Match:
             log.extend(self.fire_status_tick("round_end"))
             log.extend(self.fire_tile_time_hooks("on_round_end"))
             log.extend(self.fire_zone_time_hooks("on_round_end"))
-            # Flush any deferred turn-order rebuild between on_round_end
-            # (ran against the OLD order) and on_round_start (sees the
-            # NEW order). Round-wrap naturally restarts at the top.
-            if self._turn_order_dirty:
-                self._rebuild_turn_order(full=True)
-                log.append(
-                    "🔄 turn order re-sorted at round end."
-                )
-                new_index = 0
         self.active_index = new_index
         if wrapped:
             self.round_acted = []
             self.round_number += 1
+            # Flush any deferred turn-order rebuild between on_round_end
+            # (ran against the OLD order) and on_round_start (sees the
+            # NEW order), with the new round's number: random_stable ties
+            # reshuffle each round, as its rule says. The new round starts
+            # at the top.
+            if self._turn_order_dirty:
+                self._rebuild_turn_order(full=True)
+                log.append("🔄 turn order re-sorted at round end.")
+            elif self._reshuffles_each_round():
+                self._rebuild_turn_order(full=True)
+            self.active_index = 0
             line = self.round_start_line()
             if line:
                 log.append(line)
