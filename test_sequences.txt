@@ -36137,7 +36137,7 @@ SCENARIO 1040 — Joining mid-round: after a removed actor, a revived 2x2 body, 
 !turn next
 ?? It is now **X**'s turn
 !ent init a 0
-?? deferred
+?? ⏳ turn order change deferred (`a`.initiative: 10 → 0). New order takes effect at round end.
 !as restart
 !match use jd
 !turn next

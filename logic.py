@@ -17835,20 +17835,12 @@ class Match:
         # Before the first turn no round is under way: nothing to defer,
         # and setting up initiatives must re-sort at once.
         if policy == "deferred" and self.round_started:
-            if not self._turn_order_dirty:
-                # First defer this round — explain the policy once so
-                # the GM doesn't think the change was dropped.
-                self._var_event_warnings.append(
-                    f"⏳ turn order change deferred ({reason}). "
-                    f"New order takes effect at round end."
-                )
-            else:
-                # Subsequent changes during the same deferred window —
-                # just note the reason; the policy was already
-                # surfaced by the first warning.
-                self._var_event_warnings.append(
-                    f"⏳ turn order change deferred: {reason}."
-                )
+            # Every deferred change says when it lands: a joiner placed
+            # mid-round may already have marked the order for the round
+            # end, so "first change this round" can't pick the wording.
+            self._var_event_warnings.append(
+                f"⏳ turn order change deferred ({reason}). "
+                f"New order takes effect at round end.")
             self._turn_order_dirty = True
             return
         # 'immediate' / 'once_per_round': rebuild now (the second passes
