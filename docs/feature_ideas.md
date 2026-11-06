@@ -151,6 +151,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - `grant_turn(eid)` (and `!turn grant <eid>`) inserts one extra turn for `eid` right after the current one. An option says whether its turn-start passives and status ticks run (default: passives yes, ticks no, so a bonus turn doesn't burn twice). Under ATB the unit acts next and its charge bar is untouched.
   - The game need: NCS's planned Agility Potion ("gain an instant bonus turn").
   - Today `turn set` restarts the turn and re-runs everything (L11).
+  - With turnorder_change_policy `deferred` it also covers "jump, then jump back" (user): a unit takes a turn out of order and play then resumes where it was. `!turn set` under `deferred` deliberately sends the units it jumped over after the units ahead, since some games skip over units on purpose.
 - **#225 `schedule_on` counting skipped turns.**
   - `schedule_on(eid, delay, body, name, count_skipped=False)`, or a rule. With it on, a stunned or charging unit's delayed effect counts the turns it skips, as status ticks already do.
   - Today the delay waits for turns the unit actually starts (L12), so a charged action built from a `skips_turn` status plus `schedule_on` never fires (`fcs1b.out`: still charging after four rounds).

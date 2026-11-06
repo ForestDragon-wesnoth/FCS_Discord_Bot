@@ -1375,7 +1375,9 @@ hardcodes**.
   acts next; a removed actor's turn (`turn_vacated` same / wrap) goes the
   same way (`_advance_index` in next_turn, `_start_current_turn` and the
   skip loop). Under `deferred` it is the first after the pointer, else
-  the first before it. A future feature granting another turn this
+  the first before it, so units `!turn set` jumped over act after the
+  units ahead (user call: jumping over is a mechanic some games want; a
+  "jump, then jump back" belongs to extra turns, #224). A future feature granting another turn this
   round (extra turns, #224) takes the unit out of `round_acted` or goes
   through `set_turn`, which gives the turn whatever the memory says. A
   saved enum rule value this build lacks is dropped at load
