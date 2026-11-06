@@ -20755,11 +20755,19 @@ class Match:
         hidden = private_template_names(lib, viewer)
         if hidden:
             # A reader who may not read a private partial resolves it as
-            # one with no data (V19).
-            return {n: ({"kind": "partial", "data": {}}
+            # one with no data (V19); built once per command and viewer.
+            cache = PARTIAL_CACHE.get()
+            key = ("__reader_library", id(lib), len(lib), viewer)
+            got = cache.get(key) if cache is not None else None
+            if got is not None and got[0] is lib:
+                return got[1]
+            view = {n: ({"kind": "partial", "data": {}}
                         if n in hidden and isinstance(t, dict)
                         and t.get("kind") == "partial" else t)
                     for n, t in lib.items()}
+            if cache is not None:
+                cache[key] = (lib, view)
+            return view
         return lib
 
     def partial_data(self, name: str) -> Optional[Dict[str, Any]]:
@@ -25037,8 +25045,12 @@ class Match:
         if dis is not None:
             return self._legend_value(dis.get("legend"),
                                       self.entity_display_name(e, pov_team))
-        return self._legend_value(e.vars.get("legend"),
-                                  self.entity_display_name(e, pov_team))
+        val = e.vars.get("legend")
+        if val is not None and VAR_READER.get() is not None:
+            # A private `legend` var labels nothing for a reader who may
+            # not read it: the unit's name stands in (L50).
+            val = self.reader_vars(e, pov_team).get("legend")
+        return self._legend_value(val, self.entity_display_name(e, pov_team))
 
     def legend_label_tile(self, data: Any) -> Optional[str]:
         """A tile's legend label: its own `legend` data, else its
@@ -25070,8 +25082,11 @@ class Match:
             isinstance(c, tuple) and len(c) >= 3 and isinstance(c[2], dict)
         ) else {}
         name = ent.get("name") or eid
-        return self._legend_value((ent.get("vars") or {}).get("legend"),
-                                  f"corpse: {name}")
+        val = (ent.get("vars") or {}).get("legend")
+        if val is not None and VAR_READER.get() is not None \
+                and isinstance(c, tuple):
+            val = self.corpse_reader_vars(c[2]).get("legend")
+        return self._legend_value(val, f"corpse: {name}")
 
     def _resolve_color_value(self, val: Any, extras: Dict[str, Any],
                              target: Optional[str] = None) -> Optional[str]:
@@ -26917,10 +26932,21 @@ def private_templates_hidden(viewer: Optional[TemplateViewer]):
 def private_template_names(library: Dict[str, Any],
                            viewer: Optional[TemplateViewer]) -> "set[str]":
     """The names of the library's templates `viewer` may not read."""
-    if viewer is None:
+    if viewer is None or not library:
         return set()
-    return {n for n, t in (library or {}).items()
-            if template_hidden(t, viewer)}
+    # Once per command and viewer (X23: a listing resolves every partial,
+    # and a scan per resolution made it quadratic in the library). The
+    # command's partial cache is cleared by every library write.
+    cache = PARTIAL_CACHE.get()
+    key = ("__hidden_templates", id(library), len(library), viewer)
+    if cache is not None:
+        got = cache.get(key)
+        if got is not None and got[0] is library:
+            return got[1]
+    hidden = {n for n, t in library.items() if template_hidden(t, viewer)}
+    if cache is not None:
+        cache[key] = (library, hidden)
+    return hidden
 
 
 def mask_private_refs(value: Any, private: "set[str]") -> Any:

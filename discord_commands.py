@@ -299,9 +299,15 @@ class DiscordCtxWrapper:
         name = t[1:] if t.startswith("@") else t
         found = [r for r in roles if r.name.lower() == name.lower()]
         if not found:
+            # A grant takes one role per word, so `Game Masters` unquoted
+            # arrives as `Game` (L48).
+            longer = [r.name for r in roles
+                      if r.name.lower().startswith(name.lower() + " ")]
+            hint = (f" Did you mean `\"{longer[0]}\"`? Quote a role name "
+                    f"that contains spaces." if longer else "")
             raise vtt_commands.VTTError(
-                f"This server has no role named `{name}` (mention it, or "
-                f"give its id).")
+                f"This server has no role named `{name}` (mention it, give "
+                f"its id, or quote a name with spaces).{hint}")
         if len(found) > 1:
             raise vtt_commands.VTTError(
                 f"{len(found)} roles are named `{name}`: mention the one you "
@@ -908,6 +914,21 @@ async def _apply_board(message, m, channel_key: str, mgr: MatchManager) -> bool:
     Returns whether the viewport is engaged. Image mode falls back to text if
     rendering fails (e.g. Pillow missing). Raises only on the edit itself."""
     import io
+    # A board refreshes outside any command: in a channel showing a team's
+    # view it reads as that team's players do, so a private var (a unit's
+    # `legend` label) stays off it (L50).
+    import logic as _logic
+    pov = m.channel_pov(channel_key)
+    token = _logic.VAR_READER.set(
+        _logic.VarReader(team=pov, host=False) if pov is not None else None)
+    try:
+        return await _apply_board_as_reader(message, m, channel_key, mgr, io)
+    finally:
+        _logic.VAR_READER.reset(token)
+
+
+async def _apply_board_as_reader(message, m, channel_key: str,
+                                 mgr: MatchManager, io) -> bool:
     if getattr(m, "render_mode", "text") == "image":
         try:
             header, data, engaged = await _board_image(m, channel_key, mgr)

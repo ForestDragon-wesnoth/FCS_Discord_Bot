@@ -1760,6 +1760,11 @@ hardcodes**.
   puts back only the matches it reached (`logic.MATCHES_TOUCHED`:
   `MatchManager.get`, `copy_entity`, `require_target_host`) plus any
   deleted or replaced; every match goes back once at the end (X16).
+  The report reads the board as the caller may (V21, 1035): units and
+  corpses the query view hides are left out (a run ending with a unit out
+  of sight shows only that), vars through the reader (private ones out,
+  a disguise's decoys), and `until=` / `tally=` run in the reader's
+  `private_view`.
 - **`!again`** reruns the caller's last top-level command in the channel
   (runtime-only `mgr._last_commands`; never records `again` / `as` / clicks;
   refused inside dispatch_no_snapshot; always player-available) (639, 646).
@@ -2507,7 +2512,9 @@ hardcodes**.
   template's, a zone's field (`!zone legend`), a disguise's key, a
   corpse's snapshot var: `false` leaves it out, a text replaces the label;
   `Match.legend_label_*`, shared by both renderers; a disguised unit's
-  label comes only from the disguise; both legends are built from what
+  label comes only from the disguise; a `legend` var the reader may not
+  read labels nothing, the name stands in (L50; Discord boards render as
+  their channel's team, `_apply_board`); both legends are built from what
   the view actually draws, so nothing hidden, fogged or invisible to the
   POV is ever listed) (781), coordinate rulers
   (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
@@ -2758,6 +2765,10 @@ hardcodes**.
   the history to a mark taken before it (`MatchHistory.mark` / `rewind`):
   autosaves of turns that never happened go, autosaves pruned meanwhile
   come back (816). `!alias`, `!table` and `!turn set` are undo steps.
+  A command undo's reply names the command by its round where the
+  board's history is withheld from the channel (L49); `!history import`
+  never replaces a save under a name it picked (`<name>-2`), and one
+  named with `as` says it replaced the old one (1036).
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -2930,6 +2941,12 @@ hardcodes**.
   empty, pins unread, with a fresh partial cache; around list / show /
   diff / tags and `template_data`) (V19, 1030). A JSON import over a
   private template keeps its level unless the JSON says `"private"`.
+  The hidden set and the reader's library view are built once per
+  command and viewer, in the command's partial cache, which every
+  library write clears (X23: a scan per partial resolution made a
+  player's `!template list` quadratic, 13 s at 4,000 templates). Writing
+  onto the name of a template the caller can't read (import, copy, save,
+  rename) answers "The name is taken" (V20).
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server

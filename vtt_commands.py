@@ -4082,6 +4082,9 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 + (f" Dropped {len(held)} held command(s)." if held else ""))
         await ctx.send(f"▶ Resumed **{m.name}**; running {len(held)} held "
                        f"command(s).")
+        # One lookup per holder per resume (L49: each is a Discord REST
+        # call while the command lock is held).
+        authority: Dict[str, Any] = {}
         for h in held:
             cmd = "!" + h["name"] + (" " + " ".join(h["args"]) if h["args"] else "")
             # As the holder (G7), with the authority they hold NOW where
@@ -4093,10 +4096,13 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             now = None
             probe = getattr(ctx, "member_authority", None)
             if callable(probe) and h.get("user") is not None:
-                try:
-                    now = await probe(str(h["user"]))
-                except Exception:
-                    now = None
+                who = str(h["user"])
+                if who not in authority:
+                    try:
+                        authority[who] = await probe(who)
+                    except Exception:
+                        authority[who] = None
+                now = authority[who]
             run_ctx = _HolderCtx(ctx, h, now)
             # Whoever held it must still host the match (a co-host may have
             # been removed while the table was paused, a `gm` role taken).
@@ -6438,14 +6444,20 @@ def _require_saver(ctx: ReplyContext, name: str, tpl: Dict[str, Any],
     mgr = CURRENT_WORKSPACE.get()
     if (mgr is not None and template_private_level(tpl)
             == TEMPLATE_CREATOR_ONLY and _template_hidden(ctx, mgr, tpl)):
-        # Only its saver and administrators know a creator-level template
-        # exists, a `templates` holder included.
+        # Only its saver and administrators read a creator-level template,
+        # a `templates` holder included. Writing onto its name can't hide
+        # that the name is taken; the reply says just that (V20).
+        if verb == "replace":
+            raise VTTError(f"The name `{name}` is taken; choose another.")
         raise VTTError(f"No template `{name}` (`!template list`).")
     if not _template_saver_ok(ctx, tpl):
         mgr = CURRENT_WORKSPACE.get()
         if mgr is not None and _template_hidden(ctx, mgr, tpl):
             # A private template the caller may not read is refused like
             # a missing one: the saver's name told them it exists (L46).
+            if verb == "replace":
+                raise VTTError(f"The name `{name}` is taken; choose "
+                               f"another.")
             raise VTTError(f"No template `{name}` (`!template list`).")
         who = tpl.get("saved_by_name") or tpl.get("saved_by") or "someone"
         raise VTTError(f"Template `{name}` was saved by {who}: only they, "
@@ -17283,6 +17295,14 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if bmode is None:
                 return
             notes = []
+            # The label quotes the command as typed; where the board's
+            # history is withheld from this channel (fog, or private vars
+            # in a channel players read), the reply names it by its round
+            # (L49).
+            label = (f"a command of round {snap.round_at_snapshot}"
+                     if _whole_board_read_blocked(ctx, m)
+                     or _host_private_read_refusal(ctx, m, "x")
+                     else f"`{snap.label}`")
             # A turn advance takes no command snapshot, so a command undo
             # after `!turn next` takes the turn back too: say so.
             te_before = int(getattr(m, "turns_elapsed", 0) or 0)
@@ -17293,7 +17313,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"made since it (`!undo turn` undoes turns)."
                     if turns > 0 else "")
             return await ctx.send(
-                f"Undid {n} command(s). Reverted past `{snap.label}`.{back}"
+                f"Undid {n} command(s). Reverted past {label}.{back}"
                 + _bindings_suffix(notes)
             )
 
@@ -17370,6 +17390,14 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = override_name or (snap.label if snap.label
                                  and "=" not in snap.label
                                  else f"imported-{snap.sequence}")
+        replaced = name in m.history.manual_saves
+        if replaced and override_name is None:
+            # A name the import picked itself never replaces a save: it
+            # takes the next free `-<n>` (L49).
+            base, k = name, 2
+            while f"{base}-{k}" in m.history.manual_saves:
+                k += 1
+            name, replaced = f"{base}-{k}", False
         # The imported snapshot keeps its OLD sequence number, which
         # could collide with the current match's sequence space. That's
         # fine for the manual_saves dict (keyed by name, not seq), but
@@ -17381,7 +17409,8 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         audit_note(f"imported `{path}` into `{m.id}` as manual save `{name}`")
         return await ctx.send(
             f"Imported snapshot from `{path}` as manual save `{name}` "
-            f"(round {snap.round_at_snapshot})."
+            f"(round {snap.round_at_snapshot})"
+            + (f", replacing the old `{name}`." if replaced else ".")
         )
 
     # ---- diff --------------------------------------------------------
@@ -23753,23 +23782,41 @@ def _sim_value_text(v: Any) -> str:
         else str(v)
 
 
-def _sim_unit_view(m: Match, eid: str) -> Optional[Tuple[Any, ...]]:
+# A unit (or corpse) the reader's view doesn't show, in a `!simulate` run.
+_SIM_HIDDEN = ("hidden",)
+
+
+def _sim_unit_view(m: Match, eid: str, pov: Optional[str] = None,
+                   reader: Optional[VarReader] = None
+                   ) -> Optional[Tuple[Any, ...]]:
     """(fate, flat vars, statuses, cell) of `eid` now: alive / dead (a
     corpse or a destroyed part) with its vars and where it is (`(x,y)`, the
     map named on a match with several), or None when it is gone without a
-    corpse."""
+    corpse. Read as the caller may (V21): _SIM_HIDDEN for a unit or corpse
+    the query view `pov` doesn't show, and the vars without what `reader`
+    may not read (a disguise's decoys for a fooled view)."""
     many = len(m.maps) > 1
     e = m.entities.get(eid)
     if e is not None:
+        if _pov_hides(m, pov, eid):
+            return _SIM_HIDDEN
         cell = f"({e.x},{e.y})" + (f" on `{e.map}`" if many else "")
-        return ("alive" if e.is_alive else "dead", _sim_flat(e.vars),
-                dict(e.status), cell)
+        shown = (e.vars if pov is None and reader is None
+                 else m.reader_vars(e, pov, reader))
+        return ("alive" if e.is_alive else "dead", _sim_flat(shown),
+                dict(m.presented_statuses(e, pov) if pov is not None
+                     else e.status), cell)
     found = m.find_corpse(eid)
     if found is None:
         return None
     x, y, corpse, mp = found
+    if pov is not None and not m.corpse_visible_to(eid, corpse, x, y, pov,
+                                                    mp):
+        return _SIM_HIDDEN
     snap = corpse.get("entity") or {}
-    return ("dead", _sim_flat(snap.get("vars", {})),
+    shown = (snap.get("vars", {}) if reader is None
+             else m.corpse_reader_vars(corpse, reader))
+    return ("dead", _sim_flat(shown),
             dict(snap.get("status", {}) or {}),
             f"({x},{y})" + (f" on `{mp.name}`" if many else ""))
 
@@ -23878,16 +23925,22 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
         return await ctx.send(refusal)
     seed = opts.get("seed") or new_rng_seed()[:8]
 
-    # The board before: units (alive / dead) with their vars and statuses.
+    # The board before: units (alive / dead) with their vars and statuses,
+    # as the caller's view and private-var reader read them (V21: a unit
+    # the view hides is left out of the report, a private var too).
+    sim_pov = _query_pov(ctx, m)
+    sim_reader = VAR_READER.get()
     pre: Dict[str, Tuple[str, Dict[str, Any], Dict[str, Any]]] = {}
     for eid in list(m.entities):
-        v = _sim_unit_view(m, eid)
+        v = _sim_unit_view(m, eid, sim_pov, sim_reader)
         if v is not None:
             pre[eid] = v
     for (_mp, _x, _y, cid, _c) in m.every_corpse():
         if str(cid) not in pre:
-            pre[str(cid)] = _sim_unit_view(m, str(cid)) or ("dead", {}, {},
-                                                           "")
+            pre[str(cid)] = _sim_unit_view(
+                m, str(cid), sim_pov, sim_reader) or ("dead", {}, {}, "")
+    pre_ids = set(pre)
+    pre = {k: v for k, v in pre.items() if v is not _SIM_HIDDEN}
     pre_outcome = m.outcome
 
     snap = _snapshot_all_matches(mgr)
@@ -23946,8 +23999,9 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                     break
                 if until:
                     try:
-                        hit = FormulaEngine(cur).eval_expression(
-                            until, EvalCtx(this=cur.current_entity_id()))
+                        with cur.private_view(sim_reader):
+                            hit = FormulaEngine(cur).eval_expression(
+                                until, EvalCtx(this=cur.current_entity_id()))
                     except FormulaError as ex:
                         failed = f"❌ `until={until}` couldn't be read: {ex}"
                         break
@@ -23961,9 +24015,12 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                 break
             cur = mgr.matches.get(mid)
             if failed is None and cur is not None:
-                rec["units"] = {eid: _sim_unit_view(cur, eid) for eid in pre}
+                rec["units"] = {eid: _sim_unit_view(cur, eid, sim_pov,
+                                                    sim_reader)
+                                for eid in pre}
                 rec["new"] = [e.name or e.id for e in cur.entities.values()
-                              if e.id not in pre and not e.part_of]
+                              if e.id not in pre_ids and not e.part_of
+                              and not _pov_hides(cur, sim_pov, e.id)]
                 out = cur.outcome
                 rec["winner"] = (str(out.get("winner")) if isinstance(
                     out, dict) and out is not pre_outcome
@@ -23971,9 +24028,10 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                 rec["tally"] = []
                 for src in opts["tally"]:
                     try:
-                        rec["tally"].append(_sim_value_text(
-                            FormulaEngine(cur).eval_expression(
-                                src, EvalCtx(this=cur.current_entity_id()))))
+                        with cur.private_view(sim_reader):
+                            got = FormulaEngine(cur).eval_expression(
+                                src, EvalCtx(this=cur.current_entity_id()))
+                        rec["tally"].append(_sim_value_text(got))
                     except FormulaError as ex:
                         failed = f"❌ `tally={src}` couldn't be read: {ex}"
                         break
@@ -24066,7 +24124,11 @@ def _sim_report(name: str, rest: List[str], runs: List[Dict[str, Any]],
                                      for v in var_filter)
     for eid in keep:
         fate0, vars0, st0, cell0 = pre[eid]
-        views = [r["units"].get(eid) for r in live]
+        all_views = [r["units"].get(eid) for r in live]
+        # A run that ends with the unit out of the reader's sight tells
+        # only that (V21): its vars, statuses and fate are left out.
+        unseen = sum(1 for v in all_views if v is _SIM_HIDDEN)
+        views = [v for v in all_views if v is not _SIM_HIDDEN]
         died = sum(1 for v in views if v is not None and v[0] == "dead"
                    and fate0 == "alive")
         revived = sum(1 for v in views if v is not None and v[0] == "alive"
@@ -24081,10 +24143,11 @@ def _sim_report(name: str, rest: List[str], runs: List[Dict[str, Any]],
             fates.append(f"removed ×{_sim_pct(removed, done)}")
         if fates:
             body.append(f"`{eid}`: " + ", ".join(fates))
-        if any(v is not None and v[3] != cell0 for v in views):
+        if unseen or any(v is not None and v[3] != cell0 for v in views):
             body.append(f"`{eid}` ends at " + _sim_dist(
-                ["(gone)" if v is None else "(where it was)" if v[3] == cell0
-                 else v[3] for v in views], done) + f" (was {cell0})")
+                ["(out of sight)" if v is _SIM_HIDDEN else "(gone)"
+                 if v is None else "(where it was)" if v[3] == cell0
+                 else v[3] for v in all_views], done) + f" (was {cell0})")
         paths = sorted({p for v in views if v is not None for p in v[1]
                         if _var_ok(p) and not same_value(
                             v[1].get(p), vars0.get(p))}

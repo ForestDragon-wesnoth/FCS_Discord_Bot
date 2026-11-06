@@ -35797,6 +35797,8 @@ SCENARIO 1034 — A creator-level private template: only its saver and server ad
 ?? ❌ No template `wip` (`!template list`).
 !template private wip hosts
 ?? ❌ No template `wip` (`!template list`).
+!template import wip {"name": "Mine", "vars": {"hp": 3}}
+?? ❌ The name `wip` is taken; choose another.
 !template list
 ?! wip`
 !as host
@@ -35837,8 +35839,108 @@ co-host too, doesn't see `wip` in the list, `show` answers as for a
 missing template, a reference to `wipgear` reads `(private)` with its data
 left out, `has_template` is False and Tab doesn't offer it. Holding the
 `templates` capability changes nothing: his delete and his level change
-answer as for a missing template. The administrator reads both (the
+answer as for a missing template, and an import onto the name says the
+name is taken. The administrator reads both (the
 assert expands `pubg` through `wipgear`). In a channel with a team view
 alice reads as a player, so `wip` is missing there. Lowered to `hosts`,
 bob reads it again while carol, a player, still doesn't. An import may
 set `"private": "creator"`.
+
+SCENARIO 1035 — `!simulate` reports through the caller's view: units the fog hides and private vars stay out of a player's report and of a host's in a team-view channel
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new sv SimView 12 12
+!match use sv
+!ent add hero Hero 20 2 2
+!ent set_var hero team red
+!ent set_var hero fog_vision_radius 3
+!ent add boss Boss 20 3 3
+!ent set_var boss team blue
+!ent set_var boss secret 5
+!ent add zqxspy Spy 9 10 10
+!ent set_var zqxspy team blue
+!system set default private_vars "secret"
+!ent set_var hero actions.blast.target none
+!ent set_var hero actions.blast.body "entity[boss].hp = entity[boss].hp - 1\nentity[zqxspy].hp = entity[zqxspy].hp - 1\nentity[boss].secret = 777"
+!match fog on
+!host access set simulate all
+!host access set action all
+!match bind pov=red
+!as player bob
+!ent info zqxspy
+?? Could not find a unit named `zqxspy`
+!simulate 3 seed=a action hero blast
+?? `boss.hp`: -1 ×100%
+?! zqxspy
+?! 777
+?! secret
+!simulate 2 seed=a tally=entity[boss].secret action hero blast
+?? `tally=entity[boss].secret` couldn't be read: Variable 'secret' is not defined
+!as host
+!simulate 3 seed=a action hero blast
+?! zqxspy
+?! 777
+!match unbind
+!match use sv
+!simulate 3 seed=a action hero blast
+?? `zqxspy.hp`: -1 ×100%
+?? `boss.secret`: +772 ×100%
+!assert "entity[boss].secret == 5 and entity[zqxspy].hp == 9"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!simulate` reads the board as the caller may (V21). With
+`!simulate` opened to players, bob in the red-view channel gets the
+boss's hp change but nothing of `zqxspy`, which red's fog hides, nor of
+the private `secret`; a `tally=` reading it is refused as for a var the
+unit lacks, as a `$()` read is. The host in that channel (players read
+it) gets the same report, with the private-var reminder. In a channel
+without a team view the host's report names the spy and the secret's
+change (5 to 777). Nothing is kept.
+
+SCENARIO 1036 — Players' reads of the board's history and labels: a private `legend` var labels nothing in a player's legend; an undo reply in a team-view channel doesn't quote the command; an import never replaces a save under a name it picked
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new lh LegendHist 8 8
+!match use lh
+!ent add zed Zed 10 2 2
+!ent set_var zed team blue
+!ent set_var zed legend zqxlegend
+!ent set_var zed glyph Z
+!map legend on
+!system set default private_vars "legend, secret"
+!match bind pov=red
+!as player bob
+!map
+?? Zed
+?! zqxlegend
+!as host
+!match unbind
+!match use lh
+!map
+?? zqxlegend
+!ent set_var zed secret zqxval1
+!match bind pov=red
+!undo command
+?? Reverted past a command of round 1.
+?! zqxval1
+!match unbind
+!match use lh
+!ent set_var zed secret zqxval2
+!undo command
+?? Reverted past `!ent set_var zed secret zqxval2`.
+!history save mark
+!history export manual:mark lh1.json
+!history import lh1.json
+?? as manual save `mark-2`
+!history import lh1.json as mark
+?? as manual save `mark` (round 1), replacing the old `mark`.
+!history list manual
+?? mark-2
+HARNESS-ALLOWS-ERRORS
+
+Expected: a unit's `legend` var labels it in the map legend, but with
+`legend` private the red player's legend names the unit (`Zed`) instead
+(L50); the host's legend outside the team view keeps the label. An undo
+in a channel showing red's view while something is private names the
+command it reverted past by its round, since its text can quote a
+private value (L49); outside the team view it quotes the command. An
+import that keeps the snapshot's own label next to a save of that name
+takes `mark-2`; one given the name with `as` replaces it and says so.
