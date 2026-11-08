@@ -134,6 +134,10 @@ class GuiApp:
             print(self._persist_note)
         self.workspaces = open_workspaces(persist=local["match_persistence"])
         self.mgr = self.workspaces.get(LOCAL_WORKSPACE)
+        # The window holds this manager for its whole session: it never
+        # leaves memory while idle (#197).
+        self.workspaces.unload_guards.append(
+            lambda mgr: "the GUI shows it" if mgr is self.mgr else None)
         self.ctx = GuiCtx(self)
         self.loader = SpriteLoader(
             sprites_dir, first=self.workspaces.storage.sprites_dir(LOCAL_WORKSPACE))

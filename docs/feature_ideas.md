@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14, parts of #190 (Discord-role
@@ -367,9 +367,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#151 Named selectors.** `!selector def enemies "team!=red hp>0"`, usable as `!foreach @enemies ; ...` and as `select('enemies')` in formulas.
 - **#152 Directional armor and coverage** (§8 combat layers). Per-part, per-side armor values and coverage %, with `armor_at(target, part, side)` and a mitigation helper the GM's damage formula calls. Primitives only.
 - **#153 Vehicle follow-ups** (§8). Cover for riders inside a vehicle, a footprint per rider, and shared fuel or initiative between nested vehicles.
-- **#154 Spatial index.**
-  - A per-cell occupancy index behind `cell_occupant` and the area queries; today they scan every unit, so cell searches cost cells × units.
-  - Starts with a measurement on a large map with hundreds of units.
 - **#155 GM test runner.** `!test <macro>` runs a macro full of `!assert` / `??` checks in a throwaway clone of the match and reports pass/fail. The scenario harness, for a GM's own rules.
 - **#157 Edge-aware `side_hit`** (§8). For long bodies, the body edge an adjacent attacker touches decides the side hit.
 
@@ -497,9 +494,9 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 ### New
 
 - **#197 Scaling.**
-  - Covers the spatial index (#154), diff-based undo snapshots (§8: ~3.5 s per command after a whole-map fill on 500×500) and the per-server CPU work budget (§8).
-  - These three stand between the bot and public servers, and they share one measurement harness.
-  - Servers loaded on first use (from the combat-systems review): `open_workspaces` (storage.py:1647) loads every server folder at startup, so startup time and memory grow with every server the bot has ever joined. A server could load on its first command and unload after N idle hours; its state is on disk after every commit.
+  - Shipped: the spatial indexes (#154: units, zones and corpses by cell) and servers loaded on first use and unloaded when idle (`server_idle_unload_hours`).
+  - Left: diff-based undo snapshots (§8: ~3.5 s per command after a whole-map fill on 500×500) and the per-server CPU work budget (§8).
+  - Also measured while shipping the indexes: the per-command sweeps that still visit every unit or corpse (`sync_all_sizes`, `has_watchers`: ~125 ms per command at 10,000 units) and the per-step zone-grant check over every zone (`_grants_present`: ~37 ms per step with 20,000 zones).
 - **#198 Play-by-post mode.**
   - Turn deadlines and a ping to the active unit's player (needs #28).
   - A digest of what happened since your last turn (#146).
@@ -529,5 +526,5 @@ From the combat-systems review (docs/combat_systems_fit.md):
 - **GM tooling:** #202, #203, #207, #211, #204, #231, #249, #250
 - **Formula ergonomics:** #89, #194, #205, #210, #216, #217, #219, #228
 - **Integrity of GM data:** #209, #210, #223
-- **Before a public rollout:** #177, #178, #197 (+ lazy servers), #206, #214
+- **Before a public rollout:** #177, #178, #197, #206, #214
 - **Onboarding:** #213, #202, #231

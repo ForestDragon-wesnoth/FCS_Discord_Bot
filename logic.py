@@ -14,6 +14,7 @@ import re
 import math
 import random
 import contextvars
+import time
 from contextlib import contextmanager
 import keyword
 
@@ -8408,6 +8409,14 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many extra turns (`!turn grant`, grant_turn) a match "
                 "may hold queued at once; a grant past it is refused.",
     },
+    "server_idle_unload_hours": {
+        "default": 12, "min": 0, "max": 8760,
+        "desc": "After how many hours without a command a server's "
+                "workspace is written to disk and dropped from memory (its "
+                "next command loads it again; servers load on first use). "
+                "A server with an approval request waiting or a live "
+                "auto-update board stays loaded. 0 = never unload.",
+    },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
         "desc": "How deep maps may nest: a map a unit carries (`!map "
@@ -10533,17 +10542,39 @@ def _corpse_part_ids(corpse: Any) -> List[str]:
             if isinstance(pd, dict) and isinstance(pd.get("id"), str)]
 
 
+def _ix_add(table: Dict[Any, Any], key: Any, c: Any) -> None:
+    """Add `c` (a cell, or a zone name) under `key`: one value is kept as
+    itself, more as a set (a set per corpse or per cell would cost the
+    garbage collector)."""
+    held = table.get(key)
+    if held is None:
+        table[key] = c
+    elif isinstance(held, set):
+        held.add(c)
+    elif held != c:
+        table[key] = {held, c}
+
+
+def _ix_set(table: Dict[Any, Any], key: Any, cells: List[Any]) -> None:
+    if not cells:
+        table.pop(key, None)
+    elif len(cells) == 1:
+        table[key] = cells[0]
+    else:
+        table[key] = set(cells)
+
+
 class CorpseIndex:
     """A map's corpse index (Map._corpse_ix): the cells holding corpses,
-    and per corpse id and per id of a body part a corpse holds the cells
-    holding it. Entries can be stale (a corpse taken away); readers check
+    and per corpse id and per id of a body part a corpse holds the cell
+    holding it (a set of cells when there are several). Entries can be stale (a corpse taken away); readers check
     the cell. `pending`: cells written since, read on the next lookup."""
     __slots__ = ("cells", "ids", "parts", "pending")
 
     def __init__(self) -> None:
         self.cells: Set[Tuple[int, int]] = set()
-        self.ids: Dict[str, Set[Tuple[int, int]]] = {}
-        self.parts: Dict[str, Set[Tuple[int, int]]] = {}
+        self.ids: Dict[str, Any] = {}
+        self.parts: Dict[str, Any] = {}
         self.pending: Set[Tuple[int, int]] = set()
 
 
@@ -10603,13 +10634,14 @@ class Map:
     _corpse_ix: Optional["CorpseIndex"] = field(
         default=None, repr=False, compare=False)
 
-    # The zone index: cell -> the names of the zones holding it, so
+    # The zone index: cell -> the name of the zone holding it (a set of
+    # names when several do; _ix_add), so
     # zones_at reads its cell, never every zone (#154). Runtime-only; None
     # = built from the zones on its next use (a replaced `zones` dict
     # resets it). Every change of a zone's cells, or of which zones exist,
     # calls zone_touch(name), and the next lookup files that zone again
     # (`_zone_rec` holds the cells each zone was filed under).
-    _zone_ix: Optional[Dict[Tuple[int, int], Set[str]]] = field(
+    _zone_ix: Optional[Dict[Tuple[int, int], Any]] = field(
         default=None, repr=False, compare=False)
     _zone_rec: Dict[str, Any] = field(default_factory=dict, repr=False,
                                       compare=False)
@@ -10628,16 +10660,16 @@ class Map:
         if self._zone_ix is not None:
             self._zone_dirty.add(name)
 
-    def _zone_index(self) -> Dict[Tuple[int, int], Set[str]]:
+    def _zone_index(self) -> Dict[Tuple[int, int], Any]:
         ix = self._zone_ix
         if ix is None:
             ix = {}
             rec: Dict[str, Any] = {}
             for zname, z in self.zones.items():
-                cells = frozenset(z.get("cells") or ())
+                cells = tuple(z.get("cells") or ())
                 rec[zname] = cells
                 for c in cells:
-                    ix.setdefault(c, set()).add(zname)
+                    _ix_add(ix, c, zname)
             object.__setattr__(self, "_zone_ix", ix)
             object.__setattr__(self, "_zone_rec", rec)
             self._zone_dirty.clear()
@@ -10646,17 +10678,20 @@ class Map:
             rec = self._zone_rec
             for zname in self._zone_dirty:
                 for c in rec.pop(zname, ()):
-                    names = ix.get(c)
-                    if names is not None:
-                        names.discard(zname)
-                        if not names:
-                            del ix[c]
+                    held = ix.get(c)
+                    if held is None:
+                        continue
+                    if isinstance(held, set):
+                        held.discard(zname)
+                        _ix_set(ix, c, list(held))
+                    elif held == zname:
+                        del ix[c]
                 z = self.zones.get(zname)
                 if z is not None:
-                    cells = frozenset(z.get("cells") or ())
+                    cells = tuple(z.get("cells") or ())
                     rec[zname] = cells
                     for c in cells:
-                        ix.setdefault(c, set()).add(zname)
+                        _ix_add(ix, c, zname)
             self._zone_dirty.clear()
         return ix
 
@@ -10685,9 +10720,9 @@ class Map:
                     continue
                 ix.cells.add(c)
                 for cid, corpse in corpses.items():
-                    ix.ids.setdefault(cid, set()).add(c)
+                    _ix_add(ix.ids, cid, c)
                     for pid in _corpse_part_ids(corpse):
-                        ix.parts.setdefault(pid, set()).add(c)
+                        _ix_add(ix.parts, pid, c)
             ix.pending = set()
         return ix
 
@@ -10695,32 +10730,28 @@ class Map:
         """The cells holding a corpse of unit `cid`, sorted (one, unless
         corpse ids aren't unique)."""
         ids = self._corpse_index().ids
-        cells = ids.get(cid)
-        if not cells:
+        held = ids.get(cid)
+        if held is None:
             return []
+        cells = held if isinstance(held, set) else (held,)
         live = [c for c in cells if cid in (self._corpses_on(c) or ())]
         if len(live) != len(cells):
-            if live:
-                ids[cid] = set(live)
-            else:
-                del ids[cid]
+            _ix_set(ids, cid, live)
         return sorted(live)
 
     def corpse_holds_part(self, pid: str) -> bool:
         """Whether a corpse on this map holds a body part with id `pid`
         (its revive brings the part back under that id)."""
         parts = self._corpse_index().parts
-        cells = parts.get(pid)
-        if not cells:
+        held = parts.get(pid)
+        if held is None:
             return False
-        live = {c for c in cells
+        cells = held if isinstance(held, set) else (held,)
+        live = [c for c in cells
                 if any(pid in _corpse_part_ids(corpse)
-                       for corpse in (self._corpses_on(c) or {}).values())}
-        if live != cells:
-            if live:
-                parts[pid] = live
-            else:
-                del parts[pid]
+                       for corpse in (self._corpses_on(c) or {}).values())]
+        if len(live) != len(cells):
+            _ix_set(parts, pid, live)
         return bool(live)
 
     def corpse_entries(self) -> List[Tuple[int, int, str, Dict[str, Any]]]:
@@ -10729,14 +10760,22 @@ class Map:
         ix = self._corpse_index()
         out: List[Tuple[int, int, str, Dict[str, Any]]] = []
         gone = []
-        for (x, y) in sorted(ix.cells):
-            corpses = self._corpses_on((x, y))
-            if not corpses:
-                gone.append((x, y))
+        tiles = self.tiles
+        for c in sorted(ix.cells):
+            cell = tiles.get(c)
+            corpses = cell.get("corpses") if type(cell) is dict else None
+            if not corpses or type(corpses) is not dict:
+                gone.append(c)
                 continue
-            for cid in sorted(corpses):
-                out.append((x, y, cid, corpses[cid]))
-        ix.cells.difference_update(gone)
+            x, y = c
+            if len(corpses) == 1:
+                for cid, corpse in corpses.items():
+                    out.append((x, y, cid, corpse))
+            else:
+                for cid in sorted(corpses):
+                    out.append((x, y, cid, corpses[cid]))
+        if gone:
+            ix.cells.difference_update(gone)
         return out
 
     def size_text(self) -> str:
@@ -11103,8 +11142,9 @@ class Map:
     def zones_at(self, x: int, y: int) -> Set[str]:
         """Names of every zone whose footprint includes (x,y), read from
         the zone index."""
-        names = self._zone_index().get((x, y))
-        out = set(names) if names else set()
+        held = self._zone_index().get((x, y))
+        out = set(held) if isinstance(held, set) else \
+            ({held} if held is not None else set())
         if SPATIAL_CHECK:
             want = {name for name, z in self.zones.items()
                     if (x, y) in z["cells"]}
@@ -31131,19 +31171,96 @@ class Workspaces:
         self.storage: Any = None
         # Every server's crashes (`!owner errors`, `!server errors`).
         self.crashes = CrashLog()
+        # Callables a surface adds: guard(mgr) returns why that server
+        # stays loaded, or None (Discord: a live auto-update board holds
+        # its manager; the GUI holds the local one for its session).
+        self.unload_guards: List[Callable[[MatchManager], Optional[str]]] = []
+        self._last_sweep = time.monotonic()
 
-    def get(self, guild_key: Any) -> MatchManager:
+    def load(self, guild_key: Any) -> Tuple[MatchManager, List[str]]:
+        """The server's workspace and the notes of loading it: a server
+        is read from its data folder on first use (#197), so startup reads
+        nothing and a server the bot hasn't heard from since it started
+        costs no memory. A server with no folder starts fresh."""
         key = str(guild_key)
         mgr = self._by_key.get(key)
+        notes: List[str] = []
         if mgr is None:
             mgr = MatchManager(key)
             mgr.workspaces = self
             self._by_key[key] = mgr
-        return mgr
+            if self.storage is not None:
+                notes = self.storage.load_on_demand(mgr)
+        mgr.last_used = time.monotonic()
+        return mgr, notes
+
+    def get(self, guild_key: Any) -> MatchManager:
+        return self.load(guild_key)[0]
 
     def peek(self, guild_key: Any) -> Optional[MatchManager]:
-        """The workspace if it exists, without creating it."""
+        """The workspace if it is loaded, without loading or creating it."""
         return self._by_key.get(str(guild_key))
 
+    def find(self, guild_key: Any) -> Optional[MatchManager]:
+        """The workspace if it exists, loaded or on disk (then loaded),
+        without creating a new one."""
+        key = str(guild_key)
+        if key in self._by_key or (self.storage is not None
+                                   and self.storage.has_server(key)):
+            return self.get(key)
+        return None
+
     def items(self) -> List[Tuple[str, MatchManager]]:
+        """The loaded workspaces."""
         return sorted(self._by_key.items())
+
+    def unload_blocker(self, mgr: MatchManager) -> Optional[str]:
+        """Why server `mgr` can't leave memory now, or None when nothing
+        but its files holds it: a command running on it, an approval
+        request waiting (runtime-only), a surface guard's reason."""
+        lock = getattr(mgr, "_command_lock", None)
+        if lock is not None and lock.locked():
+            return "a command is running on it"
+        if any(m.pending_requests for m in mgr.matches.values()):
+            return "an approval request is waiting"
+        for guard in self.unload_guards:
+            why = guard(mgr)
+            if why:
+                return why
+        return None
+
+    def unload(self, guild_key: Any) -> bool:
+        """Write server `guild_key` to disk and drop it from memory; its
+        next command loads it again. False when it isn't loaded or
+        can_unload says no. A locked server (MatchManager.recovery) writes
+        nothing: its files are what a recovery works from."""
+        key = str(guild_key)
+        mgr = self._by_key.get(key)
+        if mgr is None or self.unload_blocker(mgr) is not None:
+            return False
+        st = self.storage
+        if st is not None:
+            if st.persist and not mgr.recovery:
+                st.commit_all_one(mgr)
+            st.forget_loaded(key)
+        del self._by_key[key]
+        return True
+
+    def sweep_idle(self, now: Optional[float] = None,
+                   force: bool = False) -> List[str]:
+        """Unload the servers idle for the owner limit
+        server_idle_unload_hours (0 = never), at most once an hour unless
+        `force`. Returns the keys unloaded."""
+        now = time.monotonic() if now is None else now
+        if not force and now - self._last_sweep < 3600:
+            return []
+        self._last_sweep = now
+        hours = owner_limit("server_idle_unload_hours")
+        if hours <= 0 or self.storage is None or not self.storage.persist:
+            return []
+        gone = []
+        for key, mgr in self.items():
+            if now - getattr(mgr, "last_used", now) >= hours * 3600 \
+                    and self.unload(key):
+                gone.append(key)
+        return gone

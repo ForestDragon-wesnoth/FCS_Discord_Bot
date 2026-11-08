@@ -327,6 +327,12 @@ Each of these was learned from a shipped bug.
   match RNG or a saved counter, never `uuid` / the clock, or every replay
   of it diverges (`sched_<n>` came from uuid). Re-run the replay
   differential (§5).
+- **A path that places units, zones or corpses in place** (a direct
+  `e.x =` is fine, a direct `e.vars[...]` write of a footprint var, a
+  zone's `cells` or a corpse written into tile data is not): mark the
+  spatial index (`match._spatial.touch(eid)`, `mp.zone_touch(name)`,
+  `mp.note_corpse(x, y)`, §7.1) and run the regression under
+  `FCS_SPATIAL_CHECK=1`.
 - **A change to server-wide state outside the systems** (a file, the
   template library, a deleted match): call `audit_note(...)` so `!server
   audit` names it.
@@ -456,7 +462,8 @@ own WORKSPACE: a `MatchManager` holding that server's GameSystems (rules,
 `command_access`, default vars / passives / clamps, system aliases), matches,
 channel pointers, saves folder and command lock. `logic.Workspaces` maps a
 guild id to its manager, creating it (with a fresh `default` system built from
-RULES_REGISTRY) on the server's first command. The Discord adapter
+RULES_REGISTRY) on the server's first command (loading it from its data folder when it has
+one, §3 "Startup and lazy servers"). The Discord adapter
 (`discord_commands.wire_commands(bot, workspaces)`) routes every command,
 alias, button click and board refresh by the guild the message came from, so
 a match id, system name or save name only means something inside its own
@@ -611,10 +618,26 @@ plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
   `!server storage` lists the server's use by part, largest first
   (`Storage.server_breakdown`: each match and its undo history, templates,
   old template versions, saves, sprites, corrupt files, workspace / systems).
-- **Startup:** `storage.open_workspaces()` (bot.py, cli.py, gui.py) loads every
-  server folder; a file that fails to load moves to `corrupt/` with a console
-  note and the rest loads; unknown gamerules in systems are dropped. Data of
-  servers the bot left is kept. On shutdown `commit_all` writes once more.
+- **Startup and lazy servers** (#197, 1070-1071):
+  `storage.open_workspaces()` (bot.py, cli.py, gui.py) reads no server
+  (`Storage.open`: crash log, trash purge, usage counters). A server's
+  folder loads on its first use (`Workspaces.load` / `get` ->
+  `Storage.load_on_demand`; `find` loads one only when its folder exists,
+  for the Discord alias lookup; `peek` never loads); a file that fails to
+  load moves to `corrupt/` with a console note and the rest loads;
+  unknown gamerules in systems are dropped. `Workspaces.items()` lists the
+  LOADED servers only (`!owner servers` adds the ones on disk as "not
+  loaded"). `persist_workspace` runs `Workspaces.sweep_idle` at most
+  hourly: a server unused for the owner limit `server_idle_unload_hours`
+  (12, 0 = never) is written (`commit_all_one`; a locked one writes
+  nothing) and dropped (`unload`), unless `unload_blocker` names a reason:
+  a command running on it, an approval request waiting (runtime-only), a
+  surface guard (`Workspaces.unload_guards`, each returning its reason:
+  Discord keeps a server with a live auto-update board, the GUI the local
+  workspace it holds). `!as idle <hours>` (CLI / harness) moves every
+  loaded server's last use back and sweeps. `!as restart` loads again the
+  servers that were loaded. Data of servers the bot left is kept. On
+  shutdown `commit_all` writes the loaded servers once more.
 - **Lost systems** (`Storage._settle_lost_systems`): a match whose system
   didn't load (systems.json unreadable or gone) keeps its system name and
   units untouched. If every such match's file carries a copy of its
@@ -994,6 +1017,12 @@ descriptions (pass numbers point at `docs/audit_history.md`):
 - **Reload differential** (34, 35): the same random commands on a live
   manager and on a save/load copy taken mid-game, comparing every reply and
   the full state each step (exclude the runtime-only queues).
+- **Spatial index check** (#154): the regression under
+  `FCS_SPATIAL_CHECK=1` (every lookup compared with a scan), plus a
+  harness wrapping `CommandRegistry.run` that compares the unit, zone
+  and corpse indexes of every match with a full scan after EVERY command
+  of every scenario (0 differences when it shipped; it reports dozens
+  with the marking stubbed out).
 - **Memory-equals-disk chaos** (storage work): reload the data folder into
   fresh workspaces after every command and compare every match, history index
   and snapshot state, channel pointers and systems.
@@ -1227,6 +1256,30 @@ hardcodes**.
   path.
 - **Occupancy:** one unit per cell, except units with the `__cell_stackable`
   var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
+- **Spatial indexes** (#154, 1067-1069): `UnitIndex` (`Match._spatial`,
+  runtime-only) files every unit by map, anchor and footprint: cell ->
+  ids, bodies over `SPATIAL_BIG_AREA` (64) cells as rectangles, region
+  parts tested live. Pure geometry: callers judge alive / stackable /
+  glued / mounted on the few units of a cell. `cell_occupant`,
+  `entities_at`, the area and line searches (`_alive_at`, `_occupants`),
+  `entities_in_zone` and `entities_within` (a box around the body) read
+  it. It stays current by marking: `Entity.__setattr__` for the fields in
+  `_PLACE_FIELDS` (x, y, map, vars, _match, the link fields), the raw var
+  writers `_set_path` / `_del_path`, and the part mode switches; a new
+  footprint var name, map size, map list or entities dict object rebuilds
+  it; `_rollback_match` resets it. A NEW code path that moves a unit or
+  changes its footprint in place without these (a direct `e.vars[...]`
+  write of a footprint var) must call `match._spatial.touch(eid)`.
+  `Map._zone_ix` (cell -> zone names) refiles a zone on `Map.zone_touch`,
+  which every change of a zone's cells or existence calls (a new site
+  must too); a replaced `zones` dict rebuilds it. `Map._corpse_ix`
+  (`CorpseIndex`: corpse cells, corpse id and held part id -> cells) is
+  told of each corpse laid by `Map.note_corpse(x, y)` (a new site must
+  call it) and checks stale entries on read; `find_corpse`, `all_corpses`
+  and `Match.id_taken` (spawn and `mint_entity_id` test one id) read it.
+  `FCS_SPATIAL_CHECK=1` makes every lookup compare itself with the old
+  scan and raise (`SpatialCheckError`): run the regression under it after
+  touching any of these paths (§5).
 - **Unit cap:** `max_entities_per_match` (-1 = none, the default) bounds
   the units a match holds (parts and segments count, corpses don't):
   `Match.check_unit_room` at `Entity.spawn`, and whole bodies are checked
@@ -3755,9 +3808,13 @@ hasn't named the next.
   or a diff-based snapshot format. Measured (pass 40): after a whole-map
   `!tile fill` on 500x500 every command costs ~3.5 s (the match is
   serialized three times per command: undo pre / post state and the
-  commit). Cell searches read one occupancy table per search
-  (`Match.occupancy_pass`), fogged reads one team vision index per pass
-  (`Match.vision_pass`), so neither costs cells x units (pass 49).
+  commit). Cell lookups read the spatial indexes (§7.1), fogged reads
+  one team vision index per pass (`Match.vision_pass`), so neither costs
+  cells x units. What still costs every unit on every command (measured
+  for #197): `sync_all_sizes` (every body, and every corpse's category)
+  and `has_watchers` (every unit's held watchers), ~125 ms per command at
+  10,000 units, ~240 ms with 50,000 corpses; a walk on a map with 20,000
+  zones spends ~37 ms per step in `_grants_present` (every zone's grants).
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /
