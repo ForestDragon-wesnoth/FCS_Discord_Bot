@@ -13740,7 +13740,9 @@ registry.annotate_sub(
         "own and gains the form's (one it already holds takes the form's as "
         "an application through its stack mode, resistance skipped); one "
         "the new form is immune to goes. A status's `on_transform` "
-        "(`!status on_transform`) keep / drop overrides that. A body part "
+        "(`!status on_transform`) keep / drop overrides that, immunity "
+        "excepted. The reply lists the statuses kept, gained, stacked and "
+        "lost. A body part "
         "on the same part-name path in both forms passes its statuses to "
         "the new part the same way. Vars named by the `transform_keep_vars` "
         "rule or the unit's `__transform_keep_vars` list keep their values. "
@@ -22218,8 +22220,8 @@ registry.annotate_sub(
     "status", "on_transform",
     usage="!status on_transform <name> <keep|drop|->",
     desc=("What a transform does with this status: `keep` = it survives "
-          "every transform, replace and revert (immunity of the new form "
-          "included), `drop` = every one of them takes it (on_removed "
+          "every transform, replace and revert (a new form immune to it "
+          "still takes it), `drop` = every one of them takes it (on_removed "
           "fires, removed_by `transform`). `-` goes back to the flavor's "
           "default: `!ent transform` keeps it unless the new form is "
           "immune, `!ent replace` drops it. An instance's own "

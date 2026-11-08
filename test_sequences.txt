@@ -37388,6 +37388,7 @@ SCENARIO 1062 — Transform keeps statuses: the unit's stay beside the form's, a
 !status def thickfur
 !status data thickfur status_immune poison
 !status on_transform bless drop
+!status on_transform poison keep
 !status apply a stun 1 3
 !status apply a poison 2 4
 !status apply a bless 1 5
@@ -37401,6 +37402,7 @@ SCENARIO 1062 — Transform keeps statuses: the unit's stay beside the form's, a
 !ent set_vars a xp=50 quest.flag=true quest.other=1
 !ent transform a w form
 ?? `a` transformed into **Wolf**
+?? Statuses of `a`: gained rage, thickfur; stacked stun; lost poison (immune), bless (on_transform drop).
 !assert "match_var_get('rm') == 'poison:transform bless:transform '"
 !assert "match_var_get('ad') == 'rage thickfur '"
 !assert "match_var_get('tk') == 'transform Wolf'"
@@ -37419,6 +37421,7 @@ HARNESS-ALLOWS-ERRORS
 !ent set_var a xp 75
 !ent revert a form
 ?? `a` reverted to **Hero**
+?? Statuses of `a`: kept stun, mark2; lost rage (came with the form), thickfur (came with the form).
 !assert "match_var_get('tk') == 'revert Hero'"
 !assert "match_var_get('rm') == 'rage:transform thickfur:transform '"
 !assert "status_has('a', 'stun') and status_has('a', 'mark2') and not status_has('a', 'rage') and not status_has('a', 'thickfur')"
@@ -37427,14 +37430,16 @@ HARNESS-ALLOWS-ERRORS
 !undo command
 !assert "status_has('a', 'rage') and entity['a'].name == 'Wolf'"
 
-Expected: the hero holds stun 1 for 3, poison 2 for 4 and bless (on_transform
-drop). Transforming into the wolf keeps the hero's statuses beside the
-wolf's: rage and thickfur arrive (on_added fires for each, and they carry
-the stash path as their marker); the wolf's stun 2 for 1 meets the
-hero's stun 1 for 3 and stacks through the layered default ([[2, 1],
-[1, 3]]); the poison goes because thickfur makes the wolf immune; bless
-goes because its on_transform is drop; both removals bind removed_by
-`transform`. on_transformed fires once the swap settled, transform_kind
+Expected: the hero holds stun 1 for 3, poison 2 for 4 (on_transform keep)
+and bless (on_transform drop). Transforming into the wolf keeps the
+hero's statuses beside the wolf's: rage and thickfur arrive (on_added
+fires for each, and they carry the stash path as their marker); the
+wolf's stun 2 for 1 meets the hero's stun 1 for 3 and stacks through the
+layered default ([[2, 1], [1, 3]]); the poison goes because thickfur
+makes the wolf immune, its keep notwithstanding (keep overrides the
+flavor, never immunity); bless goes because its on_transform is drop;
+both removals bind removed_by `transform`. The reply lists what
+happened to each status. on_transformed fires once the swap settled, transform_kind
 `transform`, with the wolf's name. transform_keep_vars keeps xp and
 quest.flag (quest.other isn't listed, so the wolf's vars lack it).
 A poison applied in wolf form is refused (immune); mark2 arrives in
@@ -37570,6 +37575,8 @@ SCENARIO 1065 — Transform edge cases: an on_removed hook that removes the unit
 !assert "status_level('c', 'fury') == 3"
 !system set default transform_keep_vars xp,a..b
 ?? names a var path
+!system set default transform_keep_vars @atb_charge,@nope
+?? `@nope` names no var-name rule
 !system set default transform_keep_vars ok
 !prefab save pf 1 1 10 10 definitions=all
 !prefab show pf
@@ -37581,5 +37588,42 @@ on the bat goes when the bat is replaced, while the crow's level-3 fury
 survives its replace. The hero's doom is on_transform drop and its
 on_removed hook removes the unit: the replace stops there without a crash
 (the unit is gone, and the reply says it was removed). transform_keep_vars
-refuses an empty path segment. A prefab saved with definitions=all
+refuses an empty path segment and an `@` entry naming no var-name rule. A prefab saved with definitions=all
 carries fury's definition, its on_transform level entry included.
+
+SCENARIO 1066 — transform_keep_vars defaults to @atb_charge: the ATB bar survives transform, replace and revert, follows a renamed atb_charge_var, and resets once the rule no longer names it
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!system new atbx
+!system set atbx atb_enabled true
+!system set atbx atb_charge_formula "10"
+!match new ab Bars 8 8 system=atbx
+!match use ab
+!ent add a Hero 20 1 1 5
+!ent add w Wolf 30 5 5 5
+!ent set_vars a atb_charge=40 xp=7
+!ent set_var w atb_charge 0
+!help rule transform_keep_vars
+?? `@atb_charge` (the default)
+!ent transform a w form
+!assert "entity['a'].atb_charge == 40 and entity['a'].name == 'Wolf' and not var_has('a', 'xp')"
+!system set atbx atb_charge_var bar
+!assert "entity['a'].bar == 40"
+!ent replace a w form2
+!assert "entity['a'].bar == 40"
+!ent revert a form2
+!assert "entity['a'].bar == 40 and entity['a'].name == 'Wolf'"
+!system set atbx transform_keep_vars xp
+!ent revert a form
+!assert "entity['a'].bar == 40 and entity['a'].xp == 7 and entity['a'].name == 'Hero'"
+!ent transform a w form3
+!assert "entity['a'].bar == 0 and entity['a'].xp == 7"
+
+Expected: under ATB the hero's bar holds 40 and the wolf's 0. The
+default transform_keep_vars `@atb_charge` keeps the hero's bar through
+the transform (xp isn't listed, so the wolf form lacks it). After
+atb_charge_var is renamed to `bar`, the `@` entry follows the new name
+through a replace and its revert. With the rule set to `xp` alone, the
+revert to the hero takes both from the stash: the wolf form holds no xp,
+so the stashed 7 stays, and the stashed bar of 40 (saved as atb_charge)
+moves to `bar`. A fresh transform then takes the wolf's bar, 0, while
+xp 7 is kept.

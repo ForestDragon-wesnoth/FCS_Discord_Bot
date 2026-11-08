@@ -1497,7 +1497,8 @@ hardcodes**.
   `atb_reset_formula` (default subtract `atb_threshold`). A skipped unit's
   turn still elapses (ticks fire, action surface doesn't). `round_number()`,
   `turn_index()` and `schedule()` RAISE under ATB; a one-time warning lists
-  dormant round logic. `transform` resets the bar to the new form's value (unless `transform_keep_vars` names it).
+  dormant round logic. A transform keeps the bar (`transform_keep_vars`
+  defaults to `@atb_charge`, §7.11).
   Prims `atb_threshold()` / `atb_rate(eid)` (524-527).
 - **`Match.turns_elapsed`**: serialized count of turn boundaries in both
   models (`_begin_turn`); `turns_elapsed()`; the clock for ATB-safe expiry
@@ -2372,9 +2373,11 @@ hardcodes**.
   `revert`; `!ent replace`, `replace_form`): swaps name, vars, passives,
   clamps and the part subtree; keeps id, position, facing, team, turn slot
   and the unit's own segment linkage; hp per `transform_hp_mode` (percent
-  / keep / full); the vars `transform_keep_vars` and the unit's
-  `__transform_keep_vars` list (which survives too) name keep the unit's
-  values (`Match.transform_keep_paths`); the old statblock is stashed at
+  / keep / full); the vars `transform_keep_vars` (default `@atb_charge`:
+  an `@<rule>` entry is the var a VAR_NAME_RULES rule names, so it
+  follows a rename) and the unit's `__transform_keep_vars` list (which
+  survives too) name keep the unit's values
+  (`Match.transform_keep_paths`); the old statblock is stashed at
   a caller-chosen var path, so transforms stack. New vars are checked
   before the old parts go (481-483, 586).
 - **Statuses across a transform** (user design, 1062-1065;
@@ -2383,11 +2386,14 @@ hardcodes**.
   (merge) keeps the unit's statuses and adds the form's: a new one is
   added (on_added; marked `TRANSFORM_FORM_KEY` = the stash path), one
   the unit holds takes the form's as an application through its stack
-  mode, resistance skipped; an old one the new form is immune to goes.
+  mode, resistance skipped; an old one the new form is immune to goes,
+  whatever its `on_transform` says (user call).
   `replace` keeps only the form's (a zone's status stays: the zone
   decides). A status's `on_transform` (`status_field`: instance key,
-  definition, level entries; `!status on_transform`) keep survives
-  everything, immunity included, drop goes on every transform. Leaving
+  definition, level entries; `!status on_transform`) keep overrides the
+  flavor (never immunity), drop goes on every transform. The reply (and
+  a formula's log) gets a line per unit, tagged as about it: kept /
+  gained / stacked / lost (with the reason). Leaving
   statuses fire on_removed with removed_by `transform`. Reverting a
   merge takes back the statuses marked with its stash path and adds
   nothing from the stash; reverting a replace restores the stash's as a
@@ -3665,10 +3671,6 @@ rejected already. Update this section in the PR that resolves an item.
 - **Approved commands and POV:** an approved player command runs in the
   requester's channel, so its output (including hook lines naming units that
   POV can't see) shows there. On hold at the user's request.
-- **ATB bar across a transform:** transform replaces vars, so the charge bar
-  resets to the new form's value unless `transform_keep_vars` names it
-  (the rule's default is empty; #122's entry proposed the bar as the
-  default).
 - **Aura id reuse:** a suspended aura resumes around a later unit that takes
   the old anchor's id (§7.12). Distinguishing them needs an identity concept
   beyond ids.

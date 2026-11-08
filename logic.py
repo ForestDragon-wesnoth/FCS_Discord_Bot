@@ -1385,14 +1385,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "transform_keep_vars": {
-        "default": "",
+        "default": "@atb_charge",
         "schema": {"type": "str"},
         "desc": (
             "Vars that survive every transform, replace and revert: a comma "
-            "list of var paths (`xp`, `quest.flags`). The unit's value at "
-            "each path replaces the new form's; a path the unit lacks keeps "
-            "the new form's. A unit adds its own paths in its "
-            "`__transform_keep_vars` list, which survives too."
+            "list of var paths and `@<var-name rule>` entries. "
+            "`@atb_charge` (the default) is the var atb_charge_var names, "
+            "so the ATB bar carries over and the entry follows a renamed "
+            "var; `@hp` would keep the hp itself over transform_hp_mode. "
+            "Examples: `@atb_charge, xp` (experience is the character's, "
+            "whatever its form), `@atb_charge, xp, quest.flags, "
+            "inventory` (a shapeshifter keeps its pack), `gold, "
+            "reputation`. The unit's value at each path replaces the new "
+            "form's; a path the unit lacks keeps the new form's. A unit "
+            "adds its own paths in its `__transform_keep_vars` list (or "
+            "comma text), which survives too."
         ),
     },
     "transform_hp_mode": {
@@ -5867,9 +5874,18 @@ def _check_private_paths(key: str, raw: str) -> str:
 
 
 def _check_var_path_list(key: str, raw: str) -> str:
-    """A comma list of var paths (transform_keep_vars)."""
+    """A comma list of var paths and `@<var-name rule>` entries
+    (transform_keep_vars)."""
     got = [w for w in re.split(r"[\s,]+", raw) if w]
     for w in got:
+        if w.startswith("@"):
+            if w[1:] + "_var" not in VAR_NAME_RULES:
+                raise VTTError(
+                    f"Setting '{key}': `{w}` names no var-name rule; an "
+                    f"`@` entry is one of "
+                    + ", ".join(f"`@{r[:-4]}`" for r in VAR_NAME_RULES)
+                    + ".")
+            continue
         _check_var_path_rule(key, w)
     return ", ".join(got)
 
@@ -24738,6 +24754,14 @@ class Match:
         elif isinstance(own, list):
             words += [str(w) for w in own if isinstance(w, str) and w]
         for w in words:
+            if w.startswith("@"):
+                # `@atb_charge`: the var the atb_charge_var rule names, so
+                # the entry follows a renamed var.
+                rule = w[1:] + "_var"
+                if rule not in VAR_NAME_RULES:
+                    continue
+                w = str(self.rules.get(rule) or RULES_REGISTRY[rule][
+                    "default"])
             if w not in out and all(w.split(".")):
                 out.append(w)
         return out
@@ -24781,37 +24805,49 @@ class Match:
                     form, dict)) else {}
         # Immunity as the new form has it: its vars and its own statuses.
         u.status = copy.deepcopy(form)
-        gone: List[str] = []
+        gone: Dict[str, str] = {}
         for n, inst in old.items():
             flag = self.status_field(inst, n, "on_transform")
-            if flag == "keep":
+            # Immunity takes a status whatever its on_transform says; keep
+            # overrides only the flavor (user call).
+            if self._resist_inputs(u, n)[0]:
+                gone[n] = "immune"
+            elif flag == "keep":
                 continue
-            if (flag == "drop"
-                    or (mode == "replace" and ZONE_GRANT_KEY not in inst)
-                    or (revert_tag is not None
-                        and inst.get(TRANSFORM_FORM_KEY) == revert_tag)
-                    or self._resist_inputs(u, n)[0]):
-                gone.append(n)
+            elif flag == "drop":
+                gone[n] = "on_transform drop"
+            elif (revert_tag is not None
+                  and inst.get(TRANSFORM_FORM_KEY) == revert_tag):
+                gone[n] = "came with the form"
+            elif mode == "replace" and ZONE_GRANT_KEY not in inst:
+                gone[n] = "replaced"
         u.status = copy.deepcopy(old)
-        for n in gone:
+        kept = [n for n in old if n not in gone and n not in form]
+        gained: List[str] = []
+        stacked: List[str] = []
+        lost: List[str] = []
+        for n, why in gone.items():
             if u.id not in self.entities:
-                return log
+                break
             before = u.status.pop(n, None)
             if before is not None:
+                lost.append(f"{n} ({why})")
                 log += self._emit_status_diff(u.id, n, before, None,
                                               removed_by="transform")
         for n, inst in form.items():
             if u.id not in self.entities:
-                return log
+                break
             if n not in u.status:
                 new = copy.deepcopy(inst)
                 new.pop(TRANSFORM_FORM_KEY, None)
                 if form_tag is not None:
                     new[TRANSFORM_FORM_KEY] = form_tag
                 u.status[n] = new
+                gained.append(n)
                 log += self._emit_status_diff(u.id, n, None,
                                               copy.deepcopy(new))
                 continue
+            stacked.append(n)
             lv = inst.get("level")
             du = inst.get("duration")
             try:
@@ -24825,8 +24861,18 @@ class Match:
             except VTTError as ex:
                 log.append(f"⚠️ `{u.id}`'s new form's `{n}` didn't stack: "
                            f"{ex}")
-        if u.id in self.entities:
-            self._cap_unit_status_levels(u)
+        if u.id not in self.entities:
+            return log
+        self._cap_unit_status_levels(u)
+        # What happened to the statuses, as a line about the unit (a
+        # channel whose view hides it drops it).
+        parts = [f"{word} {', '.join(names)}" for word, names in (
+            ("kept", kept), ("gained", gained), ("stacked", stacked),
+            ("lost", lost)) if names]
+        if parts:
+            who = (f"`{u.id}`" + (f" ({u.name})" if u.is_part else ""))
+            log += self.tag_lines(self.unit_tag(u.id), [
+                f"Statuses of {who}: " + "; ".join(parts) + "."])
         return log
 
     def transform_entity(self, eid: str, template: Any,
