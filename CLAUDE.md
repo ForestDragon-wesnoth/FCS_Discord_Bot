@@ -1497,7 +1497,8 @@ hardcodes**.
   `atb_reset_formula` (default subtract `atb_threshold`). A skipped unit's
   turn still elapses (ticks fire, action surface doesn't). `round_number()`,
   `turn_index()` and `schedule()` RAISE under ATB; a one-time warning lists
-  dormant round logic. `transform` resets the bar to the new form's value.
+  dormant round logic. A transform keeps the bar (`transform_keep_vars`
+  defaults to `@atb_charge`, §7.11).
   Prims `atb_threshold()` / `atb_rate(eid)` (524-527).
 - **`Match.turns_elapsed`**: serialized count of turn boundaries in both
   models (`_begin_turn`); `turns_elapsed()`; the clock for ATB-safe expiry
@@ -1538,7 +1539,7 @@ hardcodes**.
   `fire_status_event` after the on_status_* passives, self = the bearer,
   while the unit exists. Removal hooks (passives too) bind `removed_by`:
   `dispel`, `transfer`, `removes` (another status's `removes`), `zone`
-  (a granting zone let go, §7.12), `expired`
+  (a granting zone let go, §7.12), `transform` (§7.11), `expired`
   (a counter reached 0, or the status's own tick removed it:
   `logic.STATUS_TICKING`) or `removed`; `_emit_status_diff(removed_by=)`
   carries a caller's cause (884). The formula status functions surface
@@ -1547,13 +1548,44 @@ hardcodes**.
   and past `status_hook_recursion_limit` (32) the rest of the chain fires
   no status hooks, with one ⚠️ (900).
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
-  from the definition's `stack`, else `status_default_stack` (refresh /
-  add_level / extend / replace / none). `max_level` is a hard ceiling on
+  from the definition's `stack`, else `status_default_stack` (layered,
+  the default / refresh / add_level / extend / replace / none; refresh
+  keeps the level and only lengthens the duration, user call). `max_level` is a hard ceiling on
   every write of a level: applications (`_cap_status_level`), every status
   change through `_emit_status_diff` (`_cap_live_status`: status_set,
   counters, `!ent status set` report the stored value), statuses a spawn /
   summon / transform brings (`_cap_unit_status_levels`); lowering it with
   `!status maxlevel` lowers live instances as status changes (740).
+- **Layers** (user design, 1058-1061): the `layered` mode (the
+  default; `refresh` is its primitive sibling, which keeps the level).
+  Each application is a (level, duration) layer; the instance keeps the front of them (`logic.status_layer_front`: per level its
+  longest duration, a lower level only while it outlasts every higher
+  one; None = permanent, the longest), in `STATUS_LAYERS_KEY`
+  (`__layers`, `[[level, duration], ...]` highest level first) only while
+  there are two or more, and its own `level` / `duration` are the first
+  layer's level and the longest duration (`write_status_layers`). So burn
+  3 for 2 plus burn 1 for 5, either order, is level 3 for 2 turns, then
+  level 1 for 3 more; a re-application never shortens (a lower, shorter
+  one adds nothing). An application without a level is at the level
+  shown, without a duration it lasts as long as the status does now; a
+  permanent status keeps its permanent layer (L38), so a timed higher
+  application runs out back to it. A countdown on `duration`
+  (`status_counter_add`, `!status counter add`: `Match.tick_status_layers`)
+  ticks every layer, drops those reaching 0 (the level falls, one status
+  change), and removes the status (`expired`) with the last.
+  `_cap_live_status` caps every layer at max_level and collapses the
+  layers (`settle_status_layers`) when any other write changed the level
+  or duration: `status_set`, `!ent status set`, a counter set, a zone
+  grant's level. The other modes collapse them to what the instance
+  shows first; `refresh` and `add_level` only lengthen the duration
+  (`replace` is the one mode that shortens). Reads `status_layers(eid, name)`
+  (loopable; one pair without layers, [] without the status), the
+  `{layers}` placeholder (`×3 for 2, then ×1 for 3 more`, in the default
+  status_line_format), the `!status apply` / `counter` replies. A
+  transfer onto a unit without the status carries the layers. A layered
+  application with a level passes resistance like add_level
+  (`_resistance_applies`), so each layer arrives resisted; refresh sets
+  no level, so resistance doesn't touch it.
 - **Rename / copy:** `!status rename` (`Match.rename_status`: the
   definition, live instances on units, parts and corpses (their parts
   too), other definitions' `removes` / `blocked_by`, and `status_immune` /
@@ -2338,11 +2370,39 @@ hardcodes**.
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
   corpse / corpse_list action targets.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
-  `revert`): swaps name, vars, passives, clamps, statuses and the part
-  subtree; keeps id, position, facing, team, turn slot and the unit's own
-  segment linkage; hp per `transform_hp_mode` (percent / keep / full); the
-  old statblock is stashed at a caller-chosen var path, so transforms stack.
-  New vars are checked before the old parts go (481-483, 586).
+  `revert`; `!ent replace`, `replace_form`): swaps name, vars, passives,
+  clamps and the part subtree; keeps id, position, facing, team, turn slot
+  and the unit's own segment linkage; hp per `transform_hp_mode` (percent
+  / keep / full); the vars `transform_keep_vars` (default `@atb_charge`:
+  an `@<rule>` entry is the var a VAR_NAME_RULES rule names, so it
+  follows a rename) and the unit's `__transform_keep_vars` list (which
+  survives too) name keep the unit's values
+  (`Match.transform_keep_paths`); the old statblock is stashed at
+  a caller-chosen var path, so transforms stack. New vars are checked
+  before the old parts go (481-483, 586).
+- **Statuses across a transform** (user design, 1062-1065;
+  `Match._transform_status_swap`, after the new body stands): two
+  flavors, recorded in the stash (`TRANSFORM_MODE_KEY`). `transform`
+  (merge) keeps the unit's statuses and adds the form's: a new one is
+  added (on_added; marked `TRANSFORM_FORM_KEY` = the stash path), one
+  the unit holds takes the form's as an application through its stack
+  mode, resistance skipped; an old one the new form is immune to goes,
+  whatever its `on_transform` says (user call).
+  `replace` keeps only the form's (a zone's status stays: the zone
+  decides). A status's `on_transform` (`status_field`: instance key,
+  definition, level entries; `!status on_transform`) keep overrides the
+  flavor (never immunity), drop goes on every transform. The reply (and
+  a formula's log) gets a line per unit, tagged as about it: kept /
+  gained / stacked / lost (with the reason). Leaving
+  statuses fire on_removed with removed_by `transform`. Reverting a
+  merge takes back the statuses marked with its stash path and adds
+  nothing from the stash; reverting a replace restores the stash's as a
+  replace. A body part on a part-name path both forms share
+  (`Match._part_paths`: part_name var, else the name, under the parent's
+  path; duplicates paired in order) passes its statuses to the new part
+  through the same swap; parts unique to either form keep their own.
+  `on_transformed` fires on the unit at the end (`transform_kind`
+  transform / replace / revert).
 - **Disguise** (`disguise_var`): `{name, glyph, glyphs, color, vars}` shown
   to viewers outside the unit's team (maps, roster, `!ent info`, `!find`
   rows); mechanics always read the real unit; overlays hidden under a
@@ -3611,8 +3671,6 @@ rejected already. Update this section in the PR that resolves an item.
 - **Approved commands and POV:** an approved player command runs in the
   requester's channel, so its output (including hook lines naming units that
   POV can't see) shows there. On hold at the user's request.
-- **ATB bar across a transform:** transform replaces vars, so the charge bar
-  resets to the new form's value. Raise it if the user wants it kept.
 - **Aura id reuse:** a suspended aura resumes around a later unit that takes
   the old anchor's id (§7.12). Distinguishing them needs an identity concept
   beyond ids.
@@ -3634,6 +3692,13 @@ rejected already. Update this section in the PR that resolves an item.
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
   topic of debate (user: write it down).
+
+- **Status layers collapse on other writes** (user: acceptable for now,
+  a known gap): `refresh`, `add_level`, `extend`, `replace`, a direct write of the
+  level or duration and a counter set collapse a layered status to the
+  level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
+  3 for 5), and a transfer onto a unit already holding the status stacks
+  only that pair. A layer-aware version of each is open.
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose

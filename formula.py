@@ -2844,7 +2844,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   corpse_var(eid, path[, def]) -> the dead entity's stored var at a
     #                                   dotted path (raises if missing
     #                                   unless a default is supplied)
-    "kill", "revive", "transform", "revert", "has_corpse", "corpse_at", "all_corpses",
+    "kill", "revive", "transform", "replace_form", "revert", "has_corpse",
+    "corpse_at", "all_corpses",
     "corpse_has", "corpse_var",
     "corpse_status_has", "corpse_status_get", "corpse_status_names",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
@@ -2921,6 +2922,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
     # Void cells: cells of a map's rectangle that don't exist.
     "is_void", "void_cells", "void_add", "void_remove",
+    # A status's layers (layered stacking), [[level, duration], ...].
+    "status_layers",
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
     "atb_threshold", "atb_rate",
@@ -3069,7 +3072,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "summon", "summon_near", "summon_from", "remove_entity",
     "summon_template", "summon_template_near", "give_template",
     "stamp_prefab",
-    "kill", "revive", "transform", "revert",
+    "kill", "revive", "transform", "replace_form", "revert",
     "schedule", "schedule_on", "cancel_schedule",
     # They run a `!func` or a lambda per item, and a `!func` may write.
     "map_with", "filter_with", "sort_by",
@@ -3090,6 +3093,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "is_void", "void_cells",
+    "status_layers",
     'watch_exists', 'watchers_of',
     'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
     'map_carrier', 'inner_maps', 'outer_map',
@@ -3203,7 +3207,8 @@ _GRANT_SETTLE_FUNCS: "frozenset[str]" = frozenset({
     "zone_grant", "zone_ungrant",
     "summon", "summon_near", "summon_from", "summon_template",
     "summon_template_near", "stamp_prefab", "remove_entity", "kill",
-    "revive", "transform", "revert", "mount", "dismount", "switch_slot",
+    "revive", "transform", "replace_form", "revert", "mount", "dismount",
+    "switch_slot",
     "damage_part", "damage_spread", "void_add", "void_remove",
 })
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
@@ -3350,7 +3355,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
     "prefab_names", "size_categories", "next_turns", "extra_turn_queue",
-    "void_cells",
+    "void_cells", "status_layers",
     "range",
     "each",
     "keys",
@@ -3461,8 +3466,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     "removed_by",       # on_status_removed passives and a definition's
                         # on_removed hook: why the status left (expired,
                         # dispel, transfer, removes, zone (a granting
-                        # zone let go, #136), removed); None
+                        # zone let go, #136), transform, removed); None
                         # elsewhere.
+    "transform_kind",   # on_transformed: transform, replace or revert;
+                        # None elsewhere.
     "skip_status",      # on_turn_skipped: the status(es) whose skips_turn
                         # cost the unit its turn, sorted and comma-joined
                         # ("stunned" / "frozen, stunned"); None elsewhere.
@@ -6366,6 +6373,20 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
+            from logic import status_layers_of, STATUS_LAYERS_KEY
+            if field == "duration" and status_layers_of(
+                    e.status[name]) is not None:
+                if absolute:
+                    # A set gives the status one duration: the layers
+                    # collapse to the level shown.
+                    e.status[name].pop(STATUS_LAYERS_KEY, None)
+                else:
+                    # Layers (layered stacking) count down together; the
+                    # level falls as the higher ones run out.
+                    left, log = match.tick_status_layers(eid, name, amount)
+                    match.surface_log(log)
+                    self._note_affected(eid)
+                    return left
             # The current value reads through the level entries (user call,
             # S14): a level entry's `duration: 5` or `charges: 3` counts down
             # from 5 / 3, and the result is the instance's own key from then
@@ -6420,6 +6441,25 @@ class FormulaEngine:
         ns["statuses_with_tag"]   = _statuses_with_tag
         ns["status_resist_of"]    = _status_resist_of
         ns["is_status_immune"]    = _is_status_immune
+        def _status_layers(eid_t: Any, name: Any) -> list:
+            """status_layers(eid, name): the status's layers as [level,
+            duration] pairs, highest level first (layered stacking: burn 3
+            for 2 turns plus burn 1 for 5 is [[3, 2], [1, 5]]); one pair
+            for a status without layers, [] when the unit lacks it. A
+            duration of None is permanent. Loopable."""
+            eid = _eid(eid_t)
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            if not isinstance(name, str):
+                raise FormulaError("status_layers(eid, name): name must be "
+                                   "a string.")
+            if name not in e.status:
+                return []
+            return [list(x) for x in match.status_layers(e.status[name],
+                                                         name)]
+
+        ns["status_layers"]       = _status_layers
         ns["status_counter_add"]  = _status_counter_add
         ns["status_counter_set"]  = _status_counter_set
 
@@ -8150,16 +8190,31 @@ class FormulaEngine:
 
         def _transform(eid_t: Any, template: Any, stash_path: Any = None) -> str:
             """transform(eid, template, stash_path=None): swap eid's statblock
-            (name/vars/passives/clamps/status/parts) for `template`, KEEPING
-            its id/position/facing/team/turn-order slot. HP carries per the
-            transform_hp_mode rule. If `stash_path` is given, the pre-transform
-            statblock is stored at entity[eid].<stash_path> so revert(eid,
-            stash_path) can restore it (stash paths are ordinary vars, so
-            transforms stack). Returns eid."""
+            (name/vars/passives/clamps/parts) for `template`, KEEPING its
+            id/position/facing/team/turn-order slot and its statuses beside
+            the form's (`!ent transform`; replace_form keeps only the
+            form's). HP carries per the transform_hp_mode rule. If
+            `stash_path` is given, the pre-transform statblock is stored at
+            entity[eid].<stash_path> so revert(eid, stash_path) can restore
+            it (stash paths are ordinary vars, so transforms stack). Returns
+            eid."""
+            return _transform_as(eid_t, template, stash_path, "merge")
+
+        def _replace_form(eid_t: Any, template: Any,
+                          stash_path: Any = None) -> str:
+            """replace_form(eid, template, stash_path=None): transform eid
+            into `template` with the form's statuses only (`!ent replace`):
+            the unit's own go, except those whose `on_transform` is keep.
+            Otherwise as transform(). Returns eid."""
+            return _transform_as(eid_t, template, stash_path, "replace")
+
+        def _transform_as(eid_t: Any, template: Any, stash_path: Any,
+                          statuses: str) -> str:
             eid = str(_eid(eid_t))
             sp = None if stash_path is None else str(stash_path)
             try:
-                match.surface_log(match.transform_entity(eid, template, sp))
+                match.surface_log(match.transform_entity(
+                    eid, template, sp, statuses=statuses))
             except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
@@ -8269,6 +8324,7 @@ class FormulaEngine:
         ns["kill"]         = _kill
         ns["revive"]       = _revive
         ns["transform"]    = _transform
+        ns["replace_form"] = _replace_form
         ns["revert"]       = _revert
         ns["has_corpse"]   = _has_corpse
         ns["corpse_at"]    = _corpse_at

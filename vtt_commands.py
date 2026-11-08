@@ -16,6 +16,7 @@ from logic import (
 )
 
 # Passive system
+from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY
 from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
@@ -2697,9 +2698,28 @@ def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
             sdef = defs.get(name)
             fmt = sdef.get("display") if isinstance(sdef, dict) else None
         ctx["name"] = name
+        ctx.pop(STATUS_LAYERS_KEY, None)
+        if status_layers_of(inst) is not None:
+            ctx["layers"] = status_layers_text(status_layers_of(inst))
         out.append(_render_template(fmt if isinstance(fmt, str) and fmt
                                     else str(default), ctx))
     return ", ".join(out)
+
+
+def status_layers_text(layers: List[List[Any]]) -> str:
+    """Layers as read in a status line: `×3 for 2, then ×1 for 3 more`
+    (`... then ×1 permanently` for a permanent last layer)."""
+    parts = []
+    prev = 0
+    for i, (lv, du) in enumerate(layers):
+        if du is None:
+            parts.append(f"×{lv} permanently")
+        elif i == 0:
+            parts.append(f"×{lv} for {du}")
+        else:
+            parts.append(f"×{lv} for {du - prev} more")
+        prev = du if du is not None else prev
+    return ", then ".join(parts)
 
 
 def _entity_template_context(e: Entity,
@@ -11895,10 +11915,11 @@ registry.annotate_sub(
         "display <system> <name> [<format ...>] | "
         "when <system> <name> <turn_end|turn_start|round_start|round_end|never> | "
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
-        "stack <system> <name> <refresh|add_level|extend|replace|none> | "
+        "stack <system> <name> <layered|refresh|add_level|extend|replace|none> | "
         "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
         "resist_affects <system> <name> <level|duration|both|-> | "
         "resist_rounding <system> <name> <floor|ceil|round|-> | "
+        "on_transform <system> <name> <keep|drop|-> | "
         "level <system> <name> list | level <system> <name> <level> drop | "
         "level <system> <name> <level> del <field> | "
         "level <system> <name> <level> <field> <value ...> | "
@@ -12338,7 +12359,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if len(args) >= 3 and (
                 sub in ("swap", "diff", "store_entity_into_var",
                         "store_entity")
-                or (sub == "transform" and not isinstance(
+                or (sub in ("transform", "replace") and not isinstance(
                     _var_at(m.entities[_resolve_eid(m, args[1])].vars,
                             args[2]), dict))):
             _query_eid(ctx, m, args[2])
@@ -13355,8 +13376,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # summon_from convention: store a template, then transform into it), and
     # falls back to a live entity id (snapshot it). With a stash_path the
     # pre-transform statblock is saved there so `!ent revert` can restore it.
-    if sub == "transform":
-        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "transform"):
+    if sub in ("transform", "replace"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", sub):
             return
         tid = _resolve_eid(m, args[1])
         if tid not in m.entities:
@@ -13383,22 +13404,27 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ No template found: `{ref}` is neither a dict var on "
                     f"`{tid}` nor a live entity id.")
         try:
-            tlog = m.transform_entity(tid, template, stash_path)
+            tlog = m.transform_entity(
+                tid, template, stash_path,
+                statuses="merge" if sub == "transform" else "replace")
         except (VTTError, NotFound, Occupied) as ex:
             return await ctx.send(f"❌ {ex}")
         tail = ("\n" + "\n".join(l for l in tlog if l)) if tlog else ""
         stash_note = (f" (original stashed at vars.{stash_path} — "
                       f"`!ent revert {tid} {stash_path}` to restore)"
                       if stash_path else "")
+        verb = "transformed" if sub == "transform" else "was replaced"
         if tid not in m.entities:
             # The new form's hp (e.g. percent mode from 0 hp) failed the death
-            # condition once the swap settled, so the death pipeline took it.
+            # condition once the swap settled, so the death pipeline took it;
+            # or a hook the swap set off removed it.
+            fate = ("died in its new form" if m.find_corpse(tid) is not None
+                    else "was removed")
             return await ctx.send(
-                f"`{tid}` transformed{stash_note}, then died in its new form."
-                + tail)
+                f"`{tid}` {verb}{stash_note}, then {fate}." + tail)
         return await ctx.send(
-            f"`{tid}` transformed into **{m.entities[tid].name}**{stash_note}."
-            + tail)
+            f"`{tid}` {verb} " + ("into" if sub == "transform" else "by")
+            + f" **{m.entities[tid].name}**{stash_note}." + tail)
 
     # ---- revert <id> <stash_path> ----
     if sub == "revert":
@@ -13413,8 +13439,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ {ex}")
         tail = ("\n" + "\n".join(l for l in rlog if l)) if rlog else ""
         if tid not in m.entities:
-            return await ctx.send(
-                f"`{tid}` reverted, then died in its restored form." + tail)
+            fate = ("died in its restored form"
+                    if m.find_corpse(tid) is not None else "was removed")
+            return await ctx.send(f"`{tid}` reverted, then {fate}." + tail)
         return await ctx.send(
             f"`{tid}` reverted to **{m.entities[tid].name}**." + tail)
 
@@ -13705,15 +13732,37 @@ registry.annotate_sub(
     usage="!ent transform <id> <template_ref> [stash_path]",
     desc=(
         "Polymorph `<id>` into a statblock template — swaps name, vars "
-        "(incl. actions + footprint), passives, clamps, status, and body "
-        "parts, while KEEPING the entity's id, position, facing, team, and "
-        "turn-order slot. `<template_ref>` is a dotted var path on the "
+        "(incl. actions + footprint), passives, clamps and body parts, "
+        "while KEEPING the entity's id, position, facing, team, turn-order "
+        "slot and statuses. `<template_ref>` is a dotted var path on the "
         "entity (store one with `store_entity_into_var`, then transform into "
-        "it) or a live entity id to snapshot. HP carries per the "
-        "`transform_hp_mode` rule (default: preserve %). Pass `[stash_path]` "
-        "to save the pre-transform statblock at vars.<stash_path> so "
-        "`!ent revert` can restore it — stash paths are ordinary vars, so "
-        "transforms stack."
+        "it) or a live entity id to snapshot. Statuses: the unit keeps its "
+        "own and gains the form's (one it already holds takes the form's as "
+        "an application through its stack mode, resistance skipped); one "
+        "the new form is immune to goes. A status's `on_transform` "
+        "(`!status on_transform`) keep / drop overrides that, immunity "
+        "excepted. The reply lists the statuses kept, gained, stacked and "
+        "lost. A body part "
+        "on the same part-name path in both forms passes its statuses to "
+        "the new part the same way. Vars named by the `transform_keep_vars` "
+        "rule or the unit's `__transform_keep_vars` list keep their values. "
+        "HP carries per the `transform_hp_mode` rule (default: preserve %). "
+        "Pass `[stash_path]` to save the pre-transform statblock at "
+        "vars.<stash_path> so `!ent revert` can restore it — stash paths "
+        "are ordinary vars, so transforms stack. `on_transformed` fires "
+        "(transform_kind `transform`). `!ent replace` keeps only the "
+        "form's statuses."
+    ),
+)
+registry.annotate_sub(
+    "ent", "replace",
+    usage="!ent replace <id> <template_ref> [stash_path]",
+    desc=(
+        "`!ent transform` with the form's statuses only: the unit's own "
+        "statuses go (on_removed fires, removed_by `transform`), except "
+        "those whose `on_transform` is keep and those a zone holds (the "
+        "zone decides). Everything else as `!ent transform`; "
+        "`on_transformed` fires with transform_kind `replace`."
     ),
 )
 registry.annotate_sub(
@@ -13721,7 +13770,12 @@ registry.annotate_sub(
     usage="!ent revert <id> <stash_path>",
     desc=(
         "Restore `<id>`'s statblock from a snapshot previously stashed at "
-        "vars.<stash_path> by `!ent transform`. HP carries per the "
+        "vars.<stash_path> by `!ent transform` or `!ent replace`. After a "
+        "transform the statuses that came with the form go and the rest "
+        "stay (the stash's aren't re-added); after a replace the stash's "
+        "statuses come back as a replace would bring them. Kept vars and "
+        "`on_transform` apply as for a transform; `on_transformed` fires "
+        "with transform_kind `revert`. HP carries per the "
         "`transform_hp_mode` rule. The stash var is consumed."
     ),
 )
@@ -22136,7 +22190,7 @@ for _sub, _usage in (
         ("hook", "!status hook <name> <on_added|on_removed|on_changed> [<formula ...>]"),
         ("display", "!status display <name> [<format ...>]"),
         ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
-        ("stack", "!status stack <name> <refresh|add_level|extend|replace|none>"),
+        ("stack", "!status stack <name> <layered|refresh|add_level|extend|replace|none>"),
         ("maxlevel", "!status maxlevel <name> <n>"),
         ("data", "!status data <name> <path> <value>"),
         ("tags", "!status tags <name> <csv ...>"),
@@ -22161,6 +22215,18 @@ registry.annotate_sub(
           "both. A result below 1 doesn't apply; a status with no duration "
           "has none to change. Level entries (`!status level`) can set it "
           "per level."),
+)
+registry.annotate_sub(
+    "status", "on_transform",
+    usage="!status on_transform <name> <keep|drop|->",
+    desc=("What a transform does with this status: `keep` = it survives "
+          "every transform, replace and revert (a new form immune to it "
+          "still takes it), `drop` = every one of them takes it (on_removed "
+          "fires, removed_by `transform`). `-` goes back to the flavor's "
+          "default: `!ent transform` keeps it unless the new form is "
+          "immune, `!ent replace` drops it. An instance's own "
+          "`on_transform` key and level entries (`!status level`) "
+          "override the definition's."),
 )
 registry.annotate_sub(
     "status", "resist_rounding",
@@ -22226,7 +22292,8 @@ for _sub in ACTION_RESTRICTION_FIELDS:
 
 
 _TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end", "never")
-_STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
+_STACK_MODES = ("layered", "refresh", "add_level", "extend", "replace",
+                "none")
 # The `!status` subcommands that edit definitions, which `!system status`
 # runs on a system's library too: sub -> the words it needs.
 _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
@@ -22237,7 +22304,8 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     **{f + UNLESS_SUFFIX: 2
                        for f in ACTION_RESTRICTION_FIELDS},
                     GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2,
-                    "level": 3, "resist_affects": 3, "resist_rounding": 3}
+                    "level": 3, "resist_affects": 3, "resist_rounding": 3,
+                    "on_transform": 3}
 
 # `!status level` (#259): a level entry's field -> the `!status`
 # subcommand that edits that field of a definition (run on a scratch
@@ -22248,6 +22316,7 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      STATUS_UNIT_TAG_BLOCK: STATUS_UNIT_TAG_BLOCK,
                      "resist_affects": "resist_affects",
                      "resist_rounding": "resist_rounding",
+                     "on_transform": "on_transform",
                      **{f: f for f in ACTION_RESTRICTION_FIELDS},
                      **{f + UNLESS_SUFFIX: f + UNLESS_SUFFIX
                         for f in ACTION_RESTRICTION_FIELDS}}
@@ -22612,23 +22681,28 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
             f"Set overlay sprite `{val}` for status `{name}` (drawn over "
             f"afflicted entities on the graphics surface).{extra}")
 
-    if sub in ("resist_affects", "resist_rounding"):
+    if sub in ("resist_affects", "resist_rounding", "on_transform"):
         # #232: what resistance changes on this status, and how its result
-        # rounds (over the status_resist_rounding rule); `-` clears.
+        # rounds (over the status_resist_rounding rule); what a transform
+        # does with it (keep / drop over the transform's flavor); `-`
+        # clears.
         if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
             return ""
         name, val = args[1], args[2].lower()
         if name not in m.status_definitions:
             return f"❌ No status definition `{name}`."
         _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->")
-        choices = RESIST_AFFECTS if sub == "resist_affects" \
-            else RESIST_ROUNDINGS
+        choices = {"resist_affects": RESIST_AFFECTS,
+                   "resist_rounding": RESIST_ROUNDINGS,
+                   "on_transform": TRANSFORM_STATUS_FLAGS}[sub]
         if val in ("-", "default", "clear"):
             m.status_definitions[name].pop(sub, None)
             return (f"`{name}` {sub} cleared ("
-                    + ("resistance changes its level)."
-                       if sub == "resist_affects" else
-                       "the status_resist_rounding rule rounds it)."))
+                    + {"resist_affects": "resistance changes its level).",
+                       "resist_rounding":
+                           "the status_resist_rounding rule rounds it).",
+                       "on_transform": "a transform keeps it, a replace "
+                                       "drops it)."}[sub])
         if val not in choices:
             return f"❌ {sub} must be one of: {', '.join(choices)} (or `-`)."
         m.status_definitions[name][sub] = val
@@ -22777,7 +22851,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
            "immune_to_actions_with_tag_unless|immune_to_actions_with_name_unless|"
            "grants_unit_tags|cannot_affect_units_with_tag|"
-           "resist|resist_affects|resist_rounding|"
+           "resist|resist_affects|resist_rounding|on_transform|"
            "counter|dispel|transfer|sprite|level|list|info|"
            "apply|force> ..."),
     desc=(
@@ -22806,7 +22880,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         "what the status does when it arrives, leaves or changes on a unit "
         "(self = the bearer; status_name, old_value, new_value and, on "
         "removal, removed_by: expired / dispel / transfer / removes / "
-        "zone / removed), run after the on_status_* passives; no formula clears "
+        "zone / transform / removed), run after the on_status_* passives; no formula clears "
         "it. "
         "`display <name> <format>` sets how the status shows in the "
         "`{statuses}` roster placeholder (its fields are placeholders, as in "
@@ -22906,6 +22980,9 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if op not in ("add", "set"):
             return await ctx.send("❌ op must be `add` or `set`.")
         prim = "status_counter_add" if op == "add" else "status_counter_set"
+        pe = m.entities.get(eid)
+        had_layers = (field == "duration" and pe is not None
+                      and status_layers_of(pe.status.get(sname)) is not None)
         try:
             new = FormulaEngine(m).eval_expression(
                 f"{prim}('{eid}', '{sname}', {value}, '{field}')",
@@ -22915,6 +22992,18 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e = m.entities.get(eid)
         gone = e is None or sname not in e.status
         tail = " (status removed at <=0)" if gone else ""
+        layers = (status_layers_of(e.status[sname])
+                  if not gone and field == "duration" else None)
+        if layers is not None:
+            return await ctx.send(f"`{eid}.{sname}`: "
+                                  f"{status_layers_text(layers)}.")
+        if had_layers and not gone:
+            # The higher layers ran out: one layer is left.
+            inst = e.status[sname]
+            du = m.status_field(inst, sname, "duration")
+            return await ctx.send(
+                f"`{eid}.{sname}`: level {m.status_level(inst)}, "
+                f"duration {'∞' if du is None else du}.")
         if new is None:
             return await ctx.send(f"`{eid}.{sname}` has no {field}: it is "
                                   f"permanent (∞) and stays so; `set` gives "
@@ -23082,10 +23171,13 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         inst = e.status.get(name, {})
         # The duration as the status reads it, level entries included (S14).
         dur = m.status_field(inst, name, "duration")
+        layers = status_layers_of(inst)
         return await ctx.send(
             f"{verb} `{name}` to `{eid}` "
             f"(level={inst.get('level', '?')}, "
-            f"duration={'∞' if dur is None else dur}).{tail}"
+            f"duration={'∞' if dur is None else dur}"
+            + (f": {status_layers_text(layers)}" if layers else "")
+            + f").{tail}"
         )
 
     return await _help_fallback(ctx, ["status"], args[0] if args else None)
