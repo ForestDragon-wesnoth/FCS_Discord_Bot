@@ -4945,14 +4945,42 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "match at the state players would have seen as the round began."
         ),
     },
+    "autosave_round_snapshot_mode": {
+        "default": "diff",
+        "schema": {"type": "enum", "choices": ["diff", "full"]},
+        "desc": (
+            "How a round-start autosave is stored. diff (default): as what "
+            "changed since the autosave before it, like turn and command "
+            "autosaves (a few KB); undoing to it reads the chain back from "
+            "the last full snapshot. full: a complete copy of the match "
+            "(a whole board's size each round, read in one step). Either "
+            "way a full snapshot is written at least every "
+            "autosave_full_snapshot_interval autosaves. Applies to round "
+            "autosaves taken after the change."
+        ),
+    },
+    "autosave_full_snapshot_interval": {
+        "default": 100,
+        "schema": {"type": "int", "min": 1, "max": 1000, "ceiling": True},
+        "desc": (
+            "Autosaves (round, turn and command) between two full snapshots: "
+            "every other autosave is stored as a diff against the one "
+            "before it, and an undo rebuilds its state from the last full "
+            "snapshot through the diffs after it. Lower = undo reads fewer "
+            "diffs, the history takes more disk; higher = the reverse. 1 = "
+            "every autosave is a full copy. Applies to autosaves taken "
+            "after the change."
+        ),
+    },
     "autosave_turn_retention_rounds": {
-        "default": 3,
+        "default": 10,
         "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "How many rounds' worth of turn-start autosaves to keep. -1 = "
-            "unlimited (one per entity per round, forever — memory-heavy "
-            "for long matches). 0 = disable turn autosaves entirely. "
-            "Default 3 = three most recent rounds. Turn-start snapshots "
+            "unlimited (one per entity per round, forever). 0 = disable turn "
+            "autosaves entirely. Default 10 = the ten most recent rounds (a "
+            "turn autosave is stored as what changed since the autosave "
+            "before it, a few KB). Turn-start snapshots "
             "are taken AFTER on_turn_start hooks fire, so restoring one "
             "puts the match at the state players would have seen as that "
             "turn began. IGNORED under ATB (rounds are disabled there, so "
@@ -4961,26 +4989,26 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "autosave_turn_retention_turns": {
-        "default": 20,
+        "default": 60,
         "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "The ATB counterpart of autosave_turn_retention_rounds: how many "
             "of the most recent turn-start autosaves to keep when atb_enabled "
             "is on. Under ATB there are no rounds, so a round-keyed window "
             "would never advance and turn snapshots would accumulate for the "
-            "whole session (one full match state each). -1 = unlimited, 0 = "
-            "disable turn autosaves, N>0 = keep the last N. Default 20 is "
-            "roughly the round-mode default (3 rounds) for a mid-sized party. "
+            "whole session. -1 = unlimited, 0 = "
+            "disable turn autosaves, N>0 = keep the last N. Default 60 is "
+            "roughly the round-mode default (10 rounds) for a small party. "
             "Only consulted under ATB; round-based play uses the _rounds rule."
         ),
     },
     "autosave_command_retention_turns": {
-        "default": 3,
+        "default": 10,
         "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "How many turns' worth of pre-command autosaves to keep. -1 = "
-            "unlimited. 0 = disable command autosaves entirely. Default 3 = "
-            "all commands from the last three turns. Pre-command snapshots "
+            "unlimited. 0 = disable command autosaves entirely. Default 10 = "
+            "all commands from the last ten turns. Pre-command snapshots "
             "are taken before each MUTATING command runs and skipped when "
             "the command turns out to be a no-op (e.g. !ent info, !map). "
             "This gives users fine-grained undo at the cost of more "
@@ -4994,9 +5022,12 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Whether a match's undo history (round / turn / command autosaves "
             "and manual saves) is written to disk with it, so undo still "
-            "works after the bot restarts. Each snapshot is a full copy of "
-            "the match, so a long history takes room in the server's storage "
-            "limit. Off: the history lives in memory only (lost on restart) "
+            "works after the bot restarts. A manual save is a full copy of "
+            "the match, an autosave what changed since the autosave before it "
+            "(a full copy every autosave_full_snapshot_interval, and each "
+            "round's under autosave_round_snapshot_mode full); the history "
+            "takes room in the server's storage limit. Off: the history lives in memory "
+            "only (lost on restart) "
             "and its files are deleted."
         ),
     },
@@ -5012,7 +5043,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "autosave_command_retention_max": {
-        "default": 100,
+        "default": 500,
         "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Hard cap on how many pre-command autosaves are kept, on top of "
@@ -5020,10 +5051,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "the cap are dropped). -1 = no cap. The turn window alone only "
             "prunes when a turn ADVANCES, so a long setup session before "
             "the first `!turn next` (map building, spawning) otherwise kept a "
-            "full match snapshot for EVERY command: 600 tile edits held 640 "
-            "snapshots / 16 MB and grew with the board. Each snapshot is a "
-            "complete copy of the match, so this is the memory ceiling for "
-            "command undo."
+            "snapshot for EVERY command. Each is stored as what changed since "
+            "the autosave before it (a whole-map edit is large), so this caps "
+            "the disk a long setup takes."
         ),
     },
     "undo_confirmation_turn_threshold": {
@@ -6289,6 +6319,130 @@ def same_value(a: Any, b: Any) -> bool:
         return len(a) == len(b) and all(
             same_value(x, y) for x, y in zip(a, b))
     return a == b
+
+
+def _first_difference(a: Any, b: Any, path: str = "") -> str:
+    """Where two stored values first differ (same_value), as a dotted path
+    with both sides (FCS_SPATIAL_CHECK reports)."""
+    if type(a) is dict and type(b) is dict:
+        for k in list(a) + [k for k in b if k not in a]:
+            if k not in a or k not in b or not same_value(a[k], b[k]):
+                if k in a and k in b:
+                    return _first_difference(a[k], b[k], f"{path}.{k}")
+                return (f"{path}.{k}: "
+                        f"{repr(a.get(k, '<none>'))[:60]} -> "
+                        f"{repr(b.get(k, '<none>'))[:60]}")
+    return f"{path}: {repr(a)[:60]} -> {repr(b)[:60]}"
+
+
+_JSON_ATOMS = frozenset({str, int, float, bool, type(None)})
+
+# The two JSON forms of a match state: the files' (compact, keys in memory
+# order, storage._dump) and the journal hash's (sorted keys, journal.
+# state_hash). One encoder each, shared (json.dumps builds one per call).
+_JSON_FILE = json.JSONEncoder(separators=(",", ":"))
+_JSON_HASH = json.JSONEncoder(sort_keys=True, default=str)
+
+
+def state_text(state: Dict[str, Any], match: Optional["Match"] = None,
+               sort: bool = False) -> str:
+    """json.dumps of a match state (Match.to_dict), the same text, built
+    from the cached text of each unit, tile and zone of `match` whose
+    serialized form the state holds (Entity.ser_dict, Map.ser_tiles /
+    ser_zones): a command that changed one unit encodes that unit. `sort`
+    = the journal hash's form (sorted keys, default separators), else the
+    files' (compact). A state of another time (a snapshot read back)
+    encodes its pieces anew."""
+    enc = _JSON_HASH if sort else _JSON_FILE
+    isep, ksep = (", ", ": ") if sort else (",", ":")
+    mode = 1 if sort else 0
+    ekey = enc.encode
+
+    def obj(d: Dict[str, Any], value) -> str:
+        keys = sorted(d) if sort else d
+        return "{" + isep.join(ekey(k) + ksep + value(k, d[k])
+                               for k in keys) + "}"
+
+    def plain(_k: Any, v: Any) -> str:
+        return ekey(v)
+
+    ents = match.entities if match is not None else {}
+    maps = match.maps if match is not None else {}
+
+    def unit(eid: str, piece: Any) -> str:
+        e = ents.get(eid)
+        if e is None:
+            return ekey(piece)
+        dd = e.__dict__
+        txt = dd.get("_txt")
+        if txt is not None and txt[mode] is not None \
+                and txt[mode][0] is piece:
+            return txt[mode][1]
+        text = ekey(piece)
+        if dd.get("_ser") is piece:
+            if txt is None:
+                txt = dd["_txt"] = [None, None]
+            txt[mode] = (piece, text)
+        return text
+
+    def pieces(mp: Optional["Map"], kind: str, d: Any) -> str:
+        if mp is None or type(d) is not dict:
+            return ekey(d)
+        whole = mp._ptxt.get((kind, mode))
+        if whole is not None and whole[0] is d:
+            return whole[1]
+        cache = mp._ptxt.get((kind, mode, "items")) or {}
+        fresh: Dict[str, Any] = {}
+
+        def one(k: str, v: Any) -> str:
+            hit = cache.get(k)
+            if hit is not None and hit[0] is v:
+                fresh[k] = hit
+                return hit[1]
+            t = ekey(v)
+            fresh[k] = (v, t)
+            return t
+        text = obj(d, one)
+        mp._ptxt[(kind, mode, "items")] = fresh
+        mp._ptxt[(kind, mode)] = (d, text)
+        return text
+
+    def one_map(name: str, md: Any) -> str:
+        mp = maps.get(name)
+        if mp is None or type(md) is not dict:
+            return ekey(md)
+        return obj(md, lambda k, v: pieces(mp, k, v)
+                   if k in ("tiles", "zones") else ekey(v))
+
+    def top(k: str, v: Any) -> str:
+        if k == "entities" and type(v) is dict:
+            return obj(v, unit)
+        if k == "maps" and type(v) is dict:
+            return obj(v, one_map)
+        return ekey(v)
+
+    text = obj(state, top)
+    if SPATIAL_CHECK:
+        want = (json.dumps(state, sort_keys=True, default=str) if sort
+                else json.dumps(state, separators=(",", ":")))
+        if text != want:
+            raise SpatialCheckError("state_text differs from json.dumps")
+    return text
+
+
+def jcopy(v: Any) -> Any:
+    """A deep copy of a stored value, ~4x faster than copy.deepcopy for
+    the JSON shapes the engine stores (dicts, lists, text, numbers, bools,
+    None); anything else (a set, a tuple) goes to copy.deepcopy."""
+    t = type(v)
+    if t is dict:
+        return {k: (x if type(x) in _JSON_ATOMS else jcopy(x))
+                for k, x in v.items()}
+    if t is list:
+        return [x if type(x) in _JSON_ATOMS else jcopy(x) for x in v]
+    if t in _JSON_ATOMS:
+        return v
+    return copy.deepcopy(v)
 
 
 def json_text(data: Any) -> str:
@@ -8831,7 +8985,7 @@ def _coerce_status_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
         for k, v in raw.items():
             if not isinstance(k, str):
                 continue
-            out[k] = copy.deepcopy(v) if isinstance(v, dict) else {}
+            out[k] = jcopy(v) if isinstance(v, dict) else {}
         return out
     if isinstance(raw, (list, tuple, set)):
         return {str(n): {} for n in raw if isinstance(n, str)}
@@ -8935,18 +9089,29 @@ class Entity:
     _match: "Match | None" = field(default=None, repr=False, compare=False)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        # Any field set makes the cached serialized form stale (ser_dict).
+        self.__dict__["_ser"] = None
         # A change of where the unit stands (or what decides it) marks it
         # in its match's unit index (#154), and in the one it leaves.
         if name in _PLACE_FIELDS:
             d = self.__dict__
             old = d.get("_match")
+            old_parent = d.get("part_of")
             object.__setattr__(self, name, value)
             if "id" in d:
                 for m in (old, d.get("_match")):
                     if m is not None:
                         m._spatial.touch(d["id"])
+                        # The body it belonged to changes too (a part
+                        # detached or removed): its size (#197).
+                        if old_parent:
+                            m._spatial.notify(old_parent)
             return
         object.__setattr__(self, name, value)
+        if name == "status":
+            m = self.__dict__.get("_match")
+            if m is not None and "id" in self.__dict__:
+                m._spatial.notify(self.__dict__["id"])
 
     def __post_init__(self):
         tested_id = str(self.id.strip().lower())
@@ -9317,6 +9482,7 @@ class Entity:
         if match.sizes_on() and num_v in self.vars:
             self.vars[num_v] = match.checked_size_value(
                 self.vars[num_v], f"`{self.id}`.{num_v}")
+            self.mark_changed()
 
         # Validate the WHOLE footprint anchored at (x, y): every covered
         # cell in bounds and unoccupied (stackable spawners skip
@@ -9989,6 +10155,7 @@ class Entity:
                 and path == self._vital_var_names()[0]
                 and isinstance(value, (int, float)) and value > 0):
             self.vars.pop("__part_destroyed", None)
+            self.mark_changed()
             self._match._resume_anchored_zones(self.id)
         # Diff old vs new at this path and collect the resulting events
         leaf_events = _diff_subtree(path, old_post_attempt, value)
@@ -10264,6 +10431,7 @@ class Entity:
                 cur[k] = node
             cur = node
         cur[keys[-1]] = value
+        self.__dict__["_ser"] = None
         if self._match is not None:
             self._match._spatial.touch(self.id)
 
@@ -10274,6 +10442,7 @@ class Entity:
         for k in keys[:-1]:
             cur = cur[k]
         del cur[keys[-1]]
+        self.__dict__["_ser"] = None
         if self._match is not None:
             self._match._spatial.touch(self.id)
 
@@ -10316,28 +10485,69 @@ class Entity:
         from formula import validate_formula
         validate_formula(p.formula, mode="exec")
         self.passives[p.id] = p
+        self.mark_changed()
 
     def remove_passive(self, pid: str) -> None:
         if pid not in self.passives:
             raise NotFound(f"Passive '{pid}' not found on entity '{self.id}'.")
         del self.passives[pid]
+        self.mark_changed()
 
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
+        """The unit's serialized form, a copy of its own (callers may
+        change it)."""
+        return self._build_dict()
+
+    def mark_changed(self) -> None:
+        """Something of the unit changed in place (a var, a status, a
+        passive): its cached serialized form (ser_dict) is stale."""
+        self.__dict__["_ser"] = None
+
+    def ser_dict(self) -> Dict[str, Any]:
+        """The unit's serialized form, cached until the unit changes
+        (mark_changed: every field assignment, var write, status change
+        and passive / clamp edit). SHARED between every match state
+        built since (Match.to_dict, undo snapshots, rollback states), so
+        nothing may change it: a reader that wants to edit takes a copy
+        (from_dict copies; to_dict hands out a fresh one). Under
+        FCS_SPATIAL_CHECK every use compares it with a fresh build and
+        with the copy taken when it was made (a missed mark, or a
+        reader that changed the shared dict, raises)."""
+        d = self.__dict__
+        s = d.get("_ser")
+        if s is None:
+            s = self._build_dict()
+            d["_ser"] = s
+            if SPATIAL_CHECK:
+                d["_ser_frozen"] = jcopy(s)
+        elif SPATIAL_CHECK:
+            if not same_value(s, d.get("_ser_frozen")):
+                raise SpatialCheckError(
+                    f"the cached serialized form of `{self.id}` was "
+                    f"changed by a reader")
+            fresh = self._build_dict()
+            if not same_value(s, fresh):
+                raise SpatialCheckError(
+                    f"`{self.id}` changed without mark_changed: "
+                    f"{_first_difference(s, fresh)}")
+        return s
+
+    def _build_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "x": self.x,
             "y": self.y,
             "map": self.map,
             "id": self.id,
-            "status": copy.deepcopy(self.status),
+            "status": jcopy(self.status),
             # deepcopy, NOT dict(): vars hold nested dicts (inventory,
             # modifiers, …) that _set_path mutates IN PLACE. A shallow copy
             # would share those nested objects with the live entity, so a
             # later nested write would corrupt this snapshot — breaking undo
             # and action rollback for any dotted-path var. (status above is
             # deepcopied for the same reason.)
-            "vars": copy.deepcopy(self.vars),
+            "vars": jcopy(self.vars),
             "passives": {pid: p.to_dict() for pid, p in self.passives.items()},
             "clamps": {path: c.to_dict() for path, c in self.clamps.items()},
             "facing": self.facing,
@@ -10363,7 +10573,7 @@ class Entity:
             # written by clones via Entity.to_dict (the common path) load
             # cleanly. Anything else is treated as an empty status set.
             status=_coerce_status_dict(data.get("status")),
-            vars=copy.deepcopy(data.get("vars", {})),
+            vars=jcopy(data.get("vars", {})),
             facing=data.get("facing", "up"),
             part_of=data.get("part_of", None),
             mounted_on=data.get("mounted_on", None),
@@ -10647,29 +10857,247 @@ class Map:
                                       compare=False)
     _zone_dirty: Set[str] = field(default_factory=set, repr=False,
                                   compare=False)
+    # Filed with the zone index (#197): the zones with grants of their own,
+    # and definition -> the zones naming it (Match._grants_present). A grant
+    # edit or a change of a zone's `def` calls zone_touch too.
+    _zone_own_grants: Set[str] = field(default_factory=set, repr=False,
+                                       compare=False)
+    _zones_by_def: Dict[str, Set[str]] = field(default_factory=dict,
+                                               repr=False, compare=False)
+    _zone_def_rec: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                          compare=False)
+
+    # The serialization caches (to_dict), runtime-only: each tile's and
+    # each zone's serialized form, the assembled `tiles` / `zones` dicts
+    # and the row runs of fog memory, reveals and voids. Shared by every
+    # match state built since, so never changed in place. A tile's entry
+    # is marked by TileDict (set / replace / remove) or tile_touch (an
+    # in-place edit of its data); a zone by zone_touch / zone_changed;
+    # fog memory, reveals and voids by runs_changed (or a new value). A
+    # replaced `tiles` / `zones` dict is wrapped (TileDict / ZoneTable).
+    _tser: Dict[Tuple[int, int], Any] = field(default_factory=dict,
+                                              repr=False, compare=False)
+    _tser_out: Optional[Dict[str, Any]] = field(default=None, repr=False,
+                                                compare=False)
+    _zser: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                  compare=False)
+    _zser_out: Optional[Dict[str, Any]] = field(default=None, repr=False,
+                                                compare=False)
+    _runs: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                  compare=False)
+    _ser_frozen: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                        compare=False)
+    # state_text's cache: (kind, mode) -> (the tiles / zones dict, its
+    # text) and (kind, mode, "items") -> {key: (entry, its text)}.
+    _ptxt: Dict[Any, Any] = field(default_factory=dict, repr=False,
+                                  compare=False)
+    # hook_cells' index (None = built on its next use).
+    _hook_ix: Optional[Dict[Tuple[int, int], Any]] = field(
+        default=None, repr=False, compare=False)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        if name == "tiles" and type(value) is not TileDict:
+            value = TileDict(value)
+        elif name == "zones" and type(value) is not ZoneTable:
+            value = ZoneTable(value)
         object.__setattr__(self, name, value)
         if name == "tiles":
             object.__setattr__(self, "_corpse_ix", None)
+            object.__setattr__(self, "_tser_out", None)
+            object.__setattr__(self, "_hook_ix", None)
         elif name == "zones":
             object.__setattr__(self, "_zone_ix", None)
+            object.__setattr__(self, "_zser_out", None)
+        elif name in ("explored", "fog_reveals", "voids"):
+            self.__dict__.get("_runs", {}).pop(name, None)
 
     def zone_touch(self, name: str) -> None:
         """Zone `name` changed its cells, or was made, deleted or moved."""
         if self._zone_ix is not None:
             self._zone_dirty.add(name)
+        self.zone_changed(name)
+
+    def zone_changed(self, name: str) -> None:
+        """Zone `name` changed in place (its data, hooks, look, tags or
+        grants): its serialized form is stale."""
+        ch = self.zones.changed
+        if ch is not None:
+            ch.add(name)
+
+    def tile_touch(self, x: int, y: int) -> None:
+        """The data of tile (x, y) changed in place (a write into a dict
+        read from `tiles`): its serialized form is stale."""
+        self.tiles.mark((x, y))
+
+    def hook_cells(self) -> Dict[Tuple[int, int], Tuple[Any, Any]]:
+        """The tile hook index: cell -> (the hook names its own data
+        holds, its template's name) for every tile with either, so the
+        time hooks read these cells, never every tile (#197). Kept by the
+        same marks as the serialization cache (TileDict.also)."""
+        t = self.tiles
+        ix = self._hook_ix
+        if ix is None or t.also is None:
+            ix = {}
+            for c, d in t.items():
+                rec = _tile_hook_rec(d)
+                if rec is not None:
+                    ix[c] = rec
+            object.__setattr__(self, "_hook_ix", ix)
+            t.also = set()
+        elif t.also:
+            for c in t.also:
+                rec = _tile_hook_rec(t.get(c))
+                if rec is None:
+                    ix.pop(c, None)
+                else:
+                    ix[c] = rec
+            t.also = set()
+        if SPATIAL_CHECK:
+            want = {c: r for c, d in t.items()
+                    for r in [_tile_hook_rec(d)] if r is not None}
+            if want != ix:
+                raise SpatialCheckError(
+                    f"map `{self.name}`: the tile hook index differs from "
+                    f"the tiles")
+        return ix
+
+    def runs_changed(self, kind: str) -> None:
+        """`explored`, `fog_reveals` or `voids` changed in place."""
+        self._runs.pop(kind, None)
+
+    def _check_cached(self, what: str, cached: Any, fresh: Any) -> None:
+        """FCS_SPATIAL_CHECK: a cached serialized form equals a fresh
+        build and the copy taken when it was made."""
+        frozen = self._ser_frozen
+        if what in frozen and frozen[what][0] is cached \
+                and not same_value(cached, frozen[what][1]):
+            raise SpatialCheckError(
+                f"map `{self.name}`: its cached {what} was changed by a "
+                f"reader: {_first_difference(frozen[what][1], cached)}")
+        if not same_value(cached, fresh):
+            raise SpatialCheckError(
+                f"map `{self.name}`: {what} changed without a mark: "
+                f"{_first_difference(cached, fresh)}")
+        if what not in frozen or frozen[what][0] is not cached:
+            frozen[what] = (cached, jcopy(cached))
+
+    def ser_tiles(self) -> Dict[str, Any]:
+        """The `tiles` of to_dict ("x,y" -> data, sorted by cell), cached:
+        only the tiles marked since the last call are copied again."""
+        t = self.tiles
+        out = self._tser_out
+        ch = t.changed
+        if out is None or ch is None:
+            cache = {c: jcopy(d) for c, d in t.items()}
+            object.__setattr__(self, "_tser", cache)
+            out = {f"{x},{y}": cache[(x, y)] for (x, y) in sorted(cache)}
+        elif ch:
+            cache = self._tser
+            reorder = False
+            for c in ch:
+                d = t.get(c)
+                if d is None:
+                    if cache.pop(c, None) is not None:
+                        reorder = True
+                else:
+                    if c not in cache:
+                        reorder = True
+                    cache[c] = jcopy(d)
+            if reorder:
+                out = {f"{x},{y}": cache[(x, y)] for (x, y) in sorted(cache)}
+            else:
+                out = dict(out)
+                for (x, y) in ch:
+                    if (x, y) in cache:
+                        out[f"{x},{y}"] = cache[(x, y)]
+        t.changed = set()
+        object.__setattr__(self, "_tser_out", out)
+        if SPATIAL_CHECK:
+            self._check_cached("tiles", out, {
+                f"{x},{y}": jcopy(d) for (x, y), d in sorted(t.items())})
+        return out
+
+    def ser_zones(self) -> Dict[str, Any]:
+        """The `zones` of to_dict (name -> zone, sorted by name), cached:
+        only the zones marked since the last call are serialized again."""
+        zones = self.zones
+        out = self._zser_out
+        ch = zones.changed
+        if out is None or ch is None:
+            cache = {n: self._zone_to_dict(z) for n, z in zones.items()}
+            object.__setattr__(self, "_zser", cache)
+            out = {n: cache[n] for n in sorted(cache)}
+        elif ch:
+            cache = self._zser
+            for n in ch:
+                z = zones.get(n)
+                if z is None:
+                    cache.pop(n, None)
+                else:
+                    cache[n] = self._zone_to_dict(z)
+            out = {n: cache[n] for n in sorted(cache)}
+        zones.changed = set()
+        object.__setattr__(self, "_zser_out", out)
+        if SPATIAL_CHECK:
+            self._check_cached("zones", out, {
+                n: self._zone_to_dict(z) for n, z in sorted(zones.items())})
+        return out
+
+    def _runs_ser(self, kind: str) -> Any:
+        """Fog memory, reveals or voids as saved (row runs), cached until
+        runs_changed(kind)."""
+        out = self._runs.get(kind)
+        if out is None:
+            out = self._build_runs(kind)
+            self._runs[kind] = out
+        elif SPATIAL_CHECK:
+            self._check_cached(kind, out, self._build_runs(kind))
+        return out
+
+    def _build_runs(self, kind: str) -> Any:
+        if kind == "explored":
+            return {team: _cells_to_runs(cells)
+                    for team, cells in self.explored.items()}
+        if kind == "fog_reveals":
+            return {team: [{"cells": _cells_to_runs(r.get("cells", ())),
+                            "until": r.get("until"),
+                            "clock": r.get("clock", "round")}
+                           for r in recs]
+                    for team, recs in self.fog_reveals.items()}
+        return _cells_to_runs(self.voids)
+
+    def _file_zone_meta(self, zname: str, z: Any) -> None:
+        old = self._zone_def_rec.pop(zname, None)
+        if old is not None:
+            names = self._zones_by_def.get(old)
+            if names is not None:
+                names.discard(zname)
+                if not names:
+                    del self._zones_by_def[old]
+        self._zone_own_grants.discard(zname)
+        if not isinstance(z, dict):
+            return
+        d = z.get("def")
+        if isinstance(d, str):
+            self._zone_def_rec[zname] = d
+            self._zones_by_def.setdefault(d, set()).add(zname)
+        if z.get("grants"):
+            self._zone_own_grants.add(zname)
 
     def _zone_index(self) -> Dict[Tuple[int, int], Any]:
         ix = self._zone_ix
         if ix is None:
             ix = {}
             rec: Dict[str, Any] = {}
+            self._zone_own_grants.clear()
+            self._zones_by_def.clear()
+            self._zone_def_rec.clear()
             for zname, z in self.zones.items():
                 cells = tuple(z.get("cells") or ())
                 rec[zname] = cells
                 for c in cells:
                     _ix_add(ix, c, zname)
+                self._file_zone_meta(zname, z)
             object.__setattr__(self, "_zone_ix", ix)
             object.__setattr__(self, "_zone_rec", rec)
             self._zone_dirty.clear()
@@ -10687,6 +11115,7 @@ class Map:
                     elif held == zname:
                         del ix[c]
                 z = self.zones.get(zname)
+                self._file_zone_meta(zname, z)
                 if z is not None:
                     cells = tuple(z.get("cells") or ())
                     rec[zname] = cells
@@ -10696,7 +11125,8 @@ class Map:
         return ix
 
     def note_corpse(self, x: int, y: int) -> None:
-        """A corpse was laid on (x, y)."""
+        """A corpse was laid on (x, y), or one lying there changed."""
+        self.tile_touch(x, y)
         ix = self._corpse_ix
         if ix is not None:
             ix.pending.add((x, y))
@@ -10938,6 +11368,7 @@ class Map:
         if not isinstance(leaf_parent, dict) or leaf_key not in leaf_parent:
             raise NotFound(f"tile ({x},{y}) has no value at '{path}'.")
         del leaf_parent[leaf_key]
+        self.tile_touch(x, y)
         # Prune empty parents from the leaf back to the root. Each
         # iteration drops the just-emptied dict from its grandparent
         # under the key we descended through.
@@ -11206,6 +11637,7 @@ class Map:
             d = d[key]
         note_stored_tags(None, d.get(parts[-1]), value, parts[-1])
         d[parts[-1]] = owned
+        self.zone_changed(name)
 
     def zone_del_path(self, name: str, path: str) -> None:
         """Delete a dotted key from a zone's data, pruning emptied
@@ -11229,6 +11661,7 @@ class Map:
             if chain[i]:
                 break
             del chain[i - 1][parts[i - 1]]
+        self.zone_changed(name)
 
     def zone_clear_data(self, name: str) -> int:
         """Drop ALL data from a zone (keeps cells + hooks). Returns the
@@ -11236,6 +11669,7 @@ class Map:
         z = self._require_zone(name)
         n = len(z["data"])
         z["data"] = {}
+        self.zone_changed(name)
         return n
 
     def to_dict(self) -> Dict[str, Any]:
@@ -11245,34 +11679,22 @@ class Map:
         # action rollback — the same defect fixed for entity vars). Tile
         # keys are "x,y" strings (JSON object keys), sorted for readable
         # diffs of hand-edited saves.
+        # The tiles, zones and cell runs come from the serialization
+        # caches (ser_tiles, ser_zones, _runs_ser): SHARED with every state
+        # built since, so a reader never changes them (from_dict copies).
         return {
             "grid_width": self.grid_width,
             "grid_height": self.grid_height,
-            "vars": copy.deepcopy(self.vars),
+            "vars": jcopy(self.vars),
             "var_names": dict(self.var_names),
             "vehicle": self.vehicle,
-            "tiles": {
-                f"{x},{y}": copy.deepcopy(dat)
-                for (x, y), dat in sorted(self.tiles.items())
-            },
-            "zones": {
-                name: self._zone_to_dict(z)
-                for name, z in sorted(self.zones.items())
-            },
+            "tiles": self.ser_tiles(),
+            "zones": self.ser_zones(),
             # cell sets as row runs [y, x_from, x_to] (_cells_to_runs)
-            "explored": {
-                team: _cells_to_runs(cells)
-                for team, cells in self.explored.items()
-            },
-            "fog_reveals": {
-                team: [{"cells": _cells_to_runs(r.get("cells", ())),
-                        "until": r.get("until"),
-                        "clock": r.get("clock", "round")}
-                       for r in recs]
-                for team, recs in self.fog_reveals.items()
-            },
+            "explored": self._runs_ser("explored"),
+            "fog_reveals": self._runs_ser("fog_reveals"),
             # Only a map with voids carries the key.
-            **({"voids": _cells_to_runs(self.voids)} if self.voids else {}),
+            **({"voids": self._runs_ser("voids")} if self.voids else {}),
         }
 
     @staticmethod
@@ -11284,7 +11706,7 @@ class Map:
             mp.voids = _runs_to_cells(raw_voids, mp.grid_width,
                                       mp.grid_height)
         raw_vars = d.get("vars")
-        mp.vars = copy.deepcopy(raw_vars) if isinstance(raw_vars, dict) else {}
+        mp.vars = jcopy(raw_vars) if isinstance(raw_vars, dict) else {}
         veh = d.get("vehicle")
         mp.vehicle = veh if isinstance(veh, str) and veh else None
         raw_vn = d.get("var_names")
@@ -11302,7 +11724,7 @@ class Map:
             except (ValueError, AttributeError):
                 continue
             if mp.in_bounds(x, y) and isinstance(val, dict) and val:
-                mp.tiles[(x, y)] = copy.deepcopy(val)
+                mp.tiles[(x, y)] = jcopy(val)
         for zname, zdef in (d.get("zones") or {}).items():
             if not isinstance(zname, str) or not isinstance(zdef, dict):
                 continue
@@ -11333,6 +11755,92 @@ class Map:
 
 
 
+
+class ChangeDict(dict):
+    """A dict recording in `changed` each key whose entry is set, replaced
+    or removed (and each key handed out by setdefault, whose caller writes
+    into it), for a serialization cache. None = everything changed.
+    Map.tiles (TileDict: cell -> tile data, Map.ser_tiles) and Map.zones
+    (ZoneTable: name -> zone, Map.ser_zones); a write INTO an entry read
+    with get / [] calls Map.tile_touch / zone_changed. `also` is a second
+    such set (the tile hook index, Map.hook_cells)."""
+
+    __slots__ = ("changed", "also")
+
+    def __init__(self, *args: Any, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.changed: Optional[Set[Any]] = None
+        self.also: Optional[Set[Any]] = None
+
+    def mark(self, key: Any) -> None:
+        if self.changed is not None:
+            self.changed.add(key)
+        if self.also is not None:
+            self.also.add(key)
+
+    def mark_all(self) -> None:
+        self.changed = None
+        self.also = None
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        super().__setitem__(key, value)
+        self.mark(key)
+
+    def __delitem__(self, key: Any) -> None:
+        super().__delitem__(key)
+        self.mark(key)
+
+    def pop(self, key: Any, *default: Any) -> Any:
+        self.mark(key)
+        return super().pop(key, *default)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        self.mark(key)
+        return super().setdefault(key, default)
+
+    def popitem(self) -> Any:
+        self.mark_all()
+        return super().popitem()
+
+    def clear(self) -> None:
+        self.mark_all()
+        super().clear()
+
+    def update(self, *args: Any, **kw: Any) -> None:
+        self.mark_all()
+        super().update(*args, **kw)
+
+    def __ior__(self, other: Any) -> "ChangeDict":
+        self.mark_all()
+        return super().__ior__(other)
+
+
+def _tile_hook_rec(d: Any) -> Optional[Tuple[frozenset, Any]]:
+    """A tile's entry in the hook index: (its own hook names, its
+    template's name), None when it has neither."""
+    if not isinstance(d, dict):
+        return None
+    hooks = d.get("hooks")
+    own = frozenset(k for k, v in hooks.items() if isinstance(v, str) and v) \
+        if isinstance(hooks, dict) else frozenset()
+    tpl = d.get("_template")
+    tpl = tpl if isinstance(tpl, str) else None
+    if not own and tpl is None:
+        return None
+    return own, tpl
+
+
+class TileDict(ChangeDict):
+    __slots__ = ()
+
+
+class ZoneTable(ChangeDict):
+    __slots__ = ()
+
+
+# A read pass asking about more cells than this for one team (a full fogged
+# render) stamps the team's sight into a cell set (_team_vision_index).
+_VISION_STAMP_AFTER = 256
 
 # Bodies covering more cells than this are kept as rectangles a lookup
 # tests one by one, so moving a huge body costs one record, never its area.
@@ -11367,7 +11875,7 @@ class UnitIndex:
     SPATIAL_BIG_AREA cells are filed as rectangles."""
 
     __slots__ = ("full", "dirty", "ctx", "rec", "cells", "big", "scan",
-                 "order")
+                 "order", "listeners")
 
     def __init__(self) -> None:
         self.full = True
@@ -11381,10 +11889,21 @@ class UnitIndex:
         self.scan: Dict[str, Set[str]] = {}
         # eid -> position in match.entities (the scan's order), None = stale.
         self.order: Optional[Dict[str, int]] = None
+        # Sets of other per-unit caches (UnitFlags) that every mark reaches
+        # too, also while this index waits for a full rebuild.
+        self.listeners: List[Set[str]] = []
 
     def touch(self, eid: str) -> None:
         if not self.full:
             self.dirty.add(eid)
+        for s in self.listeners:
+            s.add(eid)
+
+    def notify(self, eid: str) -> None:
+        """A change that moves nothing but may change what the unit holds
+        (a status): only the listening caches hear it."""
+        for s in self.listeners:
+            s.add(eid)
 
     def reset(self) -> None:
         self.full = True
@@ -11596,6 +12115,95 @@ class UnitIndex:
                             f"unit index rect {mname} ({x1},{y1})-({x2},{y2}) "
                             f"misses `{eid}`")
         return out
+
+
+class UnitFlags:
+    """Per unit, what makes the whole-match checks after a command or a
+    step necessary (#197), cached: FLAG_WATCHERS = the unit's own data
+    holds a `watchers` dict (its vars, its watcher_sources containers, a
+    status instance's own key), FLAG_ZONE_GRANT = a status of it carries a
+    zone grant's marker. Match.has_watchers and _grants_present read the
+    units holding a flag instead of every unit. Kept current by the unit
+    index's marks (UnitIndex.listeners: the var writes, the place fields,
+    `status` set wholesale) and UnitIndex.notify from _emit_status_diff;
+    a new entities dict or watcher_sources rule rebuilds it. What a status
+    DEFINITION or team data holds is read live by the callers (few)."""
+    __slots__ = ("flags", "holders", "changed", "ctx")
+    WATCHERS = 1
+    ZONE_GRANT = 2
+
+    def __init__(self) -> None:
+        self.flags: Dict[str, int] = {}
+        self.holders: Dict[int, Set[str]] = {self.WATCHERS: set(),
+                                             self.ZONE_GRANT: set()}
+        self.changed: Set[str] = set()
+        self.ctx: Any = None
+
+    def _compute(self, match: "Match", e: "Entity") -> int:
+        f = 0
+        if WATCHERS_KEY in e.vars:
+            f |= self.WATCHERS
+        else:
+            for root in match._effective_watcher_sources(e):
+                node: Any = e.vars
+                for seg in root.split("."):
+                    node = node.get(seg) if isinstance(node, dict) else None
+                if node is not None and _holds_key(node, WATCHERS_KEY):
+                    f |= self.WATCHERS
+                    break
+        for inst in e.status.values():
+            if isinstance(inst, dict):
+                if WATCHERS_KEY in inst:
+                    f |= self.WATCHERS
+                if ZONE_GRANT_KEY in inst:
+                    f |= self.ZONE_GRANT
+        return f
+
+    def _set(self, eid: str, f: int) -> None:
+        old = self.flags.pop(eid, 0)
+        for bit, hs in self.holders.items():
+            if old & bit:
+                hs.discard(eid)
+            if f & bit:
+                hs.add(eid)
+        if f:
+            self.flags[eid] = f
+
+    def ensure(self, match: "Match") -> None:
+        if match._spatial.listeners.count(self.changed) == 0:
+            match._spatial.listeners.append(self.changed)
+            self.ctx = None
+        ctx = (id(match.entities), match.rules.get("watcher_sources"))
+        if ctx != self.ctx:
+            self.ctx = ctx
+            self.flags.clear()
+            for hs in self.holders.values():
+                hs.clear()
+            self.changed.clear()
+            for eid, e in match.entities.items():
+                self._set(eid, self._compute(match, e))
+            return
+        if self.changed:
+            for eid in self.changed:
+                e = match.entities.get(eid)
+                self._set(eid, self._compute(match, e) if e is not None
+                          and e._match is match else 0)
+            self.changed.clear()
+
+    def holders_of(self, match: "Match", bit: int) -> Set[str]:
+        self.ensure(match)
+        return self.holders[bit]
+
+
+def _holds_key(node: Any, key: str) -> bool:
+    """Whether a dict at or under `node` holds `key` (skipping `__` keys,
+    as held_watchers walks)."""
+    if not isinstance(node, dict):
+        return False
+    if key in node:
+        return True
+    return any(_holds_key(v, key) for k, v in node.items()
+               if not str(k).startswith("__"))
 
 
 def default_maps(width: int, height: int) -> Dict[str, "Map"]:
@@ -12093,6 +12701,14 @@ class Match:
     # Runtime-only, rebuilt from the units on first use.
     _spatial: "UnitIndex" = field(default_factory=lambda: UnitIndex(),
                                   repr=False, compare=False)
+    # What units hold that the per-command checks look for (UnitFlags,
+    # #197). Runtime-only.
+    _uflags: "UnitFlags" = field(default_factory=lambda: UnitFlags(),
+                                 repr=False, compare=False)
+    # [the set of units marked since the last size sweep (a UnitIndex
+    # listener), id(entities) it belongs to]: sync_touched_sizes. Runtime.
+    _size_touch: List[Any] = field(default_factory=lambda: [None, None],
+                                   repr=False, compare=False)
     # Custom event bus: re-entry guard + the current-event payload stack
     # (read by event_get / event_has during handler firing). Transient — an
     # event is a transient broadcast, nothing about it is serialized.
@@ -12369,6 +12985,7 @@ class Match:
         z["data"] = copy.deepcopy(d.get("data") or {})
         if zone_look_value(FACING_FIELD, d.get(FACING_FIELD)):
             z[FACING_FIELD] = d[FACING_FIELD]
+        self.zone_map(name).zone_touch(name)
         return name
 
     def set_zone_def(self, name: str, definition: Optional[str]) -> int:
@@ -12380,11 +12997,13 @@ class Match:
             raise NotFound(f"Zone '{name}' not found.")
         if definition is None:
             z.pop("def", None)
+            self.zone_map(name).zone_touch(name)
             return 0
         d = self.zone_definitions.get(definition)
         if d is None:
             raise NotFound(f"No zone definition `{definition}`.")
         z["def"] = definition
+        self.zone_map(name).zone_touch(name)
         if (FACING_FIELD not in z
                 and zone_look_value(FACING_FIELD, d.get(FACING_FIELD))):
             z[FACING_FIELD] = d[FACING_FIELD]
@@ -12437,6 +13056,10 @@ class Match:
                 else:
                     z[FACING_FIELD] = face
                 changed.append(name)
+        for mp in self.maps.values():
+            for name in changed:
+                if name in mp.zones:
+                    mp.zone_changed(name)
         return changed
 
     def zones_using_def(self, definition: str) -> List[str]:
@@ -12457,9 +13080,10 @@ class Match:
                                  for k, v in self.zone_definitions.items()}
         n = 0
         for mp in self.maps.values():
-            for z in mp.zones.values():
+            for zname, z in mp.zones.items():
                 if isinstance(z, dict) and z.get("def") == old:
                     z["def"] = new
+                    mp.zone_touch(zname)
                     n += 1
         return n
 
@@ -12704,16 +13328,30 @@ class Match:
 
     def _grants_present(self) -> bool:
         """Whether any zone grants or any unit holds a zone's grant: the
-        fast path of sync_zone_grants."""
+        fast path of sync_zone_grants. Reads each map's granting-zone
+        record (Map._zone_index: zones with grants of their own, zones by
+        definition) against the definitions that grant, and the units
+        UnitFlags marks as holding a grant, never every zone or unit."""
+        granting = {n for n, d in self.zone_definitions.items()
+                    if isinstance(d, dict) and d.get("grants")}
+        found = False
         for mp in self.maps.values():
-            for z in mp.zones.values():
-                if self.zone_grants_of(z):
-                    return True
-        for e in self.entities.values():
-            for inst in e.status.values():
-                if isinstance(inst, dict) and (ZONE_GRANT_KEY in inst):
-                    return True
-        return False
+            mp._zone_index()
+            if mp._zone_own_grants or any(mp._zones_by_def.get(d)
+                                          for d in granting):
+                found = True
+                break
+        if not found:
+            found = bool(self._uflags.holders_of(self, UnitFlags.ZONE_GRANT))
+        if SPATIAL_CHECK:
+            want = any(self.zone_grants_of(z) for mp in self.maps.values()
+                       for z in mp.zones.values()) or any(
+                isinstance(inst, dict) and ZONE_GRANT_KEY in inst
+                for e in self.entities.values() for inst in e.status.values())
+            if want != found:
+                raise SpatialCheckError(f"grant index: _grants_present = "
+                                        f"{found}, scan {want}")
+        return found
 
     def _sync_zone_grants_pass(self, errors: Dict[str, Any],
                                scope: Optional[Set[str]]) -> List[str]:
@@ -12758,8 +13396,10 @@ class Match:
                 if inst.get(ZONE_GRANT_KEY) != zones:
                     inst[ZONE_GRANT_KEY] = list(zones)
                     self._grant_changes += 1
+                    e.mark_changed()
                 if inst.get(ZONE_LINGER_KEY, 0) != linger:
                     self._grant_changes += 1
+                    e.mark_changed()
                     if linger:
                         inst[ZONE_LINGER_KEY] = linger
                     else:
@@ -12896,6 +13536,7 @@ class Match:
         for sname in [n for n, i in e.status.items()
                       if isinstance(i, dict) and ZONE_GRANT_KEY in i]:
             del e.status[sname]
+            e.mark_changed()
 
     def rename_zone_in_grants(self, old: str, new: str) -> None:
         """A renamed zone's name in the grant markers of every unit."""
@@ -12906,6 +13547,7 @@ class Match:
                 if isinstance(zs, list) and old in zs:
                     inst[ZONE_GRANT_KEY] = sorted(
                         {new if z == old else z for z in zs})
+                    e.mark_changed()
 
     def rename_tile_template(self, old: str, new: str) -> int:
         """Rename tile template `old` to `new`, and every tile placed from
@@ -12920,9 +13562,10 @@ class Match:
                                for k, v in self.tile_templates.items()}
         n = 0
         for mp in self.maps.values():
-            for cell in mp.tiles.values():
+            for c, cell in mp.tiles.items():
                 if isinstance(cell, dict) and cell.get("_template") == old:
                     cell["_template"] = new
+                    mp.tile_touch(*c)
                     n += 1
         return n
 
@@ -13252,6 +13895,7 @@ class Match:
             kept = corpse.get("maps")
             if isinstance(kept, list) and name in kept:
                 corpse["maps"] = [k for k in kept if k != name]
+                _mp.note_corpse(_x, _y)
         # Tagged with the gone map: only an unfiltered view reads it.
         for n in sorted(before - set(self.maps) - {name}):
             log.append(f"{UNIT_LINE_TAG}{self.id}||0|0|{n}{UNIT_LINE_TAG}"
@@ -13330,6 +13974,11 @@ class Match:
                 corpse["maps"] = [new if k == old else k for k in kept]
         for st in stores:
             n += _rename_map_coords(st, old, new)
+        for e in self.entities.values():
+            e.mark_changed()
+        for m2 in self.maps.values():
+            m2.tiles.mark_all()
+            m2.zones.changed = None
         return n
 
     def copy_map(self, name: str, new: str) -> Tuple["Map", Dict[str, str]]:
@@ -13724,25 +14373,94 @@ class Match:
                     for u in self.entities.values():
                         if u.part_of and u.part_of in self.entities:
                             children.setdefault(u.part_of, []).append(u)
-        _num, text_v, total_v = self.size_names()
         for _mp, _x, _y, _cid, c in self.every_corpse():
-            cv = _corpse_vars(c)
-            if not isinstance(cv, dict):
-                continue
-            before = (cv.get(text_v), cv.get(total_v))
-            # A corpse keeps the total it died with while sizes are off
-            # (nothing could derive it again); only its category follows
-            # the scale.
-            if self.sizes_on():
-                t = cv.get(total_v)
-                if isinstance(t, (int, float)) and not isinstance(t, bool):
-                    cat = self.size_category_of(t)
-                    if cat is None:
-                        cv.pop(text_v, None)
-                    else:
-                        cv[text_v] = cat
-            if not same_value(before, (cv.get(text_v), cv.get(total_v))):
-                self._size_changes = getattr(self, "_size_changes", 0) + 1
+            if self._settle_corpse_size(c):
+                _mp.note_corpse(_x, _y)
+        return log
+
+    def _settle_corpse_size(self, c: Any) -> bool:
+        """A corpse's category read from the total it died with (a corpse
+        keeps that total while sizes are off: nothing could derive it
+        again); only its category follows the scale. True when it changed
+        (the caller marks its cell, Map.note_corpse)."""
+        cv = _corpse_vars(c)
+        if not isinstance(cv, dict):
+            return False
+        _num, text_v, total_v = self.size_names()
+        before = (cv.get(text_v), cv.get(total_v))
+        if self.sizes_on():
+            t = cv.get(total_v)
+            if isinstance(t, (int, float)) and not isinstance(t, bool):
+                cat = self.size_category_of(t)
+                if cat is None:
+                    cv.pop(text_v, None)
+                else:
+                    cv[text_v] = cat
+        if not same_value(before, (cv.get(text_v), cv.get(total_v))):
+            self._size_changes = getattr(self, "_size_changes", 0) + 1
+            return True
+        return False
+
+    def sync_touched_sizes(self) -> List[str]:
+        """The size sweep after a command (#197): sync_body_size for the
+        bodies of the units marked since the last sweep (the unit index's
+        marks: var writes, the place fields, statuses; a part's old body
+        through notify), never every body. A corpse keeps the category it
+        died with; the scale changing re-reads every corpse in
+        sync_all_sizes, which apply_system_rules runs. The first sweep of a
+        match object (a load, an undo's restored match, a new entities
+        dict) is the full sync_all_sizes. FCS_SPATIAL_CHECK then runs the
+        full sweep and raises if it changed anything."""
+        tracker = self._size_touch
+        sp = self._spatial
+        ctx = id(self.entities)
+        if tracker[0] is None or tracker[1] != ctx \
+                or not any(l is tracker[0] for l in sp.listeners):
+            changed: Set[str] = set()
+            sp.listeners.append(changed)
+            self._size_touch = [changed, ctx]
+            return self.sync_all_sizes()
+        ids = tracker[0]
+        tracker[0] = set()
+        sp.listeners = [l for l in sp.listeners if l is not ids]
+        sp.listeners.append(tracker[0])
+        roots: Dict[str, "Entity"] = {}
+        for eid in ids:
+            e = self.entities.get(eid)
+            if e is not None and e._match is self:
+                r = self.body_root(e)
+                roots[r.id] = r
+        log: List[str] = []
+        if roots:
+            sp.ensure(self)
+            children = self._children_index()
+            for rid in sp._sorted(self, roots):
+                r = self.entities.get(rid)
+                if r is None:
+                    continue
+                before = getattr(self, "_size_changes", 0)
+                log += self.sync_body_size(r, children, warn=False)
+                if getattr(self, "_size_changes", 0) != before:
+                    children = self._children_index()
+        if SPATIAL_CHECK:
+            # The full sweep must change nothing outside the bodies just
+            # synced (one a hook keeps changing never settles).
+            _n, text_v, total_v = self.size_names()
+
+            def _state() -> Any:
+                units = {eid: (e.vars.get(total_v), e.vars.get(text_v))
+                         for eid, e in self.entities.items()
+                         if self.body_root(e).id not in roots}
+                dead = [(c[3], json.dumps(_corpse_vars(c[4]), sort_keys=True,
+                                          default=str))
+                        for c in self.every_corpse()]
+                return units, dead
+            before_state = _state()
+            self.sync_all_sizes()
+            if _state() != before_state:
+                raise SpatialCheckError(
+                    "size sweep: a body or corpse the marks missed changed "
+                    f"(marked: {sorted(ids)[:8]})")
         return log
 
     def size_of_corpse(self, cid: str) -> Any:
@@ -14056,6 +14774,7 @@ class Match:
                     kept = loc[2].setdefault("maps", [])
                     if name not in kept:
                         kept.append(name)
+                    loc[3].note_corpse(loc[0], loc[1])
                 wreck = vars_.get(str(self.rules.get(
                     "map_vehicle_wreck_var", "wreck_formula")))
                 if not isinstance(wreck, str):
@@ -14098,6 +14817,7 @@ class Match:
             spot = self._eject_spot(body, outer, box, block_mode=None)
             cell = mp.tiles.get((x, y), {})
             del cell["corpses"][cid]
+            mp.tile_touch(x, y)
             if not cell["corpses"]:
                 cell.pop("corpses")
             if not cell:
@@ -14326,6 +15046,7 @@ class Match:
                 mp.fog_reveals[team] = recs
             else:
                 del mp.fog_reveals[team]
+        mp.runs_changed("fog_reveals")
         # Shift each channel's viewport CAMERA by the same offset so it keeps
         # framing the same content after a center/edge-anchored resize (the
         # camera is coordinate-bearing too). resolve_viewport re-clamps on
@@ -14457,6 +15178,8 @@ class Match:
                 mp.fog_reveals[team] = recs
             else:
                 del mp.fog_reveals[team]
+        mp.runs_changed("explored")
+        mp.runs_changed("fog_reveals")
         mp.voids = set(target)
         return ({"added": len(added), "removed": len(removed),
                  "killed": killed, "dropped_tiles": dropped_tiles,
@@ -14621,8 +15344,10 @@ class Match:
             if e is not seg and e.vars.get("__follows") == seg.id:
                 if pred:
                     e.vars["__follows"] = pred
+                    e.mark_changed()
                 else:
                     e.vars.pop("__follows", None)
+                    e.mark_changed()
 
     def snake_segments(self, head_id: str) -> List["Entity"]:
         """The ordered body chain of a snake (head -> tail). Built by walking
@@ -14688,6 +15413,7 @@ class Match:
             for i in range(1, len(chain)):
                 chain[i].x, chain[i].y = old[i - 1]
         head.vars["__seg_last"] = [head.x, head.y]
+        head.mark_changed()
         # The trail moves segments by their anchor cell: a multi-tile
         # segment can then reach past the map's edge. Re-lay the body
         # (footprint-aware, _snake_layout) when one does.
@@ -14724,7 +15450,9 @@ class Match:
                 u.x, u.y = ux, uy
             for k in ("__seg_last", "__seg_path"):
                 head.vars.pop(k, None)
+                head.mark_changed()
             head.vars.update(kept)
+            head.mark_changed()
         ig = (self._occupancy_ignore(head, extra)
               + tuple(p.id for p in self.entity_part_subtree(head.id)))
         mp = self.map_of(head)
@@ -14762,6 +15490,7 @@ class Match:
         need = (len(chain) + 1) * spacing + 1 + len(body)
         del path[need:]
         head.vars["__seg_path"] = path
+        head.mark_changed()
         trail = [c for c in path if (c[0], c[1]) not in body] or path
         for i, s in enumerate(chain):
             idx = min((i + 1) * spacing - 1, len(trail) - 1)
@@ -14869,9 +15598,11 @@ class Match:
                               f"{', '.join(f'`{i}`' for i in stray)} of "
                               f"`{head_id}`; left where they were."])
         head.vars["__seg_last"] = [head.x, head.y]
+        head.mark_changed()
         if str(self._segment_cfg(head, "__segment_follow",
                                  "segment_follow_mode")) == "path":
             head.vars["__seg_path"] = path
+            head.mark_changed()
 
     def _find_segment_cell(self, px: int, py: int, bdx: int, bdy: int,
                            mp: "Map") -> Optional[Tuple[int, int]]:
@@ -14934,9 +15665,11 @@ class Match:
                    vars=svars, part_of=head_id)
         _, log = e.spawn(self, cell[0], cell[1], map_name=head.map)
         head.vars.setdefault("__seg_last", [head.x, head.y])
+        head.mark_changed()
         # Seed the path (for `path` follow mode) with the head's current cell
         # so segments reach full spacing without a warm-up lag.
         head.vars.setdefault("__seg_path", [[head.x, head.y]])
+        head.mark_changed()
         return e, log
 
     def create_part(self, parent_id: str, part_id: str, name: str,
@@ -15035,6 +15768,7 @@ class Match:
         self._splice_out_segment(p)
         for k in ("__segment", "__follows"):
             p.vars.pop(k, None)
+            p.mark_changed()
         p.part_of = None
         # A living limb that sat on its body (glued or region) steps off it
         # to the nearest free cell, as a dismount does: two living units
@@ -15072,13 +15806,16 @@ class Match:
             raise VTTError(f"`{part_id}` is not a body part.")
         had = p.vars.get("__part_located")
         p.vars["__part_located"] = True   # set first so the occupancy gate engages
+        p.mark_changed()
         try:
             self._validate_placement(p, x, y, None)
         except VTTError:
             if had is None:
                 p.vars.pop("__part_located", None)
+                p.mark_changed()
             raise
         p.vars.pop("__part_region", None)   # locate and region are exclusive
+        p.mark_changed()
         self._spatial.touch(p.id)       # its kind of part changed
         p.move_to(x, y)
         # Its own auras, glued parts and riders come along.
@@ -15098,7 +15835,9 @@ class Match:
             raise VTTError(f"`{part_id}` is not a body part.")
         self._refuse_segment_mode(p, "glued")
         p.vars.pop("__part_located", None)
+        p.mark_changed()
         p.vars.pop("__part_region", None)
+        p.mark_changed()
         self._spatial.touch(p.id)       # its kind of part changed
         self._restamp_parts_for(p.part_of)
         return p
@@ -15132,7 +15871,9 @@ class Match:
                 f"unknown region '{region}'. Use one of: "
                 f"{', '.join(sorted(self._PART_REGIONS))}.")
         p.vars.pop("__part_located", None)        # region and locate are exclusive
+        p.mark_changed()
         p.vars["__part_region"] = region
+        p.mark_changed()
         self._spatial.touch(p.id)       # its kind of part changed
         self._restamp_parts_for(p.part_of)        # snap anchor to the parent
         return p
@@ -16244,11 +16985,35 @@ class Match:
     def has_watchers(self) -> bool:
         """Whether a watcher poll has anything to read or settle: match
         watchers, held watchers' stored state, or a living unit holding
-        one."""
+        one. The units whose own data holds one come from UnitFlags; a
+        status definition or team data holding one is read here (few), and
+        only then are units walked."""
         if self.watchers or self.watcher_state:
             return True
-        return any(e.is_alive and self.held_watchers(e)
-                   for e in self.entities.values())
+        found = self._held_anywhere()
+        if SPATIAL_CHECK and found != any(
+                e.is_alive and self.held_watchers(e)
+                for e in self.entities.values()):
+            raise SpatialCheckError(f"unit flags: has_watchers = {found}")
+        return found
+
+    def _held_anywhere(self) -> bool:
+        if any(self.entities[eid].is_alive for eid in
+               self._uflags.holders_of(self, UnitFlags.WATCHERS)
+               if eid in self.entities):
+            return True
+        defs = {n for n, d in self.status_definitions.items()
+                if isinstance(d, dict) and (WATCHERS_KEY in d or any(
+                    isinstance(v, dict) and WATCHERS_KEY in v
+                    for v in (d.get(STATUS_LEVELS_FIELD) or {}).values()))}
+        teams = {t for t, td in self.team_data.items()
+                 if isinstance(td, dict) and WATCHERS_KEY in td}
+        if not defs and not teams:
+            return False
+        return any(e.is_alive and (
+            (e.team is not None and str(e.team) in teams)
+            or any(sn in defs for sn in e.status))
+            and self.held_watchers(e) for e in self.entities.values())
 
     def fire_watchers(self) -> List[str]:
         """Re-check the watchers until a pass fires nothing new (at most
@@ -16562,6 +17327,7 @@ class Match:
         z["anchor"] = eid
         z["anchor_radius"] = radius
         z["anchor_metric"] = metric
+        mp.zone_changed(name)
         self._stamp_anchored_zone(name, mp)
         return len(z["cells"])
 
@@ -16569,11 +17335,13 @@ class Match:
         """Detach an aura's anchor, leaving its current cells as a static
         zone. Returns True iff the zone was anchored. Raises for an
         unknown zone."""
-        z = (mp or self._zone_owner(name))._require_zone(name)
+        mp = mp or self._zone_owner(name)
+        z = mp._require_zone(name)
         was = bool(z.get("anchor"))
         z.pop("anchor", None)
         z.pop("anchor_radius", None)
         z.pop("anchor_metric", None)
+        mp.zone_changed(name)
         return was
 
     def entity_zones(self, eid: str) -> Set[str]:
@@ -17137,11 +17905,50 @@ class Match:
                 for qx in range(x0 // B, x1 // B + 1):
                     blocks.setdefault((qx, qy), []).append(box)
 
-        def test(x: int, y: int) -> bool:
+        def by_member(x: int, y: int) -> bool:
             return any(x0 <= x <= x1 and y0 <= y <= y1
                        and self._member_sees(e, x, y, mp, los=los)
                        for e, x0, y0, x1, y1
                        in blocks.get((x // B, y // B), ()))
+        if los:
+            memo[key] = by_member
+            return by_member
+        # Without line of sight, a pass that asks about many cells (a full
+        # render) stamps each member's sight area once into one cell set
+        # and reads that (#197); a few questions keep the member test.
+        asked = [0]
+        seen: List[Optional[Set[Tuple[int, int]]]] = [None]
+
+        def stamp() -> Set[Tuple[int, int]]:
+            out: Set[Tuple[int, int]] = set()
+            done: Set[Any] = set()
+            for boxes in blocks.values():
+                for e, x0, y0, x1, y1 in boxes:
+                    if id(e) in done:
+                        continue
+                    done.add(id(e))
+                    r = self._vision_radius_of(e)
+                    for (ex, ey) in self.entity_cells(e):
+                        for yy in range(max(y0, ey - r), min(y1, ey + r) + 1):
+                            for xx in range(max(x0, ex - r),
+                                            min(x1, ex + r) + 1):
+                                if (xx, yy) not in out and \
+                                        self._within_vision(ex, ey, xx, yy, r):
+                                    out.add((xx, yy))
+            return out
+
+        def test(x: int, y: int) -> bool:
+            got = seen[0]
+            if got is None:
+                asked[0] += 1
+                if asked[0] <= _VISION_STAMP_AFTER:
+                    return by_member(x, y)
+                got = seen[0] = stamp()
+            ans = (x, y) in got
+            if SPATIAL_CHECK and ans != by_member(x, y):
+                raise SpatialCheckError(
+                    f"fog stamping: ({x},{y}) for `{pov_team}` differs")
+            return ans
         memo[key] = test
         return test
 
@@ -17177,6 +17984,7 @@ class Match:
                 mp.fog_reveals[team] = live
             else:
                 mp.fog_reveals.pop(team, None)
+            mp.runs_changed("fog_reveals")
         return live
 
     def reveals_to_turn_clock(self) -> int:
@@ -17197,6 +18005,7 @@ class Match:
                     r["clock"] = "turn"
                     r["until"] = self.turns_elapsed + max(0, left - 1)
                     done += 1
+            mp.runs_changed("fog_reveals")
         return done
 
     def _cell_revealed(self, pov_team: Optional[str], x: int, y: int,
@@ -17239,6 +18048,7 @@ class Match:
         # interchangeable. Without this a scout that reveals every turn
         # piles up one record per use, and every fog check scans them all:
         # a 60x60 render went 19 ms -> 166 ms at 300 permanent records.
+        mp.runs_changed("fog_reveals")
         recs = mp.fog_reveals.setdefault(team, [])
         for r in recs:
             if (r.get("until") == rec["until"]
@@ -17252,7 +18062,9 @@ class Match:
     def clear_reveals(self, team: str, mp: Optional["Map"] = None) -> int:
         """Drop all reveals for `team` on map `mp` (None = the only map).
         Returns the number of records removed."""
-        return len((mp or self.get_map()).fog_reveals.pop(team, []) or [])
+        mp = mp or self.get_map()
+        mp.runs_changed("fog_reveals")
+        return len(mp.fog_reveals.pop(team, []) or [])
 
     def _fog_terrain_visible(self, pov_team: Optional[str], x: int, y: int,
                              mp: "Map") -> bool:
@@ -17295,6 +18107,7 @@ class Match:
             if mp is None or not self.fog_on(mp) or not self.fog_memory_on(mp):
                 continue
             seen = mp.explored.setdefault(team, set())
+            had = len(seen)
             r = self._vision_radius_of(e)
             # A large viewer reveals the UNION of every footprint cell's
             # vision-radius neighbourhood (LOS measured from that cell).
@@ -17308,6 +18121,8 @@ class Match:
                         if use_los and not self.has_los(e.id, ex, ey, xx, yy, mp):
                             continue
                         seen.add((xx, yy))
+            if len(seen) != had or not had:
+                mp.runs_changed("explored")
 
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,
@@ -20570,6 +21385,9 @@ class Match:
             if isinstance(g, dict) and old in g and new not in g:
                 z["grants"] = rename_key(g)
                 counts["zone grants"] += 1
+        for mp in self.maps.values():
+            mp.zones.changed = None
+            mp.tiles.mark_all()     # corpses' statuses
         return counts
 
     def _rename_status_refs(self, node: Any, old: str, new: str,
@@ -21953,6 +22771,10 @@ class Match:
         is removed inside its own tick on this unit, else `removed`.
         """
         log: List[str] = []
+        self._spatial.notify(entity_id)     # what it holds (UnitFlags)
+        holder = self.entities.get(entity_id)
+        if holder is not None:
+            holder.mark_changed()
         if after is not None:
             after = self._cap_live_status(entity_id, status_name, after)
         if before is None and after is not None:
@@ -22906,6 +23728,7 @@ class Match:
         equals the container's base (or, deleted, that the base lacks)
         leaves the lists — "back to the norm"; a listed parent leaves only
         when its whole subtree matches again."""
+        e.mark_changed()
         if TEMPLATE_TRACK_OFF.get() or SIZE_DERIVING.get():
             return
         keys = path.split(".")
@@ -23076,6 +23899,7 @@ class Match:
                         log += e.write_var(k, v)
                 if e.id in self.entities:
                     e.vars[TEMPLATE_MARKER] = live[TEMPLATE_MARKER]
+                    e.mark_changed()
         except Exception:
             _rollback_match(self, None, pre)
             raise
@@ -23092,6 +23916,7 @@ class Match:
         path = "" if path in ("", ".") else path
         node = self._marked_container_at(e, path)
         name = node.pop(TEMPLATE_MARKER)["name"]
+        e.mark_changed()
         for _q, nested in _marked_containers(node):
             if nested[TEMPLATE_MARKER].get("inherited"):
                 self._rebase(nested)
@@ -24009,6 +24834,7 @@ class Match:
         if p.vars.get("__part_destroyed"):
             return []
         p.vars["__part_destroyed"] = True   # raw set: no write_var recursion
+        p.mark_changed()
         self.log_event("part_destroyed", entity=p.id, name=p.name,
                        part_of=p.part_of or "")
         self._announce("death_message_format", p.id, p.name, p.x, p.y,
@@ -24129,6 +24955,7 @@ class Match:
         for k in ("__segment", "__follows", "__part_located",
                   "__part_destroyed", "__seg_path", "__seg_last"):
             seg.vars.pop(k, None)
+            seg.mark_changed()
         seg.part_of = None
         tmpl = old_head.vars.get("__segment_split_head_template")
         if not isinstance(tmpl, dict):
@@ -24137,6 +24964,7 @@ class Match:
         if seg.initiative is None and old_head.initiative is not None:
             seg.initiative = old_head.initiative
         seg.vars["__seg_last"] = [seg.x, seg.y]
+        seg.mark_changed()
 
     # ---------- status-on-part rules + AoE damage spread ----------
     def _part_status_names(self, e: "Entity", var_key: str,
@@ -24359,6 +25187,10 @@ class Match:
         part_dicts = [pp.to_dict() for pp in self.entity_part_subtree(e.id)]
         if part_dicts:
             corpses[e.id]["parts"] = part_dicts
+        # A death in the middle of a size derivation (the total written,
+        # the category not yet) leaves the pair half done: the corpse
+        # takes its category from its total now, as the scale gives it.
+        self._settle_corpse_size(corpses[e.id])
         cmap.note_corpse(e.x, e.y)
 
     def find_corpse(self, eid: str
@@ -24471,6 +25303,7 @@ class Match:
         corpses = cell.get("corpses") if isinstance(cell, dict) else None
         if isinstance(corpses, dict) and eid in corpses:
             del corpses[eid]
+            cmap.tile_touch(x, y)
             if not corpses:
                 cell.pop("corpses", None)
             # Drop an empty tile dict entirely so tile listings stay clean.
@@ -24732,6 +25565,7 @@ class Match:
                         d, self.rules, f"corpse `{d.get('id', cid)}`")
                 except VTTError as ex:
                     notes.append(f"{ex} It keeps its old var names.")
+            _mp.note_corpse(_x, _y)
         return notes
 
     def var_name_conflicts(self, rules: Dict[str, Any]) -> List[str]:
@@ -25008,8 +25842,10 @@ class Match:
                 if fol != pe.vars.get("__follows"):
                     if fol:
                         pe.vars["__follows"] = fol
+                        pe.mark_changed()
                     else:
                         pe.vars.pop("__follows", None)
+                        pe.mark_changed()
         self._restamp_parts_for(parent.id)
         return log
 
@@ -25474,12 +26310,18 @@ class Match:
             return []
         cur = self.current_entity_id()
         log: List[str] = []
-        # Every map's tiles, maps in order (a hook can delete a map).
+        # The templates with a hook of this kind.
+        tpls = {n for n, t in self.tile_templates.items()
+                if isinstance(t.hooks.get(when), str) and t.hooks[when]}
+        # Every map's tiles, maps in order (a hook can delete a map); only
+        # the tiles that can have the hook (Map.hook_cells).
         for mname in list(self.maps):
             mp = self.maps.get(mname)
             if mp is None:
                 continue
-            for (x, y) in sorted(mp.tiles.keys()):
+            cells = sorted(c for c, (own, tpl) in mp.hook_cells().items()
+                           if when in own or tpl in tpls)
+            for (x, y) in cells:
                 # Skip tiles cleared mid-iteration (e.g. by a previous
                 # tile's hook calling tile_clear on this one). Also skip if
                 # no hook of this kind is registered — fire_tile_hook
@@ -26167,7 +27009,7 @@ class Match:
             # Files are written with sorted keys: the creation order (the
             # first map is the default board) is kept here.
             "map_order": list(self.maps),
-            "entities": {eid: e.to_dict() for eid, e in self.entities.items()},
+            "entities": {eid: e.ser_dict() for eid, e in self.entities.items()},
             # COPY, don't alias: Entity.remove mutates turn_order IN PLACE
             # (m.turn_order.remove(id)), so storing the live list by reference
             # let a later removal retroactively shrink an already-taken
@@ -28449,6 +29291,7 @@ class Match:
             raise NotFound(f"Zone '{name}' not found.")
         canon = self.checked_facing(raw, self.zone_facing(name))
         z[FACING_FIELD] = canon
+        self.zone_map(name).zone_changed(name)
         return canon
 
     def facing_toward(self, e: "Entity", tx: float, ty: float) -> Optional[Direction]:
@@ -30784,10 +31627,12 @@ class MatchManager:
             fol = ne.vars.get("__follows")
             if fol in idmap:
                 ne.vars["__follows"] = idmap[fol]
+                ne.mark_changed()
             elif fol is not None:
                 # Points outside the copied body: it would dangle in the
                 # destination (or latch onto an unrelated same-id entity).
                 ne.vars.pop("__follows", None)
+                ne.mark_changed()
             # Offset the head's snake-trail coords to the destination cell so a
             # transferred path-mode snake re-lays at its new location, not the
             # source's (same delta the anchor moves by).

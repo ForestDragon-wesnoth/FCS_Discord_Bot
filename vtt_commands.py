@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
-from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
+from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
 from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
@@ -1210,7 +1210,7 @@ class CommandRegistry:
                 and pre_active_mid is not None
                 and pre_active_mid in mgr.matches):
             m_pre = mgr.matches[pre_active_mid]
-            if (int(m_pre.rules.get("autosave_command_retention_turns", 3)) != 0
+            if (int(m_pre.rules.get("autosave_command_retention_turns", 10)) != 0
                     and getattr(m_pre, "_action_depth", 0) == 0):
                 pre_state = m_pre.to_dict(include_history=False)
         # The command journal (journal.py): the channel's match before the
@@ -1504,7 +1504,7 @@ async def _settle_after(ctx: ReplyContext, mgr: MatchManager, name: str,
         if om is not None and om.sizes_on() \
                 and getattr(om, "_action_depth", 0) == 0:
             try:
-                om.surface_log(om.sync_all_sizes())
+                om.surface_log(om.sync_touched_sizes())
             except VTTError as e:
                 await ctx.send(f"❌ settling sizes in `{other}`: {e}")
     if mid not in mgr.matches:
@@ -1525,7 +1525,7 @@ async def _settle_after(ctx: ReplyContext, mgr: MatchManager, name: str,
             # body's size total and category.
             before = getattr(m_post, "_size_changes", 0)
             try:
-                m_post.surface_log(m_post.sync_all_sizes())
+                m_post.surface_log(m_post.sync_touched_sizes())
             except VTTError as e:
                 await ctx.send(f"❌ settling sizes: {e}")
             except Exception as e:
@@ -1613,7 +1613,7 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
              "by": COMMAND_USER.get() or "", "uid": ctx_user(ctx),
              "ch": ctx.channel_key, "cmd": [typed] + list(typed_args),
              "rng": [jrng[0], jrng[1], post_m.rng_position()],
-             "hash": state_hash(post),
+             "hash": state_hash(post, post_m),
              # The author's server authority: a replay runs the command with
              # no more than this (lines it refused live stay refused).
              "auth": _auth_record(ctx)}
@@ -1627,12 +1627,14 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
     if (as_state or name in _JOURNAL_STATE_ROOTS
             or (name, sub) in _JOURNAL_STATE_SUBS):
         entry["kind"] = "state"
-        entry["state"] = journal_state(post)
         if effective_seed(post_m) != jrng[0]:
             entry["rng"][0] = effective_seed(post_m)
     elif prefab_reads:
         entry["prefabs"] = journal_prefab_reads(j, prefab_reads)
-    j.add(entry)
+    if entry["kind"] == "state":
+        j.add_state(entry, post)
+    else:
+        j.add(entry)
     done.add(post_m.id)
     handled = getattr(mgr, "_journal_handled", None)
     if handled is not None:
@@ -1936,15 +1938,14 @@ def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
         if m is None or m.journal is None or mid == _REPLAYING.get():
             continue
         post = m.to_dict(include_history=False)
-        if state_hash(post) == m.journal.last_state_hash():
+        if state_hash(post, m) == m.journal.last_state_hash():
             continue    # only what an undo leaves alone moved (the RNG)
-        m.journal.add({"kind": "state", "at": _now_iso(),
-                       "by": getattr(mgr, "_journal_by", "") or "",
-                       "cmd": list(label), "outside": True,
-                       "rng": [effective_seed(m), m.rng_position(),
-                               m.rng_position()],
-                       "state": journal_state(post),
-                       "hash": state_hash(post)})
+        m.journal.add_state({"kind": "state", "at": _now_iso(),
+                             "by": getattr(mgr, "_journal_by", "") or "",
+                             "cmd": list(label), "outside": True,
+                             "rng": [effective_seed(m), m.rng_position(),
+                                     m.rng_position()],
+                             "hash": state_hash(post, m)}, post)
 
 
 # Whether this asyncio task holds its manager's command lock (see run()).
@@ -2117,7 +2118,8 @@ def _journal_systems(mgr: MatchManager, ctx: ReplyContext,
                        # The match after the edit (a var-name rule moved
                        # its units' vars), so a restart compares the load
                        # with it (J16).
-                       "hash": state_hash(m.to_dict(include_history=False))})
+                       "hash": state_hash(m.to_dict(include_history=False),
+                                          m)})
         handled = getattr(mgr, "_journal_handled", None)
         if handled is not None:
             handled.add(mid)
@@ -4385,6 +4387,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 # Off = reset: drop the map's remembered cells (render
                 # falls back to current vision only).
                 mp.explored.clear()
+                mp.runs_changed("explored")
             return await ctx.send(
                 f"Fog memory **{'on' if want else 'off'}** for {where}.")
         m.set_map_setting(mp, "fog", want)
@@ -7005,7 +7008,7 @@ def _crash_rollback(mgr: MatchManager, mid: Optional[str],
     if pre is None:
         # W9: with command autosaves and the journal both off there is no
         # state from before the command to put back.
-        if int(m.rules.get("autosave_command_retention_turns", 3)) != 0 \
+        if int(m.rules.get("autosave_command_retention_turns", 10)) != 0 \
                 or journal_limit(m) != 0:
             return ""
         return (f"\n⚠️ Match `{mid}` kept no state from before the command "
@@ -9206,6 +9209,9 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
     first_off: Optional[str] = None
     prefabs_seen: Dict[str, Any] = {}
     for seg in segs:
+        # The segment's stored state so far: a `state` entry may be a diff
+        # against it (journal.Journal.add_state).
+        stored = (seg.get("start") or {}).get("state") or {}
         for e in seg.get("entries") or []:
             n = e.get("n")
             if upto is not None and isinstance(n, int) and n > upto:
@@ -9266,7 +9272,8 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     first_off = (f"at #{n} `!{' '.join(toks)}`"[:120])
             elif kind == "state":
                 from action import _rollback_match
-                st_state = copy.deepcopy(e.get("state") or {})
+                stored = journal_entry_state(stored, e)
+                st_state = copy.deepcopy(stored)
                 st_state["id"] = mid        # `as=` renames the match
                 _rollback_match(m, mgr, st_state)
                 if m.system_name in mgr.systems:
@@ -18788,6 +18795,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         p = Passive.from_dict(src.passives[args[2]].to_dict())
         p.id = pid
         dest.passives[pid] = p
+        dest.mark_changed()
         return await ctx.send(f"Copied passive `{args[2]}` from `{src.id}` to "
                               f"`{dest.id}` as `{pid}`.")
 
@@ -18837,6 +18845,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             target=target_val, scope=scope_val, priority=prio,
             extra_turns=xturns,
         )
+        e.mark_changed()
         # Mention target/scope in the ack only for var hooks where they apply
         scope_note = ""
         from logic import VAR_HOOKS
@@ -18855,6 +18864,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if p is None:
             raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
         p.priority = checked_priority(args[3], "priority")
+        m.entities[eid].mark_changed()
         return await ctx.send(f"Passive `{eid}.{p.id}` now has priority "
                               f"{p.priority} (higher runs first).")
 
@@ -18870,6 +18880,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if p is None:
             raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
         p.extra_turns = _extra_turns_word(args[3], "extra_turns")
+        m.entities[eid].mark_changed()
         return await ctx.send(f"Passive `{eid}.{p.id}` on extra turns: "
                               f"{_extra_turns_text(p.extra_turns)}.")
 
@@ -18884,6 +18895,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pid not in e.passives:
             raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
         del e.passives[pid]
+        e.mark_changed()
         return await ctx.send(f"Removed passive `{pid}` from `{eid}`.")
 
     if sub == "list":
@@ -19228,6 +19240,7 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Remove it first with !clamp remove, or replace by remove+add."
             )
         e.clamps[path] = spec
+        e.mark_changed()
         # A bound path the unit doesn't hold reads as "no bound" until it
         # does: say so, so a typo (`max_hpp`) doesn't leave it unbounded
         # unnoticed.
@@ -19250,6 +19263,7 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if path not in e.clamps:
             raise NotFound(f"No clamp on '{path}' for entity '{eid}'.")
         del e.clamps[path]
+        e.mark_changed()
         return await ctx.send(f"Removed clamp on `{eid}.{path}`.")
 
     if sub == "list":
@@ -21293,6 +21307,17 @@ registry.annotate_sub(
     ),
 )
 async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    try:
+        return await _zone_cmd(ctx, args, mgr)
+    finally:
+        # Its subcommands edit zones in place in many ways: every zone of
+        # the channel's match is serialized again (Map.ser_zones).
+        m = mgr.matches.get(mgr.active_by_channel.get(ctx.channel_key) or "")
+        for mp in (m.maps.values() if m is not None else ()):
+            mp.zones.changed = None
+
+
+async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["zone"])
         return await ctx.send(f"**{title}**\n{body}")
@@ -21325,6 +21350,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"No zone `{args[1]}`.")
         reply = _grant_edit(z, args, f"zone `{args[1]}`", "!zone {sub}",
                             _match_program_check(m))
+        m.zone_map(args[1]).zone_touch(args[1])    # its grants (#197)
         return await ctx.send(reply)
 
     # ---- new [<name>] [def=<definition>] ----
@@ -24383,7 +24409,7 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # The sizes and zone grants it would settle (#242, #136), as after
         # a real command.
         if after is not None:
-            after.surface_log(after.sync_all_sizes())
+            after.surface_log(after.sync_touched_sizes())
         if after is not None and after._grants_present():
             after.surface_log(after.sync_zone_grants())
         post = after.to_dict(include_history=False) if after is not None \
@@ -24730,7 +24756,7 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                     await registry.dispatch_no_snapshot(name, rest, sctx, mgr)
                     cur = mgr.matches.get(mid)
                     if cur is not None:
-                        cur.surface_log(cur.sync_all_sizes())
+                        cur.surface_log(cur.sync_touched_sizes())
                         if cur._grants_present():
                             cur.surface_log(cur.sync_zone_grants())
                         if cur.has_watchers():

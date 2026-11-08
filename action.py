@@ -1619,6 +1619,7 @@ async def run_action(
             if action.full_path not in paths \
                     and len(paths) < ACTIONS_USED_MAX:
                 paths.append(action.full_path)
+                holder.mark_changed()
     # Successful completion. Fire the on_action_used hook AFTER the
     # body's writes have settled (so a passive observing this hook
     # sees post-action state).
@@ -1901,7 +1902,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
         "_death_check_deferred_ids", "_deleting_maps", "_watcher_backlog",
-        "_alive_eval_depth", "_vision_memo", "_spatial", "_turn_order_dirty",
+        "_alive_eval_depth", "_vision_memo", "_spatial", "_uflags", "_size_touch", "_turn_order_dirty",
         "_request_seq", "pending_requests", "held_commands",
         # Event bus: the live emit stack/depth + warning latch. Resetting
         # these mid-emit corrupts the outer emit (the verified crash).

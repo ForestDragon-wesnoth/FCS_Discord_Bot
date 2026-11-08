@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from match_history import _now_iso
 
@@ -69,13 +69,15 @@ def journal_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in state.items() if k != "rules"}
 
 
-def state_hash(state: Dict[str, Any]) -> str:
+def state_hash(state: Dict[str, Any], match: Any = None) -> str:
     """A short hash of what an undo restores in `state` (bar the match id:
     a replay may rename it), to tell where a replay stops matching the
-    recording."""
+    recording. `match`: the match the state was just taken from, whose
+    cached piece texts make it cheap (logic.state_text)."""
+    from logic import state_text
     body = {k: v for k, v in state.items()
             if k not in UNDO_IGNORED and k != "id"}
-    text = json.dumps(body, sort_keys=True, default=str)
+    text = state_text(body, match, sort=True)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
@@ -87,6 +89,44 @@ class Journal:
     def __init__(self) -> None:
         self.segments: List[Dict[str, Any]] = []
         self.next_n = 1
+        # (segment no, entry n or 0, state): the newest segment's last
+        # stored state (stored_state), runtime-only.
+        self._last: Optional[Tuple[int, int, Dict[str, Any]]] = None
+
+    def stored_state(self) -> Optional[Dict[str, Any]]:
+        """The newest segment's last stored match state: its start's, or
+        that of its newest `state` entry (a diff against the one before,
+        add_state). Shared: nothing may change it."""
+        if not self.segments:
+            return None
+        seg = self.segments[-1]
+        last_n = 0
+        for e in reversed(seg["entries"]):
+            if e.get("kind") == "state":
+                last_n = e.get("n") or 0
+                break
+        cache = self._last
+        if cache is not None and cache[0] == seg["no"] and cache[1] == last_n:
+            return cache[2]
+        st = segment_states(seg)
+        self._last = (seg["no"], last_n, st)
+        return st
+
+    def add_state(self, entry: Dict[str, Any],
+                  post: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a `state` entry recording match state `post` (Match.to_dict)
+        as a diff against the newest segment's last stored state
+        (`diff`), or whole (`state`) when there is none."""
+        from match_history import state_diff
+        st = journal_state(post)
+        base = self.stored_state()
+        if base is None:
+            entry["state"] = st
+        else:
+            entry["diff"] = state_diff(base, st)
+        self.add(entry)
+        self._last = (self.segments[-1]["no"], entry["n"], st)
+        return entry
 
     def entries(self) -> Iterator[Dict[str, Any]]:
         for seg in self.segments:
@@ -119,6 +159,32 @@ class Journal:
         self.segments.append({"no": header["no"], "start": header,
                               "entries": []})
         del self.segments[:-KEPT_SEGMENTS]
+
+
+def entry_state(base: Optional[Dict[str, Any]],
+                e: Dict[str, Any]) -> Dict[str, Any]:
+    """A `state` entry's match state: whole, or its diff applied to
+    `base` (the segment's stored state before it)."""
+    if isinstance(e.get("state"), dict):
+        return e["state"]
+    from match_history import apply_state_diff
+    diff = e.get("diff")
+    return apply_state_diff(base or {}, diff if isinstance(diff, dict)
+                            else {})
+
+
+def segment_states(seg: Dict[str, Any], upto: Optional[int] = None
+                   ) -> Dict[str, Any]:
+    """The segment's last stored state (through entry `upto` when
+    given): its start's, then each `state` entry's in turn."""
+    st = (seg.get("start") or {}).get("state") or {}
+    for e in seg.get("entries") or []:
+        if upto is not None and isinstance(e.get("n"), int) \
+                and e["n"] > upto:
+            break
+        if e.get("kind") == "state":
+            st = entry_state(st, e)
+    return st
 
 
 def chain_systems(mgr: Any, m: Any) -> Dict[str, Any]:

@@ -58,7 +58,7 @@ from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name, legacy_template_fixes,
                    LEGACY_IDS_OK, owner_limit, unreachable_id,
-                   check_role_perms)
+                   check_role_perms, state_text)
 from match_history import MatchHistory, HistoryError, _now_iso
 from journal import start_header
 
@@ -177,7 +177,7 @@ class Storage:
         # What was last written, per server: the text of each file, so a
         # commit rewrites only what changed and a rollback can read it back.
         #   {"workspace": str, "systems": str, "matches": {mid: str},
-        #    "index": {mid: str}, "seqs": {mid: set}, "hist": {mid: (seq, turn)}}
+        #    "index": {mid: str}, "seqs": {mid: {seq: base}}, "hist": {mid: (seq, turn)}}
         self._written: Dict[str, Dict[str, Any]] = {}
         # Bytes in each top-level folder of the root (a server, or .trash),
         # kept current by the writes this class makes; rescanned by
@@ -787,19 +787,19 @@ class Storage:
         to date; a file edited by hand) no longer has the state its journal
         last recorded: a `state` entry records the loaded one, so a replay
         goes on from what the server holds."""
-        from journal import effective_seed, journal_state, state_hash
+        from journal import effective_seed, state_hash
         for m in mgr.matches.values():
             if m.journal is None or not m.journal.segments:
                 continue
             post = m.to_dict(include_history=False)
-            h = state_hash(post)
+            h = state_hash(post, m)
             if h == m.journal.last_state_hash():
                 continue
-            m.journal.add({"kind": "state", "at": _now_iso(), "by": "",
-                           "cmd": ["(loaded from disk)"], "outside": True,
-                           "rng": [effective_seed(m), m.rng_position(),
-                                   m.rng_position()],
-                           "state": journal_state(post), "hash": h})
+            m.journal.add_state({"kind": "state", "at": _now_iso(),
+                                 "by": "", "cmd": ["(loaded from disk)"],
+                                 "outside": True,
+                                 "rng": [effective_seed(m), m.rng_position(),
+                                         m.rng_position()], "hash": h}, post)
 
     def _settle_lost_systems(self, mgr: MatchManager,
                              backups: Dict[str, Tuple[float, Dict[str, Any]]],
@@ -925,8 +925,10 @@ class Storage:
             gone = [s.sequence for s in m.history.all_snapshots()
                     if not os.path.exists(s.path)]
             if gone:
+                had = {s.sequence for s in m.history.all_snapshots()}
                 m.history.discard(gone)
-                self._lost_note(key, m.id, gone)
+                self._lost_note(key, m.id, sorted(
+                    had - {s.sequence for s in m.history.all_snapshots()}))
         except Exception as ex:  # noqa: BLE001
             m.history = MatchHistory()
             dest_dir = os.path.join(self.server_dir(key), "corrupt")
@@ -986,7 +988,8 @@ class Storage:
             if os.path.exists(os.path.join(self._history_dir(mgr.guild_key, mid),
                                            "index.json")):
                 w["index"][mid] = _dump(h.index())
-                w["seqs"][mid] = {s.sequence for s in h.all_snapshots()}
+                w["seqs"][mid] = {s.sequence: s.base
+                                  for s in h.all_snapshots()}
 
     # ---- committing -------------------------------------------------------
     def _plan(self, mgr: MatchManager, w: Dict[str, Any]
@@ -998,7 +1001,7 @@ class Storage:
         plan: Dict[str, Optional[str]] = {}
         after = {"workspace": w["workspace"], "systems": w["systems"],
                  "matches": dict(w["matches"]), "index": dict(w["index"]),
-                 "seqs": {k: set(v) for k, v in w["seqs"].items()},
+                 "seqs": {k: dict(v) for k, v in w["seqs"].items()},
                  "hist": dict(w["hist"])}
         for k, (fname, attr) in SERVER_LOGS.items():
             after[k] = w.get(k)
@@ -1027,25 +1030,32 @@ class Storage:
                 after["matches"][mid] = text
             h = m.history
             after["hist"][mid] = (h._seq, h._turn_index)
-            old_seqs = w["seqs"].get(mid, set())
+            old_seqs = w["seqs"].get(mid, {})
             if self._persists_history(m):
                 # A snapshot whose state is lost (a missing or unreadable
                 # file) leaves the history: planning its file would fail
-                # every commit of the server.
+                # every commit of the server. A snapshot whose base changed
+                # (a merge on prune, match_history._relink) is written anew.
                 lost = []
                 for s in h.all_snapshots():
-                    if s.sequence not in old_seqs:
+                    if s.sequence not in old_seqs \
+                            or old_seqs[s.sequence] != s.base:
                         try:
                             plan[self._snap_file(key, mid, s.sequence)] = \
-                                self._snap_text(s)
+                                self._snap_text(s, m)
                         except HistoryError:
                             lost.append(s.sequence)
                 if lost:
+                    had = {s.sequence for s in h.all_snapshots()}
                     h.discard(lost)
-                    self._lost_note(key, mid, lost)
+                    kept = {s.sequence for s in h.all_snapshots()}
+                    self._lost_note(key, mid, sorted(had - kept))
+                    for path in [self._snap_file(key, mid, q) for q in
+                                 range(1, h._seq + 1) if q not in kept]:
+                        plan.pop(path, None)
                 snaps = h.all_snapshots()
-                seqs = {s.sequence for s in snaps}
-                for seq in old_seqs - seqs:
+                seqs = {s.sequence: s.base for s in snaps}
+                for seq in set(old_seqs) - set(seqs):
                     plan[self._snap_file(key, mid, seq)] = None
                 itext = _dump(h.index())
                 if itext != w["index"].get(mid):
@@ -1164,13 +1174,28 @@ class Storage:
                 sysobj, "system_load_failure")) == "match_backup":
             d[SYSTEM_BACKUP_KEY] = {x.name: x.to_dict()
                                     for x in mgr.system_chain(sysobj)}
-        return _dump(d)
+        # The same text as _dump(d), from the cached text of each unit,
+        # tile and zone (logic.state_text).
+        return state_text(d, m)
 
     @staticmethod
-    def _snap_text(s) -> str:
-        d = s.to_dict()
-        d["state"] = _disk_state(d["state"])
-        return _dump(d)
+    def _snap_text(s, m: Optional[Match] = None) -> str:
+        """A snapshot's file: its index entry plus its full state (a
+        keyframe; from the cached piece texts of `m` where they are the
+        state's, logic.state_text) or its diff against the snapshot before
+        (match_history.state_diff), both without the match's `rules`."""
+        head = _dump(s.meta())
+        if s.base is None:
+            return (head[:-1] + ',"state":'
+                    + state_text(_disk_state(s.state), m) + "}")
+        diff = s.diff
+        top = diff.get("s")
+        if top and "rules" in top:
+            diff = dict(diff, s={k: v for k, v in top.items()
+                                 if k != "rules"})
+        if "rules" in (diff.get("d") or ()):
+            diff = dict(diff, d=[k for k in diff["d"] if k != "rules"])
+        return head[:-1] + ',"diff":' + _dump(diff) + "}"
 
     @staticmethod
     def _plan_delta(plan: Dict[str, Optional[str]]) -> int:
@@ -1285,19 +1310,37 @@ class Storage:
                             f"journal segment(s) to make room.")
             refusal = self._over_limit(key, need())
         if refusal:
-            cut: Dict[str, List[int]] = {}
+            # One autosave at a time, oldest first, planned again after
+            # each: a cut diff snapshot frees its diff, but cutting a full
+            # one makes the snapshot after it full in its place
+            # (MatchHistory._relink), so only a new plan tells what a cut
+            # freed. The cuts stay only if they make room.
+            cands = self._trim_candidates(mgr)
+            marks = {mid: m.history.mark() for mid, m in mgr.matches.items()}
+            n = 0
             freed = 0
-            for _ts, mid, seq, size in self._trim_candidates(mgr):
+            for _ts, mid, seq, size in cands:
                 if self._over_limit(key, need() - freed) is None:
                     break
-                cut.setdefault(mid, []).append(seq)
                 freed += size
-            if cut and self._over_limit(key, need() - freed) is None:
-                for mid, seqs in cut.items():
-                    mgr.matches[mid].history.drop_sequences(seqs)
-                n = sum(len(v) for v in cut.values())
+                if self._over_limit(key, need() - freed) is not None:
+                    continue    # cut it with the next ones, planned once
+                cut_now = [c for c in cands[n:cands.index(
+                    (_ts, mid, seq, size)) + 1]]
+                for _t2, mid2, seq2, _s2 in cut_now:
+                    mgr.matches[mid2].history.drop_sequences([seq2])
+                n += len(cut_now)
+                plan, after = self._plan(mgr, w)
+                fdelta = self._plan_delta(plan)
+                freed = 0
+            refusal = self._over_limit(key, need())
+            if n and refusal is None:
                 msgs.append(f"🗄️ Storage limit: cut the {n} oldest undo "
                             f"autosave(s) to make room.")
+            elif n:
+                for mid, mk in marks.items():
+                    if mid in mgr.matches:
+                        mgr.matches[mid].history.rewind(mk)
                 plan, after = self._plan(mgr, w)
                 fdelta = self._plan_delta(plan)
                 refusal = self._over_limit(key, need())

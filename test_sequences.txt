@@ -37836,3 +37836,408 @@ hours it writes nothing either, and its next command loads it locked
 again (the first load moved the damaged file to corrupt/, so systems.json
 is now missing). `!server recover accept confirm` moves the match to the default
 system, whose hp var `hp` takes the unit's `health` of 10.
+
+SCENARIO 1072 — Held watchers still fire through each source once the poll reads cached holders (#197): a status definition, a team, an item moved under watcher_sources
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new hw HW 10 10
+!match use hw
+!ent add hero Hero 30 2 2 10
+!status def rally
+!status data rally watchers.cry.condition "entity[self].hp < 10"
+!status data rally watchers.cry.effect "entity[self].cries = 1"
+!ent hp hero 5
+!assert "not var_has('hero', 'cries')"
+!status apply hero rally
+!ent hp hero 20
+!ent hp hero 6
+!assert "entity[hero].cries == 1"
+!ent add mole Mole 10 5 5 3
+!ent set_var mole team blue
+!team set blue watchers.dig.condition "entity[self].hp < 4"
+!team set blue watchers.dig.effect "entity[self].dug = 1"
+!ent hp mole 2
+!assert "entity[mole].dug == 1"
+!ent add imp Imp 10 8 8 2
+!ent set_var imp bag.charm.watchers.flee.condition "entity[self].hp < 5"
+!ent set_var imp bag.charm.watchers.flee.effect "entity[self].fled = 1"
+!ent hp imp 3
+!assert "not var_has('imp', 'fled')"
+!ent hp imp 10
+!eval "var_move('imp', 'bag.charm', 'imp', 'equipped.charm')"
+!ent hp imp 3
+!assert "entity[imp].fled == 1"
+
+Expected: no unit holds a watcher in its own data at first, so the poll
+reads only the holders the cache marks plus what a status definition or
+team data holds. Rally's definition holds a watcher: once the hero has
+the status, a drop from 20 to 6 fires it. The blue team's data holds one:
+the mole, first read at 10 hp, fires when it drops to 2. The imp's charm
+in `bag` counts for nothing (not under watcher_sources); moved under
+`equipped` (a var write, which marks the imp), it fires on the next
+drop.
+
+SCENARIO 1073 — Zone grants follow the granting-zone record (#197): a definition gaining and losing a grant, a zone's own grant, setdef to a granting definition and back, the formula grant functions
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new zg ZG 10 10
+!match use zg
+!status def warm
+!ent add hero Hero 20 2 2 5
+!zone def new hearth
+!zone new fire def=hearth
+!zone fill fire 1 1 3 3
+!assert "not status_has('hero', 'warm')"
+!zone def grant hearth warm
+!assert "status_has('hero', 'warm')"
+!zone def ungrant hearth warm
+!assert "not status_has('hero', 'warm')"
+!zone grant fire warm
+!assert "status_has('hero', 'warm')"
+!zone ungrant fire warm
+!assert "not status_has('hero', 'warm')"
+!zone def new oven
+!zone def grant oven warm
+!zone setdef fire oven
+!assert "status_has('hero', 'warm')"
+!zone setdef fire -
+!assert "not status_has('hero', 'warm')"
+!eval "zone_grant('fire', 'warm')"
+!assert "status_has('hero', 'warm')"
+!eval "zone_ungrant('fire', 'warm')"
+!assert "not status_has('hero', 'warm')"
+!zone new kiln def=oven
+!zone add kiln 2 2
+!assert "status_has('hero', 'warm')"
+!zone drop kiln
+!assert "not status_has('hero', 'warm')"
+
+Expected: whether a grant sync runs at all is read from each map's record
+of the zones with grants of their own and the zones by definition, against
+the definitions that grant. A grant added to the hearth definition reaches
+the fire zone made from it, and its removal lifts it; the zone's own grant
+does the same. Pointing the zone at the granting oven definition grants,
+detaching it lifts. zone_grant / zone_ungrant in a formula follow too. A
+new zone made from oven grants once it covers the hero, and dropping it
+lifts the status.
+
+SCENARIO 1074 — The size sweep syncs the bodies a command touched (#197): a detached and a removed part, a transform, a corpse made in the middle of a derivation, an undo
+----------------------------------------------------------------------------------------------------------------------------------------------------
+!match new sz SZ 12 8
+!match use sz
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre size_num 100
+!ent set_var ogre __size_total_mode sum
+!part add ogre oarm arm 5 5
+!ent set_var oarm size_num 60
+!part add ogre oleg leg 5 5
+!ent set_var oleg size_num 40
+!assert "size_of('ogre') == 200 and entity[ogre].size_text == 'large'"
+!part detach oarm
+!assert "size_of('ogre') == 140 and entity[oarm].size_total == 60 and entity[oarm].size_text == 'small'"
+!part remove oleg
+!assert "size_of('ogre') == 100 and entity[ogre].size_text == 'medium'"
+!ent add troll Troll 40 8 2 4
+!ent set_var troll size_num 400
+!ent transform oarm troll form
+!assert "entity[oarm].size_total == 400 and entity[oarm].size_text == 'huge'"
+!ent add bob Bob 20 6 6 3
+!part add bob barm arm 5 5
+!ent hp barm -5
+!part detach barm
+?? died
+!eval "corpse_var('barm', 'size_text')"
+?? = `'medium'`
+!undo command
+!assert "size_of('bob') == 100 and parts('bob') == ['barm']"
+
+Expected: the sweep after a command re-derives only the bodies it
+touched. In `sum` mode the ogre's total is 100 + 60 + 40 = 200 (large).
+Detaching the arm drops it to 140, and the free arm derives its own 60
+(small); removing the leg takes the ogre to 100 (medium). The arm, turned
+into the troll's form, takes the troll's 400 (huge). Bob's arm at 0 hp,
+detached, dies as a free unit while its size is first derived: its
+corpse holds the total and the category (medium, from the default 100).
+The undo puts the arm back on Bob, and his total is right again.
+
+
+SCENARIO 1075 — Turn and command autosaves are diffs (#197): undo after a restart lands exactly, a 2x2 body, tiles, a zone and a corpse included
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new dz DZ 10 8
+!match use dz
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add imp Imp 5 8 2 3
+!tile set 5 5 mud 1
+!zone new bog
+!zone fill bog 6 6 7 7
+!turn next
+!ent tp ogre 4 4
+!tile set 5 6 mud 2
+!zone set bog depth 3
+!ent kill imp
+!ent set_var ogre bag.gold 12
+!as restart
+!assert "has_corpse('imp') and entity[ogre].bag.gold == 12"
+!undo command 3 confirm
+?? Undid 3 command(s)
+!assert "entity[ogre].x == 4 and entity[ogre].y == 4 and not var_has('ogre', 'bag')" the 2x2 ogre stands where it was moved
+!assert "entity[imp].hp == 5 and not has_corpse('imp') and tile_get(5, 6, 'mud') == 2 and not zone_has('bog', 'depth')"
+!as restart
+!undo turn 1 confirm
+?? Undid 1 turn(s)
+!assert "entity[ogre].x == 2 and not tile_has(5, 6, 'mud') and tile_get(5, 5, 'mud') == 1 and footprint_cells('ogre') == [[2, 2], [3, 2], [2, 3], [3, 3]]"
+!assert "zone_size('bog') == 4 and cell_in_zone(6, 6, 'bog') and cell_in_zone(7, 7, 'bog')"
+
+Expected: every turn and command autosave after the first is stored as
+what changed since the autosave before it (a round autosave is a full
+copy). After a restart the snapshots are read back from disk through
+that chain: `!undo command 3` takes back the gold, the imp's death
+(its corpse is gone, the imp alive at 5 hp) and the zone's depth, and
+keeps the move and the second tile. After another restart `!undo turn 1`
+goes back to the start of the turn: the 2x2 ogre at (2,2) with its four
+cells, only the first tile, the zone's four cells.
+
+
+SCENARIO 1076 — Pruned autosaves merge into the next one (#197): undo still lands exactly; a round autosave pruned makes the next one full
+------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new pm PM 8 6
+!match use pm
+!system set default autosave_command_retention_max 2
+!system set default autosave_round_retention 1
+!ent add a A 20 1 1 5
+!ent add b B 20 3 1 4
+!ent hp a -1
+!ent hp a -2
+!ent hp a -3
+!ent hp a -4
+!history list
+?? Commands: 2 snapshot(s)
+!as restart
+!undo command 2 confirm
+?? Undid 2 command(s)
+!assert "entity[a].hp == 17" the snapshot before the -3, its older ones merged into it
+!turn next
+!ent hp b -1
+!turn next
+!ent hp a -5
+!turn next
+!ent hp b -2
+!history list
+?? Rounds: 1 snapshot(s) (round 2)
+!as restart
+!undo round 1 confirm
+?? Undid 1 round(s)
+!assert "entity[a].hp == 12 and entity[b].hp == 19"
+!undo turn 2 confirm
+?? Undid 2 turn(s)
+!assert "entity[a].hp == 17 and entity[b].hp == 20"
+
+Expected: with two command autosaves kept, each command prunes the
+oldest one and its diff merges into the next: after four hits on a (20
+-> 19 -> 17 -> 14 -> 10) the two kept snapshots are the states before
+the -3 and before the -4, and after a restart `!undo command 2` lands on
+the older, a at 17. With one round autosave kept, the round 1 snapshot
+goes when round 2 starts, so the turn autosaves of round 1, diffs that
+built on it, are rebuilt on what is left. After a restart `!undo round
+1` lands on the start of round 2 (a 12, b 19) and `!undo turn 2` on the
+start of round 1 (a 17, b 20).
+
+
+SCENARIO 1077 — A lost diff file drops the autosaves building on it (#197); the ones before it still undo
+----------------------------------------------------------------------------------------------------------
+
+!match new lf Lf 6 6
+!match use lf
+!ent add u U 10 1 1
+!ent hp u -1
+!ent hp u -1
+!ent hp u -1
+?file delete matches/lf/history/3.json
+!as restart
+!history list
+?? Commands: 2 snapshot(s)
+!undo command 1 confirm
+?? Undid 1 command(s)
+!assert "entity[u].hp == 10"
+
+Expected: HARNESS-ALLOWS-ERRORS. Autosave 3 is a diff against 2, and 4
+a diff against 3. With 3's file gone, the load drops 3 and 4 (4 can't be
+rebuilt without 3) with a console note; snapshots 1 and 2 remain, and
+`!undo command 1` restores 2: the unit before its first hit, 10 hp.
+
+
+SCENARIO 1078 — The event log in diff autosaves (#197): trimmed from the front, undone exactly
+----------------------------------------------------------------------------------------------
+
+!match new el El 6 6
+!match use el
+!system set default event_log_retention 3
+!ent add u U 30 1 1 5
+!log clear
+!ent hp u -1
+!ent hp u -2
+!ent hp u -3
+!ent hp u -4
+!ent hp u -5
+!log
+?? took 3 damage
+?! took 2 damage
+!as restart
+!undo command 2 confirm
+?? Undid 2 command(s)
+!log
+?? took 1 damage
+?? took 3 damage
+?! took 4 damage
+
+Expected: the event log keeps its newest three entries, and a diff
+autosave stores only the entries added and how many fell off the front.
+After five hits the log holds the hits of 3, 4 and 5. After a restart,
+undoing two commands restores the log as it was before the hit of 4:
+the hits of 1, 2 and 3.
+
+
+SCENARIO 1079 — Edits made in place reach the save (#197): tile template rename, zone face, map rename, status rename on a corpse
+---------------------------------------------------------------------------------------------------------------------------------
+
+!match new ip Ip 8 6
+!match use ip
+!map new cellar 4 4
+!tile def new spikes map=main
+!tile place spikes 2 2 map=main
+!tile def rename spikes thorns
+!zone new gust map=main
+!zone fill gust 4 4 5 5
+!zone face gust right
+!ent add d D 10 6 3 map=main
+!eval "entity[d].home = [2, 2, 'cellar']"
+!status def burn
+!status apply d burn 1
+!ent kill d
+!status rename burn fire
+!map rename cellar basement
+!as restart
+!assert "tile_template_of(2, 2, map='main') == 'thorns' and zone_facing('gust') == 'right'"
+!assert "corpse_status_has('d', 'fire') and not corpse_status_has('d', 'burn')"
+!assert "corpse_var('d', 'home') == [2, 2, 'basement']"
+
+Expected: each of these edits changes data the save had already
+serialized (tile data, a zone, a corpse lying in a tile): the tile's
+template name, the zone's facing, the corpse's status name and the map
+name inside the corpse's var. Each marks what it changed, so the save
+writes it: after a restart all four read back as edited.
+
+
+SCENARIO 1080 — Tile turn hooks are found through an index (#197): hooks added, placed, retemplated and removed between turns all fire as they stand
+------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new th TH 8 6
+!match use th
+!ent add a A 10 1 1 5
+!match var set ticks 0
+!tile set 7 6 kind grass
+!turn next
+!tile hook add 2 2 on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 1)'
+!turn next
+!assert "match_var_get('ticks') == 1" a hook added after the first turn fires
+!tile def new beacon
+!tile def hook beacon on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 10)'
+!tile place beacon 3 3
+!turn next
+!assert "match_var_get('ticks') == 12" a tile placed from a template with the hook fires
+!tile def new dud
+!tile def hook dud on_turn_end 'match_var_set("ticks", match_var_get("ticks") + 1000)'
+!tile place dud 4 4
+!tile def hook dud on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 100)'
+!turn next
+!assert "match_var_get('ticks') == 1123" the template that gained an on_turn_start hook fires, and its on_turn_end too
+!tile hook del 2 2 on_turn_start
+!tile del 3 3
+!turn next
+!assert "match_var_get('ticks') == 2223" only the dud tile hooks are left
+
+Expected: a turn reads only the tiles that can have a time hook: a
+tile's own hooks and its template's, kept current by the same marks as
+the save. The hook added on (2,2) after the index was built fires at the
+next turn start (1). The beacon placed from a template adds 10 (12). The
+dud tile, placed with only an on_turn_end hook, gains an on_turn_start
+hook through its template: the next turn change runs its turn-end hook
+(+1000) and its turn-start hook (+100) besides the others (+11): 1123.
+With (2,2)'s hook deleted and the beacon tile cleared, only the dud
+fires: +1100, 2223.
+
+
+SCENARIO 1081 — Round autosaves as diffs or full copies, and how often a full one is written (#197): both undo exactly after a restart
+--------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rs RS 6 6
+!match use rs
+!help rule autosave_round_snapshot_mode
+?? diff
+!help rule autosave_full_snapshot_interval
+?? 100
+!ent add a A 30 1 1 5
+!ent add b B 30 3 1 4
+!system set default autosave_full_snapshot_interval 2
+!turn next
+!ent hp a -1
+!turn next
+!ent hp b -2
+!turn next
+!system set default autosave_round_snapshot_mode full
+!ent hp a -3
+!turn next
+!ent hp b -4
+!turn next
+!as restart
+!undo round 2 confirm
+?? Undid 2 round(s)
+!assert "entity[a].hp == 29 and entity[b].hp == 28" the round 2 autosave, a diff, read back exactly
+!undo round 2 confirm
+?? Undid 2 round(s)
+!assert "entity[a].hp == 30 and entity[b].hp == 30"
+!system set default autosave_full_snapshot_interval 0
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. By default a round autosave is a diff
+against the autosave before it, like turn and command autosaves, and a
+full copy is written every autosave_full_snapshot_interval autosaves
+(set to 2 here, so the chains are short). Round 3 starts after the mode
+switched to `full`, so its autosave is a full copy. After a restart,
+undoing 2 rounds lands on the start of round 2 (a 29, b 28) through the
+diffs, and undoing 2 again (the first is the start of the round it
+stands in) on the start of round 1. The interval takes
+1 and up (1 = every autosave full).
+
+
+SCENARIO 1082 — Journal `state` entries are diffs (#197): a replay rebuilds each one from the one before
+----------------------------------------------------------------------------------------------------------
+
+!match new jd JD 6 6
+!match use jd
+!ent add a A 30 1 1 5
+!ent add b B 30 3 1 4
+!tile set 2 2 kind mud
+!ent hp a -1
+!undo command
+!ent hp b -2
+!ent tp a 5 5
+!undo command
+!ent set_var b note x
+!match journal
+?? stored state after `!undo command`
+!match journal export j1082.json
+?? 📼 Wrote the journal of `jd`
+!match replay j1082.json as=jdr
+?? ✅ The state matched the recording after every command.
+!match use jdr
+!assert "entity[a].hp == 30 and entity[b].hp == 28 and entity[a].x == 1 and entity[b].note == 'x' and tile_get(2, 2, 'kind') == 'mud'"
+
+Expected: each undo records the match state it left as a journal
+`state` entry, stored as a diff against the journal's last stored state
+(the segment's start, then the first undo's). The replay (as `jdr`)
+rebuilds each
+from the one before and matches the recording after every command; the
+replayed match has a at 30 hp at (1,1), b at 28 with its note, and the
+tile.
