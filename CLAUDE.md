@@ -3058,7 +3058,7 @@ hardcodes**.
   (`Entity._txt`, `Map._ptxt`), the same text `json.dumps` gives. `jcopy`
   is the copier for stored values (JSON shapes; anything else goes to
   `copy.deepcopy`). Measured on 1,000 units on a filled 150x150: `!eval 1`
-  257 -> 9 ms, `!ent hp` 306 -> 17 ms.
+  257 -> 10 ms, `!ent hp` 306 -> 18 ms.
 - **Undo** (`match_history.py`): autosaves per round (`autosave_round_retention`),
   turn (`autosave_turn_retention_rounds`, under ATB `_turns`), command
   (`autosave_command_retention_turns` / `_max`), manual (`!history save`).
