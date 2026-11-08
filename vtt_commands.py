@@ -1890,6 +1890,12 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
         mgr._save_failure_ref = None
     if msgs and ctx is not None:
         await ctx.send("\n".join(msgs))
+    if ws is not None:
+        # Servers idle past server_idle_unload_hours leave memory (#197);
+        # the sweep runs at most hourly.
+        for key in ws.sweep_idle():
+            print(f"💤 [{key}] unloaded after "
+                  f"{owner_limit('server_idle_unload_hours')} idle hour(s).")
 
 
 # Subcommands of a command registered without undo snapshots that change
@@ -5282,7 +5288,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as idle <hours> | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -5300,7 +5306,10 @@ def _mention(user_id: Optional[str]) -> str:
         "each server is separate; `!as server local` (or bare) returns. "
         "`!as restart` reloads every server from the data folder, as a bot "
         "restart would (unsaved runtime state — pending requests, `!again` — "
-        "is gone). `!as crash [text]` raises an error no command expects "
+        "is gone). `!as idle <hours>` moves every loaded server's last "
+        "command that many hours back and runs the idle sweep "
+        "(server_idle_unload_hours): the servers it unloads load again on "
+        "their next command. `!as crash [text]` raises an error no command expects "
         "(a test hook for the error log, `!owner errors`). Bare `!as` "
         "reports your identity and your effective POV."
     ),
@@ -5338,6 +5347,40 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             "🔄 Reloaded every server from the data folder, as after a "
             "restart." + ("\n" + "\n".join(notes) if notes else ""))
+    if role == "idle":
+        # A test hook (#197): every loaded server's last command is moved
+        # <hours> back, then the idle sweep runs, as it would that much
+        # later.
+        _check_tail(args, 2, (), "!as idle <hours>")
+        if len(args) < 2:
+            raise VTTError("Usage: `!as idle <hours>`.")
+        try:
+            hours = float(args[1])
+        except ValueError:
+            raise VTTError(f"`{args[1]}` isn't a number of hours.")
+        if not math.isfinite(hours) or hours < 0:
+            raise VTTError("The hours are a number 0 or above.")
+        ws = getattr(mgr, "workspaces", None)
+        if ws is None or ws.storage is None:
+            return await ctx.send("❌ Nothing is saved here, so nothing "
+                                  "unloads.")
+        loaded = ws.items()
+        for _k, w in loaded:
+            w.last_used = getattr(w, "last_used", 0) - hours * 3600
+        gone = ws.sweep_idle(force=True)
+        limit = owner_limit("server_idle_unload_hours")
+        lines = [f"⏳ {hours:g} idle hour(s) passed "
+                 f"(server_idle_unload_hours: {limit})."]
+        if gone:
+            lines.append("Unloaded: " + ", ".join(f"`{k}`" for k in gone)
+                         + " (each loads again on its next command).")
+        for k, w in loaded:
+            if k in gone:
+                continue
+            why = ws.unload_blocker(w) or (
+                "unloading is off" if limit <= 0 else "not idle long enough")
+            lines.append(f"Kept `{k}` loaded: {why}.")
+        return await ctx.send("\n".join(lines))
     if role == "server":
         if not getattr(ctx, "workspace_switchable", False):
             return await ctx.send(
@@ -5503,14 +5546,22 @@ async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "servers":
         _check_tail(args, 1, (), "!owner servers")
         ws = getattr(mgr, "workspaces", None)
-        items = ws.items() if ws is not None else [(mgr.guild_key, mgr)]
+        loaded = dict(ws.items() if ws is not None else [(mgr.guild_key, mgr)])
+        st = storage_of(mgr)
+        on_disk = [k for k in (sorted(os.listdir(st.root)) if st else [])
+                   if st.has_server(k) and k not in loaded]
         lines = []
-        for key, w in items:
+        for key in sorted(set(loaded) | set(on_disk)):
+            w = loaded.get(key)
+            if w is None:
+                lines.append(f"- `{key}`: not loaded (on disk, loads on its "
+                             f"next command)")
+                continue
             here = " ← this one" if w is mgr else ""
             lines.append(f"- **{w.guild_name}** (`{key}`): {len(w.matches)} "
                          f"match(es), {len(w.systems)} system(s){here}")
-        return await ctx.send(f"Server workspaces ({len(lines)}):\n"
-                              + "\n".join(lines))
+        return await ctx.send(f"Server workspaces ({len(lines)}, "
+                              f"{len(loaded)} loaded):\n" + "\n".join(lines))
     if sub == "limit":
         return await _owner_limit(ctx, args[1:], mgr)
     if sub == "storage":

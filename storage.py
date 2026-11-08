@@ -605,33 +605,46 @@ class Storage:
         return None
 
     # ---- loading ----------------------------------------------------------
-    def load_all(self, workspaces: Workspaces) -> List[str]:
-        """Load every server folder into `workspaces`. Returns console notes
-        (also printed): files that failed to load are moved to the server's
-        corrupt/ folder and everything else still loads."""
-        notes: List[str] = []
+    def open(self, workspaces: Workspaces) -> None:
+        """Start serving `workspaces` from the data folder: the crash log,
+        the hourly trash purge, the usage counters. No server is read:
+        each loads on first use (load_on_demand, from Workspaces.load)."""
         self.attach_crash_log(workspaces)
-        if not self.persist:
-            # Match persistence off: templates still load (they ignore it).
-            for name in sorted(os.listdir(self.root)):
-                path = os.path.join(self.root, name, "templates")
-                if os.path.isdir(path) and valid_id(name):
-                    notes.extend(self.load_templates(workspaces.get(name)))
-                    notes.extend(self.load_prefabs(workspaces.get(name)))
-            self.rescan()
-            for n in notes:
-                print(n)
-            return notes
-        self.purge_trash()
-        for name in sorted(os.listdir(self.root)):
-            path = os.path.join(self.root, name)
-            if not os.path.isdir(path) or not valid_id(name):
-                continue
-            notes.extend(self.load_server(workspaces.get(name)))
+        if self.persist:
+            self.purge_trash()
         self.rescan()
+
+    def has_server(self, key: str) -> bool:
+        """Whether server `key` has a folder to load."""
+        return valid_id(key) and os.path.isdir(os.path.join(self.root, key))
+
+    def load_on_demand(self, mgr: MatchManager) -> List[str]:
+        """Load server `mgr`'s folder into the fresh manager, if it has one.
+        Returns the console notes (also printed): files that failed to load
+        are moved to the server's corrupt/ folder and everything else still
+        loads. With match persistence off only its templates and prefabs
+        load (they ignore the switch)."""
+        key = mgr.guild_key
+        if not self.has_server(key):
+            return []
+        if self.persist:
+            notes = self.load_server(mgr)
+        else:
+            notes = []
+            if os.path.isdir(os.path.join(self.root, key, "templates")):
+                notes.extend(self.load_templates(mgr))
+                notes.extend(self.load_prefabs(mgr))
+        self._usage[key] = _dir_size(os.path.join(self.root, key))
         for n in notes:
             print(n)
         return notes
+
+    def forget_loaded(self, key: str) -> None:
+        """Server `key` was unloaded: drop what this mirror remembers of its
+        written files (the next load reads them again)."""
+        self._written.pop(key, None)
+        self._jwritten.pop(key, None)
+        self.last_changed.pop(key, None)
 
     def _quarantine(self, key: str, path: str, why: str) -> str:
         dest_dir = os.path.join(self.server_dir(key), "corrupt")
@@ -1750,12 +1763,12 @@ def local_persistence_note(settings: Dict[str, Any]) -> Optional[str]:
 
 def open_workspaces(root: str = DATA_DIR_DEFAULT,
                     persist: bool = True) -> Workspaces:
-    """Workspaces backed by the data folder at `root`, with every server
-    already loaded from it (the bot / CLI / GUI startup). persist=False:
+    """Workspaces backed by the data folder at `root` (the bot / CLI / GUI
+    startup); each server loads from it on first use. persist=False:
     start empty and write nothing (Storage.persist)."""
     ws = Workspaces()
     ws.storage = Storage(root, persist=persist)
-    ws.storage.load_all(ws)
+    ws.storage.open(ws)
     return ws
 
 
@@ -1766,7 +1779,12 @@ def reload_workspaces(workspaces: Workspaces) -> List[str]:
     st.commit_all(workspaces)
     fresh = Workspaces()
     fresh.storage = Storage(st.root, persist=st.persist)
-    notes = fresh.storage.load_all(fresh)
+    fresh.storage.open(fresh)
+    # The servers loaded before are loaded again now, so the restart shows
+    # what loading them does (servers load on first use).
+    notes: List[str] = []
+    for key in [k for k, _m in workspaces.items()]:
+        notes.extend(fresh.load(key)[1])
     workspaces._by_key = fresh._by_key
     workspaces.storage = fresh.storage
     if st.persist:

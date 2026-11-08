@@ -19315,7 +19315,7 @@ SCENARIO 700 — !owner servers lists every workspace; only the bot owner may us
 !match new there There 5 5
 !match new there2 There2 5 5
 !owner servers
-?? Server workspaces (2)
+?? Server workspaces (2, 2 loaded)
 ?? `local`): 1 match(es)
 ?? `333`): 2 match(es), 1 system(s) ← this one
 !whoami
@@ -37627,3 +37627,212 @@ revert to the hero takes both from the stash: the wolf form holds no xp,
 so the stashed 7 stays, and the stashed bar of 40 (saved as atb_charge)
 moves to `bar`. A fresh transform then takes the wolf's bar, 0, while
 xp 7 is kept.
+
+SCENARIO 1067 — Unit index (#154): cell lookups follow a 3x3 body through walks and footprint changes, a part that is glued, located and put on a region, a rider and an undo
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new ix Index 12 12
+!match use ix
+!ent add ogre Ogre 40 2 2 5
+!ent set_vars ogre footprint_w=3 footprint_h=3
+!assert "cell_entity(4, 4) == 'ogre' and cell_entity(5, 4) == ''"
+!ent add gob Goblin 10 6 2 3
+!ent move ogre 1 right
+!assert "cell_entity(5, 4) == 'ogre' and cell_entity(2, 2) == '' and entities_at(5, 2) == ['ogre']"
+!ent set_var ogre footprint_w 2
+!assert "cell_entity(5, 4) == '' and cell_entity(4, 4) == 'ogre'"
+!ent set_var ogre footprint_w 4
+?? is taken by `gob`
+!assert "footprint_width('ogre') == 2"
+!part add ogre ohead head 10 10
+!assert "entities_at(3, 2) == ['ogre'] and cell_entity(3, 2) == 'ogre'"
+!part locate ohead 8 8
+!assert "cell_entity(8, 8) == 'ohead' and entities_at(8, 8) == ['ohead']"
+!part region ohead front
+!assert "cell_entity(8, 8) == '' and cell_entity(3, 2) == 'ogre'"
+!ent set_var ogre slots.seat.capacity 1
+!ent add rider Rider 5 10 10 1
+!mount rider ogre seat
+!assert "cell_entity(10, 10) == '' and cell_entity(3, 3) == 'ogre'"
+!ent tp ogre 6 6
+!assert "cell_entity(7, 8) == 'ogre' and cell_entity(3, 3) == '' and 'gob' in entities_within('ogre', 4) and 'gob' not in entities_within('ogre', 1)"
+!assert "entities_in_area(7, 7, 0) == ['ogre', 'ohead']"
+!undo command
+!assert "cell_entity(7, 8) == '' and cell_entity(3, 3) == 'ogre'"
+HARNESS-ALLOWS-ERRORS
+
+Expected: every lookup reads the unit index, and each change of a body
+reaches it. The 3x3 ogre at (2,2) covers (4,4) but not (5,4); a step right
+covers (5,4) and frees (2,2). Narrowing it to 2 wide frees its third
+column, and widening it to 4 is refused (the new column holds the
+goblin). A glued head sits on the ogre and is no occupant; located at
+(8,8) it occupies that cell; put on a region it lies on the ogre again,
+which stays the cell's occupant. A rider is aboard and occupies nothing.
+A teleport to (6,6) moves the 2x3 body (and its rider); entities_within
+finds the goblin 4 cells away and not 1 away, and a burst on (7,7) holds
+the ogre and the head lying on its front. The undo puts the ogre back, and the lookups follow.
+
+SCENARIO 1068 — Unit index across a failed action's rollback and a restart; the corpse index keeps a dead unit's id and its part's id taken
+---------------------------------------------------------------------------------------------------------------------------------------
+!match new rb Rollback 8 8
+!match use rb
+!ent add hero Hero 30 2 2 5
+!ent set_var hero acts.actions.blink.target none
+!ent set_var hero acts.actions.blink.body "move_entity(self, 6, 6)\nfail('fizzled')"
+!action hero blink
+?? fizzled
+!assert "cell_entity(2, 2) == 'hero' and cell_entity(6, 6) == ''"
+!ent set_var hero acts.actions.step.target none
+!ent set_var hero acts.actions.step.body "move_entity(self, 6, 6)"
+!action hero step
+!assert "cell_entity(6, 6) == 'hero' and cell_entity(2, 2) == ''"
+!ent add gob Goblin 5 3 3 3
+!part add gob gob_arm arm 3 3
+!ent kill gob
+!assert "has_corpse('gob') and coord_x(corpse_at('gob')) == 3 and cell_entity(3, 3) == ''"
+!as restart
+!assert "cell_entity(6, 6) == 'hero' and has_corpse('gob')"
+!eval "summon({'name': 'gob', 'vars': {'hp': 4}}, 5, 5)"
+?? = `'gob2'`
+!eval "summon({'name': 'gob_arm', 'vars': {'hp': 4}}, 1, 8)"
+?? = `'gob_arm2'`
+!ent add gob Goblin 5 4 4 3
+?? already exists
+!ent revive gob
+!assert "not has_corpse('gob') and cell_entity(3, 3) == 'gob' and parts('gob') == ['gob_arm']"
+!eval "summon({'name': 'gob', 'vars': {'hp': 4}}, 1, 1)"
+?? = `'gob3'`
+HARNESS-ALLOWS-ERRORS
+
+Expected: the blink moves the hero, then fails; the rollback puts it back
+at (2,2), and the lookups say so. The step that succeeds moves it to
+(6,6). After the goblin's death its corpse lies at (3,3) and the cell is
+free. A restart rebuilds the indexes from the files: the hero is found
+at (6,6) and the corpse is still there. A summon named `gob` is minted
+`gob2` (the corpse holds the id), one named `gob_arm` `gob_arm2` (the
+corpse holds the arm, whose revive brings it back under its id), and
+`!ent add gob` is refused. The revive stands the goblin and its arm up
+again and the corpse is gone; a third `gob` summon takes `gob3`, since
+gob and gob2 are alive.
+
+SCENARIO 1069 — Zone index (#154): zones_at follows fills, shifts, an aura on a walking 2x2, a map resize, a rename and a drop; entities_in_zone reads the unit index
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new zx Zones 12 12
+!match use zx
+!zone fill gas 2 2 4 4
+!assert "zones_at(3, 3) == ['gas'] and zones_at(5, 5) == []"
+!zone shift gas 2 0
+!assert "zones_at(3, 3) == [] and zones_at(5, 3) == ['gas']"
+!ent add mage Mage 10 8 8 5
+!ent set_vars mage footprint_w=2 footprint_h=2
+!zone new flame
+!zone anchor flame mage 1
+!assert "'flame' in zones_at(10, 10) and 'flame' in zones_at(7, 7) and 'flame' not in zones_at(6, 6)"
+!ent move mage 2 left
+!assert "'flame' in zones_at(5, 8) and 'flame' not in zones_at(10, 10)"
+!assert "entities_in_zone('gas') == []"
+!ent tp mage 4 2
+!assert "entities_in_zone('gas') == ['mage'] and sorted(zones_at(5, 3)) == ['flame', 'gas']"
+!map resize 14 12 right
+!assert "zones_at(7, 3) == ['flame', 'gas'] or sorted(zones_at(7, 3)) == ['flame', 'gas']"
+!assert "zones_at(3, 3) == []"
+!zone rename gas fog
+!assert "'fog' in zones_at(7, 3) and 'gas' not in zones_at(7, 3)"
+!zone drop fog
+!assert "zones_at(7, 3) == ['flame']"
+
+Expected: zones_at reads the zone index, and every change of a zone's
+cells reaches it. The gas fill covers (2,2)-(4,4); a shift by 2 moves it to
+(4,2)-(6,4). The aura of radius 1 around the 2x2 mage at (8,8) covers
+(7,7)-(10,10) and follows the mage two steps left. The mage isn't in the
+gas, then a teleport to (4,2) puts its body there, and (5,3) is in both
+zones. Growing the map by 2 on the left (anchor right) shifts every zone 2
+cells right: (5,3) becomes (7,3). A rename and a drop update the cell's
+zones.
+
+SCENARIO 1070 — Servers load on first use and leave memory when idle (#197): an idle server is written and dropped, then loads again with its state; a waiting approval request keeps one loaded; the owner limit 0 keeps all
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new home Home 6 6
+!match use home
+!ent add hero Hero 20 2 2 5
+!ent set_var hero gold 7
+!as server far
+!match new away Away 5 5
+!match use away
+!as idle 13
+?? Unloaded: `local`
+?? Kept `far` loaded: a command is running on it.
+!owner servers
+?? `local`: not loaded
+?? Server workspaces (2, 1 loaded)
+!as server local
+!assert "entity['hero'].gold == 7 and cell_entity(2, 2) == 'hero'"
+!owner servers
+?? Server workspaces (2, 2 loaded)
+!as player pip
+!ent set_var hero gold 9
+?? approval
+!as host
+!as server far
+!as idle 13
+?? Kept `local` loaded: an approval request is waiting.
+!as server local
+!approve r1
+!assert "entity['hero'].gold == 9"
+!owner ceiling server_idle_unload_hours 0
+!as idle 1000
+?? Kept `far` loaded: unloading is off.
+!owner ceiling server_idle_unload_hours reset
+!as server far
+!match list
+!as server local
+!as idle 1
+?? Kept `far` loaded: not idle long enough.
+
+Expected: a server's folder is read on its first command. `!as idle 13`
+(a test hook) moves every loaded server's last command 13 hours back and
+runs the idle sweep: past server_idle_unload_hours (12), `local` is
+written to disk and dropped, while `far` stays (its own command is
+running). `!owner servers` lists `local` as not loaded. Its next command
+loads it again with the hero and its gold. A player's command waiting for
+approval keeps `local` loaded (the request lives only in memory); the
+approval then runs it. With the owner limit at 0 nothing unloads; after a
+reset, 1 idle hour is too few.
+
+SCENARIO 1071 — !as idle refusals; a locked server unloads without writing and comes back locked
+----------------------------------------------------------------------------------------------
+!as idle
+?? Usage: `!as idle <hours>`
+!as idle soon
+?? isn't a number of hours
+!as idle -3
+?? 0 or above
+!as idle 1 2
+?? Unexpected
+!system new pf
+!system set pf hp_var health
+!match new lk Lk 6 6 pf
+!match use lk
+!ent add u U 10 1 1
+?file corrupt systems.json
+!as restart
+!list
+?? 🔒 This server is locked
+!as server far
+!match new away Away 5 5
+!as idle 13
+?? Unloaded: `local`
+!as server local
+!list
+?? 🔒 This server is locked: systems.json is missing
+!server recover accept confirm
+?? 🔓
+!assert "entity['u'].hp == 10"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!as idle` needs one number of hours, 0 or above; a word, a
+negative number or a stray second word is refused. A server locked by a
+systems.json that failed to load saves nothing; unloaded after 13 idle
+hours it writes nothing either, and its next command loads it locked
+again (the first load moved the damaged file to corrupt/, so systems.json
+is now missing). `!server recover accept confirm` moves the match to the default
+system, whose hp var `hp` takes the unit's `health` of 10.

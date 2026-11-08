@@ -14,6 +14,7 @@ import re
 import math
 import random
 import contextvars
+import time
 from contextlib import contextmanager
 import keyword
 
@@ -8408,6 +8409,14 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many extra turns (`!turn grant`, grant_turn) a match "
                 "may hold queued at once; a grant past it is refused.",
     },
+    "server_idle_unload_hours": {
+        "default": 12, "min": 0, "max": 8760,
+        "desc": "After how many hours without a command a server's "
+                "workspace is written to disk and dropped from memory (its "
+                "next command loads it again; servers load on first use). "
+                "A server with an approval request waiting or a live "
+                "auto-update board stays loaded. 0 = never unload.",
+    },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
         "desc": "How deep maps may nest: a map a unit carries (`!map "
@@ -8829,6 +8838,12 @@ def _coerce_status_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
     return {}
 
 
+# Entity fields whose change can move a unit or change what its body covers
+# (Entity.__setattr__ marks the unit in its match's UnitIndex).
+_PLACE_FIELDS = frozenset({"x", "y", "map", "vars", "_match", "part_of",
+                           "mounted_on", "mount_slot", "id"})
+
+
 @dataclass
 class Entity:
     name: str
@@ -8918,6 +8933,20 @@ class Entity:
 
     #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # A change of where the unit stands (or what decides it) marks it
+        # in its match's unit index (#154), and in the one it leaves.
+        if name in _PLACE_FIELDS:
+            d = self.__dict__
+            old = d.get("_match")
+            object.__setattr__(self, name, value)
+            if "id" in d:
+                for m in (old, d.get("_match")):
+                    if m is not None:
+                        m._spatial.touch(d["id"])
+            return
+        object.__setattr__(self, name, value)
 
     def __post_init__(self):
         tested_id = str(self.id.strip().lower())
@@ -9257,7 +9286,7 @@ class Entity:
         # default true setting a corpse's id reserves the name too, so
         # spawning a fresh `goblin1` while a `goblin1` corpse exists
         # raises here instead of orphaning the corpse's identity.
-        if self.id in match._taken_entity_ids():
+        if match.id_taken(self.id):
             raise DuplicateId(
                 f"Entity id '{self.id}' already exists in this match "
                 f"(as a live entity or a corpse — see the "
@@ -9771,6 +9800,7 @@ class Entity:
         """
         if self._match is not None:
             private_scan_forget(self._match, self.id)
+            self._match._spatial.touch(self.id)
         check_store_path(path, "Variable path")
         if self._match is not None:
             msg = reserved_var_path_error(path, f"Writing '{path}' on `{self.id}`")
@@ -10132,6 +10162,7 @@ class Entity:
         """
         if self._match is not None:
             private_scan_forget(self._match, self.id)
+            self._match._spatial.touch(self.id)
         if not path:
             raise VTTError("Variable path cannot be empty.")
         if (not allow_protected and self._match is not None
@@ -10210,6 +10241,7 @@ class Entity:
         unwanted. No log lines returned (none generated)."""
         if self._match is not None:
             private_scan_forget(self._match, self.id)
+            self._match._spatial.touch(self.id)
         if not path:
             raise VTTError("Variable path cannot be empty.")
         if _path_resolve(self.vars, path) is _MISSING:
@@ -10232,6 +10264,8 @@ class Entity:
                 cur[k] = node
             cur = node
         cur[keys[-1]] = value
+        if self._match is not None:
+            self._match._spatial.touch(self.id)
 
     def _del_path(self, path: str) -> None:
         """Raw deep-delete on self.vars. Caller must have verified existence."""
@@ -10240,6 +10274,8 @@ class Entity:
         for k in keys[:-1]:
             cur = cur[k]
         del cur[keys[-1]]
+        if self._match is not None:
+            self._match._spatial.touch(self.id)
 
     def _fire_var_events(self, events: List[VarEvent]) -> List[str]:
         """Fire matching passives for each event. Returns log lines.
@@ -10496,6 +10532,52 @@ def line_cells(x1: int, y1: int, x2: int, y2: int,
     return cells
 
 
+def _corpse_part_ids(corpse: Any) -> List[str]:
+    """The ids of the body parts a corpse holds (its revive restores
+    them under those ids)."""
+    parts = corpse.get("parts") if isinstance(corpse, dict) else None
+    if not isinstance(parts, list):
+        return []
+    return [pd["id"] for pd in parts
+            if isinstance(pd, dict) and isinstance(pd.get("id"), str)]
+
+
+def _ix_add(table: Dict[Any, Any], key: Any, c: Any) -> None:
+    """Add `c` (a cell, or a zone name) under `key`: one value is kept as
+    itself, more as a set (a set per corpse or per cell would cost the
+    garbage collector)."""
+    held = table.get(key)
+    if held is None:
+        table[key] = c
+    elif isinstance(held, set):
+        held.add(c)
+    elif held != c:
+        table[key] = {held, c}
+
+
+def _ix_set(table: Dict[Any, Any], key: Any, cells: List[Any]) -> None:
+    if not cells:
+        table.pop(key, None)
+    elif len(cells) == 1:
+        table[key] = cells[0]
+    else:
+        table[key] = set(cells)
+
+
+class CorpseIndex:
+    """A map's corpse index (Map._corpse_ix): the cells holding corpses,
+    and per corpse id and per id of a body part a corpse holds the cell
+    holding it (a set of cells when there are several). Entries can be stale (a corpse taken away); readers check
+    the cell. `pending`: cells written since, read on the next lookup."""
+    __slots__ = ("cells", "ids", "parts", "pending")
+
+    def __init__(self) -> None:
+        self.cells: Set[Tuple[int, int]] = set()
+        self.ids: Dict[str, Any] = {}
+        self.parts: Dict[str, Any] = {}
+        self.pending: Set[Tuple[int, int]] = set()
+
+
 @dataclass
 class Map:
     """One grid of a match: its size, the tiles and zones on it, and the fog
@@ -10542,6 +10624,159 @@ class Map:
     # the rectangle (in_rect) stays the frame for coordinates, rulers,
     # resize and the cell limits. Saved as row runs.
     voids: Set[Tuple[int, int]] = field(default_factory=set)
+    # The corpse index (CorpseIndex): which cells hold corpses, by corpse
+    # id and by the ids of the body parts a corpse holds, so finding,
+    # listing and id checks read the corpses, never every tile (#154).
+    # Runtime-only; None = built from the tiles on its next use (a replaced
+    # `tiles` dict resets it). Every write that lays a corpse calls
+    # note_corpse on its cell, which the next lookup reads again; a corpse
+    # taken away is noticed when its cell is read.
+    _corpse_ix: Optional["CorpseIndex"] = field(
+        default=None, repr=False, compare=False)
+
+    # The zone index: cell -> the name of the zone holding it (a set of
+    # names when several do; _ix_add), so
+    # zones_at reads its cell, never every zone (#154). Runtime-only; None
+    # = built from the zones on its next use (a replaced `zones` dict
+    # resets it). Every change of a zone's cells, or of which zones exist,
+    # calls zone_touch(name), and the next lookup files that zone again
+    # (`_zone_rec` holds the cells each zone was filed under).
+    _zone_ix: Optional[Dict[Tuple[int, int], Any]] = field(
+        default=None, repr=False, compare=False)
+    _zone_rec: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                      compare=False)
+    _zone_dirty: Set[str] = field(default_factory=set, repr=False,
+                                  compare=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if name == "tiles":
+            object.__setattr__(self, "_corpse_ix", None)
+        elif name == "zones":
+            object.__setattr__(self, "_zone_ix", None)
+
+    def zone_touch(self, name: str) -> None:
+        """Zone `name` changed its cells, or was made, deleted or moved."""
+        if self._zone_ix is not None:
+            self._zone_dirty.add(name)
+
+    def _zone_index(self) -> Dict[Tuple[int, int], Any]:
+        ix = self._zone_ix
+        if ix is None:
+            ix = {}
+            rec: Dict[str, Any] = {}
+            for zname, z in self.zones.items():
+                cells = tuple(z.get("cells") or ())
+                rec[zname] = cells
+                for c in cells:
+                    _ix_add(ix, c, zname)
+            object.__setattr__(self, "_zone_ix", ix)
+            object.__setattr__(self, "_zone_rec", rec)
+            self._zone_dirty.clear()
+            return ix
+        if self._zone_dirty:
+            rec = self._zone_rec
+            for zname in self._zone_dirty:
+                for c in rec.pop(zname, ()):
+                    held = ix.get(c)
+                    if held is None:
+                        continue
+                    if isinstance(held, set):
+                        held.discard(zname)
+                        _ix_set(ix, c, list(held))
+                    elif held == zname:
+                        del ix[c]
+                z = self.zones.get(zname)
+                if z is not None:
+                    cells = tuple(z.get("cells") or ())
+                    rec[zname] = cells
+                    for c in cells:
+                        _ix_add(ix, c, zname)
+            self._zone_dirty.clear()
+        return ix
+
+    def note_corpse(self, x: int, y: int) -> None:
+        """A corpse was laid on (x, y)."""
+        ix = self._corpse_ix
+        if ix is not None:
+            ix.pending.add((x, y))
+
+    def _corpses_on(self, c: Tuple[int, int]) -> Optional[Dict[str, Any]]:
+        cell = self.tiles.get(c)
+        corpses = cell.get("corpses") if isinstance(cell, dict) else None
+        return corpses if isinstance(corpses, dict) and corpses else None
+
+    def _corpse_index(self) -> "CorpseIndex":
+        ix = self._corpse_ix
+        if ix is None:
+            ix = CorpseIndex()
+            ix.pending = {c for c, cell in self.tiles.items()
+                          if isinstance(cell, dict) and cell.get("corpses")}
+            object.__setattr__(self, "_corpse_ix", ix)
+        if ix.pending:
+            for c in ix.pending:
+                corpses = self._corpses_on(c)
+                if not corpses:
+                    continue
+                ix.cells.add(c)
+                for cid, corpse in corpses.items():
+                    _ix_add(ix.ids, cid, c)
+                    for pid in _corpse_part_ids(corpse):
+                        _ix_add(ix.parts, pid, c)
+            ix.pending = set()
+        return ix
+
+    def corpse_cells_of(self, cid: str) -> List[Tuple[int, int]]:
+        """The cells holding a corpse of unit `cid`, sorted (one, unless
+        corpse ids aren't unique)."""
+        ids = self._corpse_index().ids
+        held = ids.get(cid)
+        if held is None:
+            return []
+        cells = held if isinstance(held, set) else (held,)
+        live = [c for c in cells if cid in (self._corpses_on(c) or ())]
+        if len(live) != len(cells):
+            _ix_set(ids, cid, live)
+        return sorted(live)
+
+    def corpse_holds_part(self, pid: str) -> bool:
+        """Whether a corpse on this map holds a body part with id `pid`
+        (its revive brings the part back under that id)."""
+        parts = self._corpse_index().parts
+        held = parts.get(pid)
+        if held is None:
+            return False
+        cells = held if isinstance(held, set) else (held,)
+        live = [c for c in cells
+                if any(pid in _corpse_part_ids(corpse)
+                       for corpse in (self._corpses_on(c) or {}).values())]
+        if len(live) != len(cells):
+            _ix_set(parts, pid, live)
+        return bool(live)
+
+    def corpse_entries(self) -> List[Tuple[int, int, str, Dict[str, Any]]]:
+        """Every corpse on the map as (x, y, unit id, corpse), sorted by
+        cell then id."""
+        ix = self._corpse_index()
+        out: List[Tuple[int, int, str, Dict[str, Any]]] = []
+        gone = []
+        tiles = self.tiles
+        for c in sorted(ix.cells):
+            cell = tiles.get(c)
+            corpses = cell.get("corpses") if type(cell) is dict else None
+            if not corpses or type(corpses) is not dict:
+                gone.append(c)
+                continue
+            x, y = c
+            if len(corpses) == 1:
+                for cid, corpse in corpses.items():
+                    out.append((x, y, cid, corpse))
+            else:
+                for cid in sorted(corpses):
+                    out.append((x, y, cid, corpses[cid]))
+        if gone:
+            ix.cells.difference_update(gone)
+        return out
 
     def size_text(self) -> str:
         return f"{self.grid_width}x{self.grid_height}"
@@ -10815,12 +11050,14 @@ class Map:
         if name in self.zones and not overwrite:
             raise DuplicateId(f"Zone '{name}' already exists.")
         self.zones[name] = {"cells": set(), "data": {}, "hooks": {}}
+        self.zone_touch(name)
         return self.zones[name]
 
     def delete_zone(self, name: str) -> None:
         if name not in self.zones:
             raise NotFound(f"Zone '{name}' not found.")
         del self.zones[name]
+        self.zone_touch(name)
 
     def zone_add_cell(self, name: str, x: int, y: int,
                       *, create: bool = True) -> bool:
@@ -10839,6 +11076,7 @@ class Map:
         if (x, y) in z["cells"]:
             return False
         z["cells"].add((x, y))
+        self.zone_touch(name)
         return True
 
     def zone_remove_cell(self, name: str, x: int, y: int) -> bool:
@@ -10847,6 +11085,7 @@ class Map:
         z = self._require_zone(name)
         if (x, y) in z["cells"]:
             z["cells"].discard((x, y))
+            self.zone_touch(name)
             return True
         return False
 
@@ -10872,6 +11111,7 @@ class Map:
                 if self.in_bounds(xx, yy) and (xx, yy) not in z["cells"]:
                     z["cells"].add((xx, yy))
                     added += 1
+        self.zone_touch(name)
         return added
 
     def zone_shift(self, name: str, dx: int, dy: int) -> int:
@@ -10887,6 +11127,7 @@ class Map:
             if self.in_bounds(nx, ny):
                 new.add((nx, ny))
         z["cells"] = new
+        self.zone_touch(name)
         return len(new)
 
     def zone_cell_list(self, name: str) -> List[List[int]]:
@@ -10899,8 +11140,19 @@ class Map:
         return len(z["cells"]) if z is not None else 0
 
     def zones_at(self, x: int, y: int) -> Set[str]:
-        """Names of every zone whose footprint includes (x,y)."""
-        return {name for name, z in self.zones.items() if (x, y) in z["cells"]}
+        """Names of every zone whose footprint includes (x,y), read from
+        the zone index."""
+        held = self._zone_index().get((x, y))
+        out = set(held) if isinstance(held, set) else \
+            ({held} if held is not None else set())
+        if SPATIAL_CHECK:
+            want = {name for name, z in self.zones.items()
+                    if (x, y) in z["cells"]}
+            if want != out:
+                raise SpatialCheckError(
+                    f"zone index on {self.name} ({x},{y}): {sorted(out)} "
+                    f"!= scan {sorted(want)}")
+        return out
 
     def cell_in_zone(self, x: int, y: int, name: str) -> bool:
         z = self.zones.get(name)
@@ -11080,6 +11332,270 @@ class Map:
         return mp
 
 
+
+
+# Bodies covering more cells than this are kept as rectangles a lookup
+# tests one by one, so moving a huge body costs one record, never its area.
+SPATIAL_BIG_AREA = 64
+
+# FCS_SPATIAL_CHECK=1 makes every index lookup compare itself with a scan
+# of every unit and raise on a difference: the regression run under it is
+# the test that every path changing a unit's place reaches the index.
+SPATIAL_CHECK = os.environ.get("FCS_SPATIAL_CHECK") == "1"
+
+
+class SpatialCheckError(AssertionError):
+    """An index answer differs from the scan (FCS_SPATIAL_CHECK)."""
+
+
+class UnitIndex:
+    """Where every unit of a match stands, per map (#154): cell -> the ids
+    of the units whose body covers it, so a cell lookup reads its cell and
+    an area lookup its cells, never every unit. Runtime-only (Match.
+    _spatial), rebuilt from the units on its first use.
+
+    Pure geometry: a unit is filed by its map, anchor and footprint
+    whatever its state, and callers judge alive / stackable / glued /
+    mounted on the few units a cell holds, since those can change through
+    any var (a custom alive_condition). Kept current by `touch`: the
+    setters of an Entity's place (x, y, map, vars, _match and the link
+    fields, Entity.__setattr__) and its var writes mark it, and the next
+    lookup files the marked units again. A change of the footprint var
+    names, a map's size, the map list or the entities dict itself rebuilds
+    the whole index (`_context`). A region part is filed as a unit to test
+    live (its cells follow its parent's facing). Bodies larger than
+    SPATIAL_BIG_AREA cells are filed as rectangles."""
+
+    __slots__ = ("full", "dirty", "ctx", "rec", "cells", "big", "scan",
+                 "order")
+
+    def __init__(self) -> None:
+        self.full = True
+        self.dirty: Set[str] = set()
+        self.ctx: Any = None
+        # eid -> (entity, map, kind, payload): kind "c" = cells (payload the
+        # cell list), "b" = a big rectangle (x, y, w, h), "s" = test live.
+        self.rec: Dict[str, Tuple[Any, str, str, Any]] = {}
+        self.cells: Dict[str, Dict[Tuple[int, int], List[str]]] = {}
+        self.big: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {}
+        self.scan: Dict[str, Set[str]] = {}
+        # eid -> position in match.entities (the scan's order), None = stale.
+        self.order: Optional[Dict[str, int]] = None
+
+    def touch(self, eid: str) -> None:
+        if not self.full:
+            self.dirty.add(eid)
+
+    def reset(self) -> None:
+        self.full = True
+        self.dirty.clear()
+
+    @staticmethod
+    def _context(match: "Match") -> Tuple[Any, ...]:
+        rules = match.rules
+        return (id(match.entities),
+                rules.get("footprint_width_var", "footprint_w"),
+                rules.get("footprint_height_var", "footprint_h"),
+                tuple((n, m.grid_width, m.grid_height)
+                      for n, m in match.maps.items()))
+
+    def _unplace(self, eid: str) -> None:
+        r = self.rec.pop(eid, None)
+        if r is None:
+            return
+        _e, mname, kind, payload = r
+        if kind == "c":
+            table = self.cells.get(mname)
+            if table is not None:
+                for c in payload:
+                    lst = table.get(c)
+                    if lst is not None:
+                        try:
+                            lst.remove(eid)
+                        except ValueError:
+                            pass
+                        if not lst:
+                            del table[c]
+        elif kind == "b":
+            self.big.get(mname, {}).pop(eid, None)
+        else:
+            self.scan.get(mname, set()).discard(eid)
+
+    def _place(self, match: "Match", e: "Entity") -> None:
+        mname = e.map
+        if e._match is not match or not mname or mname not in match.maps \
+                or not isinstance(e.x, int) or not isinstance(e.y, int):
+            return
+        if e.is_region_part:
+            self.scan.setdefault(mname, set()).add(e.id)
+            self.rec[e.id] = (e, mname, "s", None)
+            return
+        w, h = match.entity_footprint(e)
+        if w * h > SPATIAL_BIG_AREA:
+            self.big.setdefault(mname, {})[e.id] = (e.x, e.y, w, h)
+            self.rec[e.id] = (e, mname, "b", (e.x, e.y, w, h))
+            return
+        cells = [(e.x + dx, e.y + dy) for dy in range(h) for dx in range(w)]
+        table = self.cells.setdefault(mname, {})
+        for c in cells:
+            table.setdefault(c, []).append(e.id)
+        self.rec[e.id] = (e, mname, "c", cells)
+
+    def ensure(self, match: "Match") -> None:
+        """File every marked unit again (all of them after a context
+        change)."""
+        ctx = self._context(match)
+        if ctx != self.ctx:
+            self.full = True
+            self.ctx = ctx
+        if self.full:
+            self.full = False
+            self.dirty.clear()
+            self.rec.clear()
+            self.cells.clear()
+            self.big.clear()
+            self.scan.clear()
+            for e in match.entities.values():
+                self._place(match, e)
+            self.order = None
+            return
+        if not self.dirty:
+            return
+        ents = match.entities
+        for eid in self.dirty:
+            old = self.rec.get(eid)
+            self._unplace(eid)
+            e = ents.get(eid)
+            if e is not None:
+                if old is None or old[0] is not e:
+                    self.order = None
+                self._place(match, e)
+        self.dirty.clear()
+
+    def _sorted(self, match: "Match", ids: Iterable[str]) -> List[str]:
+        ids = list(ids)
+        if len(ids) < 2:
+            return ids
+        if self.order is None:
+            self.order = {eid: i for i, eid in enumerate(match.entities)}
+        order = self.order
+        return sorted(ids, key=lambda i: order.get(i, -1))
+
+    def _live(self, match: "Match", eid: str) -> Optional["Entity"]:
+        r = self.rec.get(eid)
+        e = match.entities.get(eid)
+        return e if r is not None and e is r[0] else None
+
+    def at(self, match: "Match", mname: str, x: int, y: int) -> List[str]:
+        """Ids of the units of map `mname` whose body covers (x, y), in the
+        order of match.entities."""
+        self.ensure(match)
+        out = [eid for eid in self.cells.get(mname, {}).get((x, y), ())
+               if self._live(match, eid) is not None]
+        for eid, (bx, by, bw, bh) in self.big.get(mname, {}).items():
+            if bx <= x < bx + bw and by <= y < by + bh \
+                    and self._live(match, eid) is not None:
+                out.append(eid)
+        for eid in self.scan.get(mname, ()):
+            e = self._live(match, eid)
+            if e is not None and match.entity_occupies(e, x, y):
+                out.append(eid)
+        out = self._sorted(match, out)
+        if SPATIAL_CHECK:
+            want = [eid for eid, e in match.entities.items()
+                    if e._match is match and e.map == mname
+                    and isinstance(e.x, int) and isinstance(e.y, int)
+                    and match.entity_occupies(e, x, y)]
+            if want != out:
+                raise SpatialCheckError(
+                    f"unit index at {mname} ({x},{y}): {out} != scan {want}")
+        return out
+
+    def in_cells(self, match: "Match", mname: str, cellset: Any
+                 ) -> List[str]:
+        """Ids of the units of map `mname` whose body covers any cell of
+        `cellset` (a set of (x, y)), in the order of match.entities. Reads
+        the cells (or every record when there are more cells than units)."""
+        self.ensure(match)
+        if not isinstance(cellset, (set, frozenset, dict)):
+            cellset = set(cellset)
+        found: Set[str] = set()
+        table = self.cells.get(mname, {})
+        if len(cellset) <= len(table):
+            for c in cellset:
+                lst = table.get(c)
+                if lst:
+                    found.update(lst)
+        else:
+            for c, lst in table.items():
+                if c in cellset:
+                    found.update(lst)
+        for eid, (bx, by, bw, bh) in self.big.get(mname, {}).items():
+            if bw * bh <= len(cellset):
+                hit = any((xx, yy) in cellset for yy in range(by, by + bh)
+                          for xx in range(bx, bx + bw))
+            else:
+                hit = any(bx <= cx < bx + bw and by <= cy < by + bh
+                          for cx, cy in cellset)
+            if hit:
+                found.add(eid)
+        for eid in self.scan.get(mname, ()):
+            e = self._live(match, eid)
+            if e is not None and any(c in cellset
+                                     for c in match.entity_cells(e)):
+                found.add(eid)
+        out = self._sorted(match, (eid for eid in found
+                                   if self._live(match, eid) is not None))
+        if SPATIAL_CHECK:
+            want = [eid for eid, e in match.entities.items()
+                    if e._match is match and e.map == mname
+                    and isinstance(e.x, int) and isinstance(e.y, int)
+                    and any(c in cellset for c in match.entity_cells(e))]
+            if want != out:
+                raise SpatialCheckError(
+                    f"unit index cells on {mname}: {out} != scan {want}")
+        return out
+
+    def in_rect(self, match: "Match", mname: str, x1: int, y1: int,
+                x2: int, y2: int) -> List[str]:
+        """Ids of the units of map `mname` whose body may touch the
+        rectangle x1..x2, y1..y2 (inclusive): every one that does, plus
+        region parts to test, in the order of match.entities. Reads the
+        rectangle's cells or the map's records, whichever is fewer."""
+        self.ensure(match)
+        found: Set[str] = set()
+        table = self.cells.get(mname, {})
+        area = (x2 - x1 + 1) * (y2 - y1 + 1)
+        if area <= len(table):
+            for yy in range(y1, y2 + 1):
+                for xx in range(x1, x2 + 1):
+                    lst = table.get((xx, yy))
+                    if lst:
+                        found.update(lst)
+        else:
+            for (cx, cy), lst in table.items():
+                if x1 <= cx <= x2 and y1 <= cy <= y2:
+                    found.update(lst)
+        for eid, (bx, by, bw, bh) in self.big.get(mname, {}).items():
+            if bx <= x2 and x1 <= bx + bw - 1 and by <= y2 \
+                    and y1 <= by + bh - 1:
+                found.add(eid)
+        found.update(self.scan.get(mname, ()))
+        out = self._sorted(match, (eid for eid in found
+                                   if self._live(match, eid) is not None))
+        if SPATIAL_CHECK:
+            have = set(out)
+            for eid, e in match.entities.items():
+                if e._match is not match or e.map != mname \
+                        or not isinstance(e.x, int) or not isinstance(e.y, int):
+                    continue
+                for bx, by, bw, bh in match.body_rects(e):
+                    if bx <= x2 and x1 <= bx + bw - 1 and by <= y2 \
+                            and y1 <= by + bh - 1 and eid not in have:
+                        raise SpatialCheckError(
+                            f"unit index rect {mname} ({x1},{y1})-({x2},{y2}) "
+                            f"misses `{eid}`")
+        return out
 
 
 def default_maps(width: int, height: int) -> Dict[str, "Map"]:
@@ -11573,11 +12089,10 @@ class Match:
     # Never held across a mutation, so it cannot go stale. None = inactive.
     _vision_memo: Optional[Dict[Any, bool]] = field(
         default=None, repr=False, compare=False)
-    # Transient occupancy index for cell_occupant, active (a dict of
-    # (map, ignore) -> {cell: occupant}) only around one search that tests
-    # many cells and changes nothing (occupancy_pass). None = inactive.
-    _occ_memo: Optional[Dict[Any, Dict[Tuple[int, int], str]]] = field(
-        default=None, repr=False, compare=False)
+    # Where every unit stands (UnitIndex, #154): cell lookups read it.
+    # Runtime-only, rebuilt from the units on first use.
+    _spatial: "UnitIndex" = field(default_factory=lambda: UnitIndex(),
+                                  repr=False, compare=False)
     # Custom event bus: re-entry guard + the current-event payload stack
     # (read by event_get / event_has during handler firing). Transient — an
     # event is a transient broadcast, nothing about it is serialized.
@@ -13602,6 +14117,7 @@ class Match:
                     if isinstance(d.get("x"), int) and isinstance(d.get("y"), int):
                         d["x"], d["y"] = d["x"] + dx, d["y"] + dy
             outer.tile_data(*spot).setdefault("corpses", {})[cid] = corpse
+            outer.note_corpse(spot[0], spot[1])
         return log
 
     def _kill_all_on_map(self, name: str) -> List[str]:
@@ -13782,13 +14298,14 @@ class Match:
 
         # Shift + clip zone cells.
         clipped_cells = 0
-        for z in mp.zones.values():
+        for zname, z in mp.zones.items():
             cells = z.get("cells")
             if isinstance(cells, set):
                 before = len(cells)
                 z["cells"] = {(x + ox, y + oy) for (x, y) in cells
                               if in_new(x + ox, y + oy)}
                 clipped_cells += before - len(z["cells"])
+                mp.zone_touch(zname)
 
         # Shift + clip fog-explored memory and fog reveals (a reveal left
         # behind used to show a cell beside what was revealed).
@@ -13922,11 +14439,12 @@ class Match:
             if isinstance(cell, dict) and any(k != "corpses" for k in cell):
                 dropped_tiles += 1
         clipped = 0
-        for z in mp.zones.values():
+        for zname, z in mp.zones.items():
             cells = z.get("cells")
             if isinstance(cells, set) and cells & added:
                 clipped += len(cells & added)
                 z["cells"] = cells - added
+                mp.zone_touch(zname)
         for team in list(mp.explored):
             mp.explored[team] -= added
         for team in list(mp.fog_reveals):
@@ -13995,6 +14513,7 @@ class Match:
                     if self._within_radius(fx, fy, xx, yy, r, metric):
                         new.add((xx, yy))
         z["cells"] = new
+        mp.zone_touch(name)
 
     def _body_reshaped(self, e: "Entity", path: str) -> None:
         """After a write or delete of `e`'s footprint var: re-stamp the
@@ -14392,7 +14911,7 @@ class Match:
             raise VTTError(
                 f"`{head_id}` is a segment of `{head.part_of}`: add "
                 f"segments to the head (they go on the tail).")
-        if seg_id in self._taken_entity_ids():
+        if self.id_taken(seg_id):
             raise DuplicateId(
                 f"Entity id '{seg_id}' already exists in this match.")
         chain = self.snake_segments(head_id)
@@ -14431,7 +14950,7 @@ class Match:
         parent = self.entities.get(parent_id)
         if parent is None:
             raise NotFound(f"Entity '{parent_id}' not found.")
-        if part_id in self._taken_entity_ids():
+        if self.id_taken(part_id):
             raise DuplicateId(
                 f"Entity id '{part_id}' already exists in this match.")
         hp_var, mhp_var, _ = parent._vital_var_names()
@@ -14560,6 +15079,7 @@ class Match:
                 p.vars.pop("__part_located", None)
             raise
         p.vars.pop("__part_region", None)   # locate and region are exclusive
+        self._spatial.touch(p.id)       # its kind of part changed
         p.move_to(x, y)
         # Its own auras, glued parts and riders come along.
         self._restamp_anchors_for(p.id)
@@ -14579,6 +15099,7 @@ class Match:
         self._refuse_segment_mode(p, "glued")
         p.vars.pop("__part_located", None)
         p.vars.pop("__part_region", None)
+        self._spatial.touch(p.id)       # its kind of part changed
         self._restamp_parts_for(p.part_of)
         return p
 
@@ -14612,6 +15133,7 @@ class Match:
                 f"{', '.join(sorted(self._PART_REGIONS))}.")
         p.vars.pop("__part_located", None)        # region and locate are exclusive
         p.vars["__part_region"] = region
+        self._spatial.touch(p.id)       # its kind of part changed
         self._restamp_parts_for(p.part_of)        # snap anchor to the parent
         return p
 
@@ -16005,6 +16527,7 @@ class Match:
                     z["cells"] = set()
                 else:
                     del mp.zones[name]
+                mp.zone_touch(name)
 
     def _resume_anchored_zones(self, eid: str) -> None:
         """Re-stamp any auras still bound to `eid` after it comes back alive
@@ -16073,13 +16596,11 @@ class Match:
         z = mp.zones.get(name)
         if z is None:
             return []
-        cells = z["cells"]
         return [
-            eid for eid, e in self.entities.items()
-            if e.map == mp.name
-            and getattr(e, "is_alive", True) and not e.is_glued_part
-            and not e.is_hidden_rider
-            and any(c in cells for c in self.entity_cells(e))
+            eid for eid in self._spatial.in_cells(self, mp.name, z["cells"])
+            if self.entities[eid].is_alive
+            and not self.entities[eid].is_glued_part
+            and not self.entities[eid].is_hidden_rider
         ]
 
     # ---- host / access control ---------------------------------------
@@ -17447,63 +17968,25 @@ class Match:
         FOOTPRINT covers (x, y) of map `mp` (None = the only map), skipping
         any id in `ignore`; None when the cell is free of blockers. The
         footprint-aware core behind is_occupied — a large entity blocks
-        every cell it spans."""
+        every cell it spans. Reads the unit index (#154): only the units
+        covering the cell are judged."""
         on = (mp or self.get_map()).name
-        memo = self._occ_memo
-        if memo is not None:
-            key = (on, tuple(ignore))
-            table = memo.get(key)
-            if table is None:
-                table = memo[key] = self._occupancy_table(on, ignore)
-            return table.get((x, y))
-        for eid, e in self.entities.items():
-            if eid in ignore or e.map != on:
+        for eid in self._spatial.at(self, on, x, y):
+            if eid in ignore:
                 continue
+            e = self.entities[eid]
             # Glued body parts ride on the parent's cell and never block —
             # the parent is the occupant. A LOCATED part has its own cell
-            # and occupies it normally.
-            if e.is_glued_part or e.is_region_part:
-                continue    # a region lies on its parent, the occupant
-            # Mounted riders are aboard the vehicle, not on the ground — they
-            # never block (the vehicle's own footprint is the occupant). This
-            # holds for visible riders too (a gunner shares the tank's cell).
-            if e.is_mounted:
+            # and occupies it normally. A region lies on its parent, the
+            # occupant. Mounted riders are aboard the vehicle, not on the
+            # ground — they never block (the vehicle's own footprint is the
+            # occupant), visible riders too (a gunner shares the tank's
+            # cell).
+            if e.is_glued_part or e.is_region_part or e.is_mounted:
                 continue
-            if e.is_alive and not e.is_cell_stackable and self.entity_occupies(e, x, y):
+            if e.is_alive and not e.is_cell_stackable:
                 return eid
         return None
-
-    def _occupancy_table(self, on: str, ignore: Tuple[str, ...]
-                         ) -> Dict[Tuple[int, int], str]:
-        """cell -> the unit cell_occupant names there, for map `on`: one
-        pass over the units (the first in order wins a cell, as the scan
-        does)."""
-        table: Dict[Tuple[int, int], str] = {}
-        for eid, e in self.entities.items():
-            if eid in ignore or e.map != on or e.is_glued_part \
-                    or e.is_region_part or e.is_mounted:
-                continue
-            if not e.is_alive or e.is_cell_stackable:
-                continue
-            w, h = self.entity_footprint(e)
-            for yy in range(e.y, e.y + h):
-                for xx in range(e.x, e.x + w):
-                    table.setdefault((xx, yy), eid)
-        return table
-
-    @contextlib.contextmanager
-    def occupancy_pass(self):
-        """A search that tests many cells for occupancy and changes nothing
-        meanwhile: cell_occupant reads one index per (map, ignore) built in
-        a pass over the units, so the search costs cells plus units, never
-        cells x units (X12)."""
-        prev = self._occ_memo
-        if prev is None:
-            self._occ_memo = {}
-        try:
-            yield
-        finally:
-            self._occ_memo = prev
 
     def _occupancy_ignore(self, e: "Entity",
                           extra: Tuple[str, ...] = ()) -> Tuple[str, ...]:
@@ -17592,9 +18075,8 @@ class Match:
         if e.is_cell_stackable:
             return
         ignore = self._occupancy_ignore(e, extra_ignore)
-        with self.occupancy_pass():
-            taken = [(c, self.cell_occupant(c[0], c[1], ignore, mp))
-                     for c in grown]
+        taken = [(c, self.cell_occupant(c[0], c[1], ignore, mp))
+                 for c in grown]
         for (cx, cy), other in taken:
             if other is not None:
                 raise Occupied(
@@ -21589,6 +22071,8 @@ class Match:
         for zname in [n for n, z in src.zones.items()
                       if isinstance(z, dict) and z.get("anchor") in moving]:
             dest.zones[zname] = src.zones.pop(zname)
+            src.zone_touch(zname)
+            dest.zone_touch(zname)
         for u in body:
             u.map = dest.name
         # A board following a unit stays on its last map if it then goes.
@@ -22658,19 +23142,28 @@ class Match:
         """Return the set of entity ids that should be considered
         already-in-use for collision purposes. Always includes live
         entity ids; ALSO includes corpse ids when the
-        `corpse_id_uniqueness` rule is true (default). This is the
-        single source of truth for "is this id taken?" — used by
-        mint_entity_id and Entity.spawn so the two stay consistent."""
+        `corpse_id_uniqueness` rule is true (default), and the ids of the
+        body parts a corpse holds, which come back with its revive under
+        their ids (K9). Costs every unit and corpse: a test of one id is
+        id_taken."""
         taken: set = set(self.entities.keys())
         if bool(self.rules.get("corpse_id_uniqueness", True)):
             for (_mp, _x, _y, eid, c) in self.every_corpse():
                 taken.add(eid)
-                # The body parts the corpse holds come back with its revive
-                # under their ids (K9): a new unit can't take one.
-                for pd in (c.get("parts") or ()) if isinstance(c, dict) \
-                        and isinstance(c.get("parts"), list) else ():
-                    if isinstance(pd, dict) and isinstance(pd.get("id"), str):
-                        taken.add(pd["id"])
+                taken.update(_corpse_part_ids(c))
+        return taken
+
+    def id_taken(self, eid: str) -> bool:
+        """Whether a new unit can't take id `eid` (the test behind
+        _taken_entity_ids, for one id: the units, plus the corpses and
+        the parts they hold under corpse_id_uniqueness), read from the
+        corpse indexes."""
+        taken = eid in self.entities or (
+            bool(self.rules.get("corpse_id_uniqueness", True))
+            and any(mp.corpse_cells_of(eid) or mp.corpse_holds_part(eid)
+                    for mp in self.maps.values()))
+        if SPATIAL_CHECK and taken != (eid in self._taken_entity_ids()):
+            raise SpatialCheckError(f"corpse index: id_taken({eid!r}) = {taken}")
         return taken
 
     def mint_entity_id(self, prefix: str,
@@ -22688,12 +23181,15 @@ class Match:
             ch for ch in str(prefix).strip().lower().replace(" ", "_")
             if ch.isalnum() or ch in ("_", "-")
         ) or "summon"
-        taken = self._taken_entity_ids() | set(also or ())
-        if (base not in taken and base not in RESERVED_IDS
+        also = also or ()
+
+        def taken(i: str) -> bool:
+            return i in also or self.id_taken(i)
+        if (not taken(base) and base not in RESERVED_IDS
                 and not unreachable_id(base)):
             return base
         n = 2
-        while f"{base}{n}" in taken:
+        while taken(f"{base}{n}"):
             n += 1
         return f"{base}{n}"
 
@@ -22981,11 +23477,10 @@ class Match:
         the map searched (None: `e`'s map, else the only map)."""
         mp = self._map_for(mp, e)
         ignore = self._stand_ignore(e)
-        with self.occupancy_pass():
-            for r in self._ring_radii(x, y, radius, mp):
-                for cx, cy in self._ring_cells(x, y, r, mp):
-                    if self._can_stand_at(e, cx, cy, ignore, mp):
-                        return (cx, cy)
+        for r in self._ring_radii(x, y, radius, mp):
+            for cx, cy in self._ring_cells(x, y, r, mp):
+                if self._can_stand_at(e, cx, cy, ignore, mp):
+                    return (cx, cy)
         return None
 
     def _stand_ignore(self, e: Optional["Entity"]) -> Tuple[str, ...]:
@@ -23049,14 +23544,13 @@ class Match:
                 f"checking {len(cand)} spots for a {w}x{h} body covers more "
                 f"than the formula_cell_limit of {limit} cells.")
         out = []
-        with self.occupancy_pass():
-            for ax, ay in sorted(cand, key=lambda c: (c[1], c[0])):
-                if (e is not None and fit == "body"
-                        and any(c not in area
-                                for c in self.entity_cells(e, ax, ay))):
-                    continue
-                if self._can_stand_at(e, ax, ay, ignore, mp):
-                    out.append((ax, ay))
+        for ax, ay in sorted(cand, key=lambda c: (c[1], c[0])):
+            if (e is not None and fit == "body"
+                    and any(c not in area
+                            for c in self.entity_cells(e, ax, ay))):
+                continue
+            if self._can_stand_at(e, ax, ay, ignore, mp):
+                out.append((ax, ay))
         return out
 
     # ---- death / corpse machinery ----------------------------------------
@@ -23828,7 +24322,8 @@ class Match:
         `corpses.<eid>`. Stores the full Entity.to_dict (including id,
         x, y) so revive can spawn it back exactly. Multi-corpse-per-
         cell: existing corpses on the cell aren't disturbed."""
-        cell = self.map_of(e).tile_data(e.x, e.y)
+        cmap = self.map_of(e)
+        cell = cmap.tile_data(e.x, e.y)
         corpses = cell.setdefault("corpses", {})
         if not isinstance(corpses, dict):
             # Tile data shape was hand-written into something else;
@@ -23864,6 +24359,7 @@ class Match:
         part_dicts = [pp.to_dict() for pp in self.entity_part_subtree(e.id)]
         if part_dicts:
             corpses[e.id]["parts"] = part_dicts
+        cmap.note_corpse(e.x, e.y)
 
     def find_corpse(self, eid: str
                     ) -> Optional[Tuple[int, int, Dict[str, Any], "Map"]]:
@@ -23872,13 +24368,28 @@ class Match:
         AUTHORITATIVE position; the embedded entity dict's x/y are
         the snapshot at death and may differ if a (rare) GM hack
         moved corpses around manually — engine code never reads them
-        for placement, this method always returns the tile's coords."""
+        for placement, this method always returns the tile's coords.
+        Reads the maps' corpse index (Map.corpse_cells_of); with corpse
+        ids that aren't unique, the first map's lowest cell."""
+        found = None
         for mp in self.maps.values():
-            for (x, y), cell in mp.tiles.items():
-                corpses = cell.get("corpses") if isinstance(cell, dict) else None
-                if isinstance(corpses, dict) and eid in corpses:
-                    return x, y, corpses[eid], mp
-        return None
+            cells = mp.corpse_cells_of(eid)
+            if cells:
+                x, y = cells[0]
+                found = (x, y, mp.tiles[(x, y)]["corpses"][eid], mp)
+                break
+        if SPATIAL_CHECK:
+            scan = [(mp, c) for mp in self.maps.values()
+                    for c, cell in mp.tiles.items() if isinstance(cell, dict)
+                    and isinstance(cell.get("corpses"), dict)
+                    and eid in cell["corpses"]]
+            if (found is None) != (not scan) or (found is not None and not any(
+                    m2 is found[3] and c == (found[0], found[1])
+                    for m2, c in scan)):
+                raise SpatialCheckError(
+                    f"corpse index: find_corpse({eid!r}) = {found and found[:2]}"
+                    f", scan {[(m2.name, c) for m2, c in scan]}")
+        return found
 
     def every_corpse(self) -> List[Tuple["Map", int, int, str, Dict[str, Any]]]:
         """Every corpse on every map, as (map, x, y, eid, corpse_dict)."""
@@ -23890,15 +24401,22 @@ class Match:
         """List every corpse on map `mp` (None = the only map) as
         (x, y, eid, corpse_dict). Sorted by (x, y, eid) for stable
         iteration; the order matches what `!list`'s Dead: section
-        renders."""
+        renders. Reads the map's corpse index."""
         mp = mp or self.get_map()
-        out: List[Tuple[int, int, str, Dict[str, Any]]] = []
-        for (x, y) in sorted(mp.tiles.keys()):
-            cell = mp.tiles[(x, y)]
-            corpses = cell.get("corpses") if isinstance(cell, dict) else None
-            if isinstance(corpses, dict):
-                for eid in sorted(corpses.keys()):
-                    out.append((x, y, eid, corpses[eid]))
+        out = mp.corpse_entries()
+        if SPATIAL_CHECK:
+            scan: List[Tuple[int, int, str, Dict[str, Any]]] = []
+            for (x, y) in sorted(mp.tiles.keys()):
+                cell = mp.tiles[(x, y)]
+                corpses = cell.get("corpses") if isinstance(cell, dict) else None
+                if isinstance(corpses, dict):
+                    for eid in sorted(corpses.keys()):
+                        scan.append((x, y, eid, corpses[eid]))
+            if [(a, b, c) for a, b, c, _ in scan] != \
+                    [(a, b, c) for a, b, c, _ in out]:
+                raise SpatialCheckError(
+                    f"corpse index on {mp.name}: {[o[:3] for o in out][:5]} "
+                    f"!= scan {[o[:3] for o in scan][:5]}")
         return out
 
     def revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
@@ -24009,6 +24527,7 @@ class Match:
                 # (it used to be lost with the refusal).
                 cmap.tiles.setdefault((loc[0], loc[1]), {}).setdefault(
                     "corpses", {})[eid] = corpse
+                cmap.note_corpse(loc[0], loc[1])
                 raise
             spawn_log = moved_note + list(spawn_log)
             # Restore the creature's body parts at the parent's cell. Each
@@ -24028,7 +24547,7 @@ class Match:
                         continue
                     if not pid:
                         continue
-                    if pid in self._taken_entity_ids():
+                    if self.id_taken(pid):
                         # Another unit took the part's id while the body
                         # lay dead: the part can't come back under it.
                         if not relocate:
@@ -28293,6 +28812,22 @@ class Match:
             return bool(self.rules.get("roster_glued_parts", False))
         return True
 
+    def in_turn_order(self, ids: List[str]) -> List[str]:
+        """`ids` (units of this match, in match.entities order) ordered as
+        entities_in_turn_order lists them: turn order first, then the
+        others as added. Costs the ids, not every unit."""
+        if len(ids) < 2:
+            return list(ids)
+        to = getattr(self, "turn_order", [])
+        n = len(to)
+
+        def key(eid: str) -> int:
+            try:
+                return to.index(eid)
+            except ValueError:
+                return n
+        return sorted(ids, key=key)      # stable: the rest keep their order
+
     def entities_in_turn_order(self) -> List["Entity"]:
         # Returns Entity objects in current turn order; appends any missing at the end
         ordered = []
@@ -30636,19 +31171,96 @@ class Workspaces:
         self.storage: Any = None
         # Every server's crashes (`!owner errors`, `!server errors`).
         self.crashes = CrashLog()
+        # Callables a surface adds: guard(mgr) returns why that server
+        # stays loaded, or None (Discord: a live auto-update board holds
+        # its manager; the GUI holds the local one for its session).
+        self.unload_guards: List[Callable[[MatchManager], Optional[str]]] = []
+        self._last_sweep = time.monotonic()
 
-    def get(self, guild_key: Any) -> MatchManager:
+    def load(self, guild_key: Any) -> Tuple[MatchManager, List[str]]:
+        """The server's workspace and the notes of loading it: a server
+        is read from its data folder on first use (#197), so startup reads
+        nothing and a server the bot hasn't heard from since it started
+        costs no memory. A server with no folder starts fresh."""
         key = str(guild_key)
         mgr = self._by_key.get(key)
+        notes: List[str] = []
         if mgr is None:
             mgr = MatchManager(key)
             mgr.workspaces = self
             self._by_key[key] = mgr
-        return mgr
+            if self.storage is not None:
+                notes = self.storage.load_on_demand(mgr)
+        mgr.last_used = time.monotonic()
+        return mgr, notes
+
+    def get(self, guild_key: Any) -> MatchManager:
+        return self.load(guild_key)[0]
 
     def peek(self, guild_key: Any) -> Optional[MatchManager]:
-        """The workspace if it exists, without creating it."""
+        """The workspace if it is loaded, without loading or creating it."""
         return self._by_key.get(str(guild_key))
 
+    def find(self, guild_key: Any) -> Optional[MatchManager]:
+        """The workspace if it exists, loaded or on disk (then loaded),
+        without creating a new one."""
+        key = str(guild_key)
+        if key in self._by_key or (self.storage is not None
+                                   and self.storage.has_server(key)):
+            return self.get(key)
+        return None
+
     def items(self) -> List[Tuple[str, MatchManager]]:
+        """The loaded workspaces."""
         return sorted(self._by_key.items())
+
+    def unload_blocker(self, mgr: MatchManager) -> Optional[str]:
+        """Why server `mgr` can't leave memory now, or None when nothing
+        but its files holds it: a command running on it, an approval
+        request waiting (runtime-only), a surface guard's reason."""
+        lock = getattr(mgr, "_command_lock", None)
+        if lock is not None and lock.locked():
+            return "a command is running on it"
+        if any(m.pending_requests for m in mgr.matches.values()):
+            return "an approval request is waiting"
+        for guard in self.unload_guards:
+            why = guard(mgr)
+            if why:
+                return why
+        return None
+
+    def unload(self, guild_key: Any) -> bool:
+        """Write server `guild_key` to disk and drop it from memory; its
+        next command loads it again. False when it isn't loaded or
+        can_unload says no. A locked server (MatchManager.recovery) writes
+        nothing: its files are what a recovery works from."""
+        key = str(guild_key)
+        mgr = self._by_key.get(key)
+        if mgr is None or self.unload_blocker(mgr) is not None:
+            return False
+        st = self.storage
+        if st is not None:
+            if st.persist and not mgr.recovery:
+                st.commit_all_one(mgr)
+            st.forget_loaded(key)
+        del self._by_key[key]
+        return True
+
+    def sweep_idle(self, now: Optional[float] = None,
+                   force: bool = False) -> List[str]:
+        """Unload the servers idle for the owner limit
+        server_idle_unload_hours (0 = never), at most once an hour unless
+        `force`. Returns the keys unloaded."""
+        now = time.monotonic() if now is None else now
+        if not force and now - self._last_sweep < 3600:
+            return []
+        self._last_sweep = now
+        hours = owner_limit("server_idle_unload_hours")
+        if hours <= 0 or self.storage is None or not self.storage.persist:
+            return []
+        gone = []
+        for key, mgr in self.items():
+            if now - getattr(mgr, "last_used", now) >= hours * 3600 \
+                    and self.unload(key):
+                gone.append(key)
+        return gone

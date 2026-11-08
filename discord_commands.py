@@ -1191,6 +1191,12 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
     """Register every registry root as a discord.py command. Each command
     runs against the workspace (MatchManager) of the server it came from;
     DMs are refused (DM_REFUSAL)."""
+    # A live auto-update board holds its server's manager (pan clicks,
+    # refreshes): that server stays loaded while one is up (#197).
+    workspaces.unload_guards.append(
+        lambda mgr: "an auto-update board is up" if any(
+            e.get("workspace") == mgr.guild_key for e in _boards.values())
+        else None)
 
     def _workspace(ctx) -> Optional[MatchManager]:
         guild = getattr(ctx, "guild", None)
@@ -1329,9 +1335,9 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
         if isinstance(error, commands.CommandNotFound):
             name = getattr(ctx, "invoked_with", None) or ""
             guild = getattr(ctx, "guild", None)
-            # peek: an unknown word must not create a workspace, and a DM
-            # (no server) has no aliases.
-            mgr = workspaces.peek(guild.id) if guild is not None else None
+            # find: an unknown word must not create a workspace (it loads
+            # one from disk), and a DM (no server) has no aliases.
+            mgr = workspaces.find(guild.id) if guild is not None else None
             mid = mgr.get_active_for_channel(f"{guild.id}:{ctx.channel.id}") \
                 if mgr is not None else None
             m = mgr.matches.get(mid) if mid else None

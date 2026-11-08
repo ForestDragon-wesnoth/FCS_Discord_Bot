@@ -1901,7 +1901,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
         "_death_check_deferred_ids", "_deleting_maps", "_watcher_backlog",
-        "_alive_eval_depth", "_vision_memo", "_occ_memo", "_turn_order_dirty",
+        "_alive_eval_depth", "_vision_memo", "_spatial", "_turn_order_dirty",
         "_request_seq", "pending_requests", "held_commands",
         # Event bus: the live emit stack/depth + warning latch. Resetting
         # these mid-emit corrupts the outer emit (the verified crash).
@@ -1931,6 +1931,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
     # match instance (Match.from_dict set them to `restored`).
     for e in match.entities.values():
         e._match = match
+    match._spatial.reset()
 
 
 def _sync_dispatch(coro) -> None:

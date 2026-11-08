@@ -1132,6 +1132,7 @@ def _clear_rect(m: Match, mp: Map, x: int, y: int, w: int, h: int,
             z["cells"] = keep
             if not keep and not z.get("anchor"):
                 del mp.zones[zname]
+            mp.zone_touch(zname)
 
 
 def _merge_definitions(m: Match, pf: Dict[str, Any],
@@ -1257,6 +1258,7 @@ def _stamp_corpses(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
             notes += m._sync_unit_dict(body, m.rules,
                                        f"corpse `{body.get('id', nid)}`")
         mp.tile_data(ent["x"], ent["y"]).setdefault("corpses", {})[nid] = c
+        mp.note_corpse(ent["x"], ent["y"])
 
 
 def _spawn_units(m: Match, mp: Map, pf: Dict[str, Any],
@@ -1348,6 +1350,7 @@ def _stamp_zones(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
             if z["anchor"] not in m.entities:
                 continue
         mp.zones[new] = z
+        mp.zone_touch(new)
         if anchor:
             m._stamp_anchored_zone(new, mp)
         made.append(new)
