@@ -496,7 +496,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#197 Scaling.**
   - Shipped: the spatial indexes (#154: units, zones and corpses by cell) and servers loaded on first use and unloaded when idle (`server_idle_unload_hours`).
   - Left: diff-based undo snapshots (§8: ~3.5 s per command after a whole-map fill on 500×500) and the per-server CPU work budget (§8).
-  - Also measured while shipping the indexes: the per-command sweeps that still visit every unit or corpse (`sync_all_sizes`, `has_watchers`: ~125 ms per command at 10,000 units) and the per-step zone-grant check over every zone (`_grants_present`: ~37 ms per step with 20,000 zones).
+  - Also shipped: the per-command size sweep, watcher check and zone-grant check read only what changed (~140 ms per command at 10,000 units before, ~1 ms after).
 - **#198 Play-by-post mode.**
   - Turn deadlines and a ping to the active unit's player (needs #28).
   - A digest of what happened since your last turn (#146).

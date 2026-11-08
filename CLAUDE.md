@@ -1277,9 +1277,18 @@ hardcodes**.
   told of each corpse laid by `Map.note_corpse(x, y)` (a new site must
   call it) and checks stale entries on read; `find_corpse`, `all_corpses`
   and `Match.id_taken` (spawn and `mint_entity_id` test one id) read it.
+  `UnitFlags` (`Match._uflags`) caches per unit whether its own data
+  holds `watchers` and whether a status carries a zone grant's marker,
+  for `has_watchers` / `_grants_present`; it and the size sweep listen
+  to the same marks (`UnitIndex.listeners`) plus `UnitIndex.notify`
+  (`_emit_status_diff`, a wholesale `status` set, a part's old body).
+  `Map._zone_index` also files the zones with grants of their own and the
+  zones by definition (the grant edits and `def` changes call
+  `zone_touch`).
   `FCS_SPATIAL_CHECK=1` makes every lookup compare itself with the old
-  scan and raise (`SpatialCheckError`): run the regression under it after
-  touching any of these paths (§5).
+  scan and raise (`SpatialCheckError`), and runs the full size sweep after
+  the narrowed one: run the regression under it after touching any of
+  these paths (§5).
 - **Unit cap:** `max_entities_per_match` (-1 = none, the default) bounds
   the units a match holds (parts and segments count, corpses don't):
   `Match.check_unit_room` at `Entity.spawn`, and whole bodies are checked
@@ -1384,7 +1393,8 @@ hardcodes**.
   hides it drops them, and `!watch show` lists only units the view shows
   (V14, 986-987). Polled when
   `Match.has_watchers()` (any watcher, stored state or a unit holding
-  one). A system's `watchers` library (`!system watch`, 980) arms its
+  one; the units whose own data holds one come from `UnitFlags`, §7.1,
+  a status definition or team data holding one is read live, 1072). A system's `watchers` library (`!system watch`, 980) arms its
   entries in each new match (`watcher_definition` / `watcher_add_args`);
   `!match sync watchers` re-arms changed ones. Formulas `watch_add` /
   `watch_remove` (mutating), `watch_exists`, `watchers_of(eid)` (981).
@@ -3566,14 +3576,21 @@ and a total per body.
   var, the two override vars or a body part's hp (a death or heal) on any
   unit of the body (`_size_trigger`, then `sync_body_size`), at an attach
   or detach, at spawn, after each command that changed the match
-  (`sync_all_sizes` in `vtt_commands._settle_after` beside the zone-grant
-  sync, also per `!dry` / `!simulate` step) and in every other match the
+  (`sync_touched_sizes` in `vtt_commands._settle_after` beside the
+  zone-grant sync, also per `!dry` / `!simulate` step: the bodies of the
+  units the unit index marked since the last sweep, a part's old body
+  through `notify` when its `part_of` or `_match` changes; the first sweep
+  of a match object, a load or an undo's, is the full `sync_all_sizes`;
+  #197, 1074) and in every other match the
   command reached (`MATCHES_TOUCHED`, S16), and on a change of any size or
-  footprint rule (`apply_system_rules`). Body walks use a children index
+  footprint rule (`apply_system_rules`, the full sweep, corpses too). Body walks use a children index
   built in one pass (`Match._children_index`; `entity_part_subtree` scans
   every unit per node: a 300-part body on 2,300 units cost 12 s per
   `!find`, X18 / X19).
-  Corpses keep the total they died with; their category follows the scale.
+  Corpses keep the total they died with; their category follows the scale
+  (`_settle_corpse_size`: at the corpse's making, since a death in the
+  middle of a derivation stores the total before the category, and in
+  every full sweep).
   `size_enabled` off removes the derived vars from units (size_num stays a
   plain var) and every size function, selector and `!help size` refuses.
 - **Reads:** `size_of(x, own=False)`, `size_class`, `size_is(x, cat)`,
@@ -3810,11 +3827,9 @@ hasn't named the next.
   serialized three times per command: undo pre / post state and the
   commit). Cell lookups read the spatial indexes (§7.1), fogged reads
   one team vision index per pass (`Match.vision_pass`), so neither costs
-  cells x units. What still costs every unit on every command (measured
-  for #197): `sync_all_sizes` (every body, and every corpse's category)
-  and `has_watchers` (every unit's held watchers), ~125 ms per command at
-  10,000 units, ~240 ms with 50,000 corpses; a walk on a map with 20,000
-  zones spends ~37 ms per step in `_grants_present` (every zone's grants).
+  cells x units; the size sweep, the watcher check and the zone-grant
+  check read only what changed (#197), so a command on a board of 10,000
+  units costs ~1 ms past its own work.
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /
