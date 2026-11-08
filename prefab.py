@@ -646,7 +646,8 @@ def _check_formula_function(entry: Dict[str, Any], name: str,
 
 
 # The values a status definition's fields take (`!status stack|when|...`).
-_STATUS_STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
+_STATUS_STACK_MODES = ("layered", "refresh", "add_level", "extend",
+                       "replace", "none")
 _STATUS_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
                       "never")
 

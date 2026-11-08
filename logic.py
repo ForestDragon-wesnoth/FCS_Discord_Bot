@@ -284,7 +284,7 @@ def check_status_self_grant(sname: str, path: str, value: Any) -> None:
         raise VTTError(f"`{sname}` can't grant {what} to itself.")
 
 
-# Status layers (refresh stacking): an instance holding applications of
+# Status layers (the layered stack mode): an instance holding applications of
 # several levels keeps them as [[level, duration], ...] under this key,
 # highest level first, only while there are two or more. Each layer is one
 # no other layer dominates (higher or equal level AND at least as long),
@@ -2214,30 +2214,32 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "status_default_stack": {
-        "default": "refresh",
+        "default": "layered",
         "schema": {
             "type": "enum",
-            "choices": ["refresh", "add_level", "extend", "replace", "none"],
+            "choices": ["layered", "refresh", "add_level", "extend",
+                        "replace", "none"],
         },
         "desc": (
             "Default re-application behavior for apply_status / `!status "
             "apply` when a status is applied to an entity that already has "
             "it, used when the status DEFINITION doesn't set its own "
-            "`stack`. Modes: 'refresh' (layered: each level keeps its "
+            "`stack`. Modes: 'layered' (default: each level keeps its "
             "longest duration, a lower level stays while it outlasts the "
             "higher ones, and the status shows the highest level still "
             "running, so burn 3 for 2 turns plus burn 1 for 5 is level 3 "
             "for 2 turns, then level 1 for 3 more; a re-application never "
             "shortens what is left; a countdown on `duration` ticks every "
             "layer, and any other write of the level or duration collapses "
-            "them to what was written), 'add_level' (level += applied, "
-            "capped at the definition's max_level; the duration only "
-            "grows), 'extend' (add to remaining duration, keep level), "
-            "'replace' (overwrite level + duration, the one mode that can "
-            "shorten it), 'none' (re-application is a no-op while the "
-            "status is present). add_level, extend and replace act on the "
-            "level and longest duration a layered status shows, collapsing "
-            "its layers. "
+            "them to what was written), 'refresh' (keep the level; the "
+            "duration only grows, to the longer of what is left and the "
+            "new one), 'add_level' (level += applied, capped at the "
+            "definition's max_level; the duration only grows), 'extend' "
+            "(add to remaining duration, keep level), 'replace' (overwrite "
+            "level + duration, the one mode that can shorten it), 'none' "
+            "(re-application is a no-op while the status is present). The "
+            "modes but layered act on the level and longest duration a "
+            "layered status shows, collapsing its layers. "
             "A first application (status not yet present) always just sets "
             "the given level/duration regardless of mode."
         ),
@@ -2951,7 +2953,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "(statuses joined with `, `, by name). Placeholders: {name}, and "
             "every field of the status instance ({level}, {duration}, any "
             "custom field such as {lost_max_hp}); {layers} for a status "
-            "holding layers of several levels (refresh stacking: `×3 for 2, "
+            "holding layers of several levels (layered stacking: `×3 for 2, "
             "then ×1 for 3 more`); {?key?}...{/?} shows a part "
             "only when the field is set. A status definition's own `display` "
             "format (`!status display <name> <format>`) replaces this one "
@@ -20711,7 +20713,7 @@ class Match:
                 capped = self._cap_status_level(sdef, lvl)
                 if capped != lvl:
                     d["level"] = capped
-            # Layers (refresh stacking) follow the instance: capped, and
+            # Layers (layered stacking) follow the instance: capped, and
             # collapsed when a write set the level or duration itself.
             if isinstance(d, dict) and STATUS_LAYERS_KEY in d:
                 settle_status_layers(
@@ -20784,19 +20786,19 @@ class Match:
         """Whether a flat level-reduction resistance applies to THIS status
         application — only when a level is actually added/set: a first
         application, an add_level increment (implicit +1 OR explicit), or a
-        replace or refresh with an explicit level (refresh layers it).
-        extend / none and a refresh without a level set no level, so
+        replace or layered application with an explicit level. refresh /
+        extend / none and a layered one without a level set no level, so
         resistance has nothing to reduce (and must not block a
         duration-only refresh)."""
         if name not in e.status:
             return True  # first application seeds a level
         mode = sdef.get("stack") or str(
-            self.rules.get("status_default_stack", "refresh"))
+            self.rules.get("status_default_stack", "layered"))
         if mode == "add_level":
             return True
-        if mode in ("replace", "refresh"):
+        if mode in ("replace", "layered"):
             return level_given
-        return False  # extend / none — no level applied
+        return False  # refresh / extend / none — no level applied
 
     def status_tag_block(self, e: "Entity", name: str,
                          level: Any = None) -> Optional[str]:
@@ -20975,7 +20977,7 @@ class Match:
                 inst["duration"] = new_duration
             e.status[name] = inst
         else:
-            mode = sdef.get("stack") or str(self.rules.get("status_default_stack", "refresh"))
+            mode = sdef.get("stack") or str(self.rules.get("status_default_stack", "layered"))
             inst = e.status[name]
             # A status with no duration is permanent (∞) and stays so under
             # every stack mode: an application's duration doesn't start it
@@ -20983,9 +20985,9 @@ class Match:
             # one on purpose).
             # (The duration reads through the level entries, S14.)
             cur_duration = self.status_field(inst, name, "duration")
-            if cur_duration is None and mode != "refresh":
+            if cur_duration is None and mode != "layered":
                 new_duration = None
-            if mode not in ("none", "refresh"):
+            if mode not in ("none", "layered"):
                 # The other modes act on one layer: the layers collapse to
                 # the level and (longest) duration the instance shows.
                 inst.pop(STATUS_LAYERS_KEY, None)
@@ -21009,7 +21011,14 @@ class Match:
                     cd = _coerce_number(cur_duration)
                     if cd is None or new_duration > cd:
                         inst["duration"] = new_duration
-            else:  # refresh (default): layered
+            elif mode == "refresh":
+                # Keep the level; the duration only grows (a shorter
+                # application never cuts the time left).
+                if new_duration is not None:
+                    cd = _coerce_number(cur_duration)
+                    if cd is None or new_duration > cd:
+                        inst["duration"] = new_duration
+            else:  # layered (default)
                 # Each application is a layer (its level, its duration):
                 # per level the longest duration counts, a lower level
                 # stays while it outlasts the higher ones, and the status

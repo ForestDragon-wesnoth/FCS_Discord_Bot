@@ -1547,16 +1547,17 @@ hardcodes**.
   and past `status_hook_recursion_limit` (32) the rest of the chain fires
   no status hooks, with one ⚠️ (900).
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
-  from the definition's `stack`, else `status_default_stack` (refresh /
-  add_level / extend / replace / none). `max_level` is a hard ceiling on
+  from the definition's `stack`, else `status_default_stack` (layered,
+  the default / refresh / add_level / extend / replace / none; refresh
+  keeps the level and only lengthens the duration, user call). `max_level` is a hard ceiling on
   every write of a level: applications (`_cap_status_level`), every status
   change through `_emit_status_diff` (`_cap_live_status`: status_set,
   counters, `!ent status set` report the stored value), statuses a spawn /
   summon / transform brings (`_cap_unit_status_levels`); lowering it with
   `!status maxlevel` lowers live instances as status changes (740).
-- **Layers** (user design, 1058-1061): `refresh` (the default mode) is
-  layered. Each application is a (level, duration) layer; the instance
-  keeps the front of them (`logic.status_layer_front`: per level its
+- **Layers** (user design, 1058-1061): the `layered` mode (the
+  default; `refresh` is its primitive sibling, which keeps the level).
+  Each application is a (level, duration) layer; the instance keeps the front of them (`logic.status_layer_front`: per level its
   longest duration, a lower level only while it outlasts every higher
   one; None = permanent, the longest), in `STATUS_LAYERS_KEY`
   (`__layers`, `[[level, duration], ...]` highest level first) only while
@@ -1574,15 +1575,16 @@ hardcodes**.
   `_cap_live_status` caps every layer at max_level and collapses the
   layers (`settle_status_layers`) when any other write changed the level
   or duration: `status_set`, `!ent status set`, a counter set, a zone
-  grant's level. `add_level` / `extend` / `replace` collapse them to what
-  the instance shows first; `add_level`'s duration only grows (`replace`
-  is the one mode that shortens). Reads `status_layers(eid, name)`
+  grant's level. The other modes collapse them to what the instance
+  shows first; `refresh` and `add_level` only lengthen the duration
+  (`replace` is the one mode that shortens). Reads `status_layers(eid, name)`
   (loopable; one pair without layers, [] without the status), the
   `{layers}` placeholder (`×3 for 2, then ×1 for 3 more`, in the default
   status_line_format), the `!status apply` / `counter` replies. A
-  transfer onto a unit without the status carries the layers. A refresh
-  with a level passes resistance like add_level (`_resistance_applies`),
-  so each layer arrives resisted.
+  transfer onto a unit without the status carries the layers. A layered
+  application with a level passes resistance like add_level
+  (`_resistance_applies`), so each layer arrives resisted; refresh sets
+  no level, so resistance doesn't touch it.
 - **Rename / copy:** `!status rename` (`Match.rename_status`: the
   definition, live instances on units, parts and corpses (their parts
   too), other definitions' `removes` / `blocked_by`, and `status_immune` /
@@ -3665,7 +3667,7 @@ rejected already. Update this section in the PR that resolves an item.
   topic of debate (user: write it down).
 
 - **Status layers collapse on other writes** (user: acceptable for now,
-  a known gap): `add_level`, `extend`, `replace`, a direct write of the
+  a known gap): `refresh`, `add_level`, `extend`, `replace`, a direct write of the
   level or duration and a counter set collapse a layered status to the
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks

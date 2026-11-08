@@ -28065,8 +28065,8 @@ Expected: HARNESS-ALLOWS-ERRORS. What a status does when it arrives,
 leaves or changes lives in its definition (`!status hook`), run with
 self = the bearer after the on_status_* passives. Solis Endurance raises
 max hp and hp by 20 per level on arrival and takes the max hp back on
-removal, capping hp at the normal max. A refresh (the default stacking)
-that changes the instance fires on_changed with the new one: curse 2 for
+removal, capping hp at the normal max. A layered re-application (the
+default stacking) that changes the instance fires on_changed with the new one: curse 2 for
 5 outlasts curse 1 for 3, so it reads level 2 for 5.
 `removed_by` names why a status left, for
 the hook and for on_status_removed passives: dispel, transfer, removes
@@ -33519,7 +33519,7 @@ status change (on_changed fires; it kept level 1). Editing `zb`'s grant
 to level 5 without data reaches the unit already inside (level 5, power
 gone). Back in `za` alone, level 1. The bookkeeping keys stay out of `!ent
 info`. A permanent status stays permanent under every stack mode: a timed
-application of `hex` (refresh) is a layer above it (level 2 for 3 turns,
+application of `hex` (layered, the default) is a layer above it (level 2 for 3 turns,
 then back to the permanent level 1, the status lasting ∞), and one of
 `ward` (add_level, which still adds the level) leaves its duration at ∞; once `status_counter set` gives `ward` a
 duration, applications set it as before (5).
@@ -37225,7 +37225,7 @@ SCENARIO 1058 — Layered status stacking in real use: a burn DoT dealing its le
 !turn next
 !assert "entity['a'].hp == 11 and entity['b'].hp == 11 and not status_has('a', 'burn') and not status_has('b', 'burn')"
 
-Expected: `burn` keeps the default stack mode, refresh, which layers:
+Expected: `burn` keeps the default stack mode, layered:
 each application is a (level, duration) layer, and the status shows the
 highest level still running and the longest duration. Burn 3 for 2 then
 burn 1 for 5 (or the other way round) holds both layers, [[3, 2], [1,
@@ -37237,7 +37237,7 @@ Alpha's first turn 17 hp and [[3, 1], [1, 4]]; after its second the level
 turns each deal 3 + 3 + 1 + 1 + 1 = 9: both end at 11 hp and the burn is
 gone.
 
-SCENARIO 1059 — Re-applying never shortens: refresh keeps the longer duration and drops a dominated application, add_level only lengthens, replace still overwrites, and extend, a direct write or a counter set collapse the layers
+SCENARIO 1059 — Re-applying never shortens: layered keeps the longer duration and drops a dominated application, refresh and add_level only lengthen, replace still overwrites, and extend, a direct write or a counter set collapse the layers
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 !match new lr Refresh 6 6
 !match use lr
@@ -37269,7 +37269,7 @@ SCENARIO 1059 — Re-applying never shortens: refresh keeps the longer duration 
 !status stack burn extend
 !status apply a burn 1 2
 !assert "status_layers('a', 'burn') == [[3, 8]]"
-!status stack burn refresh
+!status stack burn layered
 !status apply a burn 1 10
 !assert "status_layers('a', 'burn') == [[3, 8], [1, 10]]"
 !ent status a set burn duration 4
@@ -37284,6 +37284,13 @@ SCENARIO 1059 — Re-applying never shortens: refresh keeps the longer duration 
 !status apply r burn 3 2
 !status apply r burn 4 5
 !assert "status_layers('r', 'burn') == [[2, 5]]"
+!status def mark
+!status stack mark refresh
+!status apply a mark 2 5
+!status apply a mark 3 2
+!assert "status_level('a', 'mark') == 2 and status_duration('a', 'mark') == 5"
+!status apply a mark 1 8
+!assert "status_level('a', 'mark') == 2 and status_duration('a', 'mark') == 8 and status_layers('a', 'mark') == [[2, 8]]"
 
 Expected: same level, the longer duration counts (2 for 5 then 2 for 3
 stays 2 for 5); a lower level for less time adds nothing; a higher one
@@ -37292,11 +37299,14 @@ lasts as long as the status already does. Under add_level the level
 rises each time and the duration only grows (4, then 4, then 6). Under
 replace an application overwrites both, so chill drops to 1 for 2.
 Switching burn to extend collapses its layers to what it shows (3 for 6)
-and adds the 2: 3 for 8. Back on refresh, a burn 1 for 10 layers again;
+and adds the 2: 3 for 8. Back on layered, a burn 1 for 10 layers again;
 a direct write of the duration collapses the layers to the level shown
 with the written duration, and so does a counter set. Resistance
 reduces each layered application's level: with 2 against burn, 3 for 2
-arrives as 1 for 2 and 4 for 5 as 2 for 5, which outlasts it.
+arrives as 1 for 2 and 4 for 5 as 2 for 5, which outlasts it. The
+primitive refresh mode (`mark`) keeps the level it has and only
+lengthens: 2 for 5, then 3 for 2 leaves 2 for 5, then 1 for 8 gives 2
+for 8, with no layers.
 
 SCENARIO 1060 — A layered status over a permanent one: the shorter higher layer runs out back to the permanent level, level entries and on_changed follow the level, max_level caps every layer, and an undo and a restart keep the layers
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------

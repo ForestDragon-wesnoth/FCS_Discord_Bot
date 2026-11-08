@@ -2921,7 +2921,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
     # Void cells: cells of a map's rectangle that don't exist.
     "is_void", "void_cells", "void_add", "void_remove",
-    # A status's layers (refresh stacking), [[level, duration], ...].
+    # A status's layers (layered stacking), [[level, duration], ...].
     "status_layers",
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
@@ -6377,7 +6377,7 @@ class FormulaEngine:
                     # collapse to the level shown.
                     e.status[name].pop(STATUS_LAYERS_KEY, None)
                 else:
-                    # Layers (refresh stacking) count down together; the
+                    # Layers (layered stacking) count down together; the
                     # level falls as the higher ones run out.
                     left, log = match.tick_status_layers(eid, name, amount)
                     match.surface_log(log)
@@ -6439,7 +6439,7 @@ class FormulaEngine:
         ns["is_status_immune"]    = _is_status_immune
         def _status_layers(eid_t: Any, name: Any) -> list:
             """status_layers(eid, name): the status's layers as [level,
-            duration] pairs, highest level first (refresh stacking: burn 3
+            duration] pairs, highest level first (layered stacking: burn 3
             for 2 turns plus burn 1 for 5 is [[3, 2], [1, 5]]); one pair
             for a status without layers, [] when the unit lacks it. A
             duration of None is permanent. Loopable."""

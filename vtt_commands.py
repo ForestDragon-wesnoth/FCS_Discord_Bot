@@ -11915,7 +11915,7 @@ registry.annotate_sub(
         "display <system> <name> [<format ...>] | "
         "when <system> <name> <turn_end|turn_start|round_start|round_end|never> | "
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
-        "stack <system> <name> <refresh|add_level|extend|replace|none> | "
+        "stack <system> <name> <layered|refresh|add_level|extend|replace|none> | "
         "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
         "resist_affects <system> <name> <level|duration|both|-> | "
         "resist_rounding <system> <name> <floor|ceil|round|-> | "
@@ -22156,7 +22156,7 @@ for _sub, _usage in (
         ("hook", "!status hook <name> <on_added|on_removed|on_changed> [<formula ...>]"),
         ("display", "!status display <name> [<format ...>]"),
         ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
-        ("stack", "!status stack <name> <refresh|add_level|extend|replace|none>"),
+        ("stack", "!status stack <name> <layered|refresh|add_level|extend|replace|none>"),
         ("maxlevel", "!status maxlevel <name> <n>"),
         ("data", "!status data <name> <path> <value>"),
         ("tags", "!status tags <name> <csv ...>"),
@@ -22246,7 +22246,8 @@ for _sub in ACTION_RESTRICTION_FIELDS:
 
 
 _TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end", "never")
-_STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
+_STACK_MODES = ("layered", "refresh", "add_level", "extend", "replace",
+                "none")
 # The `!status` subcommands that edit definitions, which `!system status`
 # runs on a system's library too: sub -> the words it needs.
 _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
