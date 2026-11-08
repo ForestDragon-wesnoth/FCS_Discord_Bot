@@ -1554,6 +1554,35 @@ hardcodes**.
   counters, `!ent status set` report the stored value), statuses a spawn /
   summon / transform brings (`_cap_unit_status_levels`); lowering it with
   `!status maxlevel` lowers live instances as status changes (740).
+- **Layers** (user design, 1058-1061): `refresh` (the default mode) is
+  layered. Each application is a (level, duration) layer; the instance
+  keeps the front of them (`logic.status_layer_front`: per level its
+  longest duration, a lower level only while it outlasts every higher
+  one; None = permanent, the longest), in `STATUS_LAYERS_KEY`
+  (`__layers`, `[[level, duration], ...]` highest level first) only while
+  there are two or more, and its own `level` / `duration` are the first
+  layer's level and the longest duration (`write_status_layers`). So burn
+  3 for 2 plus burn 1 for 5, either order, is level 3 for 2 turns, then
+  level 1 for 3 more; a re-application never shortens (a lower, shorter
+  one adds nothing). An application without a level is at the level
+  shown, without a duration it lasts as long as the status does now; a
+  permanent status keeps its permanent layer (L38), so a timed higher
+  application runs out back to it. A countdown on `duration`
+  (`status_counter_add`, `!status counter add`: `Match.tick_status_layers`)
+  ticks every layer, drops those reaching 0 (the level falls, one status
+  change), and removes the status (`expired`) with the last.
+  `_cap_live_status` caps every layer at max_level and collapses the
+  layers (`settle_status_layers`) when any other write changed the level
+  or duration: `status_set`, `!ent status set`, a counter set, a zone
+  grant's level. `add_level` / `extend` / `replace` collapse them to what
+  the instance shows first; `add_level`'s duration only grows (`replace`
+  is the one mode that shortens). Reads `status_layers(eid, name)`
+  (loopable; one pair without layers, [] without the status), the
+  `{layers}` placeholder (`×3 for 2, then ×1 for 3 more`, in the default
+  status_line_format), the `!status apply` / `counter` replies. A
+  transfer onto a unit without the status carries the layers. A refresh
+  with a level passes resistance like add_level (`_resistance_applies`),
+  so each layer arrives resisted.
 - **Rename / copy:** `!status rename` (`Match.rename_status`: the
   definition, live instances on units, parts and corpses (their parts
   too), other definitions' `removes` / `blocked_by`, and `status_immune` /
@@ -3634,6 +3663,13 @@ rejected already. Update this section in the PR that resolves an item.
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
   topic of debate (user: write it down).
+
+- **Status layers collapse on other writes** (user: acceptable for now,
+  a known gap): `add_level`, `extend`, `replace`, a direct write of the
+  level or duration and a counter set collapse a layered status to the
+  level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
+  3 for 5), and a transfer onto a unit already holding the status stacks
+  only that pair. A layer-aware version of each is open.
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose

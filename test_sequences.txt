@@ -28032,7 +28032,7 @@ SCENARIO 884 — Status definition hooks: on_added / on_removed / on_changed, an
 !status hook curse on_changed "entity[self].changes = new_value"
 !status apply u curse 1 3
 !status apply u curse 2 5
-!assert "entity[u].changes.level == 1 and entity[u].changes.duration == 5"
+!assert "entity[u].changes.level == 2 and entity[u].changes.duration == 5"
 !status dispel u curse
 ?? 'curse:dispel'
 !assert "status_has('v', 'curse') and not status_has('u', 'curse')"
@@ -28066,7 +28066,8 @@ leaves or changes lives in its definition (`!status hook`), run with
 self = the bearer after the on_status_* passives. Solis Endurance raises
 max hp and hp by 20 per level on arrival and takes the max hp back on
 removal, capping hp at the normal max. A refresh (the default stacking)
-that changes the duration fires on_changed with the new instance.
+that changes the instance fires on_changed with the new one: curse 2 for
+5 outlasts curse 1 for 3, so it reads level 2 for 5.
 `removed_by` names why a status left, for
 the hook and for on_status_removed passives: dispel, transfer, removes
 (another status's `removes`), expired (a counter reached 0, or the
@@ -33501,7 +33502,7 @@ SCENARIO 992 — A zone-held status follows its zones; a permanent status stays 
 !status def hex
 !status apply u hex
 !status apply u hex 2 3
-?? (level=1, duration=∞)
+?? (level=2, duration=∞: ×2 for 3, then ×1 permanently)
 !status def ward
 !status stack ward add_level
 !status apply u ward
@@ -33518,8 +33519,9 @@ status change (on_changed fires; it kept level 1). Editing `zb`'s grant
 to level 5 without data reaches the unit already inside (level 5, power
 gone). Back in `za` alone, level 1. The bookkeeping keys stay out of `!ent
 info`. A permanent status stays permanent under every stack mode: a timed
-application of `hex` (refresh) or `ward` (add_level, which still adds the
-level) leaves its duration at ∞; once `status_counter set` gives `ward` a
+application of `hex` (refresh) is a layer above it (level 2 for 3 turns,
+then back to the permanent level 1, the status lasting ∞), and one of
+`ward` (add_level, which still adds the level) leaves its duration at ∞; once `status_counter set` gives `ward` a
 duration, applications set it as before (5).
 
 SCENARIO 993 — Sizes in real use: a grapple limited by size steps, defaults by footprint, $() reads
@@ -37188,3 +37190,177 @@ is_void is a read (stored True), while void_add is banned and changes
 nothing; void_add off the rectangle is refused. A center resize to 9x7
 shifts everything by (1,1), the hole too; void_remove makes (5,4) a
 cell again.
+
+SCENARIO 1058 — Layered status stacking in real use: a burn DoT dealing its level each turn, burn 3 for 2 turns plus burn 1 for 5 (either order) burns 3, 3, 1, 1, 1, the level falling as the higher layer runs out
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new lb Layers 6 6
+!match use lb
+!ent add a Alpha 20 1 1 20
+!ent add b Beta 20 3 3 10
+!status def burn
+!status tick burn "entity[self].hp = entity[self].hp - status_level(self, 'burn')\nstatus_counter_add(self, 'burn', -1)"
+!status apply a burn 3 2
+!status apply a burn 1 5
+?? Applied `burn` to `a` (level=3, duration=5: ×3 for 2, then ×1 for 3 more)
+!status apply b burn 1 5
+!status apply b burn 3 2
+?? Applied `burn` to `b` (level=3, duration=5: ×3 for 2, then ×1 for 3 more)
+!assert "status_layers('a', 'burn') == [[3, 2], [1, 5]] and status_layers('b', 'burn') == [[3, 2], [1, 5]]"
+!assert "status_level('a', 'burn') == 3 and status_duration('a', 'burn') == 5"
+!ent info a short
+?? Status: burn ×3 (5): ×3 for 2, then ×1 for 3 more
+!turn next
+!turn next
+!assert "entity['a'].hp == 17 and status_layers('a', 'burn') == [[3, 1], [1, 4]]"
+!turn next
+!turn next
+!assert "entity['a'].hp == 14 and status_layers('a', 'burn') == [[1, 3]] and status_level('a', 'burn') == 1"
+!turn next
+!assert "entity['b'].hp == 14 and status_level('b', 'burn') == 1"
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!assert "entity['a'].hp == 11 and entity['b'].hp == 11 and not status_has('a', 'burn') and not status_has('b', 'burn')"
+
+Expected: `burn` keeps the default stack mode, refresh, which layers:
+each application is a (level, duration) layer, and the status shows the
+highest level still running and the longest duration. Burn 3 for 2 then
+burn 1 for 5 (or the other way round) holds both layers, [[3, 2], [1,
+5]], read as level 3, duration 5, and the status line spells it out. The
+tick deals the level as damage and counts down with
+status_counter_add(self, 'burn', -1), which ticks every layer: after
+Alpha's first turn 17 hp and [[3, 1], [1, 4]]; after its second the level
+3 layer has run out, 14 hp at level 1. Beta follows a turn behind. Five
+turns each deal 3 + 3 + 1 + 1 + 1 = 9: both end at 11 hp and the burn is
+gone.
+
+SCENARIO 1059 — Re-applying never shortens: refresh keeps the longer duration and drops a dominated application, add_level only lengthens, replace still overwrites, and extend, a direct write or a counter set collapse the layers
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new lr Refresh 6 6
+!match use lr
+!ent add a Alpha 20 1 1
+!status def burn
+!status apply a burn 2 5
+!status apply a burn 2 3
+!assert "status_layers('a', 'burn') == [[2, 5]]"
+!status apply a burn 1 4
+!assert "status_layers('a', 'burn') == [[2, 5]]"
+!status apply a burn 3 2
+!assert "status_layers('a', 'burn') == [[3, 2], [2, 5]]"
+!status apply a burn 2 6
+!assert "status_layers('a', 'burn') == [[3, 2], [2, 6]]"
+!status apply a burn 2
+!assert "status_layers('a', 'burn') == [[3, 2], [2, 6]]"
+!status def stun
+!status stack stun add_level
+!status apply a stun 1 4
+!status apply a stun 1 2
+!assert "status_level('a', 'stun') == 2 and status_duration('a', 'stun') == 4"
+!status apply a stun 1 6
+!assert "status_level('a', 'stun') == 3 and status_duration('a', 'stun') == 6"
+!status def chill
+!status stack chill replace
+!status apply a chill 2 5
+!status apply a chill 1 2
+!assert "status_level('a', 'chill') == 1 and status_duration('a', 'chill') == 2"
+!status stack burn extend
+!status apply a burn 1 2
+!assert "status_layers('a', 'burn') == [[3, 8]]"
+!status stack burn refresh
+!status apply a burn 1 10
+!assert "status_layers('a', 'burn') == [[3, 8], [1, 10]]"
+!ent status a set burn duration 4
+?? Set `a.burn.duration` = 4.
+!assert "status_layers('a', 'burn') == [[3, 4]]"
+!status apply a burn 1 10
+!status counter a burn set 3
+?? `a.burn`: level 3, duration 3.
+!assert "status_layers('a', 'burn') == [[3, 3]]"
+!ent add r Res 20 3 3
+!ent set_var r status_resist.burn 2
+!status apply r burn 3 2
+!status apply r burn 4 5
+!assert "status_layers('r', 'burn') == [[2, 5]]"
+
+Expected: same level, the longer duration counts (2 for 5 then 2 for 3
+stays 2 for 5); a lower level for less time adds nothing; a higher one
+for less time is a layer of its own; an application without a duration
+lasts as long as the status already does. Under add_level the level
+rises each time and the duration only grows (4, then 4, then 6). Under
+replace an application overwrites both, so chill drops to 1 for 2.
+Switching burn to extend collapses its layers to what it shows (3 for 6)
+and adds the 2: 3 for 8. Back on refresh, a burn 1 for 10 layers again;
+a direct write of the duration collapses the layers to the level shown
+with the written duration, and so does a counter set. Resistance
+reduces each layered application's level: with 2 against burn, 3 for 2
+arrives as 1 for 2 and 4 for 5 as 2 for 5, which outlasts it.
+
+SCENARIO 1060 — A layered status over a permanent one: the shorter higher layer runs out back to the permanent level, level entries and on_changed follow the level, max_level caps every layer, and an undo and a restart keep the layers
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new lp Perm 6 6
+!match use lp
+!ent add a Alpha 20 1 1
+!status def might
+!status level might 1+ bonus 1
+!status level might 3+ bonus 10
+!status hook might on_changed "match_var_set('changes', match_var_get('changes', 0) + 1)"
+!status apply a might 1
+!status apply a might 3 2
+?? Applied `might` to `a` (level=3, duration=∞: ×3 for 2, then ×1 permanently)
+!assert "status_layers('a', 'might') == [[3, 2], [1, None]] and status_duration('a', 'might') == None"
+!assert "status_get('a', 'might', 'bonus') == 10 and match_var_get('changes') == 1"
+!status counter a might add -1
+?? `a.might`: ×3 for 1, then ×1 permanently.
+!undo command
+!assert "status_layers('a', 'might') == [[3, 2], [1, None]]"
+!as restart
+!match use lp
+!assert "status_layers('a', 'might') == [[3, 2], [1, None]]"
+!status maxlevel might 2
+!assert "status_layers('a', 'might') == [[2, 2], [1, None]] and status_level('a', 'might') == 2"
+!status counter a might add -2
+?? `a.might`: level 1, duration ∞.
+!assert "status_layers('a', 'might') == [[1, None]] and status_get('a', 'might', 'bonus') == 1 and status_has('a', 'might')"
+
+Expected: might 1 with no duration is permanent; might 3 for 2 on top
+is a layer, so the status reads level 3, permanent, until that layer
+runs out. The level entries follow the level (bonus 10 at 3+), and the
+on_changed hook fired once for the new layer. A countdown leaves the
+permanent layer alone. An undo puts the layers back, and they survive a
+restart. Lowering max_level to 2 caps every layer. When the level 3
+(now 2) layer runs out, the status falls back to the permanent level 1:
+bonus 1, still held.
+
+SCENARIO 1061 — Layers across bodies, transfers and formulas: a 2x2 body's part redirects its burns to the parent, which layers them; a transfer carries the layers; status_layers in $() and loops
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new lm Bodies 8 8
+!match use lm
+!ent add golem Golem 40 2 2
+!ent set_vars golem footprint_w=2 footprint_h=2
+!part add golem garm arm 10 10
+!system set default part_status_redirect burn
+!status def burn
+!status apply garm burn 3 2
+!status apply garm burn 1 5
+!assert "status_layers('golem', 'burn') == [[3, 2], [1, 5]] and status_layers('garm', 'burn') == []"
+!ent add z Zed 20 6 6
+!status transfer golem z burn
+!assert "status_layers('z', 'burn') == [[3, 2], [1, 5]] and not status_has('golem', 'burn')"
+!ent set_var z layers "$(len(status_layers('z','burn')))"
+!assert "entity['z'].layers == 2"
+!eval "total = 0\nfor pair in status_layers('z', 'burn'):\n    total = total + get(pair, 0)\nmatch_var_set('lv', total)"
+!assert "match_var_get('lv') == 4"
+!ent set_var z x "$(status_counter_add('z','burn',-1))"
+?? banned in a $() inline argument
+!assert "status_layers('z', 'burn') == [[3, 2], [1, 5]]"
+HARNESS-ALLOWS-ERRORS
+
+Expected: the golem is a 2x2 body; its arm redirects burn to it, so both
+applications land on the golem and layer there ([[3, 2], [1, 5]]); the
+arm holds none. A transfer moves the status with its layers onto Zed.
+status_layers is a read: `$()` stores its length, and a loop over it
+sums the levels (4). The countdown is a mutator, banned in `$()`, and
+changes nothing.

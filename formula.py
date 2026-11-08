@@ -2921,6 +2921,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
     # Void cells: cells of a map's rectangle that don't exist.
     "is_void", "void_cells", "void_add", "void_remove",
+    # A status's layers (refresh stacking), [[level, duration], ...].
+    "status_layers",
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
     "atb_threshold", "atb_rate",
@@ -3090,6 +3092,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "is_void", "void_cells",
+    "status_layers",
     'watch_exists', 'watchers_of',
     'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
     'map_carrier', 'inner_maps', 'outer_map',
@@ -3350,7 +3353,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
     "prefab_names", "size_categories", "next_turns", "extra_turn_queue",
-    "void_cells",
+    "void_cells", "status_layers",
     "range",
     "each",
     "keys",
@@ -6366,6 +6369,20 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
+            from logic import status_layers_of, STATUS_LAYERS_KEY
+            if field == "duration" and status_layers_of(
+                    e.status[name]) is not None:
+                if absolute:
+                    # A set gives the status one duration: the layers
+                    # collapse to the level shown.
+                    e.status[name].pop(STATUS_LAYERS_KEY, None)
+                else:
+                    # Layers (refresh stacking) count down together; the
+                    # level falls as the higher ones run out.
+                    left, log = match.tick_status_layers(eid, name, amount)
+                    match.surface_log(log)
+                    self._note_affected(eid)
+                    return left
             # The current value reads through the level entries (user call,
             # S14): a level entry's `duration: 5` or `charges: 3` counts down
             # from 5 / 3, and the result is the instance's own key from then
@@ -6420,6 +6437,25 @@ class FormulaEngine:
         ns["statuses_with_tag"]   = _statuses_with_tag
         ns["status_resist_of"]    = _status_resist_of
         ns["is_status_immune"]    = _is_status_immune
+        def _status_layers(eid_t: Any, name: Any) -> list:
+            """status_layers(eid, name): the status's layers as [level,
+            duration] pairs, highest level first (refresh stacking: burn 3
+            for 2 turns plus burn 1 for 5 is [[3, 2], [1, 5]]); one pair
+            for a status without layers, [] when the unit lacks it. A
+            duration of None is permanent. Loopable."""
+            eid = _eid(eid_t)
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            if not isinstance(name, str):
+                raise FormulaError("status_layers(eid, name): name must be "
+                                   "a string.")
+            if name not in e.status:
+                return []
+            return [list(x) for x in match.status_layers(e.status[name],
+                                                         name)]
+
+        ns["status_layers"]       = _status_layers
         ns["status_counter_add"]  = _status_counter_add
         ns["status_counter_set"]  = _status_counter_set
 

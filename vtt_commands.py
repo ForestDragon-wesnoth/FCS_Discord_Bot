@@ -16,6 +16,7 @@ from logic import (
 )
 
 # Passive system
+from logic import STATUS_LAYERS_KEY, status_layers_of
 from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
@@ -2697,9 +2698,28 @@ def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
             sdef = defs.get(name)
             fmt = sdef.get("display") if isinstance(sdef, dict) else None
         ctx["name"] = name
+        ctx.pop(STATUS_LAYERS_KEY, None)
+        if status_layers_of(inst) is not None:
+            ctx["layers"] = status_layers_text(status_layers_of(inst))
         out.append(_render_template(fmt if isinstance(fmt, str) and fmt
                                     else str(default), ctx))
     return ", ".join(out)
+
+
+def status_layers_text(layers: List[List[Any]]) -> str:
+    """Layers as read in a status line: `×3 for 2, then ×1 for 3 more`
+    (`... then ×1 permanently` for a permanent last layer)."""
+    parts = []
+    prev = 0
+    for i, (lv, du) in enumerate(layers):
+        if du is None:
+            parts.append(f"×{lv} permanently")
+        elif i == 0:
+            parts.append(f"×{lv} for {du}")
+        else:
+            parts.append(f"×{lv} for {du - prev} more")
+        prev = du if du is not None else prev
+    return ", then ".join(parts)
 
 
 def _entity_template_context(e: Entity,
@@ -22906,6 +22926,9 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if op not in ("add", "set"):
             return await ctx.send("❌ op must be `add` or `set`.")
         prim = "status_counter_add" if op == "add" else "status_counter_set"
+        pe = m.entities.get(eid)
+        had_layers = (field == "duration" and pe is not None
+                      and status_layers_of(pe.status.get(sname)) is not None)
         try:
             new = FormulaEngine(m).eval_expression(
                 f"{prim}('{eid}', '{sname}', {value}, '{field}')",
@@ -22915,6 +22938,18 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e = m.entities.get(eid)
         gone = e is None or sname not in e.status
         tail = " (status removed at <=0)" if gone else ""
+        layers = (status_layers_of(e.status[sname])
+                  if not gone and field == "duration" else None)
+        if layers is not None:
+            return await ctx.send(f"`{eid}.{sname}`: "
+                                  f"{status_layers_text(layers)}.")
+        if had_layers and not gone:
+            # The higher layers ran out: one layer is left.
+            inst = e.status[sname]
+            du = m.status_field(inst, sname, "duration")
+            return await ctx.send(
+                f"`{eid}.{sname}`: level {m.status_level(inst)}, "
+                f"duration {'∞' if du is None else du}.")
         if new is None:
             return await ctx.send(f"`{eid}.{sname}` has no {field}: it is "
                                   f"permanent (∞) and stays so; `set` gives "
@@ -23082,10 +23117,13 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         inst = e.status.get(name, {})
         # The duration as the status reads it, level entries included (S14).
         dur = m.status_field(inst, name, "duration")
+        layers = status_layers_of(inst)
         return await ctx.send(
             f"{verb} `{name}` to `{eid}` "
             f"(level={inst.get('level', '?')}, "
-            f"duration={'∞' if dur is None else dur}).{tail}"
+            f"duration={'∞' if dur is None else dur}"
+            + (f": {status_layers_text(layers)}" if layers else "")
+            + f").{tail}"
         )
 
     return await _help_fallback(ctx, ["status"], args[0] if args else None)
