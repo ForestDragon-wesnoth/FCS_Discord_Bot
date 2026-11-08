@@ -5400,13 +5400,31 @@ class FormulaEngine:
                 f"ally, same_team, attackable."
             )
 
-        def _candidates(ref_eid: str, relation: str):
+        def _candidates(ref_eid: str, relation: str, within: Any = None):
             """Yield (other_eid, entity) for every ALIVE entity other than
-            ref_eid that passes the relation filter."""
+            ref_eid that passes the relation filter. `within` (a number)
+            limits it to the units whose body may lie within that distance
+            of the reference's, read from the unit index (a distance in any
+            metric is at least the square-radius gap)."""
             ref_e = match.entities.get(ref_eid)
             if ref_e is None:
                 raise FormulaError(f"unknown entity id '{ref_eid}'.")
-            for oid, oe in match.entities.items():
+            pool = match.entities.items()
+            if within is not None and ref_e.map in match.maps \
+                    and math.isfinite(within):
+                r = max(-1, int(math.floor(within)))
+                bx, by, bw, bh = match.body_box(ref_e)
+                mp = match.maps[ref_e.map]
+                x1, y1 = max(1, bx - r), max(1, by - r)
+                x2 = min(mp.grid_width, bx + bw - 1 + r)
+                y2 = min(mp.grid_height, by + bh - 1 + r)
+                if r < 0 or x1 > x2 or y1 > y2:
+                    pool = ()
+                elif (x2 - x1 + 1) * (y2 - y1 + 1) <= 4 * len(match.entities):
+                    pool = [(oid, match.entities[oid])
+                            for oid in match._spatial.in_rect(
+                                match, ref_e.map, x1, y1, x2, y2)]
+            for oid, oe in pool:
                 if oid == ref_eid or oe.map != ref_e.map:
                     continue
                 if not oe.is_alive:
@@ -5448,8 +5466,9 @@ class FormulaEngine:
                 raise FormulaError(
                     "entities_within(...): relation must be a string."
                 )
+            match._rect_gap(1, 1, 1, 1, 1, 1, 1, 1, mode)   # a known metric
             scored = []
-            for oid, oe, ref_e in _candidates(eid, relation):
+            for oid, oe, ref_e in _candidates(eid, relation, n):
                 d = _ent_dist(ref_e, oe, mode)
                 if d <= n:
                     scored.append((d, oid))
@@ -9608,33 +9627,42 @@ class FormulaEngine:
             ve = match.entities.get(vid) if vid else None
             return match.map_of(ve) if ve is not None else _cur_map()
 
+        def _on_board(e) -> bool:
+            # Glued parts and hidden riders are left out of the spatial
+            # searches (reach them with parts() / riders()).
+            return e.is_alive and not e.is_glued_part \
+                and not e.is_hidden_rider
+
         def _alive_at(cellset, mp=None):
             # Footprint-aware membership: a large entity is "in" the shape
             # if ANY cell it covers is in cellset (listed once, by anchor).
-            # Only units on the shape's map (the formula's map).
-            # Glued parts and hidden riders are left out, as in
-            # entities_in_area / entities_at (reach them with parts() /
-            # riders()).
+            # Only units on the shape's map (the formula's map), read from
+            # the unit index (the shape's cells, not every unit).
             mname = (mp or _cur_map()).name
-            return [(e.x, e.y, eid) for eid, e in match.entities.items()
-                    if e.is_alive and e.map == mname
-                    and not e.is_glued_part and not e.is_hidden_rider
-                    and any(c in cellset for c in match.entity_cells(e))]
+            out = []
+            for eid in match._spatial.in_cells(match, mname, cellset):
+                e = match.entities[eid]
+                if _on_board(e):
+                    out.append((e.x, e.y, eid))
+            return out
 
-        def _occupants(mp=None) -> dict:
-            # Footprint-aware: a large entity registers under EVERY cell it
-            # covers, so it's "on the line" / "in the way" if any part of
-            # its body is. Consumers dedupe across cells. Only units on map
-            # `mp` (the formula's map by default); glued parts and hidden
-            # riders are left out, as in _alive_at.
-            mname = (mp or _cur_map()).name
-            here: dict = {}
-            for eid, e in match.entities.items():
-                if e.is_alive and e.map == mname and not e.is_glued_part \
-                        and not e.is_hidden_rider:
-                    for c in match.entity_cells(e):
-                        here.setdefault(c, []).append(eid)
-            return here
+        class _Occupants:
+            # The units on each cell of map `mp`, read from the unit index
+            # when asked: a large entity is on EVERY cell it covers, so it's
+            # "on the line" / "in the way" if any part of its body is.
+            # Consumers dedupe across cells.
+            __slots__ = ("mname",)
+
+            def __init__(self, mp=None):
+                self.mname = (mp or _cur_map()).name
+
+            def get(self, cell, default=None):
+                ids = [eid for eid in match._spatial.at(
+                           match, self.mname, cell[0], cell[1])
+                       if _on_board(match.entities[eid])]
+                return ids or default
+
+        _occupants = _Occupants
 
         def _entities_in_line_ignorelos(x1: Any, y1: Any,
                                         x2: Any, y2: Any) -> list:
@@ -10183,11 +10211,10 @@ class FormulaEngine:
             other spatial queries. Loopable."""
             cx = _cell_arg(x, "entities_at", "x")
             cy = _cell_arg(y, "entities_at", "y")
-            mname = _cur_map().name
-            return [e.id for e in match.entities_in_turn_order()
-                    if e.is_alive and not e.is_glued_part
-                    and not e.is_hidden_rider and e.map == mname
-                    and (cx, cy) in match.entity_cells(e)]
+            ids = [eid for eid in match._spatial.at(
+                       match, _cur_map().name, cx, cy)
+                   if _on_board(match.entities[eid])]
+            return match.in_turn_order(ids)
 
         ns["zone_distance"] = _zone_distance
         ns["entities_at"] = _entities_at
