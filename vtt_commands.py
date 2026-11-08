@@ -1210,7 +1210,7 @@ class CommandRegistry:
                 and pre_active_mid is not None
                 and pre_active_mid in mgr.matches):
             m_pre = mgr.matches[pre_active_mid]
-            if (int(m_pre.rules.get("autosave_command_retention_turns", 3)) != 0
+            if (int(m_pre.rules.get("autosave_command_retention_turns", 10)) != 0
                     and getattr(m_pre, "_action_depth", 0) == 0):
                 pre_state = m_pre.to_dict(include_history=False)
         # The command journal (journal.py): the channel's match before the
@@ -1613,7 +1613,7 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
              "by": COMMAND_USER.get() or "", "uid": ctx_user(ctx),
              "ch": ctx.channel_key, "cmd": [typed] + list(typed_args),
              "rng": [jrng[0], jrng[1], post_m.rng_position()],
-             "hash": state_hash(post),
+             "hash": state_hash(post, post_m),
              # The author's server authority: a replay runs the command with
              # no more than this (lines it refused live stay refused).
              "auth": _auth_record(ctx)}
@@ -1936,7 +1936,7 @@ def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
         if m is None or m.journal is None or mid == _REPLAYING.get():
             continue
         post = m.to_dict(include_history=False)
-        if state_hash(post) == m.journal.last_state_hash():
+        if state_hash(post, m) == m.journal.last_state_hash():
             continue    # only what an undo leaves alone moved (the RNG)
         m.journal.add({"kind": "state", "at": _now_iso(),
                        "by": getattr(mgr, "_journal_by", "") or "",
@@ -1944,7 +1944,7 @@ def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
                        "rng": [effective_seed(m), m.rng_position(),
                                m.rng_position()],
                        "state": journal_state(post),
-                       "hash": state_hash(post)})
+                       "hash": state_hash(post, m)})
 
 
 # Whether this asyncio task holds its manager's command lock (see run()).
@@ -2117,7 +2117,8 @@ def _journal_systems(mgr: MatchManager, ctx: ReplyContext,
                        # The match after the edit (a var-name rule moved
                        # its units' vars), so a restart compares the load
                        # with it (J16).
-                       "hash": state_hash(m.to_dict(include_history=False))})
+                       "hash": state_hash(m.to_dict(include_history=False),
+                                          m)})
         handled = getattr(mgr, "_journal_handled", None)
         if handled is not None:
             handled.add(mid)
@@ -4385,6 +4386,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 # Off = reset: drop the map's remembered cells (render
                 # falls back to current vision only).
                 mp.explored.clear()
+                mp.runs_changed("explored")
             return await ctx.send(
                 f"Fog memory **{'on' if want else 'off'}** for {where}.")
         m.set_map_setting(mp, "fog", want)
@@ -7005,7 +7007,7 @@ def _crash_rollback(mgr: MatchManager, mid: Optional[str],
     if pre is None:
         # W9: with command autosaves and the journal both off there is no
         # state from before the command to put back.
-        if int(m.rules.get("autosave_command_retention_turns", 3)) != 0 \
+        if int(m.rules.get("autosave_command_retention_turns", 10)) != 0 \
                 or journal_limit(m) != 0:
             return ""
         return (f"\n⚠️ Match `{mid}` kept no state from before the command "
@@ -18788,6 +18790,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         p = Passive.from_dict(src.passives[args[2]].to_dict())
         p.id = pid
         dest.passives[pid] = p
+        dest.mark_changed()
         return await ctx.send(f"Copied passive `{args[2]}` from `{src.id}` to "
                               f"`{dest.id}` as `{pid}`.")
 
@@ -18837,6 +18840,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             target=target_val, scope=scope_val, priority=prio,
             extra_turns=xturns,
         )
+        e.mark_changed()
         # Mention target/scope in the ack only for var hooks where they apply
         scope_note = ""
         from logic import VAR_HOOKS
@@ -18855,6 +18859,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if p is None:
             raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
         p.priority = checked_priority(args[3], "priority")
+        m.entities[eid].mark_changed()
         return await ctx.send(f"Passive `{eid}.{p.id}` now has priority "
                               f"{p.priority} (higher runs first).")
 
@@ -18870,6 +18875,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if p is None:
             raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
         p.extra_turns = _extra_turns_word(args[3], "extra_turns")
+        m.entities[eid].mark_changed()
         return await ctx.send(f"Passive `{eid}.{p.id}` on extra turns: "
                               f"{_extra_turns_text(p.extra_turns)}.")
 
@@ -18884,6 +18890,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pid not in e.passives:
             raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
         del e.passives[pid]
+        e.mark_changed()
         return await ctx.send(f"Removed passive `{pid}` from `{eid}`.")
 
     if sub == "list":
@@ -19228,6 +19235,7 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Remove it first with !clamp remove, or replace by remove+add."
             )
         e.clamps[path] = spec
+        e.mark_changed()
         # A bound path the unit doesn't hold reads as "no bound" until it
         # does: say so, so a typo (`max_hpp`) doesn't leave it unbounded
         # unnoticed.
@@ -19250,6 +19258,7 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if path not in e.clamps:
             raise NotFound(f"No clamp on '{path}' for entity '{eid}'.")
         del e.clamps[path]
+        e.mark_changed()
         return await ctx.send(f"Removed clamp on `{eid}.{path}`.")
 
     if sub == "list":
@@ -21293,6 +21302,17 @@ registry.annotate_sub(
     ),
 )
 async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    try:
+        return await _zone_cmd(ctx, args, mgr)
+    finally:
+        # Its subcommands edit zones in place in many ways: every zone of
+        # the channel's match is serialized again (Map.ser_zones).
+        m = mgr.matches.get(mgr.active_by_channel.get(ctx.channel_key) or "")
+        for mp in (m.maps.values() if m is not None else ()):
+            mp.zones.changed = None
+
+
+async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["zone"])
         return await ctx.send(f"**{title}**\n{body}")

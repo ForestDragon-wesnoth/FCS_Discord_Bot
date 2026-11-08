@@ -1619,6 +1619,7 @@ async def run_action(
             if action.full_path not in paths \
                     and len(paths) < ACTIONS_USED_MAX:
                 paths.append(action.full_path)
+                holder.mark_changed()
     # Successful completion. Fire the on_action_used hook AFTER the
     # body's writes have settled (so a passive observing this hook
     # sees post-action state).

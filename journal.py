@@ -69,13 +69,15 @@ def journal_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in state.items() if k != "rules"}
 
 
-def state_hash(state: Dict[str, Any]) -> str:
+def state_hash(state: Dict[str, Any], match: Any = None) -> str:
     """A short hash of what an undo restores in `state` (bar the match id:
     a replay may rename it), to tell where a replay stops matching the
-    recording."""
+    recording. `match`: the match the state was just taken from, whose
+    cached piece texts make it cheap (logic.state_text)."""
+    from logic import state_text
     body = {k: v for k, v in state.items()
             if k not in UNDO_IGNORED and k != "id"}
-    text = json.dumps(body, sort_keys=True, default=str)
+    text = state_text(body, match, sort=True)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 

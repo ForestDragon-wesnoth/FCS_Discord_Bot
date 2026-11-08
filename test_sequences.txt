@@ -37957,3 +37957,173 @@ into the troll's form, takes the troll's 400 (huge). Bob's arm at 0 hp,
 detached, dies as a free unit while its size is first derived: its
 corpse holds the total and the category (medium, from the default 100).
 The undo puts the arm back on Bob, and his total is right again.
+
+
+SCENARIO 1075 — Turn and command autosaves are diffs (#197): undo after a restart lands exactly, a 2x2 body, tiles, a zone and a corpse included
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new dz DZ 10 8
+!match use dz
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add imp Imp 5 8 2 3
+!tile set 5 5 mud 1
+!zone new bog
+!zone fill bog 6 6 7 7
+!turn next
+!ent tp ogre 4 4
+!tile set 5 6 mud 2
+!zone set bog depth 3
+!ent kill imp
+!ent set_var ogre bag.gold 12
+!as restart
+!assert "has_corpse('imp') and entity[ogre].bag.gold == 12"
+!undo command 3 confirm
+?? Undid 3 command(s)
+!assert "entity[ogre].x == 4 and entity[ogre].y == 4 and not var_has('ogre', 'bag')" the 2x2 ogre stands where it was moved
+!assert "entity[imp].hp == 5 and not has_corpse('imp') and tile_get(5, 6, 'mud') == 2 and not zone_has('bog', 'depth')"
+!as restart
+!undo turn 1 confirm
+?? Undid 1 turn(s)
+!assert "entity[ogre].x == 2 and not tile_has(5, 6, 'mud') and tile_get(5, 5, 'mud') == 1 and footprint_cells('ogre') == [[2, 2], [3, 2], [2, 3], [3, 3]]"
+!assert "zone_size('bog') == 4 and cell_in_zone(6, 6, 'bog') and cell_in_zone(7, 7, 'bog')"
+
+Expected: every turn and command autosave after the first is stored as
+what changed since the autosave before it (a round autosave is a full
+copy). After a restart the snapshots are read back from disk through
+that chain: `!undo command 3` takes back the gold, the imp's death
+(its corpse is gone, the imp alive at 5 hp) and the zone's depth, and
+keeps the move and the second tile. After another restart `!undo turn 1`
+goes back to the start of the turn: the 2x2 ogre at (2,2) with its four
+cells, only the first tile, the zone's four cells.
+
+
+SCENARIO 1076 — Pruned autosaves merge into the next one (#197): undo still lands exactly; a round autosave pruned makes the next one full
+------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new pm PM 8 6
+!match use pm
+!system set default autosave_command_retention_max 2
+!system set default autosave_round_retention 1
+!ent add a A 20 1 1 5
+!ent add b B 20 3 1 4
+!ent hp a -1
+!ent hp a -2
+!ent hp a -3
+!ent hp a -4
+!history list
+?? Commands: 2 snapshot(s)
+!as restart
+!undo command 2 confirm
+?? Undid 2 command(s)
+!assert "entity[a].hp == 17" the snapshot before the -3, its older ones merged into it
+!turn next
+!ent hp b -1
+!turn next
+!ent hp a -5
+!turn next
+!ent hp b -2
+!history list
+?? Rounds: 1 snapshot(s) (round 2)
+!as restart
+!undo round 1 confirm
+?? Undid 1 round(s)
+!assert "entity[a].hp == 12 and entity[b].hp == 19"
+!undo turn 2 confirm
+?? Undid 2 turn(s)
+!assert "entity[a].hp == 17 and entity[b].hp == 20"
+
+Expected: with two command autosaves kept, each command prunes the
+oldest one and its diff merges into the next: after four hits on a (20
+-> 19 -> 17 -> 14 -> 10) the two kept snapshots are the states before
+the -3 and before the -4, and after a restart `!undo command 2` lands on
+the older, a at 17. With one round autosave kept, the round 1 snapshot
+goes when round 2 starts, so the turn autosaves of round 1, diffs that
+built on it, are rebuilt on what is left. After a restart `!undo round
+1` lands on the start of round 2 (a 12, b 19) and `!undo turn 2` on the
+start of round 1 (a 17, b 20).
+
+
+SCENARIO 1077 — A lost diff file drops the autosaves building on it (#197); the ones before it still undo
+----------------------------------------------------------------------------------------------------------
+
+!match new lf Lf 6 6
+!match use lf
+!ent add u U 10 1 1
+!ent hp u -1
+!ent hp u -1
+!ent hp u -1
+?file delete matches/lf/history/3.json
+!as restart
+!history list
+?? Commands: 2 snapshot(s)
+!undo command 1 confirm
+?? Undid 1 command(s)
+!assert "entity[u].hp == 10"
+
+Expected: HARNESS-ALLOWS-ERRORS. Autosave 3 is a diff against 2, and 4
+a diff against 3. With 3's file gone, the load drops 3 and 4 (4 can't be
+rebuilt without 3) with a console note; snapshots 1 and 2 remain, and
+`!undo command 1` restores 2: the unit before its first hit, 10 hp.
+
+
+SCENARIO 1078 — The event log in diff autosaves (#197): trimmed from the front, undone exactly
+----------------------------------------------------------------------------------------------
+
+!match new el El 6 6
+!match use el
+!system set default event_log_retention 3
+!ent add u U 30 1 1 5
+!log clear
+!ent hp u -1
+!ent hp u -2
+!ent hp u -3
+!ent hp u -4
+!ent hp u -5
+!log
+?? took 3 damage
+?! took 2 damage
+!as restart
+!undo command 2 confirm
+?? Undid 2 command(s)
+!log
+?? took 1 damage
+?? took 3 damage
+?! took 4 damage
+
+Expected: the event log keeps its newest three entries, and a diff
+autosave stores only the entries added and how many fell off the front.
+After five hits the log holds the hits of 3, 4 and 5. After a restart,
+undoing two commands restores the log as it was before the hit of 4:
+the hits of 1, 2 and 3.
+
+
+SCENARIO 1079 — Edits made in place reach the save (#197): tile template rename, zone face, map rename, status rename on a corpse
+---------------------------------------------------------------------------------------------------------------------------------
+
+!match new ip Ip 8 6
+!match use ip
+!map new cellar 4 4
+!tile def new spikes map=main
+!tile place spikes 2 2 map=main
+!tile def rename spikes thorns
+!zone new gust map=main
+!zone fill gust 4 4 5 5
+!zone face gust right
+!ent add d D 10 6 3 map=main
+!eval "entity[d].home = [2, 2, 'cellar']"
+!status def burn
+!status apply d burn 1
+!ent kill d
+!status rename burn fire
+!map rename cellar basement
+!as restart
+!assert "tile_template_of(2, 2, map='main') == 'thorns' and zone_facing('gust') == 'right'"
+!assert "corpse_status_has('d', 'fire') and not corpse_status_has('d', 'burn')"
+!assert "corpse_var('d', 'home') == [2, 2, 'basement']"
+
+Expected: each of these edits changes data the save had already
+serialized (tile data, a zone, a corpse lying in a tile): the tile's
+template name, the zone's facing, the corpse's status name and the map
+name inside the corpse's var. Each marks what it changed, so the save
+writes it: after a restart all four read back as edited.

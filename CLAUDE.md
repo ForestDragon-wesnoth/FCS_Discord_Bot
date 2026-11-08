@@ -333,6 +333,15 @@ Each of these was learned from a shipped bug.
   spatial index (`match._spatial.touch(eid)`, `mp.zone_touch(name)`,
   `mp.note_corpse(x, y)`, §7.1) and run the regression under
   `FCS_SPATIAL_CHECK=1`.
+- **A path that changes a unit, tile, zone, fog memory, a reveal or voids
+  IN PLACE** (anything but a field assignment on an Entity, `write_var` /
+  `remove_var` or `_emit_status_diff`: a direct `e.vars[...]` / `e.status`
+  / `e.passives` edit, a write into a dict read from `mp.tiles` or
+  `mp.zones`, a corpse edited where it lies): mark the serialization cache
+  (`e.mark_changed()`, `mp.tile_touch(x, y)` or `mp.note_corpse(x, y)`,
+  `mp.zone_changed(name)`, `mp.runs_changed(kind)`, §7.16 "Serialization
+  caches") and run the regression under `FCS_SPATIAL_CHECK=1`, which
+  compares every cached piece with a fresh build on every use.
 - **A change to server-wide state outside the systems** (a file, the
   template library, a deleted match): call `audit_note(...)` so `!server
   audit` names it.
@@ -388,7 +397,8 @@ back, load the schema with `ToolSearch` before calling
   `_sync_dispatch` (the sync formula engine dispatching async commands).
 - **`match_history.py`**: undo snapshots (round / turn / command / manual).
   `Snapshot.state` is `Match.to_dict(include_history=False)`, read lazily
-  from disk once persisted.
+  from disk once persisted; a turn or command autosave is stored as a diff
+  against the autosave before it (§7.16 "Undo").
 - **`storage.py`**: the data folder on disk (§3 "Persistence").
 - **`journal.py`**: the per-match command journal (segments, entries, the
   state hash, the export bundle); recorded from `CommandRegistry._run`,
@@ -857,7 +867,12 @@ Every class below shipped at least once and was fixed in an audit pass
   (vars, statuses, tiles, zones, turn_order, rules, ...); every store goes
   through `_own_value`. When live state looks right but a restored one
   doesn't, suspect aliasing before the writer. Also: an undo / restore REPLACES
-  the Match object in `mgr.matches`, so re-fetch it after one.
+  the Match object in `mgr.matches`, so re-fetch it after one. The flip side
+  since the serialization caches (§7.16): `Match.to_dict` SHARES each unit's,
+  tile's and zone's serialized dict with every state built since (undo
+  snapshots, rollback states, diffs), so nothing may change a state in place;
+  a reader that edits takes a copy (`jcopy`; `from_dict` copies), and
+  `FCS_SPATIAL_CHECK=1` raises when a shared piece changed.
 - **Ghost firing (a unit removed mid-operation).** A hook or tick that kills
   or removes the unit, after which the code keeps acting on it: own passives
   firing after a global handler removed the unit, the remaining statuses of a
@@ -1022,7 +1037,19 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   harness wrapping `CommandRegistry.run` that compares the unit, zone
   and corpse indexes of every match with a full scan after EVERY command
   of every scenario (0 differences when it shipped; it reports dozens
-  with the marking stubbed out).
+  with the marking stubbed out). The same switch checks the serialization
+  caches (§7.16): every cached unit, tile, zone and cell-run piece against
+  a fresh build and the copy taken when it was made, and `state_text`
+  against `json.dumps`.
+- **Diff undo model** (#197): random commands (moves, hp, tiles, zones,
+  kills, revives, spawns, removals, undos of each kind, `!dry`, `!batch
+  strict`, manual saves, restarts) under random retention rules; a hash of
+  every snapshot's state (plus unit, tile and zone order) recorded when it
+  was taken, compared with the state read back through its diff chain
+  after every command (81,790 reads, 0 differences when it shipped; a
+  stubbed-out merge fails at once). Pair it with a direct test of
+  `compose_state_diffs` on random add / remove / re-add sequences, which
+  the game rarely produces (a broken unit order fails it).
 - **Memory-equals-disk chaos** (storage work): reload the data folder into
   fresh workspaces after every command and compare every match, history index
   and snapshot state, channel pointers and systems.
@@ -3014,6 +3041,24 @@ hardcodes**.
   load is all-or-nothing); `!history export/import` (a snapshot from another
   match restores only the board: the match keeps its id, name, hosts and
   system, and the units take its var names).
+- **Serialization caches** (#197, 1079): `Match.to_dict` builds a state
+  from cached pieces, shared (never changed in place, §5 "Aliasing"): each
+  unit's `Entity.ser_dict` (rebuilt after `mark_changed`: any field set,
+  `_set_path` / `_del_path`, `_emit_status_diff`, and the direct engine
+  edits of vars, passives, clamps, statuses and `actions_seen`), each
+  map's `ser_tiles` (per cell; `Map.tiles` is a `TileDict`, which records
+  the cells set, replaced, removed or handed out by `setdefault`, and a
+  write into a tile's dict calls `tile_touch` / `note_corpse`), `ser_zones`
+  (per zone; `Map.zones` is a `ZoneTable`; `zone_touch` / `zone_changed`;
+  every `!zone` command re-serializes the channel match's zones) and the
+  row runs of fog memory, reveals and voids (`runs_changed`). A command
+  that changed one unit serializes that unit, an unchanged piece compares
+  by identity (`same_value`), and `logic.state_text` builds the save
+  file's text and the journal hash's from each piece's cached text
+  (`Entity._txt`, `Map._ptxt`), the same text `json.dumps` gives. `jcopy`
+  is the copier for stored values (JSON shapes; anything else goes to
+  `copy.deepcopy`). Measured on 1,000 units on a filled 150x150: `!eval 1`
+  257 -> 9 ms, `!ent hp` 306 -> 17 ms.
 - **Undo** (`match_history.py`): autosaves per round (`autosave_round_retention`),
   turn (`autosave_turn_retention_rounds`, under ATB `_turns`), command
   (`autosave_command_retention_turns` / `_max`), manual (`!history save`).
@@ -3032,6 +3077,25 @@ hardcodes**.
   the history to a mark taken before it (`MatchHistory.mark` / `rewind`):
   autosaves of turns that never happened go, autosaves pruned meanwhile
   come back (816). `!alias`, `!table` and `!turn set` are undo steps.
+  Storage (#197): a round autosave, a manual save and a chain's first
+  autosave hold the full state; every other turn and command autosave a
+  diff against the autosave before it by sequence (`state_diff`: top-level
+  fields whole, units by id, maps by name, tiles by cell, zones by name, the
+  event log as entries appended and trimmed, `"o"` the unit order when units
+  came or went), a full one at least every `KEYFRAME_EVERY` (100). A
+  snapshot rebuilds its state through the chain (`Snapshot.state`, cached
+  until the commit releases it). Pruning or cutting one in the middle
+  merges its diff into the next (`MatchHistory._relink`,
+  `compose_state_diffs`); a pruned full one that later diffs build on stays
+  unlisted in `hidden_bases` until none does (so a prune at the head of a
+  chain writes no new full state). A lost or unreadable file drops the
+  snapshots building on it (`discard`). Files: `<seq>.json` holds the index
+  entry plus `state` or `diff` (`base` = the sequence it builds on); the
+  commit rewrites a snapshot whose `base` changed. Defaults kept: turns of
+  the last 10 rounds (ATB: 60 turns), commands of the last 10 turns (at
+  most 500). A board of 1,000 units on a filled 150x150 kept 70.7 MB of
+  undo files over 6 rounds before, 10.8 MB after, nearly all of it the
+  round snapshots (1075-1078).
   A command undo's reply names the command by its round where the
   board's history is withheld from the channel (L49); `!history import`
   never replaces a save under a name it picked (`<name>-2`), and one
@@ -3774,22 +3838,16 @@ rejected already. Update this section in the PR that resolves an item.
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
   tile, zone or corpse blocks it. Known issue (user: list it).
 
-- **Large match state, per-command cost** (user: discuss later): after a
-  whole-map tile fill on 500x500 every command costs ~3.5 s (three full
-  serializations per command; numbers under "Undo history disk growth"
-  below). Options raised: a cap on what a match can hold, cheaper undo
-  snapshots (diffs / copy-on-write, reusing the post-command state for the
-  commit), or leaving it deferred. The command journal has the same cost
-  and goes into the same design (user call, pass 43's J2 follow-up): a
-  `state` entry (undo, history restore, `!run`, transfers, ...) stores the
-  whole match (~650 KB on a filled 150x150), and every segment's header
-  copies the whole template library. Every action also serializes the
-  match before its body (its rollback state; X13's action half, open: a
-  200-unit `!foreach` of `!action` on a filled 300x300 takes ~57 s), and
-  every formula evaluation builds its namespace (~2 ms; only the
-  `entity[self].<path> <op> <number>` shape skips it). `!template resync`
-  serializes the match for its rollback the same way (X20: a `!foreach`
-  of 200 resyncs on a filled 300x300 takes ~42 s).
+- **Large match state, what is left** (user: discuss later): the
+  serialization caches and diff undo (#197, §7.16) made a command's
+  serialization follow what it changed. Still whole-match: the command
+  journal's `state` entries (undo, history restore, `!run`, transfers,
+  ...; ~650 KB on a filled 150x150; asked as diffs against the journal's
+  previous state, not yet answered) and every segment header's copy of
+  the template library; a round autosave (a full copy, user call); an
+  undo's restore (`from_dict` of the whole match, then one cold encode).
+  Every formula evaluation builds its namespace (~0.8 ms; only the
+  `entity[self].<path> <op> <number>` shape skips it).
 
 ### Ask between tasks
 
@@ -3820,12 +3878,10 @@ hasn't named the next.
   shape: a deterministic work counter charged per cell walked, loop
   iteration, macro step, summon and event, per server, owner-set. Needs
   careful decisions about compromises and abuse.
-- **Undo history disk growth:** every snapshot is a full match state; if
-  history becomes the bulk of a server's disk use, revisit retention defaults
-  or a diff-based snapshot format. Measured (pass 40): after a whole-map
-  `!tile fill` on 500x500 every command costs ~3.5 s (the match is
-  serialized three times per command: undo pre / post state and the
-  commit). Cell lookups read the spatial indexes (§7.1), fogged reads
+- **Undo history disk growth:** turn and command autosaves are diffs
+  (#197, §7.16); a round autosave is a full copy, kept for the whole match
+  by default (`autosave_round_retention` -1), so a long match on a big board
+  grows by one full state per round. Cell lookups read the spatial indexes (§7.1), fogged reads
   one team vision index per pass (`Match.vision_pass`), so neither costs
   cells x units; the size sweep, the watcher check and the zone-grant
   check read only what changed (#197), so a command on a board of 10,000
