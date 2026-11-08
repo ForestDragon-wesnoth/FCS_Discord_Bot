@@ -8940,13 +8940,22 @@ class Entity:
         if name in _PLACE_FIELDS:
             d = self.__dict__
             old = d.get("_match")
+            old_parent = d.get("part_of")
             object.__setattr__(self, name, value)
             if "id" in d:
                 for m in (old, d.get("_match")):
                     if m is not None:
                         m._spatial.touch(d["id"])
+                        # The body it belonged to changes too (a part
+                        # detached or removed): its size (#197).
+                        if old_parent:
+                            m._spatial.notify(old_parent)
             return
         object.__setattr__(self, name, value)
+        if name == "status":
+            m = self.__dict__.get("_match")
+            if m is not None and "id" in self.__dict__:
+                m._spatial.notify(self.__dict__["id"])
 
     def __post_init__(self):
         tested_id = str(self.id.strip().lower())
@@ -10647,6 +10656,15 @@ class Map:
                                       compare=False)
     _zone_dirty: Set[str] = field(default_factory=set, repr=False,
                                   compare=False)
+    # Filed with the zone index (#197): the zones with grants of their own,
+    # and definition -> the zones naming it (Match._grants_present). A grant
+    # edit or a change of a zone's `def` calls zone_touch too.
+    _zone_own_grants: Set[str] = field(default_factory=set, repr=False,
+                                       compare=False)
+    _zones_by_def: Dict[str, Set[str]] = field(default_factory=dict,
+                                               repr=False, compare=False)
+    _zone_def_rec: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                          compare=False)
 
     def __setattr__(self, name: str, value: Any) -> None:
         object.__setattr__(self, name, value)
@@ -10660,16 +10678,38 @@ class Map:
         if self._zone_ix is not None:
             self._zone_dirty.add(name)
 
+    def _file_zone_meta(self, zname: str, z: Any) -> None:
+        old = self._zone_def_rec.pop(zname, None)
+        if old is not None:
+            names = self._zones_by_def.get(old)
+            if names is not None:
+                names.discard(zname)
+                if not names:
+                    del self._zones_by_def[old]
+        self._zone_own_grants.discard(zname)
+        if not isinstance(z, dict):
+            return
+        d = z.get("def")
+        if isinstance(d, str):
+            self._zone_def_rec[zname] = d
+            self._zones_by_def.setdefault(d, set()).add(zname)
+        if z.get("grants"):
+            self._zone_own_grants.add(zname)
+
     def _zone_index(self) -> Dict[Tuple[int, int], Any]:
         ix = self._zone_ix
         if ix is None:
             ix = {}
             rec: Dict[str, Any] = {}
+            self._zone_own_grants.clear()
+            self._zones_by_def.clear()
+            self._zone_def_rec.clear()
             for zname, z in self.zones.items():
                 cells = tuple(z.get("cells") or ())
                 rec[zname] = cells
                 for c in cells:
                     _ix_add(ix, c, zname)
+                self._file_zone_meta(zname, z)
             object.__setattr__(self, "_zone_ix", ix)
             object.__setattr__(self, "_zone_rec", rec)
             self._zone_dirty.clear()
@@ -10687,6 +10727,7 @@ class Map:
                     elif held == zname:
                         del ix[c]
                 z = self.zones.get(zname)
+                self._file_zone_meta(zname, z)
                 if z is not None:
                     cells = tuple(z.get("cells") or ())
                     rec[zname] = cells
@@ -11367,7 +11408,7 @@ class UnitIndex:
     SPATIAL_BIG_AREA cells are filed as rectangles."""
 
     __slots__ = ("full", "dirty", "ctx", "rec", "cells", "big", "scan",
-                 "order")
+                 "order", "listeners")
 
     def __init__(self) -> None:
         self.full = True
@@ -11381,10 +11422,21 @@ class UnitIndex:
         self.scan: Dict[str, Set[str]] = {}
         # eid -> position in match.entities (the scan's order), None = stale.
         self.order: Optional[Dict[str, int]] = None
+        # Sets of other per-unit caches (UnitFlags) that every mark reaches
+        # too, also while this index waits for a full rebuild.
+        self.listeners: List[Set[str]] = []
 
     def touch(self, eid: str) -> None:
         if not self.full:
             self.dirty.add(eid)
+        for s in self.listeners:
+            s.add(eid)
+
+    def notify(self, eid: str) -> None:
+        """A change that moves nothing but may change what the unit holds
+        (a status): only the listening caches hear it."""
+        for s in self.listeners:
+            s.add(eid)
 
     def reset(self) -> None:
         self.full = True
@@ -11596,6 +11648,95 @@ class UnitIndex:
                             f"unit index rect {mname} ({x1},{y1})-({x2},{y2}) "
                             f"misses `{eid}`")
         return out
+
+
+class UnitFlags:
+    """Per unit, what makes the whole-match checks after a command or a
+    step necessary (#197), cached: FLAG_WATCHERS = the unit's own data
+    holds a `watchers` dict (its vars, its watcher_sources containers, a
+    status instance's own key), FLAG_ZONE_GRANT = a status of it carries a
+    zone grant's marker. Match.has_watchers and _grants_present read the
+    units holding a flag instead of every unit. Kept current by the unit
+    index's marks (UnitIndex.listeners: the var writes, the place fields,
+    `status` set wholesale) and UnitIndex.notify from _emit_status_diff;
+    a new entities dict or watcher_sources rule rebuilds it. What a status
+    DEFINITION or team data holds is read live by the callers (few)."""
+    __slots__ = ("flags", "holders", "changed", "ctx")
+    WATCHERS = 1
+    ZONE_GRANT = 2
+
+    def __init__(self) -> None:
+        self.flags: Dict[str, int] = {}
+        self.holders: Dict[int, Set[str]] = {self.WATCHERS: set(),
+                                             self.ZONE_GRANT: set()}
+        self.changed: Set[str] = set()
+        self.ctx: Any = None
+
+    def _compute(self, match: "Match", e: "Entity") -> int:
+        f = 0
+        if WATCHERS_KEY in e.vars:
+            f |= self.WATCHERS
+        else:
+            for root in match._effective_watcher_sources(e):
+                node: Any = e.vars
+                for seg in root.split("."):
+                    node = node.get(seg) if isinstance(node, dict) else None
+                if node is not None and _holds_key(node, WATCHERS_KEY):
+                    f |= self.WATCHERS
+                    break
+        for inst in e.status.values():
+            if isinstance(inst, dict):
+                if WATCHERS_KEY in inst:
+                    f |= self.WATCHERS
+                if ZONE_GRANT_KEY in inst:
+                    f |= self.ZONE_GRANT
+        return f
+
+    def _set(self, eid: str, f: int) -> None:
+        old = self.flags.pop(eid, 0)
+        for bit, hs in self.holders.items():
+            if old & bit:
+                hs.discard(eid)
+            if f & bit:
+                hs.add(eid)
+        if f:
+            self.flags[eid] = f
+
+    def ensure(self, match: "Match") -> None:
+        if match._spatial.listeners.count(self.changed) == 0:
+            match._spatial.listeners.append(self.changed)
+            self.ctx = None
+        ctx = (id(match.entities), match.rules.get("watcher_sources"))
+        if ctx != self.ctx:
+            self.ctx = ctx
+            self.flags.clear()
+            for hs in self.holders.values():
+                hs.clear()
+            self.changed.clear()
+            for eid, e in match.entities.items():
+                self._set(eid, self._compute(match, e))
+            return
+        if self.changed:
+            for eid in self.changed:
+                e = match.entities.get(eid)
+                self._set(eid, self._compute(match, e) if e is not None
+                          and e._match is match else 0)
+            self.changed.clear()
+
+    def holders_of(self, match: "Match", bit: int) -> Set[str]:
+        self.ensure(match)
+        return self.holders[bit]
+
+
+def _holds_key(node: Any, key: str) -> bool:
+    """Whether a dict at or under `node` holds `key` (skipping `__` keys,
+    as held_watchers walks)."""
+    if not isinstance(node, dict):
+        return False
+    if key in node:
+        return True
+    return any(_holds_key(v, key) for k, v in node.items()
+               if not str(k).startswith("__"))
 
 
 def default_maps(width: int, height: int) -> Dict[str, "Map"]:
@@ -12093,6 +12234,14 @@ class Match:
     # Runtime-only, rebuilt from the units on first use.
     _spatial: "UnitIndex" = field(default_factory=lambda: UnitIndex(),
                                   repr=False, compare=False)
+    # What units hold that the per-command checks look for (UnitFlags,
+    # #197). Runtime-only.
+    _uflags: "UnitFlags" = field(default_factory=lambda: UnitFlags(),
+                                 repr=False, compare=False)
+    # [the set of units marked since the last size sweep (a UnitIndex
+    # listener), id(entities) it belongs to]: sync_touched_sizes. Runtime.
+    _size_touch: List[Any] = field(default_factory=lambda: [None, None],
+                                   repr=False, compare=False)
     # Custom event bus: re-entry guard + the current-event payload stack
     # (read by event_get / event_has during handler firing). Transient — an
     # event is a transient broadcast, nothing about it is serialized.
@@ -12369,6 +12518,7 @@ class Match:
         z["data"] = copy.deepcopy(d.get("data") or {})
         if zone_look_value(FACING_FIELD, d.get(FACING_FIELD)):
             z[FACING_FIELD] = d[FACING_FIELD]
+        self.zone_map(name).zone_touch(name)
         return name
 
     def set_zone_def(self, name: str, definition: Optional[str]) -> int:
@@ -12380,11 +12530,13 @@ class Match:
             raise NotFound(f"Zone '{name}' not found.")
         if definition is None:
             z.pop("def", None)
+            self.zone_map(name).zone_touch(name)
             return 0
         d = self.zone_definitions.get(definition)
         if d is None:
             raise NotFound(f"No zone definition `{definition}`.")
         z["def"] = definition
+        self.zone_map(name).zone_touch(name)
         if (FACING_FIELD not in z
                 and zone_look_value(FACING_FIELD, d.get(FACING_FIELD))):
             z[FACING_FIELD] = d[FACING_FIELD]
@@ -12457,9 +12609,10 @@ class Match:
                                  for k, v in self.zone_definitions.items()}
         n = 0
         for mp in self.maps.values():
-            for z in mp.zones.values():
+            for zname, z in mp.zones.items():
                 if isinstance(z, dict) and z.get("def") == old:
                     z["def"] = new
+                    mp.zone_touch(zname)
                     n += 1
         return n
 
@@ -12704,16 +12857,30 @@ class Match:
 
     def _grants_present(self) -> bool:
         """Whether any zone grants or any unit holds a zone's grant: the
-        fast path of sync_zone_grants."""
+        fast path of sync_zone_grants. Reads each map's granting-zone
+        record (Map._zone_index: zones with grants of their own, zones by
+        definition) against the definitions that grant, and the units
+        UnitFlags marks as holding a grant, never every zone or unit."""
+        granting = {n for n, d in self.zone_definitions.items()
+                    if isinstance(d, dict) and d.get("grants")}
+        found = False
         for mp in self.maps.values():
-            for z in mp.zones.values():
-                if self.zone_grants_of(z):
-                    return True
-        for e in self.entities.values():
-            for inst in e.status.values():
-                if isinstance(inst, dict) and (ZONE_GRANT_KEY in inst):
-                    return True
-        return False
+            mp._zone_index()
+            if mp._zone_own_grants or any(mp._zones_by_def.get(d)
+                                          for d in granting):
+                found = True
+                break
+        if not found:
+            found = bool(self._uflags.holders_of(self, UnitFlags.ZONE_GRANT))
+        if SPATIAL_CHECK:
+            want = any(self.zone_grants_of(z) for mp in self.maps.values()
+                       for z in mp.zones.values()) or any(
+                isinstance(inst, dict) and ZONE_GRANT_KEY in inst
+                for e in self.entities.values() for inst in e.status.values())
+            if want != found:
+                raise SpatialCheckError(f"grant index: _grants_present = "
+                                        f"{found}, scan {want}")
+        return found
 
     def _sync_zone_grants_pass(self, errors: Dict[str, Any],
                                scope: Optional[Set[str]]) -> List[str]:
@@ -13724,25 +13891,90 @@ class Match:
                     for u in self.entities.values():
                         if u.part_of and u.part_of in self.entities:
                             children.setdefault(u.part_of, []).append(u)
-        _num, text_v, total_v = self.size_names()
         for _mp, _x, _y, _cid, c in self.every_corpse():
-            cv = _corpse_vars(c)
-            if not isinstance(cv, dict):
-                continue
-            before = (cv.get(text_v), cv.get(total_v))
-            # A corpse keeps the total it died with while sizes are off
-            # (nothing could derive it again); only its category follows
-            # the scale.
-            if self.sizes_on():
-                t = cv.get(total_v)
-                if isinstance(t, (int, float)) and not isinstance(t, bool):
-                    cat = self.size_category_of(t)
-                    if cat is None:
-                        cv.pop(text_v, None)
-                    else:
-                        cv[text_v] = cat
-            if not same_value(before, (cv.get(text_v), cv.get(total_v))):
-                self._size_changes = getattr(self, "_size_changes", 0) + 1
+            self._settle_corpse_size(c)
+        return log
+
+    def _settle_corpse_size(self, c: Any) -> None:
+        """A corpse's category read from the total it died with (a corpse
+        keeps that total while sizes are off: nothing could derive it
+        again); only its category follows the scale."""
+        cv = _corpse_vars(c)
+        if not isinstance(cv, dict):
+            return
+        _num, text_v, total_v = self.size_names()
+        before = (cv.get(text_v), cv.get(total_v))
+        if self.sizes_on():
+            t = cv.get(total_v)
+            if isinstance(t, (int, float)) and not isinstance(t, bool):
+                cat = self.size_category_of(t)
+                if cat is None:
+                    cv.pop(text_v, None)
+                else:
+                    cv[text_v] = cat
+        if not same_value(before, (cv.get(text_v), cv.get(total_v))):
+            self._size_changes = getattr(self, "_size_changes", 0) + 1
+
+    def sync_touched_sizes(self) -> List[str]:
+        """The size sweep after a command (#197): sync_body_size for the
+        bodies of the units marked since the last sweep (the unit index's
+        marks: var writes, the place fields, statuses; a part's old body
+        through notify), never every body. A corpse keeps the category it
+        died with; the scale changing re-reads every corpse in
+        sync_all_sizes, which apply_system_rules runs. The first sweep of a
+        match object (a load, an undo's restored match, a new entities
+        dict) is the full sync_all_sizes. FCS_SPATIAL_CHECK then runs the
+        full sweep and raises if it changed anything."""
+        tracker = self._size_touch
+        sp = self._spatial
+        ctx = id(self.entities)
+        if tracker[0] is None or tracker[1] != ctx \
+                or not any(l is tracker[0] for l in sp.listeners):
+            changed: Set[str] = set()
+            sp.listeners.append(changed)
+            self._size_touch = [changed, ctx]
+            return self.sync_all_sizes()
+        ids = tracker[0]
+        tracker[0] = set()
+        sp.listeners = [l for l in sp.listeners if l is not ids]
+        sp.listeners.append(tracker[0])
+        roots: Dict[str, "Entity"] = {}
+        for eid in ids:
+            e = self.entities.get(eid)
+            if e is not None and e._match is self:
+                r = self.body_root(e)
+                roots[r.id] = r
+        log: List[str] = []
+        if roots:
+            sp.ensure(self)
+            children = self._children_index()
+            for rid in sp._sorted(self, roots):
+                r = self.entities.get(rid)
+                if r is None:
+                    continue
+                before = getattr(self, "_size_changes", 0)
+                log += self.sync_body_size(r, children, warn=False)
+                if getattr(self, "_size_changes", 0) != before:
+                    children = self._children_index()
+        if SPATIAL_CHECK:
+            # The full sweep must change nothing outside the bodies just
+            # synced (one a hook keeps changing never settles).
+            _n, text_v, total_v = self.size_names()
+
+            def _state() -> Any:
+                units = {eid: (e.vars.get(total_v), e.vars.get(text_v))
+                         for eid, e in self.entities.items()
+                         if self.body_root(e).id not in roots}
+                dead = [(c[3], json.dumps(_corpse_vars(c[4]), sort_keys=True,
+                                          default=str))
+                        for c in self.every_corpse()]
+                return units, dead
+            before_state = _state()
+            self.sync_all_sizes()
+            if _state() != before_state:
+                raise SpatialCheckError(
+                    "size sweep: a body or corpse the marks missed changed "
+                    f"(marked: {sorted(ids)[:8]})")
         return log
 
     def size_of_corpse(self, cid: str) -> Any:
@@ -16244,11 +16476,35 @@ class Match:
     def has_watchers(self) -> bool:
         """Whether a watcher poll has anything to read or settle: match
         watchers, held watchers' stored state, or a living unit holding
-        one."""
+        one. The units whose own data holds one come from UnitFlags; a
+        status definition or team data holding one is read here (few), and
+        only then are units walked."""
         if self.watchers or self.watcher_state:
             return True
-        return any(e.is_alive and self.held_watchers(e)
-                   for e in self.entities.values())
+        found = self._held_anywhere()
+        if SPATIAL_CHECK and found != any(
+                e.is_alive and self.held_watchers(e)
+                for e in self.entities.values()):
+            raise SpatialCheckError(f"unit flags: has_watchers = {found}")
+        return found
+
+    def _held_anywhere(self) -> bool:
+        if any(self.entities[eid].is_alive for eid in
+               self._uflags.holders_of(self, UnitFlags.WATCHERS)
+               if eid in self.entities):
+            return True
+        defs = {n for n, d in self.status_definitions.items()
+                if isinstance(d, dict) and (WATCHERS_KEY in d or any(
+                    isinstance(v, dict) and WATCHERS_KEY in v
+                    for v in (d.get(STATUS_LEVELS_FIELD) or {}).values()))}
+        teams = {t for t, td in self.team_data.items()
+                 if isinstance(td, dict) and WATCHERS_KEY in td}
+        if not defs and not teams:
+            return False
+        return any(e.is_alive and (
+            (e.team is not None and str(e.team) in teams)
+            or any(sn in defs for sn in e.status))
+            and self.held_watchers(e) for e in self.entities.values())
 
     def fire_watchers(self) -> List[str]:
         """Re-check the watchers until a pass fires nothing new (at most
@@ -21953,6 +22209,7 @@ class Match:
         is removed inside its own tick on this unit, else `removed`.
         """
         log: List[str] = []
+        self._spatial.notify(entity_id)     # what it holds (UnitFlags)
         if after is not None:
             after = self._cap_live_status(entity_id, status_name, after)
         if before is None and after is not None:
@@ -24359,6 +24616,10 @@ class Match:
         part_dicts = [pp.to_dict() for pp in self.entity_part_subtree(e.id)]
         if part_dicts:
             corpses[e.id]["parts"] = part_dicts
+        # A death in the middle of a size derivation (the total written,
+        # the category not yet) leaves the pair half done: the corpse
+        # takes its category from its total now, as the scale gives it.
+        self._settle_corpse_size(corpses[e.id])
         cmap.note_corpse(e.x, e.y)
 
     def find_corpse(self, eid: str

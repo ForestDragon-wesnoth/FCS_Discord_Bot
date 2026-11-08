@@ -1504,7 +1504,7 @@ async def _settle_after(ctx: ReplyContext, mgr: MatchManager, name: str,
         if om is not None and om.sizes_on() \
                 and getattr(om, "_action_depth", 0) == 0:
             try:
-                om.surface_log(om.sync_all_sizes())
+                om.surface_log(om.sync_touched_sizes())
             except VTTError as e:
                 await ctx.send(f"❌ settling sizes in `{other}`: {e}")
     if mid not in mgr.matches:
@@ -1525,7 +1525,7 @@ async def _settle_after(ctx: ReplyContext, mgr: MatchManager, name: str,
             # body's size total and category.
             before = getattr(m_post, "_size_changes", 0)
             try:
-                m_post.surface_log(m_post.sync_all_sizes())
+                m_post.surface_log(m_post.sync_touched_sizes())
             except VTTError as e:
                 await ctx.send(f"❌ settling sizes: {e}")
             except Exception as e:
@@ -21325,6 +21325,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"No zone `{args[1]}`.")
         reply = _grant_edit(z, args, f"zone `{args[1]}`", "!zone {sub}",
                             _match_program_check(m))
+        m.zone_map(args[1]).zone_touch(args[1])    # its grants (#197)
         return await ctx.send(reply)
 
     # ---- new [<name>] [def=<definition>] ----
@@ -24383,7 +24384,7 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # The sizes and zone grants it would settle (#242, #136), as after
         # a real command.
         if after is not None:
-            after.surface_log(after.sync_all_sizes())
+            after.surface_log(after.sync_touched_sizes())
         if after is not None and after._grants_present():
             after.surface_log(after.sync_zone_grants())
         post = after.to_dict(include_history=False) if after is not None \
@@ -24730,7 +24731,7 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                     await registry.dispatch_no_snapshot(name, rest, sctx, mgr)
                     cur = mgr.matches.get(mid)
                     if cur is not None:
-                        cur.surface_log(cur.sync_all_sizes())
+                        cur.surface_log(cur.sync_touched_sizes())
                         if cur._grants_present():
                             cur.surface_log(cur.sync_zone_grants())
                         if cur.has_watchers():

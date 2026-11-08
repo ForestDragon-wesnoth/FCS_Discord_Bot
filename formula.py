@@ -8647,6 +8647,7 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(f"zone_grant: {ex}")
             z.setdefault("grants", {})[status] = stored
+            match.zone_map(name).zone_touch(name)
             return True
 
         def _zone_ungrant(name: Any, status: Any) -> bool:
@@ -8659,6 +8660,7 @@ class FormulaEngine:
             del grants[status]
             if not grants:
                 z.pop("grants", None)
+            match.zone_map(name).zone_touch(name)
             return True
 
         def _zone_spawn(definition: Any, cells: Any = None, map: Any = None,
