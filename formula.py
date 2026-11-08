@@ -2844,7 +2844,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   corpse_var(eid, path[, def]) -> the dead entity's stored var at a
     #                                   dotted path (raises if missing
     #                                   unless a default is supplied)
-    "kill", "revive", "transform", "revert", "has_corpse", "corpse_at", "all_corpses",
+    "kill", "revive", "transform", "replace_form", "revert", "has_corpse",
+    "corpse_at", "all_corpses",
     "corpse_has", "corpse_var",
     "corpse_status_has", "corpse_status_get", "corpse_status_names",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
@@ -3071,7 +3072,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "summon", "summon_near", "summon_from", "remove_entity",
     "summon_template", "summon_template_near", "give_template",
     "stamp_prefab",
-    "kill", "revive", "transform", "revert",
+    "kill", "revive", "transform", "replace_form", "revert",
     "schedule", "schedule_on", "cancel_schedule",
     # They run a `!func` or a lambda per item, and a `!func` may write.
     "map_with", "filter_with", "sort_by",
@@ -3206,7 +3207,8 @@ _GRANT_SETTLE_FUNCS: "frozenset[str]" = frozenset({
     "zone_grant", "zone_ungrant",
     "summon", "summon_near", "summon_from", "summon_template",
     "summon_template_near", "stamp_prefab", "remove_entity", "kill",
-    "revive", "transform", "revert", "mount", "dismount", "switch_slot",
+    "revive", "transform", "replace_form", "revert", "mount", "dismount",
+    "switch_slot",
     "damage_part", "damage_spread", "void_add", "void_remove",
 })
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
@@ -3464,8 +3466,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     "removed_by",       # on_status_removed passives and a definition's
                         # on_removed hook: why the status left (expired,
                         # dispel, transfer, removes, zone (a granting
-                        # zone let go, #136), removed); None
+                        # zone let go, #136), transform, removed); None
                         # elsewhere.
+    "transform_kind",   # on_transformed: transform, replace or revert;
+                        # None elsewhere.
     "skip_status",      # on_turn_skipped: the status(es) whose skips_turn
                         # cost the unit its turn, sorted and comma-joined
                         # ("stunned" / "frozen, stunned"); None elsewhere.
@@ -8186,16 +8190,31 @@ class FormulaEngine:
 
         def _transform(eid_t: Any, template: Any, stash_path: Any = None) -> str:
             """transform(eid, template, stash_path=None): swap eid's statblock
-            (name/vars/passives/clamps/status/parts) for `template`, KEEPING
-            its id/position/facing/team/turn-order slot. HP carries per the
-            transform_hp_mode rule. If `stash_path` is given, the pre-transform
-            statblock is stored at entity[eid].<stash_path> so revert(eid,
-            stash_path) can restore it (stash paths are ordinary vars, so
-            transforms stack). Returns eid."""
+            (name/vars/passives/clamps/parts) for `template`, KEEPING its
+            id/position/facing/team/turn-order slot and its statuses beside
+            the form's (`!ent transform`; replace_form keeps only the
+            form's). HP carries per the transform_hp_mode rule. If
+            `stash_path` is given, the pre-transform statblock is stored at
+            entity[eid].<stash_path> so revert(eid, stash_path) can restore
+            it (stash paths are ordinary vars, so transforms stack). Returns
+            eid."""
+            return _transform_as(eid_t, template, stash_path, "merge")
+
+        def _replace_form(eid_t: Any, template: Any,
+                          stash_path: Any = None) -> str:
+            """replace_form(eid, template, stash_path=None): transform eid
+            into `template` with the form's statuses only (`!ent replace`):
+            the unit's own go, except those whose `on_transform` is keep.
+            Otherwise as transform(). Returns eid."""
+            return _transform_as(eid_t, template, stash_path, "replace")
+
+        def _transform_as(eid_t: Any, template: Any, stash_path: Any,
+                          statuses: str) -> str:
             eid = str(_eid(eid_t))
             sp = None if stash_path is None else str(stash_path)
             try:
-                match.surface_log(match.transform_entity(eid, template, sp))
+                match.surface_log(match.transform_entity(
+                    eid, template, sp, statuses=statuses))
             except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
@@ -8305,6 +8324,7 @@ class FormulaEngine:
         ns["kill"]         = _kill
         ns["revive"]       = _revive
         ns["transform"]    = _transform
+        ns["replace_form"] = _replace_form
         ns["revert"]       = _revert
         ns["has_corpse"]   = _has_corpse
         ns["corpse_at"]    = _corpse_at

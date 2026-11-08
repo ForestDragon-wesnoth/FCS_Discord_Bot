@@ -37374,3 +37374,212 @@ arm holds none. A transfer moves the status with its layers onto Zed.
 status_layers is a read: `$()` stores its length, and a loop over it
 sums the levels (4). The countdown is a mutator, banned in `$()`, and
 changes nothing.
+
+SCENARIO 1062 — Transform keeps statuses: the unit's stay beside the form's, a shared one stacks, the new form's immunity and on_transform drop take theirs (hooks with removed_by transform), on_transformed fires; revert takes back what the form brought
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new tf Forms 10 10
+!match use tf
+!ent add a Hero 20 2 2
+!ent add w Wolf 30 6 6
+!status def stun
+!status def poison
+!status def bless
+!status def rage
+!status def thickfur
+!status data thickfur status_immune poison
+!status on_transform bless drop
+!status apply a stun 1 3
+!status apply a poison 2 4
+!status apply a bless 1 5
+!status apply w rage 1 9
+!status apply w stun 2 1
+!status apply w thickfur
+!gpassive add rm on_status_removed "match_var_set('rm', match_var_get('rm', '') + status_name + ':' + removed_by + ' ')"
+!gpassive add ad on_status_added "match_var_set('ad', match_var_get('ad', '') + status_name + ' ')"
+!gpassive add tr on_transformed "match_var_set('tk', transform_kind + ' ' + entity[self].name)"
+!system set default transform_keep_vars xp,quest.flag
+!ent set_vars a xp=50 quest.flag=true quest.other=1
+!ent transform a w form
+?? `a` transformed into **Wolf**
+!assert "match_var_get('rm') == 'poison:transform bless:transform '"
+!assert "match_var_get('ad') == 'rage thickfur '"
+!assert "match_var_get('tk') == 'transform Wolf'"
+!assert "status_has('a', 'stun') and status_layers('a', 'stun') == [[2, 1], [1, 3]]"
+!assert "status_has('a', 'rage') and not status_has('a', 'poison') and not status_has('a', 'bless')"
+!assert "entity['a'].xp == 50 and entity['a'].quest.flag == True and not var_has('a', 'quest.other')"
+!ent dump a
+?? rage(__transform_form='form'
+!status apply a poison 1 2
+?? immune
+!status apply a mark2 1 1
+HARNESS-ALLOWS-ERRORS
+!status def mark2
+!status apply a mark2 1 6
+!match var set rm ""
+!ent set_var a xp 75
+!ent revert a form
+?? `a` reverted to **Hero**
+!assert "match_var_get('tk') == 'revert Hero'"
+!assert "match_var_get('rm') == 'rage:transform thickfur:transform '"
+!assert "status_has('a', 'stun') and status_has('a', 'mark2') and not status_has('a', 'rage') and not status_has('a', 'thickfur')"
+!assert "not status_has('a', 'poison') and not status_has('a', 'bless')"
+!assert "entity['a'].xp == 75 and entity['a'].hp == 20"
+!undo command
+!assert "status_has('a', 'rage') and entity['a'].name == 'Wolf'"
+
+Expected: the hero holds stun 1 for 3, poison 2 for 4 and bless (on_transform
+drop). Transforming into the wolf keeps the hero's statuses beside the
+wolf's: rage and thickfur arrive (on_added fires for each, and they carry
+the stash path as their marker); the wolf's stun 2 for 1 meets the
+hero's stun 1 for 3 and stacks through the layered default ([[2, 1],
+[1, 3]]); the poison goes because thickfur makes the wolf immune; bless
+goes because its on_transform is drop; both removals bind removed_by
+`transform`. on_transformed fires once the swap settled, transform_kind
+`transform`, with the wolf's name. transform_keep_vars keeps xp and
+quest.flag (quest.other isn't listed, so the wolf's vars lack it).
+A poison applied in wolf form is refused (immune); mark2 arrives in
+wolf form. Reverting takes back the two statuses the form brought (rage,
+thickfur, removed_by transform) and keeps stun and mark2; the stashed
+poison and bless don't come back. xp keeps the wolf form's 75; hp is the
+hero's 20. An undo puts the wolf back.
+HARNESS-ALLOWS-ERRORS
+
+SCENARIO 1063 — !ent replace keeps only the form's statuses (on_transform keep survives, an instance key overrides the definition); its revert restores the stash's; replace_form in formulas, banned in $()
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new rp Replace 10 10
+!match use rp
+!ent add a Hero 20 2 2
+!ent add o Ogre 40 6 6
+!status def stun
+!status def poison
+!status def curse
+!status def brute
+!status on_transform curse keep
+!status apply a stun 1 3
+!status apply a poison 2 4
+!status apply a curse 2
+!ent status a set poison on_transform keep
+!status apply o brute 1 9
+!status apply o curse 1 2
+!gpassive add rm on_status_removed "match_var_set('rm', match_var_get('rm', '') + status_name + ':' + removed_by + ' ')"
+!ent replace a o shape
+?? `a` was replaced by **Ogre**
+!assert "match_var_get('rm') == 'stun:transform '"
+!assert "status_has('a', 'brute') and status_has('a', 'poison') and status_has('a', 'curse') and not status_has('a', 'stun')"
+!assert "status_layers('a', 'curse') == [[2, None]]"
+!assert "get(entity['a'].shape, '__transform_mode') == 'replace'"
+!ent revert a shape
+!assert "status_has('a', 'stun') and status_has('a', 'poison') and status_has('a', 'curse') and not status_has('a', 'brute')"
+!assert "status_duration('a', 'stun') == 3 and entity['a'].name == 'Hero'"
+!eval "replace_form('a', entity_snapshot('o'), 'f2')"
+!assert "entity['a'].name == 'Ogre' and not status_has('a', 'stun') and status_has('a', 'brute')"
+!eval "revert('a', 'f2')"
+!assert "entity['a'].name == 'Hero' and status_has('a', 'stun')"
+!ent set_var a z "$(replace_form('a', entity_snapshot('o')))"
+?? banned in a $() inline argument
+!assert "entity['a'].name == 'Hero'"
+!system status def default curse
+!system status on_transform default curse drop
+!system status info default curse
+?? on_transform
+!status on_transform curse maybe
+?? on_transform must be one of: keep, drop
+!status on_transform curse -
+?? a transform keeps it, a replace drops it
+HARNESS-ALLOWS-ERRORS
+
+Expected: the hero holds stun, poison (its own instance says on_transform
+keep) and curse 2 (the definition says keep). `!ent replace` brings the
+ogre's statuses only: stun goes (removed_by transform), poison and curse
+stay through keep, and the ogre's curse 1 for 2 stacks onto the kept
+curse 2 (permanent), which stays level 2 permanent. The stash records
+the replace flavor, so reverting restores the stash's statuses: stun
+comes back for 3, brute goes. replace_form() does the same from a
+formula, and revert() returns; replace_form is a mutator, banned in
+$(). on_transform also lives in a system's library (`!system status`),
+takes only keep / drop, and `-` clears it.
+
+SCENARIO 1064 — Transform on 2x2 bodies: parts on the same part name pass their statuses to the new form's part; parts unique to either form keep their own; a unit's __transform_keep_vars list survives with what it names
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new pb Parts 10 10
+!match use pb
+!ent add a Hero 20 2 2
+!ent set_vars a footprint_w=2 footprint_h=2
+!part add a ah head 5 5
+!part add a at tail 5 5
+!ent add g Golem 30 6 6
+!ent set_vars g footprint_w=2 footprint_h=2
+!part add g gh head 8 8
+!part add g gc core 8 8
+!status def stun
+!status def poison
+!status def mark
+!status apply ah poison 1 3
+!status apply at stun 1 2
+!status apply gh stun 1 1
+!status apply gc mark 1 4
+!ent set_vars a note=hi __transform_keep_vars=note
+!ent transform a g form
+!assert "len(parts('a')) == 2 and footprint_width('a') == 2"
+!assert "status_has(part('a', 'head'), 'poison') and status_has(part('a', 'head'), 'stun')"
+!assert "status_has(part('a', 'core'), 'mark') and not status_has(part('a', 'core'), 'poison')"
+!assert "entity['a'].note == 'hi' and entity['a'].__transform_keep_vars == 'note'"
+!ent move a 1 right
+!ent revert a form
+!assert "len(parts('a')) == 2 and has_part('a', 'tail')"
+!assert "status_has(part('a', 'head'), 'poison') and not status_has(part('a', 'head'), 'stun')"
+!assert "status_has(part('a', 'tail'), 'stun') and status_duration(part('a', 'tail'), 'stun') == 2"
+!assert "entity['a'].note == 'hi' and entity['a'].x == 3"
+!as restart
+!assert "entity['a'].name == 'Hero' and status_has(part('a', 'head'), 'poison')"
+
+Expected: the hero and the golem are 2x2 bodies with a head each; the
+hero has a tail, the golem a core. Transforming the hero into the golem
+matches the heads by part name: the new head takes the old head's
+poison and gains the golem head's stun. The core is the golem's own, so
+it keeps its mark; the tail leaves with its stun. The unit's own
+__transform_keep_vars names `note`, so note and the list survive.
+Reverting the merge matches the heads again: the head keeps the poison
+and loses the stun that came with the form; the tail is the stash's
+own, so it comes back with its stashed stun (2 turns). The body keeps
+its new position, and a restart keeps all of it.
+
+SCENARIO 1065 — Transform edge cases: an on_removed hook that removes the unit stops the swap cleanly; a level entry sets on_transform; a bad transform_keep_vars entry is refused; a prefab carries on_transform
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new te Edges 10 10
+!match use te
+!ent add a Hero 20 2 2
+!ent add b Bat 10 6 6
+!ent add w Wolf 30 8 8
+!status def doom
+!status def fury
+!status level fury 3+ on_transform keep
+!status apply a fury 3
+!status apply b fury 1
+!status hook doom on_removed "remove_entity(self)"
+!status apply a doom
+!status on_transform doom drop
+!ent replace b w
+!assert "not status_has('b', 'fury')"
+!ent replace a w
+?? `a` was replaced, then was removed.
+!assert "'a' not in all_entities()"
+!ent add c Crow 10 4 4
+!status apply c fury 3
+!ent replace c w
+!assert "status_level('c', 'fury') == 3"
+!system set default transform_keep_vars xp,a..b
+?? names a var path
+!system set default transform_keep_vars ok
+!prefab save pf 1 1 10 10 definitions=all
+!prefab show pf
+?? Carries: status `fury`
+HARNESS-ALLOWS-ERRORS
+
+Expected: fury's level 3+ entry says on_transform keep, so a level-1 fury
+on the bat goes when the bat is replaced, while the crow's level-3 fury
+survives its replace. The hero's doom is on_transform drop and its
+on_removed hook removes the unit: the replace stops there without a crash
+(the unit is gone, and the reply says it was removed). transform_keep_vars
+refuses an empty path segment. A prefab saved with definitions=all
+carries fury's definition, its on_transform level entry included.

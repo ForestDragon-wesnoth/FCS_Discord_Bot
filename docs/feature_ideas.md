@@ -78,7 +78,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#119 One-shot hooks.** A `once` flag on tile and zone hooks, for pressure plates and mines.
 - **#120 `on_move_blocked` hook.** Fires on the mover when a walk, push, pull or swap is stopped, binding the blocker (a unit id or a cell) and the kind of move. It covers bump-to-attack, collision damage on knockback, and "you walk into the wall".
 - **#121 Per-unit ATB threshold.** An override var for the `atb_threshold` rule.
-- **#122 `transform_keep_vars` rule.** Names vars a transform carries over. The default would be the ATB charge bar, which a transform resets today.
+- **#122 `transform_keep_vars` default.** The rule shipped (with a per-unit `__transform_keep_vars` list) with an empty default; the entry proposed the ATB charge bar as the default, which a transform resets today.
 - **#123 `round_end_message_format` and `match_start_message_format` rules,** twins of the round-start line.
 - **#124 Initiative reroll every round.** A rule that re-runs #59's formula at each round start.
 - **#128 `!whisper <team> <text>`.** A host posts to every channel bound with that team's POV (handouts, secret info).

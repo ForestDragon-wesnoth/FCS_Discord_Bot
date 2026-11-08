@@ -116,7 +116,7 @@ FORMULA_LABEL_ROOTS = frozenset({
     "action", "template", "prefab", "match", "remind", "store"})
 _LABEL_FORMULA_SUBS = {"ent": frozenset({"set_var", "set_vars", "status",
                                          "store_entity_into_var",
-                                         "transform"})}
+                                         "transform", "replace"})}
 
 
 def formula_label(label: str) -> str:
@@ -182,7 +182,19 @@ STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
 # The causes the on_status_removed bindings and a definition's on_removed
 # hook read as `removed_by`.
 STATUS_REMOVAL_CAUSES = ("expired", "dispel", "transfer", "removes",
-                         "zone", "removed")
+                         "zone", "transform", "removed")
+# Transforms and statuses: a status that arrived with a form records the
+# stash path of that transform here, so reverting it takes the status back;
+# a stash records the flavor of the transform that made it (`merge` for
+# `!ent transform`, `replace` for `!ent replace`).
+TRANSFORM_FORM_KEY = "__transform_form"
+TRANSFORM_MODE_KEY = "__transform_mode"
+# A status's `on_transform`: keep = survives every transform, drop = gone
+# after every transform.
+TRANSFORM_STATUS_FLAGS = ("keep", "drop")
+# The var (a list of var paths) a unit names its own transform-proof vars
+# in, beside the transform_keep_vars rule.
+TRANSFORM_KEEP_VAR = "__transform_keep_vars"
 # A status definition's own hooks (`!status hook`), by the passive hook
 # each one follows.
 STATUS_DEF_HOOKS = {"on_status_added": "on_added",
@@ -1370,6 +1382,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "number (50% of 5 -> 2, of 7 -> 4; Python's round()). `floor` / "
             "`ceil`: always down / up. The formula round() function is "
             "unaffected."
+        ),
+    },
+    "transform_keep_vars": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Vars that survive every transform, replace and revert: a comma "
+            "list of var paths (`xp`, `quest.flags`). The unit's value at "
+            "each path replaces the new form's; a path the unit lacks keeps "
+            "the new form's. A unit adds its own paths in its "
+            "`__transform_keep_vars` list, which survives too."
         ),
     },
     "transform_hp_mode": {
@@ -5843,7 +5866,16 @@ def _check_private_paths(key: str, raw: str) -> str:
     return ", ".join(got)
 
 
+def _check_var_path_list(key: str, raw: str) -> str:
+    """A comma list of var paths (transform_keep_vars)."""
+    got = [w for w in re.split(r"[\s,]+", raw) if w]
+    for w in got:
+        _check_var_path_rule(key, w)
+    return ", ".join(got)
+
+
 _FORMAT_RULE_CHECKS = {
+    "transform_keep_vars": _check_var_path_list,
     "private_vars": _check_private_paths,
     "team_private_vars": _check_private_paths,
     "size_categories": _check_size_scale,
@@ -6659,6 +6691,11 @@ HOOK_NAMES: Set[str] = {
     # (mount_death_effect) and before mount_on_vehicle_death settles its
     # fate, with `vehicle` and `slot` bound.
     "on_mount_vehicle_death",
+    # A unit took another form: fired on it once the swap settled (its
+    # statuses arrived and left), with `transform_kind` bound: transform
+    # (`!ent transform`, transform()), replace (`!ent replace`,
+    # replace_form()) or revert.
+    "on_transformed",
 }
 
 # Custom event-bus subscription. A passive whose `when` is "event:<name>"
@@ -8087,6 +8124,28 @@ def without_zone_grants(status: Any) -> Any:
         return status
     return {k: v for k, v in status.items()
             if not (isinstance(v, dict) and ZONE_GRANT_KEY in v)}
+
+
+def _dict_path_get(d: Any, path: str) -> Tuple[bool, Any]:
+    """(found, value) at dotted `path` in nested dict `d`."""
+    node = d
+    for key in path.split("."):
+        if not isinstance(node, dict) or key not in node:
+            return False, None
+        node = node[key]
+    return True, node
+
+
+def _dict_path_set(d: Dict[str, Any], path: str, value: Any) -> None:
+    """Set dotted `path` in nested dict `d`, making the dicts on the way (a
+    plain value in the way is replaced)."""
+    keys = path.split(".")
+    node = d
+    for key in keys[:-1]:
+        if not isinstance(node.get(key), dict):
+            node[key] = {}
+        node = node[key]
+    node[keys[-1]] = value
 
 
 def zone_grant_fields(raw: Any) -> Dict[str, Any]:
@@ -24420,13 +24479,30 @@ class Match:
         return log
 
     def apply_statblock(self, e: "Entity", statblock: Dict[str, Any], *,
-                        hp_mode: Optional[str] = None) -> List[str]:
+                        hp_mode: Optional[str] = None,
+                        statuses: str = "merge",
+                        form_tag: Optional[str] = None,
+                        revert_tag: Optional[str] = None,
+                        add_form: bool = True,
+                        kind: str = "transform") -> List[str]:
         """Replace `e`'s statblock in place from `statblock` (a
         capture_statblock dict or a summon-style template), PRESERVING e's id,
         position, facing, team, and turn-order slot. HP carries per `hp_mode`
         (default the transform_hp_mode rule: percent | keep | full). The
         entity's current attached parts are despawned (no corpse) and the
-        statblock's `parts`/`segments` spawned. Returns log lines."""
+        statblock's `parts`/`segments` spawned. The vars the
+        transform_keep_vars rule and the unit's __transform_keep_vars name
+        keep the unit's values.
+
+        Statuses (`_transform_status_swap`): `statuses` merge keeps the
+        unit's and adds the form's, replace keeps only the form's; a
+        status's `on_transform` keep / drop overrides either. With
+        `add_form` False the form's statuses aren't added (reverting a
+        merge). `form_tag` marks the statuses that arrive with the form,
+        `revert_tag` takes back those marked with it. A body part whose
+        part-name path both forms share takes the old part's statuses
+        through the same swap. on_transformed fires at the end with
+        `transform_kind` = `kind`. Returns log lines."""
         if not isinstance(statblock, dict):
             raise VTTError("transform: statblock must be a dict.")
         sb = copy.deepcopy(statblock)
@@ -24514,6 +24590,12 @@ class Match:
             pass
         if target_hp is not None:
             new_vars[hp_var] = target_hp
+        # Vars that survive the transform (the rule's paths and the unit's
+        # own list) keep the unit's values; the list itself survives too.
+        for path in self.transform_keep_paths(e):
+            found, val = _dict_path_get(e.vars, path)
+            if found:
+                _dict_path_set(new_vars, path, copy.deepcopy(val))
         # Preserve team membership + turn-order slot (identity), overriding
         # whatever the statblock carried. The new form keeps its allegiance
         # and initiative; a GM who wants a slow form sets it explicitly after.
@@ -24588,6 +24670,13 @@ class Match:
             raise VTTError(f"transform: the new form's passives or clamps "
                            f"aren't valid ({ex!r}).")
         drop_log: List[str] = list(eject_log)
+        # The old parts' statuses by part-name path: a new part on the same
+        # path takes them over (user call: parts unique to either form keep
+        # their own).
+        old_part_status = {
+            path: [copy.deepcopy(p.status) for p in plist]
+            for path, plist in self._part_paths(e).items()}
+        old_status = e.status
         for p in reversed(self.entity_part_subtree(e.id)):
             if p.id in self.entities:
                 drop_log.extend(p.remove())
@@ -24603,9 +24692,8 @@ class Match:
             e.name = sb.get("name") or e.name
             e.passives = new_passives
             e.clamps = new_clamps
-            e.status = copy.deepcopy(sb.get("status") or {})
+            # The statuses swap once the new body stands (below).
             e.var_names = new_names
-            self._cap_unit_status_levels(e)
             # facing is identity — preserved (not taken from the statblock).
             if eject_to is not None:
                 log.append(eject_note)
@@ -24619,26 +24707,155 @@ class Match:
                 log += self._apply_statblock_parts(e, seg)
         finally:
             self._death_check_suppressed_ids.discard(e.id)
+        swap = dict(mode=statuses, form_tag=form_tag, revert_tag=revert_tag,
+                    add_form=add_form)
+        new_parts = self._part_paths(e) if e.id in self.entities else {}
+        log += self._transform_status_swap(e, old_status, sb.get("status"),
+                                           **swap)
+        for path, plist in new_parts.items():
+            olds = old_part_status.get(path) or []
+            for part, old in zip(plist, olds):
+                if part.id in self.entities:
+                    log += self._transform_status_swap(
+                        part, old, part.status, **swap)
+        if e.id in self.entities:
+            log += self.fire_hook("on_transformed", target_ids=[e.id],
+                                  extras={"transform_kind": kind})
         if e.id in self.entities:
             log += self.check_death(e.id)
         return log
 
+    def transform_keep_paths(self, e: "Entity") -> List[str]:
+        """The var paths that survive `e`'s transforms: the
+        transform_keep_vars rule's, the unit's __transform_keep_vars list
+        (a list or comma text) and that list itself."""
+        out: List[str] = [TRANSFORM_KEEP_VAR]
+        own = e.vars.get(TRANSFORM_KEEP_VAR)
+        words = [w for w in re.split(r"[\s,]+", str(
+            self.rules.get("transform_keep_vars", "") or "")) if w]
+        if isinstance(own, str):
+            words += [w for w in re.split(r"[\s,]+", own) if w]
+        elif isinstance(own, list):
+            words += [str(w) for w in own if isinstance(w, str) and w]
+        for w in words:
+            if w not in out and all(w.split(".")):
+                out.append(w)
+        return out
+
+    def _part_paths(self, root: "Entity") -> Dict[str, List["Entity"]]:
+        """`root`'s parts by part-name path (`torso/arm`: each part's
+        part_name var, else its name, under its parent's path), parts on
+        the same path in body order."""
+        name_var = self.part_name_var()
+        paths: Dict[str, str] = {root.id: ""}
+        out: Dict[str, List["Entity"]] = {}
+        for p in self.entity_part_subtree(root.id):
+            nm = p.vars.get(name_var)
+            nm = str(nm) if nm not in (None, "") else str(p.name)
+            up = paths.get(p.part_of or "", "")
+            path = f"{up}/{nm}" if up else nm
+            paths[p.id] = path
+            out.setdefault(path, []).append(p)
+        return out
+
+    def _transform_status_swap(self, u: "Entity", old: Any, form: Any, *,
+                               mode: str, form_tag: Optional[str],
+                               revert_tag: Optional[str],
+                               add_form: bool) -> List[str]:
+        """Give unit `u` (a transformed unit or a body part on a path both
+        forms share) its statuses after a transform: `u` held `old`, its
+        new form brings `form`. Each old status goes (on_removed fires,
+        removed_by `transform`) when its `on_transform` is drop, under
+        `mode` replace (a zone's status stays: the zone decides), when it
+        carries `revert_tag`'s marker or when the new form is immune to it;
+        `on_transform` keep keeps it whatever else holds (user call). Then
+        the form's statuses arrive (unless not `add_form`): a new one is
+        added (on_added fires; marked with `form_tag`), one the unit still
+        holds takes the form's as an application through its stack mode,
+        resistance skipped (user call). Returns the hook log."""
+        log: List[str] = []
+        old = {n: i for n, i in (old or {}).items()
+               if isinstance(i, dict)} if isinstance(old, dict) else {}
+        form = {n: i for n, i in (form or {}).items()
+                if isinstance(i, dict)} if (add_form and isinstance(
+                    form, dict)) else {}
+        # Immunity as the new form has it: its vars and its own statuses.
+        u.status = copy.deepcopy(form)
+        gone: List[str] = []
+        for n, inst in old.items():
+            flag = self.status_field(inst, n, "on_transform")
+            if flag == "keep":
+                continue
+            if (flag == "drop"
+                    or (mode == "replace" and ZONE_GRANT_KEY not in inst)
+                    or (revert_tag is not None
+                        and inst.get(TRANSFORM_FORM_KEY) == revert_tag)
+                    or self._resist_inputs(u, n)[0]):
+                gone.append(n)
+        u.status = copy.deepcopy(old)
+        for n in gone:
+            if u.id not in self.entities:
+                return log
+            before = u.status.pop(n, None)
+            if before is not None:
+                log += self._emit_status_diff(u.id, n, before, None,
+                                              removed_by="transform")
+        for n, inst in form.items():
+            if u.id not in self.entities:
+                return log
+            if n not in u.status:
+                new = copy.deepcopy(inst)
+                new.pop(TRANSFORM_FORM_KEY, None)
+                if form_tag is not None:
+                    new[TRANSFORM_FORM_KEY] = form_tag
+                u.status[n] = new
+                log += self._emit_status_diff(u.id, n, None,
+                                              copy.deepcopy(new))
+                continue
+            lv = inst.get("level")
+            du = inst.get("duration")
+            try:
+                log += self.apply_status(
+                    u.id, n,
+                    lv if isinstance(lv, (int, float))
+                    and not isinstance(lv, bool) else None,
+                    du if isinstance(du, (int, float))
+                    and not isinstance(du, bool) else None,
+                    force=True)
+            except VTTError as ex:
+                log.append(f"⚠️ `{u.id}`'s new form's `{n}` didn't stack: "
+                           f"{ex}")
+        if u.id in self.entities:
+            self._cap_unit_status_levels(u)
+        return log
+
     def transform_entity(self, eid: str, template: Any,
                          stash_path: Optional[str] = None,
-                         *, hp_mode: Optional[str] = None) -> List[str]:
+                         *, hp_mode: Optional[str] = None,
+                         statuses: str = "merge") -> List[str]:
         """Transform `eid` into `template` (a statblock dict). If `stash_path`
         is given, the PRE-transform statblock is stored at
         entity[eid].vars.<stash_path> (in the NEW form's vars, so it survives),
-        and `revert(eid, stash_path)` restores it. Stash paths are ordinary
-        vars chosen by the caller, so transforms stack."""
+        with the flavor (`statuses`: merge = `!ent transform`, the unit's
+        statuses kept beside the form's; replace = `!ent replace`, the
+        form's only), and `revert(eid, stash_path)` restores it. Stash paths
+        are ordinary vars chosen by the caller, so transforms stack."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
         if e.is_part:
             raise VTTError(
                 f"'{eid}' is a body part — transform its parent instead.")
+        if statuses not in ("merge", "replace"):
+            raise VTTError(f"transform: statuses must be merge or replace, "
+                           f"not `{statuses}`.")
         snap = self.capture_statblock(e) if stash_path else None
-        log = self.apply_statblock(e, template, hp_mode=hp_mode)
+        if snap is not None:
+            snap[TRANSFORM_MODE_KEY] = statuses
+        log = self.apply_statblock(
+            e, template, hp_mode=hp_mode, statuses=statuses,
+            form_tag=str(stash_path) if stash_path else None,
+            kind="transform" if statuses == "merge" else "replace")
         if stash_path and e.id in self.entities:
             e.write_var(str(stash_path), snap)
         return log
@@ -24664,7 +24881,15 @@ class Match:
         if not isinstance(snap, dict):
             raise VTTError(
                 f"revert: no stashed statblock at `{stash_path}` on `{eid}`.")
-        return self.apply_statblock(e, snap, hp_mode=hp_mode)
+        # Reverting a merge transform takes back the statuses that came
+        # with the form and keeps the rest (the stash's aren't re-added);
+        # reverting a replace restores the stash's (user call).
+        if snap.get(TRANSFORM_MODE_KEY) == "merge":
+            return self.apply_statblock(
+                e, snap, hp_mode=hp_mode, statuses="merge",
+                revert_tag=str(stash_path), add_form=False, kind="revert")
+        return self.apply_statblock(e, snap, hp_mode=hp_mode,
+                                    statuses="replace", kind="revert")
 
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)

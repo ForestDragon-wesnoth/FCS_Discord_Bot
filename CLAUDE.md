@@ -1497,7 +1497,7 @@ hardcodes**.
   `atb_reset_formula` (default subtract `atb_threshold`). A skipped unit's
   turn still elapses (ticks fire, action surface doesn't). `round_number()`,
   `turn_index()` and `schedule()` RAISE under ATB; a one-time warning lists
-  dormant round logic. `transform` resets the bar to the new form's value.
+  dormant round logic. `transform` resets the bar to the new form's value (unless `transform_keep_vars` names it).
   Prims `atb_threshold()` / `atb_rate(eid)` (524-527).
 - **`Match.turns_elapsed`**: serialized count of turn boundaries in both
   models (`_begin_turn`); `turns_elapsed()`; the clock for ATB-safe expiry
@@ -1538,7 +1538,7 @@ hardcodes**.
   `fire_status_event` after the on_status_* passives, self = the bearer,
   while the unit exists. Removal hooks (passives too) bind `removed_by`:
   `dispel`, `transfer`, `removes` (another status's `removes`), `zone`
-  (a granting zone let go, §7.12), `expired`
+  (a granting zone let go, §7.12), `transform` (§7.11), `expired`
   (a counter reached 0, or the status's own tick removed it:
   `logic.STATUS_TICKING`) or `removed`; `_emit_status_diff(removed_by=)`
   carries a caller's cause (884). The formula status functions surface
@@ -2369,11 +2369,34 @@ hardcodes**.
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
   corpse / corpse_list action targets.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
-  `revert`): swaps name, vars, passives, clamps, statuses and the part
-  subtree; keeps id, position, facing, team, turn slot and the unit's own
-  segment linkage; hp per `transform_hp_mode` (percent / keep / full); the
-  old statblock is stashed at a caller-chosen var path, so transforms stack.
-  New vars are checked before the old parts go (481-483, 586).
+  `revert`; `!ent replace`, `replace_form`): swaps name, vars, passives,
+  clamps and the part subtree; keeps id, position, facing, team, turn slot
+  and the unit's own segment linkage; hp per `transform_hp_mode` (percent
+  / keep / full); the vars `transform_keep_vars` and the unit's
+  `__transform_keep_vars` list (which survives too) name keep the unit's
+  values (`Match.transform_keep_paths`); the old statblock is stashed at
+  a caller-chosen var path, so transforms stack. New vars are checked
+  before the old parts go (481-483, 586).
+- **Statuses across a transform** (user design, 1062-1065;
+  `Match._transform_status_swap`, after the new body stands): two
+  flavors, recorded in the stash (`TRANSFORM_MODE_KEY`). `transform`
+  (merge) keeps the unit's statuses and adds the form's: a new one is
+  added (on_added; marked `TRANSFORM_FORM_KEY` = the stash path), one
+  the unit holds takes the form's as an application through its stack
+  mode, resistance skipped; an old one the new form is immune to goes.
+  `replace` keeps only the form's (a zone's status stays: the zone
+  decides). A status's `on_transform` (`status_field`: instance key,
+  definition, level entries; `!status on_transform`) keep survives
+  everything, immunity included, drop goes on every transform. Leaving
+  statuses fire on_removed with removed_by `transform`. Reverting a
+  merge takes back the statuses marked with its stash path and adds
+  nothing from the stash; reverting a replace restores the stash's as a
+  replace. A body part on a part-name path both forms share
+  (`Match._part_paths`: part_name var, else the name, under the parent's
+  path; duplicates paired in order) passes its statuses to the new part
+  through the same swap; parts unique to either form keep their own.
+  `on_transformed` fires on the unit at the end (`transform_kind`
+  transform / replace / revert).
 - **Disguise** (`disguise_var`): `{name, glyph, glyphs, color, vars}` shown
   to viewers outside the unit's team (maps, roster, `!ent info`, `!find`
   rows); mechanics always read the real unit; overlays hidden under a
@@ -3643,7 +3666,9 @@ rejected already. Update this section in the PR that resolves an item.
   requester's channel, so its output (including hook lines naming units that
   POV can't see) shows there. On hold at the user's request.
 - **ATB bar across a transform:** transform replaces vars, so the charge bar
-  resets to the new form's value. Raise it if the user wants it kept.
+  resets to the new form's value unless `transform_keep_vars` names it
+  (the rule's default is empty; #122's entry proposed the bar as the
+  default).
 - **Aura id reuse:** a suspended aura resumes around a later unit that takes
   the old anchor's id (§7.12). Distinguishing them needs an identity concept
   beyond ids.
