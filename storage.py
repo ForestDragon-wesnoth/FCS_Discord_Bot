@@ -787,7 +787,7 @@ class Storage:
         to date; a file edited by hand) no longer has the state its journal
         last recorded: a `state` entry records the loaded one, so a replay
         goes on from what the server holds."""
-        from journal import effective_seed, journal_state, state_hash
+        from journal import effective_seed, state_hash
         for m in mgr.matches.values():
             if m.journal is None or not m.journal.segments:
                 continue
@@ -795,11 +795,11 @@ class Storage:
             h = state_hash(post, m)
             if h == m.journal.last_state_hash():
                 continue
-            m.journal.add({"kind": "state", "at": _now_iso(), "by": "",
-                           "cmd": ["(loaded from disk)"], "outside": True,
-                           "rng": [effective_seed(m), m.rng_position(),
-                                   m.rng_position()],
-                           "state": journal_state(post), "hash": h})
+            m.journal.add_state({"kind": "state", "at": _now_iso(),
+                                 "by": "", "cmd": ["(loaded from disk)"],
+                                 "outside": True,
+                                 "rng": [effective_seed(m), m.rng_position(),
+                                         m.rng_position()], "hash": h}, post)
 
     def _settle_lost_systems(self, mgr: MatchManager,
                              backups: Dict[str, Tuple[float, Dict[str, Any]]],

@@ -4945,6 +4945,33 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "match at the state players would have seen as the round began."
         ),
     },
+    "autosave_round_snapshot_mode": {
+        "default": "diff",
+        "schema": {"type": "enum", "choices": ["diff", "full"]},
+        "desc": (
+            "How a round-start autosave is stored. diff (default): as what "
+            "changed since the autosave before it, like turn and command "
+            "autosaves (a few KB); undoing to it reads the chain back from "
+            "the last full snapshot. full: a complete copy of the match "
+            "(a whole board's size each round, read in one step). Either "
+            "way a full snapshot is written at least every "
+            "autosave_full_snapshot_interval autosaves. Applies to round "
+            "autosaves taken after the change."
+        ),
+    },
+    "autosave_full_snapshot_interval": {
+        "default": 100,
+        "schema": {"type": "int", "min": 1, "max": 1000, "ceiling": True},
+        "desc": (
+            "Autosaves (round, turn and command) between two full snapshots: "
+            "every other autosave is stored as a diff against the one "
+            "before it, and an undo rebuilds its state from the last full "
+            "snapshot through the diffs after it. Lower = undo reads fewer "
+            "diffs, the history takes more disk; higher = the reverse. 1 = "
+            "every autosave is a full copy. Applies to autosaves taken "
+            "after the change."
+        ),
+    },
     "autosave_turn_retention_rounds": {
         "default": 10,
         "schema": {"type": "int", "min": 0, "unlimited": True},
@@ -4995,10 +5022,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Whether a match's undo history (round / turn / command autosaves "
             "and manual saves) is written to disk with it, so undo still "
-            "works after the bot restarts. A round autosave or manual save is "
-            "a full copy of the match, a turn or command autosave what "
-            "changed since the autosave before it; the history takes room in "
-            "the server's storage limit. Off: the history lives in memory "
+            "works after the bot restarts. A manual save is a full copy of "
+            "the match, an autosave what changed since the autosave before it "
+            "(a full copy every autosave_full_snapshot_interval, and each "
+            "round's under autosave_round_snapshot_mode full); the history "
+            "takes room in the server's storage limit. Off: the history lives in memory "
             "only (lost on restart) "
             "and its files are deleted."
         ),
@@ -10863,6 +10891,9 @@ class Map:
     # text) and (kind, mode, "items") -> {key: (entry, its text)}.
     _ptxt: Dict[Any, Any] = field(default_factory=dict, repr=False,
                                   compare=False)
+    # hook_cells' index (None = built on its next use).
+    _hook_ix: Optional[Dict[Tuple[int, int], Any]] = field(
+        default=None, repr=False, compare=False)
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "tiles" and type(value) is not TileDict:
@@ -10873,6 +10904,7 @@ class Map:
         if name == "tiles":
             object.__setattr__(self, "_corpse_ix", None)
             object.__setattr__(self, "_tser_out", None)
+            object.__setattr__(self, "_hook_ix", None)
         elif name == "zones":
             object.__setattr__(self, "_zone_ix", None)
             object.__setattr__(self, "_zser_out", None)
@@ -10895,9 +10927,39 @@ class Map:
     def tile_touch(self, x: int, y: int) -> None:
         """The data of tile (x, y) changed in place (a write into a dict
         read from `tiles`): its serialized form is stale."""
-        ch = self.tiles.changed
-        if ch is not None:
-            ch.add((x, y))
+        self.tiles.mark((x, y))
+
+    def hook_cells(self) -> Dict[Tuple[int, int], Tuple[Any, Any]]:
+        """The tile hook index: cell -> (the hook names its own data
+        holds, its template's name) for every tile with either, so the
+        time hooks read these cells, never every tile (#197). Kept by the
+        same marks as the serialization cache (TileDict.also)."""
+        t = self.tiles
+        ix = self._hook_ix
+        if ix is None or t.also is None:
+            ix = {}
+            for c, d in t.items():
+                rec = _tile_hook_rec(d)
+                if rec is not None:
+                    ix[c] = rec
+            object.__setattr__(self, "_hook_ix", ix)
+            t.also = set()
+        elif t.also:
+            for c in t.also:
+                rec = _tile_hook_rec(t.get(c))
+                if rec is None:
+                    ix.pop(c, None)
+                else:
+                    ix[c] = rec
+            t.also = set()
+        if SPATIAL_CHECK:
+            want = {c: r for c, d in t.items()
+                    for r in [_tile_hook_rec(d)] if r is not None}
+            if want != ix:
+                raise SpatialCheckError(
+                    f"map `{self.name}`: the tile hook index differs from "
+                    f"the tiles")
+        return ix
 
     def runs_changed(self, kind: str) -> None:
         """`explored`, `fog_reveals` or `voids` changed in place."""
@@ -11700,49 +11762,72 @@ class ChangeDict(dict):
     into it), for a serialization cache. None = everything changed.
     Map.tiles (TileDict: cell -> tile data, Map.ser_tiles) and Map.zones
     (ZoneTable: name -> zone, Map.ser_zones); a write INTO an entry read
-    with get / [] calls Map.tile_touch / zone_changed."""
+    with get / [] calls Map.tile_touch / zone_changed. `also` is a second
+    such set (the tile hook index, Map.hook_cells)."""
 
-    __slots__ = ("changed",)
+    __slots__ = ("changed", "also")
 
     def __init__(self, *args: Any, **kw: Any) -> None:
         super().__init__(*args, **kw)
-        self.changed: Optional[Set[Tuple[int, int]]] = None
+        self.changed: Optional[Set[Any]] = None
+        self.also: Optional[Set[Any]] = None
+
+    def mark(self, key: Any) -> None:
+        if self.changed is not None:
+            self.changed.add(key)
+        if self.also is not None:
+            self.also.add(key)
+
+    def mark_all(self) -> None:
+        self.changed = None
+        self.also = None
 
     def __setitem__(self, key: Any, value: Any) -> None:
         super().__setitem__(key, value)
-        if self.changed is not None:
-            self.changed.add(key)
+        self.mark(key)
 
     def __delitem__(self, key: Any) -> None:
         super().__delitem__(key)
-        if self.changed is not None:
-            self.changed.add(key)
+        self.mark(key)
 
     def pop(self, key: Any, *default: Any) -> Any:
-        if self.changed is not None:
-            self.changed.add(key)
+        self.mark(key)
         return super().pop(key, *default)
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
-        if self.changed is not None:
-            self.changed.add(key)
+        self.mark(key)
         return super().setdefault(key, default)
 
     def popitem(self) -> Any:
-        self.changed = None
+        self.mark_all()
         return super().popitem()
 
     def clear(self) -> None:
-        self.changed = None
+        self.mark_all()
         super().clear()
 
     def update(self, *args: Any, **kw: Any) -> None:
-        self.changed = None
+        self.mark_all()
         super().update(*args, **kw)
 
     def __ior__(self, other: Any) -> "ChangeDict":
-        self.changed = None
+        self.mark_all()
         return super().__ior__(other)
+
+
+def _tile_hook_rec(d: Any) -> Optional[Tuple[frozenset, Any]]:
+    """A tile's entry in the hook index: (its own hook names, its
+    template's name), None when it has neither."""
+    if not isinstance(d, dict):
+        return None
+    hooks = d.get("hooks")
+    own = frozenset(k for k, v in hooks.items() if isinstance(v, str) and v) \
+        if isinstance(hooks, dict) else frozenset()
+    tpl = d.get("_template")
+    tpl = tpl if isinstance(tpl, str) else None
+    if not own and tpl is None:
+        return None
+    return own, tpl
 
 
 class TileDict(ChangeDict):
@@ -11752,6 +11837,10 @@ class TileDict(ChangeDict):
 class ZoneTable(ChangeDict):
     __slots__ = ()
 
+
+# A read pass asking about more cells than this for one team (a full fogged
+# render) stamps the team's sight into a cell set (_team_vision_index).
+_VISION_STAMP_AFTER = 256
 
 # Bodies covering more cells than this are kept as rectangles a lookup
 # tests one by one, so moving a huge body costs one record, never its area.
@@ -13888,7 +13977,7 @@ class Match:
         for e in self.entities.values():
             e.mark_changed()
         for m2 in self.maps.values():
-            m2.tiles.changed = None
+            m2.tiles.mark_all()
             m2.zones.changed = None
         return n
 
@@ -17816,11 +17905,50 @@ class Match:
                 for qx in range(x0 // B, x1 // B + 1):
                     blocks.setdefault((qx, qy), []).append(box)
 
-        def test(x: int, y: int) -> bool:
+        def by_member(x: int, y: int) -> bool:
             return any(x0 <= x <= x1 and y0 <= y <= y1
                        and self._member_sees(e, x, y, mp, los=los)
                        for e, x0, y0, x1, y1
                        in blocks.get((x // B, y // B), ()))
+        if los:
+            memo[key] = by_member
+            return by_member
+        # Without line of sight, a pass that asks about many cells (a full
+        # render) stamps each member's sight area once into one cell set
+        # and reads that (#197); a few questions keep the member test.
+        asked = [0]
+        seen: List[Optional[Set[Tuple[int, int]]]] = [None]
+
+        def stamp() -> Set[Tuple[int, int]]:
+            out: Set[Tuple[int, int]] = set()
+            done: Set[Any] = set()
+            for boxes in blocks.values():
+                for e, x0, y0, x1, y1 in boxes:
+                    if id(e) in done:
+                        continue
+                    done.add(id(e))
+                    r = self._vision_radius_of(e)
+                    for (ex, ey) in self.entity_cells(e):
+                        for yy in range(max(y0, ey - r), min(y1, ey + r) + 1):
+                            for xx in range(max(x0, ex - r),
+                                            min(x1, ex + r) + 1):
+                                if (xx, yy) not in out and \
+                                        self._within_vision(ex, ey, xx, yy, r):
+                                    out.add((xx, yy))
+            return out
+
+        def test(x: int, y: int) -> bool:
+            got = seen[0]
+            if got is None:
+                asked[0] += 1
+                if asked[0] <= _VISION_STAMP_AFTER:
+                    return by_member(x, y)
+                got = seen[0] = stamp()
+            ans = (x, y) in got
+            if SPATIAL_CHECK and ans != by_member(x, y):
+                raise SpatialCheckError(
+                    f"fog stamping: ({x},{y}) for `{pov_team}` differs")
+            return ans
         memo[key] = test
         return test
 
@@ -21259,7 +21387,7 @@ class Match:
                 counts["zone grants"] += 1
         for mp in self.maps.values():
             mp.zones.changed = None
-            mp.tiles.changed = None     # corpses' statuses
+            mp.tiles.mark_all()     # corpses' statuses
         return counts
 
     def _rename_status_refs(self, node: Any, old: str, new: str,
@@ -26182,12 +26310,18 @@ class Match:
             return []
         cur = self.current_entity_id()
         log: List[str] = []
-        # Every map's tiles, maps in order (a hook can delete a map).
+        # The templates with a hook of this kind.
+        tpls = {n for n, t in self.tile_templates.items()
+                if isinstance(t.hooks.get(when), str) and t.hooks[when]}
+        # Every map's tiles, maps in order (a hook can delete a map); only
+        # the tiles that can have the hook (Map.hook_cells).
         for mname in list(self.maps):
             mp = self.maps.get(mname)
             if mp is None:
                 continue
-            for (x, y) in sorted(mp.tiles.keys()):
+            cells = sorted(c for c, (own, tpl) in mp.hook_cells().items()
+                           if when in own or tpl in tpls)
+            for (x, y) in cells:
                 # Skip tiles cleared mid-iteration (e.g. by a previous
                 # tile's hook calling tile_clear on this one). Also skip if
                 # no hook of this kind is registered — fire_tile_hook

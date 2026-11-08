@@ -38127,3 +38127,117 @@ serialized (tile data, a zone, a corpse lying in a tile): the tile's
 template name, the zone's facing, the corpse's status name and the map
 name inside the corpse's var. Each marks what it changed, so the save
 writes it: after a restart all four read back as edited.
+
+
+SCENARIO 1080 — Tile turn hooks are found through an index (#197): hooks added, placed, retemplated and removed between turns all fire as they stand
+------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new th TH 8 6
+!match use th
+!ent add a A 10 1 1 5
+!match var set ticks 0
+!tile set 7 6 kind grass
+!turn next
+!tile hook add 2 2 on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 1)'
+!turn next
+!assert "match_var_get('ticks') == 1" a hook added after the first turn fires
+!tile def new beacon
+!tile def hook beacon on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 10)'
+!tile place beacon 3 3
+!turn next
+!assert "match_var_get('ticks') == 12" a tile placed from a template with the hook fires
+!tile def new dud
+!tile def hook dud on_turn_end 'match_var_set("ticks", match_var_get("ticks") + 1000)'
+!tile place dud 4 4
+!tile def hook dud on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 100)'
+!turn next
+!assert "match_var_get('ticks') == 1123" the template that gained an on_turn_start hook fires, and its on_turn_end too
+!tile hook del 2 2 on_turn_start
+!tile del 3 3
+!turn next
+!assert "match_var_get('ticks') == 2223" only the dud tile hooks are left
+
+Expected: a turn reads only the tiles that can have a time hook: a
+tile's own hooks and its template's, kept current by the same marks as
+the save. The hook added on (2,2) after the index was built fires at the
+next turn start (1). The beacon placed from a template adds 10 (12). The
+dud tile, placed with only an on_turn_end hook, gains an on_turn_start
+hook through its template: the next turn change runs its turn-end hook
+(+1000) and its turn-start hook (+100) besides the others (+11): 1123.
+With (2,2)'s hook deleted and the beacon tile cleared, only the dud
+fires: +1100, 2223.
+
+
+SCENARIO 1081 — Round autosaves as diffs or full copies, and how often a full one is written (#197): both undo exactly after a restart
+--------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rs RS 6 6
+!match use rs
+!help rule autosave_round_snapshot_mode
+?? diff
+!help rule autosave_full_snapshot_interval
+?? 100
+!ent add a A 30 1 1 5
+!ent add b B 30 3 1 4
+!system set default autosave_full_snapshot_interval 2
+!turn next
+!ent hp a -1
+!turn next
+!ent hp b -2
+!turn next
+!system set default autosave_round_snapshot_mode full
+!ent hp a -3
+!turn next
+!ent hp b -4
+!turn next
+!as restart
+!undo round 2 confirm
+?? Undid 2 round(s)
+!assert "entity[a].hp == 29 and entity[b].hp == 28" the round 2 autosave, a diff, read back exactly
+!undo round 2 confirm
+?? Undid 2 round(s)
+!assert "entity[a].hp == 30 and entity[b].hp == 30"
+!system set default autosave_full_snapshot_interval 0
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. By default a round autosave is a diff
+against the autosave before it, like turn and command autosaves, and a
+full copy is written every autosave_full_snapshot_interval autosaves
+(set to 2 here, so the chains are short). Round 3 starts after the mode
+switched to `full`, so its autosave is a full copy. After a restart,
+undoing 2 rounds lands on the start of round 2 (a 29, b 28) through the
+diffs, and undoing 2 again (the first is the start of the round it
+stands in) on the start of round 1. The interval takes
+1 and up (1 = every autosave full).
+
+
+SCENARIO 1082 — Journal `state` entries are diffs (#197): a replay rebuilds each one from the one before
+----------------------------------------------------------------------------------------------------------
+
+!match new jd JD 6 6
+!match use jd
+!ent add a A 30 1 1 5
+!ent add b B 30 3 1 4
+!tile set 2 2 kind mud
+!ent hp a -1
+!undo command
+!ent hp b -2
+!ent tp a 5 5
+!undo command
+!ent set_var b note x
+!match journal
+?? stored state after `!undo command`
+!match journal export j1082.json
+?? 📼 Wrote the journal of `jd`
+!match replay j1082.json as=jdr
+?? ✅ The state matched the recording after every command.
+!match use jdr
+!assert "entity[a].hp == 30 and entity[b].hp == 28 and entity[a].x == 1 and entity[b].note == 'x' and tile_get(2, 2, 'kind') == 'mud'"
+
+Expected: each undo records the match state it left as a journal
+`state` entry, stored as a diff against the journal's last stored state
+(the segment's start, then the first undo's). The replay (as `jdr`)
+rebuilds each
+from the one before and matches the recording after every command; the
+replayed match has a at 30 hp at (1,1), b at 28 with its note, and the
+tile.

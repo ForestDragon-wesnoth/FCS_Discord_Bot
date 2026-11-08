@@ -28,9 +28,10 @@ Key invariants:
     autosave_command_retention_max    (default 500; count cap on commands)
   -1 means unlimited, 0 disables that kind entirely, N>0 caps to last N.
 
-- Storage: a round autosave, a manual save and the first autosave hold a
-  full match state; a turn or command autosave holds a diff against the
-  autosave before it by sequence (state_diff), and pruning one in the middle
+- Storage: a manual save, the first autosave, one autosave every
+  autosave_full_snapshot_interval and (autosave_round_snapshot_mode full) a
+  round autosave hold a full match state; every other autosave holds a
+  diff against the autosave before it by sequence (state_diff), and pruning one in the middle
   merges its diff into the next (MatchHistory._relink). States share the
   serialized pieces of units, tiles and zones (Entity.ser_dict), so nothing
   may change a snapshot's state in place.
@@ -62,9 +63,10 @@ def same_value(a: Any, b: Any) -> bool:
 
 
 # ---- state diffs -----------------------------------------------------------
-# A turn or command autosave is stored as a diff against the autosave before
-# it (by sequence); a round autosave, a manual save and the first autosave
-# are full states (keyframes). A diff names what changed at the grain of the
+# An autosave is stored as a diff against the autosave before it (by
+# sequence); a manual save, the first autosave, one every
+# autosave_full_snapshot_interval and, under autosave_round_snapshot_mode
+# `full`, a round autosave are full states (keyframes). A diff names what changed at the grain of the
 # serialization caches: top-level fields whole, units by id, maps by name and
 # in each map its fields, tiles by cell and zones by name. Its parts are
 # {"s": {key: new value}, "d": [deleted keys], "c": {key: nested diff},
@@ -78,8 +80,8 @@ _MAP_SPEC: Dict[str, Tuple[str, Any]] = {"tiles": ("tiles", None),
 _STATE_SPEC: Dict[str, Tuple[str, Any]] = {"entities": ("ordered", None),
                                            "maps": ("ordered", _MAP_SPEC),
                                            "event_log": ("log", None)}
-# A keyframe at least this often, so a history without round autosaves (or
-# a long round) never replays a long chain of diffs.
+# A full snapshot at least this often (the default of the rule
+# autosave_full_snapshot_interval), so an undo never replays a long chain.
 KEYFRAME_EVERY = 100
 
 
@@ -592,9 +594,10 @@ class MatchHistory:
         then passes it here post-dispatch if the command turned out to
         be mutating). Avoids serializing the same Match dict twice.
 
-        A turn or command autosave holds a diff against the newest
-        autosave (`base`); a round autosave, the first one, one every
-        KEYFRAME_EVERY and a manual save are full states."""
+        An autosave holds a diff against the newest autosave (`base`);
+        the first one, one every autosave_full_snapshot_interval, a round
+        autosave under autosave_round_snapshot_mode `full` and a manual
+        save are full states."""
         if state is None:
             state = match.to_dict(include_history=False)
         snap = self._adopt(Snapshot(
@@ -612,8 +615,15 @@ class MatchHistory:
             return snap
         chain = self.autosaves()
         prev = chain[-1] if chain else None
-        if kind != "round" and prev is not None \
-                and prev.depth + 1 < KEYFRAME_EVERY:
+        try:
+            every = max(1, int(match.rules.get(
+                "autosave_full_snapshot_interval", KEYFRAME_EVERY)))
+        except (TypeError, ValueError):
+            every = KEYFRAME_EVERY
+        full_round = (kind == "round" and str(match.rules.get(
+            "autosave_round_snapshot_mode", "diff")) == "full")
+        if not full_round and prev is not None \
+                and prev.depth + 1 < every:
             try:
                 tail = self._tail
                 pstate = (tail[1] if tail is not None

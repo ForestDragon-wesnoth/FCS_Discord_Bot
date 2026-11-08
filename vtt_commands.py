@@ -21,7 +21,7 @@ from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JO
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
-from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs
+from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
 from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
@@ -1627,12 +1627,14 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
     if (as_state or name in _JOURNAL_STATE_ROOTS
             or (name, sub) in _JOURNAL_STATE_SUBS):
         entry["kind"] = "state"
-        entry["state"] = journal_state(post)
         if effective_seed(post_m) != jrng[0]:
             entry["rng"][0] = effective_seed(post_m)
     elif prefab_reads:
         entry["prefabs"] = journal_prefab_reads(j, prefab_reads)
-    j.add(entry)
+    if entry["kind"] == "state":
+        j.add_state(entry, post)
+    else:
+        j.add(entry)
     done.add(post_m.id)
     handled = getattr(mgr, "_journal_handled", None)
     if handled is not None:
@@ -1938,13 +1940,12 @@ def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
         post = m.to_dict(include_history=False)
         if state_hash(post, m) == m.journal.last_state_hash():
             continue    # only what an undo leaves alone moved (the RNG)
-        m.journal.add({"kind": "state", "at": _now_iso(),
-                       "by": getattr(mgr, "_journal_by", "") or "",
-                       "cmd": list(label), "outside": True,
-                       "rng": [effective_seed(m), m.rng_position(),
-                               m.rng_position()],
-                       "state": journal_state(post),
-                       "hash": state_hash(post, m)})
+        m.journal.add_state({"kind": "state", "at": _now_iso(),
+                             "by": getattr(mgr, "_journal_by", "") or "",
+                             "cmd": list(label), "outside": True,
+                             "rng": [effective_seed(m), m.rng_position(),
+                                     m.rng_position()],
+                             "hash": state_hash(post, m)}, post)
 
 
 # Whether this asyncio task holds its manager's command lock (see run()).
@@ -9208,6 +9209,9 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
     first_off: Optional[str] = None
     prefabs_seen: Dict[str, Any] = {}
     for seg in segs:
+        # The segment's stored state so far: a `state` entry may be a diff
+        # against it (journal.Journal.add_state).
+        stored = (seg.get("start") or {}).get("state") or {}
         for e in seg.get("entries") or []:
             n = e.get("n")
             if upto is not None and isinstance(n, int) and n > upto:
@@ -9268,7 +9272,8 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     first_off = (f"at #{n} `!{' '.join(toks)}`"[:120])
             elif kind == "state":
                 from action import _rollback_match
-                st_state = copy.deepcopy(e.get("state") or {})
+                stored = journal_entry_state(stored, e)
+                st_state = copy.deepcopy(stored)
                 st_state["id"] = mid        # `as=` renames the match
                 _rollback_match(m, mgr, st_state)
                 if m.system_name in mgr.systems:

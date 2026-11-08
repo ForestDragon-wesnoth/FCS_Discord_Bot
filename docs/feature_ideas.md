@@ -496,7 +496,8 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#197 Scaling.**
   - Shipped: the spatial indexes (#154: units, zones and corpses by cell) and servers loaded on first use and unloaded when idle (`server_idle_unload_hours`).
   - Left: the per-server CPU work budget (§8).
-  - Also shipped: serialization caches (a command serializes what it changed) and diff-based turn / command undo snapshots (1,000 units on a filled 150×150: ~300 ms per command before, ~15 ms after; 70.7 MB of undo files over 6 rounds before, 10.8 MB after).
+  - Also shipped: serialization caches (a command serializes what it changed), diff-based undo snapshots (rounds too, `autosave_round_snapshot_mode`) and journal `state` entries, a tile time-hook index and fog stamping for full renders (1,000 units on a filled 150×150: ~300 ms per command before, ~15 ms after).
+  - Left besides the budget: a formula namespace cache (approved, deferred: CLAUDE.md §8 "Large match state").
   - Also shipped: the per-command size sweep, watcher check and zone-grant check read only what changed (~140 ms per command at 10,000 units before, ~1 ms after).
 - **#198 Play-by-post mode.**
   - Turn deadlines and a ping to the active unit's player (needs #28).

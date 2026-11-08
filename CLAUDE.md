@@ -2516,7 +2516,9 @@ hardcodes**.
 - **Tiles:** per-cell data (`!tile set/place/line/fill/copy/...`), templates
   (`!tile def` per match, `!system tile` per system, §7.16), precedence instance > template > rule for
   glyph / color / sprite / block / opaque; tile hooks (on_enter / on_exit /
-  on_stop / time hooks). Formulas place a template with `tile_place(template,
+  on_stop / time hooks; a turn or round reads only the tiles that can hold
+  a time hook, `Map.hook_cells`: own hooks or a template, kept by the
+  serialization cache's marks, `TileDict.also`, 1080). Formulas place a template with `tile_place(template,
   x, y, data=None)` (`!tile place`: replaces the cell's data, corpses stay,
   `data` overrides fields; mutating) and read it back with
   `tile_template_of(x, y)` (892). `!tile def rename` takes the placed tiles
@@ -2680,7 +2682,11 @@ hardcodes**.
   <len> [half_angle]`, `line <x1> <y1> <x2> <y2>`: the cells_in_*
   builders), optionally temporary (`turns=N`, keyed to whichever clock
   advances). Everything funnels through `_fog_team_sees`; renders
-  memoize it for one pass (`_vision_memo`). Explored cells and reveals are
+  memoize it for one pass (`_vision_memo`, `_team_vision_index`); without
+  `fog_los`, a pass asking about more than `_VISION_STAMP_AFTER` (256)
+  cells for one team stamps each member's sight area once into a cell set
+  (#197; `FCS_SPATIAL_CHECK=1` compares every stamped answer with the
+  member test). Explored cells and reveals are
   saved as row runs `[y, x_from, x_to]` (`_cells_to_runs`): a whole-map
   reveal as one pair per cell cost every command ~0.6 s per save.
 - **Opacity / LOS:** `tile_opaque_condition` / `zone_opaque_condition` (`self`
@@ -3077,12 +3083,14 @@ hardcodes**.
   the history to a mark taken before it (`MatchHistory.mark` / `rewind`):
   autosaves of turns that never happened go, autosaves pruned meanwhile
   come back (816). `!alias`, `!table` and `!turn set` are undo steps.
-  Storage (#197): a round autosave, a manual save and a chain's first
-  autosave hold the full state; every other turn and command autosave a
-  diff against the autosave before it by sequence (`state_diff`: top-level
-  fields whole, units by id, maps by name, tiles by cell, zones by name, the
-  event log as entries appended and trimmed, `"o"` the unit order when units
-  came or went), a full one at least every `KEYFRAME_EVERY` (100). A
+  Storage (#197): a manual save and a chain's first autosave hold the
+  full state; every other autosave a diff against the autosave before it
+  by sequence (`state_diff`: top-level fields whole, units by id, maps by
+  name, tiles by cell, zones by name, the event log as entries appended and
+  trimmed, `"o"` the unit order when units came or went), a full one at
+  least every `autosave_full_snapshot_interval` (100, owner ceiling 1000);
+  a round autosave is a diff too unless `autosave_round_snapshot_mode` is
+  `full` (user call: diff by default, round retention unlimited). A
   snapshot rebuilds its state through the chain (`Snapshot.state`, cached
   until the commit releases it). Pruning or cutting one in the middle
   merges its diff into the next (`MatchHistory._relink`,
@@ -3094,8 +3102,7 @@ hardcodes**.
   commit rewrites a snapshot whose `base` changed. Defaults kept: turns of
   the last 10 rounds (ATB: 60 turns), commands of the last 10 turns (at
   most 500). A board of 1,000 units on a filled 150x150 kept 70.7 MB of
-  undo files over 6 rounds before, 10.8 MB after, nearly all of it the
-  round snapshots (1075-1078).
+  undo files over 6 rounds before diffs (1075-1078).
   A command undo's reply names the command by its round where the
   board's history is withheld from the channel (L49); `!history import`
   never replaces a save under a name it picked (`<name>-2`), and one
@@ -3136,6 +3143,12 @@ hardcodes**.
   `audit_log_entries`) lists who changed what server-wide: each such
   command's system diff (`_server_state_diff`) plus its `audit_note`s
   (files, templates, deleted matches) (774-776).
+- **Journal `state` entries are diffs** (#197): `Journal.add_state` stores
+  a match state as a diff (`match_history.state_diff`) against the newest
+  segment's last stored state (`stored_state`: its start's, then each
+  `state` entry's in turn; cached), whole only when the segment has none;
+  a replay rebuilds each in turn (`journal.entry_state`), so a segment is
+  read from its start.
 - **Command journal** (`journal.py`, rule `command_journal_limit`, -1 =
   the owner's ceiling, 0 = off): per match, segments of a starting state
   (match state, its system chain, the server's templates) plus entries:
@@ -3839,15 +3852,18 @@ rejected already. Update this section in the PR that resolves an item.
   tile, zone or corpse blocks it. Known issue (user: list it).
 
 - **Large match state, what is left** (user: discuss later): the
-  serialization caches and diff undo (#197, §7.16) made a command's
-  serialization follow what it changed. Still whole-match: the command
-  journal's `state` entries (undo, history restore, `!run`, transfers,
-  ...; ~650 KB on a filled 150x150; asked as diffs against the journal's
-  previous state, not yet answered) and every segment header's copy of
-  the template library; a round autosave (a full copy, user call); an
-  undo's restore (`from_dict` of the whole match, then one cold encode).
-  Every formula evaluation builds its namespace (~0.8 ms; only the
-  `entity[self].<path> <op> <number>` shape skips it).
+  serialization caches, diff undo and diff journal entries (#197, §7.16)
+  made a command's serialization follow what it changed. Still
+  whole-match: every journal segment header (the state and a copy of the
+  template library); an undo's restore (`from_dict` of the whole match,
+  then one cold encode). Every formula evaluation builds its namespace
+  (~0.8 ms; only the `entity[self].<path> <op> <number>` shape skips it):
+  a cache was approved (#197) and deferred to its own PR, because the
+  builder holds per-evaluation state a shared namespace would leak between
+  nested evaluations (the `map=` stack, the list budget, the once-per-
+  command zone warnings, the RNG captured at build, the loop counter, the
+  `!func`s and limit rules read at build); it needs that state moved to a
+  per-evaluation frame and a differential harness over every function.
 
 ### Ask between tasks
 
@@ -3878,10 +3894,8 @@ hasn't named the next.
   shape: a deterministic work counter charged per cell walked, loop
   iteration, macro step, summon and event, per server, owner-set. Needs
   careful decisions about compromises and abuse.
-- **Undo history disk growth:** turn and command autosaves are diffs
-  (#197, §7.16); a round autosave is a full copy, kept for the whole match
-  by default (`autosave_round_retention` -1), so a long match on a big board
-  grows by one full state per round. Cell lookups read the spatial indexes (§7.1), fogged reads
+- **Undo history disk growth:** autosaves are diffs (#197, §7.16), a
+  full state every `autosave_full_snapshot_interval`. Cell lookups read the spatial indexes (§7.1), fogged reads
   one team vision index per pass (`Match.vision_pass`), so neither costs
   cells x units; the size sweep, the watcher check and the zone-grant
   check read only what changed (#197), so a command on a board of 10,000
