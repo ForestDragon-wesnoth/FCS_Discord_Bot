@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #135 (`pending_request_expiry_seconds`), #221 (`default_passives_existing_units`, on by default), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14, parts of #190 (Discord-role
@@ -27,7 +27,9 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   export` + `!history import` into a new match), #137 (a reach aura: a zone
   anchored to the unit, whose `on_enter` / `on_exit` hooks fire once per body
   crossing, `zone_anchor_of` naming the standing unit).
-- Struck by the user: #7, #44, #45, #156, #145 (deployment phase: a player
+- Struck by the user: #7, #11 (summon lifetime: the summoning action
+  gives the summon an expiring status whose on_removed hook despawns it,
+  scenario 1089), #44, #45, #156, #145 (deployment phase: a player
   asks the host to place their unit, or the host opens `!ent tp` to them with
   a per-player access override), #163 and #199 (web viewer,
   networked GUI: the CLI / GUI test locally and Discord boards show the live
@@ -40,7 +42,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#6 Map markers.** `!map mark <x> <y> [glyph] [label] [turns=N]` puts a temporary mark on the map, optionally visible to one team only. Marks show in the legend.
 - **#10 Once-per-turn / once-per-round limits on passives.** Today each one needs a counter var plus a second passive that resets it.
   - Note: the limits should key on `turns_elapsed`, so they work under ATB. #24's `uses_per_turn` would cover them.
-- **#11 Summon lifetime.** An `expires_in` template field removes the summon after N turns. It counts on `turns_elapsed`, so it works under ATB.
 - **#14 Left-over follow-ups.** Two items remain, both marked "decide later" by you:
   - configurable side names for the directional functions;
   - `to_main_percent` per damage type.
@@ -73,7 +74,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#115 Hidden statuses.** A definition flag (or a visibility formula) keeps a status out of non-host views: `!ent info`, `show:status`, `status:` selectors. For curses and tracking marks.
   - Note: hidden statuses need the existence-oracle treatment #70's private vars got (`VAR_READER`, CLAUDE.md §7.22): `status:`, `show:status`, `count` and `$()` must treat a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
 - **#116 `max_duration` on status definitions,** the duration twin of `max_level`.
-- **#117 Zone and tile lifetimes.** `expires_in` on zones and placed tiles, counted on `turns_elapsed` (a 3-turn fire wall, a smoke cloud). It pairs with #11.
+- **#117 Zone and tile lifetimes.** `expires_in` on zones and placed tiles, counted on `turns_elapsed` (a 3-turn fire wall, a smoke cloud).
 - **#118 `zone_grow(name, n)` / `zone_shrink`, plus `!zone grow/shrink`.** Optionally stopped by block conditions; for spreading fire, expanding gas and a closing storm circle.
 - **#119 One-shot hooks.** A `once` flag on tile and zone hooks, for pressure plates and mines.
 - **#120 `on_move_blocked` hook.** Fires on the mover when a walk, push, pull or swap is stopped, binding the blocker (a unit id or a cell) and the kind of move. It covers bump-to-attack, collision damage on knockback, and "you walk into the wall".
@@ -84,7 +85,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#129 `!ent export <id>` / `!ent import <json>`.** A unit with its parts as JSON pasted in chat, to share between matches or bots without file access. Import goes through the template checks.
 - **#133 `!map around=<eid> [r]`.** A one-off window centered on a unit; the channel camera stays where it is.
 - **#134 `!history note <text>`.** Labels the latest snapshot, so `!history list` and undo previews say what it was.
-- **#135 Pending-request expiry rule.** A queued player command expires after N minutes, so a stale request can't be approved hours later.
 
 ### New
 
@@ -123,9 +123,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Bindings `final` (true on the last cell of a walk and on the landing cell of a teleport) and `move_kind` (`walk`, `tp`, `push`, `pull`, `swap`) in tile, zone and corpse block conditions.
   - FCS1's "units can walk over corpses but not stop on one" becomes `corpse_block_condition = final`. A moves-per-turn limit becomes `move_kind == 'walk' and moves_left <= 0`, which leaves knockback alone with no `current_id()` trick (the D3 trap).
   - The `block_<kind>` rules stay as the coarse switches.
-- **#221 Default passives on existing units.**
-  - `!defpassive add ... existing` (or `!match sync passives`) also puts the new default passive on the units already in the system's matches; `!defpassive remove ... existing` takes it off them.
-  - Today a default passive reaches only units created afterwards (`fcs1.out`), which surprises a GM who builds a system while units are already placed (D14).
 - **#223 `summoner` binding in `on_entity_spawned`.**
   - The unit (or `None`) whose action, passive or tick summoned the new one. The engine also stores it on the summon (`summoned_by`, a tracked reference under #209), so rules can read it later:
     - "dismiss my summons when I die";
@@ -507,7 +504,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 From the combat-systems review (docs/combat_systems_fit.md):
 
-- **Hosting turn-based combat systems:** #28 → #36 slice → #24 + #22 + #23 (with #243, #234, #233) → #227 + #232 → #150 → #222 → #220, #224, #225, #229, #235, #217, #218, #219, #228, #221, #226
+- **Hosting turn-based combat systems:** #28 → #36 slice → #24 + #22 + #23 (with #243, #234, #233) → #227 + #232 → #150 → #222 → #220, #224, #225, #229, #235, #217, #218, #219, #228, #226
 - **Status bundle for the three systems:** #233, #234, #235, #232, #227, #150, #222
 - **After the battle:** #239 → #240, #241; #158 with #251
 - **Discord table comfort:** #247, #248, #254, #255, #244, #245

@@ -963,6 +963,7 @@ class CommandRegistry:
         if m is None:  # defensive — gate already checked, but be safe
             await ctx.send("❌ No active match.")
             return
+        m.expire_pending_requests()
         req = m.add_pending_request(
             user=ctx_user(ctx), user_name=ctx_user_name(ctx),
             name=name, args=list(args), channel_key=ctx.channel_key,
@@ -971,10 +972,12 @@ class CommandRegistry:
         if callable(sender):
             return await sender(req)
         cmd = "!" + name + (" " + " ".join(args) if args else "")
+        limit = m.request_expiry()
         await ctx.send(
             f"🕓 `{cmd}` needs host approval (request `{req['id']}`, by "
             f"{req['user_name']}). A host can `!approve {req['id']}` or "
-            f"`!deny {req['id']}`."
+            f"`!deny {req['id']}`"
+            + (f" within {_span_text(limit)}." if limit is not None else ".")
         )
 
     async def run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
@@ -5306,7 +5309,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as idle <hours> | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -5327,7 +5330,9 @@ def _mention(user_id: Optional[str]) -> str:
         "is gone). `!as idle <hours>` moves every loaded server's last "
         "command that many hours back and runs the idle sweep "
         "(server_idle_unload_hours): the servers it unloads load again on "
-        "their next command. `!as crash [text]` raises an error no command expects "
+        "their next command. `!as wait <seconds>` makes every pending "
+        "approval request that much older (pending_request_expiry_seconds). "
+        "`!as crash [text]` raises an error no command expects "
         "(a test hook for the error log, `!owner errors`). Bare `!as` "
         "reports your identity and your effective POV."
     ),
@@ -5365,6 +5370,26 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             "🔄 Reloaded every server from the data folder, as after a "
             "restart." + ("\n" + "\n".join(notes) if notes else ""))
+    if role == "wait":
+        # A test hook (#135): every pending approval request of this server
+        # was queued <seconds> earlier, as if that much time had passed.
+        _check_tail(args, 2, (), "!as wait <seconds>")
+        if len(args) < 2:
+            raise VTTError("Usage: `!as wait <seconds>`.")
+        try:
+            secs = float(args[1])
+        except ValueError:
+            raise VTTError(f"`{args[1]}` isn't a number of seconds.")
+        if not math.isfinite(secs) or secs < 0:
+            raise VTTError("The seconds are a number 0 or above.")
+        n = 0
+        for m in mgr.matches.values():
+            for req in m.pending_requests.values():
+                if isinstance(req.get("queued_at"), (int, float)):
+                    req["queued_at"] -= secs
+                    n += 1
+        return await ctx.send(f"⏳ {secs:g} s passed for {n} pending "
+                              f"request(s).")
     if role == "idle":
         # A test hook (#197): every loaded server's last command is moved
         # <hours> back, then the idle sweep runs, as it would that much
@@ -5534,6 +5559,9 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             runs = ("⏸ the match is paused — read-only commands run; "
                     "commands that change it wait for `!match resume`")
     lines.append(f"**Your commands:** {runs}")
+    lines += _expired_lines(m, [req for req in m.expire_pending_requests()
+                                if user is not None
+                                and req.get("user") == user])
     mine = sorted((rid for rid, req in m.pending_requests.items()
                    if user is not None and req.get("user") == user),
                   key=lambda r: int(r[1:]) if r[1:].isdigit() else 0)
@@ -7037,7 +7065,7 @@ def _crash_rollback(mgr: MatchManager, mid: Optional[str],
         # Its rules come from its system as it is now (W9: a system edit
         # earlier in the command stays, and the match must follow it).
         if m.system_name in mgr.systems:
-            mgr.apply_system_rules(m)
+            mgr.apply_system_rules(m, sync_defaults=True)
     except Exception:   # noqa: BLE001 - the crash is already reported
         return ""
     back = [rid for rid in (pre_pending or {})
@@ -8816,11 +8844,18 @@ async def cancel_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     _check_tail(args, 1, (), "!cancel [<request id> | all]")
     user = ctx_user(ctx)
+    gone = [req for req in m.expire_pending_requests()
+            if user is not None and req.get("user") == user]
+    if args and any(req["id"] == args[0] for req in gone):
+        return await ctx.send(f"`{args[0]}` had already expired; nothing "
+                              f"to withdraw.")
     mine = sorted((rid for rid, req in m.pending_requests.items()
                    if user is not None and req.get("user") == user),
                   key=lambda r: int(r[1:]) if r[1:].isdigit() else 0)
     if not mine:
-        return await ctx.send("You have no requests waiting for approval.")
+        return await ctx.send("\n".join(
+            _expired_lines(m, gone)
+            + ["You have no requests waiting for approval."]))
     target = args[0] if args else mine[-1]
     if target.lower() == "all":
         picked = mine
@@ -8878,25 +8913,64 @@ async def again_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 # ---- approval queue (host approves / denies player commands) -----
+def _span_text(seconds: float) -> str:
+    """A wait as people say it: `40 s`, `12 min`, `2 h 5 min`."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    h, mins = divmod(s // 60, 60)
+    return f"{h} h" + (f" {mins} min" if mins else "")
+
+
+def _request_cmd(req: dict) -> str:
+    return "!" + req["name"] + (" " + " ".join(req["args"])
+                                if req["args"] else "")
+
+
+def _expired_lines(m: "Match", gone: List[dict]) -> List[str]:
+    """One line per request the expiry rule dropped (#135)."""
+    limit = m.request_expiry()
+    return [f"⌛ `{req['id']}` (`{_request_cmd(req)}`, by "
+            f"{req['user_name']}) expired: it waited longer than "
+            f"pending_request_expiry_seconds ({_span_text(limit or 0)}) "
+            f"allows, so it can't be approved." for req in gone]
+
+
+def _expired_refusal(m: "Match", req: dict) -> str:
+    return (f"❌ `{req['id']}` (`{_request_cmd(req)}`, by {req['user_name']})"
+            f" expired after {_span_text(m.request_age(req))} "
+            f"(pending_request_expiry_seconds: "
+            f"{_span_text(m.request_expiry() or 0)}). Nothing ran; the "
+            f"player can send the command again.")
+
+
 @registry.command(
     "pending", access="host_only", snapshot=False,
     usage="!pending",
     desc=(
         "List the active match's pending approval requests — player "
         "commands awaiting a host's go-ahead. Each shows an id, the "
-        "requester, and the command. Approve with `!approve <id>` or "
-        "reject with `!deny <id>`. Host-only."
+        "requester, the command and the time left before it expires "
+        "(pending_request_expiry_seconds; expired ones are dropped and "
+        "named). Approve with `!approve <id>` or reject with `!deny <id>`. "
+        "Host-only."
     ),
 )
 async def pending_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
+    gone = _expired_lines(m, m.expire_pending_requests())
     if not m.pending_requests:
-        return await ctx.send("No pending requests.")
-    lines = [f"**{m.name}** pending requests:"]
+        return await ctx.send("\n".join(gone + ["No pending requests."]))
+    limit = m.request_expiry()
+    lines = gone + [f"**{m.name}** pending requests:"]
     for rid in sorted(m.pending_requests.keys(), key=lambda r: int(r[1:])):
         req = m.pending_requests[rid]
-        cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
-        lines.append(f"- `{rid}` by {req['user_name']}: `{cmd}`")
+        left = ("" if limit is None else
+                f" (expires in {_span_text(max(1, limit - m.request_age(req)))})")
+        lines.append(f"- `{rid}` by {req['user_name']}: "
+                     f"`{_request_cmd(req)}`{left}")
     return await ctx.send("\n".join(lines))
 
 
@@ -8915,13 +8989,28 @@ async def approve_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if await return_help_if_not_enough_args(ctx, args, 1, "approve"):
         return
     target = args[0]
+    gone = m.expire_pending_requests()
     if target.lower() == "all":
+        if gone:
+            await ctx.send("\n".join(_expired_lines(m, gone)))
         if not m.pending_requests:
             return await ctx.send("No pending requests.")
         rids = sorted(m.pending_requests.keys(), key=lambda r: int(r[1:]))
         for rid in rids:
-            await _run_approved(m.pop_pending_request(rid), ctx, mgr)
+            req = m.pop_pending_request(rid)
+            if req is None:     # an earlier approved command dropped it
+                continue
+            if m.request_expired(req):
+                await ctx.send(_expired_refusal(m, req))
+                continue
+            await _run_approved(req, ctx, mgr)
         return
+    others = [req for req in gone if req["id"] != target]
+    if others:
+        await ctx.send("\n".join(_expired_lines(m, others)))
+    for req in gone:
+        if req["id"] == target:
+            return await ctx.send(_expired_refusal(m, req))
     req = m.pop_pending_request(target)
     if req is None:
         return await ctx.send(f"❌ No pending request `{target}`.")
@@ -9306,7 +9395,7 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                 # Only the replay's match: the other matches' systems were
                 # checked unchanged before the replay began.
                 if m.system_name in mgr.systems:
-                    mgr.apply_system_rules(m)
+                    mgr.apply_system_rules(m, sync_defaults=True)
                 if verbose:
                     out.append(journal_entry_text(e))
             elif kind == "template":
@@ -9429,12 +9518,20 @@ async def deny_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if await return_help_if_not_enough_args(ctx, args, 1, "deny"):
         return
     target = args[0]
+    gone = m.expire_pending_requests()
     if target.lower() == "all":
         n = len(m.pending_requests)
+        lines = _expired_lines(m, gone)
         if n == 0:
-            return await ctx.send("No pending requests.")
+            return await ctx.send("\n".join(lines + ["No pending requests."]))
         m.pending_requests.clear()
-        return await ctx.send(f"Denied all {n} pending request(s).")
+        return await ctx.send("\n".join(
+            lines + [f"Denied all {n} pending request(s)."]))
+    for req in gone:
+        if req["id"] == target:
+            return await ctx.send(
+                f"`{target}` had already expired "
+                f"({_span_text(m.request_age(req))} waiting); nothing ran.")
     req = m.pop_pending_request(target)
     if req is None:
         return await ctx.send(f"❌ No pending request `{target}`.")
@@ -9833,7 +9930,7 @@ def _switch_systems(mgr: MatchManager, target: Dict[str, Any],
         for mid, m in mgr.matches.items():
             m.system_name = after[mid]
         for m in mgr.matches.values():
-            notes += mgr.apply_system_rules(m)
+            notes += mgr.apply_system_rules(m, sync_defaults=True)
     except VTTError:
         _apply_server_state(mgr, pre_state)
         for mid, m in mgr.matches.items():
@@ -19516,11 +19613,14 @@ registry.annotate_sub(
     desc=(
         "Manage the active match's game-system `default_entity_passives` "
         "rule — passive specs copied onto EVERY entity at creation (via "
-        "!ent add, summon, or revive). Injection only: removable from an "
-        "individual entity afterward and not re-enforced (until that "
-        "entity is re-spawned). The passive analog of !gclamp for "
-        "default_clamps; edits persist on the GameSystem and apply to "
-        "every match using it."
+        "!ent add, summon, or revive). While default_passives_existing_units "
+        "is on (default) each change also reaches the units and corpses "
+        "already in the system's matches: an added default goes onto those "
+        "lacking its id, a removed or changed one comes off / is replaced "
+        "where the unit's copy still equals it. Removable from an "
+        "individual entity afterward and not re-enforced. The passive "
+        "analog of !gclamp for default_clamps; edits persist on the "
+        "GameSystem and apply to every match using it."
     ),
 )
 async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -19539,9 +19639,23 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     def _read_specs() -> List[Dict[str, Any]]:
         return list(mgr.system_value(sysobj, "default_entity_passives") or [])
 
+    sync_notes: List[str] = []
+
     def _write_specs(new_list: List[Dict[str, Any]]) -> int:
         mgr.system_rule_write(sysobj, "default_entity_passives", new_list)
-        return mgr.refresh_match_rules(sys_name)
+        return mgr.refresh_match_rules(sys_name, sync_notes)
+
+    def _reach() -> str:
+        """Where the change went (#221): the units already here too, per
+        default_passives_existing_units, else new ones only."""
+        if not m.rules.get("default_passives_existing_units", True):
+            return (" Reaches entities created from now on "
+                    "(default_passives_existing_units is off).")
+        shown = sync_notes
+        return ("" if not shown else
+                "\n" + "\n".join(f"- {n}" for n in shown[:10])
+                + (f"\n- ... and {len(shown) - 10} more"
+                   if len(shown) > 10 else ""))
 
     if sub == "hooks":
         return await ctx.send(
@@ -19586,8 +19700,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Added default passive `{pid}` ({when}){scope_note} to system "
             f"`{sys_name}` [refreshed {refreshed} live "
-            f"match{'es' if refreshed != 1 else ''}]. Applies to entities "
-            f"created from now on."
+            f"match{'es' if refreshed != 1 else ''}]." + _reach()
         )
 
     if sub == "priority":
@@ -19614,8 +19727,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Default passive `{pid}` of system `{sys_name}` now has "
             f"priority {prio} [refreshed {refreshed} live "
-            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
-            f"entities keep their copy.")
+            f"match{'es' if refreshed != 1 else ''}]." + _reach())
 
     if sub == "extra_turns":
         if await return_help_if_not_enough_args(ctx, args, 3, "defpassive", "extra_turns"):
@@ -19641,8 +19753,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Default passive `{pid}` of system `{sys_name}` on extra turns: "
             f"{_extra_turns_text(xt)} [refreshed {refreshed} live "
-            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
-            f"entities keep their copy.")
+            f"match{'es' if refreshed != 1 else ''}]." + _reach())
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "defpassive", "remove"):
@@ -19661,8 +19772,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Removed default passive `{pid}` from system `{sys_name}` "
             f"[refreshed {refreshed} live "
-            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
-            f"entities keep their copy."
+            f"match{'es' if refreshed != 1 else ''}]." + _reach()
         )
 
     if sub == "list":
@@ -19692,6 +19802,8 @@ registry.annotate_sub(
         "on_entity_spawned fires. Same id/when/target/scope/formula syntax "
         "as !passive add but without the <entity_id> (it's not bound to one "
         "entity). <when> must be a hook name (see !defpassive hooks). "
+        "Also put on the units already in the system's matches that lack "
+        "the id, while default_passives_existing_units is on (default). "
         "Removable per-entity afterward; not re-enforced."
     ),
 )
@@ -19699,21 +19811,24 @@ registry.annotate_sub(
     "defpassive", "extra_turns",
     usage="!defpassive extra_turns <id> <on|off|default>",
     desc=("Whether this passive fires on an extra turn's on_turn_start / on_turn_end (#224): on, off, or default (the extra_turn_passives rule decides)."
-          + (" Reaches entities created from now on." if "defpassive" == "defpassive" else "")),
+          + " Reaches the copies already on units that still equal the default (default_passives_existing_units), and units created from now on."),
 )
 registry.annotate_sub(
     "defpassive", "priority",
     usage="!defpassive priority <id> <n>",
     desc=("Set a default passive's priority (higher runs first within one "
-          "hook firing; default 0). Reaches entities created from now on."),
+          "hook firing; default 0). Reaches the copies already on units "
+          "that still equal the default (default_passives_existing_units), "
+          "and units created from now on."),
 )
 registry.annotate_sub(
     "defpassive", "remove",
     usage="!defpassive remove <id>",
     desc=(
-        "Remove a default passive from the game system (stops injecting it "
-        "into NEW entities; already-spawned entities keep their copy). "
-        "Aliases: del, rm."
+        "Remove a default passive from the game system: it stops reaching "
+        "new entities, and while default_passives_existing_units is on "
+        "(default) it comes off the units and corpses whose copy still "
+        "equals it (a copy edited on the unit stays). Aliases: del, rm."
     ),
 )
 registry.annotate_sub(
