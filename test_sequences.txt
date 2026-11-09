@@ -38576,3 +38576,235 @@ red view it is held (a private line) and ends the reply of the host's
 next command in a plain channel. Under `all` the error shows in the red
 view's reply as before.
 HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1089 — A summon with a lifetime: the action reads the new id and gives it an expiring status (composed, #11)
+--------------------------------------------------------------------------------------------------------------------
+
+!match new sl SL 10 10
+!match use sl
+!ent add mage Mage 20 1 1 10
+!ent add golem_proto Golem 30 9 9 1
+!ent set_var golem_proto footprint_w 2
+!ent set_var golem_proto footprint_h 2
+!ent store_entity_into_var golem_proto mage blueprints.golem
+!ent remove golem_proto
+!status def summoned
+!status when summoned turn_end
+!status tick summoned "status_counter_add(self, status_name, -1)"
+!status hook summoned on_removed "if removed_by == 'expired':\n    remove_entity(self)"
+!ent set_var mage actions.conjure.target location
+!ent set_var mage actions.conjure.body "g = summon_near(entity[self].blueprints.golem, target.x, target.y, 1)\nstatus_apply(g, 'summoned', duration=2)\nentity[self].last_summon = g\nsay('{self} conjures {g} at ({x}, {y})', g=g, x=entity[g].x, y=entity[g].y)"
+!ent action mage conjure 4 4
+?? Mage conjures Golem at (4, 4)
+!assert "entity[mage].last_summon == 'golem'"
+!assert "occupies('golem', 5, 5) and status_duration('golem', 'summoned') == 2"
+!turn next
+!turn next
+?? It is now **Golem**'s turn
+!turn next
+!assert "status_duration('golem', 'summoned') == 1"
+!turn next
+!turn next
+?? `summoned` on_removed fired on `golem`
+!assert "'golem' not in all_entities() and not cell_entity(5, 5)"
+!ent action mage conjure 4 4
+!eval "status_remove(entity[mage].last_summon, 'summoned')"
+!turn next
+!turn next
+!turn next
+!assert "'golem' in all_entities() and not status_has('golem', 'summoned')"
+
+Expected: an action keeps the id a summon function returns (every
+summon function returns the new unit's id; stamp_prefab returns the
+list of new top-level ids), so its next lines act on the new unit. The
+conjure action summons a 2x2 Golem next to the target cell (the say()
+line names it and its anchor, (4, 4)), records its id on the mage
+(`last_summon`) and gives it `summoned` for 2 turns. The status ticks
+at the end of each of the golem's own turns, so it counts the golem's
+turns under any turn model; at 0 it is removed with removed_by
+`expired`, and its on_removed hook despawns the golem (no corpse; the
+whole 2x2 body leaves, so (5, 5) is free). A status taken off another
+way (here status_remove, removed_by `removed`) leaves the summon in
+play: a dispel doesn't banish it. The engine needs no summon lifetime
+field (idea #11, struck): one status definition serves every summon.
+
+
+SCENARIO 1090 — Pending requests expire (pending_request_expiry_seconds, #135)
+------------------------------------------------------------------------------
+
+!match new pq PQ 8 8
+!match use pq
+!ent add hero Hero 30 1 1 5
+!as player bob
+!ent hp hero -5
+?? needs host approval (request `r1`, by bob). A host can `!approve r1` or `!deny r1` within 1 h.
+!ent hp hero -3
+!as host
+!pending
+?? `r1` by bob: `!ent hp hero -5` (expires in 59 min)
+!as wait 1800
+!pending
+?? (expires in 29 min)
+!as wait 1801
+!approve r1
+?? ⌛ `r2` (`!ent hp hero -3`, by bob) expired: it waited longer than pending_request_expiry_seconds (1 h) allows
+?? ❌ `r1` (`!ent hp hero -5`, by bob) expired after 1 h (pending_request_expiry_seconds: 1 h). Nothing ran
+!pending
+?? No pending requests.
+!assert "entity[hero].hp == 30"
+!system set default pending_request_expiry_seconds -1
+!as player bob
+!ent hp hero -2
+?! within
+!as wait 99999
+!as host
+!pending
+?! expires in
+!approve all
+?? Damaged `hero` by 2.
+!system set default pending_request_expiry_seconds 60
+!as player bob
+!ent hp hero -1
+!as wait 30
+!ent hp hero -1
+!as wait 31
+!as host
+!approve all
+?? ⌛ `r4` (`!ent hp hero -1`, by bob) expired
+?? ✅ Approved `r5`
+!assert "entity[hero].hp == 27"
+!as player bob
+!ent hp hero -1
+!as wait 100
+!whoami
+?? ⌛ `r6` (`!ent hp hero -1`, by bob) expired
+?! Waiting for approval
+!ent hp hero -1
+!as wait 100
+!as host
+!deny r7
+?? `r7` had already expired
+!as player bob
+!ent hp hero -1
+!as wait 100
+!cancel r8
+?? `r8` had already expired; nothing to withdraw.
+!assert "entity[hero].hp == 27"
+
+Expected: a queued command records when it was queued; the rule
+pending_request_expiry_seconds (default 3600, -1 = never) decides how
+long it can wait. The queue reply says the window ("within 1 h") and
+`!pending` the time left. Expiry is judged whenever the queue is read
+or resolved: after an hour `!approve r1` refuses r1 as expired (nothing
+runs, the hero keeps 30 hp) and names r2, which expired with it. At -1
+a request waits forever (approved after 99,999 s). The rule's value
+when the request is looked at decides, so at 60 s of r4's 61 s run out
+and only r5 is approved. `!whoami` names the player's expired request
+and lists none waiting; `!deny` and `!cancel` of an expired request
+say so. `!as wait <seconds>` (CLI / harness) ages every pending
+request. On Discord the request message says when it expires, its
+buttons last that long and the message then says the request expired.
+
+
+SCENARIO 1091 — Default passives reach the units already in play (default_passives_existing_units, #221)
+--------------------------------------------------------------------------------------------------------
+
+!match new dp DP 10 10
+!match use dp
+!ent add hero Hero 30 1 1 5
+!ent set_var hero max_hp 100
+!ent add brute Brute 40 3 3 4
+!ent set_var brute footprint_w 2
+!ent set_var brute footprint_h 2
+!part add brute brute_arm Arm 10 10
+!ent add orc Orc 20 7 7 3
+!ent add ogre Ogre 20 9 9 2
+!passive add orc regen on_turn_start "entity[self].hp = entity[self].hp - 1"
+!ent kill ogre
+!defpassive add regen on_turn_start "entity[self].hp = entity[self].hp + 1"
+?? `dp`: default passive `regen` put on 4 unit(s) and corpse(s) already here
+!passive list brute_arm
+?? `regen` (on_turn_start)
+!passive list orc
+?? entity[self].hp - 1
+!turn next
+?? passive `hero.regen` fired on `hero`
+!assert "entity[hero].hp == 31"
+!defpassive priority regen 5
+?? `dp`: default passive `regen` put on 4 unit(s) and corpse(s) already here
+!passive list brute
+?? on_turn_start pri 5
+!passive priority hero regen 7
+!defpassive remove regen
+?? `dp`: default passive `regen` taken off 3 unit(s) and corpse(s)
+!passive list hero
+?? on_turn_start pri 7
+!passive list brute
+?? has no passives
+!passive list orc
+?? entity[self].hp - 1
+!ent revive ogre
+!passive list ogre
+?? has no passives
+!system undo
+!passive list brute
+?? on_turn_start pri 5
+!system set default default_passives_existing_units false
+!defpassive add ward on_turn_end "1"
+?? Reaches entities created from now on (default_passives_existing_units is off).
+!passive list ogre
+?! ward
+!ent add late Late 10 1 9 1
+!passive list late
+?? `ward`
+
+Expected: with default_passives_existing_units on (the default), a
+change of the system's default passives reaches the units already in
+its matches. `!defpassive add regen` puts regen on the hero, the 2x2
+brute, its arm (a body part, as a spawn would) and the ogre's corpse
+(4); the orc keeps its own passive under that id. The default fires on
+the hero at once (31 hp). `!defpassive priority` replaces the copies
+that still equal the default (the same 4). `!defpassive remove` takes
+off the copies still equal to it: the brute, its arm and the corpse
+(3); the hero's copy, edited on the unit (priority 7), stays, as does
+the orc's own. The ogre revives without regen: its corpse lost the
+copy too. `!system undo` puts the default back and the units follow
+(the brute has it at priority 5 again). With the rule off, `!defpassive
+add ward` reaches only units created afterwards (the ogre lacks it, a
+new unit has it).
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1092 — A parent system's default passive reaches an inheriting system's matches (#221)
+-----------------------------------------------------------------------------------------------
+
+!system new base
+!system new kid parent=base
+!match new pa PA 8 8 base
+!match new pb PB 8 8 kid
+!match use pb
+!ent add scout Scout 10 2 2 5
+!ent set_var scout max_hp 20
+!match use pa
+!ent add knight Knight 30 1 1 5
+!defpassive add aura on_turn_start "entity[self].hp = entity[self].hp + 2"
+?? `pa`: default passive `aura` put on 1 unit(s)
+?? `pb`: default passive `aura` put on 1 unit(s)
+!match use pb
+!passive list scout
+?? `aura` (on_turn_start)
+!turn next
+!assert "entity[scout].hp == 12"
+!match use pa
+!defpassive remove aura
+?? `pb`: default passive `aura` taken off 1 unit(s)
+!match use pb
+!passive list scout
+?? has no passives
+
+Expected: `!defpassive` edits the channel match's system (`base`);
+every match on a system inheriting from it follows, so the scout in
+`pb` (on `kid`) gets the default as the knight in `pa` does, and it
+fires there (10 -> 12 at the scout's turn start). Removing it from
+`base` takes it off both.

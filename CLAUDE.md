@@ -1280,7 +1280,10 @@ hardcodes**.
   (`_apply_statblock_parts`; a part id under the unit's follows the new
   unit's, another is kept or minted anew, 830). Server templates (§7.17)
   build on the same
-  path.
+  path. Every summon function returns the new unit's id (`stamp_prefab`
+  the new top-level ids), so an action acts on what it summoned; a summon
+  with a lifetime is a status the action applies, whose on_removed hook
+  despawns it when `removed_by == 'expired'` (1089; idea #11 struck).
 - **Occupancy:** one unit per cell, except units with the `__cell_stackable`
   var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
 - **Spatial indexes** (#154, 1067-1069): `UnitIndex` (`Match._spatial`,
@@ -1345,6 +1348,20 @@ hardcodes**.
   the hook's unit, the rest of that hook's passives, global and team
   ones too, don't run on it, while a hook fired for a unit already gone
   (on_death, a despawn) still reaches its globals (937).
+- **Default passives** (`default_entity_passives`, `!defpassive`): copied
+  onto every unit at `Entity.spawn` (`_apply_default_passives`). With
+  `default_passives_existing_units` on (default; #221, user call, 1091-1092)
+  a change of the list also reaches the units already in play:
+  `MatchManager.apply_system_rules(m, sync_defaults=True)` diffs the old
+  and new lists (`Match.sync_default_passives`): an added id goes onto every
+  unit, part and corpse body lacking it, a removed or changed one comes
+  off / is replaced where the copy still equals the old default (a unit's
+  own passive under the id, or a copy edited on the unit, stays); nothing
+  fires. `sync_defaults` is passed where the systems themselves changed
+  (`refresh_match_rules`, `!system undo` / backup restore through
+  `_switch_systems`, a replayed `systems` entry, a crash rollback
+  under a kept system edit), never by a load or an undo restore, whose
+  units already followed the rules they rebuild.
 - **Var hooks** (`on_var_*`, `on_var_written`, `on_var_write_attempt`): run
   bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
   extras carry changed_key / old_value / new_value / intended_value /
@@ -2766,7 +2783,14 @@ hardcodes**.
   target-host checks.
 - **Approval queue:** `Match.add_pending_request` (runtime-only; carried
   across undo); `!pending` / `!approve` / `!deny` / `!cancel`, Discord
-  buttons. Approved commands run with the approver's authority in the
+  buttons. A request records its wall-clock `queued_at` and expires after
+  `pending_request_expiry_seconds` (default 3600, -1 = never; #135, 1090):
+  lazily, wherever the queue is read or resolved
+  (`Match.expire_pending_requests`, the commands above, `!whoami`, a new
+  request, the buttons), judged by the rule's value then; an expired one is
+  dropped and named (`_expired_lines`, `_expired_refusal`). The Discord
+  buttons last as long as the request and the message says when it
+  expired. `!as wait <seconds>` (CLI / harness) ages every request. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
   `_channel_pointed_at`).
 - **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner

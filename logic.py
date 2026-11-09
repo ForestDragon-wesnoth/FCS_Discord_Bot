@@ -5214,10 +5214,26 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "/ revive — all route through Entity.spawn), applied before "
             "on_entity_spawned fires. A default whose id the entity "
             "already has is skipped (so revive is idempotent for kept "
-            "passives). Injection only, never re-enforced — remove one "
-            "from an entity and it stays gone until that entity is "
-            "re-spawned. Edit via !defpassive add/remove/list, not "
-            "!system set."
+            "passives). A change also reaches the units already in play "
+            "while default_passives_existing_units is on. Never "
+            "re-enforced — remove one from an entity and it stays gone "
+            "until that entity is re-spawned. Edit via !defpassive "
+            "add/remove/list, not !system set."
+        ),
+    },
+    "default_passives_existing_units": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a change of default_entity_passives (`!defpassive add / "
+            "remove / priority / extra_turns`, `!system undo`, a parent's "
+            "edit) also reaches the units and corpses already in the "
+            "system's matches (#221). On (default): a new default goes onto "
+            "every unit lacking its id, a removed one comes off the units "
+            "whose copy is still that default, a changed one replaces such "
+            "copies; a unit's own passive under the id, or a copy edited on "
+            "the unit, stays. Off: a change reaches units created "
+            "afterwards only."
         ),
     },
     "default_entity_vars": {
@@ -5589,6 +5605,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`!match resume` unpauses and runs the held commands in order, "
             "`!match resume drop` unpauses and discards them. Read-only "
             "commands and `!match pause/resume` themselves always run."
+        ),
+    },
+    "pending_request_expiry_seconds": {
+        "default": 3600,
+        "schema": {"type": "int", "min": 1, "unlimited": True},
+        "desc": (
+            "How long a player's command waits for host approval before it "
+            "expires, in seconds (-1 = never; default 3600, an hour). An "
+            "expired request is dropped and can't be approved: `!approve` "
+            "and the Discord buttons say it expired, `!pending` and "
+            "`!whoami` stop listing it, and the Discord request message "
+            "says so when its time runs out. Judged by the rule's value "
+            "when the request is next looked at, so a changed value "
+            "applies to requests already waiting."
         ),
     },
     "inline_args_access": {
@@ -18506,6 +18536,9 @@ class Match:
             # buttons) must pop against THIS match, not whatever match is
             # active on the channel when the button is clicked.
             "match_id": self.id,
+            # Wall-clock seconds (#135): requests are runtime-only, so the
+            # clock decides their expiry and no replay reads it.
+            "queued_at": time.time(),
         }
         self.pending_requests[rid] = req
         return req
@@ -18513,6 +18546,33 @@ class Match:
     def pop_pending_request(self, rid: str) -> Optional[Dict[str, Any]]:
         """Remove and return a pending request by id, or None if absent."""
         return self.pending_requests.pop(rid, None)
+
+    def request_expiry(self) -> Optional[int]:
+        """Seconds a request waits before it expires (#135), None = never
+        (the pending_request_expiry_seconds rule)."""
+        v = self.rules.get("pending_request_expiry_seconds", 3600)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            return None
+        return v
+
+    def request_age(self, req: Dict[str, Any]) -> float:
+        """Seconds since `req` was queued (0 for a request without a time)."""
+        at = req.get("queued_at")
+        if not isinstance(at, (int, float)):
+            return 0.0
+        return max(0.0, time.time() - at)
+
+    def request_expired(self, req: Dict[str, Any]) -> bool:
+        """Whether `req` waited longer than the expiry rule allows."""
+        limit = self.request_expiry()
+        return limit is not None and self.request_age(req) >= limit
+
+    def expire_pending_requests(self) -> List[Dict[str, Any]]:
+        """Drop every request past its expiry; returns them, oldest first.
+        Expiry is lazy: each read or resolution of the queue calls this."""
+        gone = [rid for rid, req in self.pending_requests.items()
+                if self.request_expired(req)]
+        return [self.pending_requests.pop(rid) for rid in gone]
 
     # ---- tile-template registry --------------------------------------
     # Templates are the "kind" / "class" definitions; placed tiles in
@@ -26898,6 +26958,88 @@ class Match:
             except (VTTError, KeyError, TypeError):
                 continue
 
+    def sync_default_passives(self, old_specs: Any, new_specs: Any
+                              ) -> List[str]:
+        """Carry a change of the system's default_entity_passives to the
+        units already in the match (#221, rule
+        default_passives_existing_units): a new default goes onto every unit
+        and corpse body lacking its id; a removed one comes off those whose
+        copy is still the old default; a changed one replaces such copies. A
+        unit's own passive under the id, or a copy edited per unit, stays.
+        Fires nothing (as at spawn, a default arrives silently). Returns
+        notes, one per default that reached a unit."""
+        def norm(specs: Any) -> Dict[str, Dict[str, Any]]:
+            out: Dict[str, Dict[str, Any]] = {}
+            for sp in specs if isinstance(specs, list) else ():
+                if not isinstance(sp, dict) or not isinstance(sp.get("id"), str):
+                    continue
+                try:
+                    out[sp["id"]] = Passive.from_dict(sp).to_dict()
+                except (VTTError, KeyError, TypeError):
+                    continue
+            return out
+        old, new = norm(old_specs), norm(new_specs)
+        ids = sorted(set(old) | set(new))
+        counts = {pid: [0, 0] for pid in ids}    # [put on / replaced, taken off]
+
+        def changed(passives: Dict[str, Any], getd) -> bool:
+            """Apply the diff to one passives dict (id -> Passive or dict)."""
+            hit = False
+            for pid in ids:
+                o, n = old.get(pid), new.get(pid)
+                have = passives.get(pid)
+                if o is not None and n is not None and same_value(o, n):
+                    continue
+                if have is None:
+                    if n is not None:
+                        passives[pid] = n
+                        counts[pid][0] += 1
+                        hit = True
+                    continue
+                if o is None or not same_value(getd(have), o):
+                    continue        # the unit's own passive under the id
+                if n is None:
+                    del passives[pid]
+                    counts[pid][1] += 1
+                else:
+                    passives[pid] = n
+                    counts[pid][0] += 1
+                hit = True
+            return hit
+
+        for e in list(self.entities.values()):
+            work: Dict[str, Any] = dict(e.passives)
+            if changed(work, lambda p: p.to_dict()):
+                e.passives = {pid: (p if isinstance(p, Passive)
+                                    else Passive.from_dict(p))
+                              for pid, p in work.items()}
+                e.mark_changed()
+        for mp, x, y, cid, corpse in self.every_corpse():
+            bodies = [corpse.get("entity")] + list(corpse.get("parts") or [])
+            hit = False
+            for body in bodies:
+                if not isinstance(body, dict):
+                    continue
+                ps = body.get("passives")
+                work = dict(ps) if isinstance(ps, dict) else {}
+                if changed(work, lambda d: d):
+                    body["passives"] = {pid: (copy.deepcopy(d)
+                                              if isinstance(d, dict) else d)
+                                        for pid, d in work.items()}
+                    hit = True
+            if hit:
+                mp.note_corpse(x, y)
+        notes = []
+        for pid in ids:
+            put, off = counts[pid]
+            if put:
+                notes.append(f"default passive `{pid}` put on {put} "
+                             f"unit(s) and corpse(s) already here")
+            if off:
+                notes.append(f"default passive `{pid}` taken off {off} "
+                             f"unit(s) and corpse(s)")
+        return notes
+
     # ---- scheduled / delayed effects ----
     # A scheduled effect is a formula body queued to run at a future
     # round (match-level) or after a future number of one entity's turns
@@ -31835,14 +31977,26 @@ class MatchManager:
             log.extend(slog)
         dest._restamp_parts_for(idmap[e.id])
 
-    def apply_system_rules(self, m: "Match") -> List[str]:
+    def apply_system_rules(self, m: "Match",
+                           sync_defaults: bool = False) -> List[str]:
         """Copy `m`'s system's rules into it (every path that rebuilds a
         match's rules: a system edit, a load, an undo / restore) and move its
         units and corpses to the var names those rules give. Returns the
-        rename notes."""
+        rename notes. `sync_defaults`: the call follows a change of the
+        systems themselves (an edit, `!system undo`, a backup restore, a
+        replayed systems entry), so a changed default_entity_passives
+        reaches the units already here (#221); a load or an undo restore
+        rebuilds rules the units already followed."""
         old = m.rules or {}
         m.rules = self._build_rules_dict(self.systems[m.system_name])
         notes = m.sync_all_var_names() + m.sync_map_var_names()
+        if sync_defaults and old and m.rules.get(
+                "default_passives_existing_units", True) and not same_value(
+                old.get("default_entity_passives") or [],
+                m.rules.get("default_entity_passives") or []):
+            notes += [f"`{m.id}`: {n}" for n in m.sync_default_passives(
+                old.get("default_entity_passives"),
+                m.rules.get("default_entity_passives"))]
         # A changed turn-order rule re-sorts the order (as a changed
         # initiative does, under turnorder_change_policy); a match loaded
         # from disk has no rules to compare yet and keeps its saved order.
@@ -31877,7 +32031,7 @@ class MatchManager:
         family = {system_name, *self.system_descendants(system_name)}
         for m in self.matches.values():
             if m.system_name in family:
-                n = self.apply_system_rules(m)
+                n = self.apply_system_rules(m, sync_defaults=True)
                 if notes is not None:
                     notes += n
                 count += 1

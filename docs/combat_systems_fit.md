@@ -220,7 +220,7 @@ Each recipe below was built and run. The cost is what a GM has to write or keep 
 - **D14 Default passives for units already on the board.**
   - Trap: `!defpassive add` reaches only units created afterwards (`fcs1.out`: the stamina regeneration passive never reached the units already placed).
   - Recipe: re-add it per unit with `!foreach`, or use one `!gpassive` that filters.
-  - Fix: #221.
+  - Fix: #221 (shipped: `default_passives_existing_units`, on by default, carries every `!defpassive` change to the units already placed).
 - **D15 Setting a system up again for every battle.**
   - Global passives and watchers live in the match. Status definitions, tables, macros, functions, tile templates and aliases can live on the system (#140 shipped: `!system status|table|macro`), so a new match on it starts with them.
   - Recipe for the rest: keep a prepared match and `!match clone` it for each battle (it also copies the prepared match's units and round), or re-add them with a macro the system ships.

@@ -495,8 +495,14 @@ class DiscordCtxWrapper:
             f"🕓 **{req['user_name']}** requests `{cmd}` "
             f"(id `{req['id']}`). A host can approve or deny."
         )
+        m = self._mgr.matches.get(req.get("match_id")) if self._mgr else None
+        limit = m.request_expiry() if m is not None else None
+        if limit is not None:
+            text += f" It expires in {vtt_commands._span_text(limit)}."
         try:
-            view = _ApprovalView(req, self._mgr, self.channel_key)
+            # The buttons last as long as the request (#135), else 10 min.
+            view = _ApprovalView(req, self._mgr, self.channel_key,
+                                 timeout=float(limit) if limit else 600.0)
             view.message = await self._ctx.send(text, view=view)
         except Exception:
             # No UI support (older discord.py) — text prompt + commands.
@@ -585,14 +591,22 @@ class _ApprovalView(discord.ui.View):
         `!approve` / `!deny` commands have no timeout."""
         for child in self.children:
             child.disabled = True
+        # The request's own expiry (#135): drop it and say so. Otherwise
+        # (no expiry, or a raised one) only the buttons time out.
+        m = self._match()
+        rid = self._req.get("id")
+        expired = (m is not None and m.pending_requests.get(rid) is self._req
+                   and m.request_expired(self._req))
+        if expired:
+            m.pop_pending_request(rid)
         if self.message is None:
             return
         try:
-            rid = self._req.get("id")
+            note = ("⌛ The request expired; nothing ran." if expired
+                    else f"⌛ Buttons expired — use `!approve {rid}` or "
+                         f"`!deny {rid}`.")
             await self.message.edit(
-                content=(self.message.content or "")
-                + f"\n⌛ Buttons expired — use `!approve {rid}` or "
-                  f"`!deny {rid}`.",
+                content=(self.message.content or "") + "\n" + note,
                 view=self)
         except Exception:
             pass
@@ -622,6 +636,19 @@ class _ApprovalView(discord.ui.View):
             return None
         return m.pop_pending_request(rid)
 
+    async def _refuse_expired(self, interaction) -> bool:
+        """An expired request (#135) is dropped, and the click says so."""
+        m = self._match()
+        rid = self._req.get("id")
+        if m is None or m.pending_requests.get(rid) is not self._req \
+                or not m.request_expired(self._req):
+            return False
+        m.pop_pending_request(rid)
+        await interaction.response.send_message(
+            vtt_commands._expired_refusal(m, self._req), ephemeral=True)
+        await self._disable(interaction)
+        return True
+
     async def _require_host(self, interaction) -> bool:
         m = self._match()
         ictx = _InteractionCtx(interaction, self._mgr)
@@ -635,6 +662,8 @@ class _ApprovalView(discord.ui.View):
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
         if not await self._require_host(interaction):
+            return
+        if await self._refuse_expired(interaction):
             return
         m = self._match()
         req = self._pop_own(m)
@@ -668,6 +697,8 @@ class _ApprovalView(discord.ui.View):
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny(self, interaction, button):
         if not await self._require_host(interaction):
+            return
+        if await self._refuse_expired(interaction):
             return
         m = self._match()
         req = self._pop_own(m)
