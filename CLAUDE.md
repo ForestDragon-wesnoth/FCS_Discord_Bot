@@ -1463,6 +1463,9 @@ hardcodes**.
   lines passives, status definition hooks and tile / zone hooks print (a
   tile or zone hook now shows `→ value` too); errors always show, under
   `none` as private lines (passives, hooks, ticks, watcher effects).
+  `held_says` is undo state but out of the journal hash
+  (`journal.HASH_IGNORED`): a CLI `!as view` preview, which the journal
+  doesn't record, decides where a private line goes.
 - **Schedules:** `schedule(delay, ...)` (round-based; raises under ATB),
   `schedule_on(eid, ...)` (turn-based), `cancel_schedule`; a removed unit's
   schedules go with it. Read with `schedules_of(eid=None)` (names, loopable)

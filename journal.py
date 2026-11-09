@@ -45,6 +45,12 @@ UNDO_IGNORED = ("paused", "rules", "rng_seed", "rng_pos", "channel_views",
 # strict edit's channel map reads it, so a replay needs it.
 JOURNAL_IGNORED = tuple(k for k in UNDO_IGNORED if k != "channel_maps")
 
+# Left out of the state hash too: say(private=True) lines waiting for a
+# host (#215). Where one goes follows the channel's view, which a CLI
+# `!as view` preview sets without a journal entry, so a replay may route it
+# elsewhere; it is output, never game state.
+HASH_IGNORED = UNDO_IGNORED + ("held_says",)
+
 # Segments kept: the newest and the one before it.
 KEPT_SEGMENTS = 2
 
@@ -76,7 +82,7 @@ def state_hash(state: Dict[str, Any], match: Any = None) -> str:
     cached piece texts make it cheap (logic.state_text)."""
     from logic import state_text
     body = {k: v for k, v in state.items()
-            if k not in UNDO_IGNORED and k != "id"}
+            if k not in HASH_IGNORED and k != "id"}
     text = state_text(body, match, sort=True)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
