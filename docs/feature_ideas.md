@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14, parts of #190 (Discord-role
@@ -115,19 +115,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - A GitHub Actions workflow running `python run_scenarios.py` and pyflakes on every push and PR. The repo has no `.github/` folder, so the regression runs only when a session runs it.
   - The audit harnesses kept in the repo (`tools/audit/`: stateful chaos, POV leak and existence-oracle detectors, replay differential, renderer parity, suite-as-detector), with a short seeded chaos run in CI. CLAUDE.md §5 has each session rebuild them from descriptions; working copies live in this fork's `audit/doc2/harness/` and drift from main between passes.
   - The combat prototypes in `audit/combat/` can run in CI as well, as a check that real systems keep working.
-- **#215 Player-facing output.**
-  - `say(text)` adds a line to the reply of the command that triggered it, from any formula: actions, passives, status ticks, tile and zone hooks, watchers, schedules.
-    - It goes through `Match.surface_log`, the path hook output already takes.
-    - It carries the hidden unit-line tag, so a POV that can't see the unit drops the line, as it drops death lines.
-  - `say(text, private=True)` reaches hosts only (hidden rolls, #33; GM notes).
-  - A rule `hook_output_lines`: `all` (today's "⚙️ … fired" lines), `with_result` (only when the formula returned or said something), `none`. Errors ("⚠️ … FAILED") always show to hosts.
-  - The game need: all three systems announce every hit ("Hunter1 hits Hopper1 (crit): 30 damage") and every damage-over-time tick to the players. Today an action's last value isn't shown and `log()` writes only to `!log` (L4, L5, D1).
-  - The death and revive lines already show the shape: `death_message_format` is player-facing text from an engine event, and `say()` gives GM formulas the same.
-  - From the combat systems:
-    - A `say_format` field on actions, printed after a successful run with the action's locals as placeholders (`"{self.name} hits {target.name} for {dealt}"`), so most attacks need no `say()` call.
-    - Names resolved per viewer: `say("{target} is hit")` shows a disguised unit's disguise to a POV that the disguise fools.
-    - `say_to(team, text)` for information meant for one side.
-    - One message per command on Discord: the `say()` lines of one command grouped into one reply.
 - **#219 Directional patterns.**
   - `cells_in_pattern(x, y, dir, offsets)`: offsets written for a unit facing `right` are rotated to `up`, `down` and `left`, clipped to the map and charged to `formula_cell_limit` like the other builders. Example: `[[1,-1],[1,0],[1,1],[2,-1],[2,0],[2,1]]` is FCS1 Frost Blast, a rectangle 2 deep and 3 wide in front of the caster. `!map preview pattern` draws it.
   - Open choice: diagonal directions. Rotating a grid shape by 45° isn't exact, so a pattern could carry its own diagonal list, or diagonals could be refused.
@@ -328,7 +315,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#30 ASCII map import.** A pasted text block plus a glyph → tile template (or unit template) legend builds a board.
 - **#32 Procedural generation.** `noise(x, y, seed)` plus room and cave helpers that write tiles.
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
-  - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
+  - Formula rolls are hidden with `say(text, private=True)` (#215); this entry is the typed `!roll secret`.
 - **#34 Session recap export.** The event log as markdown, filtered by POV, for posting a session summary.
 - **#138 Tethers.** `tether(a, b, max_dist, mode=drag|block)` keeps two units within a distance, either dragging the follower along or refusing the move. For grapples, leashes, chained prisoners and harpoons.
 - **#139 Movement layers.**
@@ -520,7 +507,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 From the combat-systems review (docs/combat_systems_fit.md):
 
-- **Hosting turn-based combat systems:** #215 → #28 → #36 slice → #24 + #22 + #23 (with #243, #234, #233) → #227 + #232 → #150 → #222 → #220, #224, #225, #229, #235, #217, #218, #219, #228, #221, #226
+- **Hosting turn-based combat systems:** #28 → #36 slice → #24 + #22 + #23 (with #243, #234, #233) → #227 + #232 → #150 → #222 → #220, #224, #225, #229, #235, #217, #218, #219, #228, #221, #226
 - **Status bundle for the three systems:** #233, #234, #235, #232, #227, #150, #222
 - **After the battle:** #239 → #240, #241; #158 with #251
 - **Discord table comfort:** #247, #248, #254, #255, #244, #245

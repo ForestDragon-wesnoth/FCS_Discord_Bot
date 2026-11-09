@@ -38241,3 +38241,338 @@ rebuilds each
 from the one before and matches the recording after every command; the
 replayed match has a at 30 hp at (1,1), b at 28 with its note, and the
 tile.
+
+
+SCENARIO 1083 — say() and print() from an action, a status tick and a tile hook (#215)
+---------------------------------------------------------------------------------------
+
+!match new sy SY 8 8
+!match use sy
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 40 5 5 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var hero actions.hit.target entity
+!ent set_var hero actions.hit.body "dealt = 4\nentity[target].hp = entity[target].hp - dealt\nsay('{self} hits {t} for {n}', t=target, n=dealt)\nprint('{0} reels', target)"
+!action hero hit ogre
+?? Hero hits Ogre for 4
+?? Ogre reels
+!status def burn
+!status when burn turn_start
+!status tick burn "entity[self].hp = entity[self].hp - 2\nsay('{self} burns ({hp} left)', hp=entity[self].hp)"
+!status apply ogre burn 1 3
+!tile def new fire
+!tile def hook fire on_enter "say('{self} steps into the fire at {x},{y}', x=tile_x, y=tile_y)"
+!tile place fire 6 4
+!ent move ogre 1 up
+?? Ogre steps into the fire at 6,4
+!turn next
+!turn next
+?? Ogre burns (34 left)
+!log type=say
+?? 💬 Hero hits Ogre for 4
+?? 💬 Ogre steps into the fire at 6,4
+?? 💬 Ogre burns (34 left)
+!eval "say('{x} and {y}', x=1)"
+?? say(...): no y= argument for {y}
+!ent hp hero $(say('x'))
+?? is banned in a
+!help function print
+?? the same function as say()
+!assert "entity[ogre].hp == 34"
+
+Expected: say() and print() are one function, a line in the reply of
+the command that set the formula off. The action's two lines show with
+its reply (`{0}` / `{name}` fields filled as fmt() fills them, a unit
+id printing the unit's name). A status tick (burn on the 2x2 ogre, at
+its turn start) and a tile hook (one of the ogre's four cells steps on
+the fire tile at (6,4), so the hook runs once) say theirs in the reply
+of `!ent move` and `!turn next`; `{self}` is the formula's unit. Each
+public line is also an event-log entry of type `say` (💬). A field
+without its argument is refused, naming it, and say() is a mutating
+function, refused inside `$()` (a player's argument could add made-up
+lines). `!help function print` points at say().
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1084 — say() lines and views: hidden units, about=, disguises (#215)
+------------------------------------------------------------------------------
+
+!match new sv SV 8 8
+!match use sv
+!system set default entity_visibility_condition "not status_has(self, 'cloaked')"
+!ent add hero Hero 30 1 1 5
+!ent set_var hero team red
+!ent add orc Orc 20 3 1 4
+!ent set_var orc team blue
+!ent set_var orc actions.spot.body "say('{self} spots {h}', h='hero')\nsay('{h} is spotted by {self}', h='hero', about='hero')\nsay('a horn sounds', about=None)"
+!ent set_var hero actions.wave.body "say('{self} waves')"
+!as view blue
+!action orc spot
+?? Orc spots Hero
+?? Hero is spotted by Orc
+?? a horn sounds
+!as view omniscient
+!ent status hero add cloaked
+!as view blue
+!action orc spot
+?? Orc spots someone
+?! is spotted by
+?? a horn sounds
+!as view red
+!action orc spot
+?? Orc spots Hero
+?? Hero is spotted by Orc
+?? a horn sounds
+!as view omniscient
+!ent status hero remove cloaked
+!ent set_var hero disguise.name Shrub
+!system set default say_hidden_unit_name "a shadow"
+!as view blue
+!action hero wave
+?? Shrub waves
+!as view red
+!action hero wave
+?? Hero waves
+!as view omniscient
+!action hero wave
+?? Hero waves
+!ent status hero add cloaked
+!as view blue
+!action orc spot
+?? Orc spots a shadow
+
+Expected: a say() line is about the formula's `self` by default (the
+orc, its actor): a channel whose view can't see that unit drops it, as
+it drops a death line. `about='hero'` tags the second line with the
+hero, `about=None` reaches every view. With the hero cloaked (hidden
+from blue), blue still gets the orc's line, the hero's name in it
+replaced by say_hidden_unit_name (`someone`); it loses the line about
+the hero and keeps the horn. Red sees its own hero and the orc, so it
+gets all three lines with real names. A name prints as each view sees
+the unit: the hero's disguise (`Shrub`) fools blue, while red (the
+hero's own team) and the omniscient view read `Hero`. The rule set to
+`a shadow` changes the hidden-unit text.
+
+
+SCENARIO 1085 — say(private=True): shown to a host in a plain channel, else held for one (#215)
+-----------------------------------------------------------------------------------------------
+
+!match new sp SP 8 8
+!match use sp
+!ent add hero Hero 30 1 1 5
+!ent set_var hero team red
+!ent set_var hero actions.roll.body "r = 17\nsay('{self} rolls in secret')\nsay('hidden roll: {r}', r=r, private=True)"
+!action hero roll
+?? hidden roll: 17
+!as view red
+!action hero roll
+?! hidden roll
+!host access set action all
+!as player bob
+!action hero roll
+?? Hero rolls in secret
+?! hidden roll
+!as host
+!as view omniscient
+!as restart
+!match use sp
+?? hidden roll: 17
+!log type=say
+?! hidden roll
+!eval "1"
+?! hidden roll
+!as view red
+!action hero roll
+!as view omniscient
+!undo command
+?! hidden roll
+!eval "1"
+?! hidden roll
+
+Expected: a private line shows in the reply when a host (or an
+administrator) runs the command in a channel without a team view. Under
+the red view the host's own command doesn't show it (players read that
+channel), and a player's `!action` (opened to players with `!host access`)
+shows only the public line. Both private lines wait in the match
+(saved: they survive `!as restart`) and end the reply of the next
+command a host runs on the match in a channel without a team view, here
+`!match use sp`, once; the next command shows none. Private lines stay
+out of the event log. Undoing the command that held a line takes the
+line back with it.
+
+
+SCENARIO 1086 — say_to(team, text): one team's view, and a host in a plain channel (#215)
+------------------------------------------------------------------------------------------
+
+!match new st ST 8 8
+!match use st
+!ent add hero Hero 30 1 1 5
+!ent set_var hero team red
+!ent add orc Orc 20 3 1 4
+!ent set_var orc team blue
+!ent set_var hero actions.feint.body "say_to('blue', '{self} looks wounded')\nsay_to('red', 'the wound is a feint')\nsay('{self} staggers')"
+!as view blue
+!action hero feint
+?? Hero looks wounded
+?! a feint
+?? Hero staggers
+!as view red
+!action hero feint
+?? the wound is a feint
+?! looks wounded
+!as view omniscient
+!action hero feint
+?? Hero looks wounded
+?? the wound is a feint
+!host access set action all
+!as player bob
+!action hero feint
+?! looks wounded
+?! a feint
+?? Hero staggers
+!as host
+!log type=say
+?! a feint
+?! looks wounded
+!eval "say_to(none, 'x')"
+?? team is a team name
+
+Expected: a say_to() line reaches only a channel whose view is that
+team (blue reads the bluff, red the truth) and a host in a channel
+without a team view (both). A player in a channel without a team view
+reads neither: such a channel shows the whole board, so a team's
+secret has no place there. say_to() lines stay out of the event log;
+the plain say() line is there. A team must be a team name.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1087 — An action's say_format: locals, self / target, args, list and location targets (#215)
+-------------------------------------------------------------------------------------------------------
+
+!match new sf SF 8 8
+!match use sf
+!ent add hero Hero 30 1 1 5
+!ent set_var hero team red
+!ent add orc Orc 20 3 1 4
+!ent set_var orc team blue
+!ent add gob Gob 12 4 1 4
+!ent set_var gob team blue
+!ent add ogre Ogre 40 5 5 3
+!ent set_vars ogre team=blue footprint_w=2 footprint_h=2 armor=2
+!ent set_var hero actions.hit.target entity
+!ent set_var hero actions.hit.body "dealt = args.power - entity[target].armor if var_has(target, 'armor') else args.power\nentity[target].hp = entity[target].hp - dealt\nif args.power > 50:\n    fail('too strong')"
+!ent set_var hero actions.hit.say_format "{self} hits {target} for {dealt} ({target.hp} left, power {args.power}){nothing}"
+!action hero hit ogre power=6
+?? Hero hits Ogre for 4 (36 left, power 6)
+!ent set_var hero actions.sweep.target entity_list
+!ent set_var hero actions.sweep.body "for t in target:\n    entity[t].hp = entity[t].hp - 1"
+!ent set_var hero actions.sweep.say_format "{self.name} sweeps {target}: {target.hp}"
+!action hero sweep orc gob
+?? Hero sweeps Orc, Gob: 19, 11
+!ent set_var hero actions.leap.target location
+!ent set_var hero actions.leap.body "move_entity(self, target)"
+!ent set_var hero actions.leap.say_format "{self} leaps to {target} (x {target.x})"
+!action hero leap 2 3
+?? Hero leaps to (2, 3) (x 2)
+!action info hero leap
+?? Says:        {self} leaps to {target} (x {target.x})
+!ent set_var orc disguise.name Bush
+!as view red
+!action hero hit orc power=5
+?? Hero hits Bush for 5 (14 left, power 5)
+!as view omniscient
+!action hero hit orc power=99
+?! Hero hits
+!system set default private_vars "armor"
+!host access set action all
+!as player bob
+!ent set_var hero actions.peek.target entity
+!as host
+!ent set_var hero actions.peek.target entity
+!ent set_var hero actions.peek.body "n = 1"
+!ent set_var hero actions.peek.say_format "{target} has armor {target.armor}"
+!as player bob
+!action hero peek ogre
+?? Ogre has armor ?
+!as host
+!action hero peek ogre
+?? Ogre has armor 2
+!log type=say
+?? 💬 Hero hits Ogre for 4 (36 left, power 6)
+!ent set_var hero actions.peek.say_format 5
+!action hero peek ogre
+?? no action `peek` on `hero`
+!assert "entity[ogre].hp == 36 and entity[gob].hp == 11 and entity[hero].x == 2 and entity[orc].hp == 14"
+
+Expected: say_format is a line the action prints after a successful
+run, about its actor. Its placeholders read the body's locals
+(`{dealt}`: 6 power minus the 2x2 ogre's 2 armor), `{self}` /
+`{target}` (names as each view sees the unit, so red, fooled by the
+orc's disguise, reads `Bush`), `{target.<var>}` (`{target.hp}` after
+the hit) and `{args.<key>}`; an unknown placeholder prints nothing. An
+entity_list target prints each name and each var, joined with commas;
+a location target prints its cell, `{target.x}` its column (`!action
+info` lists the say_format under `Says:`). A failed
+action (`fail('too strong')` for power 99, rolled back)
+prints no line and leaves the orc at 14. A var the command's reader may not read prints
+private_var_text (`?`): bob, a player, sees `armor` hidden, the host
+sees 2. The line is an event-log `say` entry. A say_format that isn't
+text makes the action malformed, so it drops out like any malformed
+action.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1088 — hook_output_lines: all, with_result, none; errors held for a host under none (#215)
+---------------------------------------------------------------------------------------------------
+
+!match new ho HO 8 8
+!match use ho
+!ent add hero Hero 30 1 1 5
+!ent set_var hero team red
+!gpassive add val on_turn_start "1 + 1"
+!gpassive add quiet on_turn_start "x = 1"
+!gpassive add talk on_turn_start "say('{self} wakes')"
+!tile def new spring
+!tile def hook spring on_enter "'splash'"
+!tile place spring 2 1
+!turn next
+?? `val` fired on `hero` (on_turn_start) → 2
+?? `quiet` fired on `hero` (on_turn_start)
+?? Hero wakes
+!system set default hook_output_lines with_result
+!turn next
+?? `val` fired on `hero` (on_turn_start) → 2
+?! `quiet` fired
+?! `talk` fired
+?? Hero wakes
+!ent move hero 1 right
+?? ⚙️ tile (2,1) hook `on_enter` fired for `hero` → 'splash'
+!system set default hook_output_lines none
+!turn next
+?! fired
+?? Hero wakes
+!gpassive add bad on_turn_start "entity[self].nothere.y + 1"
+!turn next
+?? `bad` on `hero` (on_turn_start) FAILED
+!as view red
+!turn next
+?! FAILED
+?? Hero wakes
+!as view omniscient
+!eval "1"
+?? `bad` on `hero` (on_turn_start) FAILED
+!system set default hook_output_lines all
+!as view red
+!turn next
+?? `bad` on `hero` (on_turn_start) FAILED
+
+Expected: under `all` (default) every passive prints its fired line,
+with `→ value` when its formula returned one. `with_result` keeps only
+the lines with a value (val's `→ 2`, the spring tile hook's
+`→ 'splash'`, a value a tile or zone hook now shows too); say() lines
+show under every value. `none` prints no fired lines. A failing passive's
+error still shows to a host in a channel without a team view; under the
+red view it is held (a private line) and ends the reply of the host's
+next command in a plain channel. Under `all` the error shows in the red
+view's reply as before.
+HARNESS-ALLOWS-ERRORS

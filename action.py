@@ -48,6 +48,7 @@ surface (vtt_commands.py) gains `!action`.
 from __future__ import annotations
 from dataclasses import dataclass, field
 import copy
+import re
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -349,6 +350,10 @@ class Action:
     # vehicle for a rider's seat action). run_action records a successful
     # use on it, per team that saw it (Entity.actions_seen).
     holder: Optional[str] = None
+    # The line printed after a successful run (#215): placeholders read the
+    # body's locals, `self` / `target` (names as each view sees the unit,
+    # `.name` / `.<var path>`) and `args.<key>`. "" = none.
+    say_format: str = ""
 
     @staticmethod
     def from_dict(
@@ -380,6 +385,14 @@ class Action:
         if not isinstance(description, str):
             raise ActionValidationError(
                 f"action '{name}' at `{full_path}`: `description` "
+                f"must be a string."
+            )
+        say_format = raw.get("say_format", "")
+        if say_format is None:
+            say_format = ""
+        if not isinstance(say_format, str):
+            raise ActionValidationError(
+                f"action '{name}' at `{full_path}`: `say_format` "
                 f"must be a string."
             )
         target_type = raw.get("target", "none")
@@ -428,6 +441,7 @@ class Action:
             tags=tags, tag_sources=sources, tag_problems=problems,
             target_requires_tags=filters.get("target_requires_tags"),
             target_refuses_tags=filters.get("target_refuses_tags"),
+            say_format=normalize_body_source(say_format),
         )
 
 
@@ -1489,6 +1503,7 @@ async def run_action(
     # The teams that see the actor as it begins: they see the action used
     # (recorded on success, below).
     seers = match.teams_seeing(actor_id)
+    body_locals: Dict[str, Any] = {}
     match._action_depth += 1
     try:
         engine = FormulaEngine(match)
@@ -1540,6 +1555,7 @@ async def run_action(
                         action.body, eval_ctx,
                         action_mode=True,
                         action_bindings=bindings,
+                        locals_out=body_locals,
                     )
                 finally:
                     VAR_READER.reset(reader_token)
@@ -1608,6 +1624,12 @@ async def run_action(
             match._choice_answers = []
             match._choice_cursor = 0
 
+    # The action's say_format line (#215), about the actor.
+    if action.say_format.strip():
+        match.say(say_format_text(match, action.say_format, actor_id, target,
+                                  dict(args), body_locals),
+                  about=actor_id if (actor_id in match.entities or
+                                     match.find_corpse(actor_id)) else "")
     # Successful completion: the holder has now used this action
     # (entity_description_action_visibility `used`). Recorded before the
     # hooks, so a hook that kills or removes the holder can't skip it; an
@@ -1669,10 +1691,108 @@ async def run_action(
     if is_top_level:
         flush = match._runtime_buffer
         match._runtime_buffer = None
-        if flush is not None:
-            for line in flush.out:
-                await ctx.send(line)
+        if flush is not None and flush.out:
+            # One reply for the whole action (#215): on Discord each send
+            # is a message, and an attack's say() lines read as one.
+            await ctx.send("\n".join(str(x) for x in flush.out))
     return True, None
+
+
+_SAY_FIELD_RE = re.compile(r"\{([A-Za-z_]\w*(?:\.[\w]+)*)\}")
+
+
+def say_format_text(match: "Match", fmt: str, actor_id: str, target: Any,
+                    args: Dict[str, Any], body_locals: Dict[str, Any]) -> str:
+    """An action's say_format with its placeholders filled (#215): the
+    body's locals, `self` (the actor), `target`, `args.<key>`. A unit (or
+    corpse) id prints as a say name marker, which each channel's view reads
+    as it sees the unit; `.name` the same; any other `.<path>` is the var,
+    through the command's reader (a private var prints private_var_text).
+    A list prints each item, joined with commas; an unknown placeholder
+    prints nothing."""
+    from logic import VAR_READER, privacy_spec, path_privacy, reader_sees
+    hidden_text = str(match.rules.get("private_var_text", "?"))
+
+    def is_unit(v: Any) -> bool:
+        return isinstance(v, str) and (v in match.entities
+                                       or match.find_corpse(v) is not None)
+
+    def unit_path(eid: str, path: str) -> str:
+        if path in ("", "name"):
+            return match.say_name(eid)
+        e = match.entities.get(eid)
+        if e is None:
+            loc = match.find_corpse(eid)
+            uvars = (loc[2] or {}).get("vars", {}) if loc else {}
+            if path == "x" and loc:
+                return str(loc[0])
+            if path == "y" and loc:
+                return str(loc[1])
+        else:
+            if path in ("x", "y"):
+                return str(getattr(e, path))
+            uvars = e.vars
+            reader = VAR_READER.get()
+            if reader is not None:
+                spec = privacy_spec(match.rules, uvars)
+                team = match.body_team(e)
+                if not reader_sees(path_privacy(spec, uvars, path), reader,
+                                   None if team in (None, "") else str(team)):
+                    return hidden_text
+        cur: Any = uvars
+        for seg in path.split("."):
+            if not isinstance(cur, dict) or seg not in cur:
+                return ""
+            cur = cur[seg]
+        return text_of(cur)
+
+    def text_of(v: Any) -> str:
+        if is_unit(v):
+            return match.say_name(v)
+        if isinstance(v, Coord):
+            return f"({v.x}, {v.y})"
+        if isinstance(v, (list, tuple)):
+            return ", ".join(text_of(x) for x in v)
+        if v is None:
+            return ""
+        return str(v)
+
+    def value(key: str) -> str:
+        head, _, rest = key.partition(".")
+        if head == "self":
+            base: Any = actor_id
+        elif head == "target":
+            base = target
+        elif head == "args":
+            if not rest:
+                return ""
+            cur: Any = args
+            for seg in rest.split("."):
+                if not isinstance(cur, dict) or seg not in cur:
+                    return ""
+                cur = cur[seg]
+            return text_of(cur)
+        elif head in body_locals:
+            base = body_locals[head]
+        else:
+            return ""
+        if not rest:
+            return text_of(base)
+        if isinstance(base, Coord):
+            return str(getattr(base, rest, "")) if rest in ("x", "y", "map") else ""
+        if isinstance(base, (list, tuple)):
+            return ", ".join(unit_path(t, rest) if is_unit(t) else ""
+                             for t in base)
+        if is_unit(base):
+            return unit_path(base, rest)
+        cur = base
+        for seg in rest.split("."):
+            if not isinstance(cur, dict) or seg not in cur:
+                return ""
+            cur = cur[seg]
+        return text_of(cur)
+
+    return _SAY_FIELD_RE.sub(lambda mo: value(mo.group(1)), fmt)
 
 
 def _restriction_refusal(action: Action, actor_id: str, target: Any,

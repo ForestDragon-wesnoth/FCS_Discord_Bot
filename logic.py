@@ -564,6 +564,45 @@ def _bounded_move_hooks(fn):
 UNIT_LINE_TAG = "\u2063"
 UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\\d+)\\|([^|\u2063]*)\u2063")
 
+# say() lines (#215) carry more markers, each read and stripped by the same
+# reply filter:
+#   UNIT_LINE_TAG "#<match>|<unit>|<name>" UNIT_LINE_TAG   a unit's name, as
+#       each channel's view sees the unit (a disguise's name to a view it
+#       fools, say_hidden_unit_name to one that can't see it); <name> is the
+#       name when the line was made, for a unit gone since.
+#   UNIT_LINE_TAG "@<team>" UNIT_LINE_TAG   a say_to() line: shown only to
+#       that team's view, and to a host in a channel without a team view.
+#   SAY_OPEN_MARK   a line no view drops (`about=None`).
+SAY_NAME_RE = re.compile("\u2063#([^|\u2063]*)\\|([^|\u2063]*)\\|([^\u2063]*)\u2063")
+SAY_TEAM_RE = re.compile("\u2063@([^\u2063]*)\u2063")
+SAY_OPEN_MARK = "\u2063!\u2063"
+# How many say(private=True) lines a match keeps waiting for a host (the
+# oldest go first).
+HELD_SAY_MAX = 200
+
+# Whether the running command's caller is a host (or an administrator) in a
+# channel without a team view (#215): its say(private=True) lines show in the
+# reply; otherwise they wait in Match.held_says. Set per command by
+# CommandRegistry._run.
+SAY_HOST_VIEW: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_say_host_view", default=False)
+
+
+def line_has_tag(line: str) -> bool:
+    """Whether a reply line already says who may read it: a unit tag, a
+    say_to() team marker or the open mark."""
+    return bool(UNIT_LINE_RE.search(line) or SAY_TEAM_RE.search(line)
+                or SAY_OPEN_MARK in line)
+
+
+def say_plain_text(text: str) -> str:
+    """A say() line with every marker gone and each unit named as it was
+    when the line was made (the event log's text)."""
+    text = SAY_NAME_RE.sub(lambda mo: mo.group(3), text)
+    text = SAY_TEAM_RE.sub("", text).replace(SAY_OPEN_MARK, "")
+    return UNIT_LINE_RE.sub("", text)
+
+
 # While the engine runs something on behalf of one unit outside a command
 # that names it (a zone grant settling on it, a watcher it holds or one read
 # for it), the unit tag (Match.unit_tag) surface_log puts on what it shows,
@@ -998,7 +1037,7 @@ def rotate_direction(facing: str, *, clockwise: bool, eight_way: bool) -> str:
 EVENT_LOG_AUTO_TYPES: Tuple[str, ...] = (
     "death", "revive", "spawn", "move",
     "damage", "heal", "status_added", "status_removed",
-    "action_used", "action_failed",
+    "action_used", "action_failed", "say",
 )
 
 # Built-in render templates, keyed by event type. Same placeholder syntax
@@ -1018,6 +1057,7 @@ EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
     "action_used":    "⚔️ {actor_name} (`{actor}`) used `{action}`{?target?} → {target}{/?}.",
     "action_failed":  "✖️ {actor_name} (`{actor}`) failed `{action}`: {message}",
     "custom":         "{message}",
+    "say":            "💬 {message}",
 }
 
 # ---- Rule registry & model ---------------------------------------------------
@@ -3355,6 +3395,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "inventory dict."
         ),
     },
+    "hook_output_lines": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "with_result", "none"]},
+        "desc": (
+            "Which `⚙️ ... fired` lines passives, tile and zone hooks, "
+            "status ticks and status definition hooks print, and which "
+            "`watcher ... fired` lines a watcher prints (#215). `all` "
+            "(default): every one, as a GM reads them while building. "
+            "`with_result`: only a formula that returned a value (its "
+            "`→ value` line). `none`: no fired lines; a table plays with "
+            "say() lines alone. A formula's error or crash (`⚠️ ... "
+            "FAILED`, `CRASHED`) shows under every value; under `none` it is a "
+            "private line, shown only to a host reading a channel without "
+            "a team view (else held for that host's next command there, as "
+            "say(private=True) is)."
+        ),
+    },
     "formula_function_recursion_limit": {
         "default": 64,
         "schema": {"type": "int", "min": 1, "max": 256, "ceiling": True},
@@ -5359,6 +5416,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "The turn_start_message_format line for a channel whose view can't "
             "see the unit whose turn it is (no placeholders: it names "
             "nothing). Empty = no line."
+        ),
+    },
+    "say_hidden_unit_name": {
+        "default": "someone",
+        "schema": {"type": "str"},
+        "desc": (
+            "What a say() / say_to() line or an action's say_format prints "
+            "for a unit the channel's view can't see (#215): a line tagged "
+            "with a visible unit may name a hidden one (\"{a} hits {b}\", "
+            "the sniper unseen)."
         ),
     },
     "turn_forecast_line_format": {
@@ -7589,13 +7656,42 @@ def _path_resolve(root: Any, path: str) -> Any:
     return cur
 
 
+def hook_output(m: Optional["Match"], kind: str, line: str) -> List[str]:
+    """The lines a hook's run prints under the hook_output_lines rule
+    (#215): kind `fired` (no result) shows under `all`, `result` under `all`
+    and `with_result`, `error` always (under `none` as a private line,
+    Match.private_lines)."""
+    mode = str((m.rules if m is not None else {}).get(
+        "hook_output_lines", "all"))
+    if kind == "error":
+        if mode == "none" and m is not None:
+            return m.private_lines([line])
+        return [line]
+    if kind == "result":
+        return [line] if mode in ("all", "with_result") else []
+    return [line] if mode == "all" else []
+
+
 def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str,
-                        is_global: bool, label: Optional[str] = None) -> str:
+                        is_global: bool, label: Optional[str] = None
+                        ) -> List[str]:
     """
-    Run a single passive's formula and return a one-line human-readable log
-    string. Catches FormulaError (and any other exception, defensively) so one
-    broken passive can't cripple the whole hook fire.
+    Run a single passive's formula and return its log lines (a fired line,
+    a result or an error, as hook_output_lines lets them show). Catches
+    FormulaError (and any other exception, defensively) so one broken
+    passive can't cripple the whole hook fire.
     """
+    m = getattr(engine, "_match", None)
+    return hook_output(m, *_run_passive_line(engine, p, ctx,
+                                             target_id=target_id,
+                                             is_global=is_global,
+                                             label=label))
+
+
+def _run_passive_line(engine, p: "Passive", ctx, *, target_id: str,
+                      is_global: bool, label: Optional[str] = None
+                      ) -> Tuple[str, str]:
+    """(kind, line) of one passive's run, for hook_output."""
     # Lazy import to avoid logic <-> formula import cycle.
     from formula import FormulaError
     given = label
@@ -7616,21 +7712,24 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str,
     try:
         result = engine.eval_program(p.formula, ctx)
         if result is None:
-            return f"⚙️ {label} fired on `{target_id}` ({p.when})"
-        return f"⚙️ {label} fired on `{target_id}` ({p.when}) → {result!r}"
+            return "fired", f"⚙️ {label} fired on `{target_id}` ({p.when})"
+        return ("result",
+                f"⚙️ {label} fired on `{target_id}` ({p.when}) → {result!r}")
     except FormulaError as ex:
-        return f"⚠️ {label} on `{target_id}` ({p.when}) FAILED: {ex}"
+        return "error", f"⚠️ {label} on `{target_id}` ({p.when}) FAILED: {ex}"
     except RecursionError:
         # Hooks that keep setting each other off past what Python's stack
         # holds (a var_hook_recursion_limit raised past ~90 levels): the
         # chain stops here, as at the limit; no crash entry, nothing broke.
-        return (f"⚠️ {label} on `{target_id}` ({p.when}) stopped: hooks set "
-                f"each other off too deep (lower var_hook_recursion_limit).")
+        return "error", (
+            f"⚠️ {label} on `{target_id}` ({p.when}) stopped: hooks set "
+            f"each other off too deep (lower var_hook_recursion_limit).")
     except Exception as ex:
         # Defensive: programmer-error or unexpected bug shouldn't nuke a turn.
         ref = crash_ref(f"{label} on `{target_id}` ({p.when})", ex)
-        return (f"💥 {label} on `{target_id}` ({p.when}) CRASHED{ref}: "
-                f"{type(ex).__name__}: {ex}")
+        return "error", (
+            f"💥 {label} on `{target_id}` ({p.when}) CRASHED{ref}: "
+            f"{type(ex).__name__}: {ex}")
 
 
 # -------------------------
@@ -12495,6 +12594,12 @@ class Match:
     reminders: List[Dict[str, Any]] = field(default_factory=list)
     reminder_seq: int = 0
     held_reminders: List[Dict[str, Any]] = field(default_factory=list)
+    # say(..., private=True) lines (#215) made while no host read the
+    # command's reply in a channel without a team view: they end the reply
+    # of the next command a host runs on the match in such a channel, as
+    # the secret reminders above do (saved, undo state; at most
+    # HELD_SAY_MAX, the oldest dropped).
+    held_says: List[str] = field(default_factory=list)
 
     # ---- named random tables ----
     # name -> a roll_table spec ("key:weight,..." CSV). Rolled by name via the
@@ -17198,8 +17303,9 @@ class Match:
                     where = f" on `{eid}`" if eid else ""
                     why = ("" if FORMULA_TEXT_HIDDEN.get()
                            else f": {ex}")
-                    notes += self.tag_lines(utag, [
-                        f"⚠ watcher `{what}`{where} effect error{why}"])
+                    notes += hook_output(self, "error", "\n".join(
+                        self.tag_lines(utag, [
+                            f"⚠ watcher `{what}`{where} effect error{why}"])))
                 finally:
                     SURFACE_UNIT_TAG.reset(tok)
             if eid is None:
@@ -20973,18 +21079,27 @@ class Match:
         # otherwise "(no acting entity)" for time hooks during a wrap.
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
         try:
-            engine.eval_program(formula_src, ctx)
+            result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return [f"⚠️ tile ({x},{y}) hook `{when}` {tag} FAILED: {ex}"]
+            return hook_output(self, "error",
+                               f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
+                               f"FAILED: {ex}")
         except Exception as ex:
             # Defensive: any non-FormulaError exception is a bug, but
             # don't bring down the move on it.
             ref = crash_ref(f"tile ({x},{y}) hook `{when}` {tag}", ex)
-            return [
+            return hook_output(self, "error",
                 f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}"
-            ]
-        return [f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}"]
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
+        return self._hook_fired(f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}",
+                                result)
+
+    def _hook_fired(self, line: str, result: Any) -> List[str]:
+        """A tile or zone hook's fired line (with `→ result` when its
+        formula returned one), as hook_output_lines lets it show."""
+        if result is None:
+            return hook_output(self, "fired", line)
+        return hook_output(self, "result", f"{line} → {result!r}")
 
     # ---- zone hooks --------------------------------------------------
     # Zones carry two movement-hook families plus the time hooks (see
@@ -21028,16 +21143,18 @@ class Match:
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
         try:
-            engine.eval_program(formula_src, ctx)
+            result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return [f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"]
+            return hook_output(self, "error",
+                               f"⚠️ zone `{name}` hook `{when}` {tag} "
+                               f"FAILED: {ex}")
         except Exception as ex:
             ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
-            return [
+            return hook_output(self, "error",
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}"
-            ]
-        return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
+        return self._hook_fired(f"⚙️ zone `{name}` hook `{when}` fired {tag}",
+                                result)
 
     def fire_zone_exit_hooks(self, entity_id: Optional[str],
                              fx: int, fy: int, tx: int, ty: int,
@@ -21263,16 +21380,18 @@ class Match:
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
         try:
-            engine.eval_program(formula_src, ctx)
+            result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return [f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"]
+            return hook_output(self, "error",
+                               f"⚠️ zone `{name}` hook `{when}` {tag} "
+                               f"FAILED: {ex}")
         except Exception as ex:
             ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
-            return [
+            return hook_output(self, "error",
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}"
-            ]
-        return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
+        return self._hook_fired(f"⚙️ zone `{name}` hook `{when}` fired {tag}",
+                                result)
 
     # ---- status definitions (self-describing statuses) --------------
     # A status DEFINITION holds the behaviour a status of that name has:
@@ -22616,16 +22735,16 @@ class Match:
                 try:
                     engine.eval_program(src, ctx)
                 except FormulaError as ex:
-                    log.append(self.unit_line(
+                    log.extend(hook_output(self, "error", self.unit_line(
                         eid, f"⚠️ status_tick on `{eid}.{sname}` "
-                             f"({when}) FAILED: {ex}"))
+                             f"({when}) FAILED: {ex}")))
                 except Exception as ex:
                     ref = crash_ref(f"status_tick on `{eid}.{sname}` "
                                     f"({when})", ex)
-                    log.append(self.unit_line(
+                    log.extend(hook_output(self, "error", self.unit_line(
                         eid, f"⚠️ status_tick on `{eid}.{sname}` "
                              f"({when}) CRASHED{ref}: "
-                             f"{type(ex).__name__}: {ex}"))
+                             f"{type(ex).__name__}: {ex}")))
                 finally:
                     STATUS_TICKING.reset(ticking)
         return log
@@ -22741,7 +22860,7 @@ class Match:
         if isinstance(src, str) and src.strip() \
                 and entity_id in self.entities:
             hook = STATUS_DEF_HOOKS[when]
-            log.append(_run_passive_safely(
+            log.extend(_run_passive_safely(
                 engine, Passive(id=f"{status_name}.{hook}", when=when,
                                 formula=src),
                 ctx, target_id=entity_id, is_global=False,
@@ -24619,7 +24738,7 @@ class Match:
                 out.append(entry)
                 continue
             out.append("\n".join(
-                ln if (UNIT_LINE_TAG in ln or not ln.strip()) else tag + ln
+                ln if (line_has_tag(ln) or not ln.strip()) else tag + ln
                 for ln in entry.split("\n")))
         return out
 
@@ -26371,7 +26490,7 @@ class Match:
                 if present:
                     break
                 continue
-            log.append(_run_passive_safely(
+            log.extend(_run_passive_safely(
                 engine, p, ctx, target_id=target_eid,
                 is_global=kind != "own"))
 
@@ -26482,10 +26601,10 @@ class Match:
                 if kind == "own" and target not in self.entities:
                     continue
                 if kind == "global":
-                    log.append(_run_passive_safely(
+                    log.extend(_run_passive_safely(
                         engine, p, gctx, target_id=gself, is_global=True))
                 else:
-                    log.append(_run_passive_safely(
+                    log.extend(_run_passive_safely(
                         engine, p, tctx, target_id=target,
                         is_global=kind == "team"))
         finally:
@@ -27067,6 +27186,7 @@ class Match:
             "reminders": copy.deepcopy(self.reminders),
             "reminder_seq": self.reminder_seq,
             "held_reminders": copy.deepcopy(self.held_reminders),
+            "held_says": list(self.held_says),
             "tables": dict(self.tables),
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
@@ -27309,6 +27429,8 @@ class Match:
                        if isinstance(r, dict) and isinstance(r.get("due"), int)
                        and isinstance(r.get("id"), int)]
         m.reminder_seq = int(d.get("reminder_seq") or 0)
+        m.held_says = [str(x) for x in d.get("held_says") or []
+                       if isinstance(x, str)][-HELD_SAY_MAX:]
         m.held_reminders = [copy.deepcopy(r) for r in
                             d.get("held_reminders") or [] if isinstance(r, dict)]
         raw_ma = d.get("macro_authors")
@@ -29638,6 +29760,74 @@ class Match:
         sink = FORMULA_LOG_SINK.get()
         if sink is not None:
             sink.extend(lines)
+
+    # ---- say() lines (#215) ----
+    def say_name(self, eid: str) -> str:
+        """`eid`'s name inside a say() line: a marker the reply filter prints
+        as the channel's view sees the unit (vtt_commands._filter_unit_lines);
+        plain text for an id that names no unit or corpse."""
+        e = self.entities.get(eid)
+        if e is not None:
+            name = e.name
+        else:
+            loc = self.find_corpse(eid)
+            if loc is None:
+                return eid
+            name = (loc[2] or {}).get("name", eid) if isinstance(loc[2], dict) else eid
+        name = str(name).replace(UNIT_LINE_TAG, "")
+        return f"{UNIT_LINE_TAG}#{self.id}|{eid}|{name}{UNIT_LINE_TAG}"
+
+    def say_tag(self, about: Optional[str]) -> str:
+        """The tag a say() line about unit or corpse `about` starts with
+        (None = the open mark: no view drops the line)."""
+        if about is None:
+            return SAY_OPEN_MARK
+        tag = self.unit_tag(about)
+        if tag:
+            return tag
+        loc = self.find_corpse(about)
+        if loc is None:
+            raise VTTError(f"No unit or corpse `{about}` to tag the line with.")
+        x, y, _c, mp = loc
+        return (f"{UNIT_LINE_TAG}{self.id}|{about}|{x}|{y}|{mp or ''}"
+                f"{UNIT_LINE_TAG}")
+
+    def say(self, text: str, *, about: Any = "", team: Optional[str] = None,
+            private: bool = False) -> None:
+        """Add the player-facing line `text` (names already as say_name
+        markers) to the running command's reply, through surface_log.
+        `about` is the unit the line is about ("" = untagged: a held
+        watcher's or a grant's unit tag still applies; None = every view);
+        `team` makes it a say_to() line; `private` shows it to hosts only:
+        in this reply when the caller is a host reading a channel without a
+        team view (SAY_HOST_VIEW), else held for the next such command
+        (held_says). A public line is also recorded in the event log
+        (type `say`)."""
+        text = str(text)
+        if private:
+            self.surface_log(self.private_lines([text]))
+            return
+        if team is not None:
+            line = f"{UNIT_LINE_TAG}@{str(team).replace(UNIT_LINE_TAG, '')}{UNIT_LINE_TAG}{text}"
+        else:
+            line = (self.say_tag(about) if about != "" else "") + text
+            self.log_event("say", message=say_plain_text(text))
+        self.surface_log([line])
+
+    def private_lines(self, lines: List[str]) -> List[str]:
+        """Lines meant for hosts only (#215: say(private=True), hook errors
+        under hook_output_lines none): returned to be shown when the
+        running command's caller is a host reading a channel without a team
+        view; else kept in held_says (the newest HELD_SAY_MAX) and [] is
+        returned."""
+        lines = [str(ln) for ln in lines if ln]
+        if not lines:
+            return []
+        if SAY_HOST_VIEW.get():
+            return lines
+        self.held_says.extend(lines)
+        del self.held_says[:-HELD_SAY_MAX]
+        return []
 
     def roster_shows(self, e: "Entity") -> bool:
         """Whether `e` gets a row in the `!list` / `!state` roster. Only body

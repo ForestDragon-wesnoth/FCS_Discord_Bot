@@ -2867,6 +2867,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # event_log_enabled (the `custom` type bypasses the event_log_events
     # filter). Returns True if recorded. View with !log.
     "log",
+    # Player-facing lines (#215): say(text, ..., about=, private=) / print
+    # (the same function), say_to(team, text, ...).
+    "say", "print", "say_to",
     # Zone primitives. A zone is a named region (a set of cells) with
     # free-form data and hooks; these mirror the tile_* accessors plus
     # membership queries and footprint mutation.
@@ -3077,6 +3080,8 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     # They run a `!func` or a lambda per item, and a `!func` may write.
     "map_with", "filter_with", "sort_by",
     "log",
+    # A $() argument could add lines (private ones too) to the reply.
+    "say", "print", "say_to",
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift", "zone_set", "zone_del", "zone_spawn",
     "zone_anchor", "zone_unanchor", "zone_grant", "zone_ungrant",
@@ -8489,6 +8494,86 @@ class FormulaEngine:
 
         ns["log"] = _log
 
+        # ---- player-facing lines (#215) ----
+        _SAY_UNSET = object()
+
+        def _say_value(v: Any) -> Any:
+            # A unit or corpse id prints its name as each view sees it; a
+            # list of values prints each, joined with commas.
+            if isinstance(v, str) and (v in match.entities
+                                       or match.find_corpse(v) is not None):
+                return match.say_name(v)
+            if isinstance(v, (list, tuple)) and any(
+                    isinstance(x, str) and (x in match.entities)
+                    for x in v):
+                return ", ".join(str(_say_value(x)) for x in v)
+            return v
+
+        def _say_text(fname: str, text: Any, args: Tuple[Any, ...],
+                      kwargs: Dict[str, Any]) -> str:
+            t = _text_arg(text, fname, "text")
+            kw = {k: _say_value(v) for k, v in kwargs.items()}
+            if "self" not in kw and ctx.target:
+                kw["self"] = _say_value(ctx.target)
+            pos = tuple(_say_value(a) for a in args)
+            try:
+                out = _fmt(t, *pos, _limit=size_limit, **kw)
+            except FormulaError as ex:
+                raise FormulaError(str(ex).replace("fmt(...)", f"{fname}(...)"))
+            return out
+
+        def _say(text: Any, *args: Any, private: Any = False,
+                 about: Any = _SAY_UNSET, **kwargs: Any) -> None:
+            """say(text, ..., about=<unit>, private=False, name=value, ...):
+            add a line to the reply of the command that set the formula off
+            (actions, passives, ticks, tile and zone hooks, watchers,
+            schedules). {name} / {0} fields are filled as fmt() fills them; a
+            value that is a unit's id prints its name as each channel's view
+            sees it (a disguise's name to a view it fools), a list of ids
+            each name. {self} is the formula's unit. The line is about
+            `self` (a channel whose view can't see that unit drops it, as it
+            drops death lines); about=<unit> names another, about=None shows
+            it to every view. private=True shows it to hosts only: in this
+            reply when a host reads a channel without a team view, else at
+            the next such command. A public line is also recorded in the
+            event log (type `say`). Returns None."""
+            if "to" in kwargs:
+                raise FormulaError("say(...): to= is reserved; a line for "
+                                   "one team is say_to(team, text).")
+            line = _say_text("say", text, args, kwargs)
+            if about is _SAY_UNSET:
+                who: Any = ctx.target if ctx.target and (
+                    ctx.target in match.entities) else ""
+            elif about is None:
+                who = None
+            else:
+                who = _eid(about)
+            try:
+                match.say(line, about=who, private=bool(private))
+            except VTTError as ex:
+                raise FormulaError(f"say(...): {ex}")
+            return None
+
+        def _say_to(team: Any, text: Any, *args: Any, **kwargs: Any) -> None:
+            """say_to(team, text, ..., name=value, ...): a say() line shown
+            only in a channel whose view is team `team`, and to a host in a
+            channel without a team view. Fields as in say(); kept out of
+            the event log. Returns None."""
+            if team is None or isinstance(team, (dict, list, tuple)):
+                raise FormulaError("say_to(team, text): team is a team name.")
+            line = _say_text("say_to", text, args, kwargs)
+            match.say(line, team=team_text(team))
+            return None
+
+        def _print(text: Any, *args: Any, **kwargs: Any) -> None:
+            """print(text, ..., about=<unit>, private=False, name=value,
+            ...): the same function as say() (see `!help function say`)."""
+            return _say(text, *args, **kwargs)
+
+        ns["say"] = _say
+        ns["print"] = _print
+        ns["say_to"] = _say_to
+
         # ---- zone primitives ----
         # A zone is a named region (a set of cells) with free-form data
         # and hooks. These mirror the tile_* accessors plus membership
@@ -11054,8 +11139,13 @@ class FormulaEngine:
 
     def eval_program(self, src: str, ctx: EvalCtx,
                      *, action_mode: bool = False,
-                     action_bindings: Optional[Dict[str, Any]] = None) -> Any:
+                     action_bindings: Optional[Dict[str, Any]] = None,
+                     locals_out: Optional[Dict[str, Any]] = None) -> Any:
         """Run statements; if the source ends with an expression, return its value.
+
+        locals_out       filled with the program's locals once its
+                         statements ran (an action's say_format reads
+                         them, #215).
 
         action_mode      enables the action body language (cmd/fail/
                          source/args/target bindings, bare-name local
@@ -11105,6 +11195,9 @@ class FormulaEngine:
         try:
             if full.body:
                 exec(compile(_guard_arith(full), "<formula>", "exec"), ns)
+            if locals_out is not None:
+                locals_out.clear()
+                locals_out.update({k: ns[k] for k in full_locals if k in ns})
             if trailing_expr is None:
                 return None
             expr_tree = ast.Expression(body=trailing_expr)

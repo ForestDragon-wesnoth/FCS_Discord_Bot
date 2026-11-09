@@ -1429,7 +1429,43 @@ hardcodes**.
   `!system lint` reads held, team, status and library watchers.
 - **Output:** every formula-driven change hands its log to
   `Match.surface_log` (action buffer, else the command's `FORMULA_LOG_SINK`),
-  shown at the end of the command in order (651).
+  shown at the end of the command in order (651); an action's buffered
+  lines go out as one reply (one Discord message).
+- **Player-facing lines** (#215, user design, 1083-1088): `say(text, ...,
+  about=, private=False, name=value)` and `print` (the same function)
+  and `say_to(team, text, ...)`, mutating (refused in `$()`: a player's
+  argument could forge lines). Fields as `fmt()`; a value that is a unit
+  or corpse id becomes a name marker (`Match.say_name`, `logic.
+  SAY_NAME_RE`) which the reply filter (`vtt_commands._filter_unit_lines`)
+  prints as the channel's view sees the unit: its disguise's name to a
+  view it fools, `say_hidden_unit_name` (`someone`) to a view that can't
+  see it. `Match.say`: a line is tagged with `about` (default the
+  formula's `self`; a unit tag as death lines carry, dropped where the
+  view can't see the unit; `about=None` = `SAY_OPEN_MARK`, every view;
+  `logic.line_has_tag` keeps a held watcher's or a grant's
+  SURFACE_UNIT_TAG off lines that carry one); a public line is also an
+  event-log `say` entry (`say_plain_text`: names as they were). A
+  say_to() line (`SAY_TEAM_RE` marker) shows only to that team's view
+  and a host in a channel without one; no log entry. Private lines
+  (`Match.private_lines`) show when `SAY_HOST_VIEW` (set per command in
+  `CommandRegistry._run`: the caller is a host or administrator reading
+  a channel without a team view); else they wait in `Match.held_says`
+  (saved, undo state, at most `HELD_SAY_MAX`) and end the reply of the
+  next such command, with the secret reminders. An action's `say_format`
+  (`Action.say_format`, `action.say_format_text`, after a successful run,
+  about the actor; `!action info` shows it under `Says:`) fills the body's
+  locals (`eval_program(locals_out=)`), `{self}` / `{target}` (lists
+  joined with commas, a location as its cell), `{<unit>.name}` /
+  `.<var path>` (through the command's VAR_READER; a disguise's decoys
+  aren't read, only the name is per view) and `{args.<key>}`; unknown
+  placeholders print nothing. The rule `hook_output_lines` (all /
+  with_result / none; `logic.hook_output`) decides which `⚙️ ... fired`
+  lines passives, status definition hooks and tile / zone hooks print (a
+  tile or zone hook now shows `→ value` too); errors always show, under
+  `none` as private lines (passives, hooks, ticks, watcher effects).
+  `held_says` is undo state but out of the journal hash
+  (`journal.HASH_IGNORED`): a CLI `!as view` preview, which the journal
+  doesn't record, decides where a private line goes.
 - **Schedules:** `schedule(delay, ...)` (round-based; raises under ATB),
   `schedule_on(eid, ...)` (turn-based), `cancel_schedule`; a removed unit's
   schedules go with it. Read with `schedules_of(eid=None)` (names, loopable)

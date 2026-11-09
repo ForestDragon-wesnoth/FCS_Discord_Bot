@@ -17,7 +17,7 @@ from logic import (
 
 # Passive system
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -1111,6 +1111,19 @@ class CommandRegistry:
             _RUN_DEPTH.reset(depth_token)
 
     async def _run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
+        # say(private=True) lines (#215) show in this reply only when its
+        # caller is a host reading a channel without a team view.
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        host_view = (mid in mgr.matches
+                     and _var_reader(ctx, mgr, mid) is None)
+        token = SAY_HOST_VIEW.set(bool(host_view))
+        try:
+            return await self._run_body(name, args, ctx, mgr)
+        finally:
+            SAY_HOST_VIEW.reset(token)
+
+    async def _run_body(self, name: str, args: List[str], ctx: ReplyContext,
+                        mgr: MatchManager):
         # Alias resolution happens BEFORE handler lookup so an alias can
         # shadow a built-in name on this match.
         typed = name
@@ -1364,10 +1377,12 @@ class CommandRegistry:
         # read), part of that command's undo step.
         hm = (mgr.matches.get(pre_active_mid)
               if pre_active_mid and name.lower() != "as" else None)
-        if hm is not None and hm.held_reminders and _acts_as_host(ctx, hm) \
-                and _view_pov(ctx, hm, []) is None:
+        if hm is not None and (hm.held_reminders or hm.held_says) \
+                and _acts_as_host(ctx, hm) and _view_pov(ctx, hm, []) is None:
             held, hm.held_reminders = hm.held_reminders, []
-            await ctx.send("\n".join(hm.reminder_line(r) for r in held))
+            says, hm.held_says = hm.held_says, []
+            await ctx.send("\n".join([hm.reminder_line(r) for r in held]
+                                     + says))
         # Even a failed command goes through the bookkeeping below: it only
         # records a snapshot when the state REALLY changed, so a clean failure
         # stays a no-op, while a command that mutated and THEN failed (a hook
@@ -14281,11 +14296,66 @@ def _unit_line_shown(ctx: ReplyContext, mgr: MatchManager, mid: str,
             and m.tile_visible_to(x, y, pov, mp))
 
 
+def _say_view(ctx: ReplyContext, mgr: MatchManager
+              ) -> Tuple[Optional["Match"], Optional[str]]:
+    """The channel's match and its query view, for the say() markers."""
+    cur = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(cur) if cur is not None else None
+    return m, (_query_pov(ctx, m) if m is not None else None)
+
+
+def _say_name_text(m: Optional["Match"], pov: Optional[str], mid: str,
+                   eid: str, name: str) -> str:
+    """A say() name marker's text in this channel (#215): the unit's name,
+    its disguise's name to a view the disguise fools, the
+    say_hidden_unit_name text to a view that can't see it."""
+    if m is None or m.id != mid or eid not in m.entities:
+        return name
+    e = m.entities[eid]
+    if pov is not None:
+        if _pov_hides(m, pov, eid):
+            return str(m.rules.get("say_hidden_unit_name", "someone"))
+        dis = m._effective_disguise(e, pov)
+        if dis is not None and isinstance(dis.get("name"), str):
+            return dis["name"]
+    return e.name
+
+
+def _say_team_shown(ctx: ReplyContext, m: Optional["Match"],
+                    pov: Optional[str], team: str) -> bool:
+    """Whether a say_to() line for `team` shows here: that team's view, or a
+    host's channel without a team view."""
+    if m is None:
+        return True
+    if pov is not None:
+        return str(pov) == team
+    return _acts_as_host(ctx, m) or ctx_is_admin(ctx)
+
+
 def _filter_unit_lines(text: str, ctx: ReplyContext, mgr: MatchManager) -> str:
     """`text` with tagged unit lines the channel's view can't see dropped
-    and the tags stripped from the rest."""
+    and the tags stripped from the rest; say() markers (#215): names as the
+    view sees each unit, say_to() lines for another team dropped."""
     out = []
+    view: List[Any] = []
+
+    def seen() -> Tuple[Optional["Match"], Optional[str]]:
+        if not view:
+            view.extend(_say_view(ctx, mgr))
+        return view[0], view[1]
     for line in text.split("\n"):
+        if SAY_NAME_RE.search(line):
+            m, pov = seen()
+            line = SAY_NAME_RE.sub(
+                lambda mo: _say_name_text(m, pov, mo.group(1), mo.group(2),
+                                          mo.group(3)), line)
+        tmo = SAY_TEAM_RE.search(line)
+        if tmo is not None:
+            m, pov = seen()
+            if not _say_team_shown(ctx, m, pov, tmo.group(1)):
+                continue
+            line = SAY_TEAM_RE.sub("", line)
+        line = line.replace(SAY_OPEN_MARK, "")
         mo = UNIT_LINE_RE.search(line)
         if mo is None:
             out.append(line)
@@ -26902,6 +26972,8 @@ async def _action_info(
             shown = (", ".join(f"`{t}`" for t in filt)
                      if isinstance(filt, list) else f"`{filt}`")
             lines.append(f"{label} {shown}")
+    if act.say_format.strip():
+        lines.append(f"Says:        {act.say_format}")
     lines += [f"⚠️ {p}" for p in act.tag_problems]
     forbid = "" if disguised else _action_forbid_note(m, actor_id, act)
     if forbid:
