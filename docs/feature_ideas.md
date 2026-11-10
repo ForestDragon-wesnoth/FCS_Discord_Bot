@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #262). Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #263). Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
@@ -476,6 +476,8 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Per-server storage (#41) and system status definitions, tables and macros (#140) have shipped.
 
 ### New
+
+- **#263 Movement-triggered reactions.** A later trigger kind for #36's reactions: a unit's move (leaving or entering a reach, crossing a cell) opens a reaction window the way an action does, for opportunity attacks and overwatch. Left out of #36's first version (user call); a reach aura's `on_exit` hook calling `react_point` covers it until then.
 
 - **#197 Scaling.**
   - Shipped: the spatial indexes (#154: units, zones and corpses by cell) and servers loaded on first use and unloaded when idle (`server_idle_unload_hours`).
