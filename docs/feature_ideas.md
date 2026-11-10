@@ -259,7 +259,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#24 Action economy.** `turn_resources` pools (actions, bonus actions, movement) refilled at turn start, plus a `cost` field on actions that spends from them.
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
     - Action fields:
-      - `kind`: standard, free, reaction, follow_up, charged, combo;
+      - `kind`: standard, free, reaction, charged, combo;
       - `cost`: `{stamina: 8}`, with `cost_fallback` for "pay the rest in hp" (FCS1 and NCS Lethal Determination, NCS Revenant);
       - `cooldown` in the owner's own turns;
       - `uses_per_turn`;
@@ -274,7 +274,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
     - Charged actions count down on the owner's turns, skipped ones included (D8, L12).
   - From the combat systems:
     - Combo groups: several different actions of one combo type in a turn, each at most once (Solis combo actions, e.g. foraging and attack combos).
-    - Follow-ups: `follow_up: {after: [heavy_attack], once_per: trigger}`. NCS Follow Up Strike (one light attack after any melee attack); FCS1 Riposte (an attack at half cost after blocking); FCS1 Unrelenting Assault (attack again after a blocked or dodged attack).
+    - Follow-ups need no field here: a follow-up is a #36 reaction on its holder's own action (`self_trigger: true`, an after window), or any other composition (user call). NCS Follow Up Strike (one light attack after any melee attack); FCS1 Riposte (an attack at half cost after blocking); FCS1 Unrelenting Assault (attack again after a blocked or dodged attack).
     - Resource modifiers through the modifier fold:
       - FCS1 and NCS Efficiency: +1 standard action;
       - Solis Agility status: +1 standard move;
