@@ -438,14 +438,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 ### Still open
 
-- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, opportunity attack), answered through `choose()`. The choice-replay machinery is the groundwork; a reach aura's `on_enter` hook can trigger it.
-  - A sketch written against the combat systems (docs/combat_systems_fit.md):
-    - In an action body, `offer_reaction(target, payload)` ends the body and stores a pending event on the match: attacker, target, the action, and the payload (`{'damage': 15, 'type': 'blunt', 'kind': 'melee'}`). It is saved, so it survives restarts and follows undo.
-    - Reaction actions carry `kind: reaction`, `reacts_to: [melee, ranged, spell, ...]` and an `available` condition (cooldown, stamina, not asleep). `reacts_for: adjacent_ally` covers FCS1 Protect, and a range covers Counterspell.
-    - The attack's reply names the options: "Hopper1 kicks Hunter1. Hunter1 can `!react hu1 block`, `!react hu1 dodge <x> <y>`, or `!react hu1 take`."
-    - `!react <eid> <reaction> [target] [k=v]` runs the reaction with `pending` bound. The reaction can change the payload (`pending.damage -= 10`) or cancel it (`pending.cancel = True`). Then the attack's `resolve` body runs with `pending` bound, and the attacker's costs are charged there, so a cancel (NCS First Strike) means they are never paid.
-    - With no reaction available, the attack resolves at once. A reaction may offer a reaction of its own, which stacks (NCS Disarming Hook answering a First Strike). `!state` lists the open stack, and `!turn next` warns while it isn't empty.
-    - Every `!react` is an ordinary command, with its own undo step, approval and journal entry. With #28, the defender's player answers without the host.
+- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, counterspell), with the incoming action waiting while reactions are picked. The design is agreed and written in `docs/damage_reactions_design.md` (§1-§9; the details still open are in its §11); not built yet.
   - From the combat systems:
     - Windows, in the order an attack resolves:
       - before the hit: NCS First Strike, FCS1 Preemptive Strike, Counterspell, Protect, Emergency Consumable;
@@ -455,7 +448,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
       - one reaction per attack (NCS);
       - one reaction until the unit's own next turn (Solis);
       - a bypass flag (FCS1 Preemptive Strike "bypasses the reactionary limit").
-      - Modelled as a #24 resource refilled at the reacting unit's turn start.
+      - Settled: counted with `reactions_used` in each reaction's condition (design §8), no limit rule.
     - Redirects: a reaction may change the pending hit's target (FCS1 Protect: swap places with the attacked ally and take the hit at half damage).
     - Multi-hit attacks offer one reaction per hit (NCS "blocking is done individually per incoming hit").
 - **#37 Elevation.** Per-cell height, high-ground LOS, `height_diff`, and a link to #16's `move_cost`.

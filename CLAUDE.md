@@ -434,6 +434,9 @@ back, load the schema with `ToolSearch` before calling
   match and nested maps (step 1 and 2a-2d built; §8).
 - **`docs/zones_prefabs_design.md`**: the agreed design for zone
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
+- **`docs/damage_reactions_design.md`**: the design of reactions (#36,
+  agreed, not built) and the damage pipeline (#25, in discussion), which
+  meet at `incoming`. Read it whole before building either.
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
   the vocabulary (built, §7.20).
@@ -3963,8 +3966,9 @@ hasn't named the next.
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /
-  counter during another unit's turn — the choice-replay shape is the
-  groundwork), fancier revive (regrow from a template). Interactive Discord
+  counter during another unit's turn: designed in
+  `docs/damage_reactions_design.md`, with the damage pipeline in
+  discussion there), fancier revive (regrow from a template). Interactive Discord
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.
