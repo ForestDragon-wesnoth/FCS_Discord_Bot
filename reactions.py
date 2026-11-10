@@ -441,8 +441,9 @@ def _auto_picks(m: Any, ex: Dict[str, Any], uid: str, phase: str,
                 options: List[Tuple[Any, Optional[str]]],
                 notes: List[str]) -> List[str]:
     """Auto mode: each available reaction whose auto_when holds (or that
-    has none), highest priority first, up to the per-window limit. Only
-    reactions without a target of their own are picked."""
+    has none), highest priority first, up to the per-window limit. A
+    reaction taking one unit as its own target gets the incoming action's
+    actor (user call); one taking any other target isn't picked."""
     from formula import FormulaEngine
     e = m.entities[uid]
     limit = _window_limit(m, e)
@@ -453,7 +454,12 @@ def _auto_picks(m: Any, ex: Dict[str, Any], uid: str, phase: str,
     for _i, (act, via) in ranked:
         if limit != -1 and len(names) >= limit:
             break
-        if act.target_type != "none":
+        own_target = None
+        if act.target_type == "entity":
+            own_target = ex["eff_actor"]
+            if own_target not in m.entities:
+                continue
+        elif act.target_type != "none":
             continue
         spec = act.reaction
         if spec.auto_when:
@@ -467,7 +473,7 @@ def _auto_picks(m: Any, ex: Dict[str, Any], uid: str, phase: str,
                 continue
             if not ok:
                 continue
-        _pick(m, ex, uid, act, via, phase, auto=True)
+        _pick(m, ex, uid, act, via, phase, target=own_target, auto=True)
         names.append(act.name)
     return names
 

@@ -3920,7 +3920,8 @@ lists what isn't built; 1093-1116).
   transformer passes through; `affected` is loopable in action mode.
 - **Windows:** `open_window` fixes the units (candidates in turn order,
   `__reaction_mode` / `reaction_mode` ask / auto / never; auto picks at
-  once, only reactions with no target of their own); each option line is
+  once: a reaction with no target of its own, or one taking one unit,
+  which gets the incoming action's actor, user call); each option line is
   tagged with its unit (`m.unit_tag`) and names units with say() markers,
   so a team view drops the units it can't see. A unit is done when it
   passes, reaches `__reactions_per_window` / the rule, or has nothing

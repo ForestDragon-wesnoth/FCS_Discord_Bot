@@ -39118,13 +39118,24 @@ SCENARIO 1100 — Auto mode: auto_when reads the forecast; a never unit isn't of
 !action orc hit hero n=2
 ?? Ally reacts with `cheer`
 !assert "entity[ally].cheered == True and entity[hero].hp == 33"
+!ent set_var hero actions.spite.target entity
+!ent set_var hero actions.spite.after "entity[reaction_target].hp = entity[reaction_target].hp - 3"
+!ent set_var hero actions.mark.target location
+!ent set_var hero actions.mark.after "entity[self].marked = True"
+!ent set_var hero __reactions_per_window -1
+!action orc hit hero n=2
+?? Hero reacts with `spite`
+?! mark
+!assert "entity[orc].hp == 27 and not var_has('hero', 'marked')"
 
 Expected: An auto unit picks at once, so no window waits on it: the
 hero's `block` is picked only when its `auto_when` holds against the
 forecast (`incoming.damage > 20`: not at 10, yes at 30, halved to 15).
 The ally (`__reaction_mode never`) isn't offered its `cheer`. Without
 the var, the rule `reaction_mode auto` makes the ally pick `cheer` (no
-auto_when: picked whenever available).
+auto_when: picked whenever available). An auto pick of a reaction
+taking one unit as its own target gets the attacker (`spite` hits the
+orc for 3); one taking a location isn't picked (`mark`).
 
 
 SCENARIO 1101 — An open window holds the turn and moves; restart, skip and undo (#36)

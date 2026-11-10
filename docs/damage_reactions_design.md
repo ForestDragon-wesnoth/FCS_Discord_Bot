@@ -384,8 +384,9 @@ Choices made while building (open to change):
   `action_tags` are the incoming action's; the reaction's own target and
   `k=v` args (typed after its name in `!react`) are `reaction_target` and
   `reaction_args`.
-- Auto mode picks only reactions without a target of their own (an auto
-  pick has no one to name it).
+- Auto mode gives a reaction taking one unit as its own target the
+  incoming action's actor (user call); a reaction taking any other target
+  (a location, a list, a corpse) isn't auto-picked.
 - A rider is offered its seat's reactions; the vehicle isn't offered
   them.
 - A key of `incoming` nobody set reads None, so a body can test
