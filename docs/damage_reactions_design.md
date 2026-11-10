@@ -72,7 +72,9 @@ restrictions) with reaction fields:
   ONE reaction with both halves: picked once, both run.
 - **`after_on`**: when the after half runs: `resolved` (default; the
   action went through), `cancelled` (only when it was cancelled), `any`.
-- **`priority`**: a number, higher runs first (default 0).
+- **`priority`**: a number, higher runs first (default 0). Each half may
+  carry its own (`before_priority`, `after_priority`), which replaces
+  `priority` for that half (user call).
 - **`self_trigger`**: default false: a unit's reactions are never offered
   on its own actions. True allows it; a follow-up combo is a reaction to
   its holder's own attack (`self_trigger: true`, an after half), which
@@ -85,7 +87,9 @@ restrictions) with reaction fields:
 
 1. **Use.** An action is used (`!action`, `use_action`, a rider's
    action). The checks that run today run first (restrictions #234,
-   target tag filters, `target_condition`). Then `prepare` runs.
+   target tag filters, `target_condition`). Then `prepare` runs; a
+   `prepare` that fails refuses the action before any window opens, as a
+   failing body does today (user call).
 2. **Who is eligible.** The engine collects reactions from the index of
    units holding reactions (§9): `reacts_on` narrows target reactions to
    affected units, `reacts_to` filters on the action's tags, then each
@@ -115,12 +119,16 @@ restrictions) with reaction fields:
 8. **Cancelled?** If a reaction cancelled the action, the body doesn't
    run; costs follow §7. Otherwise **the body runs** once, with
    `affected` and each unit's `incoming`, and the action's `cost` runs.
-9. **After.** The after halves of picked two-half reactions run per
-   their `after_on`, and after-only reactions get an AFTER WINDOW of their
-   own: a separate window, asked again, which a host's skip of the before
-   window doesn't close (user call). After windows open only for units the
-   action actually reached, plus bystanders; units summoned during the
-   after window are never targets of the action.
+   A body that calls `fail()` rolls the action back; what happens to the
+   reactions that already ran is §7's "a failing body".
+9. **After.** After-only reactions get an AFTER WINDOW of their own: a
+   separate window, asked again, which a host's skip of the before window
+   doesn't close (user call). Once it closes, every after half runs in one
+   order (§5): the after halves of two-half reactions picked in the before
+   window (each one's `after_on` permitting) together with the after-only
+   picks. After windows open only for units the action actually reached,
+   plus bystanders; units summoned during the after window are never
+   targets of the action.
 
 Several affected units (a list target, an area): one window (step 3),
 one `incoming` copy per affected unit (§4), the body runs once, after
@@ -176,7 +184,13 @@ call); a GM gives dodges a higher `priority` if they should run early.
 `!action info` on a reaction shows "cancels: yes (detected)" and its
 effective priority.
 
-After halves run in the same order.
+**After halves** run in one order once the after window closes (user
+call): each half's effective priority (its `after_priority`, else
+`priority`), plus the rule `reaction_continuation_priority` for the after
+half of a reaction picked in the before window, then the tiebreak. The
+continuation bonus lets a block-then-counter's counter run ahead of
+after-only picks of the same priority; setting the rule to 0 turns it
+off.
 
 ## 6. Re-reading the action at resolution
 
@@ -227,6 +241,13 @@ target"):
 - A full block that zeroes the damage is no cancel: the action went
   through, so retaliation still fires. A GM who wants a full block to
   stop retaliation writes it as a cancel.
+- **A failing body** (`fail()` after reactions ran; user call): by
+  default the reactions' effects stay (costs paid, statuses applied,
+  recorded as used), and only the body's own changes roll back. `fail`
+  takes `refund` among its arguments (`fail(refund)`, `fail('slipped',
+  refund)`) to roll the whole exchange back to before the window: the
+  reactions' effects and costs too, and nothing recorded as used. A
+  failed body pays no `cost`, refund or not.
 
 ## 8. Limits and nesting
 
@@ -315,19 +336,13 @@ that break on damage) and #239 (kill credit) attach.
 
 ## 11. Details found open while writing this file
 
-- **After halves and the after window:** do the after halves of picked
-  two-half reactions run before the after window opens, or in one order
-  with the after-only picks?
-- **The body fails** (`fail()` after reactions ran): do the before
-  reactions' effects (costs paid, statuses applied) stay, as with a half
-  that fails alone, or roll back with the action?
-- **`prepare` fails:** presumably the action is refused before any window
-  opens, as a failing body is today; to confirm.
 - **Redirects:** FCS1 Protect swaps places with the attacked ally and
   takes the hit at half damage. A target that moved stays the target
   (§6 re-checks validity, not identity), so a reaction needs a way to
   replace a unit in the action's targets (and give the new one the old
   one's `incoming` copy).
+- **`reaction_continuation_priority`'s default**, and whether `refund`
+  in `fail` is a bare word bound in action bodies or `refund=True`.
 
 ## 12. Set aside for later (user call)
 
