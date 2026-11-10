@@ -18,12 +18,20 @@ action someone can react to runs in stages, each its own command:
    for the after-only reactions of the units the action reached and the
    bystanders, and once it closes every after half runs in one order.
 
-The open exchange is `Match.reaction_exchange` (JSON, saved, undo state);
-every value in it is storable. The wall clock of the open window is
-runtime (`Match._reaction_opened`).
+Exchanges live on `Match.reaction_stack` (JSON, saved, undo state); the
+top one's window is open. An action a formula starts inside a resolving
+step (a body, a cost, a reaction's half) whose units may react opens an
+automatic react point: the step rolls back, the window of the action it
+started opens on top of the stack, and once that window closes the step
+runs again from its start, the action resolving at that point with the
+picks made (`_run_step`, `_point_use`). An action a formula starts outside
+any action (a passive, a watcher) opens its window at once and the formula
+carries on (use_action returns None), or waits in `Match.reaction_queue`
+while another window is open (`_queue_use`). The wall clock of the open
+window is runtime (`Match._reaction_opened`).
 
-Not built yet (design §8, §3): reacting to a reaction (a reaction's halves
-open no windows), `react_point` mid-body windows, Discord buttons.
+Not built yet (design §13): reacting to a reaction's half itself, a
+`react_point` the GM places, Discord buttons.
 """
 from __future__ import annotations
 
@@ -53,28 +61,39 @@ MODES = ("ask", "auto", "never")
 
 class IncomingProxy:
     """`incoming` / `incoming_of(eid)`: one unit's copy of the incoming
-    action's locals, read through the match's open exchange each time (a
-    reaction half that fails rolls the match back, exchange included).
-    A key nobody set reads None. Writable in before halves and the body;
-    read-only in conditions and after halves."""
+    action's locals in exchange `seq`, read through the match each time (a
+    reaction half that fails rolls the match back, exchange included). A
+    proxy made for a reacting unit (`uid`) finds that unit's copy on every
+    read, so a bystander that redirects the action onto itself reads the
+    copy it took over. A key nobody set reads None. Writable in before
+    halves and the body; read-only in conditions and after halves."""
 
-    __slots__ = ("_m", "_key", "_writable")
+    __slots__ = ("_m", "_seq", "_key", "_uid", "_writable")
 
-    def __init__(self, match: Any, key: str, writable: bool) -> None:
+    def __init__(self, match: Any, seq: int, key: str = "",
+                 writable: bool = False, uid: Optional[str] = None) -> None:
         object.__setattr__(self, "_m", match)
+        object.__setattr__(self, "_seq", seq)
         object.__setattr__(self, "_key", key)
+        object.__setattr__(self, "_uid", uid)
         object.__setattr__(self, "_writable", writable)
 
+    def _exchange(self) -> Dict[str, Any]:
+        ex = _ex(self._m, self._seq)
+        if ex is None:
+            raise AttributeError("that action has finished resolving")
+        return ex
+
     def _copy(self) -> Dict[str, Any]:
-        ex = self._m.reaction_exchange
-        if not isinstance(ex, dict):
-            raise AttributeError("no action is resolving its reactions now")
-        return ex.setdefault("incoming", {}).setdefault(self._key, {})
+        ex = self._exchange()
+        key = self._key if self._uid is None else copy_key(self._m, ex,
+                                                            self._uid)
+        return ex.setdefault("incoming", {}).setdefault(key, {})
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
             raise AttributeError(name)
-        ex = self._m.reaction_exchange or {}
+        ex = self._exchange()
         if name == "cancelled":
             return bool(ex.get("cancelled"))
         if name == "cancelled_by":
@@ -102,7 +121,20 @@ class IncomingProxy:
             raise AttributeError(f"`incoming.{name}`: {ex}")
 
     def __repr__(self) -> str:
-        return f"incoming({self._key or 'action'})"
+        return f"incoming({self._uid or self._key or 'action'})"
+
+
+def _ex(m: Any, seq: Any) -> Optional[Dict[str, Any]]:
+    """Exchange `seq` on the match's reaction stack, or None."""
+    for ex in reversed(m.reaction_stack):
+        if ex.get("seq") == seq:
+            return ex
+    return None
+
+
+def _drop(m: Any, seq: Any) -> None:
+    m.reaction_stack[:] = [x for x in m.reaction_stack
+                           if x.get("seq") != seq]
 
 
 def _storable_locals(src: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -260,8 +292,10 @@ def _ancestors(m: Any, eid: str) -> List[str]:
 
 def copy_key(m: Any, ex: Dict[str, Any], uid: str) -> str:
     """Whose `incoming` copy unit `uid` reads: its own, else the copy of a
-    body part of it the action affects (reactions_cover_parts), else the
-    action's (a bystander)."""
+    body part of it the action affects (reactions_cover_parts), else (a
+    bystander) the copy of the action's one affected unit when it affects
+    exactly one (user call: a bystander halving a single-target attack
+    reaches the body), else the action's shared copy."""
     copies = ex.get("incoming") or {}
     if uid in copies:
         return uid
@@ -269,6 +303,9 @@ def copy_key(m: Any, ex: Dict[str, Any], uid: str) -> str:
         for key in copies:
             if key and uid in _ancestors(m, key):
                 return key
+    affected = [a for a in ex.get("affected") or [] if a in copies]
+    if len(affected) == 1:
+        return affected[0]
     return ""
 
 
@@ -310,7 +347,7 @@ def _eval_ctx(m: Any, ex: Dict[str, Any], uid: str, writable: bool,
         "actor": ex["eff_actor"],
         "target": target_from_json(ttype, jcopy(ex.get("target"))),
         "affected": list(ex.get("affected") or []),
-        "incoming": IncomingProxy(m, copy_key(m, ex, uid), writable),
+        "incoming": IncomingProxy(m, ex["seq"], writable=writable, uid=uid),
         "action_name": ex["name"],
         "action_tags": list(ex.get("tags") or []),
         "args": dict(ex.get("args") or {}),
@@ -386,6 +423,17 @@ def available(m: Any, ex: Dict[str, Any], uid: str, phase: str,
     picked = {p["path"] for p in ex.get("picks") or []
               if p["unit"] == uid and p.get("phase") == phase}
     notes = notes if notes is not None else []
+    stored = ((ex.get("units") or {}).get(uid) or {}).get("options")
+    if ex.get("point") and stored is not None:
+        # A react point's window: the board is back where the paused step
+        # began, so the options it opened with stand; conditions are read
+        # again when the action resolves at that point.
+        out = []
+        for path, via in stored:
+            a = _find_action(m, uid, path, via)
+            if a is not None and a.full_path not in picked:
+                out.append((a, via))
+        return out
     return [(a, via) for a, via in unit_reactions(m, e)
             if a.full_path not in picked
             and _reaction_open(m, ex, uid, a, phase, notes)]
@@ -494,7 +542,8 @@ def open_window(m: Any, ex: Dict[str, Any], phase: str,
         opts = available(m, ex, uid, phase, notes)
         if not opts:
             continue
-        ex["units"][uid] = {"done": False, "picked": 0}
+        ex["units"][uid] = {"done": False, "picked": 0,
+                            "options": [[a.full_path, v] for a, v in opts]}
         ex["unit_order"].append(uid)
         if mode == "auto":
             names = _auto_picks(m, ex, uid, phase, opts, notes)
@@ -551,7 +600,10 @@ def _action_line(m: Any, ex: Dict[str, Any]) -> str:
 def window_text(m: Any, ex: Dict[str, Any]) -> List[str]:
     """`!react`: the open window, its picks and who is still to answer."""
     phase = ex.get("phase", "before")
-    lines = [f"⏳ Reactions to {_action_line(m, ex)} ("
+    pt = ex.get("point")
+    by = (f" (started by `{pt['by']}`)" if isinstance(pt, dict)
+          and pt.get("by") else "")
+    lines = [f"⏳ Reactions to {_action_line(m, ex)}{by} ("
              f"{'before' if phase == 'before' else 'after'} it resolves):"]
     for p in ex.get("picks") or []:
         if p.get("phase") != phase:
@@ -617,33 +669,34 @@ def _incoming_action(m: Any, ex: Dict[str, Any]):
     return act
 
 
-def _bindings(m: Any, ex: Dict[str, Any], writable: bool,
-              allow_redirect: bool, notes: List[str]) -> Dict[str, Any]:
-    """incoming_of() and redirect() for a half or the body."""
+def _bindings(m: Any, seq: int, writable: bool,
+              allow_redirect: bool) -> Dict[str, Any]:
+    """incoming_of() and redirect() for a half or the body of exchange
+    `seq`."""
     from action import ActionFail
 
     def incoming_of(eid: Any) -> IncomingProxy:
         if not isinstance(eid, str):
             raise ActionFail(f"incoming_of() takes a unit id, got {eid!r}.",
                              reason="usage")
-        cur = m.reaction_exchange or {}
+        cur = _ex(m, seq) or {}
         if eid not in (cur.get("incoming") or {}):
             raise ActionFail(f"incoming_of(): `{eid}` isn't affected by "
-                             f"`{ex['name']}`.", reason="usage")
-        return IncomingProxy(m, eid, writable)
+                             f"`{cur.get('name', '?')}`.", reason="usage")
+        return IncomingProxy(m, seq, eid, writable)
 
     def redirect(old: Any, new: Any) -> bool:
         if not allow_redirect:
             raise ActionFail("redirect() works only in a before half.",
                              reason="usage")
-        return _redirect(m, old, new)
+        return _redirect(m, seq, old, new)
 
     return {"incoming_of": incoming_of, "redirect": redirect}
 
 
-def _redirect(m: Any, old: Any, new: Any) -> bool:
+def _redirect(m: Any, seq: int, old: Any, new: Any) -> bool:
     from action import ActionFail
-    ex = m.reaction_exchange
+    ex = _ex(m, seq)
     ttype = ex["target_type"]
     if ttype not in ("entity", "entity_list"):
         raise ActionFail(f"redirect(): `{ex['name']}` doesn't target units "
@@ -682,73 +735,6 @@ def _record_use(m: Any, ex: Dict[str, Any], pick: Dict[str, Any],
     })
     if len(m.reaction_log) > REACTION_LOG_MAX:
         del m.reaction_log[:len(m.reaction_log) - REACTION_LOG_MAX]
-
-
-async def _run_half(ctx: Any, mgr: Any, m: Any, ex: Dict[str, Any],
-                    pick: Dict[str, Any], half: str, pays: bool,
-                    out: List[str]) -> Optional[Any]:
-    """Run one half of a picked reaction. Returns the match (re-fetched
-    by the caller) or None. `out` gets the lines."""
-    from action import run_action, ArgsProxy, ActionEngineFault
-    uid = pick["unit"]
-    act = _find_action(m, uid, pick["path"], pick.get("via"))
-    if act is None or uid not in m.entities or \
-            not m.entities[uid].is_alive:
-        out.append(m.unit_tag(uid) + f"- {_name(m, uid)}'s `{pick['name']}` "
-                   f"doesn't run: the reaction or its unit is gone.")
-        return None
-    spec = act.reaction
-    src = spec.before if half == "before" else spec.after
-    if not src:
-        return None
-    eff, mextra, act = mount_routing(m, uid, act, pick.get("via"))
-    first = not pick.get("ran")
-    half_act = dataclasses.replace(
-        act, body=src, prepare="", cost=act.cost if pays else "",
-        say_format=act.say_format if first else "")
-    own_target = target_from_json(act.target_type, jcopy(pick.get("target")))
-    writable = half == "before"
-    key = copy_key(m, ex, uid)
-    extra_ctx = {
-        "actor": ex["eff_actor"],
-        "affected": list(ex.get("affected") or []),
-        "incoming": IncomingProxy(m, key, writable),
-        "action_name": ex["name"],
-        "action_tags": list(ex.get("tags") or []),
-    }
-    if mextra:
-        extra_ctx.update(mextra)
-    extra_bindings = _bindings(m, ex, writable, half == "before", out)
-    extra_bindings.update({
-        "target": target_from_json(ex["target_type"],
-                                   jcopy(ex.get("target"))),
-        "args": ArgsProxy(dict(ex.get("args") or {})),
-        "reaction_target": own_target,
-        "reaction_args": ArgsProxy(dict(pick.get("args") or {})),
-    })
-    out.append(m.unit_tag(uid) + (
-        f"↪ {_name(m, uid)} reacts: `{pick['name']}`." if first else
-        f"↪ {_name(m, uid)}'s `{pick['name']}` follows up."))
-    steps = ("cost", "body") if pays else ("body",)
-    try:
-        with _Runtime(m, ctx, mgr):
-            ok, why = await run_action(
-                half_act, actor_id=eff, target=own_target,
-                args=dict(pick.get("args") or {}), match=m, mgr=mgr,
-                ctx=ctx, answers=list(pick.get("answers") or []),
-                extra_ctx=extra_ctx, steps=steps, finish=first,
-                extra_bindings=extra_bindings)
-    except ActionEngineFault as ef:
-        out.append(m.unit_tag(uid) + f"❌ {_name(m, uid)}'s "
-                   f"`{pick['name']}`: {ef.message}")
-        return None
-    if not ok:
-        reason, message = why if isinstance(why, tuple) else ("", why)
-        tag = f"[{reason}] " if reason else ""
-        out.append(m.unit_tag(uid) + f"❌ {_name(m, uid)}'s "
-                   f"`{pick['name']}` failed: {tag}{message}")
-        return None
-    return act
 
 
 def _check_cancel(m: Any, ex: Dict[str, Any], pick: Dict[str, Any]) -> None:
@@ -895,200 +881,499 @@ def _ordered(m: Any, ex: Dict[str, Any], picks: List[Dict[str, Any]],
 
 
 # ----------------------------------------------------------------------
-# Begin, resolve, close
+# The engine: a resumable walk through one exchange
 # ----------------------------------------------------------------------
 
 def has_holders(m: Any) -> bool:
     return bool(m._uflags.holders_of(m, UnitFlags.REACTIONS))
 
 
-async def begin(ctx: Any, mgr: Any, m: Any, action: Any, *,
-                actor_id: str, eff_actor_id: str, target: Any,
-                args: Dict[str, Any], answers: List[Any],
-                extra_ctx: Optional[Dict[str, Any]],
-                via: Optional[str], rider_mode: bool) -> None:
-    """A typed action that may open a reaction window (design §3)."""
-    from action import run_action, ActionEngineFault
-    pout: Dict[str, Any] = {}
-    tout: Dict[str, Any] = {}
-    with _Runtime(m, ctx, mgr):
-        try:
-            ok, why = await run_action(
-                action, actor_id=eff_actor_id, target=target, args=args,
-                match=m, mgr=mgr, ctx=ctx, answers=answers,
-                extra_ctx=extra_ctx, steps=("prepare",), finish=False,
-                prepare_out=pout, target_out=tout)
-        except ActionEngineFault as ef:
-            return await ctx.send(f"❌ action `{action.name}`: {ef.message}")
-    if not ok:
-        reason, message = why
-        tag = f"[{reason}] " if reason else ""
-        return await ctx.send(f"❌ action `{action.name}`: {tag}{message}")
-    target = tout.get("target", target)
-    used = int(tout.get("answers_used", 0))
-    bad = [k for k in pout if k in CONTROL_KEYS]
-    if bad:
-        return await ctx.send(
-            f"❌ action `{action.name}`: its `prepare` can't use `{bad[0]}` "
-            f"as a local: it is a key of `incoming` the reactions set.")
-    base, dropped = _storable_locals(pout)
-    notes: List[str] = []
-    if dropped:
-        notes.append(f"⚠️ `{action.name}`'s `prepare` holds "
-                     + ", ".join(f"`{d}`" for d in dropped)
-                     + ", which the reaction window can't keep (not a "
-                       "value a var could store): the body won't see "
-                       + ("it." if len(dropped) == 1 else "them."))
+class _Env:
+    """One drive of the engine. `inline`: resolving an action at a react
+    point inside a step (no windows of its own: one that must open raises
+    ReactPointNeeded; `rec` holds the picks its windows got)."""
+
+    def __init__(self, ctx: Any, mgr: Any, m: Any, inline: bool = False,
+                 rec: Optional[Dict[str, Any]] = None) -> None:
+        self.ctx, self.mgr, self._m, self.mid = ctx, mgr, m, m.id
+        self.inline = inline
+        self.rec = rec or {}
+        self.out: List[str] = []
+        self.window: List[str] = []
+        self.start: Dict[int, Tuple[Dict[str, Any], Any]] = {}
+        self.finished: Dict[int, str] = {}
+
+    @property
+    def m(self) -> Any:
+        if self.mgr is not None:
+            return self.mgr.matches.get(self.mid, self._m)
+        return self._m
+
+    async def flush(self) -> None:
+        if not self.out:
+            return
+        lines, self.out = self.out, []
+        if self.inline:
+            self.m.surface_log(lines)
+        else:
+            await self.ctx.send("\n".join(lines))
+
+    def runtime(self):
+        return _NoRuntime() if self.inline else _Runtime(self.m, self.ctx,
+                                                         self.mgr)
+
+
+class _NoRuntime:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return None
+
+
+async def _run_step(env: _Env, seq: int, key: str, run,
+                    by: str = "") -> Tuple[str, Any]:
+    """Run one step of exchange `seq` (a half, the body, a cost) through
+    `run`. In a top drive the step can pause: an action its formulas start
+    raises ReactPointNeeded, the match goes back to the step's start, the
+    window of that action opens on top of the stack and the exchange
+    records where it paused; resumed, the step runs again from its start
+    with the RNG where it began and the picks each closed window got
+    (`records`, by the use_action count). ("suspended", None) or ("ok",
+    run's value)."""
+    if env.inline:
+        return "ok", await run()
+    from action import ReactPointNeeded, REACT_STEP, _rollback_match
+    m = env.m
+    ex = _ex(m, seq)
+    sus = ex.get("suspended") if isinstance(ex.get("suspended"), dict) \
+        and ex["suspended"].get("key") == key else None
+    records = jcopy(sus.get("records") or {}) if sus else {}
+    pos_live = m.rng_position()
+    rng0 = int(sus["rng"]) if sus else pos_live
+    if sus:
+        m.set_rng(pos=rng0)
+    pre = m.to_dict(include_history=False)
+    mark = m.history.mark()
+    step = {"seq": seq, "key": key, "records": records, "counter": [0],
+            "by": by or ex.get("name", "")}
+    token = REACT_STEP.set(step)
     try:
-        affected = _affects(m, action, eff_actor_id, target, args)
-    except VTTError as err:
-        return await ctx.send(f"❌ action `{action.name}`: {err}")
-    m.reaction_seq += 1
-    ex: Dict[str, Any] = {
-        "seq": m.reaction_seq, "phase": "before",
-        "actor": actor_id, "eff_actor": eff_actor_id,
-        "holder_unit": actor_id, "path": action.full_path, "via": via,
-        "rider_mode": rider_mode, "mount": jcopy(extra_ctx),
-        "name": action.name, "tags": list(action.tags),
-        "target_type": action.target_type,
-        "target": target_to_json(action.target_type, target),
-        "args": _own_value(dict(args)), "answers": list(answers[used:]),
-        "affected": list(affected), "first_affected": list(affected),
-        "dropped": [], "incoming": {"": base},
-        "picks": [], "pick_seq": 0, "channel": str(getattr(
-            ctx, "channel_key", "")),
+        value = await run()
+    except ReactPointNeeded as rp:
+        REACT_STEP.reset(token)
+        token = None
+        m = env.m
+        _rollback_match(m, env.mgr, pre)
+        m.history.rewind(mark)
+        m = env.m
+        child = rp.exchange
+        m.reaction_seq = max(m.reaction_seq, int(child.get("seq", 0)))
+        ex = _ex(m, seq)
+        ex["suspended"] = {"key": key, "rng": rng0, "records": records,
+                           "child": child.get("seq")}
+        m.reaction_stack.append(child)
+        if m.rng_position() < pos_live:
+            m.set_rng(pos=pos_live)
+        env.window = list(rp.lines)
+        return "suspended", None
+    finally:
+        if token is not None:
+            REACT_STEP.reset(token)
+    m = env.m
+    ex = _ex(m, seq)
+    if ex is not None and isinstance(ex.get("suspended"), dict) \
+            and ex["suspended"].get("key") == key:
+        del ex["suspended"]
+    if m.rng_position() < pos_live:
+        m.set_rng(pos=pos_live)
+    return "ok", value
+
+
+async def _half(env: _Env, seq: int, n: int, half: str, pays: bool) -> str:
+    """Run one half of pick `n`: "ok", "fail", "gone" or "suspended"."""
+    from action import (run_action, ArgsProxy, ActionEngineFault,
+                        REACT_ORIGIN)
+    m = env.m
+    ex = _ex(m, seq)
+    pick = next(p for p in ex["picks"] if p["n"] == n)
+    uid = pick["unit"]
+    act = _find_action(m, uid, pick["path"], pick.get("via"))
+    if act is None or uid not in m.entities or \
+            not m.entities[uid].is_alive:
+        env.out.append(m.unit_tag(uid) + f"- {_name(m, uid)}'s "
+                       f"`{pick['name']}` doesn't run: the reaction or its "
+                       f"unit is gone.")
+        return "gone"
+    spec = act.reaction
+    src = spec.before if half == "before" else spec.after
+    if not src:
+        return "gone"
+    eff, mextra, act = mount_routing(m, uid, act, pick.get("via"))
+    first = not pick.get("ran")
+    half_act = dataclasses.replace(
+        act, body=src, prepare="", cost=act.cost if pays else "",
+        say_format=act.say_format if first else "")
+    own_target = target_from_json(act.target_type, jcopy(pick.get("target")))
+    writable = half == "before"
+    extra_ctx = {
+        "actor": ex["eff_actor"],
+        "affected": list(ex.get("affected") or []),
+        "incoming": IncomingProxy(m, seq, writable=writable, uid=uid),
+        "action_name": ex["name"],
+        "action_tags": list(ex.get("tags") or []),
     }
-    for u in affected:
-        ex["incoming"][u] = jcopy(base)
-    m.reaction_exchange = ex
-    lines = open_window(m, ex, "before", notes)
+    if mextra:
+        extra_ctx.update(mextra)
+    extra_bindings = _bindings(m, seq, writable, half == "before")
+    extra_bindings.update({
+        "target": target_from_json(ex["target_type"],
+                                   jcopy(ex.get("target"))),
+        "args": ArgsProxy(dict(ex.get("args") or {})),
+        "reaction_target": own_target,
+        "reaction_args": ArgsProxy(dict(pick.get("args") or {})),
+    })
+    sus = ex.get("suspended")
+    if not (isinstance(sus, dict) and sus.get("key") == f"half:{n}:{half}"):
+        # (A half running again after a react point said this already.)
+        env.out.append(m.unit_tag(uid) + (
+            f"↪ {_name(m, uid)} reacts: `{pick['name']}`." if first else
+            f"↪ {_name(m, uid)}'s `{pick['name']}` follows up."))
+    await env.flush()
+    steps = ("cost", "body") if pays else ("body",)
+    # The actions this half starts sit one reaction deeper (#36 §8).
+    origin = (int(ex.get("depth", 0)) + 1, bool(spec.reactable))
+
+    async def run():
+        otoken = REACT_ORIGIN.set(origin)
+        try:
+            with env.runtime():
+                return await run_action(
+                    half_act, actor_id=eff, target=own_target,
+                    args=dict(pick.get("args") or {}), match=env.m,
+                    mgr=env.mgr, ctx=env.ctx,
+                    answers=list(pick.get("answers") or []),
+                    extra_ctx=extra_ctx, steps=steps, finish=first,
+                    extra_bindings=extra_bindings)
+        except ActionEngineFault as ef:
+            return False, ("", ef.message)
+        finally:
+            REACT_ORIGIN.reset(otoken)
+    st, res = await _run_step(env, seq, f"half:{n}:{half}", run,
+                              by=pick["name"])
+    if st == "suspended":
+        return "suspended"
+    ok, why = res
+    m = env.m
+    if not ok:
+        reason, message = why if isinstance(why, tuple) else ("", why)
+        tag = f"[{reason}] " if reason else ""
+        env.out.append(m.unit_tag(uid) + f"❌ {_name(m, uid)}'s "
+                       f"`{pick['name']}` failed: {tag}{message}")
+        return "fail"
+    ex = _ex(m, seq)
+    cur = next(p for p in ex["picks"] if p["n"] == n)
+    if not cur.get("ran"):
+        cur["ran"] = True
+        _record_use(m, ex, cur, act)
+    return "ok"
+
+
+def _head(m: Any, ex: Dict[str, Any]) -> str:
+    """The first line of an open window."""
+    by = ""
+    pt = ex.get("point")
+    if isinstance(pt, dict) and pt.get("by"):
+        by = f" (started by `{pt['by']}`)"
+    if ex.get("phase") == "after":
+        how = {"resolved": "has resolved", "cancelled": "was cancelled"}.get(
+            ex.get("ended", ""), "failed")
+        return (f"⏳ {_action_line(m, ex)}{by} {how}: reactions to it are "
+                f"offered.")
+    return (f"⏳ {_action_line(m, ex)}{by}: reactions are offered before it "
+            f"resolves.")
+
+
+_FOOT = "A host closes the window with `!react skip`."
+
+
+def _apply_recorded(ex: Dict[str, Any], picks: List[Dict[str, Any]],
+                    phase: str) -> None:
+    """A react point's window already closed: its picks, as made."""
+    keep = [p for p in ex.get("picks") or [] if p.get("phase") != phase]
+    seq_n = max([p["n"] for p in keep] + [0])
+    for p in picks:
+        seq_n += 1
+        q = {k: jcopy(v) for k, v in p.items()
+             if k not in ("ran", "refunded", "skipped", "failed")}
+        q["n"] = seq_n
+        keep.append(q)
+    ex["picks"] = keep
+    ex["pick_seq"] = seq_n
+    ex["units"], ex["unit_order"] = {}, []
+
+
+def _open(env: _Env, seq: int, phase: str) -> bool:
+    """Open exchange `seq`'s `phase` window (or take a react point's
+    recorded picks). True when units are left to answer; in an inline drive
+    that raises ReactPointNeeded instead."""
+    from action import ReactPointNeeded
+    m = env.m
+    ex = _ex(m, seq)
+    if env.inline and env.rec.get(phase) is not None:
+        _apply_recorded(ex, env.rec[phase], phase)
+        ex["phase"] = phase
+        return False
+    notes: List[str] = []
+    lines = open_window(m, ex, phase, notes)
     _refresh_done(m, ex)
     if not waiting(ex):
-        if notes or lines:
-            await ctx.send("\n".join(notes + lines))
-        return await resolve(ctx, mgr, m)
-    m._reaction_opened = time.time()
-    head = (f"⏳ {_action_line(m, ex)}: reactions are offered before it "
-            f"resolves.")
-    await ctx.send("\n".join(notes + [head] + lines + [
-        "A host closes the window with `!react skip`."]))
+        env.out += notes + lines
+        return False
+    window = notes + [_head(m, ex)] + lines + [_FOOT]
+    if env.inline:
+        raise ReactPointNeeded(jcopy(ex), window)
+    env.window = window
+    return True
 
 
-async def resolve(ctx: Any, mgr: Any, m: Any) -> None:
-    """The open window closed: run what it decided (design §3 steps 6-9)."""
-    ex = m.reaction_exchange
-    if ex is None:
-        return
-    m._reaction_opened = None
-    if ex.get("phase") == "after":
-        return await _finish_after(ctx, mgr, m)
-    out: List[str] = []
-    act = _incoming_action(m, ex)
-    if act is None or ex["eff_actor"] not in m.entities:
-        m.reaction_exchange = None
-        return await ctx.send(f"⚠️ {_name(m, ex['actor'])}'s `{ex['name']}` "
-                              f"doesn't resolve: the action or its unit is "
-                              f"gone. Nothing runs.")
-    start = m.to_dict(include_history=False)
-    hist_mark = m.history.mark()
-    befores = [p for p in ex.get("picks") or [] if p.get("phase") == "before"]
-    for pick in _ordered(m, ex, befores, "before"):
-        m = mgr.matches.get(m.id, m)
-        ex = m.reaction_exchange
-        cur = next((p for p in ex["picks"] if p["n"] == pick["n"]), None)
-        if cur is None:
-            continue
-        r_act = _find_action(m, cur["unit"], cur["path"], cur.get("via"))
-        if r_act is None or not m.entities[cur["unit"]].is_alive:
-            cur["skipped"] = True
-            out.append(m.unit_tag(cur["unit"]) + f"- {_name(m, cur['unit'])}"
-                       f"'s `{cur['name']}` doesn't run: the reaction or "
-                       f"its unit is gone.")
-            continue
-        if ex.get("cancelled"):
-            mode = r_act.reaction.on_cancel or str(
-                m.rules.get("reaction_on_cancel", "refund"))
-            if mode == "refund":
-                cur["refunded"] = True
-                out.append(m.unit_tag(cur["unit"]) + f"↩ {_name(m, cur['unit'])}"
-                           f"'s `{cur['name']}` is refunded: the action was "
-                           f"cancelled.")
+async def _advance(env: _Env, seq: int) -> str:
+    """Take exchange `seq` as far as it goes: "window" (a window of its own
+    or of an action one of its steps started is open) or "done"."""
+    m = env.m
+    ex = _ex(m, seq)
+    if ex["phase"] == "before":
+        if waiting(ex):
+            return "window"
+        ex["phase"] = "before_run"
+    if ex["phase"] == "before_run":
+        m = env.m
+        ex = _ex(m, seq)
+        if seq not in env.start:
+            env.start[seq] = (m.to_dict(include_history=False),
+                              m.history.mark())
+        if _incoming_action(m, ex) is None or ex["eff_actor"] not in \
+                m.entities:
+            ex["outcome"], ex["phase"], ex["gone"] = "cancelled", "done", True
+            env.out.append(f"⚠️ {_name(m, ex['actor'])}'s `{ex['name']}` "
+                           f"doesn't resolve: the action or its unit is "
+                           f"gone. Nothing runs.")
+            env.finished[seq] = "cancelled"
+            return "done"
+        befores = [p for p in ex.get("picks") or []
+                   if p.get("phase") == "before"]
+        for pick in _ordered(m, ex, befores, "before"):
+            m = env.m
+            ex = _ex(m, seq)
+            cur = next((p for p in ex["picks"] if p["n"] == pick["n"]), None)
+            if cur is None or any(cur.get(k) for k in
+                                  ("ran", "refunded", "skipped", "failed")):
                 continue
-        notes: List[str] = []
-        if not _reaction_open(m, ex, cur["unit"], r_act, "before", notes):
-            out += notes
-            cur["skipped"] = True
-            out.append(m.unit_tag(cur["unit"]) + f"- {_name(m, cur['unit'])}"
-                       f"'s `{cur['name']}` is no longer available; it "
-                       f"doesn't run.")
-            continue
-        await _flush(ctx, out)
-        ran = await _run_half(ctx, mgr, m, ex, cur, "before", True, out)
-        m = mgr.matches.get(m.id, m)
-        ex = m.reaction_exchange
-        cur = next((p for p in ex["picks"] if p["n"] == pick["n"]), cur)
-        if ran is not None:
-            cur["ran"] = True
-            _record_use(m, ex, cur, ran)
-            _check_cancel(m, ex, cur)
-    m = mgr.matches.get(m.id, m)
-    ex = m.reaction_exchange
+            r_act = _find_action(m, cur["unit"], cur["path"], cur.get("via"))
+            if r_act is None or cur["unit"] not in m.entities or \
+                    not m.entities[cur["unit"]].is_alive:
+                cur["skipped"] = True
+                env.out.append(m.unit_tag(cur["unit"]) + f"- "
+                               f"{_name(m, cur['unit'])}'s `{cur['name']}` "
+                               f"doesn't run: the reaction or its unit is "
+                               f"gone.")
+                continue
+            if ex.get("cancelled"):
+                mode = r_act.reaction.on_cancel or str(
+                    m.rules.get("reaction_on_cancel", "refund"))
+                if mode == "refund":
+                    cur["refunded"] = True
+                    env.out.append(m.unit_tag(cur["unit"]) + f"↩ "
+                                   f"{_name(m, cur['unit'])}'s "
+                                   f"`{cur['name']}` is refunded: the "
+                                   f"action was cancelled.")
+                    continue
+            notes: List[str] = []
+            if not _reaction_open(m, ex, cur["unit"], r_act, "before", notes):
+                env.out += notes
+                cur["skipped"] = True
+                env.out.append(m.unit_tag(cur["unit"]) + f"- "
+                               f"{_name(m, cur['unit'])}'s `{cur['name']}` "
+                               f"is no longer available; it doesn't run.")
+                continue
+            r = await _half(env, seq, cur["n"], "before", True)
+            if r == "suspended":
+                return "window"
+            m = env.m
+            ex = _ex(m, seq)
+            cur = next(p for p in ex["picks"] if p["n"] == pick["n"])
+            if r == "ok":
+                _check_cancel(m, ex, cur)
+            else:
+                cur["failed"] = True
+        ex = _ex(env.m, seq)
+        ex["phase"] = "body"
+    if ex["phase"] == "body":
+        r = await _body_phase(env, seq)
+        if r == "suspended":
+            return "window"
+        ex = _ex(env.m, seq)
+        ex["phase"] = "after_open"
+    if ex["phase"] == "after_open":
+        ex = _ex(env.m, seq)
+        if ex.get("refunded") or ex.get("gone"):
+            ex["units"], ex["unit_order"] = {}, []
+            ex["phase"] = "after"
+        elif _open(env, seq, "after"):
+            await env.flush()
+            return "window"
+        ex = _ex(env.m, seq)
+        ex["phase"] = "after"
+    if ex["phase"] == "after":
+        if waiting(ex):
+            return "window"
+        ex["phase"] = "after_run"
+    if ex["phase"] == "after_run":
+        r = await _after_run(env, seq)
+        if r == "suspended":
+            return "window"
+        ex = _ex(env.m, seq)
+        ex["phase"] = "done"
+    ex = _ex(env.m, seq)
+    env.finished[seq] = ex.get("outcome", "cancelled")
+    await env.flush()
+    return "done"
+
+
+async def _body_phase(env: _Env, seq: int) -> str:
+    """The action itself after its before halves: cancelled, or re-read
+    and its cost and body run. "ok" or "suspended"."""
+    from action import (run_action, ActionEngineFault, _rollback_match,
+                        REACT_ORIGIN)
+    m = env.m
+    ex = _ex(m, seq)
     act = _incoming_action(m, ex)
     if act is None or ex["eff_actor"] not in m.entities:
-        ex["outcome"] = "cancelled"
-        out.append(f"⚠️ {_name(m, ex['actor'])}'s `{ex['name']}` doesn't "
-                   f"resolve: the action or its unit is gone.")
-        await _flush(ctx, out)
-        return await _open_after(ctx, mgr, m)
-    extra = ex.get("mount") or None
+        ex["outcome"] = ex["ended"] = "cancelled"
+        env.out.append(f"⚠️ {_name(m, ex['actor'])}'s `{ex['name']}` doesn't "
+                       f"resolve: the action or its unit is gone.")
+        return "ok"
+    origin = (int(ex.get("depth", 0)), True)
     if ex.get("cancelled"):
-        await _cancelled(ctx, mgr, m, act, out)
-        m = mgr.matches.get(m.id, m)
-        return await _open_after(ctx, mgr, m)
-    _reread(m, ex, act, extra, out)
-    await _flush(ctx, out)
-    await _run_body(ctx, mgr, m, act, start, hist_mark, out)
-    m = mgr.matches.get(m.id, m)
-    await _flush(ctx, out)
-    await _open_after(ctx, mgr, m)
+        return await _cancelled(env, seq, act, origin)
+    if not ex.get("reread"):
+        _reread(m, ex, act, ex.get("mount") or None, env.out)
+        ex["reread"] = True
+    await env.flush()
+    affected = list(ex.get("affected") or [])
+    copies = ex.get("incoming") or {}
+    key = affected[0] if len(affected) == 1 else ""
+    preset = _plain(copies.get(key, copies.get("", {})))
+    extra_ctx = dict(ex.get("mount") or {})
+    extra_ctx.update({"affected": affected,
+                      "incoming": IncomingProxy(m, seq, key, True)})
+    bindings = _bindings(m, seq, True, False)
+    bout: Dict[str, Any] = {}
+    fout: Dict[str, Any] = {}
+    target = target_from_json(ex["target_type"], jcopy(ex.get("target")))
+    args = dict(ex.get("args") or {})
+    answers = list(ex.get("answers") or [])
+
+    async def run():
+        otoken = REACT_ORIGIN.set(origin)
+        try:
+            with env.runtime():
+                return await run_action(
+                    act, actor_id=ex["eff_actor"], target=target, args=args,
+                    match=env.m, mgr=env.mgr, ctx=env.ctx, answers=answers,
+                    extra_ctx=extra_ctx, steps=("cost", "body"),
+                    preset_locals=preset, skip_checks=True,
+                    extra_bindings=bindings, body_out=bout, fail_out=fout)
+        except ActionEngineFault as ef:
+            return False, ("", ef.message)
+        finally:
+            REACT_ORIGIN.reset(otoken)
+    st, res = await _run_step(env, seq, "body", run)
+    if st == "suspended":
+        return "suspended"
+    ok, why = res
+    m = env.m
+    ex = _ex(m, seq)
+    if not ok:
+        reason, message = why if isinstance(why, tuple) else ("", why)
+        tag = f"[{reason}] " if reason else ""
+        if fout.get("refund") and seq in env.start:
+            # fail(refund): the whole exchange goes back to before its
+            # reactions ran; nothing is recorded as used.
+            start, mark = env.start[seq]
+            keep_ex = jcopy(ex)
+            _rollback_match(m, env.mgr, start)
+            m.history.rewind(mark)
+            m = env.m
+            for i, x in enumerate(m.reaction_stack):
+                if x.get("seq") == seq:
+                    m.reaction_stack[i] = keep_ex
+            ex = keep_ex
+            for p in ex.get("picks") or []:
+                p["refunded"] = True
+            ex["refunded"] = True
+            env.out.append(f"❌ action `{act.name}`: {tag}{message} "
+                           f"(refunded: the reactions are undone too)")
+        else:
+            note = (" (the reactions stay: the exchange paused for another "
+                    "window since they ran)" if fout.get("refund") else "")
+            env.out.append(f"❌ action `{act.name}`: {tag}{message}{note}")
+        ex["outcome"], ex["ended"] = "cancelled", "failed"
+        return "ok"
+    ex["outcome"] = ex["ended"] = "resolved"
+    body_vals, _dropped = _storable_locals(bout)
+    for k in list(ex.get("incoming") or {}):
+        c = ex["incoming"][k]
+        for name, v in body_vals.items():
+            if name not in CONTROL_KEYS:
+                c[name] = jcopy(v)
+    env.out.append(f"`{ex['actor']}` used action `{act.name}`.")
+    return "ok"
 
 
-async def _flush(ctx: Any, out: List[str]) -> None:
-    if out:
-        await ctx.send("\n".join(out))
-        out.clear()
-
-
-async def _cancelled(ctx: Any, mgr: Any, m: Any, act: Any,
-                     out: List[str]) -> None:
-    from action import run_action, ActionEngineFault
-    ex = m.reaction_exchange
-    ex["outcome"] = ex["ended"] = "cancelled"
+async def _cancelled(env: _Env, seq: int, act: Any,
+                     origin: Tuple[int, bool]) -> str:
+    from action import run_action, ActionEngineFault, REACT_ORIGIN
+    m = env.m
+    ex = _ex(m, seq)
     by = ex.get("cancelled_by") or ["", ""]
-    who = f"{_name(m, by[0])}'s `{by[1]}`" if by[0] else "a reaction"
-    out.append(f"🚫 {_name(m, ex['actor'])}'s `{ex['name']}` is cancelled "
-               f"by {who}.")
+    if not ex.get("cancel_noted"):
+        who = f"{_name(m, by[0])}'s `{by[1]}`" if by[0] else "a reaction"
+        env.out.append(f"🚫 {_name(m, ex['actor'])}'s `{ex['name']}` is "
+                       f"cancelled by {who}.")
+        ex["cancel_noted"] = True
     pay = act.cancelled_action_cost or str(
         m.rules.get("cancelled_action_cost", "refund"))
     if pay == "pay" and act.cost:
-        await _flush(ctx, out)
-        try:
-            with _Runtime(m, ctx, mgr):
-                ok, why = await run_action(
-                    act, actor_id=ex["eff_actor"],
-                    target=target_from_json(ex["target_type"],
-                                            jcopy(ex.get("target"))),
-                    args=dict(ex.get("args") or {}), match=m, mgr=mgr,
-                    ctx=ctx, extra_ctx=ex.get("mount") or None,
-                    steps=("cost",), finish=False, skip_checks=True,
-                    preset_locals=_plain((ex.get("incoming") or {}).get(
-                        "", {})))
-            m = mgr.matches.get(m.id, m)
-            if not ok:
-                reason, message = why
-                out.append(f"⚠️ `{ex['name']}`'s cost failed: {message}")
-        except ActionEngineFault as ef:
-            out.append(f"⚠️ `{ex['name']}`'s cost: {ef.message}")
+        await env.flush()
+        target = target_from_json(ex["target_type"], jcopy(ex.get("target")))
+        preset = _plain((ex.get("incoming") or {}).get("", {}))
+
+        async def run():
+            otoken = REACT_ORIGIN.set(origin)
+            try:
+                with env.runtime():
+                    return await run_action(
+                        act, actor_id=ex["eff_actor"], target=target,
+                        args=dict(ex.get("args") or {}), match=env.m,
+                        mgr=env.mgr, ctx=env.ctx,
+                        extra_ctx=ex.get("mount") or None, steps=("cost",),
+                        finish=False, skip_checks=True,
+                        preset_locals=preset)
+            except ActionEngineFault as ef:
+                return False, ("", ef.message)
+            finally:
+                REACT_ORIGIN.reset(otoken)
+        st, res = await _run_step(env, seq, "cost", run)
+        if st == "suspended":
+            return "suspended"
+        ok, why = res
+        if not ok:
+            env.out.append(f"⚠️ `{ex['name']}`'s cost failed: "
+                           f"{why[1] if isinstance(why, tuple) else why}")
+    m = env.m
+    ex = _ex(m, seq)
+    ex["outcome"] = ex["ended"] = "cancelled"
     m.fire_action_failed(
         action_tags=act.tags, actor_id=ex["eff_actor"],
         action_name=act.name, action_path=act.full_path,
@@ -1100,107 +1385,20 @@ async def _cancelled(ctx: Any, mgr: Any, m: Any, act: Any,
                 action=act.name, action_path=act.full_path,
                 target=str(ex.get("target")), reason="cancelled",
                 message=f"cancelled by {by[0]}")
-    await _flush(ctx, out)
+    return "ok"
 
 
-async def _run_body(ctx: Any, mgr: Any, m: Any, act: Any,
-                    start: Dict[str, Any], hist_mark: Any,
-                    out: List[str]) -> None:
-    from action import run_action, ActionEngineFault, _rollback_match
-    ex = m.reaction_exchange
-    affected = list(ex.get("affected") or [])
-    copies = ex.get("incoming") or {}
-    key = affected[0] if len(affected) == 1 else ""
-    preset = _plain(copies.get(key, copies.get("", {})))
-    extra_ctx = dict(ex.get("mount") or {})
-    extra_ctx.update({"affected": affected,
-                      "incoming": IncomingProxy(m, key, True)})
-    bindings = _bindings(m, ex, True, False, out)
-    bout: Dict[str, Any] = {}
-    fout: Dict[str, Any] = {}
-    target = target_from_json(ex["target_type"], jcopy(ex.get("target")))
-    try:
-        with _Runtime(m, ctx, mgr):
-            ok, why = await run_action(
-                act, actor_id=ex["eff_actor"], target=target,
-                args=dict(ex.get("args") or {}), match=m, mgr=mgr, ctx=ctx,
-                answers=list(ex.get("answers") or []), extra_ctx=extra_ctx,
-                steps=("cost", "body"), preset_locals=preset,
-                skip_checks=True, extra_bindings=bindings, body_out=bout,
-                fail_out=fout)
-    except ActionEngineFault as ef:
-        ok, why = False, ("", ef.message)
-    m = mgr.matches.get(m.id, m)
-    ex = m.reaction_exchange
-    if not ok:
-        reason, message = why if isinstance(why, tuple) else ("", why)
-        tag = f"[{reason}] " if reason else ""
-        if fout.get("refund"):
-            # fail(refund): the whole exchange goes back to before the
-            # reactions ran; nothing is recorded as used.
-            keep_ex = jcopy(ex)
-            _rollback_match(m, mgr, start)
-            m.history.rewind(hist_mark)
-            m = mgr.matches.get(m.id, m)
-            m.reaction_exchange = keep_ex
-            ex = keep_ex
-            for p in ex.get("picks") or []:
-                p["refunded"] = True
-            ex["refunded"] = True
-            out.append(f"❌ action `{act.name}`: {tag}{message} (refunded: "
-                       f"the reactions are undone too)")
-        else:
-            out.append(f"❌ action `{act.name}`: {tag}{message}")
-        ex["outcome"] = "cancelled"
-        return
-    ex["outcome"] = ex["ended"] = "resolved"
-    body_vals, _dropped = _storable_locals(bout)
-    for k in list(ex.get("incoming") or {}):
-        c = ex["incoming"][k]
-        for name, v in body_vals.items():
-            if name not in CONTROL_KEYS:
-                c[name] = jcopy(v)
-    out.append(f"`{ex['actor']}` used action `{act.name}`.")
-
-
-async def _open_after(ctx: Any, mgr: Any, m: Any) -> None:
-    ex = m.reaction_exchange
-    if ex is None:
-        return
-    notes: List[str] = []
-    if ex.get("refunded"):
-        lines: List[str] = []
-        ex["phase"] = "after"
-        ex["units"], ex["unit_order"] = {}, []
-    else:
-        lines = open_window(m, ex, "after", notes)
-        _refresh_done(m, ex)
-    if waiting(ex):
-        m._reaction_opened = time.time()
-        await ctx.send("\n".join(notes + [
-            f"⏳ {_action_line(m, ex)} "
-            + {"resolved": "has resolved", "cancelled": "was cancelled"}.get(
-                ex.get("ended", ""), "failed")
-            + ": reactions to it are offered."] + lines + [
-            "A host closes the window with `!react skip`."]))
-        return
-    if notes or lines:
-        await ctx.send("\n".join(notes + lines))
-    await _finish_after(ctx, mgr, m)
-
-
-async def _finish_after(ctx: Any, mgr: Any, m: Any) -> None:
+async def _after_run(env: _Env, seq: int) -> str:
     """Every after half in one order: the continuations of before picks
     (their after_on permitting) and the after-only picks."""
-    ex = m.reaction_exchange
-    m._reaction_opened = None
-    out: List[str] = []
+    m = env.m
+    ex = _ex(m, seq)
     runs: List[Dict[str, Any]] = []
     for p in ex.get("picks") or []:
-        if p.get("refunded") or p.get("skipped"):
+        if any(p.get(k) for k in ("refunded", "skipped", "failed")):
             continue
         if p.get("phase") == "before":
-            if not p.get("ran"):
+            if not p.get("ran") or p.get("after_done"):
                 continue
             act = _find_action(m, p["unit"], p["path"], p.get("via"))
             if act is None or not act.reaction.after:
@@ -1208,10 +1406,12 @@ async def _finish_after(ctx: Any, mgr: Any, m: Any) -> None:
             want = act.reaction.after_on
             if want != "any" and want != unit_outcome(ex, p["unit"], m):
                 continue
+        elif p.get("ran"):
+            continue
         runs.append(p)
     for pick in _ordered(m, ex, runs, "after"):
-        m = mgr.matches.get(m.id, m)
-        ex = m.reaction_exchange
+        m = env.m
+        ex = _ex(m, seq)
         cur = next((p for p in ex["picks"] if p["n"] == pick["n"]), None)
         if cur is None:
             continue
@@ -1220,24 +1420,319 @@ async def _finish_after(ctx: Any, mgr: Any, m: Any) -> None:
             notes: List[str] = []
             if r_act is None or not _reaction_open(
                     m, ex, cur["unit"], r_act, "after", notes):
-                out += notes
-                out.append(m.unit_tag(cur["unit"]) + f"- "
-                           f"{_name(m, cur['unit'])}'s `{cur['name']}` is no "
-                           f"longer available; it doesn't run.")
+                env.out += notes
+                cur["skipped"] = True
+                env.out.append(m.unit_tag(cur["unit"]) + f"- "
+                               f"{_name(m, cur['unit'])}'s `{cur['name']}` "
+                               f"is no longer available; it doesn't run.")
                 continue
-        await _flush(ctx, out)
         pays = cur.get("phase") == "after"
-        ran = await _run_half(ctx, mgr, m, ex, cur, "after", pays, out)
-        m = mgr.matches.get(m.id, m)
-        ex = m.reaction_exchange
-        cur = next((p for p in ex["picks"] if p["n"] == pick["n"]), cur)
-        if ran is not None and not cur.get("ran"):
-            cur["ran"] = True
-            _record_use(m, ex, cur, ran)
+        r = await _half(env, seq, cur["n"], "after", pays)
+        if r == "suspended":
+            return "suspended"
+        m = env.m
+        ex = _ex(m, seq)
+        cur = next(p for p in ex["picks"] if p["n"] == pick["n"])
+        if cur.get("phase") == "before":
+            cur["after_done"] = True
+        elif r != "ok":
+            cur["failed"] = True
+    return "ok"
+
+
+def _record_child(m: Any, child: Dict[str, Any]) -> None:
+    """A react point's window closed: its picks go to the paused step of
+    the exchange below, which then runs again."""
+    pt = child.get("point") or {}
+    parent = _ex(m, pt.get("parent"))
+    phase = "after" if child.get("phase") == "after" else "before"
+    picks = [p for p in child.get("picks") or [] if p.get("phase") == phase]
+    _drop(m, child.get("seq"))
+    if parent is None or not isinstance(parent.get("suspended"), dict):
+        return
+    rec = parent["suspended"].setdefault("records", {}).setdefault(
+        str(pt.get("k")), {})
+    rec[phase] = [{k: jcopy(v) for k, v in p.items()
+                   if k not in ("ran", "refunded", "skipped", "failed",
+                                "after_done")} for p in picks]
+
+
+async def _drive(env: _Env) -> None:
+    """Run the stack (and then the queue) until a window is open or nothing
+    is left; each window that opens is announced."""
+    for _guard in range(10000):
+        m = env.m
+        if not m.reaction_stack:
+            m._reaction_opened = None
+            if not m.reaction_queue:
+                return
+            ex = m.reaction_queue.pop(0)
+            m.reaction_stack.append(ex)
+            if _open(env, ex["seq"], "before"):
+                await env.flush()
+                await _announce(env)
+                return
+            continue
+        top = m.reaction_stack[-1]
+        if top.get("point"):
+            if waiting(top):
+                await _announce(env)
+                return
+            _record_child(m, top)
+            continue
+        r = await _advance(env, top["seq"])
+        await env.flush()
+        if r == "window":
+            await _announce(env)
+            return
+        m = env.m
+        _drop(m, top["seq"])
+        m._reaction_opened = None
+
+
+async def _announce(env: _Env) -> None:
+    m = env.m
+    m._reaction_opened = time.time()
+    lines = env.window or (window_text(m, m.reaction_exchange)
+                           if m.reaction_exchange else [])
+    env.window = []
+    if lines:
+        await env.ctx.send("\n".join(lines))
+
+
+# ----------------------------------------------------------------------
+# Starting an exchange
+# ----------------------------------------------------------------------
+
+async def _prepare(ctx: Any, mgr: Any, m: Any, action: Any, eff: str,
+                   target: Any, args: Dict[str, Any], answers: List[Any],
+                   extra_ctx: Optional[Dict[str, Any]]):
+    """The action's checks and `prepare`: (ok, why, locals, target,
+    answers used)."""
+    from action import run_action, ActionEngineFault
+    pout: Dict[str, Any] = {}
+    tout: Dict[str, Any] = {}
+    try:
+        ok, why = await run_action(
+            action, actor_id=eff, target=target, args=args, match=m,
+            mgr=mgr, ctx=ctx, answers=answers, extra_ctx=extra_ctx,
+            steps=("prepare",), finish=False, prepare_out=pout,
+            target_out=tout)
+    except ActionEngineFault as ef:
+        return False, ("", ef.message), {}, target, 0
+    return ok, why, pout, tout.get("target", target), \
+        int(tout.get("answers_used", 0))
+
+
+def _new_exchange(m: Any, action: Any, *, actor_id: str, eff: str,
+                  target: Any, args: Dict[str, Any], answers: List[Any],
+                  extra_ctx: Optional[Dict[str, Any]], via: Optional[str],
+                  rider_mode: bool, pout: Dict[str, Any], channel: str,
+                  depth: int, notes: List[str]
+                  ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """The exchange of a prepared action, or (None, refusal)."""
+    bad = [k for k in pout if k in CONTROL_KEYS]
+    if bad:
+        return None, (f"its `prepare` can't use `{bad[0]}` as a local: it "
+                      f"is a key of `incoming` the reactions set.")
+    base, dropped = _storable_locals(pout)
+    if dropped:
+        notes.append(f"⚠️ `{action.name}`'s `prepare` holds "
+                     + ", ".join(f"`{d}`" for d in dropped)
+                     + ", which the reaction window can't keep (not a "
+                       "value a var could store): the body won't see "
+                     + ("it." if len(dropped) == 1 else "them."))
+    try:
+        affected = _affects(m, action, eff, target, args)
+    except VTTError as err:
+        return None, str(err)
+    m.reaction_seq += 1
+    ex: Dict[str, Any] = {
+        "seq": m.reaction_seq, "phase": "before", "depth": depth,
+        "actor": actor_id, "eff_actor": eff,
+        "holder_unit": actor_id, "path": action.full_path, "via": via,
+        "rider_mode": rider_mode, "mount": jcopy(extra_ctx),
+        "name": action.name, "tags": list(action.tags),
+        "target_type": action.target_type,
+        "target": target_to_json(action.target_type, target),
+        "args": _own_value(dict(args)), "answers": list(answers),
+        "affected": list(affected), "first_affected": list(affected),
+        "dropped": [], "incoming": {"": base},
+        "picks": [], "pick_seq": 0, "channel": channel,
+    }
+    for u in affected:
+        ex["incoming"][u] = jcopy(base)
+    return ex, None
+
+
+async def begin(ctx: Any, mgr: Any, m: Any, action: Any, *,
+                actor_id: str, eff_actor_id: str, target: Any,
+                args: Dict[str, Any], answers: List[Any],
+                extra_ctx: Optional[Dict[str, Any]],
+                via: Optional[str], rider_mode: bool) -> None:
+    """A typed action that may open a reaction window (design §3)."""
+    with _Runtime(m, ctx, mgr):
+        ok, why, pout, target, used = await _prepare(
+            ctx, mgr, m, action, eff_actor_id, target, args, answers,
+            extra_ctx)
+    if not ok:
+        reason, message = why
+        tag = f"[{reason}] " if reason else ""
+        return await ctx.send(f"❌ action `{action.name}`: {tag}{message}")
     m = mgr.matches.get(m.id, m)
-    m.reaction_exchange = None
-    m._reaction_opened = None
-    await _flush(ctx, out)
+    notes: List[str] = []
+    ex, refusal = _new_exchange(
+        m, action, actor_id=actor_id, eff=eff_actor_id, target=target,
+        args=args, answers=answers[used:], extra_ctx=extra_ctx, via=via,
+        rider_mode=rider_mode, pout=pout,
+        channel=str(getattr(ctx, "channel_key", "")), depth=0, notes=notes)
+    if ex is None:
+        return await ctx.send(f"❌ action `{action.name}`: {refusal}")
+    m.reaction_stack.append(ex)
+    env = _Env(ctx, mgr, m)
+    env.out += notes
+    if _open(env, ex["seq"], "before"):
+        await env.flush()
+        return await _announce(env)
+    await _drive(env)
+
+
+# ----------------------------------------------------------------------
+# Actions a formula starts (#36: react points and the queue)
+# ----------------------------------------------------------------------
+
+def _sync(coro) -> Any:
+    from action import _sync_dispatch_returning
+    return _sync_dispatch_returning(coro)
+
+
+def _plain_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
+               target: Any, args: Dict[str, Any],
+               why: str) -> Tuple[bool, Any]:
+    """Run the action at once with no window (a formula outside any
+    resolving step, or past reaction_depth_limit)."""
+    from action import run_action, _BufferCtx
+    buf = ctx if hasattr(ctx, "out") else _BufferCtx.for_ctx(ctx)
+    top = m._action_depth == 0
+    ok, why_f = _sync(run_action(action, actor_id=eid, target=target,
+                                 args=args, match=m, mgr=mgr, ctx=buf))
+    if top and buf is not ctx and buf.out:
+        m.surface_log(list(buf.out))
+    if ok and why:
+        note = unoffered_note(m, action, eid, target, why)
+        if note:
+            m.surface_log([note])
+    return ok, why_f
+
+
+def formula_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
+                target: Any, args: Dict[str, Any]) -> Tuple[Any, Any]:
+    """use_action(): (result, why). The result is True / False as the
+    action resolved or failed, or None while it waits on a window."""
+    from action import REACT_STEP, REACT_ORIGIN
+    depth, reactable = REACT_ORIGIN.get() or (0, True)
+    try:
+        limit = int(m.rules.get("reaction_depth_limit", 2))
+    except (TypeError, ValueError):
+        limit = 2
+    step = REACT_STEP.get()
+    if not has_holders(m):
+        return _plain_use(m, mgr, ctx, action, eid, target, args, "")
+    if not reactable:
+        return _plain_use(m, mgr, ctx, action, eid, target, args,
+                          "its reaction isn't reactable")
+    if depth > limit:
+        return _plain_use(m, mgr, ctx, action, eid, target, args,
+                          "reaction_depth_limit")
+    if step is None:
+        if m._action_depth > 0:
+            return _plain_use(m, mgr, ctx, action, eid, target, args,
+                              "formula")
+        return _queue_use(m, mgr, ctx, action, eid, target, args, depth)
+    return _point_use(m, mgr, ctx, action, eid, target, args, depth, step)
+
+
+def _point_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
+               target: Any, args: Dict[str, Any], depth: int,
+               step: Dict[str, Any]) -> Tuple[Any, Any]:
+    """An automatic react point: the action resolves here, inside the
+    step, with the picks its windows got; a window not yet answered stops
+    the step (ReactPointNeeded)."""
+    from action import _BufferCtx
+    k = step["counter"][0]
+    step["counter"][0] += 1
+    rec = (step.get("records") or {}).get(str(k)) or {}
+    buf = ctx if hasattr(ctx, "out") else _BufferCtx.for_ctx(ctx)
+    ok, why, pout, target, _used = _sync(_prepare(
+        buf, mgr, m, action, eid, target, args, [], None))
+    if not ok:
+        return False, why
+    parent = _ex(m, step["seq"]) or {}
+    notes: List[str] = []
+    ex, refusal = _new_exchange(
+        m, action, actor_id=eid, eff=eid, target=target, args=args,
+        answers=[], extra_ctx=None, via=None, rider_mode=False, pout=pout,
+        channel=str(getattr(buf, "channel_key", "")), depth=depth,
+        notes=notes)
+    if ex is None:
+        return False, ("", refusal)
+    ex["point"] = {"parent": step["seq"], "k": k,
+                   "by": step.get("by") or parent.get("name", "")}
+    m.reaction_stack.append(ex)
+    env = _Env(buf, mgr, m, inline=True, rec=rec)
+    env.out += notes
+    try:
+        _open(env, ex["seq"], "before")
+        _sync(_advance(env, ex["seq"]))
+    finally:
+        _drop(env.m, ex["seq"])
+    _sync(env.flush())
+    return env.finished.get(ex["seq"]) == "resolved", None
+
+
+def _queue_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
+               target: Any, args: Dict[str, Any],
+               depth: int) -> Tuple[Any, Any]:
+    """An action a formula outside any action starts (a passive, a
+    watcher): its window opens now and the formula carries on (None), or
+    it waits its turn in the queue while another window is open."""
+    from action import _BufferCtx
+    buf = _BufferCtx.for_ctx(ctx)
+    ok, why, pout, target, _used = _sync(_prepare(
+        buf, mgr, m, action, eid, target, args, [], None))
+    if buf.out:
+        m.surface_log(list(buf.out))
+        buf.out.clear()
+    if not ok:
+        return False, why
+    notes: List[str] = []
+    ex, refusal = _new_exchange(
+        m, action, actor_id=eid, eff=eid, target=target, args=args,
+        answers=[], extra_ctx=None, via=None, rider_mode=False, pout=pout,
+        channel=str(getattr(buf, "channel_key", "")), depth=depth,
+        notes=notes)
+    if ex is None:
+        return False, ("", refusal)
+    if notes:
+        m.surface_log(notes)
+    if m.reaction_stack:
+        m.reaction_queue.append(ex)
+        m.surface_log([f"⏳ {_action_line(m, ex)} waits: another reaction "
+                       f"window is open, and its own opens after."])
+        return None, None
+    m.reaction_stack.append(ex)
+    env = _Env(buf, mgr, m)
+    opened = _open(env, ex["seq"], "before")
+    if opened:
+        _sync(env.flush())
+        _sync(_announce(env))
+    else:
+        _sync(_drive(env))
+    if buf.out:
+        m.surface_log(list(buf.out))
+    if ex["seq"] in env.finished:
+        return env.finished[ex["seq"]] == "resolved", None
+    return None, None
 
 
 # ----------------------------------------------------------------------
@@ -1317,7 +1812,7 @@ async def react_skip(ctx: Any, mgr: Any, m: Any, why: str = "") -> None:
     for uid in waiting(ex):
         ex["units"][uid]["done"] = True
     await ctx.send(why or "⏭ The host closes the reaction window.")
-    await resolve(ctx, mgr, m)
+    await _drive(_Env(ctx, mgr, m))
 
 
 async def maybe_close(ctx: Any, mgr: Any, m: Any) -> None:
@@ -1327,7 +1822,7 @@ async def maybe_close(ctx: Any, mgr: Any, m: Any) -> None:
         return
     _refresh_done(m, ex)
     if not waiting(ex):
-        await resolve(ctx, mgr, m)
+        await _drive(_Env(ctx, mgr, m))
 
 
 def expired(m: Any) -> bool:
@@ -1363,12 +1858,15 @@ async def settle_expiry(ctx: Any, mgr: Any, m: Any) -> None:
 
 
 # ----------------------------------------------------------------------
-# Actions a formula starts, reactions_used
+# The note on an unoffered action, reactions_used
 # ----------------------------------------------------------------------
 
-def unoffered_note(m: Any, act: Any, actor: str, target: Any) -> Optional[str]:
-    """A note for an action a formula started (no window of its own) when
-    a unit holds a reaction that would answer it (reacts_to, reacts_on;
+def unoffered_note(m: Any, act: Any, actor: str, target: Any,
+                   why: str = "formula") -> Optional[str]:
+    """A note for an action a formula started that opened no window (`why`:
+    "formula", a formula inside an action outside any reaction step;
+    "reaction_depth_limit"; or a reaction that isn't reactable) when a unit
+    holds a reaction that would answer it (reacts_to, reacts_on;
     conditions aren't read)."""
     if not has_holders(m):
         return None
@@ -1392,8 +1890,14 @@ def unoffered_note(m: Any, act: Any, actor: str, target: Any) -> Optional[str]:
             if spec.reacts_on == "target" and not _covered(
                     m, fake, uid, affected):
                 continue
-            return (f"ℹ️ `{act.name}` ran from a formula, so reactions to it "
-                    f"weren't offered.")
+            if why == "reaction_depth_limit":
+                return (f"ℹ️ `{act.name}` ran past reaction_depth_limit, so "
+                        f"reactions to it weren't offered.")
+            if why == "formula":
+                return (f"ℹ️ `{act.name}` ran from a formula, so reactions "
+                        f"to it weren't offered.")
+            return (f"ℹ️ `{act.name}` ran from a reaction that isn't "
+                    f"reactable, so reactions to it weren't offered.")
     return None
 
 
@@ -1408,6 +1912,8 @@ def reactions_used(m: Any, eid: str, since: str = "own_turn",
     if since == "action" and m.reaction_exchange is None \
             and not m.reaction_seq:
         return 0
+    cur_seq = (m.reaction_stack[-1].get("seq") if m.reaction_stack
+               else m.reaction_seq)
     n = 0
     start = m.own_turn_at.get(eid, 0)
     for r in m.reaction_log:
@@ -1419,7 +1925,7 @@ def reactions_used(m: Any, eid: str, since: str = "own_turn",
             continue
         if since == "turn" and int(r.get("turn", 0)) != m.turns_elapsed:
             continue
-        if since == "action" and int(r.get("seq", 0)) != m.reaction_seq:
+        if since == "action" and r.get("seq") != cur_seq:
             continue
         if tag is not None:
             try:

@@ -32,6 +32,12 @@ FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
 COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
     contextvars.ContextVar("vtt_command_user", default=None))
 
+# The reply context of the running top-level command (CommandRegistry._run_top
+# sets it): an action a formula outside any action starts (a passive's
+# use_action) runs through it (#36).
+COMMAND_CTX: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar("vtt_command_ctx", default=None))
+
 # Set by the running command (CommandRegistry._run) to a one-item list; a
 # change the command's own replay couldn't redo (a line that needs another
 # match, transfer_entity) sets its item True, and the command is journaled
@@ -4960,6 +4966,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "program (an action's own `cancelled_action_cost` field "
             "overrides it). refund (default): it pays nothing. pay: its "
             "`cost` runs anyway (the mana of a countered spell is spent)."
+        ),
+    },
+    "reaction_depth_limit": {
+        "default": 2,
+        "schema": {"type": "int", "min": 0, "max": 8},
+        "desc": (
+            "How deep reactions may answer reactions: an action a reaction's "
+            "half starts (`use_action` in a riposte) opens windows of its own "
+            "while the chain is at most this many reactions deep; past it, "
+            "such actions run with no windows. 0 = actions reactions start "
+            "are never reacted to. A reaction with `reactable: false` never "
+            "lets its actions be reacted to."
         ),
     },
     "reaction_window_expiry_seconds": {
@@ -12540,14 +12558,16 @@ class Match:
     # Serialized and undo state.
     extra_turns: List[str] = field(default_factory=list)
     extra_turn: Optional[str] = None
-    # Reactions (#36, docs/damage_reactions_design.md): the open reaction
-    # exchange (an action waiting on its reaction windows; None when none
-    # is open; reactions.py), the exchange counter, the reactions units
+    # Reactions (#36, docs/damage_reactions_design.md): the exchange stack
+    # (actions resolving their reactions; the top one's window is open, one
+    # below paused at a react point; reactions.py), the queue of actions a
+    # formula started while a window was open, the exchange counter, the reactions units
     # used (reactions_used(), the newest REACTION_LOG_MAX), and per unit the
     # turns_elapsed at which its own latest turn began. Serialized and undo
     # state; `_reaction_opened` (wall clock, for
     # reaction_window_expiry_seconds) is runtime.
-    reaction_exchange: Optional[Dict[str, Any]] = None
+    reaction_stack: List[Dict[str, Any]] = field(default_factory=list)
+    reaction_queue: List[Dict[str, Any]] = field(default_factory=list)
     reaction_seq: int = 0
     reaction_log: List[Dict[str, Any]] = field(default_factory=list)
     own_turn_at: Dict[str, int] = field(default_factory=dict)
@@ -20183,6 +20203,13 @@ class Match:
         # have acted).
         self._rebuild_turn_order()
 
+    @property
+    def reaction_exchange(self) -> Optional[Dict[str, Any]]:
+        """The exchange whose window is open (#36): the top of the reaction
+        stack (an action whose step paused at a react point sits below the
+        exchange it opened), None when no window is open."""
+        return self.reaction_stack[-1] if self.reaction_stack else None
+
     def current_entity_id(self) -> Optional[str]:
         """The unit whose turn it is: during an extra turn (#224) the unit
         taking it (None once it left), else the unit at active_index."""
@@ -27440,7 +27467,8 @@ class Match:
             "round_acted": list(self.round_acted),
             "extra_turns": list(self.extra_turns),
             "extra_turn": self.extra_turn,
-            "reaction_exchange": jcopy(self.reaction_exchange),
+            "reaction_stack": jcopy(self.reaction_stack),
+            "reaction_queue": jcopy(self.reaction_queue),
             "reaction_seq": self.reaction_seq,
             "reaction_log": jcopy(self.reaction_log),
             "own_turn_at": dict(self.own_turn_at),
@@ -27658,8 +27686,10 @@ class Match:
                          if isinstance(xq, list) else [])
         xt = d.get("extra_turn")
         m.extra_turn = xt if isinstance(xt, str) else None
-        rx = d.get("reaction_exchange")
-        m.reaction_exchange = jcopy(rx) if isinstance(rx, dict) else None
+        for key in ("reaction_stack", "reaction_queue"):
+            rx = d.get(key)
+            setattr(m, key, [jcopy(x) for x in rx if isinstance(x, dict)]
+                    if isinstance(rx, list) else [])
         rs = d.get("reaction_seq")
         m.reaction_seq = rs if isinstance(rs, int) and not isinstance(
             rs, bool) and rs >= 0 else 0

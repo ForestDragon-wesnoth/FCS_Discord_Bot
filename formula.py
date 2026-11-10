@@ -7441,12 +7441,16 @@ class FormulaEngine:
 
         def _use_action(eid_t: Any, name: Any,
                         target_arg: Any = None,
-                        args_arg: Any = None) -> bool:
+                        args_arg: Any = None) -> Any:
             """use_action(eid, name, target=None, args=None): invoke an
             action on `eid` from inside another formula or action body.
             Returns True on a clean successful run, False if the action
-            cleanly fail()ed. Unexpected errors propagate as
-            FormulaError. Counts toward the action_recursion_limit."""
+            cleanly fail()ed or was cancelled, None when it waits on a
+            reaction window (a formula outside any action: a passive, a
+            watcher, a hook). Inside an action it is a react point: the
+            action's windows open and the step runs again once they
+            close. Unexpected errors propagate as FormulaError. Counts
+            toward the action_recursion_limit."""
             if not isinstance(name, str) or not name:
                 raise FormulaError("use_action(eid, name): name must be a non-empty string.")
             eid, e = _resolve_entity(eid_t, "use_action")
@@ -7474,27 +7478,23 @@ class FormulaEngine:
                     f"use_action(args=...): args must be a dict, got "
                     f"{type(args_arg).__name__}."
                 )
-            # Resolve a synchronous-friendly path through the runner.
-            # Because the formula engine is sync but run_action is
-            # async, we drive the coroutine with the same trampoline
-            # the action runner uses for cmd().
-            from action import run_action, _sync_dispatch_returning
-            # We need ctx and mgr; both are wired into FormulaEngine
-            # only loosely. Best path: stash them on the match when
-            # the outer action runner starts (already happens via the
-            # ctx/mgr closure variables in cmd()) — for use_action
-            # called from a passive or a top-level !eval there's no
-            # outer runner, so we look up via the match's manager
-            # attribute set up below.
-            mgr_local = getattr(match, "_runtime_mgr", None)
-            ctx_local = getattr(match, "_runtime_ctx", None)
+            # The formula engine is sync and run_action async: the
+            # reaction engine drives it with the trampoline cmd() uses.
+            # ctx / mgr come from the runner that set them on the match,
+            # else from the command running now (a passive or a watcher
+            # firing at the end of a command).
+            from logic import COMMAND_CTX
+            mgr_local = getattr(match, "_runtime_mgr", None) \
+                or CURRENT_WORKSPACE.get()
+            ctx_local = getattr(match, "_runtime_ctx", None) \
+                or COMMAND_CTX.get()
             if mgr_local is None or ctx_local is None:
                 raise FormulaError(
                     "use_action: no command context available — "
                     "this formula was evaluated outside an active "
-                    "command dispatch (e.g. an internal !eval). "
-                    "Call use_action from inside !action / !ent / a "
-                    "passive that fires during command processing."
+                    "command dispatch. Call use_action from inside "
+                    "!action / !ent / a passive that fires during command "
+                    "processing."
                 )
             from action import coerce_target, dedupe_targets
             try:
@@ -7506,27 +7506,19 @@ class FormulaEngine:
                                                   target_arg, name)
             if dup_note:
                 match.surface_log([dup_note])
-            coro = run_action(
-                action, actor_id=eid, target=target_arg,
-                args=args_dict, match=match, mgr=mgr_local,
-                ctx=ctx_local,
-            )
-            ok, why = _sync_dispatch_returning(coro)
+            import reactions
+            ok, why = reactions.formula_use(match, mgr_local, ctx_local,
+                                            action, eid, target_arg,
+                                            args_dict)
             # A status refusing the nested action (forbidden / immune /
             # the target's tags) is the engine's, worded by its rules: the
             # body only sees False, so the line reaches the chat. A body's
             # own fail() stays its own to report.
-            if not ok and isinstance(why, tuple) and len(why) == 2 \
+            if ok is False and isinstance(why, tuple) and len(why) == 2 \
                     and why[0] in ("forbidden", "immune", "target_tags",
                                    "target_condition", "reaction"):
                 match.surface_log([f"↳ use_action `{name}`: {why[1]}"])
-            if ok:
-                # An action a formula starts opens no reaction window (#36).
-                import reactions
-                note = reactions.unoffered_note(match, action, eid,
-                                                target_arg)
-                if note:
-                    match.surface_log([note])
+            # None: the action waits on a reaction window (#36).
             return ok
 
         def _one_action(eid_t: Any, name: Any, fname: str):

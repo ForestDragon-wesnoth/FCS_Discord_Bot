@@ -366,20 +366,47 @@ None at the moment.
 
 Not built yet:
 
-- **Reacting to a reaction** (§8): a reaction's halves open no windows;
-  `reactable` and `reaction_depth_limit` don't exist yet.
-- **`react_point`** mid-body windows (§3).
+- **A GM-called `react_point()`** (§3): a body opening a window for
+  something other than an action it starts (an aura's `on_exit` for an
+  opportunity attack, #263). An action a body starts is a react point
+  already (below).
 - **Discord buttons** for the options (§9, with #42).
 - **The dice rewind** before the body (§10): it belongs to the damage
   pipeline (#25), where "where `prepare`'s pipeline began" gets a
   meaning; a body rolling dice of its own would otherwise repeat
   `prepare`'s first rolls.
 
+Actions a formula starts (user calls, after the first build):
+
+- **Inside an action** (a body, a cost, a reaction half, a hook firing
+  inside one): `use_action` is an automatic react point. When the action
+  it starts needs a window, the whole step (the body, or the half) goes
+  back to its start, the window opens on top of the exchange (a stack:
+  `Match.reaction_stack`), and when it closes the step runs again from
+  its start: the RNG where the step began, every earlier react point of
+  the step answered with the picks its window got (`suspended.records`,
+  by the order the step reaches them), the action resolving at that
+  point with those picks. `use_action` then gives True (resolved) or
+  False (cancelled or failed). A window of such an action offers the
+  options read when it opened (the re-runs read no conditions for it).
+- **Outside any action** (a passive, a watcher effect, a tile hook, a
+  status tick, an `!eval`): the action's window opens and the formula
+  carries on with `use_action` giving None. While another window is
+  open, the action waits in a queue (`Match.reaction_queue`) and its
+  window opens when the stack empties, in order.
+- **Depth:** the actions a reaction's half starts sit one deeper than
+  the exchange it answers (a typed action is depth 0). Past
+  `reaction_depth_limit` (default 2) an action opens no windows, nor
+  does one a reaction marked `reactable: false` starts; both run at once,
+  with a note when some unit holds a reaction that would answer them.
+- `fail(refund)` rolls back to the state when the body's resolution
+  began in the current command: when the body paused for a react point,
+  the reactions that ran in an earlier command stay (the reply says so).
+- A failing action takes back the actions it started, a react point's
+  reactions included.
+
 Choices made while building (open to change):
 
-- Only a typed `!action` / `!ent action` opens windows. An action a
-  formula starts (`use_action`) runs at once, and the reply notes that
-  reactions weren't offered when some unit holds one that would answer it.
 - In a reaction's formulas `target`, `args`, `actor`, `action_name` and
   `action_tags` are the incoming action's; the reaction's own target and
   `k=v` args (typed after its name in `!react`) are `reaction_target` and
@@ -400,7 +427,9 @@ Choices made while building (open to change):
   warning, and the body doesn't see it.
 - With several affected units, the incoming action's body starts with the
   locals of the action's own copy (what bystanders write); per-unit
-  values are read with `incoming_of(eid)`.
+  values are read with `incoming_of(eid)`. A bystander's `incoming` is
+  the copy of the one unit affected when exactly one is, else the
+  action's own copy (user call).
 - The match remembers the newest 2,000 reaction uses for
   `reactions_used`; `since='round'` is refused under ATB.
 - A picked reaction whose condition is no longer true when the window

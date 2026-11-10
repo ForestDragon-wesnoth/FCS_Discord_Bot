@@ -176,6 +176,33 @@ class ActionFail(Exception):
         self.refund = refund
 
 
+class ReactPointNeeded(BaseException):
+    """An action a formula started inside a resolving step (a body, a cost,
+    a reaction's half) has units that may react to it and a window must
+    open (#36, an automatic react point). Raised from use_action and
+    carried up to the step that runs the outermost action
+    (reactions._run_step), which rolls the step back, opens the window and
+    replays the step from its start once the window closes. A
+    BaseException, so the formula engine and the passive runners, which
+    catch Exception, let it pass."""
+
+    def __init__(self, exchange: Dict[str, Any], lines: List[str]):
+        super().__init__("react point")
+        self.exchange = exchange
+        self.lines = lines
+
+
+# The resolving step a react point belongs to (reactions._run_step sets it
+# around the step's run_action): its exchange, the step key, the replay
+# records of its react points and the counter of use_action calls.
+REACT_STEP: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = \
+    contextvars.ContextVar("vtt_react_step", default=None)
+# What starts an action now (#36): (chain depth, reactable). A reaction's
+# half runs at its exchange's depth + 1; an action's own body at its depth.
+REACT_ORIGIN: "contextvars.ContextVar[Optional[Tuple[int, bool]]]" = \
+    contextvars.ContextVar("vtt_react_origin", default=None)
+
+
 class _RefundWord(str):
     """The word `refund` bound in action bodies, which fail() reads."""
 
@@ -337,6 +364,8 @@ class ReactionSpec:
     on_cancel: Optional[str] = None   # reaction_on_cancel override
     auto_when: str = ""
     cancels: bool = False
+    # False: the actions this reaction's halves start are never reacted to.
+    reactable: bool = True
     # A bystander reaction without a condition is never offered.
     disabled: str = ""
 
@@ -456,6 +485,10 @@ def _parse_reaction(raw: Dict[str, Any], full_path: str,
     if isinstance(st, str):
         st = st.strip().lower() in ("true", "yes", "on", "1")
     spec.self_trigger = bool(st)
+    ra = raw.get("reactable")
+    if isinstance(ra, str):
+        ra = ra.strip().lower() not in ("false", "no", "off", "0")
+    spec.reactable = True if ra is None else bool(ra)
     spec.on_cancel = _word_field(raw, "reaction_on_cancel", ON_CANCEL, None,
                                  full_path, problems)
     spec.auto_when = _expression_field(raw, "auto_when", full_path,
@@ -1780,6 +1813,14 @@ async def run_action(
         if is_top_level:
             match._choice_answers = list(answers or [])
             rng_state = _snapshot_rng(match)
+            # The run a resolving step started owns its react point counter
+            # (#36); a later top-level run in the same step (a passive's
+            # use_action after the body) doesn't reset it.
+            own_step = REACT_STEP.get()
+            if own_step is not None and not own_step.get("owned"):
+                own_step["owned"] = True
+            else:
+                own_step = None
             # The per-command summon budget at action start. Each replay
             # attempt re-runs the body from the top (its summons are rolled
             # back between attempts), so the counter must reset to this — NOT
@@ -1794,6 +1835,10 @@ async def run_action(
                 match._choice_cursor = 0
                 match._summon_count = summon_at_start
                 _restore_rng(match, rng_state)
+                # Each attempt replays from the top: react points count
+                # again from the first use_action (#36).
+                if own_step is not None:
+                    own_step["counter"][0] = 0
                 # Fresh output buffer per attempt — rolled-back attempts'
                 # command echoes must not leak into the committed run.
                 match._runtime_buffer = _BufferCtx.for_ctx(ctx)
@@ -1861,6 +1906,17 @@ async def run_action(
                 if fail_out is not None:
                     fail_out["refund"] = bool(getattr(af, "refund", False))
                 return _finish_action_fail(af)
+            except ReactPointNeeded:
+                # A window must open at a react point (#36): the step that
+                # runs the outermost action rolls the match back and opens
+                # it (reactions._run_step). Every level puts back what it
+                # changed, other matches included, so the step's re-run
+                # doesn't repeat a transfer.
+                _rollback_all()
+                match._action_depth = pre_action_depth
+                if is_top_level:
+                    match._runtime_buffer = None
+                raise
             except ActionEngineFault:
                 # Engine refusal (recursion / choice limit). Roll back
                 # AND re-raise so every level unwinds.

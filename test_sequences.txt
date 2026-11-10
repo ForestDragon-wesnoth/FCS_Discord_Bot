@@ -39035,7 +39035,7 @@ SCENARIO 1098 — Protect: a bystander redirects the attack onto itself and halv
 !ent set_var orc actions.burn.body "x = 1"
 !ent set_var guard actions.protect.reacts_on any
 !ent set_var guard actions.protect.condition "target != self and actor != self"
-!ent set_var guard actions.protect.before "redirect(target, self)\nincoming_of(self).damage = incoming_of(self).damage / 2"
+!ent set_var guard actions.protect.before "redirect(target, self)\nincoming.damage = incoming.damage / 2"
 !action orc slash hero
 ?? `!react guard protect`
 !react guard protect
@@ -39049,8 +39049,8 @@ SCENARIO 1098 — Protect: a bystander redirects the attack onto itself and halv
 Expected: The guard isn't a target: `protect` is a bystander reaction.
 `redirect(target, self)` puts the guard in the hero's place among the
 targets and in `affected`, the guard takes over the hero's `incoming`
-copy and halves it there (`incoming_of(self)`), and the hero leaves the
-action. The body hits the guard for 5; the hero is untouched. A location
+copy and halves it there (`incoming` reads the guard's own copy once it
+is affected), and the hero leaves the action. The body hits the guard for 5; the hero is untouched. A location
 target can't be redirected: the half fails alone (`[redirect]`, rolled
 back, not counted as used) and the burn resolves.
 HARNESS-ALLOWS-ERRORS
@@ -39296,7 +39296,7 @@ picked (`a` before `c`). With reaction_tiebreak turn_order, ties follow
 the reactors' turn order: the ally (initiative 9) before the hero.
 
 
-SCENARIO 1105 — A combo answers its holder's own attack; a formula's action opens no window (#36)
+SCENARIO 1105 — A combo answers its holder's own attack, also inside another action (#36)
 ------------------------------------------------------------------------------------------------
 
 !match new rx Rx 8 8
@@ -39319,20 +39319,26 @@ SCENARIO 1105 — A combo answers its holder's own attack; a formula's action op
 !react orc combo
 !assert "entity[hero].hp == 24"
 !action orc twice hero
-?? `slash` ran from a formula, so reactions to it weren't offered
-!assert "entity[hero].hp == 19"
+?? (started by `twice`) has resolved
+!assert "entity[hero].hp == 24"
+!react orc combo
+?? `orc` used action `twice`
+!assert "entity[hero].hp == 18"
 !ent set_var orc actions.combo.self_trigger false
 !action orc slash hero
 ?! !react orc combo
-!assert "entity[hero].hp == 14"
+!assert "entity[hero].hp == 13"
 
 Expected: `combo` is an after-only reaction to the orc's own melee
 attacks: `self_trigger: true` lets it answer its holder's actions
 (reacts_on any, condition `actor == self`). After the slash resolves,
-the after window offers it, and it hits again (30 -> 25 -> 24). A slash
-`use_action` starts from a formula runs without windows; the reply says
-reactions weren't offered. With self_trigger off, the orc's own slash
-offers it nothing.
+the after window offers it, and it hits again (30 -> 25 -> 24). `twice`
+starts a slash with `use_action`: a react point. The slash's after
+window opens "started by `twice`" and the match stays at 24 (the step
+went back to its start); picking combo runs `twice`'s body again, the
+slash resolving with the combo after it (24 -> 19 -> 18), and `twice`
+is used. With self_trigger off, the orc's own slash offers it nothing
+(18 -> 13).
 
 
 SCENARIO 1106 — A gunner's seat reaction defends its vehicle (#36)
@@ -39345,7 +39351,7 @@ SCENARIO 1106 — A gunner's seat reaction defends its vehicle (#36)
 !ent set_var tank slots.gunner.capacity 1
 !ent set_var tank slots.gunner.actions.flak.reacts_on any
 !ent set_var tank slots.gunner.actions.flak.condition "target == 'tank'"
-!ent set_var tank slots.gunner.actions.flak.before "incoming_of(target).damage = 0\nentity[self].fired = 1"
+!ent set_var tank slots.gunner.actions.flak.before "incoming.damage = 0\nentity[self].fired = 1"
 !ent add gun Gunner 10 6 1 5
 !mount gun tank gunner
 !ent add orc Orc 30 1 1 5
@@ -39365,7 +39371,9 @@ SCENARIO 1106 — A gunner's seat reaction defends its vehicle (#36)
 Expected: The flak reaction lives in the tank's `gunner` seat: it is
 offered to the unit riding there (the tank itself isn't offered its
 seats' reactions), runs as the rider (mount_action_actor rider: `self`
-is the gunner) and zeroes the tank's copy of the damage. Dismounted, the
+is the gunner) and zeroes the tank's copy of the damage: the gunner is a
+bystander and the tank the one unit affected, so `incoming` is the
+tank's copy. Dismounted, the
 gunner holds no reaction and the shot resolves at once.
 
 
@@ -39697,3 +39705,265 @@ SCENARIO 1116 — Tab completes a unit's reactions in the open window (#36)
 
 Expected: `!react <unit> <Tab>` offers the reactions that unit may pick
 now, and `pass`.
+
+
+SCENARIO 1117 — A reaction's own action is a react point: a riposte's stab is dodged (#36)
+------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent set_var orc footprint_w 2
+!ent set_var orc footprint_h 2
+!ent add hero Hero 30 3 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.prepare "damage = 5"
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var orc actions.dodge.reacts_to melee
+!ent set_var orc actions.dodge.before "incoming.damage = 0\nentity[self].dodged = 1"
+!ent set_var hero actions.stab.target entity
+!ent set_var hero actions.stab.tags melee
+!ent set_var hero actions.stab.prepare "damage = 4"
+!ent set_var hero actions.stab.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.riposte.reacts_to melee
+!ent set_var hero actions.riposte.after_on resolved
+!ent set_var hero actions.riposte.after "use_action(self, 'stab', actor)\nentity[self].riposted = entity[self].riposted + 1"
+!ent set_var hero riposted 0
+!action orc slash hero
+?? `!react hero riposte`
+!react hero riposte
+?? Hero's `stab` on Orc (started by `riposte`)
+?? `!react orc dodge`
+!assert "entity[hero].hp == 25 and entity[hero].riposted == 0 and entity[orc].hp == 30"
+!react
+?? (started by `riposte`)
+!react orc dodge
+?? `hero` used action `stab`
+!assert "entity[orc].hp == 30 and entity[orc].dodged == 1 and entity[hero].riposted == 1"
+!assert "reactions_used('hero', 'ever') == 1 and reactions_used('orc', 'ever') == 1"
+!react
+?? No reaction window is open
+!action orc slash hero
+!react hero riposte
+!react orc pass
+!assert "entity[hero].hp == 20 and entity[orc].hp == 26 and entity[hero].riposted == 2"
+
+Expected: The riposte's after half starts the hero's stab with
+`use_action`, a melee action the 2x2 orc can dodge: a react point. The
+half goes back to its start (the riposte count and the orc's hp are
+untouched, 0 and 30) and the stab's window opens, "started by
+`riposte`"; `!react` shows it. When the orc dodges, the half runs again
+from its start, the stab resolving at that point with the dodge: the
+orc takes 0 and the riposte counts once. Each unit used one reaction.
+The second time the orc passes: the stab hits for 4 (30 -> 26).
+
+
+SCENARIO 1118 — reaction_depth_limit and a reaction that isn't reactable (#36)
+-----------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var orc actions.dodge.reacts_to melee
+!ent set_var orc actions.dodge.before "incoming.cancel = True"
+!ent set_var hero actions.stab.target entity
+!ent set_var hero actions.stab.tags melee
+!ent set_var hero actions.stab.body "entity[target].hp = entity[target].hp - 4"
+!ent set_var hero actions.riposte.reacts_to melee
+!ent set_var hero actions.riposte.after "use_action(self, 'stab', actor)"
+!system set default reaction_depth_limit 0
+!action orc slash hero
+!react hero riposte
+?? `stab` ran past reaction_depth_limit, so reactions to it weren't offered
+?! `!react orc dodge`
+!assert "entity[orc].hp == 26 and entity[hero].hp == 25"
+!system set default reaction_depth_limit 2
+!ent set_var hero actions.riposte.reactable false
+!action info hero riposte
+?? Reactable:   no
+!action orc slash hero
+!react hero riposte
+?? `stab` ran from a reaction that isn't reactable, so reactions to it weren't offered
+!assert "entity[orc].hp == 22 and entity[hero].hp == 20"
+!ent set_var hero actions.riposte.reactable true
+!action orc slash hero
+!react hero riposte
+!react orc dodge
+?? Hero's `stab` is cancelled by Orc's `dodge`
+!assert "entity[orc].hp == 22 and entity[hero].hp == 15"
+
+Expected: The riposte's half runs at depth 0, so the stab it starts sits
+at depth 1. With reaction_depth_limit 0 the stab runs at once, no window
+(a note says why), and hits (30 -> 26). Back at 2, a riposte marked
+`reactable: false` (shown by `!action info`) starts its stab without a
+window too (26 -> 22). Reactable again, the stab's window opens and the
+orc's dodge cancels it.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1119 — A passive's and an !eval's actions open their windows; use_action gives None (#36)
+---------------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.prepare "damage = 6"
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.parry.reacts_to melee
+!ent set_var hero actions.parry.before "incoming.damage = incoming.damage - 4"
+!eval "use_action('orc', 'slash', 'hero')"
+?? Orc's `slash` on Hero: reactions are offered
+?? = `None`
+!assert "entity[hero].hp == 30"
+!react hero parry
+?? `orc` used action `slash`
+!assert "entity[hero].hp == 28"
+!passive add orc rage on_turn_start "entity[self].raged = use_action(self, 'slash', 'hero')"
+!turn next
+?? Orc's `slash` on Hero: reactions are offered
+!assert "entity[orc].raged == None and entity[hero].hp == 28"
+!turn next
+?? A reaction window is open
+!react hero pass
+!assert "entity[hero].hp == 22"
+
+Expected: An action a formula starts outside any action (an `!eval`, a
+turn-start passive) opens its window and the formula carries on:
+`use_action` gives None while the action waits. The parry then takes 4
+off the 6 (30 -> 28). The passive stores None; the
+turn can't move on while the window is open, and when the hero passes
+the slash hits for 6 (28 -> 22).
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1120 — Actions started while a window is open wait in a queue (#36)
+---------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.prepare "damage = 6"
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var orc actions.kick.target entity
+!ent set_var orc actions.kick.tags melee
+!ent set_var orc actions.kick.prepare "damage = 3"
+!ent set_var orc actions.kick.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.parry.reacts_to melee
+!ent set_var hero actions.parry.before "incoming.damage = 0"
+!action orc slash hero
+!eval "use_action('orc', 'kick', 'hero')"
+?? Orc's `kick` on Hero waits: another reaction window is open
+!react
+?? Reactions to Orc's `slash` on Hero
+!react hero pass
+?? `orc` used action `slash`
+?? Orc's `kick` on Hero: reactions are offered
+!assert "entity[hero].hp == 24"
+!react hero parry
+?? `orc` used action `kick`
+!assert "entity[hero].hp == 24"
+!react
+?? No reaction window is open
+
+Expected: While the slash's window is open, an `!eval` starts a kick:
+it waits in the queue (the eval gives None). When the slash resolves
+(30 -> 24), the kick's window opens; the parry takes its damage to 0.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1121 — A paused step survives a restart, a host's skip and an undo (#36)
+--------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.prepare "damage = 6"
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var orc actions.twice.target entity
+!ent set_var orc actions.twice.body "entity[self].r1 = roll('1d1000000')\nuse_action(self, 'slash', target)\nentity[self].r2 = roll('1d1000000')\nuse_action(self, 'slash', target)\nentity[self].done = 1"
+!ent set_var hero actions.parry.reacts_to melee
+!ent set_var hero actions.parry.before "incoming.damage = 0"
+!action orc twice hero
+?? Orc's `slash` on Hero (started by `twice`)
+!assert "var_has('orc', 'r1') == False"
+!as restart
+!react
+?? (started by `twice`)
+!react hero parry
+?? (started by `twice`): reactions are offered
+!assert "var_has('orc', 'r1') == False and entity[hero].hp == 30"
+!react skip
+?? `orc` used action `twice`
+!assert "entity[orc].done == 1 and entity[hero].hp == 24"
+!assert "var_has('orc', 'r1') and var_has('orc', 'r2')"
+!undo command confirm
+!assert "entity[hero].hp == 30 and var_has('orc', 'done') == False"
+!react
+?? Reactions to Orc's `slash` on Hero (started by `twice`)
+
+Expected: `twice` starts two slashes. The first opens a window and the
+body pauses before anything stays (r1 isn't set). The paused step is
+saved with the match, so after a restart `!react` still shows the
+window and the parry resolves it; the body runs again from its start and
+pauses at the second slash, whose window opens. A host's `!react skip`
+closes it with no picks: the body runs to its end, the first slash
+parried, the second hitting for 6 (the reply runs the first parry: the
+body's last run is the one that stays). A command undo takes back the
+skip: the second window is open again and the board as it was.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1122 — fail(refund) after a react point paused the body (#36)
+---------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var hero stamina 5
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var orc actions.lunge.target entity
+!ent set_var orc actions.lunge.body "use_action(self, 'slash', target)\nfail('overreached', refund)"
+!ent set_var orc actions.feint.target entity
+!ent set_var orc actions.feint.body "fail('feinted', refund)"
+!ent set_var hero actions.brace.before "entity[self].stamina = entity[self].stamina - 1"
+!ent set_var hero actions.parry.reacts_to melee
+!ent set_var hero actions.parry.before "incoming.cancel = True"
+!action orc feint hero
+!react hero brace
+?? (refunded: the reactions are undone too)
+!assert "entity[hero].stamina == 5"
+!action orc lunge hero
+!react hero brace
+?? Orc's `slash` on Hero (started by `lunge`)
+!react hero parry
+?? ❌ action `lunge`: overreached (the reactions stay: the exchange paused for another window since they ran)
+!assert "entity[hero].stamina == 4 and entity[hero].hp == 30"
+!assert "reactions_used('hero', 'ever') == 1"
+
+Expected: Within one command, `fail(..., refund)` rolls the exchange
+back to before its reactions ran (the brace's stamina comes back). The
+lunge's body starts a slash: a react point, so the body pauses for the
+slash's window while the brace has already run in the command before.
+When the parry cancels the slash, the body runs again and fails with
+refund: the body's own effects go, the slash and its parry with them
+(a failing action takes back the actions it started), but the brace
+stays (stamina 4) and the reply says why. Only the brace counts as
+used.
+HARNESS-ALLOWS-ERRORS
