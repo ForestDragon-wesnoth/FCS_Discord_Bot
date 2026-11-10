@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #262). Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #263). Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
@@ -256,11 +256,11 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - With action tags (#234) shipped: Solis shock forbids every action with a cooldown, so an action with a cooldown could carry a derived tag (`cooldown`) a status can forbid; until then the GM tags those actions by hand.
 - **#23 Declarative action targeting.** `range`, `requires_los` and `relation` fields on an action, checked before the body runs, with the refusal reason reported.
   - See #24's sketch, which covers #22, #23 and #24 together.
-- **#24 Action economy.** `turn_resources` pools (actions, bonus actions, movement) refilled at turn start, plus a `cost` field on actions that spends from them.
+- **#24 Action economy.** `turn_resources` pools (actions, bonus actions, movement) refilled at turn start, spent by actions' `cost` programs (#36).
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
     - Action fields:
-      - `kind`: standard, free, reaction, follow_up, charged, combo;
-      - `cost`: `{stamina: 8}`, with `cost_fallback` for "pay the rest in hp" (FCS1 and NCS Lethal Determination, NCS Revenant);
+      - `kind`: standard, free, reaction, charged, combo;
+      - `cost`: a formula program like `prepare` / `body`, run by the engine at #36's cost point (user call; no `{stamina: 8}` shorthand). "Pay the rest in hp" (FCS1 and NCS Lethal Determination, NCS Revenant) is written in it;
       - `cooldown` in the owner's own turns;
       - `uses_per_turn`;
       - `range` with a metric, `requires_los`, `relation`;
@@ -274,7 +274,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
     - Charged actions count down on the owner's turns, skipped ones included (D8, L12).
   - From the combat systems:
     - Combo groups: several different actions of one combo type in a turn, each at most once (Solis combo actions, e.g. foraging and attack combos).
-    - Follow-ups: `follow_up: {after: [heavy_attack], once_per: trigger}`. NCS Follow Up Strike (one light attack after any melee attack); FCS1 Riposte (an attack at half cost after blocking); FCS1 Unrelenting Assault (attack again after a blocked or dodged attack).
+    - Follow-ups need no field here: a follow-up is a #36 reaction on its holder's own action (`self_trigger: true`, an after window), or any other composition (user call). NCS Follow Up Strike (one light attack after any melee attack); FCS1 Riposte (an attack at half cost after blocking); FCS1 Unrelenting Assault (attack again after a blocked or dodged attack).
     - Resource modifiers through the modifier fold:
       - FCS1 and NCS Efficiency: +1 standard action;
       - Solis Agility status: +1 standard move;
@@ -438,14 +438,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 ### Still open
 
-- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, opportunity attack), answered through `choose()`. The choice-replay machinery is the groundwork; a reach aura's `on_enter` hook can trigger it.
-  - A sketch written against the combat systems (docs/combat_systems_fit.md):
-    - In an action body, `offer_reaction(target, payload)` ends the body and stores a pending event on the match: attacker, target, the action, and the payload (`{'damage': 15, 'type': 'blunt', 'kind': 'melee'}`). It is saved, so it survives restarts and follows undo.
-    - Reaction actions carry `kind: reaction`, `reacts_to: [melee, ranged, spell, ...]` and an `available` condition (cooldown, stamina, not asleep). `reacts_for: adjacent_ally` covers FCS1 Protect, and a range covers Counterspell.
-    - The attack's reply names the options: "Hopper1 kicks Hunter1. Hunter1 can `!react hu1 block`, `!react hu1 dodge <x> <y>`, or `!react hu1 take`."
-    - `!react <eid> <reaction> [target] [k=v]` runs the reaction with `pending` bound. The reaction can change the payload (`pending.damage -= 10`) or cancel it (`pending.cancel = True`). Then the attack's `resolve` body runs with `pending` bound, and the attacker's costs are charged there, so a cancel (NCS First Strike) means they are never paid.
-    - With no reaction available, the attack resolves at once. A reaction may offer a reaction of its own, which stacks (NCS Disarming Hook answering a First Strike). `!state` lists the open stack, and `!turn next` warns while it isn't empty.
-    - Every `!react` is an ordinary command, with its own undo step, approval and journal entry. With #28, the defender's player answers without the host.
+- **#36 Reaction framework.** Built (`docs/damage_reactions_design.md` §1-§9, CLAUDE.md §7.23) except what its §13 lists as still open: a GM-called `react_point()` (actions a formula starts are react points already), Discord buttons for the options (with #42).
   - From the combat systems:
     - Windows, in the order an attack resolves:
       - before the hit: NCS First Strike, FCS1 Preemptive Strike, Counterspell, Protect, Emergency Consumable;
@@ -455,7 +448,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
       - one reaction per attack (NCS);
       - one reaction until the unit's own next turn (Solis);
       - a bypass flag (FCS1 Preemptive Strike "bypasses the reactionary limit").
-      - Modelled as a #24 resource refilled at the reacting unit's turn start.
+      - Settled: counted with `reactions_used` in each reaction's condition (design §8), no limit rule.
     - Redirects: a reaction may change the pending hit's target (FCS1 Protect: swap places with the attacked ally and take the hit at half damage).
     - Multi-hit attacks offer one reaction per hit (NCS "blocking is done individually per incoming hit").
 - **#37 Elevation.** Per-cell height, high-ground LOS, `height_diff`, and a link to #16's `move_cost`.
@@ -476,6 +469,8 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Per-server storage (#41) and system status definitions, tables and macros (#140) have shipped.
 
 ### New
+
+- **#263 Movement-triggered reactions.** A later trigger kind for #36's reactions: a unit's move (leaving or entering a reach, crossing a cell) opens a reaction window the way an action does, for opportunity attacks and overwatch. Left out of #36's first version (user call); a reach aura's `on_exit` hook calling `react_point` covers it until then.
 
 - **#197 Scaling.**
   - Shipped: the spatial indexes (#154: units, zones and corpses by cell) and servers loaded on first use and unloaded when idle (`server_idle_unload_hours`).

@@ -2923,6 +2923,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Extra turns (#224): grant_turn / clear_extra_turns change the queue,
     # extra_turn_queue reads it.
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
+    # Reactions (#36): how many reactions a unit used since a point.
+    "reactions_used",
     # Void cells: cells of a map's rectangle that don't exist.
     "is_void", "void_cells", "void_add", "void_remove",
     # A status's layers (layered stacking), [[level, duration], ...].
@@ -3097,6 +3099,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    "reactions_used",
     "is_void", "void_cells",
     "status_layers",
     'watch_exists', 'watchers_of',
@@ -3584,6 +3587,11 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # passives, status ticks, tile / zone turn hooks, action bodies); False
     # during a regular turn.
     "extra_turn",
+    # Reactions (#36): the incoming action's locals as a reaction, the
+    # incoming body and a reaction's condition see them (`incoming.damage`,
+    # `incoming.cancel = True`); the units the action directly affects;
+    # and the word `fail(refund)` reads (None outside an action body).
+    "incoming", "affected", "refund",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -3669,7 +3677,12 @@ class EvalCtx:
 #                              raw value for target)
 #   cmd / fail               — callables (added to _ACTION_BUILTINS
 #                              and allowed as Call targets)
-_ACTION_BINDING_NAMES = frozenset({"source", "args", "target"})
+_ACTION_BINDING_NAMES = frozenset({"source", "args", "target",
+                                   # A reaction's own target and args
+                                   # (`!react <eid> <reaction> <target>
+                                   # k=v`); `target` / `args` are the
+                                   # incoming action's there (#36).
+                                   "reaction_target", "reaction_args"})
 
 
 def _is_python_dunder(name: str) -> bool:
@@ -3683,12 +3696,19 @@ def _is_python_dunder(name: str) -> bool:
 # cmd/fail plus the mid-body choice prompts. choose(prompt, list) returns
 # the chosen element; choose_number(prompt, lo, hi) returns the chosen int.
 # Both are supplied as action_bindings by the runner (action-mode only).
-_ACTION_BUILTINS = frozenset({"cmd", "fail", "choose", "choose_number"})
+_ACTION_BUILTINS = frozenset({"cmd", "fail", "choose", "choose_number",
+                              # Reactions (#36): a unit's copy of the
+                              # incoming action's locals, and a before
+                              # half's target swap.
+                              "incoming_of", "redirect"})
+# Attribute chains rooted at these bindings resolve at runtime in every
+# formula mode (a reaction's condition reads `incoming.taken`).
+_ANY_MODE_ATTR_ROOTS = frozenset({"incoming"})
 # Names that are loopable in action mode WITHOUT being a Call. Lets
 # `for x in target:` work for *_list target types. The runtime will
 # error cleanly if the loop runs against a non-iterable (e.g. for a
 # target=entity action where the GM iterates `target`).
-_ACTION_LOOPABLE_NAMES = frozenset({"target"})
+_ACTION_LOOPABLE_NAMES = frozenset({"target", "affected"})
 
 
 def _collect_program_locals(tree: ast.AST,
@@ -3925,7 +3945,12 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         bound value) surface cleanly through the runner's exception
         handler."""
         if not self.action_mode:
-            return False
+            root = node
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if not (isinstance(root, ast.Name)
+                    and root.id in _ANY_MODE_ATTR_ROOTS):
+                return False
         cur = node
         while isinstance(cur, ast.Attribute):
             # Python DUNDER attributes are never a legitimate GM read and are
@@ -3945,7 +3970,12 @@ class _EntityAccessTransformer(ast.NodeTransformer):
                     f"Attribute '{cur.attr}' is not allowed — Python "
                     f"dunder attributes are blocked in action bodies.")
             cur = cur.value
-        return isinstance(cur, ast.Name)
+        # `incoming_of(eid).damage` (#36): a reaction's copy, read and
+        # written by attribute like `incoming`.
+        return isinstance(cur, ast.Name) or (
+            self.action_mode and isinstance(cur, ast.Call)
+            and isinstance(cur.func, ast.Name)
+            and cur.func.id == "incoming_of")
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
         # match.<path> read — rewrite to __read_match("path"). Checked
@@ -7411,12 +7441,16 @@ class FormulaEngine:
 
         def _use_action(eid_t: Any, name: Any,
                         target_arg: Any = None,
-                        args_arg: Any = None) -> bool:
+                        args_arg: Any = None) -> Any:
             """use_action(eid, name, target=None, args=None): invoke an
             action on `eid` from inside another formula or action body.
             Returns True on a clean successful run, False if the action
-            cleanly fail()ed. Unexpected errors propagate as
-            FormulaError. Counts toward the action_recursion_limit."""
+            cleanly fail()ed or was cancelled, None when it waits on a
+            reaction window (a formula outside any action: a passive, a
+            watcher, a hook). Inside an action it is a react point: the
+            action's windows open and the step runs again once they
+            close. Unexpected errors propagate as FormulaError. Counts
+            toward the action_recursion_limit."""
             if not isinstance(name, str) or not name:
                 raise FormulaError("use_action(eid, name): name must be a non-empty string.")
             eid, e = _resolve_entity(eid_t, "use_action")
@@ -7444,27 +7478,23 @@ class FormulaEngine:
                     f"use_action(args=...): args must be a dict, got "
                     f"{type(args_arg).__name__}."
                 )
-            # Resolve a synchronous-friendly path through the runner.
-            # Because the formula engine is sync but run_action is
-            # async, we drive the coroutine with the same trampoline
-            # the action runner uses for cmd().
-            from action import run_action, _sync_dispatch_returning
-            # We need ctx and mgr; both are wired into FormulaEngine
-            # only loosely. Best path: stash them on the match when
-            # the outer action runner starts (already happens via the
-            # ctx/mgr closure variables in cmd()) — for use_action
-            # called from a passive or a top-level !eval there's no
-            # outer runner, so we look up via the match's manager
-            # attribute set up below.
-            mgr_local = getattr(match, "_runtime_mgr", None)
-            ctx_local = getattr(match, "_runtime_ctx", None)
+            # The formula engine is sync and run_action async: the
+            # reaction engine drives it with the trampoline cmd() uses.
+            # ctx / mgr come from the runner that set them on the match,
+            # else from the command running now (a passive or a watcher
+            # firing at the end of a command).
+            from logic import COMMAND_CTX
+            mgr_local = getattr(match, "_runtime_mgr", None) \
+                or CURRENT_WORKSPACE.get()
+            ctx_local = getattr(match, "_runtime_ctx", None) \
+                or COMMAND_CTX.get()
             if mgr_local is None or ctx_local is None:
                 raise FormulaError(
                     "use_action: no command context available — "
                     "this formula was evaluated outside an active "
-                    "command dispatch (e.g. an internal !eval). "
-                    "Call use_action from inside !action / !ent / a "
-                    "passive that fires during command processing."
+                    "command dispatch. Call use_action from inside "
+                    "!action / !ent / a passive that fires during command "
+                    "processing."
                 )
             from action import coerce_target, dedupe_targets
             try:
@@ -7476,19 +7506,19 @@ class FormulaEngine:
                                                   target_arg, name)
             if dup_note:
                 match.surface_log([dup_note])
-            coro = run_action(
-                action, actor_id=eid, target=target_arg,
-                args=args_dict, match=match, mgr=mgr_local,
-                ctx=ctx_local,
-            )
-            ok, why = _sync_dispatch_returning(coro)
+            import reactions
+            ok, why = reactions.formula_use(match, mgr_local, ctx_local,
+                                            action, eid, target_arg,
+                                            args_dict)
             # A status refusing the nested action (forbidden / immune /
             # the target's tags) is the engine's, worded by its rules: the
             # body only sees False, so the line reaches the chat. A body's
             # own fail() stays its own to report.
-            if not ok and isinstance(why, tuple) and len(why) == 2 \
-                    and why[0] in ("forbidden", "immune", "target_tags"):
+            if ok is False and isinstance(why, tuple) and len(why) == 2 \
+                    and why[0] in ("forbidden", "immune", "target_tags",
+                                   "target_condition", "reaction"):
                 match.surface_log([f"↳ use_action `{name}`: {why[1]}"])
+            # None: the action waits on a reaction window (#36).
             return ok
 
         def _one_action(eid_t: Any, name: Any, fname: str):
@@ -9268,6 +9298,24 @@ class FormulaEngine:
         ns["grant_turn"] = _grant_turn
         ns["clear_extra_turns"] = _clear_extra_turns
         ns["extra_turn_queue"] = _extra_turn_queue
+
+        def _reactions_used(eid_t: Any, since: Any = "own_turn",
+                            tag: Any = None) -> int:
+            """reactions_used(eid, since='own_turn', tag=None): how many
+            reactions unit `eid` has used (#36): since the start of its own
+            latest turn (`own_turn`, every one before its first turn), this
+            `round`, this `turn`, the `action` resolving now (the latest
+            one once it is over) or `ever`; `tag` (a tag filter) counts only
+            reactions with matching tags. A refunded reaction isn't counted.
+            The limits of a game go in a reaction's condition:
+            `reactions_used(self, 'own_turn') < 1`."""
+            import reactions
+            eid, _e = _resolve_entity(eid_t, "reactions_used")
+            try:
+                return reactions.reactions_used(match, eid, str(since), tag)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+        ns["reactions_used"] = _reactions_used
 
         def _turn_index() -> int:
             """turn_index(): the 0-based position of the acting entity
@@ -11140,7 +11188,8 @@ class FormulaEngine:
     def eval_program(self, src: str, ctx: EvalCtx,
                      *, action_mode: bool = False,
                      action_bindings: Optional[Dict[str, Any]] = None,
-                     locals_out: Optional[Dict[str, Any]] = None) -> Any:
+                     locals_out: Optional[Dict[str, Any]] = None,
+                     locals_in: Optional[Dict[str, Any]] = None) -> Any:
         """Run statements; if the source ends with an expression, return its value.
 
         locals_out       filled with the program's locals once its
@@ -11179,6 +11228,12 @@ class FormulaEngine:
         if trailing_expr is not None:
             full_locals = full_locals | _collect_program_locals(
                 ast.Expression(body=trailing_expr), known, action_mode)
+        # Locals given before the program runs (an action's body starts
+        # with its `prepare`'s locals, #36): readable from the first line.
+        preset = {k: v for k, v in (locals_in or {}).items()
+                  if isinstance(k, str) and k.isidentifier()
+                  and not k.startswith("__")}
+        full_locals = full_locals | frozenset(preset)
 
         full = _EntityAccessTransformer(
             full_locals, action_mode=action_mode, locals_ok=True,
@@ -11192,6 +11247,9 @@ class FormulaEngine:
         ns = self._namespace(ctx)
         if action_bindings:
             ns.update(action_bindings)
+        for k, v in preset.items():
+            if k not in ns or k in full_locals:
+                ns[k] = v
         try:
             if full.body:
                 exec(compile(_guard_arith(full), "<formula>", "exec"), ns)
@@ -11334,6 +11392,7 @@ def validate_program(
     src: str,
     known_funcs: "frozenset[str]" = frozenset(),
     *, action_mode: bool = False,
+    known_params: "frozenset[str]" = frozenset(),
 ) -> None:
     """
     Parse and validate a formula in program mode (statements + optional
@@ -11353,7 +11412,18 @@ def validate_program(
     """
     FormulaEngine._prepare(
         src, "exec", known_funcs=known_funcs, action_mode=action_mode,
+        known_params=known_params,
     )
+
+
+def program_locals(src: str) -> "frozenset[str]":
+    """The bare-name locals program `src` binds (empty when it doesn't
+    parse): an action's `prepare` locals, which its body starts with."""
+    try:
+        tree = ast.parse(src or "", mode="exec")
+    except SyntaxError:
+        return frozenset()
+    return frozenset(_collect_action_locals(tree))
 
 # ---- the formula function reference (`!help function`, #202) -------------
 # Built once from a throwaway match's namespace: every built-in function's

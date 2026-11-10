@@ -32,6 +32,12 @@ FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
 COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
     contextvars.ContextVar("vtt_command_user", default=None))
 
+# The reply context of the running top-level command (CommandRegistry._run_top
+# sets it): an action a formula outside any action starts (a passive's
+# use_action) runs through it (#36).
+COMMAND_CTX: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar("vtt_command_ctx", default=None))
+
 # Set by the running command (CommandRegistry._run) to a one-item list; a
 # change the command's own replay couldn't redo (a line that needs another
 # match, transfer_entity) sets its item True, and the command is journaled
@@ -4881,6 +4887,129 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "bounds that work and catches a body that loops choose() "
             "unboundedly. Hitting it raises an engine fault. Raise it if "
             "you legitimately need more interactive picks in one action."
+        ),
+    },
+    # ---- Reactions (#36, docs/damage_reactions_design.md) ----
+    "reaction_mode": {
+        "default": "ask",
+        "schema": {"type": "enum", "choices": ["ask", "auto", "never"]},
+        "desc": (
+            "How a unit answers the reaction windows it is offered (a unit's "
+            "own `__reaction_mode` var overrides it). ask (default): the "
+            "action waits until the unit picks with `!react <unit> "
+            "<reaction>` or passes (`!react <unit> pass`), or a host runs "
+            "`!react skip`. auto: the engine picks each available reaction "
+            "whose `auto_when` is true (a reaction without one whenever it "
+            "is available), by priority, up to reactions_per_window. never: "
+            "the unit is never offered a reaction."
+        ),
+    },
+    "reactions_per_window": {
+        "default": 1,
+        "schema": {"type": "int", "min": 1, "unlimited": True},
+        "desc": (
+            "How many reactions one unit may pick in one reaction window "
+            "(-1 = no limit). A unit's own `__reactions_per_window` var "
+            "overrides it. A unit is done picking once it passes, reaches "
+            "this, or has nothing available left. Limits across windows "
+            "(once per round, once until the unit's next turn) go in a "
+            "reaction's condition with reactions_used()."
+        ),
+    },
+    "reaction_tiebreak": {
+        "default": "picked",
+        "schema": {"type": "enum", "choices": ["picked", "turn_order"]},
+        "desc": (
+            "The order of picked reactions of equal effective priority when "
+            "a window closes: picked (default, the order they were picked) "
+            "or turn_order (the reactors' turn order, then picked)."
+        ),
+    },
+    "reaction_cancel_priority": {
+        "default": 1000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Added to the priority of a reaction whose before half assigns "
+            "`incoming.cancel` anywhere (detected; `!action info` says "
+            "'cancels: yes'), so cancels run before the other reactions of a "
+            "window. 0 turns the bonus off. A dodge (`incoming.avoid`) gets "
+            "none."
+        ),
+    },
+    "reaction_continuation_priority": {
+        "default": 500,
+        "schema": {"type": "int"},
+        "desc": (
+            "Added to the priority of the after half of a reaction picked in "
+            "the before window (block-then-counter's counter), so it runs "
+            "ahead of after-only reactions of the same priority. 0 turns it "
+            "off."
+        ),
+    },
+    "reaction_on_cancel": {
+        "default": "refund",
+        "schema": {"type": "enum", "choices": ["refund", "keep"]},
+        "desc": (
+            "What happens to a picked reaction that hasn't run yet when an "
+            "earlier one cancels the action (a reaction's own "
+            "`reaction_on_cancel` field overrides it). refund (default): it "
+            "is dropped as if never picked; nothing runs, its cost isn't "
+            "paid and it doesn't count for reactions_used. keep: its before "
+            "half runs with `incoming.cancelled` true, pays and counts."
+        ),
+    },
+    "cancelled_action_cost": {
+        "default": "refund",
+        "schema": {"type": "enum", "choices": ["refund", "pay"]},
+        "desc": (
+            "Whether an action cancelled by a reaction pays its `cost` "
+            "program (an action's own `cancelled_action_cost` field "
+            "overrides it). refund (default): it pays nothing. pay: its "
+            "`cost` runs anyway (the mana of a countered spell is spent)."
+        ),
+    },
+    "reaction_depth_limit": {
+        "default": 2,
+        "schema": {"type": "int", "min": 0, "max": 8},
+        "desc": (
+            "How deep reactions may answer reactions: an action a reaction's "
+            "half starts (`use_action` in a riposte) opens windows of its own "
+            "while the chain is at most this many reactions deep; past it, "
+            "such actions run with no windows. 0 = actions reactions start "
+            "are never reacted to. A reaction with `reactable: false` never "
+            "lets its actions be reacted to."
+        ),
+    },
+    "reaction_window_expiry_seconds": {
+        "default": -1,
+        "schema": {"type": "int", "min": 1, "unlimited": True},
+        "desc": (
+            "How long a reaction window may stay open, in seconds (-1 = "
+            "never, the default). Once it has run out, the next command on "
+            "the match closes it as skipped and the action resolves with "
+            "the reactions picked so far. Measured from when the window "
+            "opened in this bot process (a restart starts the count again)."
+        ),
+    },
+    "reaction_hold_commands": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "While a reaction window is open, refuse the typed commands that "
+            "would move the game on under it: `!action`, `!turn next / set / "
+            "grant`, and the walks (`!ent move / push / pull / swap`, group "
+            "moves), with a reply saying a host must `!react skip` first. "
+            "Everything else runs. Off: those run, and an action used while "
+            "a window is open opens no window of its own."
+        ),
+    },
+    "reactions_cover_parts": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a unit's target reactions (`reacts_on: target`) are "
+            "also offered when one of its body parts is what an action "
+            "affects (the dragon's block when its wing is struck)."
         ),
     },
     "action_cmd_allowlist": {
@@ -12260,11 +12389,15 @@ class UnitFlags:
     __slots__ = ("flags", "holders", "changed", "ctx")
     WATCHERS = 1
     ZONE_GRANT = 2
+    # The unit's vars hold a reaction (#36): an `actions` entry with a
+    # `before` or `after` half.
+    REACTIONS = 4
 
     def __init__(self) -> None:
         self.flags: Dict[str, int] = {}
         self.holders: Dict[int, Set[str]] = {self.WATCHERS: set(),
-                                             self.ZONE_GRANT: set()}
+                                             self.ZONE_GRANT: set(),
+                                             self.REACTIONS: set()}
         self.changed: Set[str] = set()
         self.ctx: Any = None
 
@@ -12286,6 +12419,8 @@ class UnitFlags:
                     f |= self.WATCHERS
                 if ZONE_GRANT_KEY in inst:
                     f |= self.ZONE_GRANT
+        if _holds_reaction(e.vars):
+            f |= self.REACTIONS
         return f
 
     def _set(self, eid: str, f: int) -> None:
@@ -12322,6 +12457,20 @@ class UnitFlags:
     def holders_of(self, match: "Match", bit: int) -> Set[str]:
         self.ensure(match)
         return self.holders[bit]
+
+
+def _holds_reaction(node: Any, depth: int = 0) -> bool:
+    """Whether vars `node` hold a reaction anywhere: an `actions` dict with
+    an entry holding a `before` or `after` half (#36)."""
+    if not isinstance(node, dict) or depth > STORE_DEPTH_LIMIT:
+        return False
+    acts = node.get("actions")
+    if isinstance(acts, dict) and any(
+            isinstance(a, dict) and ("before" in a or "after" in a)
+            for a in acts.values()):
+        return True
+    return any(_holds_reaction(v, depth + 1) for k, v in node.items()
+               if k != "actions" and isinstance(v, dict))
 
 
 def _holds_key(node: Any, key: str) -> bool:
@@ -12409,6 +12558,20 @@ class Match:
     # Serialized and undo state.
     extra_turns: List[str] = field(default_factory=list)
     extra_turn: Optional[str] = None
+    # Reactions (#36, docs/damage_reactions_design.md): the exchange stack
+    # (actions resolving their reactions; the top one's window is open, one
+    # below paused at a react point; reactions.py), the queue of actions a
+    # formula started while a window was open, the exchange counter, the reactions units
+    # used (reactions_used(), the newest REACTION_LOG_MAX), and per unit the
+    # turns_elapsed at which its own latest turn began. Serialized and undo
+    # state; `_reaction_opened` (wall clock, for
+    # reaction_window_expiry_seconds) is runtime.
+    reaction_stack: List[Dict[str, Any]] = field(default_factory=list)
+    reaction_queue: List[Dict[str, Any]] = field(default_factory=list)
+    reaction_seq: int = 0
+    reaction_log: List[Dict[str, Any]] = field(default_factory=list)
+    own_turn_at: Dict[str, int] = field(default_factory=dict)
+    _reaction_opened: Optional[float] = field(default=None, repr=False)
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
 
@@ -20040,6 +20203,13 @@ class Match:
         # have acted).
         self._rebuild_turn_order()
 
+    @property
+    def reaction_exchange(self) -> Optional[Dict[str, Any]]:
+        """The exchange whose window is open (#36): the top of the reaction
+        stack (an action whose step paused at a react point sits below the
+        exchange it opened), None when no window is open."""
+        return self.reaction_stack[-1] if self.reaction_stack else None
+
     def current_entity_id(self) -> Optional[str]:
         """The unit whose turn it is: during an extra turn (#224) the unit
         taking it (None once it left), else the unit at active_index."""
@@ -20546,6 +20716,9 @@ class Match:
         e = self.entities.get(eid) if eid else None
         if e is None:
             return
+        # The turn its own latest turn began on (reactions_used(..,
+        # 'own_turn'), #36).
+        self.own_turn_at[e.id] = self.turns_elapsed
         rec = [e.id, e.map]
         self.last_actors[""] = list(rec)
         team = self._root_team(e)
@@ -27294,6 +27467,11 @@ class Match:
             "round_acted": list(self.round_acted),
             "extra_turns": list(self.extra_turns),
             "extra_turn": self.extra_turn,
+            "reaction_stack": jcopy(self.reaction_stack),
+            "reaction_queue": jcopy(self.reaction_queue),
+            "reaction_seq": self.reaction_seq,
+            "reaction_log": jcopy(self.reaction_log),
+            "own_turn_at": dict(self.own_turn_at),
             # Saved only while set: whether the current ATB turn is a
             # skipped one (its end fires no action surface, T7), and a
             # watcher chain waiting for a change (L28).
@@ -27508,6 +27686,20 @@ class Match:
                          if isinstance(xq, list) else [])
         xt = d.get("extra_turn")
         m.extra_turn = xt if isinstance(xt, str) else None
+        for key in ("reaction_stack", "reaction_queue"):
+            rx = d.get(key)
+            setattr(m, key, [jcopy(x) for x in rx if isinstance(x, dict)]
+                    if isinstance(rx, list) else [])
+        rs = d.get("reaction_seq")
+        m.reaction_seq = rs if isinstance(rs, int) and not isinstance(
+            rs, bool) and rs >= 0 else 0
+        rl = d.get("reaction_log")
+        m.reaction_log = ([jcopy(r) for r in rl if isinstance(r, dict)]
+                          if isinstance(rl, list) else [])
+        ot = d.get("own_turn_at")
+        m.own_turn_at = ({str(k): v for k, v in ot.items()
+                          if isinstance(v, int) and not isinstance(v, bool)}
+                         if isinstance(ot, dict) else {})
         m._atb_last_skipped = d.get("atb_turn_skipped") is True
         m._turn_order_dirty = d.get("turn_order_dirty") is True
         m._watcher_backlog = d.get("watcher_backlog") is True

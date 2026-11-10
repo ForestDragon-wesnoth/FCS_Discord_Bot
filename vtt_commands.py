@@ -17,7 +17,7 @@ from logic import (
 
 # Passive system
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY
-from logic import SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -216,7 +216,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
 # next`, `!history undo`). Only the bare invocation downgrades — `!undo`,
 # whose bare form itself mutates, deliberately stays gated.
 READ_ONLY_BARE_ROOTS: frozenset = frozenset({
-    "turn", "history", "match",
+    "turn", "history", "match", "react",
 })
 # Commands that dispatch arbitrary inner content of their own, so their real
 # authority is NOT visible in args[0]. `!foreach`'s read-only downgrade refuses
@@ -706,6 +706,11 @@ class CommandRegistry:
                            f"foreach or player-written macro for you: it "
                            f"needs a host (send it on its own).")
             return
+        if _GATE_LINES.get():
+            held = _reaction_hold_refusal(ctx, mgr, name, args)
+            if held:
+                await ctx.send(held)
+                return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
         # caller's current context. Same raw_args gate as run().
@@ -1040,6 +1045,8 @@ class CommandRegistry:
         user_token = COMMAND_USER.set(ctx_user_name(ctx) if ctx_user(ctx)
                                       or getattr(ctx, "user_name", None)
                                       else None)
+        # A passive's use_action runs through this command's context (#36).
+        cctx_token = COMMAND_CTX.set(ctx)
         # `map='view'` in a formula: the map this channel views on the
         # match the formula runs in.
         view_ctx = ctx
@@ -1110,6 +1117,7 @@ class CommandRegistry:
             if scan_token is not None:
                 PRIVATE_SCAN.reset(scan_token)
             CURRENT_WORKSPACE.reset(ws_token)
+            COMMAND_CTX.reset(cctx_token)
             FORMULA_LOG_SINK.reset(sink_token)
             _RUN_DEPTH.reset(depth_token)
 
@@ -1189,6 +1197,13 @@ class CommandRegistry:
                 if (bool(pm.rules.get("pause_affects_hosts", False))
                         and not _pause_control(name, args)):
                     return await self._hold_command(pm, name, args, ctx)
+        # An open reaction window holds the commands that would move the
+        # game on under it (reaction_hold_commands, #36): refused, never
+        # queued (a queued action would run against a changed board).
+        if not admin_cmd:
+            held = _reaction_hold_refusal(ctx, mgr, name, args)
+            if held:
+                return await ctx.send(held)
         # inline_args_access = host: a non-host's `$()` is refused here, for
         # every command (`!ent` and `!foreach` resolve theirs themselves) and
         # before a request is queued (approved, it would run with the
@@ -1326,6 +1341,13 @@ class CommandRegistry:
         other_token = (_OTHER_MATCH_PRE.set(other_pre)
                        if _OTHER_MATCH_PRE.get() is None else None)
         try:
+            # A reaction window past reaction_window_expiry_seconds closes
+            # as skipped inside this command (#36).
+            rm = (mgr.matches.get(pre_active_mid)
+                  if pre_active_mid and name.lower() != "as" else None)
+            if rm is not None and rm.reaction_exchange is not None:
+                import reactions
+                await reactions.settle_expiry(ctx, mgr, rm)
             result = await h(ctx, args, mgr)
         except VTTError as e:
             await ctx.send(f"❌ {e}")
@@ -3565,6 +3587,10 @@ def _typed_unit_view(ctx: ReplyContext, mgr: MatchManager,
 # `<field>_unless` restriction formulas.
 _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "condition", "effect", "cost",
+                                 # An action's other programs and a
+                                 # reaction's (#36).
+                                 "prepare", "affects", "target_condition",
+                                 "before", "after", "auto_when",
                                  "grant_condition",
                                  "death_effect", "__death_condition",
                                  "__map_vehicle_death_effect",
@@ -5383,13 +5409,22 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not math.isfinite(secs) or secs < 0:
             raise VTTError("The seconds are a number 0 or above.")
         n = 0
+        w = 0
         for m in mgr.matches.values():
             for req in m.pending_requests.values():
                 if isinstance(req.get("queued_at"), (int, float)):
                     req["queued_at"] -= secs
                     n += 1
+            # An open reaction window ages too (#36).
+            if m.reaction_exchange is not None:
+                if m._reaction_opened is None:
+                    m._reaction_opened = time.time()
+                m._reaction_opened -= secs
+                w += 1
         return await ctx.send(f"⏳ {secs:g} s passed for {n} pending "
-                              f"request(s).")
+                              f"request(s)" + (f" and {w} reaction "
+                                               f"window(s)" if w else "")
+                              + ".")
     if role == "idle":
         # A test hook (#197): every loaded server's last command is moved
         # <hours> back, then the idle sweep runs, as it would that much
@@ -10608,7 +10643,8 @@ def _lint_one(src: Any, mode: str, known: frozenset,
         return None
     try:
         if action_mode:
-            validate_program(src, known_funcs=known, action_mode=True)
+            validate_program(src, known_funcs=known, action_mode=True,
+                             known_params=params)
         else:
             validate_formula(src, mode=mode, known_funcs=known,
                              known_params=params)
@@ -10648,6 +10684,29 @@ def _status_watchers(sdef: Any) -> List[Tuple[str, Any]]:
     return out
 
 
+def _action_slots(where: str, act: Any):
+    """Lint slots of one action: its programs (the body starts with its
+    `prepare`'s locals) and, for a reaction (#36), its halves and
+    expressions."""
+    from formula import program_locals
+    pre = program_locals(act.prepare) if act.prepare else frozenset()
+    yield (where, act.body, "exec", pre, True)
+    for key in ("prepare", "cost"):
+        yield (f"{where} {key}", getattr(act, key), "exec",
+               pre if key == "cost" else frozenset(), True)
+    for key in ("affects", "target_condition"):
+        yield (f"{where} {key}", getattr(act, key), "eval", frozenset(),
+               False)
+    spec = act.reaction
+    if spec is not None:
+        for key in ("before", "after"):
+            yield (f"{where} {key}", getattr(spec, key), "exec",
+                   frozenset(), True)
+        for key in ("condition", "auto_when"):
+            yield (f"{where} {key}", getattr(spec, key), "eval",
+                   frozenset(), False)
+
+
 def _match_formula_slots(m: Match):
     """Every formula match `m` stores, as (where, source, mode, params,
     action_mode): its functions, global / team / unit passives, unit
@@ -10670,8 +10729,8 @@ def _match_formula_slots(m: Match):
             yield f"`{eid}` passive `{pid}`", p.formula, "exec", frozenset(), False
         for _aname, acts in sorted(discover_actions(e, m.rules).items()):
             for act in acts:
-                yield (f"`{eid}` action `{act.full_path}`", act.body, "exec",
-                       frozenset(), True)
+                yield from _action_slots(f"`{eid}` action `{act.full_path}`",
+                                         act)
     for wname, w in sorted(m.watchers.items()):
         yield (f"watcher `{wname}` condition", w.get("condition"), "eval",
                frozenset(), False)
@@ -26847,7 +26906,12 @@ registry.annotate_sub("mount", "info",
         "tags) cuts; statuses forbid actions or make their bearer immune "
         "by tag or name (`!status forbids_actions_with_tag`, ...), checked "
         "before the body. `info` lists the tags, `list` marks what is "
-        "forbidden now."
+        "forbidden now. Reactions (#36): an action may carry `prepare` "
+        "(run when it is used; its locals become `incoming` and the body's "
+        "starting locals), `cost` (run with the body), `affects` (the "
+        "units it affects, default its unit targets) and `target_condition`; "
+        "an action with a `before` and / or `after` half is a reaction, "
+        "offered in the window a typed action opens (see `!react`)."
     ),
 )
 async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -26883,6 +26947,102 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ctx, mgr, m, actor_id=actor_id,
         requested_name=requested, tail_tokens=tail,
     )
+
+
+@registry.command(
+    "react",
+    usage=("!react | !react <eid> <reaction> [target...] [k=v ...] "
+           "| !react <eid> pass | !react skip"),
+    desc=(
+        "Answer the open reaction window (#36): an action someone can react "
+        "to waits until every unit offered a reaction picks or passes. "
+        "Bare `!react` shows the window: the action, the picks so far and "
+        "each unit's options. `!react <eid> <reaction> ...` picks one (its "
+        "own target and `k=v` args follow, as for `!action`; the reaction "
+        "reads them as `reaction_target` / `reaction_args`, while `target`, "
+        "`args` and `actor` are the incoming action's). A unit picks up to "
+        "reactions_per_window. `pass` ends a unit's answers; `skip` (a "
+        "host) closes the window for everyone, keeping what was picked. "
+        "The command that closes a window runs it: the before halves, the "
+        "action, then the after window. See `!help action` and "
+        "docs/damage_reactions_design.md."
+    ),
+)
+async def react_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    import reactions
+    m = active_match(mgr, ctx)
+    ex = m.reaction_exchange
+    if ex is None:
+        if args:
+            raise VTTError("No reaction window is open on this match.")
+        return await ctx.send("No reaction window is open on this match.")
+    if not args:
+        return await ctx.send("\n".join(reactions.window_text(m, ex)))
+    if args[0].lower() == "skip":
+        _check_tail(args, 1, (), "!react skip")
+        if not _acts_as_host(ctx, m):
+            raise VTTError("Only a host closes the reaction window "
+                           "(`!react <eid> pass` passes one unit).")
+        return await reactions.react_skip(ctx, mgr, m)
+    if len(args) < 2:
+        raise VTTError("Usage: `!react <eid> <reaction> [target...]`, "
+                       "`!react <eid> pass` or `!react skip`.")
+    uid = _query_eid(ctx, m, args[0])
+    if args[1].lower() == "pass":
+        _check_tail(args, 2, (), "!react <eid> pass")
+        return await reactions.react_pass(ctx, mgr, m, uid)
+
+    def missing(eid: str, token: str) -> None:
+        if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
+            _query_eid(ctx, m, token)
+
+    def missing_corpse(cid: str) -> None:
+        _query_corpse(ctx, m, cid)
+
+    def map_of(spec: str) -> str:
+        return _resolve_maps(ctx, m, spec)[0].name
+    await reactions.react_pick(ctx, mgr, m, uid, args[1], list(args[2:]),
+                               missing=missing, missing_corpse=missing_corpse,
+                               map_of=map_of)
+
+
+registry.annotate_sub("react", "skip", usage="!react skip",
+                      desc="(A host) close the open reaction window for "
+                           "every unit still to answer; what was picked "
+                           "runs.")
+
+
+def _reaction_held(name: str, args: List[str]) -> bool:
+    """A typed command reaction_hold_commands refuses while a reaction
+    window is open: one that would move the game on under it."""
+    sub = str(args[0]).lower() if args else ""
+    if name == "action":
+        return bool(args) and sub not in ("list", "info")
+    if name == "ent":
+        return sub in ("move", "push", "pull", "swap", "action")
+    if name == "turn":
+        return sub in ("next", "set", "grant")
+    return False
+
+
+def _reaction_hold_refusal(ctx: ReplyContext, mgr: MatchManager,
+                           name: str, args: List[str]) -> Optional[str]:
+    """The refusal for a held command while the channel's match has a
+    reaction window open (reaction_hold_commands), else None. An expired
+    window doesn't hold: the command closes it first."""
+    if not _reaction_held(name, args):
+        return None
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    if m is None or m.reaction_exchange is None \
+            or not m.rules.get("reaction_hold_commands", True):
+        return None
+    import reactions
+    if reactions.expired(m):
+        return None
+    return ("❌ A reaction window is open (`!react` shows it): units are "
+            "still answering an action, so this waits. A host closes the "
+            "window with `!react skip` first.")
 
 
 async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
@@ -27089,17 +27249,84 @@ async def _action_info(
             lines.append(f"{label} {shown}")
     if act.say_format.strip():
         lines.append(f"Says:        {act.say_format}")
+    lines += _reaction_info_lines(m, act, private)
     lines += [f"⚠️ {p}" for p in act.tag_problems]
     forbid = "" if disguised else _action_forbid_note(m, actor_id, act)
     if forbid:
         lines.append(f"Forbidden:   {forbid}")
-    lines += [
-        "Body:",
-        "```",
-        _private_text(m) if private else formula_text(act.body),
-        "```",
-    ]
+    for key, label in (("prepare", "Prepare:"), ("cost", "Cost:")):
+        src = getattr(act, key)
+        if src:
+            lines += [label, "```", _private_text(m) if private
+                      else formula_text(src), "```"]
+    if act.body or act.reaction is None:
+        lines += [
+            "Body:",
+            "```",
+            _private_text(m) if private else formula_text(act.body),
+            "```",
+        ]
+    spec = act.reaction
+    if spec is not None:
+        for key, label in (("before", "Before half:"),
+                           ("after", "After half:")):
+            src = getattr(spec, key)
+            if src:
+                lines += [label, "```", _private_text(m) if private
+                          else formula_text(src), "```"]
     await ctx.send("\n".join(lines))
+
+
+def _reaction_info_lines(m: Match, act: Any, private: bool) -> List[str]:
+    """`!action info`'s lines for an action's reaction fields (#36)."""
+    import reactions
+    out: List[str] = []
+
+    def ftext(src: str) -> str:
+        return _private_text(m) if private else formula_text(src)
+    if act.affects:
+        out.append(f"Affects:     `{ftext(act.affects)}`")
+    if act.target_condition:
+        out.append(f"Target condition: `{ftext(act.target_condition)}`")
+    if act.cancelled_action_cost:
+        out.append(f"If cancelled, its cost: {act.cancelled_action_cost}")
+    spec = act.reaction
+    if spec is None:
+        return out
+    halves = " and ".join(h for h in ("before", "after")
+                          if getattr(spec, h)) or "none"
+    out.append(f"Reaction:    halves {halves}; reacts on "
+               + ("units it affects" if spec.reacts_on == "target"
+                  else "any action (a bystander)")
+               + "; to " + (("actions tagged " + (
+                   " or ".join(f"`{t}`" for t in spec.reacts_to)
+                   if isinstance(spec.reacts_to, list)
+                   else f"`{spec.reacts_to}`"))
+                   if spec.reacts_to is not None else "every action"))
+    if spec.condition:
+        out.append(f"Condition:   `{ftext(spec.condition)}`")
+    if spec.before:
+        out.append(f"Cancels:     {'yes (detected)' if spec.cancels else 'no'}"
+                   f"; before priority "
+                   f"{reactions.effective_priority(m, act, 'before'):g}")
+    if spec.after:
+        out.append(f"After half:  when the action {spec.after_on}"
+                   f"; priority "
+                   f"{reactions.effective_priority(m, act, 'after'):g}"
+                   + (f" (+{int(m.rules.get('reaction_continuation_priority', 500))}"
+                      f" after a before pick)" if spec.before else ""))
+    if spec.self_trigger:
+        out.append("Self trigger: yes (offered on its holder's own actions)")
+    if not spec.reactable:
+        out.append("Reactable:   no (the actions its halves start open no "
+                   "reaction windows)")
+    if spec.on_cancel:
+        out.append(f"On cancel:   {spec.on_cancel}")
+    if spec.auto_when:
+        out.append(f"Auto when:   `{ftext(spec.auto_when)}`")
+    # A reaction never offered, and a reacts_to that doesn't parse, are
+    # among the action's problems (the ⚠️ lines below).
+    return out
 
 
 async def _run_action_dispatch(
@@ -27234,6 +27461,27 @@ async def _run_action_dispatch(
         else:
             import dataclasses
             action = dataclasses.replace(action, container_path="")
+    # Reactions (#36): a typed action that units may react to (or that
+    # has a `prepare`) runs through the reaction exchange, which may open a
+    # window and finish in a later `!react` command. An action used while
+    # a window is open (reaction_hold_commands off) opens none.
+    import reactions
+    if (m.reaction_exchange is None and m._action_depth == 0
+            and (action.prepare or reactions.has_holders(m))):
+        try:
+            return await reactions.begin(
+                ctx, mgr, m, action, actor_id=actor_id,
+                eff_actor_id=eff_actor_id, target=target_value,
+                args=args_dict, answers=answers, extra_ctx=extra_ctx,
+                via=mount_paths.get(action.full_path),
+                rider_mode=(action.full_path in mount_paths
+                            and eff_actor_id == actor_id))
+        except FormulaError:
+            if not FORMULA_TEXT_HIDDEN.get():
+                raise
+            return await ctx.send(
+                f"❌ action `{action.name}`: its formula failed (formula "
+                f"text is {HIDDEN_FORMULA_TEXT} here); nothing was changed.")
     prev_ctx = getattr(m, "_runtime_ctx", None)
     prev_mgr = getattr(m, "_runtime_mgr", None)
     m._runtime_ctx = ctx
