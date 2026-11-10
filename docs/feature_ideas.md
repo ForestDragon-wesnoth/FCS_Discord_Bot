@@ -256,11 +256,11 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - With action tags (#234) shipped: Solis shock forbids every action with a cooldown, so an action with a cooldown could carry a derived tag (`cooldown`) a status can forbid; until then the GM tags those actions by hand.
 - **#23 Declarative action targeting.** `range`, `requires_los` and `relation` fields on an action, checked before the body runs, with the refusal reason reported.
   - See #24's sketch, which covers #22, #23 and #24 together.
-- **#24 Action economy.** `turn_resources` pools (actions, bonus actions, movement) refilled at turn start, plus a `cost` field on actions that spends from them.
+- **#24 Action economy.** `turn_resources` pools (actions, bonus actions, movement) refilled at turn start, spent by actions' `cost` programs (#36).
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
     - Action fields:
       - `kind`: standard, free, reaction, charged, combo;
-      - `cost`: `{stamina: 8}`, with `cost_fallback` for "pay the rest in hp" (FCS1 and NCS Lethal Determination, NCS Revenant);
+      - `cost`: a formula program like `prepare` / `body`, run by the engine at #36's cost point (user call; no `{stamina: 8}` shorthand). "Pay the rest in hp" (FCS1 and NCS Lethal Determination, NCS Revenant) is written in it;
       - `cooldown` in the owner's own turns;
       - `uses_per_turn`;
       - `range` with a metric, `requires_los`, `relation`;
