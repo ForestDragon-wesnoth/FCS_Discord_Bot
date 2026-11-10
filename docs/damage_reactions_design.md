@@ -188,9 +188,10 @@ effective priority.
 call): each half's effective priority (its `after_priority`, else
 `priority`), plus the rule `reaction_continuation_priority` for the after
 half of a reaction picked in the before window, then the tiebreak. The
-continuation bonus lets a block-then-counter's counter run ahead of
-after-only picks of the same priority; setting the rule to 0 turns it
-off.
+continuation bonus (default 500, half the cancel bonus; the two never
+meet, since nothing cancels in an after window) lets a block-then-counter's
+counter run ahead of after-only picks of the same priority; setting the
+rule to 0 turns it off.
 
 ## 6. Re-reading the action at resolution
 
@@ -210,6 +211,17 @@ target"):
   the target tag filters and `target_condition`. A unit that fails drops
   out as if it had avoided. A reaction applying an "invisible" status
   works this way when the action refuses or is immune to such targets.
+- **Redirects** (user call): a before half may call `redirect(old,
+  new)`, which puts `new` in `old`'s place among the action's targets and
+  in `affected`. `new` takes over `old`'s `incoming` copy, and `old`
+  leaves the action as if it had avoided it, so FCS1 Protect (swap places,
+  take the hit at half damage) is a swap, a redirect and a block applied
+  to the copy the protector inherited. Only an action whose target is a
+  unit id or a list of ids can be redirected: a targetless action, a
+  location target or a unit reached only through an area's `affects` is
+  refused, and the refusal fails that half alone (§3 step 6). The re-check
+  below judges `new` like any target, so a redirect onto an immune unit
+  drops it as invalid.
 - **Fewer targets, or none, still resolves** (user call): the body runs
   with what is left (its secondary effects run), the cost is paid, and
   bystanders see the action as resolved. A unit that dropped out sees it
@@ -245,9 +257,11 @@ target"):
   default the reactions' effects stay (costs paid, statuses applied,
   recorded as used), and only the body's own changes roll back. `fail`
   takes `refund` among its arguments (`fail(refund)`, `fail('slipped',
-  refund)`) to roll the whole exchange back to before the window: the
-  reactions' effects and costs too, and nothing recorded as used. A
-  failed body pays no `cost`, refund or not.
+  refund)`, `fail('dodge', 'slipped', refund)`; `refund` is a word bound in
+  action bodies, like `true`, and can't name a local or a unit;
+  `fail('x', refund=True)` works too) to roll the whole exchange back to
+  before the window: the reactions' effects and costs too, and nothing
+  recorded as used. A failed body pays no `cost`, refund or not.
 
 ## 8. Limits and nesting
 
@@ -336,13 +350,7 @@ that break on damage) and #239 (kill credit) attach.
 
 ## 11. Details found open while writing this file
 
-- **Redirects:** FCS1 Protect swaps places with the attacked ally and
-  takes the hit at half damage. A target that moved stays the target
-  (§6 re-checks validity, not identity), so a reaction needs a way to
-  replace a unit in the action's targets (and give the new one the old
-  one's `incoming` copy).
-- **`reaction_continuation_priority`'s default**, and whether `refund`
-  in `fail` is a bare word bound in action bodies or `refund=True`.
+None at the moment.
 
 ## 12. Set aside for later (user call)
 
