@@ -166,10 +166,21 @@ class ActionFail(Exception):
     via the `fail_reason` binding. Empty string means "no reason
     tag" (the single-arg `fail("msg")` form)."""
 
-    def __init__(self, message: str, *, reason: str = ""):
+    def __init__(self, message: str, *, reason: str = "",
+                 refund: bool = False):
         super().__init__(message)
         self.message = message
         self.reason = reason
+        # fail(refund) (#36): a body failing after reactions ran rolls the
+        # whole exchange back, the reactions' effects too.
+        self.refund = refund
+
+
+class _RefundWord(str):
+    """The word `refund` bound in action bodies, which fail() reads."""
+
+
+REFUND = _RefundWord("refund")
 
 
 class ActionValidationError(VTTError):
@@ -297,6 +308,170 @@ class ActionEngineFault(Exception):
 
 
 # ----------------------------------------------------------------------
+# Reaction fields (#36)
+# ----------------------------------------------------------------------
+
+REACTS_ON = ("target", "any")
+AFTER_ON = ("resolved", "cancelled", "any")
+ON_CANCEL = ("refund", "keep")
+CANCEL_COST = ("refund", "pay")
+
+
+@dataclass
+class ReactionSpec:
+    """What makes an action a reaction (docs/damage_reactions_design.md
+    §2): its halves, what it answers, when it is available and how it
+    orders. `cancels` is detected: the before half assigns
+    `incoming.cancel` somewhere in its text."""
+    before: str = ""
+    after: str = ""
+    reacts_to: Any = None          # a checked tag filter, or None = any
+    reacts_to_error: str = ""      # a filter that doesn't parse: matches nothing
+    reacts_on: str = "target"
+    condition: str = ""
+    after_on: str = "resolved"
+    priority: float = 0
+    before_priority: Optional[float] = None
+    after_priority: Optional[float] = None
+    self_trigger: bool = False
+    on_cancel: Optional[str] = None   # reaction_on_cancel override
+    auto_when: str = ""
+    cancels: bool = False
+    # A bystander reaction without a condition is never offered.
+    disabled: str = ""
+
+
+def detects_cancel(src: str) -> bool:
+    """Whether the program `src` assigns `incoming.cancel` (or
+    `incoming_of(...).cancel`) anywhere, a branch included."""
+    import ast
+    try:
+        tree = ast.parse(src or "", mode="exec")
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for t in node.targets:
+            if not (isinstance(t, ast.Attribute) and t.attr == "cancel"):
+                continue
+            v = t.value
+            if isinstance(v, ast.Name) and v.id == "incoming":
+                return True
+            if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                    and v.func.id == "incoming_of"):
+                return True
+    return False
+
+
+def _formula_field(raw: Dict[str, Any], key: str, full_path: str,
+                   problems: List[str]) -> str:
+    """A formula-text field of an action dict (normalized), "" when
+    absent; a value that isn't text is named in `problems` and ignored."""
+    from formula import normalize_body_source
+    v = raw.get(key)
+    if v is None or v == "":
+        return ""
+    if not isinstance(v, str):
+        problems.append(f"`{full_path}.{key}` isn't formula text "
+                        f"({type(v).__name__}); it is ignored.")
+        return ""
+    return normalize_body_source(v)
+
+
+def _expression_field(raw: Dict[str, Any], key: str, full_path: str,
+                      problems: List[str]) -> str:
+    """An expression field that may also hold a bool: `!ent set_var u
+    actions.r.condition true` stores True, which reads as always."""
+    v = raw.get(key)
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    return _formula_field(raw, key, full_path, problems)
+
+
+def _word_field(raw: Dict[str, Any], key: str, choices: Tuple[str, ...],
+                default: Optional[str], full_path: str,
+                problems: List[str]) -> Optional[str]:
+    v = raw.get(key)
+    if v is None:
+        return default
+    w = str(v).strip().lower()
+    if w not in choices:
+        problems.append(f"`{full_path}.{key}` must be one of "
+                        f"{', '.join(choices)}, not {v!r}; "
+                        f"{default or 'the rule'} applies.")
+        return default
+    return w
+
+
+def _number_field(raw: Dict[str, Any], key: str, full_path: str,
+                  problems: List[str]) -> Optional[float]:
+    import math
+    v = raw.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+            or not math.isfinite(v):
+        try:
+            v = float(str(v))
+            if not math.isfinite(v):
+                raise ValueError
+        except ValueError:
+            problems.append(f"`{full_path}.{key}` must be a number, "
+                            f"not {raw.get(key)!r}; it is ignored.")
+            return None
+    return int(v) if float(v).is_integer() else float(v)
+
+
+def _parse_reaction(raw: Dict[str, Any], full_path: str,
+                    problems: List[str]) -> Optional[ReactionSpec]:
+    """The reaction fields of an action dict, or None for an action that
+    has neither half."""
+    if raw.get("before") is None and raw.get("after") is None:
+        return None
+    spec = ReactionSpec()
+    spec.before = _formula_field(raw, "before", full_path, problems)
+    spec.after = _formula_field(raw, "after", full_path, problems)
+    rt = raw.get("reacts_to")
+    if rt is not None and not tag_filter_empty(rt):
+        try:
+            spec.reacts_to = check_tag_filter(rt)
+        except VTTError as ex:
+            spec.reacts_to = rt
+            spec.reacts_to_error = str(ex)
+            problems.append(f"`{full_path}.reacts_to`: {ex} It matches "
+                            f"nothing until fixed.")
+    spec.reacts_on = _word_field(raw, "reacts_on", REACTS_ON, "target",
+                                 full_path, problems) or "target"
+    spec.condition = _expression_field(raw, "condition", full_path,
+                                       problems)
+    spec.after_on = _word_field(raw, "after_on", AFTER_ON, "resolved",
+                                full_path, problems) or "resolved"
+    spec.priority = _number_field(raw, "priority", full_path, problems) or 0
+    spec.before_priority = _number_field(raw, "before_priority", full_path,
+                                         problems)
+    spec.after_priority = _number_field(raw, "after_priority", full_path,
+                                        problems)
+    st = raw.get("self_trigger")
+    if isinstance(st, str):
+        st = st.strip().lower() in ("true", "yes", "on", "1")
+    spec.self_trigger = bool(st)
+    spec.on_cancel = _word_field(raw, "reaction_on_cancel", ON_CANCEL, None,
+                                 full_path, problems)
+    spec.auto_when = _expression_field(raw, "auto_when", full_path,
+                                       problems)
+    spec.cancels = bool(spec.before) and detects_cancel(spec.before)
+    if not spec.before and not spec.after:
+        spec.disabled = "it has no `before` or `after` text"
+    elif spec.reacts_on == "any" and not spec.condition:
+        spec.disabled = ("a `reacts_on: any` reaction needs a `condition` "
+                         "(`condition: true` answers every action)")
+    if spec.disabled:
+        problems.append(f"`{full_path}` is never offered: {spec.disabled}.")
+    return spec
+
+
+# ----------------------------------------------------------------------
 # Action dataclass
 # ----------------------------------------------------------------------
 
@@ -354,6 +529,20 @@ class Action:
     # body's locals, `self` / `target` (names as each view sees the unit,
     # `.name` / `.<var path>`) and `args.<key>`. "" = none.
     say_format: str = ""
+    # Reactions (#36, docs/damage_reactions_design.md): `prepare` runs when
+    # the action is used, before any reaction window, its locals becoming
+    # `incoming`; `cost` runs right before the body (a cancelled action's
+    # per cancelled_action_cost); `affects` names the units the action
+    # directly affects (default its entity targets); `target_condition`
+    # judges each target when the action is used and again at resolution.
+    prepare: str = ""
+    cost: str = ""
+    affects: str = ""
+    target_condition: str = ""
+    cancelled_action_cost: Optional[str] = None
+    # Set when the action is a reaction (it holds a `before` and / or
+    # `after` half).
+    reaction: Optional["ReactionSpec"] = None
 
     @staticmethod
     def from_dict(
@@ -370,7 +559,11 @@ class Action:
                 f"(got {type(raw).__name__})."
             )
         body = raw.get("body", "")
-        if not isinstance(body, str) or not body.strip():
+        is_reaction = (raw.get("before") is not None
+                       or raw.get("after") is not None)
+        if is_reaction and body in (None, ""):
+            body = ""
+        elif not isinstance(body, str) or not body.strip():
             raise ActionValidationError(
                 f"action '{name}' at `{full_path}`: `body` is "
                 f"required and must be a non-empty string."
@@ -433,6 +626,14 @@ class Action:
             except VTTError as ex:
                 problems.append(f"`{full_path}.{key}`: {ex}")
                 filters[key] = raw_f
+        prepare = _formula_field(raw, "prepare", full_path, problems)
+        cost = _formula_field(raw, "cost", full_path, problems)
+        affects = _formula_field(raw, "affects", full_path, problems)
+        target_condition = _formula_field(raw, "target_condition",
+                                          full_path, problems)
+        cancel_cost = _word_field(raw, "cancelled_action_cost", CANCEL_COST,
+                                  None, full_path, problems)
+        reaction = _parse_reaction(raw, full_path, problems)
         return Action(
             name=name, body=body, description=description,
             target_type=target_type,
@@ -442,6 +643,9 @@ class Action:
             target_requires_tags=filters.get("target_requires_tags"),
             target_refuses_tags=filters.get("target_refuses_tags"),
             say_format=normalize_body_source(say_format),
+            prepare=prepare, cost=cost, affects=affects,
+            target_condition=target_condition,
+            cancelled_action_cost=cancel_cost, reaction=reaction,
         )
 
 
@@ -1195,6 +1399,26 @@ async def run_action(
     ctx: Any,           # ReplyContext for cmd()'s dispatch output
     answers: Optional[List[Any]] = None,  # pre-supplied choose() answers
     extra_ctx: Optional[Dict[str, Any]] = None,  # extra hook-ctx bindings
+    # Reactions (#36). `steps`: the programs to run, in order, as one
+    # transaction (default prepare, cost, body: those the action has).
+    # `preset_locals`: locals the first step starts with (a resolving
+    # body gets its prepare's). `prepare_out` / `body_out`: filled with
+    # those steps' locals. `finish`: run the success tail (say_format,
+    # hooks, the log); a prepare-only run doesn't. `skip_checks`: the
+    # restrictions and target_condition were judged already (a
+    # resolution re-checks them itself). `extra_bindings`: merged into the
+    # body's bindings last. `fail_out`: gets "refund" when fail(refund).
+    # `target_out`: gets the target as the checks left it ("target") and
+    # how many choice answers the run used ("answers_used").
+    steps: Optional[Tuple[str, ...]] = None,
+    preset_locals: Optional[Dict[str, Any]] = None,
+    prepare_out: Optional[Dict[str, Any]] = None,
+    body_out: Optional[Dict[str, Any]] = None,
+    finish: bool = True,
+    skip_checks: bool = False,
+    extra_bindings: Optional[Dict[str, Any]] = None,
+    fail_out: Optional[Dict[str, Any]] = None,
+    target_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Execute an action body transactionally.
 
@@ -1356,7 +1580,7 @@ async def run_action(
             raise ActionFail(f"cmd(): `{line}` failed its assertion.",
                              reason="assert")
 
-    def _fail(*fail_args: Any) -> None:
+    def _fail(*fail_args: Any, refund: Any = False) -> None:
         """fail(message) | fail(reason, message): abort the action
         body cleanly. The runner catches ActionFail, rolls back to
         pre-state, fires on_action_failed (when reachable), and
@@ -1367,7 +1591,15 @@ async def run_action(
         Reason is a GM-chosen tag like "cost", "out_of_range",
         "invalid_target". It's surfaced to on_action_failed passives
         via the `fail_reason` binding so reactive logic can
-        discriminate between failure modes."""
+        discriminate between failure modes. The word `refund` among the
+        arguments (or refund=True) makes a body failing after reactions
+        ran roll the whole exchange back, the reactions too (#36)."""
+        refund_flag = bool(refund) or any(type(a) is _RefundWord
+                                          for a in fail_args)
+        fail_args = tuple(a for a in fail_args if type(a) is not _RefundWord)
+        if not fail_args:
+            raise ActionFail("the action failed.", reason="",
+                             refund=refund_flag)
         if len(fail_args) == 1:
             reason = ""
             message = str(fail_args[0])
@@ -1377,10 +1609,10 @@ async def run_action(
         else:
             raise ActionFail(
                 "fail() takes 1 or 2 arguments: fail(message) or "
-                "fail(reason, message).",
+                "fail(reason, message), plus the word refund.",
                 reason="usage",
             )
-        raise ActionFail(message, reason=reason)
+        raise ActionFail(message, reason=reason, refund=refund_flag)
 
     def _choose(prompt: Any, options: Any) -> Any:
         """choose(prompt, options): present `options` (a list) and return
@@ -1445,6 +1677,10 @@ async def run_action(
             return n
         raise ChoiceNeeded(str(prompt), options=None, lo=lo_i, hi=hi_i)
 
+    def _no_window(*_a: Any, **_k: Any) -> Any:
+        raise ActionFail("incoming_of() / redirect() work only while an "
+                         "action resolves its reactions.", reason="usage")
+
     bindings = {
         "source": source,
         "args": args_proxy,
@@ -1453,7 +1689,23 @@ async def run_action(
         "fail": _fail,
         "choose": _choose,
         "choose_number": _choose_number,
+        "refund": REFUND,
+        "reaction_target": None,
+        "reaction_args": ArgsProxy({}),
+        "incoming_of": _no_window,
+        "redirect": _no_window,
     }
+    if extra_bindings:
+        bindings.update(extra_bindings)
+    if steps is None:
+        steps = ("prepare", "cost", "body")
+    programs = [(k, getattr(action, k)) for k in steps
+                if isinstance(getattr(action, k, ""), str)
+                and getattr(action, k, "").strip()]
+    if not programs and "body" in steps:
+        # A reaction without a body of its own runs only through !react.
+        return _finish_body_less(action, match, pre_action_depth,
+                                 is_top_level)
 
     def _finish_action_fail(af: "ActionFail") -> Tuple[bool, Optional[str]]:
         """Shared tail for a clean abort (body fail() OR a cancelled /
@@ -1485,8 +1737,10 @@ async def run_action(
 
     # Statuses that forbid the action, or make its targets immune (#234),
     # before the body runs; an immune unit in a list target is dropped.
-    refusal = _restriction_refusal(action, actor_id, target, match,
-                                   extra_ctx)
+    refusal = None if skip_checks else _restriction_refusal(
+        action, actor_id, target, match, extra_ctx)
+    if refusal is None and not skip_checks and action.target_condition:
+        refusal = _target_condition_refusal(action, actor_id, target, match)
     if refusal is not None:
         reason, message, kept, notes = refusal
         if reason:
@@ -1498,7 +1752,8 @@ async def run_action(
             else:
                 match.surface_log(notes)
         target = kept
-        bindings["target"] = target
+        if not (extra_bindings and "target" in extra_bindings):
+            bindings["target"] = target
 
     # The teams that see the actor as it begins: they see the action used
     # (recorded on success, below).
@@ -1551,12 +1806,28 @@ async def run_action(
                 # caller's reader, so the outcome hung on who ran it (L45).
                 reader_token = VAR_READER.set(None)
                 try:
-                    engine.eval_program(
-                        action.body, eval_ctx,
-                        action_mode=True,
-                        action_bindings=bindings,
-                        locals_out=body_locals,
-                    )
+                    carried: Dict[str, Any] = dict(preset_locals or {})
+                    for kind, src in programs:
+                        out_locals: Dict[str, Any] = {}
+                        engine.eval_program(
+                            src, eval_ctx,
+                            action_mode=True,
+                            action_bindings=bindings,
+                            locals_out=out_locals,
+                            locals_in=carried,
+                        )
+                        if kind == "prepare":
+                            # The body starts with the prepare's locals.
+                            carried = dict(carried, **out_locals)
+                            if prepare_out is not None:
+                                prepare_out.clear()
+                                prepare_out.update(out_locals)
+                        elif kind == "body":
+                            body_locals.clear()
+                            body_locals.update(out_locals)
+                            if body_out is not None:
+                                body_out.clear()
+                                body_out.update(out_locals)
                 finally:
                     VAR_READER.reset(reader_token)
                     _CROSS_LEVELS.reset(levels_token)
@@ -1587,6 +1858,8 @@ async def run_action(
                 # Buffered command echoes are DISCARDED — the action
                 # rolled back, so its partial output would mislead.
                 _rollback_all()
+                if fail_out is not None:
+                    fail_out["refund"] = bool(getattr(af, "refund", False))
                 return _finish_action_fail(af)
             except ActionEngineFault:
                 # Engine refusal (recursion / choice limit). Roll back
@@ -1603,7 +1876,9 @@ async def run_action(
                     match._runtime_buffer = None
                 raise
             else:
-                if is_top_level:
+                if target_out is not None:
+                    target_out["answers_used"] = match._choice_cursor
+                if is_top_level and finish:
                     # Answers the body never asked for (user call: warn,
                     # still run): a typo'd count, or a body that took
                     # another branch than the caller expected.
@@ -1624,6 +1899,16 @@ async def run_action(
             match._choice_answers = []
             match._choice_cursor = 0
 
+    if target_out is not None:
+        target_out["target"] = target
+    if not finish:
+        # A prepare-only run (#36): its output goes out, nothing else.
+        if is_top_level:
+            flush = match._runtime_buffer
+            match._runtime_buffer = None
+            if flush is not None and flush.out:
+                await ctx.send("\n".join(str(x) for x in flush.out))
+        return True, None
     # The action's say_format line (#215), about the actor.
     if action.say_format.strip():
         match.say(say_format_text(match, action.say_format, actor_id, target,
@@ -1860,6 +2145,68 @@ def _restriction_refusal(action: Action, actor_id: str, target: Any,
     return None
 
 
+def target_condition_ok(action: Action, actor_id: str, tid: str,
+                        match: "Match") -> Tuple[bool, str]:
+    """Whether target `tid` meets the action's target_condition (#36;
+    `self` = the actor, `target` = the target), and the error text when
+    the formula fails (a failing formula is not met)."""
+    if not action.target_condition:
+        return True, ""
+    from formula import FormulaEngine, EvalCtx
+    try:
+        ok = FormulaEngine(match).eval_expression(
+            action.target_condition,
+            EvalCtx(this=match.current_entity_id(), target=actor_id,
+                    extras={"target": tid, "actor": actor_id,
+                            "action_name": action.name,
+                            "action_tags": list(action.tags)}))
+        return bool(ok), ""
+    except Exception as ex:      # noqa: BLE001 - reported, not raised
+        return False, str(ex)
+
+
+def _target_condition_refusal(action: Action, actor_id: str, target: Any,
+                              match: "Match",
+                              ) -> Optional[Tuple[str, str, Any, List[str]]]:
+    """Like _restriction_refusal, for the action's target_condition: a
+    single target that fails refuses the action; a list drops the ones
+    that fail, refused only when none is left."""
+    if action.target_type not in ("entity", "entity_list"):
+        return None
+
+    def line(tid: str, err: str) -> str:
+        return (f"`{tid}` doesn't meet `{action.name}`'s target condition"
+                + (f" (its formula failed: {err})" if err else "") + ".")
+    if action.target_type == "entity" and isinstance(target, str):
+        ok, err = target_condition_ok(action, actor_id, target, match)
+        return None if ok else ("target_condition", line(target, err),
+                                target, [])
+    if isinstance(target, list):
+        kept, dropped = [], []
+        for tid in target:
+            ok, err = target_condition_ok(action, actor_id, tid, match)
+            (kept if ok else dropped).append((tid, err))
+        if not dropped:
+            return None
+        if not kept:
+            return ("target_condition",
+                    "\n".join(line(t, e) for t, e in dropped), target, [])
+        return "", "", [t for t, _e in kept], [
+            f"⚠️ `{action.name}` dropped a target: {line(t, e)}"
+            for t, e in dropped]
+    return None
+
+
+def _finish_body_less(action: Action, match: "Match", depth: int,
+                      top: bool) -> Tuple[bool, Any]:
+    """A reaction without a body of its own used as an action: refused."""
+    match._action_depth = depth
+    if top:
+        match._runtime_buffer = None
+    return False, ("reaction", f"`{action.name}` is a reaction: it runs "
+                   f"through `!react` while a reaction window offers it.")
+
+
 def _target_tag_lines(action: Action, actor_id: str, tid: str,
                       match: "Match", corpse: bool) -> List[str]:
     """Why target `tid` (a unit, or a corpse id) fails the action's
@@ -2024,6 +2371,8 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_death_check_deferred_ids", "_deleting_maps", "_watcher_backlog",
         "_alive_eval_depth", "_vision_memo", "_spatial", "_uflags", "_size_touch", "_turn_order_dirty",
         "_request_seq", "pending_requests", "held_commands",
+        # Wall clock of the open reaction window (expiry; runtime).
+        "_reaction_opened",
         # Event bus: the live emit stack/depth + warning latch. Resetting
         # these mid-emit corrupts the outer emit (the verified crash).
         "_event_depth", "_event_stack", "_event_warned", "_event_warnings",

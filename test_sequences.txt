@@ -38808,3 +38808,881 @@ every match on a system inheriting from it follows, so the scout in
 `pb` (on `kid`) gets the default as the knight in `pa` does, and it
 fires there (10 -> 12 at the scout's turn start). Removing it from
 `base` takes it off both.
+
+
+SCENARIO 1093 — A block reaction lowers the damage its attacker's prepare forecast (#36)
+---------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = 10"
+!ent set_var orc actions.cleave.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.block.reacts_to melee
+!ent set_var hero actions.block.before "incoming.damage = incoming.damage - 6"
+!action info hero block
+?? Reaction:    halves before; reacts on units it affects; to actions tagged `melee`
+?? Cancels:     no; before priority 0
+!action orc cleave hero
+?? reactions are offered before it resolves
+?? `!react hero block` — or `!react hero pass`
+!assert "entity[hero].hp == 30"
+!react
+?? (before it resolves)
+!react hero block
+?? Hero picks `block`
+?? `orc` used action `cleave`
+!assert "entity[hero].hp == 26"
+!action orc cleave hero
+!react hero pass
+?? Hero passes
+!assert "entity[hero].hp == 16"
+!react
+?? No reaction window is open
+
+Expected: The orc's `cleave` has a `prepare` (`damage = 10`) and a body
+reading `damage`. The hero holds `block`, a reaction (a `before` half)
+answering melee actions. `!action orc cleave hero` runs the prepare and
+opens a before window instead of resolving: nothing has happened yet
+(hero 30). `!react` shows the window. Picking `block` closes it (the
+hero was the only unit to answer): the before half lowers the hero's copy
+of `incoming.damage` to 4, and the body starts with `damage` = 4 (hero
+26). Passing the next window lets the full 10 through (16).
+
+
+SCENARIO 1094 — Block-then-counter is one reaction; the counter runs before an after-only reaction (#36)
+------------------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc trail ""
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.prepare "damage = 10"
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - damage\ndealt = damage"
+!ent set_var hero actions.parry.before "incoming.damage = incoming.damage - 4"
+!ent set_var hero actions.parry.after "entity[actor].trail = entity[actor].trail + 'p' + str(incoming.dealt)\nentity[actor].hp = entity[actor].hp - 2"
+!ent set_var hero actions.thorns.after "entity[actor].trail = entity[actor].trail + 't'\nentity[actor].hp = entity[actor].hp - 1"
+!action info hero parry
+?? After half:  when the action resolved; priority 0 (+500 after a before pick)
+!action orc slash hero
+?! thorns
+!react hero parry
+?? has resolved: reactions to it are offered
+?? `!react hero thorns`
+!assert "entity[hero].hp == 24 and entity[orc].hp == 30"
+!react hero thorns
+?? Hero's `parry` follows up
+!assert "entity[orc].trail == 'p6t' and entity[orc].hp == 27"
+!system set default reaction_continuation_priority 0
+!ent set_var hero actions.thorns.priority 1
+!action orc slash hero
+!react hero parry
+!react hero thorns
+!assert "entity[orc].trail == 'p6ttp6'"
+
+Expected: `parry` has both halves: picked once in the before window, its
+before half lowers the damage (hero 30 -> 24) and its after half, the
+counter, runs once the action resolved. `thorns` is after-only, so the
+before window doesn't offer it; once the action resolved an after window
+opens for the units it reached. Its after halves run in one order: the
+parry's counter gets reaction_continuation_priority (+500) as the after
+half of a before pick, so it runs before thorns (trail `p6t`; the
+counter reads the body's local `dealt` = 6 through `incoming`). With the
+bonus at 0 and thorns at priority 1, thorns runs first (`tp6`).
+
+
+SCENARIO 1095 — A bystander's counterspell cancels; picked reactions are refunded, the cost too (#36)
+----------------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent add wiz Wizard 20 5 5 1
+!ent set_var orc mana 20
+!ent set_var orc actions.fireball.target entity
+!ent set_var orc actions.fireball.tags spell
+!ent set_var orc actions.fireball.prepare "damage = 12"
+!ent set_var orc actions.fireball.cost "entity[self].mana = entity[self].mana - 5"
+!ent set_var orc actions.fireball.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.ward.before "incoming.damage = 0"
+!ent set_var hero actions.ward.cost "entity[self].hp = entity[self].hp - 1"
+!ent set_var wiz actions.counterspell.reacts_on any
+!ent set_var wiz actions.counterspell.reacts_to spell
+!ent set_var wiz actions.counterspell.condition "actor != self"
+!ent set_var wiz actions.counterspell.before "incoming.cancel = True"
+!action info wiz counterspell
+?? Cancels:     yes (detected); before priority 1000
+!action orc fireball hero
+?? `!react wiz counterspell`
+!react hero ward
+!react wiz counterspell
+?? Wizard reacts: `counterspell`
+?? Hero's `ward` is refunded: the action was cancelled
+?? Orc's `fireball` is cancelled by Wizard's `counterspell`
+!assert "entity[hero].hp == 30 and entity[orc].mana == 20"
+!assert "reactions_used('wiz', 'ever') == 1 and reactions_used('hero', 'ever') == 0"
+!system set default cancelled_action_cost pay
+!system set default reaction_on_cancel keep
+!action orc fireball hero
+!react hero ward
+!react wiz counterspell
+?? Hero reacts: `ward`
+!assert "entity[orc].mana == 15 and entity[hero].hp == 29"
+!assert "reactions_used('hero', 'ever') == 1"
+
+Expected: The wizard isn't affected by the fireball: `counterspell` is a
+bystander reaction (`reacts_on: any`, with the condition it needs). Its
+before half assigns `incoming.cancel`, so it cancels (`!action info`:
+"cancels: yes (detected)", priority 0 + 1000) and runs first though the
+hero picked first. The hero's `ward` is refunded (reaction_on_cancel
+refund): it doesn't run, its cost (1 hp) isn't paid, and it isn't
+recorded as used. The orc's cost doesn't run either (cancelled_action_cost
+refund: mana 20). With the rules at `pay` and `keep`, the orc pays its
+mana (15) and the ward runs on the cancelled action, paying its hp (29),
+counted as used.
+
+
+SCENARIO 1096 — Per-action and per-reaction cancel overrides; after_on cancelled (#36)
+-------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent add wiz Wizard 20 5 5 1
+!ent set_var orc mana 20
+!ent set_var orc actions.bolt.target entity
+!ent set_var orc actions.bolt.cancelled_action_cost pay
+!ent set_var orc actions.bolt.cost "entity[self].mana = entity[self].mana - 3"
+!ent set_var orc actions.bolt.body "entity[target].hp = entity[target].hp - 8"
+!ent set_var hero actions.brace.before "entity[self].braced = True"
+!ent set_var hero actions.brace.reaction_on_cancel keep
+!ent set_var hero actions.gloat.after "entity[self].gloated = True"
+!ent set_var hero actions.gloat.after_on cancelled
+!ent set_var hero actions.punish.after "entity[actor].hp = entity[actor].hp - 5"
+!ent set_var wiz actions.negate.reacts_on any
+!ent set_var wiz actions.negate.condition true
+!ent set_var wiz actions.negate.before "incoming.cancel = True"
+!action orc bolt hero
+!react hero brace
+!react wiz negate
+?? Hero reacts: `brace`
+?? `!react hero gloat`
+?! punish
+!react hero gloat
+!assert "entity[hero].braced == True and entity[hero].gloated == True"
+!assert "entity[orc].mana == 17 and entity[orc].hp == 30 and entity[hero].hp == 30"
+
+Expected: The bolt's own `cancelled_action_cost: pay` overrides the rule
+(refund): cancelled, it still pays its 3 mana. The hero's `brace` carries
+`reaction_on_cancel: keep`, so it runs although the wizard's `negate`
+(`condition: true`, a bystander answering every action) cancelled the
+bolt. In the after window the cancelled bolt offers `gloat` (`after_on:
+cancelled`) and not `punish` (`after_on` resolved, the default: a
+retaliation against a fully prevented action makes no sense).
+
+
+SCENARIO 1097 — A dodge takes one unit out of a sweep; each unit keeps its own incoming (#36)
+--------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent add ally Ally 30 3 1 2
+!ent set_var orc actions.sweep.target entity_list
+!ent set_var orc actions.sweep.prepare "damage = 8"
+!ent set_var orc actions.sweep.body "for t in target:\n    entity[t].hp = entity[t].hp - incoming_of(t).damage"
+!ent set_var hero actions.dodge.before "incoming.avoid = True"
+!ent set_var hero actions.dodge.after "entity[actor].hp = entity[actor].hp - 2"
+!ent set_var hero actions.dodge.after_on cancelled
+!ent set_var ally actions.brace.before "incoming.damage = 4"
+!action orc sweep hero ally
+?? Orc's `sweep` on Hero, Ally
+!react hero dodge
+!react ally brace
+?? Hero's `dodge` follows up
+!assert "entity[hero].hp == 30 and entity[ally].hp == 26 and entity[orc].hp == 28"
+
+Expected: One window covers both targets. The hero's dodge sets
+`incoming.avoid`, taking the hero out of the sweep (its target list is
+read again before the body: the body loops over the ally alone). The
+ally's brace sets its OWN copy's damage to 4, read by the body with
+`incoming_of(t)`; the hero's copy is untouched. The dodge's after half
+(`after_on: cancelled`) runs: for a unit that left the action, it
+counts as cancelled (the riposte after a miss, orc 30 -> 28).
+
+
+SCENARIO 1098 — Protect: a bystander redirects the attack onto itself and halves it (#36)
+----------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent add guard Guard 40 3 1 2
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.prepare "damage = 10"
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var orc actions.burn.target location
+!ent set_var orc actions.burn.body "x = 1"
+!ent set_var guard actions.protect.reacts_on any
+!ent set_var guard actions.protect.condition "target != self and actor != self"
+!ent set_var guard actions.protect.before "redirect(target, self)\nincoming_of(self).damage = incoming_of(self).damage / 2"
+!action orc slash hero
+?? `!react guard protect`
+!react guard protect
+!assert "entity[hero].hp == 30 and entity[guard].hp == 35"
+!action orc burn 4 4
+!react guard protect
+?? Guard's `protect` failed: [redirect]
+?? `orc` used action `burn`
+!assert "reactions_used('guard', 'ever') == 1"
+
+Expected: The guard isn't a target: `protect` is a bystander reaction.
+`redirect(target, self)` puts the guard in the hero's place among the
+targets and in `affected`, the guard takes over the hero's `incoming`
+copy and halves it there (`incoming_of(self)`), and the hero leaves the
+action. The body hits the guard for 5; the hero is untouched. A location
+target can't be redirected: the half fails alone (`[redirect]`, rolled
+back, not counted as used) and the burn resolves.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1099 — A failing body keeps the reactions' effects unless it fails with refund (#36)
+--------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var hero stamina 5
+!ent set_var orc actions.slip.target entity
+!ent set_var orc actions.slip.body "fail('slipped', refund)"
+!ent set_var orc actions.trip.target entity
+!ent set_var orc actions.trip.body "fail('balance', 'slipped')"
+!ent set_var hero actions.block.before "entity[self].stamina = entity[self].stamina - 1"
+!ent set_var hero actions.mock.after "entity[self].mocked = True"
+!action orc slip hero
+!react hero block
+?? ❌ action `slip`: slipped (refunded: the reactions are undone too)
+!assert "entity[hero].stamina == 5 and reactions_used('hero', 'ever') == 0"
+!action orc trip hero
+!react hero block
+?? ❌ action `trip`: [balance] slipped
+?! mock
+!assert "entity[hero].stamina == 4 and reactions_used('hero', 'ever') == 1"
+!assert "not var_has('hero', 'mocked')"
+
+Expected: `fail('slipped', refund)` (the word `refund` among fail's
+arguments) rolls the whole exchange back: the block's stamina cost too,
+and the block isn't counted. A plain `fail` rolls back only the body: the
+block's effect stays (stamina 4) and counts. A failed action counts as
+failed for after windows, so `mock` (after_on resolved) isn't offered.
+
+
+SCENARIO 1100 — Auto mode: auto_when reads the forecast; a never unit isn't offered (#36)
+----------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 60 2 1 3
+!ent add ally Ally 30 3 1 2
+!ent set_var hero __reaction_mode auto
+!ent set_var orc actions.hit.target entity
+!ent set_var orc actions.hit.prepare "damage = args.n"
+!ent set_var orc actions.hit.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.block.before "incoming.damage = incoming.damage / 2"
+!ent set_var hero actions.block.auto_when "incoming.damage > 20"
+!ent set_var ally actions.cheer.reacts_on any
+!ent set_var ally actions.cheer.condition true
+!ent set_var ally actions.cheer.before "entity[self].cheered = True"
+!ent set_var ally __reaction_mode never
+!action orc hit hero n=10
+?? Hero doesn't react
+?? `orc` used action `hit`
+!assert "entity[hero].hp == 50"
+!action orc hit hero n=30
+?? Hero reacts with `block`
+!assert "entity[hero].hp == 35"
+!ent delete_var ally __reaction_mode
+!system set default reaction_mode auto
+!action orc hit hero n=2
+?? Ally reacts with `cheer`
+!assert "entity[ally].cheered == True and entity[hero].hp == 33"
+
+Expected: An auto unit picks at once, so no window waits on it: the
+hero's `block` is picked only when its `auto_when` holds against the
+forecast (`incoming.damage > 20`: not at 10, yes at 30, halved to 15).
+The ally (`__reaction_mode never`) isn't offered its `cheer`. Without
+the var, the rule `reaction_mode auto` makes the ally pick `cheer` (no
+auto_when: picked whenever available).
+
+
+SCENARIO 1101 — An open window holds the turn and moves; restart, skip and undo (#36)
+------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 10"
+!ent set_var hero actions.block.before "entity[self].blocked = True"
+!action orc slash hero
+!turn next
+?? A reaction window is open
+!ent move orc 1 down
+?? A host closes the window with `!react skip` first
+!action orc slash hero
+?? A reaction window is open
+!ent hp hero 28
+?? Set `hero` hp to 28
+!as restart
+!react
+?? Reactions to Orc's `slash` on Hero
+!react skip
+?? The host closes the reaction window
+!assert "entity[hero].hp == 18"
+!undo command
+!react
+?? `!react hero block`
+!undo command
+!undo command
+!react
+?? No reaction window is open
+!system set default reaction_hold_commands false
+!action orc slash hero
+!turn next
+?! A reaction window is open
+
+Expected: While the window is open, `!turn next`, `!ent move` and another
+`!action` are refused (reaction_hold_commands) with a reply naming
+`!react skip`; a host's hp edit runs. The window is saved with the
+match: after `!as restart` it is still open. `!react skip` closes it
+with nothing picked, and the slash resolves (28 -> 18). Undoing the skip
+reopens the window; undoing the hp edit and the attack closes it with
+nothing having happened. With the rule off, `!turn next` runs while a
+window is open.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1102 — A window past reaction_window_expiry_seconds closes as skipped (#36)
+-----------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!system set default reaction_window_expiry_seconds 60
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 10"
+!ent set_var hero actions.block.before "incoming.x = 1"
+!action orc slash hero
+!as wait 30
+?? and 1 reaction window(s)
+!list
+?! ran out
+!assert "entity[hero].hp == 30"
+!as wait 31
+!list
+?? The reaction window ran out (reaction_window_expiry_seconds); it closes as skipped
+?? `orc` used action `slash`
+!assert "entity[hero].hp == 20"
+
+Expected: The rule counts from when the window opened (`!as wait`, the
+test hook, ages it). At 30 s the window stays open; past 60 s the next
+command on the match (a `!list`) closes it as skipped before running,
+and the slash resolves with nothing picked.
+
+
+SCENARIO 1103 — reactions_used counts uses since a point; a limit is a line in the condition (#36)
+-------------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 1"
+!ent set_var hero actions.block.tags guard
+!ent set_var hero actions.block.before "x = 1"
+!ent set_var hero actions.block.condition "reactions_used(self, 'own_turn') < 1"
+!turn next
+!action orc slash hero
+?? `!react hero block`
+!react hero block
+!action orc slash hero
+?! !react hero block
+?? `orc` used action `slash`
+!assert "reactions_used('hero') == 1 and reactions_used('hero', 'ever') == 1"
+!assert "reactions_used('hero', 'turn') == 1 and reactions_used('hero', 'round') == 1"
+!assert "reactions_used('hero', 'action') == 0"
+!assert "reactions_used('hero', 'ever', 'guard') == 1 and reactions_used('hero', 'ever', 'magic') == 0"
+!turn next
+!assert "reactions_used('hero') == 0 and reactions_used('hero', 'ever') == 1"
+!action orc slash hero
+?? `!react hero block`
+!react hero pass
+!eval "reactions_used('hero', 'week')"
+?? reactions_used(since=): one of own_turn, round, turn, action, ever
+
+Expected: The engine records each reaction used (unit, reaction, the
+action it answered, turn and round). `block`'s condition limits it to
+once per the hero's own turn: after one use the next slash offers
+nothing (it resolves at once). `turn` / `round` / `ever` count it,
+`action` counts the uses on the latest action (none: the second slash
+had no reaction), `tag=` filters by the reaction's tags. Once the hero's
+own turn starts, `own_turn` counts from there (0) and the block is
+offered again. An unknown `since` word is refused.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1104 — Two picks per unit, priority, then the tiebreak rule (#36)
+-------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent add ally Ally 30 3 1 9
+!ent set_var orc log ""
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 1"
+!ent set_var hero __reactions_per_window 2
+!ent set_var hero actions.a.before "entity[actor].log = entity[actor].log + 'a'"
+!ent set_var hero actions.b.before "entity[actor].log = entity[actor].log + 'b'"
+!ent set_var hero actions.b.priority 5
+!ent set_var ally actions.c.reacts_on any
+!ent set_var ally actions.c.condition true
+!ent set_var ally actions.c.before "entity[actor].log = entity[actor].log + 'c'"
+!action orc slash hero
+!react hero a
+?? It can add: `!react hero b` — or `!react hero pass`
+!react ally c
+!react hero b
+!assert "entity[orc].log == 'bac'"
+!system set default reaction_tiebreak turn_order
+!action orc slash hero
+!react hero a
+!react ally c
+!react hero pass
+!assert "entity[orc].log == 'bacca'"
+
+Expected: `__reactions_per_window 2` lets the hero pick twice (the reply
+after the first pick says what it can still add). Before halves run in
+one global order: priority first (`b`, 5), then ties in the order
+picked (`a` before `c`). With reaction_tiebreak turn_order, ties follow
+the reactors' turn order: the ally (initiative 9) before the hero.
+
+
+SCENARIO 1105 — A combo answers its holder's own attack; a formula's action opens no window (#36)
+------------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.tags melee
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var orc actions.combo.reacts_on any
+!ent set_var orc actions.combo.reacts_to melee
+!ent set_var orc actions.combo.self_trigger true
+!ent set_var orc actions.combo.condition "actor == self"
+!ent set_var orc actions.combo.after "entity[target].hp = entity[target].hp - 1"
+!ent set_var orc actions.twice.target entity
+!ent set_var orc actions.twice.body "use_action(self, 'slash', target)"
+!action orc slash hero
+?? `orc` used action `slash`
+?? `!react orc combo`
+!react orc combo
+!assert "entity[hero].hp == 24"
+!action orc twice hero
+?? `slash` ran from a formula, so reactions to it weren't offered
+!assert "entity[hero].hp == 19"
+!ent set_var orc actions.combo.self_trigger false
+!action orc slash hero
+?! !react orc combo
+!assert "entity[hero].hp == 14"
+
+Expected: `combo` is an after-only reaction to the orc's own melee
+attacks: `self_trigger: true` lets it answer its holder's actions
+(reacts_on any, condition `actor == self`). After the slash resolves,
+the after window offers it, and it hits again (30 -> 25 -> 24). A slash
+`use_action` starts from a formula runs without windows; the reply says
+reactions weren't offered. With self_trigger off, the orc's own slash
+offers it nothing.
+
+
+SCENARIO 1106 — A gunner's seat reaction defends its vehicle (#36)
+-----------------------------------------------------------------
+
+!match new rx Rx 10 10
+!match use rx
+!ent add tank Tank 40 3 3 0
+!ent set_var tank footprint_w 2
+!ent set_var tank slots.gunner.capacity 1
+!ent set_var tank slots.gunner.actions.flak.reacts_on any
+!ent set_var tank slots.gunner.actions.flak.condition "target == 'tank'"
+!ent set_var tank slots.gunner.actions.flak.before "incoming_of(target).damage = 0\nentity[self].fired = 1"
+!ent add gun Gunner 10 6 1 5
+!mount gun tank gunner
+!ent add orc Orc 30 1 1 5
+!ent set_var orc actions.shoot.target entity
+!ent set_var orc actions.shoot.prepare "damage = 9"
+!ent set_var orc actions.shoot.body "entity[target].hp = entity[target].hp - damage"
+!action orc shoot tank
+?? - Gunner can react: `!react gun flak`
+?! - Tank can react
+!react gun flak
+!assert "entity[tank].hp == 40 and entity['gun'].fired == 1"
+!mount dismount gun
+!action orc shoot tank
+?? `orc` used action `shoot`
+!assert "entity[tank].hp == 31"
+
+Expected: The flak reaction lives in the tank's `gunner` seat: it is
+offered to the unit riding there (the tank itself isn't offered its
+seats' reactions), runs as the rider (mount_action_actor rider: `self`
+is the gunner) and zeroes the tank's copy of the damage. Dismounted, the
+gunner holds no reaction and the shot resolves at once.
+
+
+SCENARIO 1107 — A multi-tile body: its parts and every covered cell bring its reactions (#36)
+--------------------------------------------------------------------------------------------
+
+!match new rx Rx 10 10
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add drake Drake 50 5 5 4
+!ent set_var drake footprint_w 2
+!ent set_var drake footprint_h 2
+!part add drake wing wing 20 20
+!part locate wing 8 5
+!ent set_var orc actions.shoot.target entity
+!ent set_var orc actions.shoot.prepare "damage = 9"
+!ent set_var orc actions.shoot.body "entity[target].hp = entity[target].hp - damage"
+!ent set_var orc actions.quake.target location
+!ent set_var orc actions.quake.affects "entities_in_area(target, 0)"
+!ent set_var orc actions.quake.prepare "damage = 6"
+!ent set_var orc actions.quake.body "for u in affected:\n    entity[u].hp = entity[u].hp - incoming_of(u).damage"
+!ent set_var drake actions.shield.before "incoming.damage = incoming.damage - 5"
+!action orc shoot wing
+?? Orc's `shoot` on wing
+?? `!react drake shield`
+!react drake shield
+!assert "entity[wing].hp == 16 and entity[drake].hp == 50"
+!action orc quake 6 6
+?? `!react drake shield`
+!react drake shield
+!assert "entity[drake].hp == 49"
+!system set default reactions_cover_parts false
+!action orc shoot wing
+?? `orc` used action `shoot`
+!assert "entity[wing].hp == 7"
+
+Expected: The 2x2 drake's located wing is struck: with
+reactions_cover_parts on, the drake's target reaction answers it and
+reads the wing's copy (`incoming` = the copy of the part it covers),
+so the wing takes 4. The quake's `affects` names the units covering
+(6, 6), the drake's bottom-right cell, not its anchor: the drake is
+affected and shields (6 - 5 = 1). With the rule off the wing's hit
+offers the drake nothing.
+
+
+SCENARIO 1108 — target_condition: checked when used and again at resolution (#36)
+--------------------------------------------------------------------------------
+
+!match new rx Rx 10 10
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 5 5 3
+!ent set_var orc actions.zap.target entity
+!ent set_var orc actions.zap.target_condition "not status_has(target, 'invisible')"
+!ent set_var orc actions.zap.body "if target != None:\n    entity[target].hp = entity[target].hp - 10\nentity[self].zaps = 1"
+!ent set_var hero actions.vanish.before "status_apply(self, 'invisible')"
+!action info orc zap
+?? Target condition: `not status_has(target, 'invisible')`
+!action orc zap hero
+!react hero vanish
+?? Hero drops out of `zap`: Hero no longer meets `zap`'s target condition
+?? `orc` used action `zap`
+!assert "entity[hero].hp == 30 and entity[orc].zaps == 1"
+!action orc zap hero
+?? ❌ action `zap`: [target_condition] `hero` doesn't meet `zap`'s target condition.
+
+Expected: The hero's `vanish` makes it invisible before the zap
+resolves. The target is checked again at resolution: the hero no longer
+meets the target condition and drops out (as if it had dodged); the
+body still runs with no target (`target` is None), so its other effects
+happen. Used against an invisible hero, the zap is refused at once.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1109 — An area action: affects names the units, a duck leaves it (#36)
+------------------------------------------------------------------------------
+
+!match new rx Rx 10 10
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 5 5 3
+!ent add ally Ally 30 6 5 2
+!ent add far Far 30 9 9 1
+!ent set_var orc actions.boom.target location
+!ent set_var orc actions.boom.affects "entities_in_area(target, 1)"
+!ent set_var orc actions.boom.body "for u in affected:\n    entity[u].hp = entity[u].hp - 3"
+!ent set_var ally actions.duck.before "incoming.avoid = True"
+!ent set_var hero actions.duck.before "incoming.avoid = True"
+!ent set_var far actions.duck.before "incoming.avoid = True"
+!action orc boom 5 5
+?? `!react hero duck`
+?? `!react ally duck`
+?! `!react far duck`
+!react hero pass
+!react ally duck
+!assert "entity[hero].hp == 27 and entity[ally].hp == 30 and entity[far].hp == 30"
+
+Expected: A location target has no unit targets: `affects` (here every
+unit within 1 of the cell, `target` read as the cell) names the units
+the boom affects, the body reads them as `affected`, and only they are
+offered target reactions (`far` is out of the area). The ally's duck
+takes it out of `affected`; the hero passed and takes 3.
+
+
+SCENARIO 1110 — Costs, failing prepares and control keys (#36)
+-------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc mana 10
+!ent set_var hero stamina 3
+!ent set_var orc actions.hex.target entity
+!ent set_var orc actions.hex.cost "if entity[self].mana < 4:\n    fail('mana', 'not enough mana')\nentity[self].mana = entity[self].mana - 4"
+!ent set_var orc actions.hex.body "entity[target].hp = entity[target].hp - 2"
+!ent set_var hero actions.parry.before "x = 1"
+!ent set_var hero actions.parry.cost "entity[self].stamina = entity[self].stamina - 1"
+!action orc hex hero
+!assert "entity[orc].mana == 10"
+!react hero parry
+!assert "entity[orc].mana == 6 and entity[hero].stamina == 2 and entity[hero].hp == 28"
+!ent set_var orc mana 2
+!action orc hex hero
+!react hero parry
+?? ❌ action `hex`: [mana] not enough mana
+!assert "entity[hero].hp == 28 and entity[hero].stamina == 1"
+!ent set_var orc actions.p.target entity
+!ent set_var orc actions.p.prepare "fail('too far')"
+!ent set_var orc actions.p.body "x = 1"
+!action orc p hero
+?? ❌ action `p`: too far
+!react
+?? No reaction window is open
+!ent set_var orc actions.q.target entity
+!ent set_var orc actions.q.prepare "cancel = 1"
+!ent set_var orc actions.q.body "x = 1"
+!action orc q hero
+?? its `prepare` can't use `cancel` as a local
+
+Expected: The action's `cost` runs when its body runs (after the window,
+mana 10 -> 6), the reaction's when its half runs (stamina 3 -> 2). A cost
+that fails fails the action: the hex's body and cost roll back, while
+the parry that already ran keeps its cost (stamina 1). A `prepare` that
+fails refuses the action before any window opens. `cancel`, `avoid`,
+`cancelled` and `cancelled_by` are `incoming`'s control keys and can't be
+locals of a prepare.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1111 — Reactions never offered are named; a reaction isn't an action; lint (#36)
+----------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 1"
+!ent set_var hero actions.watch.reacts_on any
+!ent set_var hero actions.watch.before "x = 1"
+!ent set_var hero actions.odd.reacts_to "fire and"
+!ent set_var hero actions.odd.before "x = 1"
+!ent set_var hero actions.broken.before "f = lambda: 1"
+!action info hero watch
+?? is never offered: a `reacts_on: any` reaction needs a `condition`
+!action info hero odd
+?? `actions.odd.reacts_to`: Tag filter `fire and`
+!action hero odd
+?? `odd` is a reaction: it runs through `!react` while a reaction window offers it
+!system lint default
+?? action `actions.broken` before
+!action orc slash hero
+?! !react hero watch
+?! !react hero odd
+
+Expected: A bystander reaction without a condition is never offered,
+and a `reacts_to` that doesn't parse matches nothing: `!action info`
+names both. A reaction without a body of its own runs only through
+`!react`. `!system lint` reads the halves, the conditions and the
+action's other programs.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1112 — A team view sees only the reactions of units it can see (#36)
+----------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or not status_has(self, 'invisible')"
+!ent add orc Orc 30 1 1 5
+!ent set_var orc team blue
+!ent add hero Hero 30 2 1 3
+!ent set_var hero team red
+!ent add sneak Sneak 20 5 5 4
+!ent set_var sneak team blue
+!ent status sneak add invisible
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 2"
+!ent set_var hero actions.block.before "x = 1"
+!ent set_var sneak actions.trip.reacts_on any
+!ent set_var sneak actions.trip.condition true
+!ent set_var sneak actions.trip.before "x = 1"
+!as view red
+!action orc slash hero
+?? `!react hero block`
+?! sneak
+!react
+?! sneak
+!as view omniscient
+!react
+?? `!react sneak trip`
+!react sneak trip
+!react hero block
+!as view red
+!list
+?! Sneak
+
+Expected: Each option line is tagged with its unit, so a channel whose
+view can't see the unit drops it: under the red view the invisible
+blue sneak's line is gone from the window and from `!react`, while the
+omniscient view lists it.
+
+
+SCENARIO 1113 — A player's !react waits for a host's approval (#36)
+------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 4"
+!ent set_var hero actions.block.before "incoming.x = 1\nentity[self].blocked = True"
+!action orc slash hero
+!as player alice
+!react
+?? `!react hero block`
+!react hero block
+?? needs host approval (request `r1`
+!action orc slash hero
+?? A reaction window is open
+!as host
+!approve r1
+!assert "entity[hero].blocked == True and entity[hero].hp == 26"
+
+Expected: The bare `!react` is open to players. A player's pick goes
+through host approval like any player command (#28 will let a unit's
+players answer directly); approved, it runs and closes the window. A
+player's `!action` while the window is open is refused outright, never
+queued.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1114 — A reaction's own target and args; the incoming action's stay `target` / `args` (#36)
+---------------------------------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent add imp Imp 10 4 4 2
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - args.n"
+!ent set_var hero actions.riposte.target entity
+!ent set_var hero actions.riposte.after "entity[reaction_target].hp = entity[reaction_target].hp - reaction_args.power\nentity[self].seen = args.n\nentity[self].hit = target"
+!ent set_var hero actions.taunt.before "w = choose('word?', ['boo', 'hiss'])\nentity[self].word = w"
+!action orc slash hero n=3
+?? `!react hero taunt`
+!react hero taunt answer=hiss
+?? `!react hero riposte <unit>`
+!react hero riposte imp power=4
+!assert "entity[imp].hp == 6 and entity[hero].seen == 3 and entity[hero].hit == 'hero'"
+!assert "entity[hero].word == 'hiss' and entity[hero].hp == 27"
+
+Expected: `!react` takes the reaction's own target and `k=v` args after
+its name, as `!action` does: the riposte reads them as `reaction_target`
+/ `reaction_args`, while `target` and `args` stay the slash's (hero,
+n=3). A reaction's `choose()` takes `answer=` tokens on its `!react`.
+
+
+SCENARIO 1115 — Units gone before the window closes (#36)
+--------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent add ally Ally 30 3 1 2
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 4"
+!ent set_var ally actions.cheer.reacts_on any
+!ent set_var ally actions.cheer.condition true
+!ent set_var ally actions.cheer.before "entity[self].cheered = True"
+!ent set_var hero actions.block.before "x = 1"
+!action orc slash hero
+!react ally cheer
+!ent remove ally
+!react hero pass
+?? `ally`'s `cheer` doesn't run: the reaction or its unit is gone
+!assert "entity[hero].hp == 26"
+!action orc slash hero
+!ent remove orc
+!react hero pass
+?? doesn't resolve: the action or its unit is gone
+!react
+?? No reaction window is open
+!assert "entity[hero].hp == 26"
+
+Expected: A host may remove units while a window is open. A picked
+reaction whose unit is gone doesn't run; an action whose unit is gone
+doesn't resolve, and the window closes with nothing happening.
+
+
+SCENARIO 1116 — Tab completes a unit's reactions in the open window (#36)
+------------------------------------------------------------------------
+
+!match new rx Rx 8 8
+!match use rx
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.slash.target entity
+!ent set_var orc actions.slash.body "entity[target].hp = entity[target].hp - 4"
+!ent set_var hero actions.block.before "x = 1"
+!ent set_var hero actions.dodge.before "incoming.avoid = True"
+!action orc slash hero
+?tab "!react hero "
+?? candidates: block  dodge  pass
+
+Expected: `!react <unit> <Tab>` offers the reactions that unit may pick
+now, and `pass`.

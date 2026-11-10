@@ -438,7 +438,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 ### Still open
 
-- **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, counterspell), with the incoming action waiting while reactions are picked. The design is agreed and written in `docs/damage_reactions_design.md` (§1-§9; the details still open are in its §11); not built yet.
+- **#36 Reaction framework.** Built (`docs/damage_reactions_design.md` §1-§9, CLAUDE.md §7.23) except what its §13 lists as still open: reacting to a reaction (`reactable`, `reaction_depth_limit`), `react_point` mid-body windows, Discord buttons for the options (with #42).
   - From the combat systems:
     - Windows, in the order an attack resolves:
       - before the hit: NCS First Strike, FCS1 Preemptive Strike, Counterspell, Protect, Emergency Consumable;

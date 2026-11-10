@@ -405,6 +405,11 @@ back, load the schema with `ToolSearch` before calling
   replayed by `!match replay` (§7.16).
 - **`prefab.py`**: prefabs (§7.19): `capture_prefab`, `check_prefab`, the
   `Turn` rotation / mirroring, `stamp_prefab` and its id / link remapping.
+- **`reactions.py`**: the reaction exchange (#36, §7.23): `begin` (a
+  typed action's prepare and before window), `open_window` / `available`
+  (eligibility), `react_pick` / `react_pass` / `react_skip`, `resolve`
+  (before halves, re-read, body, after window, after halves),
+  `IncomingProxy`, `reactions_used`, `settle_expiry`.
 - **`completion.py`**: Tab completion for a typed line, shared by gui.py and
   cli.py (readline). It walks the typed words through the command's usage
   strings (`_usage_tails` / `_usage_tokens`, the stray-word check's
@@ -435,8 +440,9 @@ back, load the schema with `ToolSearch` before calling
 - **`docs/zones_prefabs_design.md`**: the agreed design for zone
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/damage_reactions_design.md`**: the design of reactions (#36,
-  agreed, not built) and the damage pipeline (#25, in discussion), which
-  meet at `incoming`. Read it whole before building either.
+  agreed, built but for its §13 list, §7.23) and the damage pipeline (#25,
+  in discussion), which meet at `incoming`. Read it whole before touching
+  either.
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
   the vocabulary (built, §7.20).
@@ -3868,6 +3874,84 @@ dump` is the raw data for the GM.
 
 ---
 
+### 7.23 Reactions
+
+#36 (`reactions.py`, design `docs/damage_reactions_design.md`, its §13
+lists what isn't built; 1093-1116).
+- **Action fields** (`Action`, parsed in `action.py`): `prepare` (program,
+  run when the action is used; its locals become `incoming` and the
+  body's starting locals, `eval_program(locals_in=)`), `cost` (program,
+  run right before the body, in the same transaction), `affects`
+  (expression, `target` a location's cell; default the unit targets),
+  `target_condition` (expression, self = actor, `target` one target),
+  `cancelled_action_cost` (refund / pay). `run_action(steps=,
+  preset_locals=, prepare_out=, body_out=, finish=, skip_checks=,
+  extra_bindings=, fail_out=, target_out=)` runs any of the programs as
+  one transaction. `fail(...)` takes the word `refund` (`REFUND`, a
+  binding; `ActionFail.refund`).
+- **A reaction** is an action holding `before` and / or `after`
+  (`ReactionSpec`: reacts_to, reacts_on target / any, condition,
+  after_on, priority / before_priority / after_priority, self_trigger,
+  reaction_on_cancel, auto_when; `cancels` detected from the before
+  half's text, `detects_cancel`). A bool `condition` / `auto_when` (a
+  `set_var ... true`) reads as always / never. `reacts_on: any` without a
+  condition and an unparseable `reacts_to` are never offered (named in
+  `!action info`). A reaction without a body can't be used by `!action`.
+  `UnitFlags.REACTIONS` indexes the units whose vars hold one; a rider is
+  offered its seat's reactions (a vehicle isn't offered its seats').
+- **The exchange** (`Match.reaction_exchange`, JSON, saved, undo state;
+  `reaction_seq`, `reaction_log` (the newest `REACTION_LOG_MAX` uses),
+  `own_turn_at` (per unit, turns_elapsed at its latest own turn), all
+  serialized; `_reaction_opened` runtime, rollback-preserved). Only a
+  TYPED `!action` / `!ent action` opens windows (`_run_action_dispatch`
+  -> `reactions.begin`, when a unit holds a reaction or the action has a
+  prepare; not while a window is open); an action a formula starts
+  (`use_action`) runs without, with an ℹ️ note when a reaction would have
+  answered it (`unoffered_note`). Copies of `incoming` per affected unit
+  plus `""` (the action's, what bystanders read); a reactor reads its
+  own, else a part's it covers (`reactions_cover_parts`), else `""`
+  (`copy_key`). `IncomingProxy` reads through the match each time
+  (a failed half rolls the exchange back), a key nobody set reads None,
+  writable in before halves and the body only. In a reaction's formulas
+  `actor`, `target`, `args`, `action_name`, `action_tags` are the incoming
+  action's; its own are `reaction_target` / `reaction_args`
+  (`_ACTION_BINDING_NAMES`). `incoming_of(eid)` and `redirect(old, new)`
+  are action builtins; `incoming_of(x).k` is an attribute chain the
+  transformer passes through; `affected` is loopable in action mode.
+- **Windows:** `open_window` fixes the units (candidates in turn order,
+  `__reaction_mode` / `reaction_mode` ask / auto / never; auto picks at
+  once, only reactions with no target of their own); each option line is
+  tagged with its unit (`m.unit_tag`) and names units with say() markers,
+  so a team view drops the units it can't see. A unit is done when it
+  passes, reaches `__reactions_per_window` / the rule, or has nothing
+  left (`_refresh_done`, re-reading conditions); the command closing the
+  window resolves it in that command. Holds (`_reaction_held`, refused
+  before the queue in `_run_body` and for gated batch lines): `!action`,
+  `!ent move / push / pull / swap / action`, `!turn next / set / grant`.
+  Expiry (`settle_expiry`, at the start of the next command on the match
+  but `!as`) journals the command as state; `!as wait` ages windows.
+- **Resolution** (`resolve`): picks ordered (`_ordered`: effective
+  priority, tiebreak); per pick: refund on cancel per its
+  `reaction_on_cancel` / the rule, the condition read again, the half run
+  through `run_action` with a synthetic Action (`body` = the half, `cost`
+  on the paying half, `finish` only on the first half, so on_action_used
+  fires once) and recorded (`_record_use`) on success; `_check_cancel`
+  after each. Then `_reread` (targets re-checked: immunity, target tags,
+  target_condition; `affects` again; newcomers get a copy of `""`), the
+  cancelled path (`cancelled_action_cost`, on_action_failed reason
+  `cancelled`) or the body (`_run_body`: one affected unit's copy as
+  preset locals, else `""`; body locals merged into every copy;
+  `fail(refund)` rolls back to the in-memory state at resolution start and
+  marks every pick refunded). After window (`_open_after`) for after-only
+  reactions of units reached (`_reached`: first affected, affected,
+  dropped) and bystanders, `after_on` against `unit_outcome` (a dropped
+  unit sees cancelled); then `_finish_after` runs continuations and
+  after-only picks. Every step re-fetches `m.reaction_exchange` after a
+  `run_action` (a rollback replaces it).
+- **`reactions_used(eid, since='own_turn', tag=None)`** (ARG_SAFE):
+  own_turn / round (refused under ATB) / turn / action (`reaction_seq`) /
+  ever.
+
 ## 8. Open questions, planned work, deferred and rejected ideas
 
 Check here before proposing a feature: it may be planned, deferred or
@@ -3965,10 +4049,9 @@ hasn't named the next.
   units costs ~1 ms past its own work.
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
-  hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /
-  counter during another unit's turn: designed in
-  `docs/damage_reactions_design.md`, with the damage pipeline in
-  discussion there), fancier revive (regrow from a template). Interactive Discord
+  hit_location), AP / FP / ARC action economy, the damage pipeline (#25,
+  in discussion in `docs/damage_reactions_design.md` §10; reactions are
+  built, §7.23), fancier revive (regrow from a template). Interactive Discord
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.

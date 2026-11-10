@@ -368,6 +368,16 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(meta.get("subs") or {})
     ent = binds.get("eid") or binds.get("id") or binds.get("unit") \
         or binds.get("entity_id")
+    if slot == "reaction":
+        # `!react <eid> <reaction>`: what the unit may pick in the open
+        # window now (#36), and `pass`.
+        ex = getattr(m, "reaction_exchange", None) if m is not None else None
+        if ex is None or ent not in (ex.get("units") or {}) \
+                or ent not in _entity_ids(mgr, ctx):
+            return []
+        import reactions
+        return sorted({a.name for a, _v in reactions.available(
+            m, ex, ent, ex.get("phase", "before"))} | {"pass"})
     if slot in ("path", "var.path", "key", "stash_path", "dest_path",
                 "template_ref"):
         if root == "template" and slot == "path" and "name" in binds:

@@ -1,11 +1,13 @@
 # Reactions (#36) and the damage pipeline (#25): design in discussion
 
 Status: the reaction design (§1-§9) is agreed with the user, question by
-question, in chat. The damage pipeline (§10) has its first decisions,
-the ones the reactions needed; the rest is still to be discussed. §11
-lists the details found open while writing this file; §12 what is set
-aside for later. Nothing here is built yet. Read the whole file before
-building either feature, and ask before deviating from it.
+question, in chat, and BUILT (`reactions.py`, CLAUDE.md §7.23) but for
+what §13 lists, which also records the choices made while building. The
+damage pipeline (§10) has its first decisions, the ones the reactions
+needed; the rest is still to be discussed. §11 lists the details found
+open while writing this file; §12 what is set aside for later. Read the
+whole file before building on either feature, and ask before deviating
+from it.
 
 The two features share one design because they meet at `incoming`: the
 data an action hands to the reactions it provokes, which the damage
@@ -359,3 +361,47 @@ None at the moment.
   thought through carefully; `react_point` is only the mid-action hook.
 - **Movement-triggered reactions** (opportunity attacks, overwatch): idea
   #263, a later trigger kind under `reacts_on`.
+
+## 13. As built (#36)
+
+Not built yet:
+
+- **Reacting to a reaction** (§8): a reaction's halves open no windows;
+  `reactable` and `reaction_depth_limit` don't exist yet.
+- **`react_point`** mid-body windows (§3).
+- **Discord buttons** for the options (§9, with #42).
+- **The dice rewind** before the body (§10): it belongs to the damage
+  pipeline (#25), where "where `prepare`'s pipeline began" gets a
+  meaning; a body rolling dice of its own would otherwise repeat
+  `prepare`'s first rolls.
+
+Choices made while building (open to change):
+
+- Only a typed `!action` / `!ent action` opens windows. An action a
+  formula starts (`use_action`) runs at once, and the reply notes that
+  reactions weren't offered when some unit holds one that would answer it.
+- In a reaction's formulas `target`, `args`, `actor`, `action_name` and
+  `action_tags` are the incoming action's; the reaction's own target and
+  `k=v` args (typed after its name in `!react`) are `reaction_target` and
+  `reaction_args`.
+- Auto mode picks only reactions without a target of their own (an auto
+  pick has no one to name it).
+- A rider is offered its seat's reactions; the vehicle isn't offered
+  them.
+- A key of `incoming` nobody set reads None, so a body can test
+  `incoming.blocked` whether or not a block ran.
+- `fail(refund)` rolls back to the state when the window closed: a host's
+  edits made while it was open stay.
+- `reaction_window_expiry_seconds` counts from when the window opened in
+  this bot process; after a restart the count starts again.
+- `prepare`'s locals are saved with the open window, so they must be
+  values a var can hold; one that isn't (a proxy) is dropped with a
+  warning, and the body doesn't see it.
+- With several affected units, the incoming action's body starts with the
+  locals of the action's own copy (what bystanders write); per-unit
+  values are read with `incoming_of(eid)`.
+- The match remembers the newest 2,000 reaction uses for
+  `reactions_used`; `since='round'` is refused under ATB.
+- A picked reaction whose condition is no longer true when the window
+  closes, or whose unit is gone, doesn't run; an action whose unit or
+  action is gone when the window closes doesn't resolve.
