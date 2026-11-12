@@ -441,7 +441,7 @@ back, load the schema with `ToolSearch` before calling
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/damage_reactions_design.md`**: the design of reactions (#36,
   agreed, built but for its §13 list, §7.23) and the damage pipeline (#25,
-  in discussion), which meet at `incoming`. Read it whole before touching
+  agreed in §10, not built yet), which meet at `incoming`. Read it whole before touching
   either.
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
@@ -4079,8 +4079,8 @@ hasn't named the next.
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy, the damage pipeline (#25,
-  in discussion in `docs/damage_reactions_design.md` §10; reactions are
-  built, §7.23), fancier revive (regrow from a template). Interactive Discord
+  agreed in `docs/damage_reactions_design.md` §10, next to build;
+  reactions are built, §7.23), fancier revive (regrow from a template). Interactive Discord
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.

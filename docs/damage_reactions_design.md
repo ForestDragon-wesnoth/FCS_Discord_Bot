@@ -3,11 +3,10 @@
 Status: the reaction design (§1-§9) is agreed with the user, question by
 question, in chat, and BUILT (`reactions.py`, CLAUDE.md §7.23) but for
 what §13 lists, which also records the choices made while building. The
-damage pipeline (§10) has its first decisions, the ones the reactions
-needed; the rest is still to be discussed. §11 lists the details found
-open while writing this file; §12 what is set aside for later. Read the
-whole file before building on either feature, and ask before deviating
-from it.
+damage pipeline (§10) is agreed the same way and not built yet. §11 lists
+the details still open; §12 what is set aside for later. Read the whole
+file before building on either feature, and ask before deviating from
+it.
 
 The two features share one design because they meet at `incoming`: the
 data an action hands to the reactions it provokes, which the damage
@@ -288,9 +287,9 @@ target"):
   var), `auto` or `never`; a rule gives the system-wide default (`ask`).
   In `auto` mode the engine picks each available reaction whose
   `auto_when` is true (read against the forecast, so "block only if
-  `incoming.taken > 20`" works), in priority order, up to the per-window
-  limit; a reaction without `auto_when` is picked whenever available; a
-  unit with nothing qualifying passes. `ask` units ignore `auto_when`.
+  `incoming.damage_taken.hp > 20`" works), in priority order, up to the
+  per-window limit; a reaction without `auto_when` is picked whenever
+  available; a unit with nothing qualifying passes. `ask` units ignore `auto_when`.
 - **Who may react:** `!react` goes through host approval by default, like
   any player command; #28 (player-controlled units) will let a unit's
   players answer directly (user call). A unit's player may pass on its own
@@ -321,44 +320,270 @@ target"):
   index. A window reads only indexed units, `reacts_to` before any
   condition.
 
-## 10. The damage pipeline (#25): settled so far
+## 10. The damage pipeline (#25)
 
-- **The pipeline runs in `prepare`**, both sides: the attacker's steps,
-  then the defender's passives, resistances and weaknesses. Both numbers
-  are kept, as `incoming.damage` (raw, attacker's side) and
-  `incoming.taken` (after the defender's side); the names are
-  placeholders. Conditions, `auto_when` and the option lines read
-  `taken`.
-- **The forecast is not trusted** (user call): the body recalculates the
-  whole pipeline, attacker passives through the defender's state as it is
-  then. `prepare`'s numbers exist for the reactions' convenience.
+Agreed with the user question by question, in chat; not built yet. The
+engine runs a packet of damage through the system's ordered steps and
+writes the result; healing runs through its own twin pipeline. The first
+four points were settled while designing reactions, the rest after.
+
+### 10.1 With reactions: the forecast and the body
+
+- **The forecast runs in `prepare`.** `damage_forecast(target, damage,
+  ...)` (§10.6) runs the same steps as the real hit and then undoes every
+  write they made (a block costing stamina, a shield draining), so a step
+  needs no side-effect-free twin. Called in `prepare`, it records into
+  that target's `incoming` copy, per pool: `incoming.damage_raw` (after
+  the attacker's steps) and `incoming.damage_taken` (after the
+  defender's), e.g. `incoming.damage_taken.hp`. Conditions, `auto_when`
+  and the option lines read them. Healing: `incoming.healing_raw` /
+  `incoming.healing_received`.
+- **The forecast is not trusted** (user call): the body's `deal_damage`
+  runs the whole pipeline again, against the state as it is then.
+  `prepare`'s numbers exist for the reactions' convenience.
 - **Reactions usually change defender state** (user call): a block
   applies a status, sets a var or writes a key such as `incoming.block`,
-  which a defender step reads at its place in the order (FCS1 blocks
-  before its capped resistance). Changing the numbers in their own
-  `incoming` copy is allowed too; the GM's body decides what it reads.
+  which a defender step reads at its place in the order. Changing the
+  numbers in their own `incoming` copy is allowed too; the body decides
+  what it reads.
 - **Dice:** attacker dice are rolled in `prepare` and reused by the body
   (`base = roll('2d6')` in `prepare`, `base` in the body). Before the
   body's recalculation the engine rewinds the dice to where `prepare`'s
   pipeline began, so a step that rolls on its own (an armor roll) gives
   the forecast's result when nothing changed.
 
-Still to discuss for #25: how a system declares its ordered step list;
-damage packets with several types (Solis Fire Arrow, FCS1 damage and
-stamina damage, NCS arcana); conversions between pools (FCS1 Brittle,
-Hollow Bones, Freeze; NCS Magical Body); true damage; `deal_damage` and
-the `on_damage_taken` / `on_damage_dealt` handlers; how #235 (statuses
-that break on damage) and #239 (kill credit) attach.
+### 10.2 Packets and components
+
+- **A packet** is a list of **components** plus fields for the whole hit
+  (user call: "components", so nothing reads as a body part):
+  - a component is `{amount, pool, tags}`: `tags` its types (`slash`,
+    `fire`, `physical`), `pool` the var it lowers;
+  - the packet's own `tags` (`melee`, `ranged`), `attacker` and `source`.
+- **Pools.** A pool is any numeric var path (`hp`, `stamina`,
+  `resources.arcana`). A component without one hits the rule
+  `damage_default_pool` (twin `healing_default_pool`), default `@hp`: the
+  var `hp_var` names, the `@<rule>` convention of `transform_keep_vars`.
+  Only the hp var kills by default, since the `death_condition` rule reads
+  it; a packet lowering only stamina subtracts it and nothing else (user
+  call). A system where an empty pool kills says so in `death_condition`.
+- **A component's filter tags** are its own tags, the packet's tags and
+  its pool as `pool:<path>` (`pool:stamina`). `pool:` is a RESERVED prefix
+  (user call): the engine derives it, and no component, packet, unit or
+  vocabulary tag may start with it.
+- **True damage** is a tag, `true_damage`, with no engine meaning of its
+  own: a step's default filter leaves it out (§10.3).
+
+### 10.3 Steps
+
+- **Two ordered lists per system**, `damage_steps` and `healing_steps`, a
+  system library like status definitions (user call): copied into each new
+  match, the match edits its own copy (`!damage step ...`, `!heal step
+  ...`), the system its own (`!system damage ...`, `!system heal ...`),
+  and `!match sync damage` / `sync healing` copies a system's list over a
+  live match's.
+- **Per-unit effects come in as data the steps read** (user call): the
+  systems lean on many effects of single units (a status's resistance, an
+  item's damage bonus, a block), which stay modifier records, status data,
+  vars or `incoming` keys. Units, statuses and items don't add steps.
+- **Fields:** `name` (unique in its list), `side` (`attacker` /
+  `defender`), `filter`, `formula` (a program), `description` (optional;
+  `!damage explain` and `!damage step list` show it). Placed by list
+  position: `!damage step add <name> ... [before=<step> | after=<step>]`,
+  `!damage step move`.
+- **Two phases** (user call): every attacker step runs, then every
+  defender step, each phase in list order. `side` picks the phase and
+  `self`. Every system the user plays fits: Solis (Fire Arrow's +25%, then
+  armor, weakness, resistance), FCS1 (attacker buffs, then block, the
+  defender's percentages, resistance with its 90% cap; the older wording
+  "block, then percentage buffs" meant the defender's buffs, user call),
+  NCS (block, resistances to 50%, weaknesses). The attacker phase's
+  result is `damage_raw`, the defender phase's `damage_taken`.
+- **Filter:** a tag filter (`docs/tags_design.md`) on the components'
+  filter tags (§10.2). A step without one uses the rule
+  `damage_step_default_filter` (twin for healing), default `not
+  true_damage`. A step runs once per packet per target, given the
+  components its filter matched; with none matched it is skipped.
+- **A step whose formula errors** is skipped with a ⚠️ naming the error,
+  and the packet goes on (user call).
+- **Bindings:** `self` (the step's side's unit), `attacker`, `defender`
+  (`attacker` may be None: a lava tile), `damage_source`, `damage_tags`
+  (the packet's), `components` (the matched ones, editable: `amount`,
+  `pool`, `tags`), `damage_components` (every component, read-only), and
+  `incoming` (the defender's copy, when the packet comes from an action
+  resolving in a reaction exchange: a block step reads `incoming.block`).
+- **Helpers** (user call on the `step_` prefix: `part_` would read as body
+  parts, and `damage_part` already exists), acting on the matched
+  components, refused outside a step:
+
+  | Helper | Does |
+  |---|---|
+  | `step_scale(f)` | each amount × f |
+  | `step_add(n)` | each amount + n |
+  | `step_reduce(n)` | takes n off the matched components as a whole, in order, until n is used up (armor once per hit, however many components) |
+  | `step_mods(stat)` | folds each component through `apply_mods(self, stat, amount, its filter tags)`: `inc%` records add up, `more%` multiply, as the records say |
+  | `step_move(pool)` | moves the components to another pool |
+  | `step_new(amount, pool=None, tags=None)` | adds a component |
+  | `step_drop()` | removes the matched components |
+  | `step_total()` | the matched components' sum |
+
+- **Examples** (the scenarios use these):
+  - Solis armor: `a = entity[self].armor`, halved when hard and the hit
+    is `blunt`, then `step_reduce(a)` (filter `pool:hp`).
+  - Fire Arrow (attacker, filter `fire_arrow`): `step_new(step_total() *
+    0.25, tags=['fire'])`.
+  - Strength / Vulnerable: `step_mods('damage_dealt')` (attacker),
+    `step_mods('damage_taken')` (defender).
+  - FCS1 block, then capped resistance: `if incoming.block:
+    step_reduce(incoming.block)`; `step_scale(1 - min(0.9,
+    apply_mods(self, 'resist_pct', 0, damage_tags) / 100))`.
+  - NCS resistances, up to 50% added, past 50% only the highest.
+  - FCS1 Freeze overflow (filter `pool:stamina`): the stamina damage past
+    the defender's stamina moves to an hp component. Overflow is the GM's
+    step, never an engine feature; one scenario is this recipe, written
+    to be copied (user call).
+
+### 10.4 Writing the result
+
+- After the steps, per pool: the components' sum, never below the rule
+  `damage_component_floor` (default 0, `none` = no floor; healing twin)
+  (user call: damage doesn't heal by default), rounded once by
+  `damage_rounding` (floor / round / ceil, default floor; healing twin).
+  Amounts stay exact through every step: rounding earlier would lose
+  accuracy (user call).
+- Each pool is written once through `write_var` (clamps, var hooks,
+  partial-template tracking), then ONE death check after all of them.
+- **A pool the defender lacks:** the component is dropped, and `!damage
+  explain` names it (user call). A step can move it first (NCS Magical
+  Body: stamina effects hit arcana).
+- **Shields** stay a step the GM places, calling `absorb_damage` (user
+  call): the systems put them at different points in the order, and a
+  shield step with a `true_damage` filter can take true damage too.
+- **Indestructible units** (0/0 parts, `indestructible`) can be hit (user
+  call): their steps, line, hooks and records run, nothing is written to
+  their own hp, and a 0/0 part still sends its share to its main body.
+- **A dead target** is skipped with a note; a corpse can't be a target.
+
+### 10.5 Body parts
+
+- A packet aimed at a body part runs the PART's pipeline (its armor) and
+  writes, then sends a share to the main body.
+- The part var `to_main_percent` becomes `damage_to_main_percent`, beside
+  a new `heal_to_main_percent`, which follows the damage one when unset
+  (user call: a stimpack on a limb heals the body a little, as in
+  Fallout). The default rule splits the same way:
+  `part_damage_to_main_percent_default` and
+  `part_heal_to_main_percent_default` (default: follow the damage one).
+- Either var may hold a number or a dict of tag filter -> percent
+  (`{fire: 100, default: 50}`): each component takes the first entry
+  whose filter matches it, else `default` (the per-damage-type share #14
+  asked for).
+- The share arrives as true damage by default: its components get the
+  `true_damage` tag and go through the main body's pipeline, so steps with
+  the default filter skip it and a step written for true damage (a shield
+  soaking everything) still sees it (user call). One rule per direction
+  decides it: `part_damage_share_mode` / `part_heal_share_mode`, `true`
+  (default) or `pipeline` (the main body's steps run on it).
+- `to_main_cap` caps the damage share only; the heal share stops at the
+  main body's max hp through its clamp.
+- `damage_spread` and `hit_location` keep choosing the parts; each part's
+  share goes through `deal_damage`.
+
+### 10.6 Entry points
+
+- **`deal_damage(target, damage, pool=None, tags=None, packet_tags=None,
+  attacker=<default>, source=<default>, quiet=False)`**:
+  - `damage` is a number (one component: `deal_damage(t, 20,
+    tags=['slash'])`) or a list of components (`[{amount: 20, tags:
+    ['slash']}, {amount: 10, pool: 'stamina'}]`); `pool=` fills in each
+    component without one, else `damage_default_pool`;
+  - `tags` are the components' types, `packet_tags` the hit's;
+  - defaults from context: in an action body the actor and the action; in
+    a reaction's half the reacting unit and the reaction; in a status
+    tick `status_source(self, name)` (#227's `source`, folded into this
+    feature, user call) and the status; in a tile or zone hook none and
+    the tile / zone; elsewhere none;
+  - returns `damage_taken` per pool (`{hp: 18}`);
+  - changes the match: banned in `$()`, lines through `surface_log`.
+- **`damage_forecast(...)`**: the same arguments, returns `{damage_raw,
+  damage_taken}` per pool, changes nothing (§10.1).
+- **Healing twins** (user call: healing is something many mechanics care
+  about, and it should be customizable too): `heal(...)` returns
+  `healing_received`; `healing_forecast(...)`.
+- **What counts as damage** (user call): only these. `!ent hp` and a
+  direct var write stay silent writes, since a GM has real reasons to set
+  hp without anything firing.
+- **Commands:** `!ent damage <id> <amount> [pool=<var>] [tags=a,b]
+  [packet_tags=...] [from=<unit>] [quiet]` and `!ent heal ...`, gated
+  like other `!ent` changes; `!damage explain`, `!damage last` and their
+  `!heal` twins (§10.8).
+- **`last_damage(eid)`** reads the unit's last packet taken and last
+  packet dealt: saved with the match and restored by undo, so a replay or
+  a reload reads the same (user call). Healing twin `last_healing`.
+
+### 10.7 After the writes, per target
+
+In order:
+1. **Statuses that break on damage** (#235, folded in, user call):
+   status fields `removed_on_damage` and `break_at_damage: N`, each with a
+   tag filter on what counts, counting only amounts above 0 actually
+   taken; heals never touch them.
+2. **The damage line** (#247, user call: on by default): rule
+   `damage_message_format` (healing twin `healing_message_format`), the
+   unit's placeholders plus `{damage_taken.hp}`, `{damage_lost.hp}`,
+   `{components}` ("12 slash, 5 fire"), `{attacker}`, `{source}`; tagged
+   as a line about the defender, so a view that can't see it drops it.
+   `quiet=True` skips it for that packet.
+3. **Hooks**: `on_damage_taken` on the defender, then `on_damage_dealt`
+   on the attacker (none without one); heals `on_healing_received` /
+   `on_healing_given`. Bindings: `attacker`, `defender`, `damage_source`,
+   `damage_taken` (per pool, what the steps decided), `damage_lost` (per
+   pool, what the var actually moved: 20 taken on 5 hp clamped at 0 is
+   lost 5), `damage_components`, `damage_tags`. They fire on a hit that
+   came to 0 too (user call). Changing amounts is the steps' job; no hook
+   runs before the steps (open, §11).
+4. **Recursion:** rule `damage_hook_recursion_limit` (default 16) counts
+   nested packets (thorns against thorns); past it packets still apply
+   but fire no hooks, with one ⚠️ (user call). The thorns scenario tags
+   its returned damage `thorns` and its passive skips packets carrying
+   it, the pattern to copy (user call).
+5. **Kill credit** (#239's binding, user call): `on_death` binds `killer`
+   from the packet that killed. The per-pair damage tally waits for the
+   battle report (#240).
+6. **The event log** (user call): a packet logs a `damage` / `healing`
+   entry (target, attacker, source, per-pool amounts). A raw hp write
+   (`!ent hp`, a direct write) logs a renamed `hp_change` entry; a write a
+   packet makes logs none. All three are words in `event_log_events`, on
+   by default.
+7. **The records** `last_damage` reads (§10.6).
+
+An area attack calls `deal_damage` once per target, each running all of
+the above.
+
+### 10.8 Reading it
+
+- **`!damage explain <attacker | -> <target> <amount> [pool=] [tags=]
+  [packet_tags=]`** runs the forecast and lists each step with its side,
+  filter, the components before and after, steps skipped (no match, an
+  error) and the writes, rounding included. It names steps and filters,
+  never formula text. Host-only (it reads both units' state), like `!ent
+  dump`. `!heal explain` twin.
+- **`!damage last <unit>`**: the same table for the last packet the unit
+  actually took, from the saved record. `!heal last` twin.
 
 ## 11. Details found open while writing this file
 
-None at the moment.
+- **A hook before the damage steps** (user call: skipped for now, to
+  discuss later): a passive that learns a packet is coming before any
+  step runs. Reactions already change an action's damage before it
+  lands, and the steps change the amounts.
 
 ## 12. Set aside for later (user call)
 
 - **Multi-hit attacks** (several hits on one unit, each with its own
-  reaction, NCS "blocking is done individually per incoming hit"): to be
-  thought through carefully; `react_point` is only the mid-action hook.
+  reaction, NCS "blocking is done individually per incoming hit"): on the
+  to-do list (user call: reactions per hit, and more customization of how
+  multi-hit works). Until then an action that hits twice calls
+  `deal_damage` twice, and the reactions answer the action as a whole.
 - **Movement-triggered reactions** (opportunity attacks, overwatch): idea
   #263, a later trigger kind under `reacts_on`.
 
