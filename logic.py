@@ -3411,7 +3411,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "exist. `use`: spawn it, give it and build templates on it "
             "without reading it (its reads still answer as missing); "
             "copying it stays refused, since the copy would be theirs to "
-            "read. Read from the channel's match, else the channel's "
+            "read. A host's own `!eval` follows the rule too "
+            "(summon_template, summon_template_near, give_template). "
+            "What it doesn't cover: formulas the engine runs (action "
+            "bodies, passives, hooks, watchers) read and use the whole "
+            "library, so a trap or summon the creator built works "
+            "whoever sets it off; under `use`, the units and containers "
+            "another host builds from it show its vars to that host "
+            "(`!ent info <id> full`); and a public template the creator "
+            "built on a creator-level partial expands it for any host who "
+            "spawns or resyncs it (publishing it was the creator's "
+            "choice). Read from the channel's match, else the channel's "
             "default system."
         ),
     },
@@ -10146,6 +10156,13 @@ class Entity:
                     o.mark_changed()
         # scrub from turn order & clamp active index, drop its extra turns
         m._leave_turns(self.id)
+        # The round's memory forgets a unit that leaves for good (a despawn,
+        # a death without a corpse), so a later unit under its id acts this
+        # round; a corpse keeps its place, since a revive is the same unit
+        # (L52, user call).
+        if (despawn or not (corpse_kept or self.part_of)) \
+                and self.id in m.round_acted:
+            m.round_acted = [x for x in m.round_acted if x != self.id]
         m._scrub_entity_from_groups(self.id)
         # Drop any entity-attached scheduled effects bound to this entity
         # — a dead/despawned entity's pending turn-delayed effects don't
@@ -32587,6 +32604,14 @@ class MatchManager:
             notes += [f"`{m.id}`: {w}"
                       for w in m._var_event_warnings[before:]]
             del m._var_event_warnings[before:]
+        # ATB switched off: the round memory starts fresh, the unit holding
+        # the turn counted as having acted (L52, user call); the memory
+        # from before ATB came on let the unit whose ATB turn just ended act
+        # again at once.
+        if old and not stub and old.get("atb_enabled") \
+                and not m.rules.get("atb_enabled"):
+            cur = m.current_entity_id() if m.round_started else None
+            m.round_acted = [cur] if cur else []
         if old and not old.get("atb_enabled") and m.rules.get("atb_enabled"):
             m.reveals_to_turn_clock()
         # Which units of a body hold zone grants changed (#136): they settle

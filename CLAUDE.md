@@ -1549,7 +1549,11 @@ hardcodes**.
   units ahead (user call: jumping over is a mechanic some games want; a
   "jump, then jump back" belongs to extra turns, #224). An extra turn
   (below) leaves `round_acted` alone; `set_turn` gives the turn whatever
-  the memory says. A saved enum rule value this build lacks is dropped at load
+  the memory says. A unit that leaves for good (a despawn, a death
+  without a corpse) leaves the memory, so a later unit under its id acts
+  this round; a corpse keeps its place, as a revive is the same unit.
+  Switching ATB off starts a fresh memory holding the unit whose turn it
+  is (user calls, L52, 1147). A saved enum rule value this build lacks is dropped at load
   (`GameSystem.from_dict`, a console note), so the default applies.
 - **Joining and leaving under `deferred`** (user call, 1038, 1040): a
   structural rebuild mid-round (`_rebuild_turn_order` without `full`:
@@ -3378,8 +3382,12 @@ hardcodes**.
   a missing template; `use`, they spawn, give and reference it without
   reading it, and a copy is refused. A mutating `!eval` runs with the
   command's viewer (`match._view_templates`), so `summon_template*` and
-  `give_template` follow the rule there too (V22, 1034; action bodies
-  read the whole library). To anyone else it
+  `give_template` follow the rule there too (V22, 1034). Formulas the
+  engine runs (action bodies, passives, hooks, watchers) read and use the
+  whole library, units another host builds from one under `use` show its
+  vars to that host, and a public template the creator built on a
+  creator-level partial expands it for anyone who spawns it (user calls,
+  in the rule's description). To anyone else it
   reads as missing in list / show / diff / tags / trash, template_names /
   has_template / template_data and Tab (`_readable_template`,
   `completion._readable_template_names`), and in the edits and restore

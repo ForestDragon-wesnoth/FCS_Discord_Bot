@@ -36719,7 +36719,8 @@ SCENARIO 1048 — Extra turns and skip statuses: a stunned unit loses its extra 
 !turn next
 ?? It is now **Alpha**'s extra turn
 !turn next
-?? — Round 4 —
+?! — Round 4 —
+?? It is now **Alpha**'s turn (id `a`)
 !part add c arm Arm 5 5
 !turn grant arm
 ?? ❌ `arm` is a glued body part of `c`: it doesn't act by itself.
@@ -36742,7 +36743,9 @@ Alpha's extra turn leaves the order to go on without it: Gamma's turn
 second one, `!turn` names no extra turn, and play returns to the order
 (Gamma). `!turn set c`
 during an extra turn ends it and keeps the queue: Alpha's remaining
-extra turn runs after Gamma's turn. A glued part and a dead unit (its
+extra turn runs after Gamma's turn, then the re-added Alpha takes its
+round-3 turn: the removal took the old Alpha's id out of the round's
+memory (it used to wait for round 4). A glued part and a dead unit (its
 corpse) are refused.
 
 SCENARIO 1049 — Extra turns in real use: an action granting one (grant_turn(target)), a 2x2 body whose glued part rides the extra turn, ATB leaving the bars alone, a death at an extra turn's start, a restart mid extra turn
@@ -41076,3 +41079,50 @@ the void. Now the hidden void cells are marked and counted like the
 fogged cells around them (25 and 11); the void at (3,4), which the view
 sees, stays out (8 of a 3x3 burst). In a channel without a team view the
 void is left out (16).
+
+
+SCENARIO 1147 — Round memory: switching ATB off starts it fresh with the actor counted; a removed unit's id leaves it, a corpse keeps its place (L52)
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new at AT 8 8
+!match use at
+!ent add a A 10 1 1 30
+!ent add b B 10 2 1 20
+!ent add c C 10 3 1 10
+!turn next
+!turn next
+!system set default atb_enabled true
+!turn next
+!turn next
+!turn next
+?? It is now **A**'s turn (id `a`)
+!system set default atb_enabled false
+!turn next
+?? It is now **B**'s turn (id `b`)
+!turn next
+?? It is now **C**'s turn (id `c`)
+!turn next
+?? — Round 2 —
+?? It is now **A**'s turn (id `a`)
+!turn next
+?? It is now **B**'s turn (id `b`)
+!ent remove a
+!ent add a Anew 10 1 1 30
+!turn next
+?? It is now **Anew**'s turn (id `a`)
+!ent kill b
+!ent revive b
+!turn next
+?? It is now **C**'s turn (id `c`)
+!turn next
+?? — Round 3 —
+
+Expected: a and b act in round 1, then ATB runs three turns ending on
+a. Switching ATB off starts a fresh round memory holding only a (the
+unit whose turn it is), so b and c act, then round 2 opens with a; the
+memory from before ATB came on used to let a act again at once. In round
+2, after a and b, `a` is removed and a new unit takes its id: the removal
+dropped the id from the round's memory, so Anew acts this round (it used
+to read as having acted and wait). b, killed and revived (its corpse kept
+its place), is the same unit and doesn't act again: c takes the next
+turn, then round 3.
