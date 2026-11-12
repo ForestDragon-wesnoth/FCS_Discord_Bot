@@ -1358,7 +1358,9 @@ async def _body_phase(env: _Env, seq: int) -> str:
         for name, v in body_vals.items():
             if name not in CONTROL_KEYS:
                 c[name] = jcopy(v)
-    env.out.append(f"`{ex['actor']}` used action `{act.name}`.")
+    line = m.action_used_line(ex["actor"], act.name, ex.get("target"))
+    if line:
+        env.out.append(line)
     return "ok"
 
 

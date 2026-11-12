@@ -4483,7 +4483,7 @@ turn-order variable changed). Order is Ship B(50), Ship A(30),
 Ship C(10).
 
 Setting Ship A's speed to 99 reorders to Ship A(99), Ship B(50),
-Ship C(10) — the same `immediate` policy applies regardless of
+Ship C(10) — the same `live` policy applies regardless of
 what `turnorder_var` is named. Restoring `turnorder_var =
 initiative` at the end keeps the global default clean for
 subsequent scenarios.
@@ -4512,7 +4512,7 @@ team as A so they cluster). Deleting C's team var moves her
 out of team blue into the "teamless" bucket. The `remove_var`
 path detects that the deleted key is the configured
 `team_var` and calls `_mark_turn_order_dirty`, which under
-the default `immediate` policy rebuilds right away.
+the default `live` policy re-sorts right away.
 
 Post-removal, blue's slot drops to 30 (A alone), red is still
 50, and C is teamless with slot 10. With the default
@@ -27869,7 +27869,7 @@ SCENARIO 880 — `!action ... map=<map>` aims a location action at another map
 !ent set_var hero actions.blink.target location
 !ent set_var hero actions.blink.body "entity[self].got = [target.x, target.y, target.map]\nmove_entity(self, target)"
 !action hero blink 4 4 map=deck
-?? `hero` used action `blink`.
+?? `hero` used action `blink` on `(4,4)`.
 !assert "entity[hero].got == [4, 4, 'deck'] and map_of('hero') == 'deck' and entity[hero].x == 4"
 !action hero blink 3 3 map=nowhere
 ?? Could not find a map named `nowhere`
@@ -29713,7 +29713,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag_unless blind "entity[self].blindsight == True"
 !ent set_var hunter blindsight true
 !action hunter shoot wolf
-?? `hunter` used action `shoot`.
+?? `hunter` used action `shoot` on `wolf`.
 !assert "entity[wolf].hp == 5"
 !action hunter aimed_shot wolf
 ?? forbids `aimed_shot`.
@@ -29732,7 +29732,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag blind -
 ?? Cleared `blind` forbids_actions_with_tag.
 !action hunter bash wolf
-?? `hunter` used action `bash`.
+?? `hunter` used action `bash` on `wolf`.
 
 Expected: An action's tags are its own `tags` plus the `action_tags` of every
 container above it, the vars root included, nearest first, and `!action
@@ -29795,12 +29795,12 @@ SCENARIO 917 — Action tags: immune statuses on single and list targets, body r
 !assert "entity[knight].swept == ['rat']"
 !status apply knight flying
 !action knight hack bird
-?? `knight` used action `hack`.
+?? `knight` used action `hack` on `bird`.
 !assert "entity[bird].hp == 5"
 !status dispel knight flying
 !ent status bird set flying immune_to_actions_with_tag ranged
 !action knight hack bird
-?? `knight` used action `hack`.
+?? `knight` used action `hack` on `bird`.
 !action archer arrow bird
 ?? flying on `bird` blocks `ranged` actions.
 !assert "entity[bird].hp == 2"
@@ -29878,7 +29878,7 @@ SCENARIO 918 — Action tags: mounts, the system library, lint, malformed tag fi
 ?? `gun` used action `horn`.
 !ent set_var tank crew 3
 !action gun cannon ogre
-?? `gun` used action `cannon`.
+?? `gun` used action `cannon` on `ogre`.
 !assert "entity[ogre].hp == 25"
 !status apply gun blind
 !action gun cannon ogre
@@ -30089,7 +30089,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action info druid raise
 ?? Target must match: `humanoid and not undead`
 !action druid command horse
-?? `druid` used action `command`.
+?? `druid` used action `command` on `horse`.
 !action druid command zed
 ?? ❌ action `command`: [target_tags] `zed` doesn't fit `command`: its tags (mindless) don't match `animal`.
 !assert "entity[horse].commanded == True and not var_has('zed', 'commanded')"
@@ -30108,7 +30108,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action druid raise horse
 ?? ❌ action `raise`: [target_tags] `horse` doesn't fit `raise`: its tags (animal, rideable, corpse) don't match `humanoid and not undead`.
 !action druid raise bandit
-?? `druid` used action `raise`.
+?? `druid` used action `raise` on `bandit`.
 !assert "'bandit' in all_entities() and has_corpse('horse')"
 !status def feared
 !status cannot_affect_units_with_tag feared "mindless or construct"
@@ -30251,7 +30251,7 @@ SCENARIO 923 — One filter rule: modifiers, shields, status tag: tokens, restri
 !action hero smash foe
 ?? heavy_load on `hero` forbids `melee and heavy` actions.
 !action hero jab foe
-?? `hero` used action `jab`.
+?? `hero` used action `jab` on `foe`.
 !zone new lava
 !zone add lava 2 2
 !zone tags lava "fire, hazard"
@@ -35817,6 +35817,10 @@ SCENARIO 1034 — A creator-level private template: only its saver and server ad
 ?? ❌ No template `wip` (`!template list`).
 !template import bobref {"name": "B", "vars": {"hp": 2, "g": {"__template": "wipgear"}}}
 ?? ❌ Template `bobref` references `wipgear`, which isn't a partial template
+!eval "summon_template('wip', 6, 6)"
+?? ❌ summon_template: this server has no template `wip`
+!eval "give_template('orc', 'gear3', 'wipgear')"
+?? ❌ give_template: There is no partial template `wipgear`.
 !as host
 !system set default creator_template_use use
 !as player bob roles=gms
@@ -35824,6 +35828,10 @@ SCENARIO 1034 — A creator-level private template: only its saver and server ad
 ?? Spawned `wip` from template `wip`
 !template give wipgear orc gear2
 ?? Gave `orc` a `wipgear` at `gear2`.
+!eval "summon_template_near('wip', 6, 6, 2)"
+?? = `'wip2'`
+!eval "give_template('orc', 'gear3', 'wipgear')"
+?? = `True`
 !template copy wip bobc
 ?? ❌ `wip` is private to its creator: you can spawn it and give it, not copy it.
 !template import bobref {"name": "B", "vars": {"hp": 2, "g": {"__template": "wipgear"}}}
@@ -35876,7 +35884,9 @@ name is taken. Spawning `wip`, giving `wipgear`, copying `wip` and
 importing a template built on `wipgear` answer as for missing ones
 under the default `creator_template_use none` (user call); with `use`
 he spawns, gives and builds on them without reading them (`show` still
-answers as missing) and the copy is refused. The administrator reads both (the
+answers as missing) and the copy is refused. His `!eval` follows the same
+rule: `summon_template` and `give_template` of the creator-level ones
+answer as missing under `none` and work under `use` (V22). The administrator reads both (the
 assert expands `pubg` through `wipgear`). In a channel with a team view
 alice reads as a player, so `wip` is missing there. Lowered to `hosts`,
 bob reads it again while carol, a player, still doesn't. An import may
@@ -36709,7 +36719,8 @@ SCENARIO 1048 — Extra turns and skip statuses: a stunned unit loses its extra 
 !turn next
 ?? It is now **Alpha**'s extra turn
 !turn next
-?? — Round 4 —
+?! — Round 4 —
+?? It is now **Alpha**'s turn (id `a`)
 !part add c arm Arm 5 5
 !turn grant arm
 ?? ❌ `arm` is a glued body part of `c`: it doesn't act by itself.
@@ -36732,7 +36743,9 @@ Alpha's extra turn leaves the order to go on without it: Gamma's turn
 second one, `!turn` names no extra turn, and play returns to the order
 (Gamma). `!turn set c`
 during an extra turn ends it and keeps the queue: Alpha's remaining
-extra turn runs after Gamma's turn. A glued part and a dead unit (its
+extra turn runs after Gamma's turn, then the re-added Alpha takes its
+round-3 turn: the removal took the old Alpha's id out of the round's
+memory (it used to wait for round 4). A glued part and a dead unit (its
 corpse) are refused.
 
 SCENARIO 1049 — Extra turns in real use: an action granting one (grant_turn(target)), a 2x2 body whose glued part rides the extra turn, ATB leaving the bars alone, a death at an extra turn's start, a restart mid extra turn
@@ -36933,7 +36946,7 @@ SCENARIO 1052 — Extra turns in an action: a Bard's inspire gives an ally withi
 !assert "extra_turn_queue() == [] and entity_distance('bard', 'archer') == 3"
 !assert "entity_distance('bard', 'knight') == 2"
 !action bard inspire knight
-?? `bard` used action `inspire`.
+?? `bard` used action `inspire` on `knight`.
 !turn forecast 3
 ?? 1. `knight` **Knight** (extra)
 ?? 2. `archer` **Archer**
@@ -40796,3 +40809,380 @@ components whose sum overflows to infinity are refused before any write;
 `last_damage` refuses a `which` that isn't a word; a wrong-arity call of
 a step_ function names it with its underscore (the message cleaner cut
 `step_total()` to `steptotal()`). The 2x2 boss is untouched.
+
+
+SCENARIO 1141 — `!history import` takes a fresh sequence number: the match's own export imported back, another match's snapshot, both kept across a restart (W10)
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new hi HI 6 6
+!match use hi
+!ent add orc Orc 10 1 1 5
+!ent hp orc 9
+!ent set_vars orc team=red
+!history export latest:command snapg
+?? (seq 3)
+!history import snapg as mine
+!match new hb HB 6 6
+!match use hb
+!ent add elf Elf 10 1 1 5
+!ent hp elf 6
+!match use hi
+!history export command:2 froma
+?? (seq 2)
+!match use hb
+!history import froma as checkpoint
+!as restart
+!match use hi
+!undo command 1
+?? Undid 1 command(s). Reverted past `!ent set_vars orc team=red`.
+!assert "entity[orc].hp == 9"
+!ent dump orc
+?! "team"
+!history restore mine confirm
+?? Restored manual `mine`
+!match use hb
+!undo command 1
+?? Undid 1 command(s). Reverted past `!ent hp elf 6`.
+!assert "entity[elf].hp == 10"
+!history restore checkpoint confirm
+?? Restored manual `checkpoint`
+!list
+?? Orc (orc): HP: 10/10
+?! Elf
+
+Expected: an import used to keep the exported snapshot's sequence number,
+which every match counts from 1: the match's own snapshot 3 (and the diffs
+built on it) and the import itself were dropped at the next commit, so
+`!undo command 1` refused with a KeyError, and a snapshot from another
+match restored the target's own snapshot of that number. Now an import
+takes the next number from the match's counter and is stored whole:
+after a restart `!undo command 1` undoes the team write on `hi`,
+restoring `mine` works, `hb`'s own undo takes back its hp write, and
+restoring `checkpoint` (match `hi`'s snapshot 2) puts `hi`'s board, the
+orc at 10 hp, on `hb`.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1142 — A recovery that moves a match to `default` is journaled: the replay runs the next command on `default` (J18)
+-----------------------------------------------------------------------------------------------------------------------------
+
+!system new pf
+!system set pf hp_var health
+!match new lk Lk 6 6 pf
+!match use lk
+!ent add u U 10 1 1
+?file corrupt systems.json
+!as restart
+!server recover accept confirm
+?? 🔓
+!ent hp u -1
+!match journal
+?? systems `default` changed
+!match journal export jb
+!match replay jb as=lk2
+?? ✅ The state matched the recording after every command.
+!match use lk2
+?? system `default`
+!assert "entity[u].hp == 9"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!server recover accept` moves `lk` from the lost system `pf`
+(hp var `health`) to `default` without changing any system, so it wrote
+no `systems` entry and the replay kept `pf`: the unit's `hp` went back to
+`health` and the first command after the recovery diverged. The recovery
+now journals each moved match's chain and system, and a replayed state
+entry takes its stored system when the replay has it: the replay matches
+every entry and `lk2` runs on `default` with the unit at hp 9.
+
+
+SCENARIO 1143 — A body grown into a void is told so; an expired approval request no longer keeps its server loaded (L53)
+-----------------------------------------------------------------------------------------------------------------------
+
+!match new vd VD 12 12
+!match use vd
+!map void add 6 2
+!ent add big Big 30 4 2 5
+!ent set_var big footprint_w 3
+?? ❌
+?? (6,2) is a void cell.
+!ent set_var big footprint_h 12
+?? (4,13) is outside the 12x12 grid.
+!as player pip
+!ent hp big -5
+?? approval
+!as host
+!as wait 7200
+!as server far
+!match new away Away 5 5
+!as idle 13
+?? Unloaded: `local`
+!as server local
+!pending
+?? No pending requests.
+HARNESS-ALLOWS-ERRORS
+
+Expected: growing the 1x1 body at (4,2) to 3 wide covers (6,2), a void:
+the refusal names the void cell, where it used to call the cell outside
+the 12x12 grid (a cell past the edge still reads that way). pip's
+request expired after an hour (`!as wait 7200`); with nobody reading the
+queue, the idle sweep used to keep `local` loaded ("an approval request
+is waiting") until something read it. The sweep now drops expired
+requests first, so `local` unloads; loaded again, its queue is empty
+(requests are runtime-only).
+
+
+SCENARIO 1144 — Turn order: a stunned unit ending one round and opening the next, a destroyed part with its own initiative, a forecast length under a team view, `!turn grant list` for players (T9, T10, V23, L52)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new tn TN 12 12
+!match use tn
+!ent add a A 10 1 1 30
+!ent add b B 10 2 1 20
+!ent add c C 10 3 1 10
+!status def stun
+!status data stun skips_turn true
+!turn next
+!turn next
+!ent init c 40
+!status apply c stun
+!turn next
+?! every entity is skippable
+?? — Round 2 —
+?? It is now **A**'s turn (id `a`)
+!turn forecast
+?? ➡️ now: `a` **A**
+!status dispel c stun 1
+!ent add boss Boss 30 6 6 25
+!ent set_vars boss footprint_w=2 footprint_h=2
+!part add boss arm Arm 5 5
+!part locate arm 8 6
+!ent init arm 22
+!turn grant arm 2
+!turn
+?? `arm` **Arm** (initiative 22)
+!ent kill arm
+!turn
+?! `arm`
+!turn grant list
+?? No extra turns queued.
+!assert "len(next_turns(6)) == 6 and not ('arm' in next_turns(10))"
+!ent hp arm 5
+!turn
+?? `arm` **Arm** (initiative 22)
+!ent remove boss
+!ent set_var a team red
+!ent set_var b team red
+!ent set_var c team blue
+!ent set_var a fog_vision_radius 1
+!ent set_var b fog_vision_radius 1
+!ent tp c 12 12
+!match fog on
+!match bind tn pov=red
+!turn grant a
+!as player bob
+!turn forecast 1
+?? 1. `
+?! zqx
+!turn forecast 3
+?? 3. `a` **A**
+?! `c`
+!turn grant list
+?? Extra turns queued (after the turn under way): `a` **A**
+HARNESS-ALLOWS-ERRORS
+
+Expected: after a and b act, c (raised to 40, stunned) is skipped at the
+end of round 1 and the new round's order starts with c again. The skip
+pass used to stop there ("every entity is skippable"), resting the round
+on c; now c is skipped again as its round-2 turn and a acts. A body part
+with its own initiative, destroyed, leaves the turn order and loses its
+queued extra turns (it used to keep taking turns, its on_turn_start
+firing on a dead limb); healed, it is back in the order. Under a red
+view with blue c out of sight, `!turn forecast 3` lists three visible
+turns (a's extra turn, b, then a in round 3), passing over c's round-3
+turn: `n` counts the turns the view shows (hidden turns used to count,
+so the listing came up one short where c's turn fell). `!turn grant
+list` is a player read, as bare `!turn` already showed the queue.
+
+
+SCENARIO 1145 — Under `deferred`, a restart and an undo don't mark the order changed; a real turn-order rule change says so on its own reply (T11)
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+!system set default turnorder_change_policy deferred
+!system set default turnorder_tiebreaker id
+!match new td TD 8 8
+!match use td
+!ent add a A 10 1 1 30
+!ent add b B 10 2 1 20
+!ent add c C 10 3 1 10
+!turn next
+!as restart
+!ent set_var a foo 1
+?! deferred
+!turn next
+!undo turn 1
+!ent set_var a foo 2
+?! deferred
+!turn next
+!turn next
+?! re-sorted
+!system set default turnorder_tiebreaker name
+?? ⏳ turn order change deferred (turn-order rules changed)
+!ent set_var a foo 3
+?! deferred
+!system set default turnorder_change_policy live
+!system set default turnorder_tiebreaker id
+
+Expected: a match file leaves its rules out, so a load (and an undo
+restore) built the match with the registry's stand-in rules and compared
+them with the system's: every `turnorder_*` rule the system sets read as
+changed, so under `deferred` the next var write carried "turn order
+change deferred" and the round ended "re-sorted". A state without rules
+now compares nothing. A real change (`turnorder_tiebreaker name`
+mid-round) puts its deferred note on the `!system set` reply, where it
+used to wait for the match's next var write.
+
+
+SCENARIO 1146 — `!map preview` under void_under_fog fog: a void the view can't see is marked and counted like the fog around it (V24)
+------------------------------------------------------------------------------------------------------------------------------------
+
+!system set default void_under_fog fog
+!match new vp VP 12 6
+!match use vp
+!map void add rect 9 2 11 4
+!map void add 3 4
+!ent add v V 10 2 2
+!ent set_var v team red
+!ent set_var v fog_vision_radius 2
+!match fog on
+!match bind vp pov=red
+!as player bob
+!map cell 10 3
+?? unseen (fog)
+!map preview burst 10 3 2
+?? 25 cell(s) on the map
+!map preview line 2 3 12 3
+?? 11 cell(s) on the map
+!map preview burst 3 4 1
+?? 8 cell(s) on the map
+!as host
+!match unbind
+!match use vp
+!map preview burst 10 3 2
+?? 16 cell(s) on the map
+!system set default void_under_fog show
+
+Expected: under `void_under_fog fog`, a void bob's red view can't see
+reads as an unseen cell everywhere. The preview used to build its shape
+over the existing cells only, so a burst on the hidden 3x3 hole marked a
+ring of 16 cells through the fog and a line skipped 3 cells, outlining
+the void. Now the hidden void cells are marked and counted like the
+fogged cells around them (25 and 11); the void at (3,4), which the view
+sees, stays out (8 of a 3x3 burst). In a channel without a team view the
+void is left out (16).
+
+
+SCENARIO 1147 — Round memory: switching ATB off starts it fresh with the actor counted; a removed unit's id leaves it, a corpse keeps its place (L52)
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new at AT 8 8
+!match use at
+!ent add a A 10 1 1 30
+!ent add b B 10 2 1 20
+!ent add c C 10 3 1 10
+!turn next
+!turn next
+!system set default atb_enabled true
+!turn next
+!turn next
+!turn next
+?? It is now **A**'s turn (id `a`)
+!system set default atb_enabled false
+!turn next
+?? It is now **B**'s turn (id `b`)
+!turn next
+?? It is now **C**'s turn (id `c`)
+!turn next
+?? — Round 2 —
+?? It is now **A**'s turn (id `a`)
+!turn next
+?? It is now **B**'s turn (id `b`)
+!ent remove a
+!ent add a Anew 10 1 1 30
+!turn next
+?? It is now **Anew**'s turn (id `a`)
+!ent kill b
+!ent revive b
+!turn next
+?? It is now **C**'s turn (id `c`)
+!turn next
+?? — Round 3 —
+
+Expected: a and b act in round 1, then ATB runs three turns ending on
+a. Switching ATB off starts a fresh round memory holding only a (the
+unit whose turn it is), so b and c act, then round 2 opens with a; the
+memory from before ATB came on used to let a act again at once. In round
+2, after a and b, `a` is removed and a new unit takes its id: the removal
+dropped the id from the round's memory, so Anew acts this round (it used
+to read as having acted and wait). b, killed and revived (its corpse kept
+its place), is the same unit and doesn't act again: c takes the next
+turn, then round 3.
+
+
+SCENARIO 1148 — The action-used line names its target (action_used_message_format): a unit, a list after a dropped target, a cell, none; names through a view; empty = no line
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new au AU 10 10
+!match use au
+!ent add hunter Hunter 20 1 1 5
+!ent add boss Boss 40 4 4 5
+!ent set_vars boss footprint_w=2 footprint_h=2
+!ent add bird Bird 10 8 1 5
+!ent set_var hunter actions.shoot.target entity
+!ent set_var hunter actions.shoot.body "deal_damage(target, 3)"
+!ent set_var hunter actions.volley.target entity_list
+!ent set_var hunter actions.volley.target_refuses_tags flying
+!ent set_var hunter actions.volley.body "x = 1"
+!ent set_var hunter actions.mark.target location
+!ent set_var hunter actions.mark.body "x = 1"
+!ent set_var hunter actions.rest.target none
+!ent set_var hunter actions.rest.body "x = 1"
+!ent set_var bird tags flying
+!action hunter shoot boss
+?? `hunter` used action `shoot` on `boss`.
+!action hunter volley boss bird
+?? dropped a target
+?? `hunter` used action `volley` on `boss`.
+!action hunter mark 3 7
+?? `hunter` used action `mark` on `(3,7)`.
+!action hunter rest
+?? `hunter` used action `rest`.
+?! `rest` on
+!system set default action_used_message_format "{actor_name} uses {action}{?target?} on {target_name}{/?}!"
+!ent set_var boss team red
+!ent set_var hunter team red
+!ent set_var hunter fog_vision_radius 9
+!ent set_var boss disguise.name Rock
+!match bind au pov=blue
+!action hunter shoot boss
+?? Hunter uses shoot on Rock!
+!match unbind
+!match use au
+!action hunter shoot boss
+?? Hunter uses shoot on Boss!
+!system set default action_used_message_format ""
+!action hunter rest
+?! used
+?! uses
+!assert "entity[boss].hp == 31"
+!system set default action_used_message_format "`{actor}` used action `{action}`{?target?} on `{target}`{/?}."
+HARNESS-ALLOWS-ERRORS
+
+Expected: the line a successful action ends with names what it was used
+on: the 2x2 boss, the list as the checks left it (the flying bird
+dropped by target_refuses_tags, so only `boss`), a cell as (x,y), and
+nothing for an action without a target (`{?target?}...{/?}` leaves the
+" on ..." out). A custom format's {actor_name} / {target_name} print as
+the channel's view sees each unit: in a blue-view channel the red boss
+reads as its disguise (Rock), in an unbound channel the real names. An
+empty format prints no line. Boss took 3 damage from each of three
+shoots (40 → 31).

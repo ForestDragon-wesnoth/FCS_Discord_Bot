@@ -395,7 +395,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy, template_hidden, template_private_level, TEMPLATE_CREATOR_ONLY
 
 
 class FormulaError(VTTError):
@@ -8033,6 +8033,19 @@ class FormulaEngine:
                 return lib
             return {k: v for k, v in lib.items() if k not in hidden}
 
+        def _usable(fn: str, key: str, tpl: Any) -> Any:
+            """A creator-level template the formula's view may not read
+            (a mutating `!eval`'s caller, as its commands are judged)
+            answers as missing under creator_template_use `none` (V22,
+            V20's formula half)."""
+            if (tpl is not None and template_private_level(tpl)
+                    == TEMPLATE_CREATOR_ONLY and template_hidden(
+                        tpl, getattr(match, "_view_templates", None))
+                    and str(match.rules.get("creator_template_use",
+                                            "none")) != "use"):
+                return None
+            return tpl
+
         def _template_spawn(fn: str, name: Any, x: Any, y: Any,
                             radius: Any, mv: Any = None) -> str:
             if not isinstance(name, str):
@@ -8041,7 +8054,7 @@ class FormulaEngine:
                 if not isinstance(v, int) or isinstance(v, bool):
                     raise FormulaError(f"{fn}: {what} must be a whole number.")
             key = name.strip().lower()
-            tpl = _workspace_templates().get(key)
+            tpl = _usable(fn, key, _workspace_templates().get(key))
             if tpl is None:
                 raise FormulaError(f"{fn}: this server has no template "
                                    f"`{name}` (see `!template list`).")
@@ -8163,6 +8176,11 @@ class FormulaEngine:
             if not isinstance(name, str):
                 raise FormulaError("give_template: the template name must "
                                    "be text.")
+            key = name.strip().lower()
+            if _usable("give_template", key, _workspace_templates().get(
+                    key)) is None and key in _workspace_templates():
+                raise FormulaError(f"give_template: There is no partial "
+                                   f"template `{key}`.")
             try:
                 match.surface_log(match.give_partial(
                     e, path, name.strip().lower()))

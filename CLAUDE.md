@@ -297,7 +297,8 @@ Each of these was learned from a shipped bug.
   check and Tab completion read it; a NEW placeholder name that names
   something — a unit, a template, a rule — goes in `completion.py`'s slot
   tables, or it completes from the general name pool); alias spellings in `_SUB_ALIASES`; player-available reads
-  in `READ_ONLY_SUBCOMMANDS[root]`; a host-only READ in `_HOST_READS` (or a
+  in `READ_ONLY_SUBCOMMANDS[root]` (a two-word read form of a gated
+  subcommand in `_READ_ONLY_FORMS`); a host-only READ in `_HOST_READS` (or a
   pause with `pause_affects_hosts` holds it); a read form of an elevated arg
   in `_ELEVATED_READ_FORMS`; anything touching server-wide state or host files
   in `_admin_required` (files via `saves_path`); naming another match →
@@ -655,10 +656,13 @@ plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
   hourly: a server unused for the owner limit `server_idle_unload_hours`
   (12, 0 = never) is written (`commit_all_one`; a locked one writes
   nothing) and dropped (`unload`), unless `unload_blocker` names a reason:
-  a command running on it, an approval request waiting (runtime-only), a
+  a command running on it, an approval request waiting (runtime-only;
+  expired ones are dropped first, L53), a
   surface guard (`Workspaces.unload_guards`, each returning its reason:
   Discord keeps a server with a live auto-update board, the GUI the local
-  workspace it holds). `!as idle <hours>` (CLI / harness) moves every
+  workspace it holds). A server whose write fails stays loaded, the
+  error goes to the crash log once and the sweep goes on (W11: it raised
+  out of another server's command). `!as idle <hours>` (CLI / harness) moves every
   loaded server's last use back and sweeps. `!as restart` loads again the
   servers that were loaded. Data of servers the bot left is kept. On
   shutdown `commit_all` writes the loaded servers once more.
@@ -675,7 +679,9 @@ plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
   `!server recover` (admin) shows the reason, the matches and the options:
   `backup <n>` restores a dated systems.json copy, `accept [confirm]`
   moves the uncovered matches to the default system; both rebuild what the
-  match backups cover. After a lock or rebuild the next commit rewrites
+  match backups cover; the journal of each match a recovery moves records
+  its new chain as a `systems` entry, and a replayed `state` entry takes
+  its stored system when the replay has it (J18, 1142). After a lock or rebuild the next commit rewrites
   systems.json and workspace.json (864-865). Without a systems.json that
   loaded, `default` is the registry's stand-in (most servers customize
   it), so its matches count as lost too and aren't renamed at load; a
@@ -1543,7 +1549,11 @@ hardcodes**.
   units ahead (user call: jumping over is a mechanic some games want; a
   "jump, then jump back" belongs to extra turns, #224). An extra turn
   (below) leaves `round_acted` alone; `set_turn` gives the turn whatever
-  the memory says. A saved enum rule value this build lacks is dropped at load
+  the memory says. A unit that leaves for good (a despawn, a death
+  without a corpse) leaves the memory, so a later unit under its id acts
+  this round; a corpse keeps its place, as a revive is the same unit.
+  Switching ATB off starts a fresh memory holding the unit whose turn it
+  is (user calls, L52, 1147). A saved enum rule value this build lacks is dropped at load
   (`GameSystem.from_dict`, a console note), so the default applies.
 - **Joining and leaving under `deferred`** (user call, 1038, 1040): a
   structural rebuild mid-round (`_rebuild_turn_order` without `full`:
@@ -1566,7 +1576,9 @@ hardcodes**.
   then each later round (`_sorted_turn_ids(round)` where the wrap would
   re-sort: a pending change, or `random_stable`, re-sorted per round).
   Default length: to the end of the next round (round 1 before the first
-  turn); at most the owner limit `turn_forecast_limit` (100). Under ATB
+  turn); at most the owner limit `turn_forecast_limit` (100). The rest of
+  the round is read in one pass over the order and stops at n (X24: a
+  scan from the top per turn cost the order's length squared). Under ATB
   (`_atb_forecast`) n is required and the bars are extended at their
   rates now, resetting by the threshold; every ATB forecast carries an
   estimate warning (user call), plus a note when atb_reset_formula is
@@ -1574,7 +1586,8 @@ hardcodes**.
   turns of a unit holding a skips_turn status are marked skipped;
   next_turns leaves marked turns out), `turn_forecast_hidden_units`
   (omit default / text, with `turn_forecast_hidden_text`: a turn the
-  channel's view can't see; the numbers count only lines shown),
+  channel's view can't see; the numbers count only lines shown, and under
+  `omit` n counts the turns the view shows, V23, 1144),
   `turn_forecast_line_format`. A random-board differential of forecast
   against the turns that followed (both policies, every tiebreaker, team
   grouping, joins, removals of the actor, `!turn set`, ATB) matched
@@ -1621,7 +1634,7 @@ hardcodes**.
   turn hands play back to the order. `!turn set` ends an extra turn
   under way and keeps the queue. The reply line is
   `extra_turn_message_format` (the hidden-unit line still applies); bare
-  `!turn`, `!turn grant list` and the forecast (entries marked `extra`,
+  `!turn`, `!turn grant list` (a player read, `_READ_ONLY_FORMS`) and the forecast (entries marked `extra`,
   shown "(extra)", included in next_turns) show the queue through the
   channel's view; `!match info`, `!list` and the history diff name the
   extra turn's unit as the current one.
@@ -1635,7 +1648,9 @@ hardcodes**.
   units whose statuses carry `skips_turn` (each skip fires on_turn_skipped
   and the unit's turn_start / turn_end status ticks, as under ATB, so a stun
   counting down on its own turns wears off; `_skip_to_eligible` tracks the
-  ids it has seen, so removals mid-pass can't over- or under-run it). When
+  ids it has seen, so removals mid-pass can't over- or under-run it; a
+  unit met again before every unit was seen opens a new round inside the
+  pass and is skipped again, T9, 1144). When
   every unit is skipped, whole rounds keep passing until one can act, up to
   `skip_all_round_limit`, stopping early once a round changes no status
   (permanent stuns) → `_start_current_turn`. The reply prints hook
@@ -1647,6 +1662,14 @@ hardcodes**.
   skipping it; a unit that dies to its own turn-start effects passes the turn
   on at once (bounded by the order size). Every path that can empty the
   order returns cleanly.
+- **A destroyed body part** with its own initiative leaves the turn order
+  and loses its queued extra turns (`Match._leave_turns`, shared with
+  `Entity.remove`); a heal above 0 rebuilds the order with it (T10, 1144).
+- **A match built from a state without rules** (a load, an undo restore:
+  files leave rules out) carries `_rules_stub`, so `apply_system_rules`
+  compares no turn-order rules for it (T11: every restart marked the order
+  changed under `deferred`); a real turn-order rule change puts its
+  deferred note on the edit's reply (1145).
 - **Attached parts ride the parent's clock** (`_attached_tick_parts`): their
   statuses tick, turn/round own-passives fire and turn schedules run on the
   parent's turn; a part with its own initiative has its own turn instead.
@@ -1906,7 +1929,13 @@ hardcodes**.
   the map of a location / location_list target's cells (the actor's by
   default; not an action arg there, 880); `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
-  [x, y] → location, ids checked, lists non-empty).
+  [x, y] → location, ids checked, lists non-empty). A successful
+  `!action` (and a resolved exchange) ends with the
+  `action_used_message_format` line (`Match.action_used_line`: {actor},
+  {action}, {target} as the checks left it, a cell as (x,y), lists joined;
+  {actor_name} / {target_name} as say() markers, so a view reads names
+  as it sees each unit; the actor's own placeholders; empty = no line;
+  1148).
 - **`run_action`** is transactional: pre-state captured, body run,
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo
@@ -2297,7 +2326,7 @@ hardcodes**.
   listings) treats a void as off the map; `Map.in_rect` keeps the
   rectangle for coordinates, rulers, resize, prefab corners and the cell
   limits (`match_cell_limit` counts the rectangle). Refusals name a void
-  as one (`Map.off_text`). `Match.set_voids(mp, target, confirm)` is the
+  as one (`Map.off_text`; a body grown onto one too, L53). `Match.set_voids(mp, target, confirm)` is the
   one edit: units on a cell turning void follow `map_void_occupied_mode`
   (refuse / kill, the resize kill loop), and dropping tile data,
   corpses, zone cells or a kill needs `confirm` (NeedsConfirm listing
@@ -2374,7 +2403,9 @@ hardcodes**.
   `_occupants`; 933). Every line is the sight walk (`logic.line_cells`:
   cells_in_line, `!map preview line`, `!reveal_fog line`, `!tile line`,
   has_los, the line searches; 935). Builders are clipped to the map
-  and charged to `formula_cell_limit`. `!dist` and `!map preview
+  and charged to `formula_cell_limit` (`!map preview` under
+  `void_under_fog fog` marks and counts a void the view can't see like
+  the fog around it, V24, 1146). `!dist` and `!map preview
   <burst|cone|line|rect>` show the same geometry. Block conditions also
   see the step (`move_dir`, §7.12 "Facing").
 
@@ -2890,7 +2921,7 @@ hardcodes**.
   `Match.legend_label_*`, shared by both renderers; a disguised unit's
   label comes only from the disguise; a `legend` var the reader may not
   read labels nothing, the name stands in (L50; Discord boards render as
-  their channel's team, `_apply_board`); both legends are built from what
+  a player of their channel reads, its team or none, `_apply_board`, L51); both legends are built from what
   the view actually draws, so nothing hidden, fogged or invisible to the
   POV is ever listed) (781), coordinate rulers
   (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
@@ -3185,7 +3216,9 @@ hardcodes**.
   A command undo's reply names the command by its round where the
   board's history is withheld from the channel (L49); `!history import`
   never replaces a save under a name it picked (`<name>-2`), and one
-  named with `as` says it replaced the old one (1036).
+  named with `as` says it replaced the old one (1036); it takes the next
+  sequence of the match's counter and is stored whole (W10, 1141: the
+  export's own number replaced the match's snapshot of that number).
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -3353,7 +3386,14 @@ hardcodes**.
   V20; `_usable_template`, the reference check in `_store_template`):
   `none` (default), spawn / give / copy / a new reference answer as for
   a missing template; `use`, they spawn, give and reference it without
-  reading it, and a copy is refused. To anyone else it
+  reading it, and a copy is refused. A mutating `!eval` runs with the
+  command's viewer (`match._view_templates`), so `summon_template*` and
+  `give_template` follow the rule there too (V22, 1034). Formulas the
+  engine runs (action bodies, passives, hooks, watchers) read and use the
+  whole library, units another host builds from one under `use` show its
+  vars to that host, and a public template the creator built on a
+  creator-level partial expands it for anyone who spawns it (user calls,
+  in the rule's description). To anyone else it
   reads as missing in list / show / diff / tags / trash, template_names /
   has_template / template_data and Tab (`_readable_template`,
   `completion._readable_template_names`), and in the edits and restore

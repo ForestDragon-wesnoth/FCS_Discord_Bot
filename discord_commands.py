@@ -952,13 +952,13 @@ async def _apply_board(message, m, channel_key: str, mgr: MatchManager) -> bool:
     Returns whether the viewport is engaged. Image mode falls back to text if
     rendering fails (e.g. Pillow missing). Raises only on the edit itself."""
     import io
-    # A board refreshes outside any command: in a channel showing a team's
-    # view it reads as that team's players do, so a private var (a unit's
-    # `legend` label) stays off it (L50).
+    # A board refreshes outside any command and everyone in its channel
+    # reads it: it reads as that channel's players do (the channel's team,
+    # or none), so a private var (a unit's `legend` label) stays off it
+    # (L50; L51: a channel without a team view read as a host).
     import logic as _logic
     pov = m.channel_pov(channel_key)
-    token = _logic.VAR_READER.set(
-        _logic.VarReader(team=pov, host=False) if pov is not None else None)
+    token = _logic.VAR_READER.set(_logic.VarReader(team=pov, host=False))
     try:
         return await _apply_board_as_reader(message, m, channel_key, mgr, io)
     finally:
