@@ -28241,11 +28241,14 @@ async def _run_action_dispatch(
     m._runtime_ctx = ctx
     m._runtime_mgr = mgr
     from action import ActionEngineFault
+    # The target as the checks left it (immune / misfit units dropped),
+    # for the action_used_message_format line.
+    tout: Dict[str, Any] = {}
     try:
         ok, fail_info = await run_action(
             action, actor_id=eff_actor_id, target=target_value,
             args=args_dict, match=m, mgr=mgr, ctx=ctx,
-            answers=answers, extra_ctx=extra_ctx,
+            answers=answers, extra_ctx=extra_ctx, target_out=tout,
         )
     except ActionEngineFault as ef:
         # Engine-level refusal (recursion limit etc.) — runner has
@@ -28273,9 +28276,11 @@ async def _run_action_dispatch(
         return await ctx.send(
             f"❌ action `{action.name}`: {tag}{message}"
         )
-    return await ctx.send(
-        f"`{actor_id}` used action `{action.name}`."
-    )
+    m = mgr.matches.get(m.id, m)
+    line = m.action_used_line(actor_id, action.name,
+                              tout.get("target", target_value))
+    if line:
+        return await ctx.send(line)
 
 
 # ---- Automated Help command (shows available commands----------------------------------------------------------

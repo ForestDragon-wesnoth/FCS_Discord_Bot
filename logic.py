@@ -4906,6 +4906,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "overflow rather than blowing Python's stack."
         ),
     },
+    "action_used_message_format": {
+        "default": "`{actor}` used action `{action}`{?target?} on `{target}`{/?}.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line a successful `!action` (or `!ent action`) ends with. "
+            "Placeholders: {actor} (the acting unit's id), {action}, "
+            "{target} (what it was used on: a unit or corpse id, a cell "
+            "as (x,y), a list joined with commas; empty for an action "
+            "without a target), {actor_name} / {target_name} (names as "
+            "the channel's view sees each unit), and the acting unit's "
+            "own placeholders ({name}, {x}, {y}, {team}, its vars). "
+            "`{?target?}...{/?}` keeps its text only when there is a "
+            "target. Empty = no line."
+        ),
+    },
     "action_forbidden_message_format": {
         "default": ("`{actor}` can't use `{action}`: {status} on `{unit}` "
                     "forbids {matched}."),
@@ -30508,6 +30523,49 @@ class Match:
             name = (loc[2] or {}).get("name", eid) if isinstance(loc[2], dict) else eid
         name = str(name).replace(UNIT_LINE_TAG, "")
         return f"{UNIT_LINE_TAG}#{self.id}|{eid}|{name}{UNIT_LINE_TAG}"
+
+    def action_used_line(self, actor_id: str, action_name: str,
+                         target: Any) -> str:
+        """The action_used_message_format line for `actor_id` using
+        `action_name` on `target` (a unit or corpse id, a cell — a Coord or
+        an [x, y(, map)] list — or a list of them; None = no target); ""
+        when the rule is empty."""
+        fmt = str(self.rules.get("action_used_message_format", "") or "")
+        if not fmt.strip():
+            return ""
+
+        def one(t: Any) -> Tuple[str, str]:
+            if isinstance(t, str):
+                return t, self.say_name(t)
+            if hasattr(t, "x") and hasattr(t, "y"):
+                cell = f"({t.x},{t.y})"
+                return cell, cell
+            if (isinstance(t, (list, tuple)) and len(t) in (2, 3)
+                    and all(isinstance(v, int) and not isinstance(v, bool)
+                            for v in t[:2])):
+                cell = f"({t[0]},{t[1]})"
+                return cell, cell
+            return str(t), str(t)
+        if target is None or target == "" or target == []:
+            items: List[Tuple[str, str]] = []
+        elif isinstance(target, (list, tuple)) and not (
+                len(target) in (2, 3) and all(
+                    isinstance(v, int) and not isinstance(v, bool)
+                    for v in target[:2])):
+            items = [one(t) for t in target]
+        else:
+            items = [one(target)]
+        e = self.entities.get(actor_id)
+        extra = {"actor": actor_id, "action": action_name,
+                 "actor_name": self.say_name(actor_id),
+                 "target": ", ".join(a for a, _ in items),
+                 "target_name": ", ".join(b for _, b in items)}
+        if e is None:
+            return self.render_unit_message(fmt, actor_id, actor_id, "", "",
+                                            {}, extra=extra)
+        return self.render_unit_message(fmt, actor_id, e.name, e.x, e.y,
+                                        e.vars, part_of=e.part_of or "",
+                                        extra=extra)
 
     def say_tag(self, about: Optional[str]) -> str:
         """The tag a say() line about unit or corpse `about` starts with

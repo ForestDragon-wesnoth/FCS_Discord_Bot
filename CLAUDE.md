@@ -1929,7 +1929,13 @@ hardcodes**.
   the map of a location / location_list target's cells (the actor's by
   default; not an action arg there, 880); `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
-  [x, y] → location, ids checked, lists non-empty).
+  [x, y] → location, ids checked, lists non-empty). A successful
+  `!action` (and a resolved exchange) ends with the
+  `action_used_message_format` line (`Match.action_used_line`: {actor},
+  {action}, {target} as the checks left it, a cell as (x,y), lists joined;
+  {actor_name} / {target_name} as say() markers, so a view reads names
+  as it sees each unit; the actor's own placeholders; empty = no line;
+  1148).
 - **`run_action`** is transactional: pre-state captured, body run,
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo

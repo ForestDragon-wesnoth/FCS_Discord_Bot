@@ -27869,7 +27869,7 @@ SCENARIO 880 — `!action ... map=<map>` aims a location action at another map
 !ent set_var hero actions.blink.target location
 !ent set_var hero actions.blink.body "entity[self].got = [target.x, target.y, target.map]\nmove_entity(self, target)"
 !action hero blink 4 4 map=deck
-?? `hero` used action `blink`.
+?? `hero` used action `blink` on `(4,4)`.
 !assert "entity[hero].got == [4, 4, 'deck'] and map_of('hero') == 'deck' and entity[hero].x == 4"
 !action hero blink 3 3 map=nowhere
 ?? Could not find a map named `nowhere`
@@ -29713,7 +29713,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag_unless blind "entity[self].blindsight == True"
 !ent set_var hunter blindsight true
 !action hunter shoot wolf
-?? `hunter` used action `shoot`.
+?? `hunter` used action `shoot` on `wolf`.
 !assert "entity[wolf].hp == 5"
 !action hunter aimed_shot wolf
 ?? forbids `aimed_shot`.
@@ -29732,7 +29732,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag blind -
 ?? Cleared `blind` forbids_actions_with_tag.
 !action hunter bash wolf
-?? `hunter` used action `bash`.
+?? `hunter` used action `bash` on `wolf`.
 
 Expected: An action's tags are its own `tags` plus the `action_tags` of every
 container above it, the vars root included, nearest first, and `!action
@@ -29795,12 +29795,12 @@ SCENARIO 917 — Action tags: immune statuses on single and list targets, body r
 !assert "entity[knight].swept == ['rat']"
 !status apply knight flying
 !action knight hack bird
-?? `knight` used action `hack`.
+?? `knight` used action `hack` on `bird`.
 !assert "entity[bird].hp == 5"
 !status dispel knight flying
 !ent status bird set flying immune_to_actions_with_tag ranged
 !action knight hack bird
-?? `knight` used action `hack`.
+?? `knight` used action `hack` on `bird`.
 !action archer arrow bird
 ?? flying on `bird` blocks `ranged` actions.
 !assert "entity[bird].hp == 2"
@@ -29878,7 +29878,7 @@ SCENARIO 918 — Action tags: mounts, the system library, lint, malformed tag fi
 ?? `gun` used action `horn`.
 !ent set_var tank crew 3
 !action gun cannon ogre
-?? `gun` used action `cannon`.
+?? `gun` used action `cannon` on `ogre`.
 !assert "entity[ogre].hp == 25"
 !status apply gun blind
 !action gun cannon ogre
@@ -30089,7 +30089,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action info druid raise
 ?? Target must match: `humanoid and not undead`
 !action druid command horse
-?? `druid` used action `command`.
+?? `druid` used action `command` on `horse`.
 !action druid command zed
 ?? ❌ action `command`: [target_tags] `zed` doesn't fit `command`: its tags (mindless) don't match `animal`.
 !assert "entity[horse].commanded == True and not var_has('zed', 'commanded')"
@@ -30108,7 +30108,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action druid raise horse
 ?? ❌ action `raise`: [target_tags] `horse` doesn't fit `raise`: its tags (animal, rideable, corpse) don't match `humanoid and not undead`.
 !action druid raise bandit
-?? `druid` used action `raise`.
+?? `druid` used action `raise` on `bandit`.
 !assert "'bandit' in all_entities() and has_corpse('horse')"
 !status def feared
 !status cannot_affect_units_with_tag feared "mindless or construct"
@@ -30251,7 +30251,7 @@ SCENARIO 923 — One filter rule: modifiers, shields, status tag: tokens, restri
 !action hero smash foe
 ?? heavy_load on `hero` forbids `melee and heavy` actions.
 !action hero jab foe
-?? `hero` used action `jab`.
+?? `hero` used action `jab` on `foe`.
 !zone new lava
 !zone add lava 2 2
 !zone tags lava "fire, hazard"
@@ -36946,7 +36946,7 @@ SCENARIO 1052 — Extra turns in an action: a Bard's inspire gives an ally withi
 !assert "extra_turn_queue() == [] and entity_distance('bard', 'archer') == 3"
 !assert "entity_distance('bard', 'knight') == 2"
 !action bard inspire knight
-?? `bard` used action `inspire`.
+?? `bard` used action `inspire` on `knight`.
 !turn forecast 3
 ?? 1. `knight` **Knight** (extra)
 ?? 2. `archer` **Archer**
@@ -41126,3 +41126,63 @@ dropped the id from the round's memory, so Anew acts this round (it used
 to read as having acted and wait). b, killed and revived (its corpse kept
 its place), is the same unit and doesn't act again: c takes the next
 turn, then round 3.
+
+
+SCENARIO 1148 — The action-used line names its target (action_used_message_format): a unit, a list after a dropped target, a cell, none; names through a view; empty = no line
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new au AU 10 10
+!match use au
+!ent add hunter Hunter 20 1 1 5
+!ent add boss Boss 40 4 4 5
+!ent set_vars boss footprint_w=2 footprint_h=2
+!ent add bird Bird 10 8 1 5
+!ent set_var hunter actions.shoot.target entity
+!ent set_var hunter actions.shoot.body "deal_damage(target, 3)"
+!ent set_var hunter actions.volley.target entity_list
+!ent set_var hunter actions.volley.target_refuses_tags flying
+!ent set_var hunter actions.volley.body "x = 1"
+!ent set_var hunter actions.mark.target location
+!ent set_var hunter actions.mark.body "x = 1"
+!ent set_var hunter actions.rest.target none
+!ent set_var hunter actions.rest.body "x = 1"
+!ent set_var bird tags flying
+!action hunter shoot boss
+?? `hunter` used action `shoot` on `boss`.
+!action hunter volley boss bird
+?? dropped a target
+?? `hunter` used action `volley` on `boss`.
+!action hunter mark 3 7
+?? `hunter` used action `mark` on `(3,7)`.
+!action hunter rest
+?? `hunter` used action `rest`.
+?! `rest` on
+!system set default action_used_message_format "{actor_name} uses {action}{?target?} on {target_name}{/?}!"
+!ent set_var boss team red
+!ent set_var hunter team red
+!ent set_var hunter fog_vision_radius 9
+!ent set_var boss disguise.name Rock
+!match bind au pov=blue
+!action hunter shoot boss
+?? Hunter uses shoot on Rock!
+!match unbind
+!match use au
+!action hunter shoot boss
+?? Hunter uses shoot on Boss!
+!system set default action_used_message_format ""
+!action hunter rest
+?! used
+?! uses
+!assert "entity[boss].hp == 31"
+!system set default action_used_message_format "`{actor}` used action `{action}`{?target?} on `{target}`{/?}."
+HARNESS-ALLOWS-ERRORS
+
+Expected: the line a successful action ends with names what it was used
+on: the 2x2 boss, the list as the checks left it (the flying bird
+dropped by target_refuses_tags, so only `boss`), a cell as (x,y), and
+nothing for an action without a target (`{?target?}...{/?}` leaves the
+" on ..." out). A custom format's {actor_name} / {target_name} print as
+the channel's view sees each unit: in a blue-view channel the red boss
+reads as its disguise (Rock), in an unbound channel the real names. An
+empty format prints no line. Boss took 3 damage from each of three
+shoots (40 → 31).
