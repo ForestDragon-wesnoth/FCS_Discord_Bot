@@ -209,6 +209,9 @@ def place_order(steps: Dict[str, Dict[str, Any]], kind: str, side: str,
     if ref is not None:
         if ref not in steps:
             raise NotFound(f"no {kind} step `{ref}`.")
+        if ref == skip:
+            raise VTTError(f"a step can't go before or after itself "
+                           f"(`{ref}`).")
         if steps[ref].get("side") != side:
             raise VTTError(f"`{ref}` is a {steps[ref].get('side')} step: a "
                            f"step goes among the steps of its own side.")
@@ -388,6 +391,9 @@ def pool_totals(m: Any, kind: str,
         sums[c["pool"]] = sums.get(c["pool"], 0) + c["amount"]
     out: Dict[str, int] = {}
     for p, v in sums.items():
+        if not math.isfinite(v):
+            raise VTTError(f"the {info['noun']} to pool `{p}` adds up past "
+                           f"the largest number ({v}).")
         if floor is not None and v < floor:
             v = floor
         out[p] = _rounded(v, mode)

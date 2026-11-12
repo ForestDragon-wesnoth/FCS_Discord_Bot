@@ -40766,3 +40766,33 @@ kill only when the defender's hp is still at 0 or below, so the hit
 endure answered isn't one. The
 third hit kills T: the death check runs once, after the hooks, and
 on_death still credits A.
+
+SCENARIO 1140 — Damage pipeline refusals: a step placed by itself, a total past the largest number, a junk record kind (#25)
+-------------------------------------------------------------------------------------------------------------------------
+
+!match new de DE 8 8
+!match use de
+!ent add boss Boss 50 3 3 5
+!ent set_vars boss footprint_w=2 footprint_h=2
+!damage step add armor side=defender "step_reduce(1)"
+!damage step edit armor before=armor
+?? ❌ a step can't go before or after itself (`armor`).
+!damage step move armor after=armor
+?? ❌ a step can't go before or after itself (`armor`).
+!eval "deal_damage('boss', [{'amount': 1e308}, {'amount': 1e308}])"
+?? ❌ deal_damage: the damage to pool `hp` adds up past the largest number (inf). Nothing was changed.
+!eval "heal('boss', [{'amount': 1e308}, {'amount': 1e308}])"
+?? ❌ heal: the healing to pool `hp` adds up past the largest number (inf).
+!eval "last_damage('boss', [])"
+?? ❌ last_damage(eid, which): which is taken or dealt, not [].
+!eval "step_total(1)"
+?? step_total() takes 0 positional arguments
+!assert "entity[boss].hp == 50 and last_damage('boss') == None"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `before=` / `after=` naming the step being placed is refused
+(it crashed: the step isn't among the ones it is placed between). Two
+components whose sum overflows to infinity are refused before any write;
+`last_damage` refuses a `which` that isn't a word; a wrong-arity call of
+a step_ function names it with its underscore (the message cleaner cut
+`step_total()` to `steptotal()`). The 2x2 boss is untouched.

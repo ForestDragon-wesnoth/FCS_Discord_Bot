@@ -1612,7 +1612,8 @@ def _len(v: Any) -> int:
 # Coordinates are 1-indexed to match the rest of the engine.
 
 _IMPL_NAME_RE = re.compile(
-    r"(?:FormulaEngine\._namespace\.<locals>\.)?_([a-z][a-z0-9_]*)\(\)")
+    r"(?:FormulaEngine\._namespace\.<locals>\.)?(?<![A-Za-z0-9_])"
+    r"_([a-z][a-z0-9_]*)\(\)")
 
 
 def _runtime_msg(e: BaseException) -> str:
@@ -9500,7 +9501,7 @@ class FormulaEngine:
                      "dealt": info["rec_dealer"]} if kind == "damage"
                     else {"received": info["rec_target"],
                           "given": info["rec_dealer"]})
-            if which not in keys:
+            if not isinstance(which, str) or which not in keys:
                 raise FormulaError(
                     f"{fname}(eid, which): which is "
                     + ("taken or dealt" if kind == "damage"
