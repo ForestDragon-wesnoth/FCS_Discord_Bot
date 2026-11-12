@@ -322,10 +322,9 @@ target"):
 
 ## 10. The damage pipeline (#25)
 
-Agreed with the user question by question, in chat. Part 1 is built
-(`damage.py`, CLAUDE.md §7.24): packets, steps, the writes, the
-forecast, the records and the commands; §10.5, §10.7 and §10.1's
-`incoming` and dice rewind are next. The engine runs a packet of damage through the system's ordered steps and
+Agreed with the user question by question, in chat. Built in full
+(`damage.py`, CLAUDE.md §7.24); §10.9 lists the choices made while
+building. The engine runs a packet of damage through the system's ordered steps and
 writes the result; healing runs through its own twin pipeline. The first
 four points were settled while designing reactions, the rest after.
 
@@ -577,6 +576,46 @@ the above.
   dump`. `!healing explain` twin.
 - **`!damage last <unit>`**: the same table for the last packet the unit
   actually took, from the saved record. `!healing last` twin.
+
+### 10.9 As built (choices made while building, open to change)
+
+- **The order after the writes:** statuses that break, the line, the
+  event-log entry, the death check (so the line and the entry read before
+  the death's), the records, a body part's share and destruction, then
+  the hooks. The records come before the hooks, so `last_damage(self)` in
+  `on_damage_taken` reads the packet being handled.
+- **`on_damage_taken` on a dead defender:** the killing blow's
+  `on_damage_taken` fires only while the defender is still in the match
+  (a corpse left it); `on_death` (with `killer`) and the attacker's
+  `on_damage_dealt` still fire.
+- **`damage_lost`** is what the var moved: without a clamp at 0, 40
+  damage on 25 hp moves it 40.
+- **Break-on-damage fields:** `removed_on_damage` (on / off),
+  `break_at_damage: N` (counted in the instance's `damage_counted`,
+  removed once it reaches N) and one `damage_filter` (a tag filter) for
+  both; a pool's damage taken counts by the share of its positive
+  components the filter matches. removed_by `damage`.
+- **Status source:** an action body's `status_apply` records the actor
+  unless `source=None`; an application without a source leaves an
+  earlier one in place; statblocks, templates, prefabs, copies and
+  corpses drop it, and the applier leaving the match clears it.
+- **Body-part shares:** the base is the components the part took after
+  its own steps; the share is worked out before the part's writes (a bad
+  knob refuses the hit), sent after them with the packet tag
+  `part_share`, and the part's destruction follows the share (as
+  damage_part did). The part's hp stops at 0, and a destroyed part still
+  passes hits on while its body lives. The heal percent follows: the
+  part's `heal_to_main_percent`, else its `damage_to_main_percent`, else
+  the heal rule (`same` = the damage rule). A dict percent with no
+  `default` key falls back on the rule. The share rounds by
+  damage_rounding (half of 5 is 2 by default; rounding_mode now applies
+  to transforms only). `damage_part` and `damage_spread` are packets.
+- **Forecasts in `prepare`:** several on one target add up per pool; a
+  forecast of a unit the action doesn't affect isn't recorded.
+  `incoming.damage_taken.hp` reads (a dict from `incoming` reads keys as
+  attributes). The dice rewind applies when an exchange opened; after
+  the body the RNG never stays behind where it was, so later rolls don't
+  repeat the reactions' rolls.
 
 ## 11. Details found open while writing this file
 

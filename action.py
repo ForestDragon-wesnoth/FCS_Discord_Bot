@@ -2424,6 +2424,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "journal",
         "_var_event_depth", "_var_event_warned", "_var_event_warnings",
         "_status_event_depth", "_status_event_warned",
+        "_damage_hook_depth", "_damage_hook_warned",
         "_grant_syncing", "_grant_dirty", "_grant_changes",
         "_grant_warned",
         "_action_depth", "_runtime_buffer",

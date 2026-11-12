@@ -3444,9 +3444,11 @@ def _part_status_str(m, p: Entity) -> str:
     hp = text if m.var_hidden(p, hp_var) else p.vars.get(hp_var, 0)
     mhp = text if m.var_hidden(p, mhp_var) else p.vars.get(mhp_var, 0)
     flags: List[str] = []
-    pct = p.vars.get("to_main_percent",
-                     m.rules.get("part_to_main_percent_default", 0))
-    flags.append(f"{pct}%→main")
+    pct = p.vars.get("damage_to_main_percent",
+                     m.rules.get("part_damage_to_main_percent_default", 0))
+    flags.append((f"{pct}%" if not isinstance(pct, dict) else
+                  ", ".join(f"{k} {v}%" for k, v in pct.items()))
+                 + "→main")
     cap = p.vars.get("to_main_cap", m.rules.get("part_to_main_cap_default", "max_hp"))
     flags.append(f"cap={cap}")
     if m.is_indestructible(p):
@@ -12176,6 +12178,9 @@ registry.annotate_sub(
         "resist_affects <system> <name> <level|duration|both|-> | "
         "resist_rounding <system> <name> <floor|ceil|round|-> | "
         "on_transform <system> <name> <keep|drop|-> | "
+        "removed_on_damage <system> <name> <on|off> | "
+        "break_at_damage <system> <name> <n|-> | "
+        "damage_filter <system> <name> [<filter ...>] | "
         "level <system> <name> list | level <system> <name> <level> drop | "
         "level <system> <name> <level> del <field> | "
         "level <system> <name> <level> <field> <value ...> | "
@@ -22571,8 +22576,8 @@ for _sub, _usage in (
         ("sprite", "!status sprite <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>]"),
         ("list", "!status list"),
         ("info", "!status info <name>"),
-        ("apply", "!status apply <eid> <name> [level] [duration] [rounding=<floor|ceil|round>]"),
-        ("force", "!status force <eid> <name> [level] [duration]")):
+        ("apply", "!status apply <eid> <name> [level] [duration] [rounding=<floor|ceil|round>] [source=<unit>]"),
+        ("force", "!status force <eid> <name> [level] [duration] [source=<unit>]")):
     registry.annotate_sub("status", _sub, usage=_usage)
 registry.annotate_sub(
     "status", "resist_affects",
@@ -22595,6 +22600,33 @@ registry.annotate_sub(
           "immune, `!ent replace` drops it. An instance's own "
           "`on_transform` key and level entries (`!status level`) "
           "override the definition's."),
+)
+registry.annotate_sub(
+    "status", "removed_on_damage",
+    usage="!status removed_on_damage <name> <on|off>",
+    desc=("#235: on = its bearer taking damage removes the status "
+          "(removed_by `damage`; sleep, a shutdown). Damage is a damage "
+          "packet's amount taken above 0 (deal_damage, `!ent damage`; a "
+          "raw `!ent hp` doesn't count), narrowed by `!status "
+          "damage_filter`. Heals never touch it."),
+)
+registry.annotate_sub(
+    "status", "break_at_damage",
+    usage="!status break_at_damage <name> <n|->",
+    desc=("#235: the damage its bearer takes while it holds the status adds "
+          "up in the instance's `damage_counted` (a display can show "
+          "`{damage_counted}`), and the status goes once that reaches n "
+          "(removed_by `damage`; a charged action broken by 100 damage). "
+          "Narrowed by `!status damage_filter`."),
+)
+registry.annotate_sub(
+    "status", "damage_filter",
+    usage="!status damage_filter <name> [<filter ...>]",
+    desc=("A tag filter on what damage counts toward removed_on_damage and "
+          "break_at_damage: a component counts when its filter tags (its "
+          "tags, the packet's, `pool:<var>`) match (`pool:hp`, `physical "
+          "and not true_damage`). Each pool's damage taken counts by the "
+          "share of its components that match. `-` or none clears it."),
 )
 registry.annotate_sub(
     "status", "resist_rounding",
@@ -22673,7 +22705,8 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                        for f in ACTION_RESTRICTION_FIELDS},
                     GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2,
                     "level": 3, "resist_affects": 3, "resist_rounding": 3,
-                    "on_transform": 3}
+                    "on_transform": 3, "removed_on_damage": 3,
+                    "break_at_damage": 3, "damage_filter": 2}
 
 # `!status level` (#259): a level entry's field -> the `!status`
 # subcommand that edits that field of a definition (run on a scratch
@@ -22685,6 +22718,9 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "resist_affects": "resist_affects",
                      "resist_rounding": "resist_rounding",
                      "on_transform": "on_transform",
+                     "removed_on_damage": "removed_on_damage",
+                     "break_at_damage": "break_at_damage",
+                     "damage_filter": "damage_filter",
                      **{f: f for f in ACTION_RESTRICTION_FIELDS},
                      **{f + UNLESS_SUFFIX: f + UNLESS_SUFFIX
                         for f in ACTION_RESTRICTION_FIELDS}}
@@ -23049,6 +23085,55 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
             f"Set overlay sprite `{val}` for status `{name}` (drawn over "
             f"afflicted entities on the graphics surface).{extra}")
 
+    if sub in ("removed_on_damage", "break_at_damage", "damage_filter"):
+        # #235: statuses that break on damage (damage.py _break_statuses).
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", sub):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        sdef = m.status_definitions[name]
+        words = args[2:]
+        clear = not words or (len(words) == 1 and words[0].lower() in
+                              ("-", "clear", "off", "default"))
+        if sub == "damage_filter":
+            if clear:
+                sdef.pop(sub, None)
+                return (f"`{name}` damage_filter cleared (every damage "
+                        f"counts).")
+            flt = " ".join(words)
+            try:
+                check_tag_filter(flt)
+            except VTTError as ex:
+                return f"❌ {ex}"
+            sdef[sub] = flt
+            return (f"`{name}` damage_filter = `{flt}`: only damage whose "
+                    f"components match it counts toward removed_on_damage "
+                    f"and break_at_damage.")
+        _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->")
+        if sub == "removed_on_damage":
+            if clear:
+                sdef.pop(sub, None)
+                return f"`{name}` removed_on_damage off."
+            if words[0].lower() not in ("on", "true", "yes"):
+                return "❌ removed_on_damage takes on or off."
+            sdef[sub] = True
+            return (f"`{name}` removed_on_damage on: its bearer taking "
+                    f"damage removes it (removed_by `damage`).")
+        if clear:
+            sdef.pop(sub, None)
+            return f"`{name}` break_at_damage cleared."
+        try:
+            n = float(words[0])
+        except ValueError:
+            return "❌ break_at_damage takes a number above 0 (or `-`)."
+        if not math.isfinite(n) or n <= 0:
+            return "❌ break_at_damage takes a number above 0 (or `-`)."
+        sdef[sub] = int(n) if n == int(n) else n
+        return (f"`{name}` break_at_damage = {sdef[sub]}: the damage its "
+                f"bearer takes adds up in the instance's `damage_counted`, "
+                f"and the status goes once it reaches {sdef[sub]}.")
+
     if sub in ("resist_affects", "resist_rounding", "on_transform"):
         # #232: what resistance changes on this status, and how its result
         # rounds (over the status_resist_rounding rule); what a transform
@@ -23220,6 +23305,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
            "immune_to_actions_with_tag_unless|immune_to_actions_with_name_unless|"
            "grants_unit_tags|cannot_affect_units_with_tag|"
            "resist|resist_affects|resist_rounding|on_transform|"
+           "removed_on_damage|break_at_damage|damage_filter|"
            "counter|dispel|transfer|sprite|level|list|info|"
            "apply|force> ..."),
     desc=(
@@ -23458,6 +23544,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
             return
         rounding = None
+        source = None
         rest_args = []
         for a in args:
             k, eq, v = a.partition("=")
@@ -23466,9 +23553,18 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     return await ctx.send(
                         f"❌ rounding= takes {', '.join(RESIST_ROUNDINGS)}.")
                 rounding = v
+            elif eq and k.lower() == "source":
+                # #227: who applied it (status_source; a tick's damage
+                # credits it).
+                source = _resolve_eid(m, v)
+                if source not in m.entities:
+                    raise NotFound(f"Entity '{v}' not found.")
             else:
                 rest_args.append(a)
         args = rest_args
+        if len(args) < 3:
+            title, body = registry.help_for(["status", sub])
+            return await ctx.send(f"**{title}**\n{body}")
         eid = _resolve_eid(m, args[1])
         name = args[2]
         level = duration = None
@@ -23495,7 +23591,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             pre_inst = copy.deepcopy(m.entities[eid].status[name])
         try:
             event_log = m.apply_status(eid, name, level, duration, force=force,
-                                       rounding=rounding)
+                                       rounding=rounding, source=source)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
@@ -27144,12 +27240,18 @@ async def _ent_packet(ctx: ReplyContext, m: Match, sub: str,
     res = _damage.run_packet(
         m, kind, eid, amount, pool=opts.get("pool"), tags=opts.get("tags"),
         packet_tags=opts.get("packet_tags"), dealer=opts.get("dealer"),
-        source="command")
+        source="command", quiet=quiet)
     lines = list(res["notes"])
-    if res["skipped"] is None:
+    # The packet's own line (damage_message_format) was surfaced with the
+    # lines its writes and hooks surfaced (a death line, a thorns hit):
+    # they read in order, before the hooks' own lines. A quiet packet (or
+    # an empty format) gets a plain confirmation instead.
+    if res["skipped"] is None and not res.get("line"):
         lines.append(_packet_line(m, kind, eid, res))
+    m._pull_surfaced(lines)
     lines += res["log"]
-    return await ctx.send("\n".join(lines))
+    if lines:
+        return await ctx.send("\n".join(lines))
 
 
 def _dmg_step_line(name: str, step: Dict[str, Any], src: str = "") -> str:

@@ -59,6 +59,23 @@ MODES = ("ask", "auto", "never")
 # incoming
 # ----------------------------------------------------------------------
 
+class IncomingDict(dict):
+    """A dict read from `incoming` (a copy): its keys read as attributes
+    too, so `incoming.damage_taken.hp` works beside `get(...)`; a missing
+    key reads None. Stored, it becomes a plain dict (_own_value)."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _attr_view(self.get(name))
+
+
+def _attr_view(v: Any) -> Any:
+    if type(v) is dict:
+        return IncomingDict({k: _attr_view(x) for k, x in v.items()})
+    return v
+
+
 class IncomingProxy:
     """`incoming` / `incoming_of(eid)`: one unit's copy of the incoming
     action's locals in exchange `seq`, read through the match each time (a
@@ -99,7 +116,7 @@ class IncomingProxy:
         if name == "cancelled_by":
             by = ex.get("cancelled_by")
             return list(by) if isinstance(by, list) else None
-        return jcopy(self._copy().get(name))
+        return _attr_view(jcopy(self._copy().get(name)))
 
     def __setattr__(self, name: str, value: Any) -> None:
         if not self._writable:
@@ -1274,8 +1291,19 @@ async def _body_phase(env: _Env, seq: int) -> str:
     args = dict(ex.get("args") or {})
     answers = list(ex.get("answers") or [])
 
+    live_rng = m.rng_position()
+    if ex.get("forecast_rng") is not None:
+        # The dice rewind (design §10.1): the body's packets roll from where
+        # `prepare`'s first forecast began, so a step's own roll (an armor
+        # roll) gives the forecast's result when nothing changed. After the
+        # body the dice go on from where they were (or further), so later
+        # rolls don't repeat the reactions' ones.
+        m.set_rng(pos=int(ex["forecast_rng"]))
+
     async def run():
+        from damage import PACKET_EXCHANGE
         otoken = REACT_ORIGIN.set(origin)
+        xtoken = PACKET_EXCHANGE.set((env.m.id, seq))
         try:
             with env.runtime():
                 return await run_action(
@@ -1287,8 +1315,11 @@ async def _body_phase(env: _Env, seq: int) -> str:
         except ActionEngineFault as ef:
             return False, ("", ef.message)
         finally:
+            PACKET_EXCHANGE.reset(xtoken)
             REACT_ORIGIN.reset(otoken)
     st, res = await _run_step(env, seq, "body", run)
+    if env.m.rng_position() < live_rng:
+        env.m.set_rng(pos=live_rng)
     if st == "suspended":
         return "suspended"
     ok, why = res
@@ -1510,8 +1541,11 @@ async def _prepare(ctx: Any, mgr: Any, m: Any, action: Any, eff: str,
     """The action's checks and `prepare`: (ok, why, locals, target,
     answers used)."""
     from action import run_action, ActionEngineFault
+    from damage import PREPARE_FORECAST
     pout: Dict[str, Any] = {}
     tout: Dict[str, Any] = {}
+    frame: Dict[str, Any] = {}
+    ftoken = PREPARE_FORECAST.set(frame)
     try:
         ok, why = await run_action(
             action, actor_id=eff, target=target, args=args, match=m,
@@ -1520,8 +1554,18 @@ async def _prepare(ctx: Any, mgr: Any, m: Any, action: Any, eff: str,
             target_out=tout)
     except ActionEngineFault as ef:
         return False, ("", ef.message), {}, target, 0
+    finally:
+        PREPARE_FORECAST.reset(ftoken)
+    if frame:
+        # What the damage / healing forecasts in `prepare` came to (design
+        # §10.1): the exchange puts them in the targets' `incoming`.
+        pout[_FORECAST_KEY] = frame
     return ok, why, pout, tout.get("target", target), \
         int(tout.get("answers_used", 0))
+
+
+# Where _prepare hands _new_exchange the forecasts (not a local name).
+_FORECAST_KEY = "\x00forecast"
 
 
 def _new_exchange(m: Any, action: Any, *, actor_id: str, eff: str,
@@ -1531,6 +1575,8 @@ def _new_exchange(m: Any, action: Any, *, actor_id: str, eff: str,
                   depth: int, notes: List[str]
                   ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """The exchange of a prepared action, or (None, refusal)."""
+    pout = dict(pout)
+    forecast = pout.pop(_FORECAST_KEY, None) or {}
     bad = [k for k in pout if k in CONTROL_KEYS]
     if bad:
         return None, (f"its `prepare` can't use `{bad[0]}` as a local: it "
@@ -1562,6 +1608,14 @@ def _new_exchange(m: Any, action: Any, *, actor_id: str, eff: str,
     }
     for u in affected:
         ex["incoming"][u] = jcopy(base)
+    # The forecasts `prepare` made: each target's copy holds what they came
+    # to (incoming.damage_taken.hp); the body's packets roll the dice the
+    # first one rolled (design §10.1).
+    for t, rec in (forecast.get("targets") or {}).items():
+        if t in ex["incoming"]:
+            ex["incoming"][t].update(jcopy(rec))
+    if forecast.get("rng") is not None:
+        ex["forecast_rng"] = int(forecast["rng"])
     return ex, None
 
 
