@@ -2893,6 +2893,11 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # minting its name), and tile tags.
     "zone_tags", "zone_has_tag", "zones_with_tag", "zone_def_of",
     "zone_spawn", "tile_tags", "tile_has_tag", "tiles_with_tag",
+    # Placing and moving zones (docs/terrain_design.md §3-§4): zone_place
+    # makes a one-cell zone of a definition; zone_move jumps, zone_step
+    # walks (both fire the movement hooks of the units they move onto or
+    # off, then on_moved); zone_can_move reads.
+    "zone_place", "zone_move", "zone_step", "zone_can_move",
     # Status-granting zones (#136): zone_grants(zone) reads, zone_grant /
     # zone_ungrant change a zone's own grants.
     "zone_grants", "zone_grant", "zone_ungrant",
@@ -3103,6 +3108,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift", "zone_set", "zone_del", "zone_spawn",
     "zone_anchor", "zone_unanchor", "zone_grant", "zone_ungrant",
+    "zone_place", "zone_move", "zone_step",
     "watch_add", "watch_remove",
     "mount", "dismount", "switch_slot",
     "damage_part", "damage_spread",
@@ -3117,7 +3123,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "reactions_used",
     "last_damage", "last_healing", "status_source",
-    "is_void", "void_cells",
+    "is_void", "void_cells", "zone_can_move",
     "status_layers",
     'watch_exists', 'watchers_of',
     'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
@@ -3229,7 +3235,7 @@ _TAG_ARG_FUNCS: "frozenset[str]" = frozenset({
 _GRANT_SETTLE_FUNCS: "frozenset[str]" = frozenset({
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift", "zone_spawn", "zone_anchor", "zone_unanchor",
-    "zone_grant", "zone_ungrant",
+    "zone_grant", "zone_ungrant", "zone_place", "zone_move", "zone_step",
     "summon", "summon_near", "summon_from", "summon_template",
     "summon_template_near", "stamp_prefab", "remove_entity", "kill",
     "revive", "transform", "replace_form", "revert", "mount", "dismount",
@@ -3245,7 +3251,7 @@ _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "cell_opaque", "cell_blocked", "in_bounds", "grid_width", "grid_height",
     "team_sees_cell", "team_sees_cell_rangeonly", "team_sees_cell_losonly",
     "can_see", "can_see_rangeonly", "can_see_losonly", "has_los",
-    "is_void", "void_add", "void_remove",
+    "is_void", "void_add", "void_remove", "zone_place",
 })
 assert _MAP_ARG_FUNCS <= _TUPLE_FREE_FUNCS, (
     _MAP_ARG_FUNCS - _TUPLE_FREE_FUNCS)
@@ -3604,6 +3610,11 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # passives, status ticks, tile / zone turn hooks, action bodies); False
     # during a regular turn.
     "extra_turn",
+    # Moving zones (docs/terrain_design.md §4): `zone_moved` is True in the
+    # hooks a zone moving onto or off a unit fires (False when the unit
+    # moved); a zone's on_moved also binds zone_dx / zone_dy (the move)
+    # and zone_covered (the units it covers now).
+    "zone_moved", "zone_dx", "zone_dy", "zone_covered",
     # Reactions (#36): the incoming action's locals as a reaction, the
     # incoming body and a reaction's condition see them (`incoming.damage`,
     # `incoming.cancel = True`); the units the action directly affects;
@@ -4845,7 +4856,8 @@ class FormulaEngine:
         # Per-name default: was_clamped is boolean-flavored (default False);
         # args defaults to an empty dict (so attribute access via
         # ArgsProxy never NPEs); everything else defaults to None.
-        _CONTEXT_DEFAULTS = {"was_clamped": False, "args": {}}
+        _CONTEXT_DEFAULTS = {"was_clamped": False, "args": {},
+                             "zone_moved": False}
         for name in HOOK_CONTEXT_NAMES:
             val = extras.get(name, _CONTEXT_DEFAULTS.get(name))
             if name == "extra_turn" and name not in extras:
@@ -9073,6 +9085,84 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
+        def _zone_place(definition: Any, x: Any, y: Any, name: Any = None,
+                        map: Any = None) -> str:
+            """zone_place(definition, x, y, name=None, map=None): place a
+            one-cell zone of zone definition `definition` on (x, y) (`!zone
+            place`): an object standing on the ground. Returns its name:
+            `name`, or one made from the definition's (`buzzsaw`,
+            `buzzsaw2`, ...)."""
+            if not isinstance(definition, str) or not definition:
+                raise FormulaError("zone_place(definition, x, y): definition "
+                                   "must be a zone definition's name.")
+            if name is not None and (not isinstance(name, str) or not name):
+                raise FormulaError("zone_place(...): name= must be a "
+                                   "non-empty string.")
+            px = _cell_arg(x, "zone_place", "x")
+            py = _cell_arg(y, "zone_place", "y")
+            mp = _cur_map()
+            if not mp.in_bounds(px, py):
+                raise FormulaError(f"zone_place: ({px},{py}) "
+                                   f"{mp.off_text(px, py)}.")
+            try:
+                zn = match.create_zone_from_def(name, definition, mp)
+            except VTTError as ex:
+                raise FormulaError(f"zone_place: {ex}")
+            mp.zone_add_cell(zn, px, py, create=False)
+            return zn
+
+        def _zone_move(name: Any, dx: Any, dy: Any, hooks: Any = True) -> bool:
+            """zone_move(name, dx, dy, hooks=True): move zone `name` by
+            (dx, dy) in one jump. Nothing moves (False) when a cell it would
+            newly cover is off the map, a void, or blocked (its `move_block`
+            data, else its definition's, else zone_move_block_condition).
+            Units it moves onto or off fire its movement hooks as if they
+            had moved (`zone_moved` True; on_stop on the units it lands on);
+            then its on_moved hook. hooks=False fires none. An aura moves
+            with its anchor and is refused."""
+            ddx, ddy = _zone_xy(dx, dy, "zone_move")
+            try:
+                moved, log = match.zone_move(_zone_name(name, "zone_move"),
+                                             ddx, ddy, hooks=bool(hooks))
+            except VTTError as ex:
+                raise FormulaError(f"zone_move: {ex}")
+            match.surface_log(log)
+            return moved
+
+        def _zone_step(name: Any, direction: Any, n: Any = 1,
+                       hooks: Any = True, face: Any = False) -> int:
+            """zone_step(name, direction, n=1, hooks=True, face=False): walk
+            zone `name` up to n cells toward `direction`, one cell at a
+            time, stopping before a step zone_move refuses. Returns the
+            steps taken (0 = blocked at once: a bouncing trap turns
+            around). Each step fires the hooks zone_move does; on_stop
+            fires once, after the last. face=True turns the zone to its
+            steps' direction."""
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise FormulaError("zone_step(name, direction, n): n must be "
+                                   "a whole number.")
+            try:
+                steps, log = match.zone_step(
+                    _zone_name(name, "zone_step"), direction, n,
+                    hooks=bool(hooks), face=bool(face))
+            except VTTError as ex:
+                raise FormulaError(f"zone_step: {ex}")
+            match.surface_log(log)
+            return steps
+
+        def _zone_can_move(name: Any, dx: Any, dy: Any) -> bool:
+            """zone_can_move(name, dx, dy): whether zone_move(name, dx, dy)
+            would move the zone (every cell it would newly cover on the
+            map, no void, not blocked); moves nothing."""
+            ddx, ddy = _zone_xy(dx, dy, "zone_can_move")
+            zn = _zone_name(name, "zone_can_move")
+            move_dir = next((d for d, v in DIRECTION_VECTORS.items()
+                             if v == (ddx, ddy)), None)
+            try:
+                return match.zone_move_problem(zn, ddx, ddy, move_dir) is None
+            except VTTError as ex:
+                raise FormulaError(f"zone_can_move: {ex}")
+
         def _zone_anchor(name: Any, eid: Any, radius: Any = 0,
                          metric: Any = "square_radius") -> int:
             """zone_anchor(name, eid, radius=0, metric="square_radius"):
@@ -9223,6 +9313,10 @@ class FormulaEngine:
         ns["zones_with_tag"]    = _zones_with_tag
         ns["zone_def_of"]       = _zone_def_of
         ns["zone_spawn"]        = _zone_spawn
+        ns["zone_place"]        = _zone_place
+        ns["zone_move"]         = _zone_move
+        ns["zone_step"]         = _zone_step
+        ns["zone_can_move"]     = _zone_can_move
         def _watch_add(name: Any, condition: Any, effect: Any = "",
                        once: Any = False, each: Any = False,
                        tag: Any = None, once_each: Any = False) -> bool:

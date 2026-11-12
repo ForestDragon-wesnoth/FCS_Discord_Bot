@@ -1,7 +1,7 @@
 # Ground tiles, object zones, moving zones and the corpse store: agreed design
 
 Status: design agreed with the user (chat after #178, questions 1-18).
-Built in three PRs, in the order of §6: PR 1 (§2) built. Read this whole file before
+Built in three PRs, in the order of §6: PR 1 (§2) and PR 2 (§3, §4) built. Read this whole file before
 touching tiles, zones or corpses.
 
 ## 1. Roles
@@ -92,7 +92,7 @@ touching tiles, zones or corpses.
   and `move_dir` bound; `self` = the acting unit. A zone's own `move_block`
   data, else its definition's, overrides the rule (a bool or an
   expression). Fail-open like the other block conditions. Units block only
-  when the condition says so (`cell_entity(tile_x, tile_y) != None`). The
+  when the condition says so (`cell_entity(tile_x, tile_y) != ''`). The
   read `zone_can_move(name, dx, dy)` tests a move without making it.
   (Named `zone_*` where the questions said `terrain_*`: only zones move.)
 - **Units under a moving zone** (question 4, user: a zone entering a
@@ -108,8 +108,10 @@ touching tiles, zones or corpses.
   can tell them apart. `hooks=False` skips them for one call. Ghost firing:
   each unit is re-checked after every hook.
 - **`on_moved`** (question 5): a zone hook fired once after each move and
-  each step, with `dx` / `dy`, `move_dir` (None for a jump that isn't one
-  step) and `covered` (the units it covers now) bound. The buzzsaw's
+  each step, with `zone_dx` / `zone_dy`, `move_dir` (None for a jump that
+  isn't one step) and `zone_covered` (the units it covers now) bound
+  (zone_-prefixed: a binding named `dx` would forbid that local in every
+  GM formula). The buzzsaw's
   arrival damage lives there.
 - **Facing** (question 6): `face=True` turns the zone to each step's
   direction (`zone_face`), so `sprites.<facing>` show where it heads.

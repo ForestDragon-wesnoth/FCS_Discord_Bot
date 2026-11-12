@@ -12157,7 +12157,7 @@ registry.annotate_sub(
         "glyph <system> <name> <char|-> [<facing>] | "
         "color <system> <name> <color|-> | "
         "sprite <system> <name> <key|-> [<facing>] | "
-        "face <system> <name> <dir|-> | "
+        "face <system> <name> <dir|-> | layer <system> <name> <n|-> | "
         "legend <system> <name> <text ...> | tags <system> <name> <tag ...> | "
         "grant <system> <name> <status> [level=<n>] [linger=<n>] "
         "[<key>=<value> ...] | ungrant <system> <name> <status> | "
@@ -21625,7 +21625,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # the channel's match is serialized again (Map.ser_zones).
         m = mgr.matches.get(mgr.active_by_channel.get(ctx.channel_key) or "")
         for mp in (m.maps.values() if m is not None else ()):
-            mp.zones.changed = None
+            mp.zones.mark_all()
 
 
 async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -21910,6 +21910,93 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except NotFound as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"Cleared {n} data key(s) from zone `{name}`.")
+
+    # ---- layer <name> <n|-> ----  (draw order, docs/terrain_design.md §3)
+    if sub == "layer":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "layer"):
+            return
+        _check_tail(args, 3, (), "!zone layer <name> <n|->")
+        name = args[1]
+        z = m.find_zone(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        if args[2] in ("-", "none", "clear"):
+            z.pop("sprite_layer", None)
+            return await ctx.send(
+                f"Zone `{name}` draws at layer {m.zone_draw_layer(z)} (its "
+                f"definition's, else the sprite_layer_zone rule).")
+        z["sprite_layer"] = _draw_layer_arg(args[2])
+        return await ctx.send(
+            f"Zone `{name}` draws at layer {z['sprite_layer']} (tiles draw "
+            f"at {m.tile_draw_layer({})} unless their own sprite_layer says "
+            f"otherwise; the higher layer shows).")
+
+    # ---- place <definition> <x> <y> [name=] [map=] ----  (§3)
+    if sub == "place":
+        if await return_help_if_not_enough_args(ctx, args, 4, "zone", "place"):
+            return
+        opts = [a for a in args[4:] if "=" in a]
+        if len(args) - 4 != len(opts) or any(
+                not o.lower().startswith("name=") for o in opts) \
+                or len(opts) > 1:
+            raise VTTError("Usage: `!zone place <definition> <x> <y> "
+                           "[name=<name>] [map=<map>]`.")
+        zname = opts[0].split("=", 1)[1] if opts else None
+        x, y = _parse_xy(args, 2)
+        zmp = _one_map(ctx, m, mapspec, strict=True)
+        if not zmp.in_bounds(x, y):
+            raise VTTError(f"({x},{y}) {zmp.off_text(x, y)}.")
+        name = m.create_zone_from_def(zname or None, args[1], zmp)
+        zmp.zone_add_cell(name, x, y, create=False)
+        return await ctx.send(f"Placed zone `{name}` of definition "
+                              f"`{args[1]}` at ({x},{y}){_on_map(m, zmp)}.")
+
+    # ---- move <name> <dx> <dy> | <name> <dir> [n] [face] ----  (§4)
+    if sub == "move":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "move"):
+            return
+        name = args[1]
+        if m.find_zone(name) is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        canon = normalize_direction(args[2])
+        if canon is not None:
+            rest = [a.lower() for a in args[3:]]
+            face = "face" in rest
+            rest = [a for a in rest if a != "face"]
+            if len(rest) > 1:
+                raise VTTError("Usage: `!zone move <name> <dir> [n] [face]`.")
+            try:
+                n = int(rest[0]) if rest else 1
+            except ValueError:
+                raise VTTError(f"A step count is a whole number, not "
+                               f"`{rest[0]}`.")
+            steps, log = m.zone_step(name, canon, n, face=face)
+            head = (f"Zone `{name}` stepped {steps} of {n} cell(s) "
+                    f"{canon}" + (", facing it" if face and steps else "")
+                    + ".")
+            if steps < n:
+                why = m.zone_move_problem(name, *DIRECTION_VECTORS[canon],
+                                          canon) \
+                    if m.find_zone(name) is not None else None
+                if why:
+                    head += f" Stopped: {why}."
+            return await ctx.send("\n".join([head] + list(log)))
+        if len(args) != 4:
+            raise VTTError("Usage: `!zone move <name> <dx> <dy>` or "
+                           "`!zone move <name> <dir> [n] [face]`.")
+        try:
+            dx, dy = int(args[2]), int(args[3])
+        except ValueError:
+            raise VTTError(f"`{args[2]}` is neither a direction nor a whole "
+                           f"number (dx).")
+        move_dir = next((d for d, v in DIRECTION_VECTORS.items()
+                         if v == (dx, dy)), None)
+        why = m.zone_move_problem(name, dx, dy, move_dir)
+        if why is not None:
+            raise VTTError(f"Zone `{name}` can't move by ({dx},{dy}): {why}.")
+        _moved, log = m.zone_move(name, dx, dy)
+        return await ctx.send("\n".join(
+            [f"Moved zone `{name}` by ({dx},{dy})."] + list(log)))
 
     # ---- glyph <name> <char|-> ----  (map rendering)
     if sub == "glyph":
@@ -22307,12 +22394,22 @@ def _grant_view(z: Dict[str, Any]) -> Dict[str, Any]:
     return {k: copy.deepcopy(z[k]) for k in ZONE_GRANT_FIELDS if k in z}
 
 
+def _draw_layer_arg(raw: str) -> int:
+    """A draw layer typed for a zone or zone definition: a whole number."""
+    try:
+        return int(raw)
+    except ValueError:
+        raise VTTError(f"A draw layer is a whole number (zones draw at the "
+                       f"sprite_layer_zone rule's, tiles at "
+                       f"sprite_layer_tile's), not `{raw}`.")
+
+
 # `!zone def <action> <name> ...` (and `!system zone <action> <system>
 # <name> ...`, which runs the same code on a scratch match): action -> the
 # words `!zone def` needs (action included).
 _ZONE_DEF_SUBS = {"new": 2, "data": 4, "del-data": 3, "hook": 4,
                   "del-hook": 3, "glyph": 3, "color": 3, "sprite": 3,
-                  "face": 3, "reapply": 2,
+                  "face": 3, "reapply": 2, "layer": 3,
                   "legend": 3, "tags": 2, "rename": 3, "copy": 3,
                   **_GRANT_SUBS}
 _ZONE_DEF_DELETES = ("del", "delete", "remove", "rm", "drop")
@@ -22414,6 +22511,16 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         d[FACING_FIELD] = canon
         return (f"zone definition `{name}` faces {canon} (new zones of it "
                 f"copy it; `reapply` pushes it to its zones).")
+    if sub == "layer":
+        _check_tail(args, 3, (), prefix.format(sub="layer") + " <name> <n|->")
+        if args[2] in ("-", "none", "clear"):
+            d.pop("sprite_layer", None)
+            return (f"Cleared zone definition `{name}`'s draw layer (its zones "
+                    f"draw at the sprite_layer_zone rule's).")
+        d["sprite_layer"] = _draw_layer_arg(args[2])
+        return (f"zone definition `{name}` draws at layer "
+                f"{d['sprite_layer']} (zones of it without their own read "
+                f"it).")
     if sub in ("glyph", "sprite"):
         _check_tail(args, 4, (), prefix.format(sub=sub)
                     + f" <name> <{'char' if sub == 'glyph' else 'key'}|-> "
@@ -24184,6 +24291,7 @@ _ZONE_DEF_USAGE = (
     "!zone def color <name> <color|-> | "
     "!zone def sprite <name> <key|-> [<facing>] | "
     "!zone def face <name> <dir|-> | !zone def reapply <name> [reset] | "
+    "!zone def layer <name> <n|-> | "
     "!zone def legend <name> <text ...> | "
     "!zone def tags <name> <tag ...> | "
     "!zone def grant <name> <status> [level=<n>] [linger=<n>] "
@@ -24264,9 +24372,49 @@ registry.annotate_sub(
     usage="!zone shift <name> <dx> <dy>",
     desc=(
         "Translate the entire zone footprint by (dx, dy). Cells pushed "
-        "off the grid are dropped (the zone can drift off an edge). The "
-        "drifting-gas-cloud primitive — pair with a turn/round hook to "
-        "move a hazard each round."
+        "off the grid are dropped (the zone can drift off an edge), and no "
+        "hooks fire. `!zone move` moves a zone as a whole, stopped by "
+        "walls and firing the hooks of the units it moves onto or off."
+    ),
+)
+registry.annotate_sub(
+    "zone", "move",
+    usage="!zone move <name> <dx_or_dir> [dy_or_n] [face]",
+    desc=(
+        "Move a zone as one piece (docs/terrain_design.md §4): `<dx> <dy>` "
+        "jumps, `<dir> [n]` walks n cells (default 1) a cell at a time and "
+        "stops before a step it can't take; `face` turns the zone to the "
+        "steps' direction. A cell the zone would newly cover that is off "
+        "the map, a void, or blocked (its `move_block` data, else its "
+        "definition's, else the zone_move_block_condition rule) stops it. "
+        "Units it moves onto or off fire its on_enter / on_cell_enter / "
+        "on_exit / on_cell_exit hooks as if they had moved (`zone_moved` is "
+        "true in them), the units it lands on its on_stop / on_cell_stop "
+        "at the end, and the zone its own on_moved after each move or step "
+        "(zone_dx, zone_dy, move_dir, zone_covered). An aura moves with its "
+        "anchor. Formulas: zone_move, zone_step, zone_can_move."
+    ),
+)
+registry.annotate_sub(
+    "zone", "place",
+    usage="!zone place <definition> <x> <y> [name=<name>] [map=<map>]",
+    desc=(
+        "Place a one-cell zone of a zone definition: an object standing on "
+        "the ground (a trap, a chest, a fire). Named after the definition "
+        "(`buzzsaw`, `buzzsaw2`, ...) unless `name=` gives one. Formula: "
+        "zone_place(definition, x, y)."
+    ),
+)
+registry.annotate_sub(
+    "zone", "layer",
+    usage="!zone layer <name> <n|->",
+    desc=(
+        "The layer the zone draws at, in text maps and images alike: a cell "
+        "shows its highest layer, a tile winning a tie. Zones draw at the "
+        "sprite_layer_zone rule's (25) and tiles at sprite_layer_tile's "
+        "(50) unless they set their own, so a zone at 60 draws over the "
+        "ground. `-` goes back to its definition's or the rule. `!zone def "
+        "layer` sets it for every zone of a definition."
     ),
 )
 registry.annotate_sub(
@@ -24301,8 +24449,8 @@ registry.annotate_sub(
     desc=(
         "Set the zone's single-character map glyph (shown in !map on "
         "every zone cell that has no tile glyph or entity on top), or "
-        "pass `-` / `none` to clear it. Zone glyphs are the lowest "
-        "render layer. With a facing, the glyph shown while the zone "
+        "pass `-` / `none` to clear it. Zones draw under tiles unless "
+        "`!zone layer` puts them higher. With a facing, the glyph shown while the zone "
         "faces that way (`glyphs.<facing>`, before the plain glyph)."
     ),
 )

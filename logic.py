@@ -2536,6 +2536,26 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "one-way zone."
         ),
     },
+    "zone_move_block_condition": {
+        "default": "",
+        "schema": {"type": "str", "formula": "expression"},
+        "desc": (
+            "Whether a cell blocks a ZONE moving onto it (zone_move / "
+            "zone_step / `!zone move`; docs/terrain_design.md §4). Read for "
+            "each cell the move newly covers; truthy = the move (or that "
+            "step) doesn't happen. Bindings: zone_name, zone_map, tile_x / "
+            "tile_y (the cell entered), from_x / from_y (the cell of the "
+            "zone it comes from), move_dir (the step's direction, None for "
+            "a jump of more than one cell) and entity[self] = the unit "
+            "whose turn it is. A zone's own `move_block` data, else its "
+            "definition's, overrides it (a bool or a formula). Off the map "
+            "and void cells always block; units block only when the "
+            "condition says so (`cell_entity(tile_x, tile_y) != ''`), "
+            "walls when it reads them (`tile_has_tag(tile_x, tile_y, "
+            "'wall')`). Empty = nothing else blocks. Malformed = not "
+            "blocking."
+        ),
+    },
     "corpse_block_condition": {
         "default": "",
         "schema": {"type": "str", "formula": "expression"},
@@ -7411,6 +7431,10 @@ ZONE_HOOK_NAMES: Set[str] = {
     "on_round_end",
     "on_turn_start",
     "on_turn_end",
+    # The zone itself moved (zone_move / zone_step, docs/terrain_design.md
+    # §4): once per move and per step, zone_dx / zone_dy / move_dir /
+    # zone_covered bound.
+    "on_moved",
 }
 # Reserved top-level keys inside a zone dict (everything else under
 # zones[name]["data"] is free-form GM data). `anchor`/`anchor_radius`/
@@ -8654,7 +8678,8 @@ class SpecialTileTemplate:
 # plain dicts in Match.zone_definitions (and a system library), in the
 # shape normalize_zone_def gives.
 ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend",
-                                     "facing", "glyphs", "sprites")
+                                     "facing", "glyphs", "sprites",
+                                     "sprite_layer")
 # The per-facing look fields (#257) and the plain field each stands in for:
 # `glyphs.<facing>` / `sprites.<facing>` on units, tiles (data, template
 # data), zones and zone definitions.
@@ -8699,6 +8724,11 @@ def zone_look_value(key: str, value: Any) -> bool:
         return value is False or (isinstance(value, str) and bool(value))
     if key == "facing":
         return isinstance(value, str) and value in ALLOWED_DIRECTIONS
+    if key == "sprite_layer":
+        # The draw layer both renderers order zones and tiles by
+        # (docs/terrain_design.md §3).
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value))
     if key in FACING_LOOK_FIELDS:
         return isinstance(value, dict) and any(
             facing_look_entry(key, f, v) for f, v in value.items())
@@ -11470,6 +11500,10 @@ class Map:
     # hook_cells' index (None = built on its next use).
     _hook_ix: Optional[Dict[Tuple[int, int], Any]] = field(
         default=None, repr=False, compare=False)
+    # zone_hook_names' index: zone -> the hook names its own data holds
+    # (None = built on its next use; kept by ZoneTable.also).
+    _zhook_ix: Optional[Dict[str, frozenset]] = field(
+        default=None, repr=False, compare=False)
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "tiles" and type(value) is not TileDict:
@@ -11485,6 +11519,7 @@ class Map:
         elif name == "zones":
             object.__setattr__(self, "_zone_ix", None)
             object.__setattr__(self, "_zser_out", None)
+            object.__setattr__(self, "_zhook_ix", None)
         elif name == "corpses":
             object.__setattr__(self, "_corpse_ix", None)
             object.__setattr__(self, "_cser_out", None)
@@ -11499,10 +11534,40 @@ class Map:
 
     def zone_changed(self, name: str) -> None:
         """Zone `name` changed in place (its data, hooks, look, tags or
-        grants): its serialized form is stale."""
-        ch = self.zones.changed
-        if ch is not None:
-            ch.add(name)
+        grants): its serialized form and hook index entry are stale."""
+        self.zones.mark(name)
+
+    def zone_hook_names(self) -> Dict[str, frozenset]:
+        """zone -> the hook names its own `hooks` hold, for every zone with
+        one, so the time hooks read these zones (and the zones of a
+        definition holding the hook), never every zone. Kept by the
+        ZoneTable's marks (`also`)."""
+        zt = self.zones
+        ix = self._zhook_ix
+        if ix is None or zt.also is None:
+            ix = {}
+            for n, z in zt.items():
+                rec = _zone_hook_rec(z)
+                if rec:
+                    ix[n] = rec
+            object.__setattr__(self, "_zhook_ix", ix)
+            zt.also = set()
+        elif zt.also:
+            for n in zt.also:
+                rec = _zone_hook_rec(zt.get(n))
+                if rec:
+                    ix[n] = rec
+                else:
+                    ix.pop(n, None)
+            zt.also = set()
+        if SPATIAL_CHECK:
+            want = {n: r for n, z in zt.items()
+                    for r in [_zone_hook_rec(z)] if r}
+            if want != ix:
+                raise SpatialCheckError(
+                    f"map `{self.name}`: the zone hook index differs from "
+                    f"the zones")
+        return ix
 
     def tile_touch(self, x: int, y: int) -> None:
         """The data of tile (x, y) changed in place (a write into a dict
@@ -12405,6 +12470,13 @@ class ChangeDict(dict):
     def __ior__(self, other: Any) -> "ChangeDict":
         self.mark_all()
         return super().__ior__(other)
+
+
+def _zone_hook_rec(z: Any) -> frozenset:
+    """The hook names zone dict `z`'s own `hooks` hold."""
+    hooks = z.get("hooks") if isinstance(z, dict) else None
+    return frozenset(k for k, v in hooks.items() if isinstance(v, str) and v) \
+        if isinstance(hooks, dict) else frozenset()
 
 
 def _tile_hook_rec(d: Any) -> Optional[Tuple[frozenset, Any]]:
@@ -13502,6 +13574,233 @@ class Match:
 
     def zone_shift(self, name: str, dx: int, dy: int) -> int:
         return self._zone_owner(name).zone_shift(name, dx, dy)
+
+    # ---- moving zones (docs/terrain_design.md §4) ---------------------
+    # A zone moves as one piece: zone_move jumps by (dx, dy), zone_step
+    # walks a direction a cell at a time. A cell it would newly cover off
+    # the map, on a void, or blocked (its `move_block` data, else its
+    # definition's, else the zone_move_block_condition rule) stops it. A
+    # zone moving onto or off a unit fires its movement hooks on the unit
+    # as if the unit had moved (user call), with `zone_moved` bound; then
+    # the zone's own on_moved. zone_shift (clipping, no hooks) stays.
+
+    def _movable_zone(self, name: str) -> Tuple["Map", Dict[str, Any]]:
+        mp = self.zone_map(name)
+        if mp is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        z = mp.zones[name]
+        if z.get("anchor"):
+            raise VTTError(f"Zone `{name}` is an aura of `{z['anchor']}`: it "
+                           f"moves with its anchor.")
+        return mp, z
+
+    def zone_move_problem(self, name: str, dx: int, dy: int,
+                          move_dir: Optional[str] = None) -> Optional[str]:
+        """Why zone `name` can't move by (dx, dy) (the first cell it would
+        newly cover that is off the map, a void or blocked), None when it
+        can. Raises for a missing zone or an aura."""
+        mp, z = self._movable_zone(name)
+        cells = set(z.get("cells") or ())
+        spec = self.zone_data_spec(z, "move_block")
+        if spec is None:
+            spec = self.rules.get("zone_move_block_condition", "")
+        for (nx, ny) in sorted({(x + dx, y + dy) for x, y in cells} - cells,
+                               key=lambda c: (c[1], c[0])):
+            if not mp.in_bounds(nx, ny):
+                return f"({nx},{ny}) {mp.off_text(nx, ny)}"
+            if self._eval_block_spec(spec, self.current_entity_id(), {
+                    "zone_name": name, "zone_map": mp.name, "tile_x": nx,
+                    "tile_y": ny, "from_x": nx - dx, "from_y": ny - dy,
+                    "move_dir": move_dir}):
+                return f"({nx},{ny}) blocks it"
+        return None
+
+    def _zone_cover(self, mp: "Map", cells: Any) -> Dict[str, Set[Tuple[int, int]]]:
+        """The units on map `mp` a zone with `cells` covers (alive, neither
+        glued parts nor riders hidden in a vehicle, as the area searches
+        read them) -> the cells of each body it covers."""
+        cells = set(cells)
+        out: Dict[str, Set[Tuple[int, int]]] = {}
+        for eid in self._spatial.in_cells(self, mp.name, cells):
+            e = self.entities[eid]
+            if not e.is_alive or e.is_glued_part or e.is_hidden_rider:
+                continue
+            got = set(self.entity_cells(e)) & cells
+            if got:
+                out[eid] = got
+        return out
+
+    def _turn_ordered(self, ids: Any) -> List[str]:
+        ids = set(ids)
+        first = [i for i in self.turn_order if i in ids]
+        return first + sorted(ids - set(first))
+
+    def _zone_unit_hook(self, name: str, eid: str, when: str,
+                        cell: Tuple[int, int], mp: "Map",
+                        log: List[str]) -> bool:
+        """Fire zone `name`'s hook `when` on unit `eid` for a zone move;
+        False once the zone or the unit is gone or dead (ghost firing)."""
+        if name not in mp.zones or eid not in self.entities \
+                or not self.entities[eid].is_alive:
+            return False
+        log.extend(self.fire_zone_hook(when, name, eid, cell[0], cell[1], mp,
+                                       extra={"zone_moved": True}))
+        return (name in mp.zones and eid in self.entities
+                and self.entities[eid].is_alive)
+
+    def _zone_step_once(self, name: str, dx: int, dy: int,
+                        move_dir: Optional[str], hooks: bool,
+                        face: Optional[str], log: List[str]) -> None:
+        """Move zone `name` by (dx, dy) (checked by the caller), then fire
+        the hooks of the units it moved onto or off and its on_moved."""
+        mp = self.zone_map(name)
+        z = mp.zones[name]
+        old = set(z.get("cells") or ())
+        new = {(x + dx, y + dy) for x, y in old}
+        before = self._zone_cover(mp, old) if hooks else {}
+        z["cells"] = new
+        mp.zone_touch(name)
+        if face is not None:
+            z[FACING_FIELD] = face
+            mp.zone_changed(name)
+        if not hooks:
+            return
+        with move_hook_level(self.rules, log, self.id, move=True) as ok:
+            if not ok:
+                return
+            after = self._zone_cover(mp, new)
+            for eid in self._turn_ordered(set(before) | set(after)):
+                e = self.entities.get(eid)
+                if e is None or name not in mp.zones:
+                    continue
+                b, a = before.get(eid, set()), after.get(eid, set())
+                order = list(self.entity_cells(e))
+                alive = True
+                exited = False
+                for c in order:
+                    if alive and c in b and c not in a:
+                        if not a and not exited:
+                            exited = True
+                            alive = self._zone_unit_hook(
+                                name, eid, "on_exit", c, mp, log)
+                        if alive:
+                            alive = self._zone_unit_hook(
+                                name, eid, "on_cell_exit", c, mp, log)
+                entered = False
+                for c in order:
+                    if alive and c in a and c not in b:
+                        if not b and not entered:
+                            entered = True
+                            alive = self._zone_unit_hook(
+                                name, eid, "on_enter", c, mp, log)
+                        if alive:
+                            alive = self._zone_unit_hook(
+                                name, eid, "on_cell_enter", c, mp, log)
+            if name in mp.zones:
+                covered = self._turn_ordered(self._zone_cover(
+                    mp, mp.zones[name].get("cells") or ()))
+                log.extend(self._fire_zone_time_hook(
+                    "on_moved", name, self.current_entity_id(), mp,
+                    extra={"zone_moved": True, "zone_dx": dx, "zone_dy": dy,
+                           "move_dir": move_dir, "zone_covered": covered}))
+
+    def _zone_stop_hooks(self, name: str, start: Dict[str, Set[Any]],
+                         log: List[str]) -> None:
+        """At the end of a zone's move: on_stop once and on_cell_stop per
+        covered cell for every unit the move newly covered, as a unit
+        landing there would fire them."""
+        mp = self.zone_map(name)
+        if mp is None:
+            return
+        now = self._zone_cover(mp, mp.zones[name].get("cells") or ())
+        with move_hook_level(self.rules, log, self.id) as ok:
+            if not ok:
+                return
+            for eid in self._turn_ordered(i for i in now if i not in start):
+                e = self.entities.get(eid)
+                if e is None:
+                    continue
+                cells = [c for c in self.entity_cells(e) if c in now[eid]]
+                if cells and self._zone_unit_hook(name, eid, "on_stop",
+                                                  cells[0], mp, log):
+                    for c in cells:
+                        if not self._zone_unit_hook(name, eid, "on_cell_stop",
+                                                    c, mp, log):
+                            break
+
+    def zone_move(self, name: str, dx: int, dy: int,
+                  hooks: bool = True) -> Tuple[bool, List[str]]:
+        """Move zone `name` by (dx, dy) in one jump (every cell it newly
+        covers is checked, not the cells between). Returns (moved, the
+        hooks' log); nothing moves when a cell is off the map, void or
+        blocked (zone_move_problem)."""
+        dx, dy = int(dx), int(dy)
+        move_dir = next((d for d, v in DIRECTION_VECTORS.items()
+                         if v == (dx, dy)), None)
+        if self.zone_move_problem(name, dx, dy, move_dir) is not None:
+            return False, []
+        log: List[str] = []
+        if (dx, dy) == (0, 0):
+            return True, log
+        mp = self.zone_map(name)
+        start = self._zone_cover(mp, mp.zones[name].get("cells") or ()) \
+            if hooks else {}
+        self._zone_step_once(name, dx, dy, move_dir, hooks, None, log)
+        if hooks and self.zone_map(name) is not None:
+            self._zone_stop_hooks(name, start, log)
+        return True, log
+
+    def zone_step(self, name: str, direction: str, n: int = 1,
+                  hooks: bool = True, face: bool = False
+                  ) -> Tuple[int, List[str]]:
+        """Walk zone `name` up to `n` cells toward `direction`, one cell at
+        a time, stopping before a step zone_move_problem refuses (or once a
+        hook removed the zone or made it an aura). `face`: the zone turns to
+        each step's direction (a diagonal snaps to up / down while
+        allow_diagonal_facing is off, as a walking unit does). Returns
+        (steps taken, the hooks' log)."""
+        canon = normalize_direction(direction) \
+            if isinstance(direction, str) else None
+        if canon is None:
+            raise VTTError(f"Unknown direction '{direction}'.")
+        if canon in DIAGONAL_DIRECTIONS and not bool(
+                self.rules.get("allow_diagonal_movement", False)):
+            raise VTTError(f"Diagonal direction '{direction}' is not allowed "
+                           f"by the active game system (rule "
+                           f"allow_diagonal_movement).")
+        mp, _z = self._movable_zone(name)
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            raise VTTError(f"A step count is a whole number, not `{n}`.")
+        longest = max(mp.grid_width, mp.grid_height)
+        if n < 0 or n > longest:
+            raise VTTError(f"A zone takes 0 to {longest} steps on map "
+                           f"`{mp.name}` (its longer side), not {n}.")
+        dx, dy = DIRECTION_VECTORS[canon]
+        facing = None
+        if face:
+            facing = canon
+            if canon in DIAGONAL_DIRECTIONS and not bool(
+                    self.rules.get("allow_diagonal_facing", False)):
+                facing = "up" if dy < 0 else "down"
+        log: List[str] = []
+        start = self._zone_cover(mp, mp.zones[name].get("cells") or ()) \
+            if hooks else {}
+        steps = 0
+        for _ in range(n):
+            if self.zone_map(name) is None:
+                break
+            try:
+                if self.zone_move_problem(name, dx, dy, canon) is not None:
+                    break
+            except VTTError:
+                break
+            self._zone_step_once(name, dx, dy, canon, hooks, facing, log)
+            steps += 1
+        if hooks and steps and self.zone_map(name) is not None:
+            self._zone_stop_hooks(name, start, log)
+        return steps, log
 
     def zone_cell_list(self, name: str) -> List[List[int]]:
         return self._zone_owner(name).zone_cell_list(name)
@@ -21736,7 +22035,8 @@ class Match:
     # round/turn hooks across all zones.
     def fire_zone_hook(self, when: str, name: str,
                        entity_id: Optional[str], x: int, y: int,
-                       mp: Optional["Map"] = None) -> List[str]:
+                       mp: Optional["Map"] = None,
+                       extra: Optional[Dict[str, Any]] = None) -> List[str]:
         """Fire zone `name`'s hook of `when`. Bindings: self = the bound
         entity (or None -> unbound), this = current entity, zone_name =
         `name`, tile_x/tile_y = (x,y) (the crossed/stepped cell), and
@@ -21760,6 +22060,7 @@ class Match:
             "tile_y": y,
             "zone_map": mp.name,
             "hook_name": when,
+            **(extra or {}),
         }
         ctx = EvalCtx(
             this=self.current_entity_id(),
@@ -21971,11 +22272,30 @@ class Match:
         cur = self.current_entity_id()
         log: List[str] = []
         # Every map's zones, maps in order. A hook can delete a map.
+        defs = [d for d, dd in self.zone_definitions.items()
+                if isinstance(dd, dict) and isinstance(dd.get("hooks"), dict)
+                and isinstance(dd["hooks"].get(when), str)
+                and dd["hooks"][when]]
         for mname in list(self.maps):
             mp = self.maps.get(mname)
             if mp is None:
                 continue
-            for name in sorted(mp.zones.keys()):
+            # Only the zones that can hold the hook: their own, or their
+            # definition's (Map.zone_hook_names, the zones-by-definition
+            # index).
+            names = {n for n, hk in mp.zone_hook_names().items() if when in hk}
+            if defs:
+                mp._zone_index()
+                for d in defs:
+                    names |= mp._zones_by_def.get(d, set())
+            if SPATIAL_CHECK:
+                want = {n for n, z in mp.zones.items()
+                        if self.zone_hook_source(z, when) is not None}
+                if not want <= names:
+                    raise SpatialCheckError(
+                        f"map `{mp.name}`: zones {sorted(want - names)} hold "
+                        f"`{when}` but the hook index missed them")
+            for name in sorted(names):
                 if name not in mp.zones:
                     continue
                 # tile_x/tile_y default to None for time hooks (no single
@@ -21986,7 +22306,9 @@ class Match:
         return log
 
     def _fire_zone_time_hook(self, when: str, name: str,
-                             entity_id: Optional[str], mp: "Map") -> List[str]:
+                             entity_id: Optional[str], mp: "Map",
+                             extra: Optional[Dict[str, Any]] = None
+                             ) -> List[str]:
         """fire_zone_hook variant for time hooks: binds tile_x/tile_y to
         None (no single firing cell) rather than a real coordinate."""
         from formula import FormulaEngine, EvalCtx, FormulaError
@@ -22001,7 +22323,7 @@ class Match:
             this=self.current_entity_id(),
             target=entity_id or None,
             extras={"zone_name": name, "tile_x": None, "tile_y": None,
-                    "zone_map": mp.name, "hook_name": when},
+                    "zone_map": mp.name, "hook_name": when, **(extra or {})},
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
         try:
@@ -29344,10 +29666,20 @@ class Match:
             if mp.in_rect(vx, vy):
                 grid[vy][vx] = vg
 
-        # Zone layer (lowest): a single-char `glyph` paints all the zone's
-        # cells; a `color` tints them (the glyph if present, else the '.').
-        # Overlapping zones: later-iterated wins for both.
-        for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
+        # Zones and tiles by draw layer (docs/terrain_design.md §3), as the
+        # scene orders them: each cell shows the glyph of its highest layer
+        # (a zone's sprite_layer, else its definition's, else
+        # sprite_layer_zone; a tile's sprite_layer data, else
+        # sprite_layer_tile); on a tie a tile is above a zone and a zone
+        # made later above an earlier one. A colour without a glyph tints the
+        # cell when it is the highest colour there.
+        g_layer: Dict[Tuple[int, int], float] = {}
+        c_layer: Dict[Tuple[int, int], float] = {}
+        zone_items = list(mp.zones.items()) if "zones" not in hidden else []
+        zone_items = sorted(enumerate(zone_items),
+                            key=lambda iz: (self.zone_draw_layer(iz[1][1]),
+                                            iz[0]))
+        for _i, (zname, z) in zone_items:
             if not self.zone_visible_to(zname, pov_team, mp):
                 continue
             g = self.zone_glyph(zname, mp)
@@ -29355,20 +29687,22 @@ class Match:
             zc = self.zone_color(zname, mp)
             if not has_glyph and zc is None:
                 continue
+            lay = self.zone_draw_layer(z)
             for (zx, zy) in z.get("cells", ()):
                 if not mp.in_bounds(zx, zy):
                     continue
                 if has_glyph:
+                    if lay < g_layer.get((zx, zy), -math.inf):
+                        continue
                     grid[zy][zx] = g
                     colors[zy][zx] = zc
+                    g_layer[(zx, zy)] = c_layer[(zx, zy)] = lay
                     if meanings is not None:
                         meanings[zy][zx] = self.legend_label_zone(zname, mp)
-                elif zc is not None:
+                elif lay >= c_layer.get((zx, zy), -math.inf):
                     colors[zy][zx] = zc
+                    c_layer[(zx, zy)] = lay
 
-        # Tile layer: instance `glyph` wins, else the template's. A tile
-        # `color` (instance > template) tints the cell — overriding any zone
-        # tint underneath, since the tile is the higher layer.
         for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
             if not mp.in_bounds(tx, ty):
                 continue
@@ -29377,13 +29711,20 @@ class Match:
             glyph = self.tile_glyph(tx, ty, mp)
             has_glyph = glyph is not None
             tc = self.tile_color(tx, ty, mp)
+            if not has_glyph and tc is None:
+                continue
+            lay = self.tile_draw_layer(data)
             if has_glyph:
+                if lay < g_layer.get((tx, ty), -math.inf):
+                    continue
                 grid[ty][tx] = glyph
                 colors[ty][tx] = tc            # tile owns the cell (tc may be None)
+                g_layer[(tx, ty)] = c_layer[(tx, ty)] = lay
                 if meanings is not None:
                     meanings[ty][tx] = self.legend_label_tile(data)
-            elif tc is not None:
+            elif lay >= c_layer.get((tx, ty), -math.inf):
                 colors[ty][tx] = tc
+                c_layer[(tx, ty)] = lay
 
         # Cells currently showing a unit's glyph (so a preview mark leaves
         # them alone; a fog overlay takes them back out).
@@ -29680,6 +30021,20 @@ class Match:
     def _layer_rule(self, key: str, default: int) -> int:
         return self._coerce_layer(self.rules.get(key, default), default)
 
+    def zone_draw_layer(self, z: Any) -> int:
+        """The layer zone dict `z` draws at in both renderers: its own
+        `sprite_layer`, else its definition's, else sprite_layer_zone
+        (docs/terrain_design.md §3)."""
+        return self._coerce_layer(self.zone_look(z, "sprite_layer"),
+                                  self._layer_rule("sprite_layer_zone", 25))
+
+    def tile_draw_layer(self, data: Any) -> int:
+        """The layer tile data `data` draws at in both renderers: its
+        `sprite_layer` field, else sprite_layer_tile."""
+        return self._coerce_layer(
+            data.get("sprite_layer") if isinstance(data, dict) else None,
+            self._layer_rule("sprite_layer_tile", 50))
+
     _LEGEND_LOOK = ("kind", "sprite", "glyph", "tint", "opacity",
                     "glyph_tint", "glyph_opacity", "flip_h", "flip_v")
 
@@ -29839,9 +30194,8 @@ class Match:
                            mp: "Map") -> Dict[str, Any]:
         placements: List[Dict[str, Any]] = []
         # Z-layer defaults per kind (configurable via the sprite_layer_* rules;
-        # per-item overrides handled at each emission). Background is the floor.
-        zone_layer = self._layer_rule("sprite_layer_zone", 25)
-        tile_layer = self._layer_rule("sprite_layer_tile", 50)
+        # per-item overrides handled at each emission; zones and tiles through
+        # zone_draw_layer / tile_draw_layer). Background is the floor.
         corpse_layer = self._layer_rule("sprite_layer_corpse", 75)
         entity_layer = self._layer_rule("sprite_layer_entity", 100)
         rider_layer = self._layer_rule("sprite_layer_rider", 110)
@@ -29856,6 +30210,7 @@ class Match:
             tint = self.zone_color(zname, mp)
             if spr is None and g is None and tint is None:
                 continue
+            z_layer = self.zone_draw_layer(z)
             for (zx, zy) in z.get("cells", ()):
                 if not mp.in_bounds(zx, zy):
                     continue
@@ -29863,7 +30218,7 @@ class Match:
                     "kind": "zone", "ref": zname, "x": zx, "y": zy,
                     "w": 1, "h": 1, "mode": "single", "sprite": spr,
                     "glyph": g, "tint": tint, "opacity": 100,
-                    "flip_h": fh, "flip_v": fv, "layer": zone_layer})
+                    "flip_h": fh, "flip_v": fv, "layer": z_layer})
 
         # Tile layer (20).
         for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
@@ -29877,9 +30232,7 @@ class Match:
             if spr is None and g is None and tint is None:
                 continue
             # Per-tile override: a `sprite_layer` data field wins over the rule.
-            t_layer = self._coerce_layer(
-                data.get("sprite_layer") if isinstance(data, dict) else None,
-                tile_layer)
+            t_layer = self.tile_draw_layer(data)
             placements.append({
                 "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
