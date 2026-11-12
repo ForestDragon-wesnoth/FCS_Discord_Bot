@@ -40315,7 +40315,7 @@ SCENARIO 1130 — Damage hooks and lines: the thorns recipe, damage_taken vs dam
 ?? takes 40 damage from A.
 ?? died.
 !assert "entity[a].dealt == 40 and entity[a].moved == 25 and entity[a].src == 'command'"
-!assert "entity[a].hp == 28"
+!assert "entity[a].hp == 26"
 !ent add u U 30 3 3 3
 !damage step add wall side=defender "step_reduce(100)"
 !gpassive add zero on_damage_taken "entity[self].hits = var_get(self, 'hits', 0) + 1"
@@ -40342,9 +40342,8 @@ packet prints its line (damage_message_format), the attacker named as
 the view sees it. on_damage_dealt fires on the attacker after the
 defender's hook: damage_taken is what the steps decided (40), damage_lost
 what the var moved (25: T had 25 left); damage_source is `command` for
-`!ent damage` (T's hard clamp stops its hp at 0). The killing blow's
-thorns don't fire: the dead T is gone
-before its on_damage_taken (A stays 28). A hit the steps bring to 0 still
+`!ent damage` (T's hard clamp stops its hp at 0). The hooks run before
+the death check, so the killing blow's thorns fire too (A 28 → 26). A hit the steps bring to 0 still
 fires the hooks (U's hits 1, hp 30). `quiet=True` / `quiet` drop the line
 (the command gives a plain confirmation instead). The format takes
 {damage_taken.<pool>}, {components} and {source}; empty = no line.
@@ -40707,3 +40706,42 @@ attacker as the channel's view sees it: red can't see the cloaked orc,
 so its line reads "from someone"; blue sees its own orc. A defender the
 view can't see drops the line (blue, the hero cloaked); the damage lands
 all the same (30 → 22).
+
+
+SCENARIO 1139 — A killing blow fires the damage hooks first: endure, a lethal check, kill rewards (#25)
+--------------------------------------------------------------------------------------------------------
+
+!match new kb KB 8 8
+!match use kb
+!ent add a A 30 1 1 5
+!ent add t T 20 3 1 3
+!ent set_var t endure 1
+!passive add t endure on_damage_taken "if entity[self].hp <= 0 and entity[self].endure > 0:\n    entity[self].endure = entity[self].endure - 1\n    entity[self].hp = 1\n    say('{s} endures the blow', s=self)"
+!passive add t rage on_damage_taken priority=1 "if entity[self].hp > 0:\n    entity[self].rage = var_get(self, 'rage', 0) + get(damage_taken, 'hp')"
+!passive add a reward on_damage_dealt "if entity[defender].hp <= 0:\n    entity[self].kills = var_get(self, 'kills', 0) + 1"
+!ent damage t 8 from=a
+!assert "entity[t].rage == 8 and var_get('a', 'kills', 0) == 0"
+!ent damage t 50 from=a
+?? T endures the blow
+?! died
+!assert "entity[t].hp == 1 and entity[t].endure == 0 and entity[t].rage == 8"
+!gpassive add credit on_death "match.last = fmt('{s}:{k}', s=self, k=killer)"
+!ent damage t 50 from=a
+?? died.
+!assert "has_corpse('t') and entity[a].kills == 1 and match.last == 't:a'"
+!log type=death
+?? T (`t`) died
+
+Expected: on_damage_taken and on_damage_dealt run after the packet's
+writes and before its death check, so on a killing blow the defender is
+still in the match at 0 hp or less. T's `endure` passive (once) heals it
+to 1, which saves it: the 50 hit leaves T at 1, no death. A hook that
+shouldn't act on a lethal hit checks the defender's hp: `rage` grows
+only when T survives the hit (8 from the first, nothing from the lethal
+ones); it has priority 1, so it runs before `endure` and reads the hit
+as it landed (at the default 0 it would see endure's heal). A's
+`reward` (on_damage_dealt, after every on_damage_taken hook) counts a
+kill only when the defender's hp is still at 0 or below, so the hit
+endure answered isn't one. The
+third hit kills T: the death check runs once, after the hooks, and
+on_death still credits A.

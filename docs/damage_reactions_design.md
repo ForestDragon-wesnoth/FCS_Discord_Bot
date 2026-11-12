@@ -580,14 +580,17 @@ the above.
 ### 10.9 As built (choices made while building, open to change)
 
 - **The order after the writes:** statuses that break, the line, the
-  event-log entry, the death check (so the line and the entry read before
-  the death's), the records, a body part's share and destruction, then
-  the hooks. The records come before the hooks, so `last_damage(self)` in
-  `on_damage_taken` reads the packet being handled.
-- **`on_damage_taken` on a dead defender:** the killing blow's
-  `on_damage_taken` fires only while the defender is still in the match
-  (a corpse left it); `on_death` (with `killer`) and the attacker's
-  `on_damage_dealt` still fire.
+  event-log entry, the records, a body part's share, the hooks, then the
+  one death check, then a body part's destruction. The records come
+  before the hooks, so `last_damage(self)` in `on_damage_taken` reads the
+  packet being handled.
+- **The hooks run before the death check** (user call, after the first
+  build had them after it): on a killing blow `on_damage_taken` and
+  `on_damage_dealt` see the defender still in the match at 0 hp or less,
+  its own passives included, and a hook that heals it above 0 saves it
+  ("endure", "cheat death": on_damage passives often prevent a death). The
+  hooks' own writes to the defender wait for the same single check. A
+  hook that mustn't act on a lethal hit tests the defender's hp.
 - **`damage_lost`** is what the var moved: without a clamp at 0, 40
   damage on 25 hp moves it 40.
 - **Break-on-damage fields:** `removed_on_damage` (on / off),
@@ -602,8 +605,7 @@ the above.
 - **Body-part shares:** the base is the components the part took after
   its own steps; the share is worked out before the part's writes (a bad
   knob refuses the hit), sent after them with the packet tag
-  `part_share`, and the part's destruction follows the share (as
-  damage_part did). The part's hp stops at 0, and a destroyed part still
+  `part_share`, and the part's destruction comes after the hooks. The part's hp stops at 0, and a destroyed part still
   passes hits on while its body lives. The heal percent follows: the
   part's `heal_to_main_percent`, else its `damage_to_main_percent`, else
   the heal rule (`same` = the damage rule). A dict percent with no

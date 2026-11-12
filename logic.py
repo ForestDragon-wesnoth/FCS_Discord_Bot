@@ -7239,9 +7239,10 @@ HOOK_NAMES: Set[str] = {
     # "trap counters attacker", "this entity has resistance to
     # actions whose action_path starts with `inventory.poison.`".
     "on_action_used_on_target",
-    # The damage pipeline (#25, damage.py): after a damage packet's writes,
-    # its line and its death check, on_damage_taken fires on the defender
-    # (while it is in the match), then on_damage_dealt on the attacker
+    # The damage pipeline (#25, damage.py): after a damage packet's writes
+    # and its line, BEFORE its death check (a hook that heals the defender
+    # saves it), on_damage_taken fires on the defender, then
+    # on_damage_dealt on the attacker
     # (none without one); healing packets fire on_healing_received /
     # on_healing_given. Bindings: attacker / defender (healing_giver /
     # healing_receiver), damage_source, damage_tags (the packet's),

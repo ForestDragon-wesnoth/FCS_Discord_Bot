@@ -588,13 +588,32 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
         except VTTError as ex:
             raise VTTError(f"damage_part `{target}`: {ex}"
                            if kind == "damage" else f"`{target}`: {ex}")
-    _write_pools(m, kind, e, result, quiet)
-    _record(m, kind, result)
-    if e.is_part:
-        if share:
+    # The target's death check is held through the writes, the share and
+    # the hooks, then runs once (design §10.9): on_damage_taken fires on a
+    # killing blow too, with the unit still in the match at 0 hp, and a
+    # hook that heals it above 0 saves it. A hook's own writes to the
+    # target wait for the same check.
+    from logic import PACKET_KILLER
+    held = target not in m._death_check_deferred_ids
+    if held:
+        m._death_check_deferred_ids.add(target)
+    try:
+        _write_pools(m, kind, e, result, quiet)
+        _record(m, kind, result)
+        if e.is_part and share:
             _send_share(m, kind, result, share, quiet)
+        _fire_hooks(m, kind, result)
+    finally:
+        if held:
+            m._death_check_deferred_ids.discard(target)
+    if held and target in m.entities:
+        token = PACKET_KILLER.set((m.id, target, result["dealer"]))
+        try:
+            result["log"].extend(m.check_death(target))
+        finally:
+            PACKET_KILLER.reset(token)
+    if target in m.entities and m.entities[target].is_part:
         _part_destroyed(m, kind, result)
-    _fire_hooks(m, kind, result)
     return result
 
 
@@ -733,16 +752,14 @@ def _part_destroyed(m: Any, kind: str, result: Dict[str, Any]) -> None:
 def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any],
                  quiet: bool = False) -> None:
     """Each pool once through write_var (a write a packet makes logs no
-    hp_change entry); then the packet's line and event-log entry; then ONE
-    death check, whose death credits the packet's dealer (`killer`)."""
-    from logic import PACKET_WRITE, PACKET_KILLER
+    hp_change entry); then the statuses that break, the packet's line and
+    its event-log entry. The target's death check stays held (run_packet
+    runs it once, after the hooks)."""
+    from logic import PACKET_WRITE
     log: List[str] = result["log"]
     target = e.id
     hp_var = str(m.rules.get("hp_var", "hp"))
     skip_hp = m.is_indestructible(e)
-    deferred = target not in m._death_check_deferred_ids
-    if deferred:
-        m._death_check_deferred_ids.add(target)
     token = PACKET_WRITE.set((m.id, target))
     try:
         for p, amount in result["taken"].items():
@@ -770,19 +787,11 @@ def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any],
                 result["lost"][p] = amount
     finally:
         PACKET_WRITE.reset(token)
-        if deferred:
-            m._death_check_deferred_ids.discard(target)
     if kind == "damage" and target in m.entities:
         log.extend(_break_statuses(m, result))
     if target in m.entities:
         _announce_packet(m, kind, result, quiet)
     _log_packet(m, kind, result)
-    if deferred and target in m.entities:
-        token = PACKET_KILLER.set((m.id, target, result["dealer"]))
-        try:
-            log.extend(m.check_death(target))
-        finally:
-            PACKET_KILLER.reset(token)
 
 
 def counted_damage(result: Dict[str, Any], flt: Any) -> float:

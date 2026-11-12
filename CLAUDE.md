@@ -3988,7 +3988,7 @@ lists what isn't built; 1093-1122).
 ### 7.24 The damage pipeline
 
 #25 (`damage.py`, design `docs/damage_reactions_design.md` §10; built
-in full: 1123-1137).
+in full: 1123-1139).
 - **Packets** (`damage.run_packet(m, kind, target, damage, pool=, tags=,
   packet_tags=, dealer=, source=, forecast=, trace=)`, kind `damage` or
   `healing`, `KINDS` holds every per-kind name): components `{amount,
@@ -4035,16 +4035,21 @@ in full: 1123-1137).
   say() name marker, `{?key?}...{/?}`; tagged as a line about the target;
   `quiet` skips it), the event-log entry (`damage` / `healing`; the hp
   writes run under `logic.PACKET_WRITE`, so write_var logs no
-  `hp_change`, which a raw hp write logs), then the ONE death check under
-  `logic.PACKET_KILLER`, so on_death binds `killer`
-  (`Match.packet_killer`: the target or its body). Then the records, a
-  body part's share and destruction, then the hooks (`_fire_hooks`):
-  `on_damage_taken` on the target while it is in the match, then
-  `on_damage_dealt` on the dealer (`on_healing_received` /
+  `hp_change`, which a raw hp write logs), the records, a body part's
+  share, then the hooks (`_fire_hooks`): `on_damage_taken` on the target,
+  then `on_damage_dealt` on the dealer (`on_healing_received` /
   `on_healing_given`), extras `hook_extras` (damage_taken / damage_lost
-  per pool, components as dicts), firing on 0 too; packets dealt from
-  them nest `Match._damage_hook_depth` deep, past
-  `damage_hook_recursion_limit` (16, ceiling) no hooks, one ⚠️ per chain.
+  per pool, components as dicts), firing on 0 too. The target's death
+  check is held (`_death_check_deferred_ids`, run_packet) through all of
+  it, the hooks' own writes to the target included, and runs ONCE after
+  the hooks under `logic.PACKET_KILLER`, so on_death binds `killer`
+  (`Match.packet_killer`: the target or its body); then a body part at 0
+  hp is destroyed. So on a killing blow the hooks see the defender in
+  the match at 0 hp, and one that heals it saves it (user call: on_damage
+  passives often prevent a death); a hook that mustn't act on a lethal
+  hit tests the defender's hp (1139). Packets dealt from the hooks nest
+  `Match._damage_hook_depth` deep, past `damage_hook_recursion_limit`
+  (16, ceiling) no hooks, one ⚠️ per chain.
 - **Body parts** (design §10.5): a packet on a part (also `damage_part`,
   `damage_spread`, which route through it) plans the share BEFORE writing
   (`_plan_share`, so a bad knob refuses the hit): per component above 0,
@@ -4056,8 +4061,8 @@ in full: 1123-1137).
   before the hit; tagged `true_damage` / `true_healing` under
   `part_*_share_mode` `true`. The part's hp stops at 0; then the share
   goes to the parent as its own packet (packet tag `part_share`, same
-  dealer and source, `_send_share`), then a part at 0 hp is destroyed
-  (`_process_part_death` under PACKET_KILLER). A destroyed part still
+  dealer and source, `_send_share`), and after the part's hooks a part
+  at 0 hp is destroyed (`_process_part_death` under PACKET_KILLER). A destroyed part still
   takes packets while its body lives. The share rounds by
   `damage_rounding` (rounding_mode is transform's alone now).
 - **Status source** (#227): `apply_status(..., source=)` stores the
