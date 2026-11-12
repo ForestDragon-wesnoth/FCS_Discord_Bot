@@ -21009,7 +21009,7 @@ SCENARIO 738 — Tab completion: commands, subcommands, literal words and option
 ?tab "!ent "
 ?? set_var
 ?? hp
-?tab !ent h
+?tab !ent hp
 ?? → '!ent hp '
 ?tab "!ent hp "
 ?? candidates: healer  hero
@@ -22059,7 +22059,7 @@ SCENARIO 759 — System libraries: promote from a match, !match sync, undo, rest
 !match sync funcs nothere
 ?? ❌ system `default` has no formula function `nothere`
 !match sync spells
-?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, zones, watchers, all.
+?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, zones, watchers, damage, healing, all.
 !match sync all calc
 ?? ❌
 ?tab "!system func info default ca"

@@ -368,6 +368,11 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(meta.get("subs") or {})
     ent = binds.get("eid") or binds.get("id") or binds.get("unit") \
         or binds.get("entity_id")
+    if slot in ("name", "step") and root in ("damage", "healing") \
+            and m is not None:
+        # A step of the match's damage / healing steps (#25).
+        return sorted(m.damage_steps if root == "damage"
+                      else m.healing_steps)
     if slot == "reaction":
         # `!react <eid> <reaction>`: what the unit may pick in the open
         # window now (#36), and `pass`.
@@ -546,12 +551,14 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
 _SYSTEM_LIBS = {"alias": "aliases", "tile": "tile_templates",
                 "func": "formula_functions", "status": "status_definitions",
                 "table": "tables", "macro": "macros",
-                "zone": "zone_definitions"}
+                "zone": "zone_definitions", "damage": "damage_steps",
+                "healing": "healing_steps"}
 # `!match sync <kind>` -> the library named.
 _SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
               "funcs": "formula_functions", "statuses": "status_definitions",
               "tables": "tables", "macros": "macros",
-              "zones": "zone_definitions"}
+              "zones": "zone_definitions", "damage": "damage_steps",
+              "healing": "healing_steps"}
 
 
 # Placeholders _slot_names knows a source for (used to tell slots from
@@ -560,7 +567,7 @@ _KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
                "dest_match", "rule", "function", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
                "slot", "corpse_id", "key", "path", "sub", "definition",
-               "prefab", "tag", "filter", "facing"}
+               "prefab", "tag", "filter", "facing", "step"}
 
 
 # ---- the entry point -------------------------------------------------------

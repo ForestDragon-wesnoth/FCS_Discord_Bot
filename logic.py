@@ -4980,6 +4980,67 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "lets its actions be reacted to."
         ),
     },
+    # The damage pipeline (#25, docs/damage_reactions_design.md §10) and
+    # its healing twin. Each rule comes in a damage_ / healing_ pair.
+    "damage_default_pool": {
+        "default": "@hp",
+        "schema": {"type": "str"},
+        "desc": (
+            "The var a damage component without a `pool` lowers. A var path "
+            "(`stamina`, `resources.arcana`) or `@<var rule>` for the var a "
+            "var-name rule names (`@hp` = the hp_var's var, so a rename "
+            "follows). Only the hp var kills by default, since "
+            "death_condition reads it."
+        ),
+    },
+    "healing_default_pool": {
+        "default": "@hp",
+        "schema": {"type": "str"},
+        "desc": "The var a healing component without a `pool` raises; as damage_default_pool.",
+    },
+    "damage_step_default_filter": {
+        "default": "not true_damage",
+        "schema": {"type": "str"},
+        "desc": (
+            "The tag filter of a damage step that has no filter of its own. "
+            "A component's filter tags are its own tags, the packet's tags "
+            "and `pool:<var>`. The default skips true damage: components "
+            "tagged `true_damage` reach only steps written for them."
+        ),
+    },
+    "healing_step_default_filter": {
+        "default": "not true_healing",
+        "schema": {"type": "str"},
+        "desc": "The tag filter of a healing step without one; as damage_step_default_filter, for `true_healing`.",
+    },
+    "damage_rounding": {
+        "default": "floor",
+        "schema": {"type": "enum", "choices": ["floor", "round", "ceil"]},
+        "desc": (
+            "How a pool's damage is rounded, once, when it is written: "
+            "steps work on exact amounts (25% of 15 is 3.75) and only the "
+            "sum written to each pool is rounded. round = halves up."
+        ),
+    },
+    "healing_rounding": {
+        "default": "floor",
+        "schema": {"type": "enum", "choices": ["floor", "round", "ceil"]},
+        "desc": "How a pool's healing is rounded when it is written; as damage_rounding.",
+    },
+    "damage_component_floor": {
+        "default": "0",
+        "schema": {"type": "str"},
+        "desc": (
+            "The least a pool's damage can come to after the steps: a "
+            "number (default 0, so armor never turns a hit into a heal), or "
+            "`none` for no floor (a negative total then raises the pool)."
+        ),
+    },
+    "healing_component_floor": {
+        "default": "0",
+        "schema": {"type": "str"},
+        "desc": "The least a pool's healing can come to; as damage_component_floor.",
+    },
     "reaction_window_expiry_seconds": {
         "default": -1,
         "schema": {"type": "int", "min": 1, "unlimited": True},
@@ -6147,6 +6208,43 @@ def _check_var_path_list(key: str, raw: str) -> str:
     return ", ".join(got)
 
 
+def _check_pool_rule(key: str, raw: str) -> str:
+    """damage_default_pool / healing_default_pool: a var path or `@<var
+    rule>`."""
+    v = raw.strip()
+    if v.startswith("@"):
+        if v[1:] + "_var" not in VAR_NAME_RULES:
+            raise VTTError(
+                f"Setting '{key}': `{v}` names no var-name rule; an `@` "
+                f"entry is one of "
+                + ", ".join(f"`@{r[:-4]}`" for r in VAR_NAME_RULES) + ".")
+        return v
+    if not v:
+        raise VTTError(f"Setting '{key}' names a var: `@hp` or a var path.")
+    return _check_var_path_rule(key, v)
+
+
+def _check_component_floor(key: str, raw: str) -> str:
+    v = raw.strip().lower()
+    if v == "none":
+        return v
+    try:
+        f = float(v)
+    except ValueError:
+        raise VTTError(f"Setting '{key}' is a number or `none`, not "
+                       f"`{raw}`.")
+    if not math.isfinite(f):
+        raise VTTError(f"Setting '{key}' is a finite number or `none`.")
+    return raw.strip()
+
+
+def _check_filter_rule(key: str, raw: str) -> str:
+    v = raw.strip()
+    if v:
+        check_tag_filter(v)
+    return v
+
+
 _FORMAT_RULE_CHECKS = {
     "transform_keep_vars": _check_var_path_list,
     "private_vars": _check_private_paths,
@@ -6159,6 +6257,12 @@ _FORMAT_RULE_CHECKS = {
     "amount_field": _check_plain_key,
     "turnorder_tiebreak_var": _check_var_path_rule,
     "action_container_paths": _check_top_vars,
+    "damage_default_pool": _check_pool_rule,
+    "healing_default_pool": _check_pool_rule,
+    "damage_component_floor": _check_component_floor,
+    "healing_component_floor": _check_component_floor,
+    "damage_step_default_filter": _check_filter_rule,
+    "healing_step_default_filter": _check_filter_rule,
 }
 
 
@@ -8743,7 +8847,8 @@ SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
                                      "status_definitions", "tables",
                                      "macros", "zone_definitions",
                                      "tag_vocabulary", "watchers",
-                                     "var_labels")
+                                     "var_labels", "damage_steps",
+                                     "healing_steps")
 
 # Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
 # it can't bound the system chain itself). Set with `!owner ceiling <key>
@@ -8994,6 +9099,21 @@ def diff_rule_value(rule: str, base: Any, new: Any
     return own_l, sorted(k for k in bmap if k not in nmap)
 
 
+def _loaded_steps(raw: Any, kind: str) -> Dict[str, Dict[str, Any]]:
+    """A saved damage / healing step library: the steps that still read
+    (damage.normalize_step), the rest dropped with a console note."""
+    import damage as _damage
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in (raw or {}).items() if isinstance(raw, dict) else ():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            continue
+        try:
+            out[k] = _damage.normalize_step(kind, v)
+        except VTTError as ex:
+            print(f"[steps] {kind} step `{k}` dropped at load: {ex}")
+    return out
+
+
 @dataclass
 class GameSystem:
     name: str
@@ -9045,6 +9165,11 @@ class GameSystem:
     # place of the key, under var_labels_enabled. Read live from the system
     # (never copied into a match), like tag_vocabulary.
     var_labels: Dict[str, str] = field(default_factory=dict)
+    # The damage pipeline's steps (#25, `!system damage` / `!system heal`):
+    # step name -> a damage.normalize_step dict, ordered by its `order`
+    # field. Copied into a new match like the other libraries.
+    damage_steps: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    healing_steps: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # The system this one inherits from (live: MatchManager resolves the
     # chain on every read), or None for a root. `settings` and the
     # libraries above then hold only this system's OWN overrides.
@@ -9115,6 +9240,12 @@ class GameSystem:
                          for n, w in sorted(self.watchers.items())},
             "var_labels": {k: str(v)
                            for k, v in sorted(self.var_labels.items())},
+            **({"damage_steps": {n: copy.deepcopy(v) for n, v
+                                 in sorted(self.damage_steps.items())}}
+               if self.damage_steps else {}),
+            **({"healing_steps": {n: copy.deepcopy(v) for n, v
+                                  in sorted(self.healing_steps.items())}}
+               if self.healing_steps else {}),
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
@@ -9218,6 +9349,8 @@ class GameSystem:
             var_labels={k: v for k, v in (d.get("var_labels") or {}).items()
                         if isinstance(k, str) and isinstance(v, str)
                         and var_label_problem(k, v) is None},
+            damage_steps=_loaded_steps(d.get("damage_steps"), "damage"),
+            healing_steps=_loaded_steps(d.get("healing_steps"), "healing"),
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
             description=str(d.get("description") or ""),
@@ -9845,6 +9978,9 @@ class Entity:
         m._splice_out_segment(self)
         if self.id in m.entities:
             del m.entities[self.id]
+        # Its damage records go with it (a later unit under the id starts
+        # with none).
+        m.damage_records.pop(self.id, None)
         # scrub from turn order & clamp active index
         if self.id in m.turn_order:
             idx = m.turn_order.index(self.id)
@@ -12626,6 +12762,14 @@ class Match:
     # was copied in when the zone was made (see ZONE_LOOK_FIELDS). Seeded
     # from the system's library at creation, serialized with the match.
     zone_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # The damage pipeline (#25, damage.py): the match's own copies of its
+    # system's step libraries (`!damage step`, `!heal step`), and per unit
+    # the last packet it took / dealt / received / gave (last_damage(),
+    # `!damage last`), dropped when the unit leaves the match.
+    damage_steps: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    healing_steps: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    damage_records: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # User-defined formula functions, keyed by name. Defined via !func
     # def and callable by name from any formula on this match. Seeded
@@ -27494,6 +27638,9 @@ class Match:
                 name: normalize_zone_def(d)
                 for name, d in sorted(self.zone_definitions.items())
             },
+            "damage_steps": jcopy(self.damage_steps),
+            "healing_steps": jcopy(self.healing_steps),
+            "damage_records": jcopy(self.damage_records),
             "formula_functions": {
                 name: fn.to_dict()
                 for name, fn in sorted(self.formula_functions.items())
@@ -27738,6 +27885,11 @@ class Match:
             zname: normalize_zone_def(zdef)
             for zname, zdef in (d.get("zone_definitions") or {}).items()
             if isinstance(zname, str) and zname}
+        m.damage_steps = _loaded_steps(d.get("damage_steps"), "damage")
+        m.healing_steps = _loaded_steps(d.get("healing_steps"), "healing")
+        m.damage_records = {
+            str(k): jcopy(v) for k, v in (d.get("damage_records") or {}).items()
+            if isinstance(v, dict)}
         raw_funcs = d.get("formula_functions", {}) or {}
         m.formula_functions = {}
         for fname, fdef in raw_funcs.items():
@@ -32006,7 +32158,7 @@ class MatchManager:
         # Status definitions, dice tables and macros, the same way. A
         # system macro carries no author, so it runs as a host's.
         for kind in ("status_definitions", "tables", "macros",
-                     "zone_definitions"):
+                     "zone_definitions", "damage_steps", "healing_steps"):
             setattr(m, kind, copy.deepcopy(self.system_library(sysobj, kind)))
         # Watchers arrive armed: each reads its condition once now.
         for wname, wdef in sorted(
