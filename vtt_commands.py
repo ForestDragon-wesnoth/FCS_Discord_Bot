@@ -27111,8 +27111,10 @@ def _packet_line(m: Match, kind: str, eid: str,
     import damage as _damage
     info = _damage.kind_info(kind)
     dpool = _damage.resolve_pool(m, None, kind)
+    shown = {p: v for p, v in res["taken"].items() if v} \
+        or dict(list(res["taken"].items())[:1])
     bits = [f"{v}" + ("" if p == dpool else f" {p}") + f" {info['noun']}"
-            for p, v in res["taken"].items()]
+            for p, v in shown.items()]
     text = f"`{eid}` {info['verb']} " + (" and ".join(bits) or
                                          f"no {info['noun']}")
     moved = [f"{p} moved by {res['lost'][p]}" for p in res["taken"]

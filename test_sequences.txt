@@ -39967,3 +39967,331 @@ refund: the body's own effects go, the slash and its parry with them
 stays (stamina 4) and the reply says why. Only the brace counts as
 used.
 HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1123 — Damage pipeline: Solis armor, Fire Arrow and Strength in a real attack (#25)
+-------------------------------------------------------------------------------------------
+
+!match new dp DP 8 8
+!match use dp
+!ent add hunter Hunter 40 1 1 5
+!ent add hopper Hopper 60 3 1 3
+!ent set_var hopper footprint_w 2
+!ent set_var hopper footprint_h 2
+!ent set_var hopper armor 8
+!ent set_var hopper armor_kind hard
+!ent set_var hunter modifiers.strength.stat damage_dealt
+!ent set_var hunter modifiers.strength.op inc%
+!ent set_var hunter modifiers.strength.value 25
+!damage step add armor filter=pool:hp desc="flat armor, halved against blunt when hard" "a = entity[self].armor\nfor c in components:\n    if entity[self].armor_kind == 'hard' and 'blunt' in c.tags:\n        a = entity[self].armor / 2\nstep_reduce(a)"
+!damage step add fire_arrow side=attacker filter=fire_arrow "step_new(step_total() * 0.25, tags=['fire'])"
+!damage step add strength side=attacker "step_mods('damage_dealt')"
+!damage
+?? - `fire_arrow` (attacker, filter fire_arrow)
+?? - `strength` (attacker)
+?? - `armor` (defender, filter pool:hp): flat armor, halved against blunt when hard
+!ent set_var hunter actions.shoot.target entity
+!ent set_var hunter actions.shoot.body "deal_damage(target, 20, tags=['pierce'], packet_tags=['fire_arrow', 'ranged'])"
+!ent set_var hunter actions.club.target entity
+!ent set_var hunter actions.club.body "deal_damage(target, 20, tags=['blunt'])"
+!damage explain hunter hopper 20 tags=pierce packet_tags=fire_arrow
+?? 1. `fire_arrow` [fire_arrow]: 20 pierce → 20 pierce; 5 fire
+?? 2. `strength` [not true_damage]: 20 pierce; 5 fire → 25 pierce; 6.25 fire
+?? 3. `armor` [pool:hp]: 25 pierce; 6.25 fire → 17 pierce; 6.25 fire
+?? Raw (attacker steps): hp 31
+?? Taken (defender steps, rounded): hp 23
+!assert "entity[hopper].hp == 60"
+!action hunter shoot hopper
+!assert "entity[hopper].hp == 37"
+!assert "get(last_damage('hopper'), 'attacker') == 'hunter' and get(last_damage('hopper'), 'source') == 'action:actions.shoot'"
+!assert "get(last_damage('hunter', 'dealt'), 'damage_taken') == {'hp': 23}"
+!action hunter club hopper
+!assert "entity[hopper].hp == 16"
+!damage last hopper
+?? attacker: hunter; defender: hopper; source: action:actions.club
+?? Components after the steps: 21 blunt
+
+Expected: Three damage steps: Fire Arrow (attacker, only for a packet
+tagged `fire_arrow`) adds 25% as a fire component, Strength folds the
+hunter's own modifier records (+25% `inc%` on damage_dealt) into each
+component, and the 2x2 hopper's armor takes 8 off the hit as a whole
+(`step_reduce`, so both components share it). The explain (a forecast:
+the hopper keeps 60) shows 20 pierce → 20 + 5 fire → 25 + 6.25 → 17 +
+6.25, raw 31, taken 23.25 rounded down to 23. The hunter's `shoot` action
+deals it for real (60 → 37), recorded with the hunter as attacker and
+the action as source. A blunt club hit: 20 × 1.25 = 25, hard armor
+halved against blunt takes 4: 21 (37 → 16).
+
+
+SCENARIO 1124 — Damage pipeline: several pools, FCS1 Freeze overflow, a pool the unit lacks (#25)
+-----------------------------------------------------------------------------------------------
+
+!match new dp DP 8 8
+!match use dp
+!ent add mage Mage 40 1 1 5
+!ent add knight Knight 50 3 1 3
+!ent set_var knight stamina 12
+!ent add golem Golem 50 5 1 2
+!damage step add freeze_overflow filter="pool:stamina" desc="stamina damage past 0 becomes hp damage" "over = step_total() - entity[defender].stamina if var_has(defender, 'stamina') else 0\nif over > 0:\n    step_reduce(over)\n    step_new(over, pool='hp', tags=['freeze_overflow'])"
+!eval "deal_damage('knight', [{'amount': 10, 'tags': ['cold']}, {'amount': 20, 'pool': 'stamina', 'tags': ['cold']}])"
+?? {'hp': 18, 'stamina': 12}
+!assert "entity[knight].hp == 32 and entity[knight].stamina == 0"
+!ent damage knight 5 pool=stamina
+?? `knight` takes 5 damage.
+!assert "entity[knight].hp == 27 and entity[knight].stamina == 0"
+!ent damage golem 8 pool=stamina
+?? `golem` has no number at `stamina`: its damage there is dropped.
+?? `golem` takes no damage.
+!assert "entity[golem].hp == 50"
+!ent damage knight 3 pool=@hp
+!assert "entity[knight].hp == 24"
+!eval "deal_damage('knight', 1, pool='hp.max')"
+?? `knight` has no number at `hp.max`: its damage there is dropped.
+
+Expected: The FCS1 Freeze recipe, to copy: a defender step filtered to
+`pool:stamina` (every component's pool is a tag of the form `pool:<var>`)
+compares the stamina damage with the stamina the defender has, takes the
+excess off (`step_reduce`) and adds it as an hp component (`step_new(...,
+pool='hp')`). 10 hp + 20 stamina damage on a knight with 12 stamina is 18
+hp (10 + 8 over) and 12 stamina (32 / 0). With stamina already at 0, 5
+stamina damage all goes to hp (27). A golem has no stamina: the component
+is dropped and it takes nothing (the step reads the stamina only when
+the unit has some: a step that errors would be skipped with a ⚠️).
+`pool=@hp` names the hp var's var (24); a pool path under a number
+(`hp.max`) isn't a number on the unit, so the component is dropped.
+
+
+SCENARIO 1125 — Damage pipeline: true damage, the default filter, the floor and rounding rules (#25)
+---------------------------------------------------------------------------------------------------
+
+!match new dp DP 8 8
+!match use dp
+!ent add a A 40 1 1 5
+!ent add t T 100 3 1 3
+!damage step add resist "step_scale(0.5)"
+!damage step add shield filter="true_damage or pool:hp" "step_reduce(1)"
+!ent damage t 10
+!assert "entity[t].hp == 96"
+!ent damage t 10 tags=true_damage
+!assert "entity[t].hp == 87"
+!system set default damage_step_default_filter "not true_damage and not holy"
+!ent damage t 10 tags=holy
+!assert "entity[t].hp == 78"
+!system set default damage_rounding ceil
+!ent damage t 5
+!assert "entity[t].hp == 76"
+!system set default damage_rounding round
+!ent damage t 5
+!assert "entity[t].hp == 74"
+!ent damage t 1
+!assert "entity[t].hp == 74"
+!damage step add armor "step_reduce(30)"
+!ent damage t 10
+?? `t` takes 0 damage.
+!assert "entity[t].hp == 74"
+!system set default damage_component_floor none
+!damage step add armor_neg "step_add(-30)"
+!ent damage t 10
+!assert "entity[t].hp > 74"
+!system set default damage_component_floor 2
+!system set default damage_component_floor oops
+?? ❌
+
+Expected: `resist` has no filter, so it takes the rule's default `not
+true_damage`: 10 is halved to 5, then `shield` (filter true_damage or
+pool:hp) takes 1: 4 (100 → 96). A `true_damage` component skips `resist`
+and reaches `shield`: 9 (87). The default filter is a rule: once it
+leaves out `holy` too, a holy hit skips `resist` (9, 78). Rounding
+happens once per pool: 5 → 2.5 → 1.5, ceil 2 (76), round 2 (74); 1 →
+0.5 → -0.5, floored at 0 (the floor rule), then rounded (74). Armor
+taking 30 leaves the pool at the floor 0 ("takes 0 damage"). With the
+floor `none`, `step_add(-30)` makes the total negative and the damage
+raises hp. The floor is a number or `none`.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1126 — Healing pipeline: giver and receiver steps, a curse, last_healing (#25)
+--------------------------------------------------------------------------------------
+
+!match new dp DP 8 8
+!match use dp
+!ent add cleric Cleric 40 1 1 5
+!ent add hero Hero 50 3 1 3
+!ent set_var hero max_hp 100
+!ent hp hero 30
+!ent set_var cleric potency 1.5
+!ent set_var hero cursed 1
+!healing step add potency side=giver "step_scale(entity[healing_giver].potency)"
+!healing step add curse side=receiver "if entity[self].cursed:\n    step_scale(0.5)"
+!healing
+?? - `potency` (giver)
+?? - `curse` (receiver)
+!ent set_var cleric actions.mend.target entity
+!ent set_var cleric actions.mend.body "heal(target, 20, tags=['holy'])"
+!healing explain cleric hero 20
+?? Raw (giver steps): hp 30
+?? Taken (receiver steps, rounded): hp 15
+!action cleric mend hero
+!assert "entity[hero].hp == 45"
+!assert "get(last_healing('hero'), 'healing_giver') == 'cleric' and get(last_healing('hero'), 'healing_received') == {'hp': 15}"
+!assert "get(last_healing('cleric', 'given'), 'healing_receiver') == 'hero'"
+!ent heal hero 20
+?? `hero` receives 10 healing.
+!assert "entity[hero].hp == 55"
+!ent heal hero 200 from=cleric
+!assert "entity[hero].hp == 100"
+!healing last hero
+?? the vars moved by: hp 45
+!eval "last_healing('hero', 'taken')"
+?? ❌
+!ent set_var hero cursed 0
+!ent damage hero 10
+!assert "entity[hero].hp == 90 and get(last_healing('hero'), 'healing_received') == {'hp': 150}"
+
+Expected: Healing runs its own steps: the cleric's potency (a giver step,
+`healing_giver` bound) scales 20 to 30, the hero's curse (a receiver
+step) halves it: 15 (30 → 45), recorded on both. `!ent heal` without a
+giver skips the giver steps: 20 halved to 10 (55). A 200 heal from the
+cleric is 150 after the steps, and the soft clamp stops hp at max_hp:
+the record keeps 150 received and 45 moved. `which` is `received` or
+`given` for healing. Damage packets don't touch the healing record.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1127 — Damage steps as a system library: copied, synced, promoted, inherited, kept (#25)
+-----------------------------------------------------------------------------------------------
+
+!system new base
+!system new kid parent=base
+!system damage add base halve "step_scale(0.5)"
+!system damage add kid flat side=attacker "step_add(2)"
+!system damage list kid
+?? - `flat` (attacker)
+?? - `halve` (defender) (inherited)
+!match new k1 K1 8 8 system=kid
+!match use k1
+!ent add a A 40 1 1 5
+!ent add t T 100 3 1 3
+!ent damage t 10 from=a
+!assert "entity[t].hp == 94"
+!system damage add base extra "step_add(1)"
+!ent damage t 10 from=a
+!assert "entity[t].hp == 88"
+!match sync damage diff
+?? would add `extra`
+!match sync damage
+!ent damage t 10 from=a
+!assert "entity[t].hp == 81"
+!damage step edit extra "step_add(3)"
+!system damage promote kid extra
+!system damage info kid extra
+?? step_add(3)
+!system damage remove kid halve
+!system damage list kid
+?? Hidden here: `halve`
+!system damage info base halve
+?? step_scale(0.5)
+!as restart
+!match use k1
+!damage
+?? - `extra` (defender)
+!undo command 2 confirm
+!assert "entity[t].hp == 88"
+!system lint kid
+?? all clean
+
+Expected: `!system damage` edits a system's steps; a child inherits its
+parent's (`(inherited)`). A new match copies the steps of its system
+chain: flat +2 then halve: 12 × 0.5 = 6 (94). A later system edit
+reaches only new matches until `!match sync damage` (88 before the
+sync, 81 after: 6 + 1). A match edit can be promoted into the system.
+Removing an inherited step on the child hides it there. The steps are
+saved with the match (after a restart), and undoing the last two
+commands takes back the step edit and the last packet (88). `!system
+lint` reads the step formulas too.
+
+
+SCENARIO 1128 — Damage pipeline edges: a failing step, $() refusal, indestructible, dead, one death check (#25)
+-----------------------------------------------------------------------------------------------------------
+
+!match new dp DP 8 8
+!match use dp
+!ent add a A 40 1 1 5
+!ent add t T 30 3 1 3
+!ent set_var t stamina 5
+!ent set_var t death_note 0
+!damage step add broken "step_scale('x')"
+!damage step add halve "step_scale(0.5)"
+!ent damage t 10
+?? ⚠️ damage step `broken` failed and was skipped: step_scale: step_scale(factor) is a number, got 'x'.
+!assert "entity[t].hp == 25"
+!eval "step_scale(2)"
+?? only inside a damage or healing step
+!ent set_var a note "$(deal_damage('t', 5))"
+?? deal_damage
+!assert "entity[t].hp == 25"
+!damage step remove broken
+!ent set_var t indestructible true
+!ent damage t 100
+!assert "entity[t].hp == 25"
+!ent set_var t indestructible false
+!gpassive add deaths on_death "entity['a'].deaths = entity['a'].deaths + 1"
+!ent set_var a deaths 0
+!eval "deal_damage('t', [{'amount': 60}, {'amount': 20, 'pool': 'stamina'}])"
+!assert "entity[a].deaths == 1"
+!ent damage t 5
+?? ❌
+!eval "deal_damage('nobody', 5)"
+?? ❌
+!damage step add bad "while True:\n    x = 1"
+?? ❌ step formula
+!damage step add halve "step_scale(1)"
+?? exists
+!damage step move halve before=nothing
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: A step whose formula errors is skipped with a ⚠️ and the packet
+goes on (10 halved to 5: 25). The step_ helpers refuse outside a step.
+`deal_damage` changes the match, so `$()` refuses it and nothing
+changes. An indestructible unit is hit (its steps run) but its hp isn't
+written. A packet lowering hp and stamina at once checks the unit's
+death once, after both writes: one on_death. A dead (gone) unit and a
+missing one are refused; a broken formula, a duplicate step name and an
+unknown `before=` step are refused.
+
+
+SCENARIO 1129 — The damage forecast changes nothing: writes, rolls and records (#25)
+------------------------------------------------------------------------------------
+
+!match new dp DP 8 8
+!match use dp
+!match rng set seed1 0
+!ent add a A 40 1 1 5
+!ent add t T 100 3 1 3
+!ent set_var t blocks 2
+!damage step add block "if entity[self].blocks > 0:\n    entity[self].blocks = entity[self].blocks - 1\n    step_reduce(roll('1d6') + 100)"
+!eval "damage_forecast('t', 10)"
+?? {'damage_raw': {'hp': 10}, 'damage_taken': {'hp': 0}}
+!assert "entity[t].blocks == 2 and entity[t].hp == 100 and last_damage('t') == None"
+!eval "match.r1 = roll('1d1000000')"
+!match rng set seed1 0
+!eval "damage_forecast('t', 10)"
+!eval "match.r2 = roll('1d1000000')"
+!assert "match.r1 == match.r2"
+!ent damage t 10
+!assert "entity[t].blocks == 1 and entity[t].hp == 100"
+!ent damage t 10
+!ent damage t 10
+!assert "entity[t].blocks == 0 and entity[t].hp == 90"
+!damage explain a t 10
+?? 1. `block` [not true_damage]: 10 → 10
+!assert "entity[t].hp == 90"
+
+Expected: The block step spends a block (a var write) and rolls dice.
+`damage_forecast` runs it and puts the match back: the blocks, hp and
+records are as before, and the RNG with them (a roll after a forecast
+equals the roll from the same position without one). The real packets spend the
+two blocks (100 → 100 → 100), and the third hits (90). `!damage explain`
+is a forecast too: nothing changes.
+HARNESS-ALLOWS-ERRORS

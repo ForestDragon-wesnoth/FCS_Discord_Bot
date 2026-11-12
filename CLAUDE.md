@@ -410,6 +410,9 @@ back, load the schema with `ToolSearch` before calling
   (eligibility), `react_pick` / `react_pass` / `react_skip`, `resolve`
   (before halves, re-read, body, after window, after halves),
   `IncomingProxy`, `reactions_used`, `settle_expiry`.
+- **`damage.py`**: the damage pipeline (#25, §7.24): `run_packet`
+  (steps in two phases, pool totals, writes, records, forecast), the
+  step libraries' order helpers, `ComponentProxy`, the `step_` helpers.
 - **`completion.py`**: Tab completion for a typed line, shared by gui.py and
   cli.py (readline). It walks the typed words through the command's usage
   strings (`_usage_tails` / `_usage_tokens`, the stray-word check's
@@ -441,7 +444,7 @@ back, load the schema with `ToolSearch` before calling
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/damage_reactions_design.md`**: the design of reactions (#36,
   agreed, built but for its §13 list, §7.23) and the damage pipeline (#25,
-  agreed in §10, not built yet), which meet at `incoming`. Read it whole before touching
+  agreed in §10, part 1 built, §7.24), which meet at `incoming`. Read it whole before touching
   either.
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
@@ -3980,6 +3983,62 @@ lists what isn't built; 1093-1122).
 - **`reactions_used(eid, since='own_turn', tag=None)`** (ARG_SAFE):
   own_turn / round (refused under ATB) / turn / action (`reaction_seq`) /
   ever.
+
+### 7.24 The damage pipeline
+
+#25 (`damage.py`, design `docs/damage_reactions_design.md` §10; part 1
+built: packets, steps, writes, commands; 1123-1129).
+- **Packets** (`damage.run_packet(m, kind, target, damage, pool=, tags=,
+  packet_tags=, dealer=, source=, forecast=, trace=)`, kind `damage` or
+  `healing`, `KINDS` holds every per-kind name): components `{amount,
+  pool, tags}` (`build_components`; a number makes one; a pool is a var
+  path or `@<var rule>`, default the `*_default_pool` rule). A
+  component's filter tags are its tags, the packet's and `pool:<var>`
+  (`filter_tags`; `pool:` is a reserved prefix no tag may take,
+  `check_component_tag`).
+- **Steps** (`Match.damage_steps` / `healing_steps`, name -> `{side,
+  formula, filter?, description?, order}`, `normalize_step`; system
+  libraries in SYSTEM_LIBRARIES, copied into new matches, `!match sync
+  damage|healing`): two phases, the first side's steps (attacker / giver)
+  then the second's (defender / receiver), each by `order` then name
+  (`ordered_steps`; `place_order` / `renumber` keep orders 10, 20, ...).
+  A step runs on the components its filter matches (none: the
+  `*_step_default_filter` rule, `not true_damage` / `not true_healing`);
+  a first-side step is skipped when the packet has no dealer. Formulas
+  run in ACTION MODE (`c.amount = ...` on `ComponentProxy`), extras
+  `attacker` / `defender` (healing: `healing_giver` / `healing_receiver`;
+  `healer` would have made a common unit id unusable), `*_source`,
+  `*_tags`, `components` (matched, editable), `*_components` (all,
+  read-only); `self` = the step's side's unit. The `step_` helpers
+  (`damage.step_*`, bound in formula.py) read `STEP_FRAME` and refuse
+  outside a step; `step_reduce` takes n off the matched components as a
+  whole. A step that errors is skipped with a ⚠️, its component edits
+  undone (its match writes stay, as a failed passive's).
+- **Writes** (`_write_pools`): per pool the sum, floored by
+  `*_component_floor` (number or `none`), rounded once by `*_rounding`
+  (`pool_totals`); a pool the unit lacks is dropped; each pool written
+  once through write_var with the unit's death check deferred
+  (`_death_check_deferred_ids`) to one check after the last; an
+  indestructible unit's hp var isn't written. Records: `Match.
+  damage_records[eid]` (`damage_taken` / `damage_dealt` / `healing_received`
+  / `healing_given`, `packet_record`), saved, undo state, dropped in
+  `Entity.remove`.
+- **Forecast**: steps run, then `_rollback_match`, history rewind and the
+  RNG position put back; no writes, no records.
+- **Defaults** (formula.py `_packet_defaults`): a status tick (`status:<n>`),
+  a zone hook, a tile hook, else `action.ACTION_ORIGIN` (set by run_action
+  around its programs: the actor and `action:<path>`; a reaction's half is
+  its own action, so the reacting unit).
+- **Surface**: `deal_damage`, `heal`, `damage_forecast`,
+  `healing_forecast` (mutating), `last_damage(eid, taken|dealt)`,
+  `last_healing(eid, received|given)` (read), `step_*` (mutating);
+  `!ent damage` / `!ent heal` (`_ent_packet`), `!damage` / `!healing`
+  (`!heal` is a common alias name; `_packet_root`: `step add | edit |
+  move | rename | remove | list | info`, `explain` and `last` host-only
+  reads), `!system damage|healing` (`_system_steps`). `!ent hp` stays a
+  silent write. Not built yet (design §10.5, §10.7, §10.1's incoming and
+  dice): body-part shares, break-on-damage statuses, damage lines, hooks,
+  kill credit, packet event-log entries, the forecast feeding `incoming`.
 
 ## 8. Open questions, planned work, deferred and rejected ideas
 

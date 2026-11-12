@@ -9449,10 +9449,10 @@ class FormulaEngine:
             import damage as _damage
             eid, _e = _resolve_entity(eid_t, fname)
             info = _damage.kind_info(kind)
-            keys = {"taken": info["rec_target"],
-                    "received": info["rec_target"],
-                    "dealt": info["rec_dealer"],
-                    "given": info["rec_dealer"]}
+            keys = ({"taken": info["rec_target"],
+                     "dealt": info["rec_dealer"]} if kind == "damage"
+                    else {"received": info["rec_target"],
+                          "given": info["rec_dealer"]})
             if which not in keys:
                 raise FormulaError(
                     f"{fname}(eid, which): which is "

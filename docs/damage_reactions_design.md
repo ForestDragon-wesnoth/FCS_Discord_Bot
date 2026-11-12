@@ -322,8 +322,10 @@ target"):
 
 ## 10. The damage pipeline (#25)
 
-Agreed with the user question by question, in chat; not built yet. The
-engine runs a packet of damage through the system's ordered steps and
+Agreed with the user question by question, in chat. Part 1 is built
+(`damage.py`, CLAUDE.md §7.24): packets, steps, the writes, the
+forecast, the records and the commands; §10.5, §10.7 and §10.1's
+`incoming` and dice rewind are next. The engine runs a packet of damage through the system's ordered steps and
 writes the result; healing runs through its own twin pipeline. The first
 four points were settled while designing reactions, the rest after.
 
@@ -377,8 +379,9 @@ four points were settled while designing reactions, the rest after.
 
 - **Two ordered lists per system**, `damage_steps` and `healing_steps`, a
   system library like status definitions (user call): copied into each new
-  match, the match edits its own copy (`!damage step ...`, `!heal step
-  ...`), the system its own (`!system damage ...`, `!system heal ...`),
+  match, the match edits its own copy (`!damage step ...`, `!healing step
+  ...`; `!heal` is a common alias name, which a command would forbid),
+  the system its own (`!system damage ...`, `!system healing ...`),
   and `!match sync damage` / `sync healing` copies a system's list over a
   live match's.
 - **Per-unit effects come in as data the steps read** (user call): the
@@ -405,6 +408,10 @@ four points were settled while designing reactions, the rest after.
   components its filter matched; with none matched it is skipped.
 - **A step whose formula errors** is skipped with a ⚠️ naming the error,
   and the packet goes on (user call).
+- **Healing steps** have the sides `giver` / `receiver` and bind
+  `healing_giver` / `healing_receiver`, `healing_source`, `healing_tags`,
+  `healing_components` (as built: a `healer` binding would forbid that
+  unit id).
 - **Bindings:** `self` (the step's side's unit), `attacker`, `defender`
   (`attacker` may be None: a lava tile), `damage_source`, `damage_tags`
   (the packet's), `components` (the matched ones, editable: `amount`,
@@ -427,8 +434,9 @@ four points were settled while designing reactions, the rest after.
   | `step_total()` | the matched components' sum |
 
 - **Examples** (the scenarios use these):
-  - Solis armor: `a = entity[self].armor`, halved when hard and the hit
-    is `blunt`, then `step_reduce(a)` (filter `pool:hp`).
+  - Solis armor: `a = entity[self].armor`, halved when hard and a
+    component is `blunt` (`for c in components: if 'blunt' in c.tags`),
+    then `step_reduce(a)` (filter `pool:hp`).
   - Fire Arrow (attacker, filter `fire_arrow`): `step_new(step_total() *
     0.25, tags=['fire'])`.
   - Strength / Vulnerable: `step_mods('damage_dealt')` (attacker),
@@ -515,7 +523,7 @@ four points were settled while designing reactions, the rest after.
 - **Commands:** `!ent damage <id> <amount> [pool=<var>] [tags=a,b]
   [packet_tags=...] [from=<unit>] [quiet]` and `!ent heal ...`, gated
   like other `!ent` changes; `!damage explain`, `!damage last` and their
-  `!heal` twins (§10.8).
+  `!healing` twins (§10.8).
 - **`last_damage(eid)`** reads the unit's last packet taken and last
   packet dealt: saved with the match and restored by undo, so a replay or
   a reload reads the same (user call). Healing twin `last_healing`.
@@ -566,9 +574,9 @@ the above.
   filter, the components before and after, steps skipped (no match, an
   error) and the writes, rounding included. It names steps and filters,
   never formula text. Host-only (it reads both units' state), like `!ent
-  dump`. `!heal explain` twin.
+  dump`. `!healing explain` twin.
 - **`!damage last <unit>`**: the same table for the last packet the unit
-  actually took, from the saved record. `!heal last` twin.
+  actually took, from the saved record. `!healing last` twin.
 
 ## 11. Details found open while writing this file
 
