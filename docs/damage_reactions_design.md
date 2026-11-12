@@ -606,10 +606,12 @@ the above.
   its own steps; the share is worked out before the part's writes (a bad
   knob refuses the hit), sent after them with the packet tag
   `part_share`, and the part's destruction comes after the hooks. The part's hp stops at 0, and a destroyed part still
-  passes hits on while its body lives. The heal percent follows: the
-  part's `heal_to_main_percent`, else its `damage_to_main_percent`, else
-  the heal rule (`same` = the damage rule). A dict percent with no
-  `default` key falls back on the rule. The share rounds by
+  passes hits on while its body lives. The heal percent is the part's
+  `heal_to_main_percent`, else the heal rule when it is a number, else
+  what damage uses (the part's `damage_to_main_percent`, else the damage
+  rule): an explicit heal percent wins over following the damage one
+  (user call). A dict percent with no `default` key falls back on the
+  rule (for healing the heal rule when it is a number). The share rounds by
   damage_rounding (half of 5 is 2 by default; rounding_mode now applies
   to transforms only). `damage_part` and `damage_spread` are packets.
 - **Forecasts in `prepare`:** several on one target add up per pool; a

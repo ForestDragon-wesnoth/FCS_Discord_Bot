@@ -4055,10 +4055,12 @@ in full: 1123-1139).
 - **Body parts** (design §10.5): a packet on a part (also `damage_part`,
   `damage_spread`, which route through it) plans the share BEFORE writing
   (`_plan_share`, so a bad knob refuses the hit): per component above 0,
-  the part's `damage_to_main_percent` (`heal_to_main_percent`, falling
-  back on the damage var; a number or a dict of tag filter -> percent with
-  `default`) else `part_damage_to_main_percent_default` /
-  `part_heal_to_main_percent_default` (`same` = follow the damage one),
+  the part's `damage_to_main_percent` var (a number or a dict of tag
+  filter -> percent with `default`) else
+  `part_damage_to_main_percent_default`; healing: the part's
+  `heal_to_main_percent`, else `part_heal_to_main_percent_default` when
+  it is a number, else the damage lookup (`same`; an explicit heal
+  percent wins, user call),
   the damage share capped as a whole by `to_main_cap` from the part's hp
   before the hit; tagged `true_damage` / `true_healing` under
   `part_*_share_mode` `true`. The part's hp stops at 0; then the share

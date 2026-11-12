@@ -624,27 +624,33 @@ def _num(v: Any, default: float = 0) -> float:
 
 def _share_percent(m: Any, kind: str, part: Any, comp: Dict[str, Any],
                    packet_tags: List[str]) -> float:
-    """The percent of component `comp` a body part sends to its parent:
-    the part's `<kind>_to_main_percent` var (a heal falls back on the
-    damage var), else the rule; a var may be a number or a dict of tag
-    filter -> percent with a `default`."""
+    """The percent of component `comp` a body part sends to its parent.
+    Damage: the part's `damage_to_main_percent` var, else the
+    part_damage_to_main_percent_default rule. Healing: the part's
+    `heal_to_main_percent` var, else the part_heal_to_main_percent_default
+    rule when it is a number, else what damage would use (the part's
+    damage var, else the damage rule): an explicit heal percent wins over
+    following the damage one (user call). A var may be a number or a dict
+    of tag filter -> percent with a `default`."""
+    def part_var(name: str) -> Any:
+        found, v = _dict_path_get(part.vars, name)
+        return v if found and v is not None else None
+
+    damage_rule = m.rules.get("part_damage_to_main_percent_default", 0)
+    raw, var, rule = None, None, damage_rule
     if kind == "healing":
-        names = ["heal_to_main_percent", "damage_to_main_percent"]
-    else:
-        names = ["damage_to_main_percent"]
-    raw = None
-    for n in names:
-        found, v = _dict_path_get(part.vars, n)
-        if found and v is not None:
-            raw, var = v, n
-            break
-    rule = m.rules.get("part_damage_to_main_percent_default", 0)
-    if kind == "healing":
+        raw = part_var("heal_to_main_percent")
+        var = "heal_to_main_percent" if raw is not None else None
         hr = str(m.rules.get("part_heal_to_main_percent_default", "same"))
-        if raw is None and hr.strip().lower() != "same":
+        if hr.strip().lower() != "same":
             rule = hr
+            if raw is None:
+                raw = hr
     if raw is None:
-        raw, var = rule, None
+        raw = part_var("damage_to_main_percent")
+        var = "damage_to_main_percent" if raw is not None else None
+    if raw is None:
+        raw = rule
     if isinstance(raw, dict):
         pick = None
         tags = filter_tags(comp, packet_tags)

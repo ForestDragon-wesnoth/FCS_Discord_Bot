@@ -1737,11 +1737,12 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Default % of the healing a body part receives that also heals "
             "its parent (a stimpack on a limb heals the body a little). "
             "`same` (default) = follow the damage percent "
-            "(damage_to_main_percent, part_damage_to_main_percent_default), "
-            "else a number. Per-part override: the `heal_to_main_percent` "
-            "var (number or filter dict as for damage); a part without it "
-            "follows its damage_to_main_percent var. The share stops at "
-            "the parent's max hp through its clamp."
+            "(the part's damage_to_main_percent, else "
+            "part_damage_to_main_percent_default), else a number, which "
+            "wins over following the damage percent. Per-part override: "
+            "the `heal_to_main_percent` var (number or filter dict as for "
+            "damage), which wins over this rule. The share stops at the "
+            "parent's max hp through its clamp."
         ),
     },
     "part_damage_share_mode": {

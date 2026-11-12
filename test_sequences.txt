@@ -40560,9 +40560,16 @@ SCENARIO 1135 — Body-part shares: per-tag percents, heal shares, share modes, 
 !ent heal arm 6
 ?? 💚 **Boss** (`boss`) receives 3 healing.
 !assert "entity[boss].hp == 47 and entity[arm].hp == 18"
+!system set default part_heal_to_main_percent_default 25
+!ent hp arm 10
+!ent heal arm 8
+?? 💚 **Boss** (`boss`) receives 2 healing.
+!assert "entity[boss].hp == 49 and entity[arm].hp == 18"
 !ent set_var arm heal_to_main_percent 0
 !ent heal arm 2
-!assert "entity[boss].hp == 47 and entity[arm].hp == 20"
+!assert "entity[boss].hp == 49 and entity[arm].hp == 20"
+!system set default part_heal_to_main_percent_default same
+!ent hp boss 47
 !damage step add armor side=defender "step_reduce(1)"
 !ent damage arm 5
 !assert "entity[arm].hp == 16 and entity[boss].hp == 45"
@@ -40590,7 +40597,9 @@ the first `damage_to_main_percent` filter matching its tags (fire 100%)
 else `default` (50%): 4 + 2 = 6 (boss 50 → 44). The share's components
 carry `true_damage` (part_damage_share_mode `true`) and its packet the
 tag `part_share`. A heal on the part heals the body by the damage percent
-when no heal percent is set (3); `heal_to_main_percent 0` stops it. With
+when no heal percent is set (3); a heal rule set to a number (25) wins
+over following the arm's damage percent (8 healing: 2 to the body), and
+the arm's own `heal_to_main_percent 0` wins over the rule. With
 a defender armor step taking 1: in `true` mode the share skips it (arm
 takes 4, the body 2), in `pipeline` mode the share pays it too (the body
 takes 1). `to_main_cap remaining_hp` caps the share's base at the arm's
