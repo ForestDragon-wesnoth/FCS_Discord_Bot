@@ -189,7 +189,19 @@ STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
 # The causes the on_status_removed bindings and a definition's on_removed
 # hook read as `removed_by`.
 STATUS_REMOVAL_CAUSES = ("expired", "dispel", "transfer", "removes",
-                         "zone", "transform", "removed")
+                         "zone", "transform", "damage", "removed")
+# Statuses that break on damage (#235, #25): a status (instance key, else
+# its definition at its level) with `removed_on_damage` true goes when its
+# bearer takes damage (removed_by `damage`); one with `break_at_damage: N`
+# counts the damage taken in the instance's `damage_counted` and goes
+# once it reaches N. `damage_filter` (a tag filter on the components'
+# filter tags) narrows what counts for both.
+STATUS_DAMAGE_FIELDS = ("removed_on_damage", "break_at_damage",
+                        "damage_filter")
+STATUS_DAMAGE_COUNT_KEY = "damage_counted"
+# Who applied a status (#227's `source=`, status_source): a unit id in the
+# instance, scrubbed when that unit leaves the match.
+STATUS_SOURCE_KEY = "__source"
 # Transforms and statuses: a status that arrived with a form records the
 # stash path of that transform here, so reverting it takes the status back;
 # a stash records the flavor of the transform that made it (`merge` for
@@ -1042,7 +1054,7 @@ def rotate_direction(facing: str, *, clockwise: bool, eight_way: bool) -> str:
 # type via the event_log_format rule (a dict, edited with `!log format`).
 EVENT_LOG_AUTO_TYPES: Tuple[str, ...] = (
     "death", "revive", "spawn", "move",
-    "damage", "heal", "status_added", "status_removed",
+    "damage", "healing", "hp_change", "status_added", "status_removed",
     "action_used", "action_failed", "say",
 )
 
@@ -1056,8 +1068,9 @@ EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
     "revive":         "✨ {name} (`{entity}`) was revived.",
     "spawn":          "➕ {name} (`{entity}`) spawned at ({x},{y}).",
     "move":           "👣 {name} (`{entity}`) moved ({from_x},{from_y})→({to_x},{to_y}).",
-    "damage":         "🩸 {name} (`{entity}`) took {amount} damage ({var} {old}→{new}).",
-    "heal":           "💚 {name} (`{entity}`) healed {amount} ({var} {old}→{new}).",
+    "damage":         "🩸 {name} (`{entity}`) took {amounts}{?attacker?} from {attacker_name}{/?}.",
+    "healing":        "💚 {name} (`{entity}`) received {amounts}{?giver?} from {giver_name}{/?}.",
+    "hp_change":      "❤️ {name} (`{entity}`) {var} {old}→{new}.",
     "status_added":   "🔆 {name} (`{entity}`) gained status `{status}`.",
     "status_removed": "🔅 {name} (`{entity}`) lost status `{status}`.",
     "action_used":    "⚔️ {actor_name} (`{actor}`) used `{action}`{?target?} → {target}{/?}.",
@@ -1143,6 +1156,14 @@ class VarReader:
 
 VAR_READER: "contextvars.ContextVar[Optional[VarReader]]" = (
     contextvars.ContextVar("vtt_var_reader", default=None))
+# The damage pipeline (#25, damage.py): (match id, unit id) while a packet
+# writes that unit's pools, so its hp write logs no hp_change entry (the
+# packet logs its own); and (match id, target id, dealer id) around the
+# packet's death check, so on_death binds `killer`.
+PACKET_WRITE: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
+    contextvars.ContextVar("vtt_packet_write", default=None))
+PACKET_KILLER: "contextvars.ContextVar[Optional[Tuple[str, str, Optional[str]]]]" = (
+    contextvars.ContextVar("vtt_packet_killer", default=None))
 # One top-level command's memo of which units hold anything private
 # (privacy_applies), per match: a `!foreach` of `$()` reads scans each unit
 # once, not once per line (X21). write_var / remove_var drop the written
@@ -1423,8 +1444,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
                    "choices": ["half_up", "half_even", "floor", "ceil"]},
         "desc": (
             "How the engine rounds a computed amount to a whole number: "
-            "damage_part's to-main share (part damage x to_main_percent) and "
-            "transform's `percent` hp. `half_up` (default): .5 rounds away "
+            "transform's `percent` hp (a damage packet, a body part's share "
+            "included, rounds by damage_rounding). `half_up` (default): .5 rounds away "
             "from zero (50% of 5 -> 3). `half_even`: .5 rounds to the even "
             "number (50% of 5 -> 2, of 7 -> 4; Python's round()). `floor` / "
             "`ceil`: always down / up. The formula round() function is "
@@ -1691,17 +1712,55 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     # --- Locational damage: damage_part routing knobs (per-part vars of
     #     the same name override these system defaults) ---
-    "part_to_main_percent_default": {
+    "part_damage_to_main_percent_default": {
         "default": 0,
         "schema": {"type": "number"},
         "desc": (
-            "Default % of a hit on a body part that is ALSO dealt to the "
-            "parent's main HP (the Helldivers-2 'damage to main' tap). "
-            "Per-part override: the `to_main_percent` var (doc values: head "
-            "150, chest 100, stomach 70, limb 30). 0 = a hit on the part "
-            "stays on the part. Applied by damage_part, never by a raw HP "
-            "write."
+            "Default % of the damage a body part takes that is ALSO dealt to "
+            "its parent (the Helldivers-2 'damage to main' tap): a damage "
+            "packet on a part (deal_damage, damage_part, damage_spread, "
+            "`!ent damage`) runs the part's steps and writes, then sends "
+            "this share of each component to the parent as a packet of its "
+            "own (part_damage_share_mode). Per-part override: the "
+            "`damage_to_main_percent` var, a number (doc values: head 150, "
+            "chest 100, stomach 70, limb 30) or a dict of tag filter -> "
+            "percent (`{fire: 100, default: 50}`: each component takes the "
+            "first filter matching its tags, else `default`, else this "
+            "rule). 0 = a hit on the part stays on the part. A raw hp write "
+            "never taps through."
         ),
+    },
+    "part_heal_to_main_percent_default": {
+        "default": "same",
+        "schema": {"type": "str"},
+        "desc": (
+            "Default % of the healing a body part receives that also heals "
+            "its parent (a stimpack on a limb heals the body a little). "
+            "`same` (default) = follow the damage percent "
+            "(the part's damage_to_main_percent, else "
+            "part_damage_to_main_percent_default), else a number, which "
+            "wins over following the damage percent. Per-part override: "
+            "the `heal_to_main_percent` var (number or filter dict as for "
+            "damage), which wins over this rule. The share stops at the "
+            "parent's max hp through its clamp."
+        ),
+    },
+    "part_damage_share_mode": {
+        "default": "true",
+        "schema": {"type": "enum", "choices": ["true", "pipeline"]},
+        "desc": (
+            "How a body part's share reaches its parent: `true` (default) "
+            "tags each share component `true_damage`, so the parent's steps "
+            "with the default filter skip it (a step written for true "
+            "damage, a shield soaking everything, still sees it); "
+            "`pipeline` sends it as it is, through the parent's steps. The "
+            "share packet carries the hit's packet tags plus `part_share`."
+        ),
+    },
+    "part_heal_share_mode": {
+        "default": "true",
+        "schema": {"type": "enum", "choices": ["true", "pipeline"]},
+        "desc": "How a body part's healing share reaches its parent; as part_damage_share_mode, with `true_healing`.",
     },
     "part_to_main_cap_default": {
         "default": "max_hp",
@@ -5041,6 +5100,44 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": "The least a pool's healing can come to; as damage_component_floor.",
     },
+    "damage_message_format": {
+        "default": "🩸 **{name}** (`{id}`) takes {amounts}{?attacker?} from {attacker}{/?}.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line a damage packet prints (deal_damage, `!ent damage`) "
+            "unless it is quiet. Placeholders: the unit's ({name}, {id}, "
+            "{x}, {y}, {team}, {round}, any var by name or dotted path), "
+            "{amounts} (`18 damage and 5 stamina damage`), "
+            "{damage_taken.<pool>} (what the steps decided), "
+            "{damage_lost.<pool>} (what the var moved: 20 taken on 5 hp is "
+            "lost 5), {components} (`12 slash, 5 fire`), {attacker} (its "
+            "name as the channel's view sees it; empty without one) and "
+            "{source}; `{?key?}...{/?}` shows its text only when key isn't "
+            "empty. Hidden from a channel whose view can't see the unit. "
+            "Empty = no line."
+        ),
+    },
+    "healing_message_format": {
+        "default": "💚 **{name}** (`{id}`) receives {amounts}{?healing_giver?} from {healing_giver}{/?}.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line a healing packet prints (heal, `!ent heal`) unless it "
+            "is quiet; as damage_message_format, with {healing_received.<pool>}, "
+            "{healing_gained.<pool>} and {healing_giver}."
+        ),
+    },
+    "damage_hook_recursion_limit": {
+        "default": 16,
+        "schema": {"type": "int", "min": 1, "max": 64, "ceiling": True},
+        "desc": (
+            "How deep packets dealt from damage / healing hooks may nest "
+            "(on_damage_taken thorns hitting a unit whose on_damage_taken "
+            "hits back): past it, packets still apply but fire no "
+            "on_damage_* / on_healing_* hooks, with one warning. Tag the "
+            "returned damage (`thorns`) and skip packets carrying it to "
+            "stop a loop at once."
+        ),
+    },
     "reaction_window_expiry_seconds": {
         "default": -1,
         "schema": {"type": "int", "min": 1, "unlimited": True},
@@ -6238,6 +6335,20 @@ def _check_component_floor(key: str, raw: str) -> str:
     return raw.strip()
 
 
+def _check_heal_share_rule(key: str, raw: str) -> str:
+    v = raw.strip().lower()
+    if v == "same":
+        return v
+    try:
+        f = float(v)
+    except ValueError:
+        raise VTTError(f"Setting '{key}' is a number or `same` (follow the "
+                       f"damage percent), not `{raw}`.")
+    if not math.isfinite(f):
+        raise VTTError(f"Setting '{key}' is a finite number or `same`.")
+    return raw.strip()
+
+
 def _check_filter_rule(key: str, raw: str) -> str:
     v = raw.strip()
     if v:
@@ -6261,6 +6372,7 @@ _FORMAT_RULE_CHECKS = {
     "healing_default_pool": _check_pool_rule,
     "damage_component_floor": _check_component_floor,
     "healing_component_floor": _check_component_floor,
+    "part_heal_to_main_percent_default": _check_heal_share_rule,
     "damage_step_default_filter": _check_filter_rule,
     "healing_step_default_filter": _check_filter_rule,
 }
@@ -7128,6 +7240,19 @@ HOOK_NAMES: Set[str] = {
     # "trap counters attacker", "this entity has resistance to
     # actions whose action_path starts with `inventory.poison.`".
     "on_action_used_on_target",
+    # The damage pipeline (#25, damage.py): after a damage packet's writes
+    # and its line, BEFORE its death check (a hook that heals the defender
+    # saves it), on_damage_taken fires on the defender, then
+    # on_damage_dealt on the attacker
+    # (none without one); healing packets fire on_healing_received /
+    # on_healing_given. Bindings: attacker / defender (healing_giver /
+    # healing_receiver), damage_source, damage_tags (the packet's),
+    # damage_taken / damage_lost (per pool: what the steps decided, what
+    # the var moved), damage_components (dicts); healing_source,
+    # healing_tags, healing_received, healing_gained, healing_components.
+    # They fire on a hit that came to 0 too; damage_hook_recursion_limit.
+    "on_damage_taken", "on_damage_dealt",
+    "on_healing_received", "on_healing_given",
     # Failure event. Fires on the ACTOR after a clean fail() abort —
     # AFTER the runner has rolled back to pre-state, so passives see
     # the unchanged world (matching on_action_used's "see settled
@@ -7945,10 +8070,32 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str,
     passive can't cripple the whole hook fire.
     """
     m = getattr(engine, "_match", None)
-    return hook_output(m, *_run_passive_line(engine, p, ctx,
-                                             target_id=target_id,
-                                             is_global=is_global,
-                                             label=label))
+    tag = _hook_line_tag(m, target_id)
+    lines = hook_output(m, *_run_passive_line(engine, p, ctx,
+                                              target_id=target_id,
+                                              is_global=is_global,
+                                              label=label))
+    return Match.tag_lines(tag or _hook_line_tag(m, target_id), lines)
+
+
+def _hook_line_tag(m: Any, eid: str) -> str:
+    """The unit tag for a hook's `fired on <eid>` line: the unit where it
+    stands, else its corpse's cell, else "" (a channel whose view can't
+    see the unit drops the tagged line, as a death line)."""
+    if m is None or not eid:
+        return ""
+    tag = m.unit_tag(eid)
+    if tag:
+        return tag
+    try:
+        found = m.find_corpse(eid)
+    except Exception:
+        found = None
+    if not found:
+        return ""
+    x, y, mp = found[0], found[1], found[3]
+    mname = getattr(mp, "name", mp) or ""
+    return f"{UNIT_LINE_TAG}{m.id}|{eid}|{x}|{y}|{mname}{UNIT_LINE_TAG}"
 
 
 def _run_passive_line(engine, p: "Passive", ctx, *, target_id: str,
@@ -8652,11 +8799,19 @@ def without_zone_grants(status: Any) -> Any:
     """A unit dict's `status` without the statuses a zone holds (a lingering
     one stays: it is the unit's own now). Library saves and snapshots leave
     them out: the zone holds them, and it gives them back where it covers
-    the unit."""
+    the unit. The rest lose who applied them (STATUS_SOURCE_KEY, #227): a
+    unit id that means nothing to the unit made from the dict."""
     if not isinstance(status, dict):
         return status
-    return {k: v for k, v in status.items()
-            if not (isinstance(v, dict) and ZONE_GRANT_KEY in v)}
+    out = {}
+    for k, v in status.items():
+        if isinstance(v, dict):
+            if ZONE_GRANT_KEY in v:
+                continue
+            if STATUS_SOURCE_KEY in v:
+                v = {a: b for a, b in v.items() if a != STATUS_SOURCE_KEY}
+        out[k] = v
+    return out
 
 
 def _dict_path_get(d: Any, path: str) -> Tuple[bool, Any]:
@@ -9981,6 +10136,14 @@ class Entity:
         # Its damage records go with it (a later unit under the id starts
         # with none).
         m.damage_records.pop(self.id, None)
+        # The statuses it applied forget it (#227): a later unit under the
+        # id didn't apply them.
+        for o in m.entities.values():
+            for inst in (o.status or {}).values():
+                if isinstance(inst, dict) and \
+                        inst.get(STATUS_SOURCE_KEY) == self.id:
+                    del inst[STATUS_SOURCE_KEY]
+                    o.mark_changed()
         # scrub from turn order & clamp active index
         if self.id in m.turn_order:
             idx = m.turn_order.index(self.id)
@@ -10658,10 +10821,11 @@ class Entity:
         if is_top_level_write and self._match is not None and self._match._var_event_warnings:
             combined.extend(self._match._var_event_warnings)
             self._match._var_event_warnings = []
-        # Damage / heal event logging. A top-level NUMERIC change to the
-        # hp var becomes a damage (decrease) or heal (increase) event —
-        # logged before the death check so a fatal blow reads
-        # "damage ... then death" in the log. Only 'changed' events count
+        # hp_change event logging. A top-level NUMERIC change to the
+        # hp var made outside a damage / healing packet (`!ent hp`, a
+        # direct write; a packet logs its own `damage` / `healing` entry,
+        # PACKET_WRITE) — logged before the death check so a fatal blow
+        # reads "hp_change ... then death" in the log. Only 'changed' events count
         # (an initial 'created' hp write at spawn isn't damage). Skipped
         # while this entity is in the revive window (its hp-restore is the
         # revive mechanic, not combat healing — the revive emits a single
@@ -10670,6 +10834,7 @@ class Entity:
         if (is_top_level_write and self._match is not None
                 and self.id in self._match.entities
                 and self.id not in self._match._death_check_suppressed_ids
+                and PACKET_WRITE.get() != (self._match.id, self.id)
                 and self._match.rules.get("event_log_enabled", True)):
             hp_var = self._match.rules.get("hp_var", "hp")
             for ev in leaf_events:
@@ -10680,10 +10845,10 @@ class Entity:
                         and isinstance(new_v, (int, float)) and not isinstance(new_v, bool)
                         and new_v != old_v):
                     self._match.log_event(
-                        "damage" if new_v < old_v else "heal",
+                        "hp_change",
                         entity=self.id, name=self._match._entity_name(self.id),
                         var=hp_var, old=old_v, new=new_v,
-                        amount=abs(new_v - old_v),
+                        change=new_v - old_v,
                     )
                 break
         # Death check. Runs at TOP-LEVEL writes only — a passive whose
@@ -13040,6 +13205,11 @@ class Match:
     # passives and a definition's own hooks), status_hook_recursion_limit.
     _status_event_depth: int = field(default=0, repr=False)
     _status_event_warned: bool = field(default=False, repr=False)
+    # The same guard for damage / healing hooks (#25,
+    # damage_hook_recursion_limit): packets dealt from on_damage_* /
+    # on_healing_* hooks nest one deeper.
+    _damage_hook_depth: int = field(default=0, repr=False)
+    _damage_hook_warned: bool = field(default=False, repr=False)
     # Status-granting zones (#136): a sync is running (a move its status
     # hooks make asks for another pass instead of nesting one) / a pass was
     # asked for while it ran.
@@ -22748,7 +22918,8 @@ class Match:
                      duration: Optional[int] = None,
                      *, force: bool = False,
                      seed_data: Optional[Dict[str, Any]] = None,
-                     rounding: Optional[str] = None) -> List[str]:
+                     rounding: Optional[str] = None,
+                     source: Optional[str] = None) -> List[str]:
         """Apply status `name` to entity `eid`, honoring the definition's
         `stack` mode (else the status_default_stack rule) when the status
         is already present. A FIRST application seeds the definition's
@@ -22765,7 +22936,11 @@ class Match:
 
         `seed_data` (status_transfer) replaces the definition's `data` as the
         new instance's fields on a FIRST application, so a moved status keeps
-        its custom fields; stacking onto an existing instance ignores it."""
+        its custom fields; stacking onto an existing instance ignores it.
+
+        `source` (#227) records the unit that applied it
+        (STATUS_SOURCE_KEY, read by status_source): the latest application
+        that lands names it (a `none` stack mode changes nothing)."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -22780,7 +22955,8 @@ class Match:
                     e, "__status_redirect", "part_status_redirect"):
                 if e.part_of in self.entities:
                     return self.apply_status(e.part_of, name, level, duration,
-                                             force=force, seed_data=seed_data)
+                                             force=force, seed_data=seed_data,
+                                             source=source)
                 return []
         sdef = self.status_definitions.get(name) or {}
         new_level = None if level is None else int(level)
@@ -22915,6 +23091,11 @@ class Match:
                     front = status_layer_front(layers + [[lv, du]])
                     if front != layers:
                         write_status_layers(inst, front)
+        if source is not None and name in e.status and not (
+                before is not None and (sdef.get("stack") or str(
+                    self.rules.get("status_default_stack", "layered")))
+                == "none"):
+            e.status[name][STATUS_SOURCE_KEY] = source
         after = copy.deepcopy(e.status.get(name))
         log = ([] if before == after
                else self._emit_status_diff(eid, name, before, after))
@@ -24962,6 +25143,30 @@ class Match:
             return []
         return self._process_death(entity_id)
 
+    def status_source(self, eid: str, name: str) -> Optional[str]:
+        """Who applied status `name` on unit `eid` (#227 `source=`), while
+        that unit is in the match; None otherwise."""
+        e = self.entities.get(eid)
+        inst = e.status.get(name) if e is not None else None
+        src = inst.get(STATUS_SOURCE_KEY) if isinstance(inst, dict) else None
+        return src if isinstance(src, str) and src in self.entities else None
+
+    def packet_killer(self, eid: str) -> Optional[str]:
+        """The dealer of the damage packet whose death check is running,
+        when `eid` is its target or of its target's body (a vital part
+        taking the body with it): on_death's `killer` (#25). None
+        otherwise."""
+        cur = PACKET_KILLER.get()
+        if cur is None or cur[0] != self.id or cur[2] is None:
+            return None
+        if eid == cur[1]:
+            return cur[2]
+        e, t = self.entities.get(eid), self.entities.get(cur[1])
+        if e is not None and t is not None and \
+                self.body_root(e).id == self.body_root(t).id:
+            return cur[2]
+        return None
+
     def _process_death(self, entity_id: str) -> List[str]:
         """Run the death pipeline for `entity_id`: fire on_death (entity
         still in match), apply the death_result (corpse-store or
@@ -24986,7 +25191,9 @@ class Match:
         dead_vehicles: List[Tuple[str, Dict[str, Any], Tuple[int, int, int, int],
                                   str]] = []
         try:
-            log = self.fire_hook("on_death", target_ids=[entity_id])
+            log = self.fire_hook("on_death", target_ids=[entity_id],
+                                 extras={"killer": self.packet_killer(
+                                     entity_id)})
             # Re-check entity still exists — a paranoid on_death passive
             # could have already removed the entity, in which case the
             # corpse/delete step has nothing to do.
@@ -25047,6 +25254,7 @@ class Match:
         return log
 
     _MSG_FMT_RE = re.compile(r"\{([\w.]+)\}")
+    _MSG_COND_RE = re.compile(r"\{\?([\w.]+)\?\}(.*?)\{/\?\}", re.DOTALL)
 
     def _announce(self, rule: str, eid: str, name: str, x: Any, y: Any,
                   unit_vars: Dict[str, Any], part_of: str = "",
@@ -25057,11 +25265,27 @@ class Match:
         fmt = str(self.rules.get(rule, "") or "")
         if not fmt:
             return
+        text = self.render_unit_message(fmt, eid, name, x, y, unit_vars,
+                                        part_of=part_of)
+        self.surface_log([f"{UNIT_LINE_TAG}{self.id}|{eid}|{x}|{y}|"
+                          f"{map_name or ''}{UNIT_LINE_TAG}{text}"])
+
+    def render_unit_message(self, fmt: str, eid: str, name: str, x: Any,
+                            y: Any, unit_vars: Dict[str, Any],
+                            part_of: str = "",
+                            extra: Optional[Dict[str, Any]] = None) -> str:
+        """A message format filled for unit `eid`: {name}, {id}, {x}, {y},
+        {team}, {part_of}, {round}, {match}, the `extra` values (dotted
+        paths into dicts) and the unit's vars by name or dotted path
+        (a private var the command's reader may not see prints
+        private_var_text); `{?key?}...{/?}` keeps its text only when key
+        reads non-empty."""
         team_var = str(self.rules.get("team_var", "team"))
         fixed = {"name": name, "id": eid, "x": x, "y": y,
                  "team": unit_vars.get(team_var, "") if isinstance(unit_vars, dict) else "",
                  "part_of": part_of or "", "round": self.round_number,
                  "match": self.name}
+        extra = extra or {}
 
         # The reader of the running command (#70): a private var prints
         # private_var_text.
@@ -25069,29 +25293,46 @@ class Match:
         spec = (privacy_spec(self.rules, unit_vars)
                 if reader is not None and isinstance(unit_vars, dict) else None)
         team = fixed["team"]
+        private_text = str(self.rules.get("private_var_text", "?"))
 
         def hidden(path: str) -> bool:
             return spec is not None and not reader_sees(
                 path_privacy(spec, unit_vars, path), reader,
                 None if team in (None, "") else str(team))
 
-        def sub(mo):
-            key = mo.group(1)
-            if key == "team" and hidden(team_var):
-                return str(self.rules.get("private_var_text", "?"))
+        def look(key: str) -> Tuple[bool, Any]:
             if key in fixed:
-                return str(fixed[key] if fixed[key] is not None else "")
-            if hidden(key):
-                return str(self.rules.get("private_var_text", "?"))
-            cur: Any = unit_vars
+                if key == "team" and hidden(team_var):
+                    return True, private_text
+                return True, fixed[key]
+            head = key.split(".", 1)[0]
+            if head in extra:
+                cur: Any = extra
+            else:
+                if hidden(key):
+                    return True, private_text
+                cur = unit_vars
             for seg in key.split("."):
                 if not isinstance(cur, dict) or seg not in cur:
-                    return ""
+                    return False, None
                 cur = cur[seg]
-            return str(cur)
-        text = self._MSG_FMT_RE.sub(sub, fmt)
-        self.surface_log([f"{UNIT_LINE_TAG}{self.id}|{eid}|{x}|{y}|"
-                          f"{map_name or ''}{UNIT_LINE_TAG}{text}"])
+            return True, cur
+
+        def cond(mo):
+            found, v = look(mo.group(1))
+            return mo.group(2) if found and v not in (None, "", [], {}) \
+                else ""
+
+        def sub(mo):
+            found, v = look(mo.group(1))
+            return "" if not found or v is None else str(v)
+        text = fmt.replace("\\n", "\n")
+        for _ in range(4):
+            new = self._MSG_COND_RE.sub(cond, text)
+            if new == text:
+                break
+            text = new
+        return self._MSG_FMT_RE.sub(sub, text)
 
     def unit_tag(self, eid: str) -> str:
         """The UNIT_LINE_TAG prefix for unit `eid` where it stands now ("" for
@@ -25244,80 +25485,32 @@ class Match:
         # half_up: a half rounds away from zero.
         return int(_m.floor(abs(v) + Fraction(1, 2))) * (1 if v >= 0 else -1)
 
-    def damage_part(self, part_id: str, amount: int) -> Tuple[int, List[str]]:
-        """Deal `amount` damage to body part `part_id`, routing the
-        configured share to the parent's main HP (the HD2 'damage to main'
-        model). Returns (to_main_dealt, log_lines).
+    def damage_part(self, part_id: str, amount: Any,
+                    **packet: Any) -> Tuple[int, List[str]]:
+        """Deal `amount` damage to body part `part_id` as a damage packet
+        (damage.run_packet: the part's steps, its writes with its hp
+        stopping at 0, then its share to the parent, the
+        part_damage_to_main_percent_default rule / damage_to_main_percent
+        var under to_main_cap, then its destruction at 0 hp: on_death once,
+        a vital part kills the parent). `packet` passes the packet's
+        options (tags, packet_tags, dealer, source, quiet). Returns (the hp
+        damage its share took off the parent, log lines).
 
-        Order (so the transfer never depends on clamp timing — see CLAUDE.md):
-          1. read the part's pre-hit hp + knobs;
-          2. compute to_main = to_main_percent% of the cap-moded damage and
-             apply it to the PARENT via the normal hp path (parent
-             clamp/hooks/death all fire — this is what lets a big uncapped
-             hit kill the parent);
-          3. write the part's own hp, floored at 0 (a 0/0 zone stays 0);
-          4. if the part hit 0 and isn't indestructible, run its death
-             (fire on_death once; if `vital`, kill the parent).
-
-        Routing happens ONLY here — a raw `entity[part].hp -= n` does not
-        spill to main (intentional, mirrors damage_entity vs write_var)."""
+        Routing happens only through damage packets: a raw `entity[part].hp
+        -= n` does not spill to main."""
+        import damage as _damage
         p = self.entities.get(part_id)
         if p is None:
             raise NotFound(f"Entity '{part_id}' not found.")
-        try:
-            amount = int(amount)
-        except (TypeError, ValueError, OverflowError):
-            raise VTTError("damage_part: amount must be an integer.")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            raise VTTError("damage_part: amount must be a number.")
         if amount < 0:
-            # A negative hit used to heal the part AND move to_main_percent
-            # of the heal to the main body. Heal with a plain hp write.
             raise VTTError(f"damage_part `{part_id}`: amount can't be negative "
-                           f"(heal a part with an hp write: `entity[{part_id}]"
-                           f".hp = ...`).")
-        hp_var, mhp_var, _ = p._vital_var_names()
-        cur_hp = int(p.vars.get(hp_var, 0) or 0)
-        max_hp = int(p.vars.get(mhp_var, 0) or 0)
-        raw_pct = p.vars.get("to_main_percent",
-                             self.rules.get("part_to_main_percent_default", 0)) or 0
-        pct = _coerce_number(raw_pct)
-        if pct is None:
-            raise VTTError(f"damage_part `{p.id}`: to_main_percent must be a "
-                           f"finite number, got {raw_pct!r}.")
-        cap = str(p.vars.get("to_main_cap",
-                            self.rules.get("part_to_main_cap_default", "max_hp")))
-        log: List[str] = []
-        # (2) transfer to parent main HP first, from pre-hit values.
-        to_main = 0
-        parent = self.entities.get(p.part_of) if p.part_of else None
-        if parent is not None and pct != 0:
-            try:
-                base = self._part_transfer_base(amount, cur_hp, max_hp, cap)
-            except VTTError as ex:
-                raise VTTError(f"damage_part `{p.id}`: {ex}")
-            from fractions import Fraction
-            to_main = self.round_by_rule(
-                Fraction(base) * Fraction(repr(float(pct))) / 100)
-            if to_main != 0:
-                p_hp_var, _, _ = parent._vital_var_names()
-                # Its log carries the parent's hp hooks and, on a lethal
-                # transfer, its death (both used to be dropped).
-                log += parent.write_var(
-                    p_hp_var,
-                    int(parent.vars.get(p_hp_var, 0) or 0) - to_main) or []
-        # The transfer can kill the parent, whose death removes its parts:
-        # this part is then gone with the corpse and takes no hit of its own.
-        if p.id not in self.entities:
-            return to_main, log
-        # (3) write the part's own hp, floored at 0.
-        new_hp = max(0, cur_hp - amount)
-        if new_hp != cur_hp:
-            log += p.write_var(hp_var, new_hp) or []
-            if p.id not in self.entities:
-                return to_main, log
-        # (4) destruction.
-        if new_hp <= 0 and (cur_hp - amount) <= 0 and not self.is_indestructible(p):
-            log += self._process_part_death(p)
-        return to_main, log
+                           f"(heal a part with heal(...)).")
+        res = _damage.run_packet(self, "damage", part_id, amount, **packet)
+        hp_var = str(self.rules.get("hp_var", "hp"))
+        to_main = (res.get("share") or {}).get("damage_taken", {}).get(hp_var, 0)
+        return to_main, res["notes"] + res["log"]
 
     def _process_part_death(self, p: "Entity", *, cascade: bool = False) -> List[str]:
         """A body part reaching 0 hp by damage. Fires the part's on_death
@@ -25335,7 +25528,8 @@ class Match:
                        part_of=p.part_of or "")
         self._announce("death_message_format", p.id, p.name, p.x, p.y,
                        p.vars, part_of=p.part_of or "", map_name=p.map)
-        log = self.fire_hook("on_death", target_ids=[p.id])
+        log = self.fire_hook("on_death", target_ids=[p.id],
+                             extras={"killer": self.packet_killer(p.id)})
         # A destroyed limb that carries riders: the mount-death rules, as
         # for any vehicle's death (keep leaves them aboard the dead limb).
         if p.id in self.entities and self.vehicle_riders(p.id):
@@ -25510,7 +25704,8 @@ class Match:
                       mode: Optional[str] = None,
                       fragments: Optional[int] = None,
                       origin: Optional[Tuple[int, int]] = None,
-                      radius: Optional[int] = None) -> Tuple[int, List[str]]:
+                      radius: Optional[int] = None,
+                      **packet: Any) -> Tuple[int, List[str]]:
         """Distribute `total` area damage across `target_id`'s body parts,
         returning (to_main_dealt, log). Each part's share is routed via
         damage_part (so it taps the main per the part's to_main config). The
@@ -25555,13 +25750,16 @@ class Match:
                             for (cx, cy) in self.entity_cells(p))]
 
         def _hit_main(amount: int) -> Tuple[int, List[str]]:
-            """Fallback: deal `amount` straight to the target's main HP."""
+            """Fallback: deal `amount` straight to the target as a damage
+            packet."""
+            import damage as _damage
             if amount == 0:
                 return 0, []
             hp_var, _, _ = target._vital_var_names()
-            log = target.write_var(
-                hp_var, int(target.vars.get(hp_var, 0) or 0) - amount)
-            return amount, (log or [])
+            res = _damage.run_packet(self, "damage", target_id, amount,
+                                     **packet)
+            return (res["taken"].get(hp_var, 0),
+                    res["notes"] + res["log"])
 
         if mode == "main_only" or not parts:
             return _hit_main(total)
@@ -25636,7 +25834,7 @@ class Match:
             # action that ROLLED BACK the kill.
             if pid not in self.entities or target_id not in self.entities:
                 continue
-            tm, plog = self.damage_part(pid, amt)
+            tm, plog = self.damage_part(pid, amt, **packet)
             to_main += tm
             log += plog
         return to_main, log
@@ -25662,6 +25860,9 @@ class Match:
         # always mount again after revival.
         snap.pop("mounted_on", None)
         snap.pop("mount_slot", None)
+        # Who applied its statuses goes (#227): a revive may come after
+        # that unit left and its id went to another.
+        snap["status"] = without_zone_grants(snap.get("status"))
         corpses[e.id] = {
             "entity": snap,
             "died_round": self.round_number,
@@ -25681,6 +25882,8 @@ class Match:
         # minimal — the "regrow from a fresh template" variant is a deferred
         # TODO.
         part_dicts = [pp.to_dict() for pp in self.entity_part_subtree(e.id)]
+        for pd in part_dicts:
+            pd["status"] = without_zone_grants(pd.get("status"))
         if part_dicts:
             corpses[e.id]["parts"] = part_dicts
         # A death in the middle of a size derivation (the total written,

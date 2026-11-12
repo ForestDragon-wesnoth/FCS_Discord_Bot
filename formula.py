@@ -1612,7 +1612,8 @@ def _len(v: Any) -> int:
 # Coordinates are 1-indexed to match the rest of the engine.
 
 _IMPL_NAME_RE = re.compile(
-    r"(?:FormulaEngine\._namespace\.<locals>\.)?_([a-z][a-z0-9_]*)\(\)")
+    r"(?:FormulaEngine\._namespace\.<locals>\.)?(?<![A-Za-z0-9_])"
+    r"_([a-z][a-z0-9_]*)\(\)")
 
 
 def _runtime_msg(e: BaseException) -> str:
@@ -2692,6 +2693,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_add(eid, name)               -> bool (True iff newly added)
     #   status_remove(eid, name)            -> bool (True iff removed)
     "status_has", "status_has_path", "status_get", "status_level_data",
+    "status_source",
     "status_resisted",
     # status_level(eid, name) / status_duration(eid, name) -> 0 when the
     # unit lacks the status (#90); a level-less status reads 1, one
@@ -3112,7 +3114,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "reactions_used",
-    "last_damage", "last_healing",
+    "last_damage", "last_healing", "status_source",
     "is_void", "void_cells",
     "status_layers",
     'watch_exists', 'watchers_of',
@@ -3614,6 +3616,11 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     "damage_source", "damage_tags", "damage_components",
     "healing_source", "healing_tags", "healing_components",
     "components",
+    # The packet's hooks (on_damage_* / on_healing_*): per pool, what the
+    # steps decided and what the var moved; on_death's `killer`, the
+    # dealer of the damage packet that killed (None otherwise).
+    "damage_taken", "damage_lost", "healing_received", "healing_gained",
+    "killer",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -6008,10 +6015,28 @@ class FormulaEngine:
             self._note_affected(eid)
             return True
 
+        _NO_SOURCE = object()
+
+        def _status_source_arg(fname: str, source: Any) -> Optional[str]:
+            """A status application's source (#227): a unit, None = none;
+            not given = the unit whose action runs (an action body, a
+            reaction's half), else none."""
+            if source is _NO_SOURCE:
+                import action as _action
+                origin = _action.ACTION_ORIGIN.get()
+                return origin[0] if origin is not None and \
+                    origin[0] in match.entities else None
+            if source is None:
+                return None
+            sid, _se = _resolve_entity(source, fname)
+            return sid
+
         def _do_status_apply(fname: str, eid_t: Any, name: Any,
                              level: Any, duration: Any, force: bool,
-                             rounding: Any = None) -> bool:
+                             rounding: Any = None,
+                             source: Any = _NO_SOURCE) -> bool:
             eid = _eid(eid_t)
+            src = _status_source_arg(fname, source)
             if not isinstance(name, str):
                 raise FormulaError(f"{fname}(eid, name, ...): name must be a string.")
             for label, v in (("level", level), ("duration", duration)):
@@ -6030,7 +6055,8 @@ class FormulaEngine:
             try:
                 match.surface_log(match.apply_status(eid, name, lv, du,
                                                      force=force,
-                                                     rounding=rounding))
+                                                     rounding=rounding,
+                                                     source=src))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
@@ -6038,8 +6064,9 @@ class FormulaEngine:
 
         def _status_apply(eid_t: Any, name: Any,
                           level: Any = None, duration: Any = None,
-                          rounding: Any = None) -> bool:
-            """status_apply(eid, name, level=None, duration=None, rounding=None):
+                          rounding: Any = None,
+                          source: Any = _NO_SOURCE) -> bool:
+            """status_apply(eid, name, level=None, duration=None, rounding=None, source=...):
             apply a status, honoring its definition's stack mode (else the
             status_default_stack rule) when already present AND the target's
             resistance / weakness / immunity (an immune or fully-resisted
@@ -6047,9 +6074,12 @@ class FormulaEngine:
             change the applied level, or the duration per the status's
             resist_affects, rounded per `rounding=`, else the definition's
             resist_rounding, else the status_resist_rounding rule). Seeds the
-            definition's default data on a first application. Returns True."""
+            definition's default data on a first application. `source` (a
+            unit, default the unit whose action runs, None = none) records
+            who applied it: status_source(eid, name), the default attacker
+            of the damage its tick deals. Returns True."""
             return _do_status_apply("status_apply", eid_t, name, level,
-                                    duration, False, rounding)
+                                    duration, False, rounding, source)
 
         def _status_resisted(eid_t: Any, name: Any, level: Any = 1,
                              duration: Any = None,
@@ -6140,13 +6170,27 @@ class FormulaEngine:
             return landed
 
         def _status_force(eid_t: Any, name: Any,
-                          level: Any = None, duration: Any = None) -> bool:
-            """status_force(eid, name, level=None, duration=None): like
+                          level: Any = None, duration: Any = None,
+                          source: Any = _NO_SOURCE) -> bool:
+            """status_force(eid, name, level=None, duration=None, source=...): like
             status_apply but IGNORES the target's resistance/immunity — the
             level/increment lands at full strength regardless (cross-status
             blocked_by and the part immune/redirect rules are still honored).
-            The 'forced affliction' counterpart to status_apply. Returns True."""
-            return _do_status_apply("status_force", eid_t, name, level, duration, True)
+            The 'forced affliction' counterpart to status_apply; `source` as
+            there. Returns True."""
+            return _do_status_apply("status_force", eid_t, name, level,
+                                    duration, True, None, source)
+
+        def _status_source(eid_t: Any, name: Any) -> Any:
+            """status_source(eid, name): the unit that applied status `name`
+            on `eid` (status_apply's `source`), while it is in the match;
+            None otherwise (no source, the unit gone, no such status)."""
+            eid, _e = _resolve_entity(eid_t, "status_source")
+            if not isinstance(name, str):
+                raise FormulaError("status_source(eid, name): name must be "
+                                   "a string.")
+            return match.status_source(eid, name)
+        ns["status_source"] = _status_source
 
         # ---- sizes (#242) ----
         # A size reference is a unit (its body's total, or with own=True its
@@ -9353,6 +9397,9 @@ class FormulaEngine:
             d_dealer, d_source = None, None
             if ex.get("status_name"):
                 d_source = f"status:{ex['status_name']}"
+                if ctx.target in match.entities:
+                    d_dealer = match.status_source(ctx.target,
+                                                   ex["status_name"])
             elif ex.get("zone_name"):
                 d_source = f"zone:{ex['zone_name']}"
             elif ex.get("tile_x") is not None:
@@ -9374,7 +9421,8 @@ class FormulaEngine:
 
         def _packet(kind: str, fname: str, target: Any, amount: Any,
                     pool: Any, tags: Any, packet_tags: Any, dealer: Any,
-                    source: Any, forecast: bool) -> Dict[str, Any]:
+                    source: Any, forecast: bool,
+                    quiet: Any = False) -> Dict[str, Any]:
             import damage as _damage
             tid, _te = _resolve_entity(target, fname)
             who, src = _packet_defaults(dealer, source)
@@ -9382,7 +9430,7 @@ class FormulaEngine:
                 res = _damage.run_packet(
                     match, kind, tid, amount, pool=pool, tags=tags,
                     packet_tags=packet_tags, dealer=who, source=src,
-                    forecast=forecast)
+                    forecast=forecast, quiet=bool(quiet))
             except VTTError as ex:
                 raise FormulaError(f"{fname}: {ex}")
             match.surface_log(res["notes"] + res["log"])
@@ -9404,7 +9452,7 @@ class FormulaEngine:
             Returns the damage taken per pool ({'hp': 18})."""
             return dict(_packet("damage", "deal_damage", target, damage,
                                 pool, tags, packet_tags, attacker, source,
-                                False)["taken"])
+                                False, quiet)["taken"])
 
         def _heal(target: Any, healing: Any, pool: Any = None,
                   tags: Any = None, packet_tags: Any = None,
@@ -9417,7 +9465,7 @@ class FormulaEngine:
             healing received per pool."""
             return dict(_packet("healing", "heal", target, healing, pool,
                                 tags, packet_tags, healer, source,
-                                False)["taken"])
+                                False, quiet)["taken"])
 
         def _damage_forecast(target: Any, damage: Any, pool: Any = None,
                              tags: Any = None, packet_tags: Any = None,
@@ -9453,7 +9501,7 @@ class FormulaEngine:
                      "dealt": info["rec_dealer"]} if kind == "damage"
                     else {"received": info["rec_target"],
                           "given": info["rec_dealer"]})
-            if which not in keys:
+            if not isinstance(which, str) or which not in keys:
                 raise FormulaError(
                     f"{fname}(eid, which): which is "
                     + ("taken or dealt" if kind == "damage"
@@ -9588,31 +9636,50 @@ class FormulaEngine:
             return match.find_part(pid, handle) is not None
         ns["has_part"] = _has_part
 
-        def _damage_part(part_token: Any, amount: Any) -> int:
-            """damage_part(part, amount): deal `amount` to a body part,
-            routing the configured share to the parent's main HP (the
-            HD2 'damage to main' model — see the part_to_main_* rules and
-            per-part to_main_percent / to_main_cap / vital vars). Returns
-            the amount dealt to the parent's main HP. Destroying a part
-            fires its on_death (destroy effects) and, if `vital`, kills
-            the parent. Routing happens ONLY through this verb — a raw
-            entity[part].hp write does not spill to main."""
+        def _spread_packet(fname: str, tags: Any, packet_tags: Any,
+                           attacker: Any, source: Any,
+                           quiet: Any) -> Dict[str, Any]:
+            who, src = _packet_defaults(attacker, source)
+            return {"tags": tags, "packet_tags": packet_tags, "dealer": who,
+                    "source": src, "quiet": bool(quiet)}
+
+        def _damage_part(part_token: Any, amount: Any, tags: Any = None,
+                         packet_tags: Any = None, attacker: Any = _UNSET,
+                         source: Any = _UNSET, quiet: Any = False) -> int:
+            """damage_part(part, amount, tags=None, packet_tags=None,
+            attacker=..., source=..., quiet=False): a damage packet on a
+            body part (as deal_damage on it): the part's steps and writes
+            (its hp stops at 0), then its share to the parent (the
+            part_damage_to_main_percent_default rule, the part's
+            damage_to_main_percent / to_main_cap vars, sent per
+            part_damage_share_mode), then, at 0 hp, its destruction (its
+            on_death; a `vital` part kills the parent). Returns the hp
+            damage the share took off the parent. A raw entity[part].hp
+            write does not spill to main."""
             pid, _pe = _resolve_entity(part_token, "damage_part")
             if isinstance(amount, bool) or not isinstance(amount, (int, float)):
                 raise FormulaError("damage_part(part, amount): amount must be a number.")
-            to_main, _log = match.damage_part(pid, int(amount))
+            to_main, _log = match.damage_part(
+                pid, amount, **_spread_packet("damage_part", tags,
+                                              packet_tags, attacker,
+                                              source, quiet))
             match.surface_log(_log)
             return to_main
         ns["damage_part"] = _damage_part
 
         def _damage_spread(target_token: Any, total: Any, mode: Any = None,
                            fragments: Any = None, origin_x: Any = None,
-                           origin_y: Any = None, radius: Any = None) -> int:
+                           origin_y: Any = None, radius: Any = None,
+                           tags: Any = None, packet_tags: Any = None,
+                           attacker: Any = _UNSET, source: Any = _UNSET,
+                           quiet: Any = False) -> int:
             """damage_spread(target, total, mode=None, fragments=None,
-            origin_x=None, origin_y=None, radius=None): distribute `total`
-            area damage across the target's body parts, returning the amount
-            that reached the parent's main HP. The total is DIVIDED among
-            parts (each routed via damage_part), never full to each. Modes
+            origin_x=None, origin_y=None, radius=None, tags=None,
+            packet_tags=None, attacker=..., source=..., quiet=False):
+            distribute `total` area damage across the target's body parts,
+            returning the hp damage that reached the parent. The total is
+            DIVIDED among parts (each a damage packet on the part, as
+            damage_part), never full to each. Modes
             (default aoe_default_mode): weighted / uniform / fragment /
             main_only — see the aoe_* rules and per-part aoe_weight var. With
             origin_x/origin_y + radius, only parts with a cell within radius
@@ -9636,7 +9703,10 @@ class FormulaEngine:
                 if isinstance(radius, bool) or not isinstance(radius, (int, float)):
                     raise FormulaError("damage_spread(...): radius must be a number.")
                 radius_i = int(radius)
-            to_main, _log = match.damage_spread(tid, int(total), m, f, origin, radius_i)
+            to_main, _log = match.damage_spread(
+                tid, int(total), m, f, origin, radius_i,
+                **_spread_packet("damage_spread", tags, packet_tags,
+                                 attacker, source, quiet))
             match.surface_log(_log)
             return to_main
         ns["damage_spread"] = _damage_spread

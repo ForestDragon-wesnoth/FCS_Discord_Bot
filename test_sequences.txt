@@ -10197,8 +10197,8 @@ SCENARIO 396 — Body parts: damage_part HD2 routing + 0/0 passthrough zone
 !match use loc
 !ent add knight Knight 50 2 3 9
 !ent add ogre Ogre 200 5 3 5
-!part add ogre oarm arm 40 40 to_main_percent=50 to_main_cap=max_hp
-!part add ogre ohead head 0 0 to_main_percent=150
+!part add ogre oarm arm 40 40 damage_to_main_percent=50 to_main_cap=max_hp
+!part add ogre ohead head 0 0 damage_to_main_percent=150
 !ent set_var knight inventory.weapon.actions.hit.target entity
 !ent set_var knight inventory.weapon.actions.hit.body "damage_part(part(target, args.where), args.dmg)"
 !action knight hit ogre where=arm dmg=20
@@ -10221,8 +10221,8 @@ SCENARIO 397 — Body parts: vital cascade + lingering destruction
 !match new loc2 LOC2 10 5
 !match use loc2
 !ent add mech Mech 300 5 3 5
-!part add mech marm arm 40 40 to_main_percent=30
-!part add mech mcore core 50 50 vital=true to_main_percent=0
+!part add mech marm arm 40 40 damage_to_main_percent=30
+!part add mech mcore core 50 50 vital=true damage_to_main_percent=0
 !ent add gun Gunner 30 2 3 9
 !ent set_var gun actions.blast.target entity
 !ent set_var gun actions.blast.body "damage_part(part(target, args.where), args.dmg)"
@@ -10247,7 +10247,7 @@ SCENARIO 398 — Body parts: hit_location aim feeds damage_part
 !match use loc3
 !system set default random_seed bodyseed
 !ent add t Target 100 5 3 5
-!part add t th head 0 0 to_main_percent=150 hit_weights.front=20 hit_weights.back=20
+!part add t th head 0 0 damage_to_main_percent=150 hit_weights.front=20 hit_weights.back=20
 !ent add a Attacker 30 5 1 9
 !ent set_var a actions.snipe.target entity
 !ent set_var a actions.snipe.body "damage_part(hit_location(target, entity[self].x, entity[self].y, args.aim, 1, 1000), args.dmg)"
@@ -10539,7 +10539,7 @@ SCENARIO 409 — Independently-located body parts
 !match new lp LP 8 4
 !match use lp
 !ent add mech Mech 200 2 2 9
-!part add mech turret turret 30 30 to_main_percent=50
+!part add mech turret turret 30 30 damage_to_main_percent=50
 !map
 !part locate turret 5 3
 !map
@@ -10564,9 +10564,9 @@ SCENARIO 410 — AoE damage spread across body parts (damage_spread)
 !match use aoe
 !ent add bomber Bomber 50 1 1 9
 !ent add ogre Ogre 300 4 2 5
-!part add ogre chest chest 0 0 to_main_percent=100 aoe_weight=60
-!part add ogre head head 0 0 to_main_percent=150 aoe_weight=10
-!part add ogre arm arm 40 40 to_main_percent=50 aoe_weight=30
+!part add ogre chest chest 0 0 damage_to_main_percent=100 aoe_weight=60
+!part add ogre head head 0 0 damage_to_main_percent=150 aoe_weight=10
+!part add ogre arm arm 40 40 damage_to_main_percent=50 aoe_weight=30
 !ent set_var bomber actions.blast.target entity
 !ent set_var bomber actions.blast.body "entity[self].lasthit = damage_spread(target, args.dmg)"
 !action bomber blast ogre dmg=100
@@ -10615,8 +10615,8 @@ SCENARIO 412 — Footprint-region part positioning + render priority
 !ent set_var dragon footprint_w 2
 !ent set_var dragon footprint_h 2
 !ent face dragon up
-!part add dragon head head 0 0 to_main_percent=150
-!part add dragon tail tail 30 30 to_main_percent=30
+!part add dragon head head 0 0 damage_to_main_percent=150
+!part add dragon tail tail 30 30 damage_to_main_percent=30
 !part region head front
 !part region tail back
 !ent set_var head glyph H
@@ -10643,8 +10643,8 @@ SCENARIO 413 — Spatial AoE on a multi-tile entity (origin + radius)
 !ent set_var dragon footprint_w 2
 !ent set_var dragon footprint_h 2
 !ent face dragon up
-!part add dragon head head 0 0 to_main_percent=150
-!part add dragon tail tail 40 40 to_main_percent=50
+!part add dragon head head 0 0 damage_to_main_percent=150
+!part add dragon tail tail 40 40 damage_to_main_percent=50
 !part region head front
 !part region tail back
 !ent set_var gunner actions.frontblast.target entity
@@ -10668,9 +10668,9 @@ SCENARIO 414 — Composite multi-tile entity: region head + torso parts
 !ent set_var boss footprint_w 2
 !ent set_var boss footprint_h 2
 !ent face boss right
-!part add boss head head 0 0 to_main_percent=150
+!part add boss head head 0 0 damage_to_main_percent=150
 !part region head front
-!part add boss torso torso 0 0 to_main_percent=100
+!part add boss torso torso 0 0 damage_to_main_percent=100
 !part region torso all
 !eval "len(footprint_cells('boss'))"
 !eval "len(footprint_cells('head'))"
@@ -10699,7 +10699,7 @@ SCENARIO 415 — Body part detach becomes a free standalone entity
 !match new dp DP 10 5
 !match use dp
 !ent add ogre Ogre 100 5 3 5
-!part add ogre arm arm 30 30 to_main_percent=50
+!part add ogre arm arm 30 30 damage_to_main_percent=50
 !eval "has_part('ogre', 'arm')"
 !eval "part_of('arm')"
 !part detach arm
@@ -10720,8 +10720,8 @@ SCENARIO 416 — Parent death snapshots parts; revive restores them
 !match new pr PR 10 5
 !match use pr
 !ent add golem Golem 40 5 3 5
-!part add golem core core 25 25 to_main_percent=30
-!part add golem fist fist 20 20 to_main_percent=50
+!part add golem core core 25 25 damage_to_main_percent=30
+!part add golem fist fist 20 20 damage_to_main_percent=50
 !ent add cleric Cleric 30 1 3 12
 !ent set_var cleric actions.raise.target corpse
 !ent set_var cleric actions.raise.body "revive(target)"
@@ -10746,7 +10746,7 @@ SCENARIO 417 — Killing a body part destroys it (no corpse); only parents corps
 !match new pc PC 10 5
 !match use pc
 !ent add ogre Ogre 60 5 3 5
-!part add ogre arm arm 30 30 to_main_percent=50
+!part add ogre arm arm 30 30 damage_to_main_percent=50
 !part add ogre core core 20 20 vital=true
 !eval "kill('arm')"
 !eval "has_corpse('arm')"
@@ -10770,9 +10770,9 @@ SCENARIO 418 — Destroyer: body segments trail the head; damage routes to main
 !match use dz
 !ent add d Destroyer 120 8 2 9
 !ent face d right
-!part segment d b0 Body0 0 0 to_main_percent=100
-!part segment d b1 Body1 0 0 to_main_percent=100
-!part segment d b2 Body2 0 0 to_main_percent=100
+!part segment d b0 Body0 0 0 damage_to_main_percent=100
+!part segment d b1 Body1 0 0 damage_to_main_percent=100
+!part segment d b2 Body2 0 0 damage_to_main_percent=100
 !list
 !ent move d right
 !ent move d right
@@ -11113,7 +11113,7 @@ SCENARIO 432 — alive_condition rule: custom aliveness + is_indestructible
 !match new ac AC 12 5
 !match use ac
 !ent add boss Boss 60 5 2
-!part segment boss seg Seg 0 0 to_main_percent=100
+!part segment boss seg Seg 0 0 damage_to_main_percent=100
 !map
 !system set default alive_condition "entity[self].hp > 0"
 !map
@@ -12259,7 +12259,7 @@ SCENARIO 475 — A part's tick routes damage to the parent via damage_part
 !match new spr StatusPartRoute 10 6
 !match use spr
 !ent add troll Troll 30 4 3 50
-!part add troll tleg leg 25 25 to_main_percent=100 to_main_cap=max_hp
+!part add troll tleg leg 25 25 damage_to_main_percent=100 to_main_cap=max_hp
 !status def acid
 !status when acid turn_end
 !status tick acid "damage_part(self, 4)"
@@ -12275,7 +12275,7 @@ Expected: the troll's leg has an `acid` DoT whose tick calls `damage_part(self,
 4)` — the headline pattern the doc describes for limb DoTs. (The first `!turn next`
 begins round 1; the second ends the troll's turn.) Ending the troll's
 turn ticks the leg (it shares the parent's clock); the leg's tick routes 4
-damage through the part-damage pipeline: with to_main_percent=100 the parent
+damage through the part-damage pipeline: with damage_to_main_percent=100 the parent
 troll takes 4 (30→26) and the leg itself drops 25→21. This proves a status on a
 limb can both live on the limb and bleed into the main body.
 
@@ -13319,9 +13319,9 @@ SCENARIO 518 — damage_spread fragment mode works without a random_seed
 !part add ogre a A 0 0
 !part add ogre b B 0 0
 !part add ogre c C 0 0
-!ent set_var a to_main_percent 100
-!ent set_var b to_main_percent 100
-!ent set_var c to_main_percent 100
+!ent set_var a damage_to_main_percent 100
+!ent set_var b damage_to_main_percent 100
+!ent set_var c damage_to_main_percent 100
 !ent set_var a aoe_weight 1
 !ent set_var b aoe_weight 1
 !ent set_var c aoe_weight 1
@@ -13332,7 +13332,7 @@ SCENARIO 518 — damage_spread fragment mode works without a random_seed
 !eval "var_get('ogre', 'hp')"
 !eval "var_get('bomber', 'dealt')"
 
-Expected: the ogre has three 0/0 passthrough parts (to_main_percent=100). The
+Expected: the ogre has three 0/0 passthrough parts (damage_to_main_percent=100). The
 bomber's `fragment`-mode damage_spread of 30 splits 30 across the parts as
 discrete weighted-random hits and routes each share to the ogre's main HP at
 100% — so the total to main is exactly 30 regardless of which fragments land
@@ -17903,7 +17903,7 @@ SCENARIO 660 — a part hit and a `source.` write show their hook output
 !match use s660
 !ent add boss Boss 5 3 3 5
 !part add boss head Head 20 20
-!ent set_var head to_main_percent 100
+!ent set_var head damage_to_main_percent 100
 !ent set_var head to_main_cap none
 !gpassive add obit on_death "log('obit')"
 !passive add boss flinch on_var_changed target=hp "entity[boss].flinched = 1"
@@ -17949,7 +17949,7 @@ SCENARIO 661 — mode names are checked: distance metrics, damage_spread, to_mai
 ?? ❌ damage_spread: mode 'wieghted' isn't weighted, uniform, fragment or main_only.
 !eval "damage_spread('b', 4, 'fragment', 10**9)"
 ?? over the formula_loop_limit of 10000
-!ent set_var arm to_main_percent 50
+!ent set_var arm damage_to_main_percent 50
 !ent set_var arm to_main_cap max_HP
 !eval "damage_part('arm', 2)"
 ?? ❌ damage_part `arm`: to_main_cap 'max_HP' isn't none, max_hp, remaining_hp or absolute:<n>
@@ -18148,25 +18148,24 @@ inventory[""]["sword"], `.lead` stored vars[""]["lead"], and the typo never
 surfaced.
 
 
-SCENARIO 667 — rounding_mode decides how a half lands (damage_part, transform)
--------------------------------------------------------------------------------
+SCENARIO 667 — rounding_mode decides how a half lands in a transform; a part's share rounds by damage_rounding
+---------------------------------------------------------------------------------------------------------------
 
 !match new s667 Round 8 8
 !match use s667
 !ent add boss Boss 100 3 3 5
 !part add boss arm Arm 20 20
-!ent set_var arm to_main_percent 50
-!eval "damage_part('arm', 5)"
-?? = `3`
-!system set default rounding_mode half_even
+!ent set_var arm damage_to_main_percent 50
 !eval "damage_part('arm', 5)"
 ?? = `2`
+!system set default damage_rounding round
+!eval "damage_part('arm', 5)"
+?? = `3`
+!system set default damage_rounding ceil
 !eval "damage_part('arm', 7)"
 ?? = `4`
-!system set default rounding_mode floor
-!eval "damage_part('arm', 7)"
-?? = `3`
-!system set default rounding_mode half_up
+!system set default damage_rounding floor
+!assert "entity[boss].hp == 91 and entity[arm].hp == 3"
 !ent add w W 3 6 6 4
 !ent set_var w max_hp 4
 !ent set_var w form.name Ogre
@@ -18175,11 +18174,12 @@ SCENARIO 667 — rounding_mode decides how a half lands (damage_part, transform)
 !ent transform w form
 !assert "entity[w].hp == 8" "3/4 of 10 = 7.5 rounds up to 8"
 
-Expected: half of a 5-point arm hit goes to the boss: 2.5, which half_up
-(the default) rounds to 3. half_even gives Python's round(): 2 for 2.5 and
-4 for 3.5; floor gives 3 for 3.5. Transform's percent hp uses the same
-rule: 3/4 hp carried into a 10-hp form is 7.5, so 8. Before, both always
-used round(), so a half went to the even number.
+Expected: half of a 5-point arm hit goes to the boss as a damage packet of
+its own (#25), so it rounds by damage_rounding like any packet: 2.5 floors
+to 2 by default, `round` gives 3, and `ceil` gives 4 for 3.5 (boss 100 ->
+98 -> 95 -> 91; the arm 20 -> 3). Transform's percent hp uses the
+rounding_mode rule: 3/4 hp carried into a 10-hp form is 7.5, which half_up
+(the default) rounds to 8.
 
 
 SCENARIO 668 — writing under a key that holds a value is refused everywhere
@@ -18364,15 +18364,15 @@ SCENARIO 673 — damage_part / damage_spread refuse negative amounts and bad kno
 !ent add ogre Ogre 50 5 5 5
 !ent hp ogre 30
 !part add ogre arm Arm 10 10
-!ent set_var arm to_main_percent 50
+!ent set_var arm damage_to_main_percent 50
 !eval "damage_part('arm', -5)"
 ?? amount can't be negative
 !eval "damage_spread('ogre', -10)"
 ?? total can't be negative
-!ent set_var arm to_main_percent abc
+!ent set_var arm damage_to_main_percent abc
 !eval "damage_part('arm', 3)"
-?? to_main_percent must be a finite number, got 'abc'
-!ent set_var arm to_main_percent 100
+?? damage_part `arm`: damage_to_main_percent: a to-main percent is a finite number, got 'abc'
+!ent set_var arm damage_to_main_percent 100
 !ent set_var arm to_main_cap absolute:-5
 !eval "damage_part('arm', 3)"
 ?? n a whole number, 0 or more
@@ -19970,10 +19970,10 @@ SCENARIO 718 — !template: save a multi-tile body with parts, spawn copies
 !ent set_var boss footprint_w 2
 !ent set_var boss footprint_h 2
 !ent face boss right
-!part add boss boss_head head 0 0 to_main_percent=150
+!part add boss boss_head head 0 0 damage_to_main_percent=150
 !part region boss_head front
 !part add boss_head boss_eye eye 0 0
-!part add boss torso torso 0 0 to_main_percent=100
+!part add boss torso torso 0 0 damage_to_main_percent=100
 !part add boss turret turret 5 5
 !part locate turret 6 3
 !ent hp boss -20
@@ -20180,9 +20180,9 @@ SCENARIO 723 — !template set / unset / show <path>: edit a saved body without 
 !ent add boss Wyrm 300 3 3 9
 !ent set_var boss footprint_w 2
 !ent set_var boss footprint_h 2
-!part add boss boss_head head 0 0 to_main_percent=150
+!part add boss boss_head head 0 0 damage_to_main_percent=150
 !part region boss_head front
-!part add boss torso torso 0 0 to_main_percent=100
+!part add boss torso torso 0 0 damage_to_main_percent=100
 !template save boss wyrm
 !template show wyrm vars.hp
 ?? 300
@@ -33287,11 +33287,19 @@ SCENARIO 987 — Zone grants and watchers on a unit the channel's view hides sta
 ?! zqxspy
 !as owner
 !assert "entity[zqxspy].seenc == 1 and entity[zqxspy].litc == 1"
+!passive add zqxspy hurt on_damage_taken "entity[self].hurtc = 1"
+!eval "deal_damage('zqxspy', 1)"
+?! zqxspy
+?! Spy
+!assert "entity[zqxspy].hurtc == 1 and entity[zqxspy].hp == 19"
 !match unbind
 !match use m1
 !ent move scout 1 left
 !ent move scout 1 right
 ?? ⚠ watcher `alarm` on `zqxspy` effect error
+!eval "deal_damage('zqxspy', 1)"
+?? 🩸 **Spy** (`zqxspy`) takes 1 damage.
+?? passive `zqxspy.hurt` fired on `zqxspy` (on_damage_taken)
 
 Expected: bob's channel shows red's view, which hides the blue spy. His
 scout's aura grants `lit` to the spy and a watcher the spy holds turns
@@ -33299,7 +33307,11 @@ true: the hook and passive lines of the spy's grant and the watcher's
 effect error are tagged as lines about the spy, so his reply drops them
 and shows only the scout's own lines. `!watch show` lists only the units
 the view shows. Everything still happened (the spy holds `seenc` and
-`litc`). In an unbound channel the same watcher error names the spy.
+`litc`). A host in that channel damaging the spy by a formula sees
+neither the damage line nor the `fired on` line of the spy's own passive
+(passive and status-hook lines are tagged with the unit they fired on),
+while the passive ran. In an unbound channel the same watcher error, the
+damage line and the passive line name the spy.
 
 SCENARIO 988 — Held commands run as their holder; a pause lets the channel point elsewhere
 --------------------------------------------------------------------------------------------
@@ -33322,7 +33334,7 @@ SCENARIO 988 — Held commands run as their holder; a pause lets the channel poi
 ?? Damaged `gob` by 1
 !assert "entity[gob].hp == 9"
 !log 2
-?? took 1 damage (hp 10→9). — by bob
+?? hp 10→9. — by bob
 !match pause
 !match use m2
 ?? Active match is now **M2**
@@ -34890,7 +34902,7 @@ SCENARIO 1018 — Private vars and whole-board reads: `!log` and `!history` host
 !ent hp boss -7
 !as player bob
 !log 3
-?? Boss (`boss`) took 7 damage
+?? Boss (`boss`) hp 50→43
 !as host
 !eval "entity[boss].traps = [{'dc': 66613, 'kind': 'pit'}, {'kind': 'web', '__private_container': 'yes'}]"
 !system set default private_vars hp,max_hp,secret_dc,*.dc
@@ -34924,7 +34936,7 @@ SCENARIO 1018 — Private vars and whole-board reads: `!log` and `!history` host
 !tile info 6 6
 ?? 77731
 !log 3
-?? took 7 damage
+?? hp 50→43
 !system unset default private_vars
 
 Expected: before any private rule a player reads the log as usual. With hp,
@@ -38081,15 +38093,15 @@ SCENARIO 1078 — The event log in diff autosaves (#197): trimmed from the front
 !ent hp u -4
 !ent hp u -5
 !log
-?? took 3 damage
-?! took 2 damage
+?? hp 27→24
+?! hp 29→27
 !as restart
 !undo command 2 confirm
 ?? Undid 2 command(s)
 !log
-?? took 1 damage
-?? took 3 damage
-?! took 4 damage
+?? hp 30→29
+?? hp 27→24
+?! hp 24→20
 
 Expected: the event log keeps its newest three entries, and a diff
 autosave stores only the entries added and how many fell off the front.
@@ -40037,11 +40049,11 @@ SCENARIO 1124 — Damage pipeline: several pools, FCS1 Freeze overflow, a pool t
 ?? {'hp': 18, 'stamina': 12}
 !assert "entity[knight].hp == 32 and entity[knight].stamina == 0"
 !ent damage knight 5 pool=stamina
-?? `knight` takes 5 damage.
+?? (`knight`) takes 5 damage.
 !assert "entity[knight].hp == 27 and entity[knight].stamina == 0"
 !ent damage golem 8 pool=stamina
 ?? `golem` has no number at `stamina`: its damage there is dropped.
-?? `golem` takes no damage.
+?? (`golem`) takes no damage.
 !assert "entity[golem].hp == 50"
 !ent damage knight 3 pool=@hp
 !assert "entity[knight].hp == 24"
@@ -40087,7 +40099,7 @@ SCENARIO 1125 — Damage pipeline: true damage, the default filter, the floor an
 !assert "entity[t].hp == 74"
 !damage step add armor "step_reduce(30)"
 !ent damage t 10
-?? `t` takes 0 damage.
+?? (`t`) takes 0 damage.
 !assert "entity[t].hp == 74"
 !system set default damage_component_floor none
 !damage step add armor_neg "step_add(-30)"
@@ -40136,7 +40148,7 @@ SCENARIO 1126 — Healing pipeline: giver and receiver steps, a curse, last_heal
 !assert "get(last_healing('hero'), 'healing_giver') == 'cleric' and get(last_healing('hero'), 'healing_received') == {'hp': 15}"
 !assert "get(last_healing('cleric', 'given'), 'healing_receiver') == 'hero'"
 !ent heal hero 20
-?? `hero` receives 10 healing.
+?? (`hero`) receives 10 healing.
 !assert "entity[hero].hp == 55"
 !ent heal hero 200 from=cleric
 !assert "entity[hero].hp == 100"
@@ -40295,3 +40307,492 @@ equals the roll from the same position without one). The real packets spend the
 two blocks (100 → 100 → 100), and the third hits (90). `!damage explain`
 is a forecast too: nothing changes.
 HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1130 — Damage hooks and lines: the thorns recipe, damage_taken vs damage_lost, zero hits, quiet (#25)
+----------------------------------------------------------------------------------------------------------
+
+!match new dh DH 8 8
+!match use dh
+!ent add a A 30 1 1 5
+!ent add t T 30 3 1 3
+!gpassive add thorns on_damage_taken "if attacker != None and not 'thorns' in damage_tags:\n    deal_damage(attacker, 2, packet_tags=['thorns'], attacker=self)"
+!ent damage t 5 from=a
+?? 🩸 **T** (`t`) takes 5 damage from A.
+?? 🩸 **A** (`a`) takes 2 damage from T.
+!assert "entity[a].hp == 28 and entity[t].hp == 25"
+!passive add a tally on_damage_dealt "entity[self].dealt = get(damage_taken, 'hp')\nentity[self].moved = get(damage_lost, 'hp')\nentity[self].src = damage_source"
+!clamp add t hp min=0 mode=hard
+!ent damage t 40 from=a
+?? takes 40 damage from A.
+?? died.
+!assert "entity[a].dealt == 40 and entity[a].moved == 25 and entity[a].src == 'command'"
+!assert "entity[a].hp == 26"
+!ent add u U 30 3 3 3
+!damage step add wall side=defender "step_reduce(100)"
+!gpassive add zero on_damage_taken "entity[self].hits = var_get(self, 'hits', 0) + 1"
+!ent damage u 7 from=a
+?? 🩸 **U** (`u`) takes 0 damage from A.
+!assert "entity[u].hits == 1 and entity[u].hp == 30"
+!damage step remove wall
+!eval "deal_damage('u', 3, quiet=True)"
+?! takes 3 damage
+!assert "entity[u].hp == 27 and entity[u].hits == 2"
+!ent damage u 2 quiet
+?? `u` takes 2 damage.
+!system set default damage_message_format "{name}: -{damage_taken.hp} ({components}, {source})"
+!eval "deal_damage('u', [{'amount': 2, 'tags': ['fire']}, {'amount': 1, 'tags': ['cold']}], source='trap')"
+?? U: -3 (2 fire, 1 cold, trap)
+!system set default damage_message_format ""
+!ent damage u 1
+?? `u` takes 1 damage.
+
+Expected: the thorns recipe to copy: a global on_damage_taken passive
+deals 2 back to the attacker, tagged `thorns`, and skips packets that
+carry that tag, so thorns against thorns can't loop (A 28, T 25). Each
+packet prints its line (damage_message_format), the attacker named as
+the view sees it. on_damage_dealt fires on the attacker after the
+defender's hook: damage_taken is what the steps decided (40), damage_lost
+what the var moved (25: T had 25 left); damage_source is `command` for
+`!ent damage` (T's hard clamp stops its hp at 0). The hooks run before
+the death check, so the killing blow's thorns fire too (A 28 → 26). A hit the steps bring to 0 still
+fires the hooks (U's hits 1, hp 30). `quiet=True` / `quiet` drop the line
+(the command gives a plain confirmation instead). The format takes
+{damage_taken.<pool>}, {components} and {source}; empty = no line.
+
+
+SCENARIO 1131 — damage_hook_recursion_limit stops a thorns loop, the packets still land (#25)
+----------------------------------------------------------------------------------------------
+
+!match new dr DR 8 8
+!match use dr
+!system set default damage_hook_recursion_limit 3
+!ent add a A 100 1 1 5
+!ent add b B 100 3 1 3
+!gpassive add loop on_damage_taken "if attacker != None:\n    deal_damage(attacker, 1, attacker=self)"
+!ent damage b 10 from=a
+?? ⚠️ damage hook recursion limit (3) reached
+!assert "entity[b].hp == 89 and entity[a].hp == 98"
+!ent damage b 1 from=a
+?? ⚠️ damage hook recursion limit (3) reached
+!assert "entity[b].hp == 87 and entity[a].hp == 96"
+!system set default damage_hook_recursion_limit 99
+?? ❌
+!system set default damage_hook_recursion_limit 1
+!ent damage b 1 from=a
+!assert "entity[b].hp == 86 and entity[a].hp == 95"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a passive that hits back without a tag check loops (A hits B,
+B hits A, ...). Packets dealt from the hooks nest one deeper each; past
+damage_hook_recursion_limit (3) they still apply but fire no hooks, with
+one ⚠️ per chain: B takes 10, A 1, B 1 (three packets firing hooks),
+then A's 1 lands without them: B 89, A 98. The second chain is the same
+again with B's first hit 1 (87 / 96). The limit has a ceiling (64). At 1
+only the first packet fires hooks: B's reply lands on A, which fires none
+(86 / 95).
+
+
+SCENARIO 1132 — Kill credit: on_death's killer, a burn's source, status_source (#25, #227)
+-------------------------------------------------------------------------------------------
+
+!match new kc KC 8 8
+!match use kc
+!ent add a A 30 1 1 5
+!ent add v V 10 3 1 3
+!ent add w W 6 5 1 1
+!gpassive add credit on_death "match.last_kill = fmt('{s}:{k}', s=self, k=killer)"
+!ent damage v 20 from=a
+!assert "match.last_kill == 'v:a'"
+!status def burn
+!status tick burn "deal_damage(self, 3)"
+!status when burn turn_start
+!status apply w burn source=a
+!eval "status_source('w', 'burn')"
+?? = `'a'`
+!turn set w
+!assert "entity[w].hp == 3"
+!eval "last_damage('w')"
+?? 'attacker': 'a'
+?? 'source': 'status:burn'
+!turn set a
+!turn set w
+!assert "match.last_kill == 'w:a'"
+!ent add x X 10 3 3 2
+!ent set_var a actions.ignite.target entity
+!ent set_var a actions.ignite.body "status_apply(target, 'burn')"
+!action a ignite x
+!eval "status_source('x', 'burn')"
+?? = `'a'`
+!ent add y Y 10 4 4 2
+!ent set_var a actions.douse.target entity
+!ent set_var a actions.douse.body "status_apply(target, 'burn', source=None)"
+!action a douse y
+!ent set_var a note "$(status_source('y', 'burn'))"
+?? vars.note = ''
+!ent remove a
+!eval "status_source('x', 'burn')"
+?? = `None`
+!ent add a A2 30 1 1 5
+!eval "status_source('x', 'burn')"
+?? = `None`
+!ent hp x 0
+!assert "match.last_kill == 'x:None'"
+
+Expected: on_death binds `killer`, the dealer of the packet whose writes
+killed the unit (`v:a`). A status applied with `source=` remembers who
+applied it (status_source); its tick's deal_damage defaults its attacker
+to that unit, so W's last damage names A and the burn that kills W
+credits A (`w:a`). An action body applying a status records the actor
+by default; `source=None` records none (status_source reads in `$()`).
+When the source leaves the match the statuses it applied forget it, so a
+later unit under the id isn't credited. A raw `!ent hp` kill has no
+killer (None).
+
+
+SCENARIO 1133 — The event log: damage / healing entries per packet, hp_change for raw writes (#25)
+---------------------------------------------------------------------------------------------------
+
+!match new el EL 8 8
+!match use el
+!ent add a A 30 1 1 5
+!ent add t T 30 3 1 3
+!log clear
+!ent damage t 5 from=a
+!ent heal t 2 from=a
+!ent hp t 20
+!ent hp t +3
+!log
+?? 🩸 T (`t`) took 5 damage from A.
+?? 💚 T (`t`) received 2 healing from A.
+?? ❤️ T (`t`) hp 27→20.
+?? ❤️ T (`t`) hp 20→23.
+?! hp 30→25
+?! hp 25→27
+!log type=damage
+?? took 5 damage
+?! healing
+!log type=hp_change
+?? hp 27→20
+?! took 5
+!system set default event_log_events death,damage
+!log clear
+!ent heal t 1
+!ent hp t 10
+!ent damage t 1
+!log
+?? took 1 damage
+?! received
+?! hp 24→10
+!system set default event_log_events death,heal
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: a damage packet logs one `damage` entry (target, attacker,
+amounts), a healing packet a `healing` entry, and the hp writes they make
+log no hp_change; a raw `!ent hp` logs an `hp_change` entry (27 → 20, 20
+→ 23). `!log type=` filters each. event_log_events gates the three words;
+the old `heal` word is gone.
+
+
+SCENARIO 1134 — Statuses that break on damage: removed_on_damage, break_at_damage, damage_filter (#25, #235)
+-------------------------------------------------------------------------------------------------------------
+
+!match new sb SB 8 8
+!match use sb
+!ent add h H 50 1 1 5
+!ent set_var h stamina 20
+!status def sleep
+!status removed_on_damage sleep on
+!status hook sleep on_removed "entity[self].woke = removed_by"
+!status def charge
+!status break_at_damage charge 10
+!status damage_filter charge pool:hp
+!status display charge "charging {damage_counted}/10"
+!status apply h sleep
+!status apply h charge
+!ent heal h 5
+!assert "status_has('h', 'sleep') and status_has('h', 'charge')"
+!ent hp h 45
+!assert "status_has('h', 'sleep')"
+!ent damage h 4
+!assert "not status_has('h', 'sleep') and entity[h].woke == 'damage'"
+!ent info h short
+?? charging 4/10
+!ent damage h 8 pool=stamina
+!assert "status_get('h', 'charge', 'damage_counted') == 4"
+!eval "deal_damage('h', [{'amount': 4}, {'amount': 4, 'pool': 'stamina'}])"
+!assert "status_get('h', 'charge', 'damage_counted') == 8"
+!ent damage h 2
+!assert "not status_has('h', 'charge')"
+!status apply h sleep
+!damage step add wall side=defender "step_reduce(100)"
+!ent damage h 5
+!assert "status_has('h', 'sleep')"
+!damage step remove wall
+!status damage_filter sleep fire
+!ent damage h 3
+!assert "status_has('h', 'sleep')"
+!eval "deal_damage('h', 3, tags=['fire'])"
+!assert "not status_has('h', 'sleep')"
+!status break_at_damage charge 0
+?? ❌
+!status damage_filter charge (fire
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: `removed_on_damage` (sleep) ends the status on the first damage
+packet that comes to more than 0: a heal and a raw `!ent hp` write
+don't count, and on_removed reads removed_by `damage`. `break_at_damage:
+10` with `damage_filter pool:hp` counts the hp damage taken in the
+instance's `damage_counted` (shown by the display: 4/10); stamina damage
+doesn't count, and a packet with 4 hp and 4 stamina counts 4 (8); the
+next 2 reach 10 and end it. A hit the steps bring to 0 counts nothing.
+With `damage_filter fire` only fire components count. A break_at_damage
+of 0 and a filter that doesn't parse are refused.
+
+
+SCENARIO 1135 — Body-part shares: per-tag percents, heal shares, share modes, the cap, a vital part (#25)
+-------------------------------------------------------------------------------------------------------
+
+!match new ps PS 10 10
+!match use ps
+!ent add boss Boss 100 3 3 5
+!ent set_vars boss footprint_w=2 footprint_h=2
+!ent hp boss 50
+!part add boss arm Arm 20 20 vital=true
+!ent set_var arm damage_to_main_percent.fire 100
+!ent set_var arm damage_to_main_percent.default 50
+!eval "deal_damage('arm', [{'amount': 4, 'tags': ['fire']}, {'amount': 4}])"
+?? 🩸 **Boss** (`boss`) takes 6 damage.
+!assert "entity[boss].hp == 44 and entity[arm].hp == 12"
+!eval "last_damage('boss')"
+?? 'tags': ['part_share']
+?? 'tags': ['fire', 'true_damage']
+!ent heal arm 6
+?? 💚 **Boss** (`boss`) receives 3 healing.
+!assert "entity[boss].hp == 47 and entity[arm].hp == 18"
+!system set default part_heal_to_main_percent_default 25
+!ent hp arm 10
+!ent heal arm 8
+?? 💚 **Boss** (`boss`) receives 2 healing.
+!assert "entity[boss].hp == 49 and entity[arm].hp == 18"
+!ent set_var arm heal_to_main_percent 0
+!ent heal arm 2
+!assert "entity[boss].hp == 49 and entity[arm].hp == 20"
+!system set default part_heal_to_main_percent_default same
+!ent hp boss 47
+!damage step add armor side=defender "step_reduce(1)"
+!ent damage arm 5
+!assert "entity[arm].hp == 16 and entity[boss].hp == 45"
+!system set default part_damage_share_mode pipeline
+!ent damage arm 5
+!assert "entity[arm].hp == 12 and entity[boss].hp == 44"
+!system set default part_damage_share_mode true
+!damage step remove armor
+!ent set_var arm to_main_cap remaining_hp
+!match var set kills ""
+!gpassive add credit on_death "match.kills = fmt('{a}{s}:{k} ', a=match.kills, s=self, k=killer)"
+!ent add k K 10 8 8 1
+!ent damage arm 30 from=k
+?? 🩸 **Boss** (`boss`) takes 6 damage from K.
+?? 💀 **Arm** (`arm`) died.
+?? 💀 **Boss** (`boss`) died.
+!assert "match.kills == 'arm:k boss:k '"
+!system set default part_heal_to_main_percent_default sometimes
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: a packet on a body part runs the part's pipeline and writes,
+then sends a share to the 2x2 body as a packet of its own: per component,
+the first `damage_to_main_percent` filter matching its tags (fire 100%)
+else `default` (50%): 4 + 2 = 6 (boss 50 → 44). The share's components
+carry `true_damage` (part_damage_share_mode `true`) and its packet the
+tag `part_share`. A heal on the part heals the body by the damage percent
+when no heal percent is set (3); a heal rule set to a number (25) wins
+over following the arm's damage percent (8 healing: 2 to the body), and
+the arm's own `heal_to_main_percent 0` wins over the rule. With
+a defender armor step taking 1: in `true` mode the share skips it (arm
+takes 4, the body 2), in `pipeline` mode the share pays it too (the body
+takes 1). `to_main_cap remaining_hp` caps the share's base at the arm's
+12 hp before the hit: 6 to the body; the arm reaching 0 is destroyed and,
+being vital, kills the body: both deaths credit K.
+
+
+SCENARIO 1136 — damage_part and damage_spread are packets: attacker, lines, a broken limb (#25)
+-----------------------------------------------------------------------------------------------
+
+!match new dsp DSP 10 10
+!match use dsp
+!ent add k K 30 1 1 5
+!ent add ogre Ogre 100 4 4 3
+!part add ogre arm Arm 10 10 damage_to_main_percent=50
+!part add ogre leg Leg 10 10 damage_to_main_percent=50
+!ent set_var k actions.smash.target entity
+!ent set_var k actions.smash.body "damage_spread(target, 8, 'uniform')"
+!action k smash ogre
+?? 🩸 **Arm** (`arm`) takes 4 damage from K.
+?? 🩸 **Leg** (`leg`) takes 4 damage from K.
+!assert "entity[ogre].hp == 96 and entity[arm].hp == 6 and entity[leg].hp == 6"
+!eval "last_damage('k', 'dealt')"
+?? 'defender': 'ogre'
+?? 'source': 'action:actions.smash'
+!eval "damage_part('arm', 10, quiet=True)"
+?? = `5`
+?! takes 10
+!assert "entity[arm].hp == 0 and var_get('arm', '__part_destroyed') == True"
+!eval "damage_part('arm', 4)"
+?? = `2`
+!assert "entity[arm].hp == 0 and entity[ogre].hp == 89"
+!eval "damage_part('arm', -1)"
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: damage_spread divides 8 between the two parts (uniform: 4
+each); each is a damage packet on the part with the actor as attacker
+and the action as source, its line, and the part's 50% share to the
+ogre (2 + 2: 96). damage_part is a packet too: quiet drops its lines,
+it returns the hp its share took off the body (5), and the arm stops at
+0 and is destroyed. A hit on the destroyed arm still passes its share on
+(2: 89). A negative amount is refused.
+
+
+SCENARIO 1137 — The forecast in prepare fills incoming; the body rolls the forecast's dice (#25, #36)
+-----------------------------------------------------------------------------------------------------
+
+!match new fi FI 8 8
+!match use fi
+!match rng set seed7 0
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "base = 10\nf = damage_forecast(target, base)"
+!ent set_var orc actions.cleave.body "deal_damage(target, base)"
+!damage step add hide side=defender "step_reduce(roll('1d4'))\nif incoming != None and incoming.block:\n    step_reduce(incoming.block)"
+!ent set_var hero actions.block.reacts_to melee
+!ent set_var hero actions.block.condition "incoming.damage_taken.hp >= 7"
+!ent set_var hero actions.block.before "entity[self].saw = incoming.damage_taken.hp\nentity[self].noise = roll('1d1000')\nincoming.block = 2"
+!action orc cleave hero
+?? Hero can react
+!react hero block
+!assert "entity[hero].saw == 8 and entity[hero].hp == 24"
+!eval "last_damage('hero')"
+?? 'damage_raw': {'hp': 10}
+!ent set_var hero actions.block.condition "incoming.damage_taken.hp >= 100"
+!action orc cleave hero
+?? used action `cleave`
+?! can react
+
+Expected: the orc's `prepare` forecasts its hit (damage_forecast) and
+the forecast lands in the hero's `incoming` copy: the block reaction's
+condition reads `incoming.damage_taken.hp` (10 minus the armor roll) and
+its before half records it (8), rolls a die of its own and sets
+`incoming.block`. A defender step reads `incoming` (the defender's copy)
+and takes the block off. Before the body, the dice go back to where the
+forecast rolled, so the armor roll repeats the forecast's: the hero loses
+exactly the forecast minus the block (6: 24). A condition the forecast doesn't
+meet offers no window.
+
+
+SCENARIO 1138 — Damage lines and views: a hidden attacker, a hidden defender (#25)
+----------------------------------------------------------------------------------
+
+!match new sv SV 8 8
+!match use sv
+!system set default entity_visibility_condition "not status_has(self, 'cloaked')"
+!ent add hero Hero 30 1 1 5
+!ent set_var hero team red
+!ent add orc Orc 20 3 1 4
+!ent set_var orc team blue
+!ent status orc add cloaked
+!as view red
+!ent damage hero 3 from=orc
+?? takes 3 damage from someone.
+?! Orc
+!as view blue
+!ent damage hero 3 from=orc
+?? takes 3 damage from Orc.
+!as view omniscient
+!ent status orc remove cloaked
+!ent status hero add cloaked
+!as view blue
+!eval "deal_damage('hero', 2, attacker='orc')"
+?! takes 2 damage
+!as view omniscient
+!assert "entity[hero].hp == 22"
+
+Expected: a packet's line is a line about its defender, and it names the
+attacker as the channel's view sees it: red can't see the cloaked orc,
+so its line reads "from someone"; blue sees its own orc. A defender the
+view can't see drops the line (blue, the hero cloaked); the damage lands
+all the same (30 → 22).
+
+
+SCENARIO 1139 — A killing blow fires the damage hooks first: endure, a lethal check, kill rewards (#25)
+--------------------------------------------------------------------------------------------------------
+
+!match new kb KB 8 8
+!match use kb
+!ent add a A 30 1 1 5
+!ent add t T 20 3 1 3
+!ent set_var t endure 1
+!passive add t endure on_damage_taken "if entity[self].hp <= 0 and entity[self].endure > 0:\n    entity[self].endure = entity[self].endure - 1\n    entity[self].hp = 1\n    say('{s} endures the blow', s=self)"
+!passive add t rage on_damage_taken priority=1 "if entity[self].hp > 0:\n    entity[self].rage = var_get(self, 'rage', 0) + get(damage_taken, 'hp')"
+!passive add a reward on_damage_dealt "if entity[defender].hp <= 0:\n    entity[self].kills = var_get(self, 'kills', 0) + 1"
+!ent damage t 8 from=a
+!assert "entity[t].rage == 8 and var_get('a', 'kills', 0) == 0"
+!ent damage t 50 from=a
+?? T endures the blow
+?! died
+!assert "entity[t].hp == 1 and entity[t].endure == 0 and entity[t].rage == 8"
+!gpassive add credit on_death "match.last = fmt('{s}:{k}', s=self, k=killer)"
+!ent damage t 50 from=a
+?? died.
+!assert "has_corpse('t') and entity[a].kills == 1 and match.last == 't:a'"
+!log type=death
+?? T (`t`) died
+
+Expected: on_damage_taken and on_damage_dealt run after the packet's
+writes and before its death check, so on a killing blow the defender is
+still in the match at 0 hp or less. T's `endure` passive (once) heals it
+to 1, which saves it: the 50 hit leaves T at 1, no death. A hook that
+shouldn't act on a lethal hit checks the defender's hp: `rage` grows
+only when T survives the hit (8 from the first, nothing from the lethal
+ones); it has priority 1, so it runs before `endure` and reads the hit
+as it landed (at the default 0 it would see endure's heal). A's
+`reward` (on_damage_dealt, after every on_damage_taken hook) counts a
+kill only when the defender's hp is still at 0 or below, so the hit
+endure answered isn't one. The
+third hit kills T: the death check runs once, after the hooks, and
+on_death still credits A.
+
+SCENARIO 1140 — Damage pipeline refusals: a step placed by itself, a total past the largest number, a junk record kind (#25)
+-------------------------------------------------------------------------------------------------------------------------
+
+!match new de DE 8 8
+!match use de
+!ent add boss Boss 50 3 3 5
+!ent set_vars boss footprint_w=2 footprint_h=2
+!damage step add armor side=defender "step_reduce(1)"
+!damage step edit armor before=armor
+?? ❌ a step can't go before or after itself (`armor`).
+!damage step move armor after=armor
+?? ❌ a step can't go before or after itself (`armor`).
+!eval "deal_damage('boss', [{'amount': 1e308}, {'amount': 1e308}])"
+?? ❌ deal_damage: the damage to pool `hp` adds up past the largest number (inf). Nothing was changed.
+!eval "heal('boss', [{'amount': 1e308}, {'amount': 1e308}])"
+?? ❌ heal: the healing to pool `hp` adds up past the largest number (inf).
+!eval "last_damage('boss', [])"
+?? ❌ last_damage(eid, which): which is taken or dealt, not [].
+!eval "step_total(1)"
+?? step_total() takes 0 positional arguments
+!assert "entity[boss].hp == 50 and last_damage('boss') == None"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `before=` / `after=` naming the step being placed is refused
+(it crashed: the step isn't among the ones it is placed between). Two
+components whose sum overflows to infinity are refused before any write;
+`last_damage` refuses a `which` that isn't a word; a wrong-arity call of
+a step_ function names it with its underscore (the message cleaner cut
+`step_total()` to `steptotal()`). The 2x2 boss is untouched.

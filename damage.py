@@ -95,6 +95,18 @@ KINDS: Dict[str, Dict[str, Any]] = {
 # may start with it (user call: a reserved, engine-made tag).
 POOL_TAG_PREFIX = "pool:"
 
+# An action's `prepare` running (reactions._prepare): the forecasts it
+# makes record here, per target, what they came to ({target: {damage_raw:
+# {pool: n}, damage_taken: ...}}, summed over several), plus the RNG
+# position where the first one began (`rng`), for the target's `incoming`
+# copy and the dice rewind before the body (design §10.1).
+PREPARE_FORECAST: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = (
+    contextvars.ContextVar("vtt_damage_prepare", default=None))
+# The exchange whose body is running (match id, seq): a step's `incoming`
+# is the defender's copy of it.
+PACKET_EXCHANGE: "contextvars.ContextVar[Optional[Tuple[str, int]]]" = (
+    contextvars.ContextVar("vtt_damage_exchange", default=None))
+
 # The step being run: its matched components, the whole packet and the
 # kind, for the step_ helpers. None outside a step.
 STEP_FRAME: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = (
@@ -197,6 +209,9 @@ def place_order(steps: Dict[str, Dict[str, Any]], kind: str, side: str,
     if ref is not None:
         if ref not in steps:
             raise NotFound(f"no {kind} step `{ref}`.")
+        if ref == skip:
+            raise VTTError(f"a step can't go before or after itself "
+                           f"(`{ref}`).")
         if steps[ref].get("side") != side:
             raise VTTError(f"`{ref}` is a {steps[ref].get('side')} step: a "
                            f"step goes among the steps of its own side.")
@@ -376,6 +391,9 @@ def pool_totals(m: Any, kind: str,
         sums[c["pool"]] = sums.get(c["pool"], 0) + c["amount"]
     out: Dict[str, int] = {}
     for p, v in sums.items():
+        if not math.isfinite(v):
+            raise VTTError(f"the {info['noun']} to pool `{p}` adds up past "
+                           f"the largest number ({v}).")
         if floor is not None and v < floor:
             v = floor
         out[p] = _rounded(v, mode)
@@ -436,6 +454,7 @@ def _run_step(m: Any, kind: str, name: str, step: Dict[str, Any],
         "components": [ComponentProxy(c, m, kind) for c in matched],
         info["all"]: [ComponentProxy(c, m, kind, read_only=True)
                       for c in comps],
+        "incoming": _step_incoming(m, packet["target"]),
     }
     token = STEP_FRAME.set(frame)
     try:
@@ -463,10 +482,38 @@ def _run_step(m: Any, kind: str, name: str, step: Dict[str, Any],
     return comps
 
 
+def _step_incoming(m: Any, target: str) -> Any:
+    """A step's `incoming`: the defender's copy of the exchange whose body
+    is running (read-only), else None."""
+    cur = PACKET_EXCHANGE.get()
+    if cur is None or cur[0] != m.id:
+        return None
+    from reactions import IncomingProxy, _ex
+    if _ex(m, cur[1]) is None:
+        return None
+    return IncomingProxy(m, cur[1], "", False, uid=target)
+
+
+def _record_forecast(m: Any, kind: str, target: str,
+                     result: Dict[str, Any], rng_at: int) -> None:
+    """A forecast made in a `prepare` (PREPARE_FORECAST): what it came to,
+    added to the target's record, and where the first one's dice began."""
+    frame = PREPARE_FORECAST.get()
+    if frame is None:
+        return
+    info = kind_info(kind)
+    frame.setdefault("rng", rng_at)
+    rec = frame.setdefault("targets", {}).setdefault(target, {})
+    for key, part in ((info["raw"], "raw"), (info["taken"], "taken")):
+        d = rec.setdefault(key, {})
+        for p, v in result[part].items():
+            d[p] = d.get(p, 0) + v
+
+
 def run_packet(m: Any, kind: str, target: str, damage: Any, *,
                pool: Any = None, tags: Any = None, packet_tags: Any = None,
                dealer: Optional[str] = None, source: Optional[str] = None,
-               forecast: bool = False,
+               forecast: bool = False, quiet: bool = False,
                trace: Optional[List[Dict[str, Any]]] = None
                ) -> Dict[str, Any]:
     """Take one packet to `target` (module docstring). Returns {raw,
@@ -482,7 +529,9 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
                               "raw": {}, "taken": {}, "lost": {},
                               "components": [], "dropped": [], "notes": [],
                               "log": [], "skipped": None}
-    if not e.is_alive:
+    # A dead unit takes nothing; a destroyed body part still passes hits on
+    # to a living body (a broken limb).
+    if not (e.is_alive or (e.is_part and m.body_root(e).is_alive)):
         result["skipped"] = "dead"
         result["notes"].append(f"ℹ️ `{target}` is dead: the {info['noun']} "
                                f"isn't dealt.")
@@ -530,22 +579,200 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
             _rollback_match(m, None, pre)
             m.history.rewind(mark)
             m.set_rng(pos=rng)
+    if forecast:
+        _record_forecast(m, kind, target, result, rng)
     if forecast or e is None or target not in m.entities:
         return result
-    _write_pools(m, kind, e, result)
-    _record(m, kind, result)
+    # A body part's share is worked out before anything is written, so a
+    # bad knob (to_main_cap, a percent) refuses the whole hit.
+    share = None
+    if e.is_part:
+        hp_var, mhp_var, _ = e._vital_var_names()
+        try:
+            share = _plan_share(m, kind, result, unit_var(e, hp_var),
+                                unit_var(e, mhp_var))
+        except VTTError as ex:
+            raise VTTError(f"damage_part `{target}`: {ex}"
+                           if kind == "damage" else f"`{target}`: {ex}")
+    # The target's death check is held through the writes, the share and
+    # the hooks, then runs once (design §10.9): on_damage_taken fires on a
+    # killing blow too, with the unit still in the match at 0 hp, and a
+    # hook that heals it above 0 saves it. A hook's own writes to the
+    # target wait for the same check.
+    from logic import PACKET_KILLER
+    held = target not in m._death_check_deferred_ids
+    if held:
+        m._death_check_deferred_ids.add(target)
+    try:
+        _write_pools(m, kind, e, result, quiet)
+        _record(m, kind, result)
+        if e.is_part and share:
+            _send_share(m, kind, result, share, quiet)
+        _fire_hooks(m, kind, result)
+    finally:
+        if held:
+            m._death_check_deferred_ids.discard(target)
+    if held and target in m.entities:
+        token = PACKET_KILLER.set((m.id, target, result["dealer"]))
+        try:
+            result["log"].extend(m.check_death(target))
+        finally:
+            PACKET_KILLER.reset(token)
+    if target in m.entities and m.entities[target].is_part:
+        _part_destroyed(m, kind, result)
     return result
 
 
-def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any]) -> None:
-    """Each pool once through write_var; one death check after all."""
+def _num(v: Any, default: float = 0) -> float:
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) \
+        and math.isfinite(v) else default
+
+
+def _share_percent(m: Any, kind: str, part: Any, comp: Dict[str, Any],
+                   packet_tags: List[str]) -> float:
+    """The percent of component `comp` a body part sends to its parent.
+    Damage: the part's `damage_to_main_percent` var, else the
+    part_damage_to_main_percent_default rule. Healing: the part's
+    `heal_to_main_percent` var, else the part_heal_to_main_percent_default
+    rule when it is a number, else what damage would use (the part's
+    damage var, else the damage rule): an explicit heal percent wins over
+    following the damage one (user call). A var may be a number or a dict
+    of tag filter -> percent with a `default`."""
+    def part_var(name: str) -> Any:
+        found, v = _dict_path_get(part.vars, name)
+        return v if found and v is not None else None
+
+    damage_rule = m.rules.get("part_damage_to_main_percent_default", 0)
+    raw, var, rule = None, None, damage_rule
+    if kind == "healing":
+        raw = part_var("heal_to_main_percent")
+        var = "heal_to_main_percent" if raw is not None else None
+        hr = str(m.rules.get("part_heal_to_main_percent_default", "same"))
+        if hr.strip().lower() != "same":
+            rule = hr
+            if raw is None:
+                raw = hr
+    if raw is None:
+        raw = part_var("damage_to_main_percent")
+        var = "damage_to_main_percent" if raw is not None else None
+    if raw is None:
+        raw = rule
+    if isinstance(raw, dict):
+        pick = None
+        tags = filter_tags(comp, packet_tags)
+        for k, pct in raw.items():
+            if k == "default":
+                continue
+            try:
+                if tag_filter_matches(tags, k):
+                    pick = pct
+                    break
+            except VTTError as ex:
+                raise VTTError(f"{var}: `{k}` isn't a tag filter ({ex}).")
+        if pick is None:
+            pick = raw.get("default", rule)
+        raw = pick
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError):
+        pct = float("nan")
+    if not math.isfinite(pct):
+        where = var if var else "the to-main percent rule"
+        raise VTTError(f"{where}: a to-main percent is a finite number, got "
+                       f"{raw!r}.")
+    return pct
+
+
+def _plan_share(m: Any, kind: str, result: Dict[str, Any], pre_hp: Any,
+                pre_max: Any) -> List[Dict[str, Any]]:
+    """A body part's share to its parent (design §10.5): each component it
+    takes above 0, times its percent (the damage share first capped as a
+    whole by to_main_cap from the part's hp before the hit), tagged
+    true_damage / true_healing under the share-mode rule `true`. [] when
+    there is nothing to send."""
+    info = kind_info(kind)
+    part = m.entities.get(result["target"])
+    if part is None or not part.part_of or part.part_of not in m.entities:
+        return []
+    comps = [c for c in result["components"] if c["amount"] > 0]
+    if not comps:
+        return []
+    tags = list(result.get("packet_tags") or [])
+    factor = 1.0
+    if kind == "damage":
+        cap = str(part.vars.get("to_main_cap",
+                                m.rules.get("part_to_main_cap_default",
+                                            "max_hp")))
+        whole = sum(c["amount"] for c in comps)
+        base = m._part_transfer_base(whole, int(_num(pre_hp)),
+                                     int(_num(pre_max)), cap)
+        factor = base / whole
+    mode = str(m.rules.get(
+        "part_damage_share_mode" if kind == "damage"
+        else "part_heal_share_mode", "true"))
+    share: List[Dict[str, Any]] = []
+    for c in comps:
+        pct = _share_percent(m, kind, part, c, tags)
+        amt = c["amount"] * factor * pct / 100
+        if amt == 0:
+            continue
+        ctags = list(c["tags"])
+        if mode == "true" and info["true_tag"] not in ctags:
+            ctags.append(info["true_tag"])
+        share.append({"amount": amt, "pool": c["pool"], "tags": ctags})
+    return share
+
+
+def _send_share(m: Any, kind: str, result: Dict[str, Any],
+                share: List[Dict[str, Any]], quiet: bool) -> None:
+    """The share goes to the parent as a packet of its own: the hit's
+    dealer and source, its packet tags plus `part_share`."""
+    info = kind_info(kind)
+    part = m.entities.get(result["target"])
+    if part is None or not part.part_of or part.part_of not in m.entities:
+        return
+    tags = list(result.get("packet_tags") or [])
+    res = run_packet(m, kind, part.part_of, share,
+                     packet_tags=tags + (["part_share"]
+                                         if "part_share" not in tags else []),
+                     dealer=result["dealer"], source=result["source"],
+                     quiet=quiet)
+    result["share"] = {"to": part.part_of, info["taken"]: dict(res["taken"])}
+    result["log"].extend(res["notes"] + res["log"])
+
+
+def _part_destroyed(m: Any, kind: str, result: Dict[str, Any]) -> None:
+    """A body part a damage packet brought to 0 hp is destroyed (its
+    on_death once, a vital part kills its body), unless indestructible:
+    after its share reached the body, as damage_part did."""
+    from logic import PACKET_KILLER
+    if kind != "damage":
+        return
+    p = m.entities.get(result["target"])
+    if p is None or not p.is_part or m.is_indestructible(p):
+        return
+    hp = unit_var(p, p._vital_var_names()[0])
+    if not isinstance(hp, (int, float)) or isinstance(hp, bool) or hp > 0:
+        return
+    token = PACKET_KILLER.set((m.id, p.id, result["dealer"]))
+    try:
+        result["log"].extend(m._process_part_death(p))
+    finally:
+        PACKET_KILLER.reset(token)
+
+
+def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any],
+                 quiet: bool = False) -> None:
+    """Each pool once through write_var (a write a packet makes logs no
+    hp_change entry); then the statuses that break, the packet's line and
+    its event-log entry. The target's death check stays held (run_packet
+    runs it once, after the hooks)."""
+    from logic import PACKET_WRITE
     log: List[str] = result["log"]
     target = e.id
     hp_var = str(m.rules.get("hp_var", "hp"))
     skip_hp = m.is_indestructible(e)
-    deferred = target not in m._death_check_deferred_ids
-    if deferred:
-        m._death_check_deferred_ids.add(target)
+    token = PACKET_WRITE.set((m.id, target))
     try:
         for p, amount in result["taken"].items():
             if target not in m.entities:
@@ -558,6 +785,10 @@ def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any]) -> None:
             if isinstance(old, bool) or not isinstance(old, (int, float)):
                 continue
             new = old - amount if kind == "damage" else old + amount
+            if kind == "damage" and p == hp_var and e.is_part and new < 0 \
+                    and old >= 0:
+                # A body part's hp stops at 0 (a destroyed limb lingers).
+                new = 0
             log.extend(e.write_var(p, new) or [])
             now = unit_var(m.entities[target], p) \
                 if target in m.entities else new
@@ -567,10 +798,211 @@ def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any]) -> None:
             else:
                 result["lost"][p] = amount
     finally:
-        if deferred:
-            m._death_check_deferred_ids.discard(target)
-    if deferred and target in m.entities:
-        log.extend(m.check_death(target))
+        PACKET_WRITE.reset(token)
+    if kind == "damage" and target in m.entities:
+        log.extend(_break_statuses(m, result))
+    if target in m.entities:
+        _announce_packet(m, kind, result, quiet)
+    _log_packet(m, kind, result)
+
+
+def counted_damage(result: Dict[str, Any], flt: Any) -> float:
+    """The damage a packet dealt that a status's damage_filter counts: per
+    pool, the pool's damage taken times the share of that pool's positive
+    component amounts the filter matches (no filter: everything taken,
+    pools above 0 only)."""
+    total = 0.0
+    tags = list(result.get("packet_tags") or [])
+    for p, taken in result["taken"].items():
+        if not isinstance(taken, (int, float)) or taken <= 0:
+            continue
+        if not flt:
+            total += taken
+            continue
+        comps = [c for c in result["components"] if c["pool"] == p
+                 and c["amount"] > 0]
+        whole = sum(c["amount"] for c in comps)
+        if whole <= 0:
+            continue
+        hit = sum(c["amount"] for c in comps
+                  if tag_filter_matches(filter_tags(c, tags), flt))
+        total += taken * hit / whole
+    return total
+
+
+def _break_statuses(m: Any, result: Dict[str, Any]) -> List[str]:
+    """#235: the target's statuses with `removed_on_damage` go when the
+    packet's counted damage is above 0 (removed_by `damage`); those with
+    `break_at_damage: N` add it to `damage_counted` and go at N."""
+    from logic import STATUS_DAMAGE_COUNT_KEY
+    log: List[str] = []
+    target = result["target"]
+    e = m.entities.get(target)
+    if e is None or not e.status:
+        return log
+    for name in list(e.status):
+        e = m.entities.get(target)
+        if e is None or name not in e.status:
+            continue
+        inst = e.status[name]
+        rod = m.status_field(inst, name, "removed_on_damage")
+        cap = m.status_field(inst, name, "break_at_damage")
+        if rod is not True and not (
+                isinstance(cap, (int, float)) and not isinstance(cap, bool)):
+            continue
+        flt = m.status_field(inst, name, "damage_filter")
+        try:
+            n = counted_damage(result, flt)
+        except VTTError as ex:
+            log.append(f"⚠️ status `{name}`: its damage_filter doesn't read "
+                       f"({ex}); this hit doesn't count.")
+            continue
+        if n <= 0:
+            continue
+        before = jcopy(inst)
+        gone = rod is True
+        if not gone:
+            had = inst.get(STATUS_DAMAGE_COUNT_KEY, 0) \
+                if isinstance(inst, dict) else 0
+            if isinstance(had, bool) or not isinstance(had, (int, float)):
+                had = 0
+            now = had + n
+            if now == int(now):
+                now = int(now)
+            if now >= cap:
+                gone = True
+            else:
+                inst[STATUS_DAMAGE_COUNT_KEY] = now
+                log.extend(m._emit_status_diff(target, name, before,
+                                               jcopy(inst)))
+                continue
+        del e.status[name]
+        log.extend(m._emit_status_diff(target, name, before, None,
+                                       removed_by="damage"))
+    return log
+
+
+def amounts_text(m: Any, kind: str, taken: Dict[str, Any]) -> str:
+    """`18 damage`, `18 damage and 5 stamina damage` (the default pool
+    unnamed, pools with nothing left out unless all are)."""
+    info = kind_info(kind)
+    try:
+        dpool = resolve_pool(m, None, kind)
+    except VTTError:
+        dpool = None
+    shown = {p: v for p, v in taken.items() if v} \
+        or dict(list(taken.items())[:1])
+    bits = [f"{v}" + ("" if p == dpool else f" {p}") + f" {info['noun']}"
+            for p, v in shown.items()]
+    return " and ".join(bits) or f"no {info['noun']}"
+
+
+def components_text(m: Any, kind: str, comps: List[Dict[str, Any]]) -> str:
+    """`12 slash, 5 fire`."""
+    try:
+        dpool = resolve_pool(m, None, kind)
+    except VTTError:
+        dpool = None
+    return ", ".join(component_text(c, dpool) for c in comps)
+
+
+def _announce_packet(m: Any, kind: str, result: Dict[str, Any],
+                     quiet: bool) -> None:
+    """The packet's line (damage_message_format / healing_message_format),
+    tagged as a line about the target, through surface_log; result['line']
+    records whether one was shown."""
+    info = kind_info(kind)
+    result["line"] = None
+    if quiet:
+        return
+    fmt = str(m.rules.get(f"{kind}_message_format", "") or "")
+    if not fmt:
+        return
+    e = m.entities[result["target"]]
+    first = info["units"][0]
+    dealer = result["dealer"]
+    extra = {
+        "amounts": amounts_text(m, kind, result["taken"]),
+        info["taken"]: dict(result["taken"]),
+        info["lost"]: dict(result["lost"]),
+        info["raw"]: dict(result["raw"]),
+        "components": components_text(m, kind, result["components"]),
+        first: (m.say_name(dealer) if dealer is not None else ""),
+        "source": result["source"] or "",
+    }
+    text = m.render_unit_message(fmt, e.id, e.name, e.x, e.y, e.vars,
+                                 part_of=e.part_of or "", extra=extra)
+    result["line"] = text
+    m.surface_log([m.unit_tag(e.id) + text])
+
+
+def _log_packet(m: Any, kind: str, result: Dict[str, Any]) -> None:
+    """The event-log entry (`damage` / `healing`) of a packet."""
+    info = kind_info(kind)
+    dealer = result["dealer"]
+    m.log_event(kind, entity=result["target"],
+                name=m._entity_name(result["target"]),
+                **{info["sides"][0]: dealer or "",
+                   info["sides"][0] + "_name":
+                   (m._entity_name(dealer) if dealer else "")},
+                source=result["source"] or "",
+                amounts=amounts_text(m, kind, result["taken"]),
+                taken=dict(result["taken"]), lost=dict(result["lost"]))
+
+
+def hook_extras(kind: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """The bindings the packet's hooks see."""
+    info = kind_info(kind)
+    first, second = info["units"]
+    return {
+        first: result["dealer"], second: result["target"],
+        info["source"]: result["source"],
+        info["tags"]: list(result.get("packet_tags") or []),
+        info["taken"]: dict(result["taken"]),
+        info["lost"]: dict(result["lost"]),
+        info["all"]: jcopy(result["components"]),
+    }
+
+
+HOOKS = {"damage": ("on_damage_taken", "on_damage_dealt"),
+         "healing": ("on_healing_received", "on_healing_given")}
+
+
+def _fire_hooks(m: Any, kind: str, result: Dict[str, Any]) -> None:
+    """on_damage_taken on the target (while it is in the match), then
+    on_damage_dealt on the dealer (healing: on_healing_received /
+    on_healing_given), under damage_hook_recursion_limit: a packet dealt
+    from these hooks nests one deeper, and past the limit packets fire no
+    hooks (one warning per chain)."""
+    log: List[str] = result["log"]
+    try:
+        limit = int(m.rules.get("damage_hook_recursion_limit", 16))
+    except (TypeError, ValueError):
+        limit = 16
+    if m._damage_hook_depth >= limit:
+        if not m._damage_hook_warned:
+            m._damage_hook_warned = True
+            log.append(f"⚠️ damage hook recursion limit ({limit}) reached: "
+                       f"the rest of this chain's packets fire no damage or "
+                       f"healing hooks. Check for a loop (thorns hitting "
+                       f"thorns: tag the returned damage and skip it) "
+                       f"(damage_hook_recursion_limit).")
+        return
+    taken_hook, dealt_hook = HOOKS[kind]
+    extras = hook_extras(kind, result)
+    m._damage_hook_depth += 1
+    try:
+        if result["target"] in m.entities:
+            log.extend(m.fire_hook(taken_hook, target_ids=[result["target"]],
+                                   extras=dict(extras, hook_name=taken_hook)))
+        d = result["dealer"]
+        if d is not None and d in m.entities:
+            log.extend(m.fire_hook(dealt_hook, target_ids=[d],
+                                   extras=dict(extras, hook_name=dealt_hook)))
+    finally:
+        m._damage_hook_depth -= 1
+        if m._damage_hook_depth == 0:
+            m._damage_hook_warned = False
 
 
 def packet_record(m: Any, kind: str, result: Dict[str, Any]

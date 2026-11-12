@@ -411,7 +411,8 @@ back, load the schema with `ToolSearch` before calling
   (before halves, re-read, body, after window, after halves),
   `IncomingProxy`, `reactions_used`, `settle_expiry`.
 - **`damage.py`**: the damage pipeline (#25, §7.24): `run_packet`
-  (steps in two phases, pool totals, writes, records, forecast), the
+  (steps in two phases, pool totals, writes, statuses that break, the
+  line, the log entry, records, body-part shares, hooks, forecast), the
   step libraries' order helpers, `ComponentProxy`, the `step_` helpers.
 - **`completion.py`**: Tab completion for a typed line, shared by gui.py and
   cli.py (readline). It walks the typed words through the command's usage
@@ -444,7 +445,8 @@ back, load the schema with `ToolSearch` before calling
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/damage_reactions_design.md`**: the design of reactions (#36,
   agreed, built but for its §13 list, §7.23) and the damage pipeline (#25,
-  agreed in §10, part 1 built, §7.24), which meet at `incoming`. Read it whole before touching
+  agreed in §10, built, §7.24; §10.9 the choices made while building),
+  which meet at `incoming`. Read it whole before touching
   either.
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
@@ -967,8 +969,9 @@ Every class below shipped at least once and was fixed in an audit pass
   the top-level `run_action` flushes it afterwards. Don't drive coroutines
   with `.send(None)`.
 - **The harness masks escape handling** (§4 "Body sources").
-- **Harness-author mistakes that looked like engine bugs:** there is no `!ent
-  damage` (use `!ent hp x -5`; a bare `!ent hp x 5` SETS 5); `!passive add`
+- **Harness-author mistakes that looked like engine bugs:** `!ent damage`
+  runs a damage packet (steps, lines, hooks) while `!ent hp x -5` is a
+  silent write (a bare `!ent hp x 5` SETS 5); `!passive add`
   takes `target=` / `scope=` BEFORE the quoted formula; `!ent move <id> <n>
   <dir>` (count first) but `!ent push <id> <dir> [n]`; the default soft clamp
   caps hp at max_hp, which defaults to the spawn hp; spawning onto an occupied
@@ -1359,7 +1362,11 @@ hardcodes**.
   unit is gone (ghost firing, §5) (882); once a passive removes or kills
   the hook's unit, the rest of that hook's passives, global and team
   ones too, don't run on it, while a hook fired for a unit already gone
-  (on_death, a despawn) still reaches its globals (937).
+  (on_death, a despawn) still reaches its globals (937). A passive's or
+  status hook's lines (`fired on <unit>`, its result or error) are tagged
+  as lines about the unit it fired on (`logic._hook_line_tag`: where it
+  stands, else its corpse's cell), so a channel whose view can't see it
+  drops them (987).
 - **Default passives** (`default_entity_passives`, `!defpassive`): copied
   onto every unit at `Entity.spawn` (`_apply_default_passives`). With
   `default_passives_existing_units` on (default; #221, user call, 1091-1092)
@@ -2416,11 +2423,11 @@ hardcodes**.
   front / back / left / right / center / all / corners; drawn over the parent
   only with a custom glyph, `part_custom_glyph_priority`). 0/0 parts are
   indestructible pass-throughs (`is_indestructible`).
-- **Damage:** only `damage_part(part, n)` routes to main: `to_main_percent`
-  (default `part_to_main_percent_default`), `to_main_cap` (none / max_hp /
-  remaining_hp / absolute:<n ≥ 0> — a typo is refused), `vital`,
-  `indestructible`; the transfer is computed from pre-hit values and applied
-  to the parent first; `rounding_mode`. A destroyed part lingers dead, fires
+- **Damage:** a damage packet on a part (deal_damage, `damage_part(part,
+  n)`, `damage_spread`, `!ent damage`) sends a share to main (§7.24
+  "Body parts": `damage_to_main_percent`, `to_main_cap` (none / max_hp /
+  remaining_hp / absolute:<n ≥ 0> — a typo is refused), the share modes),
+  `vital`, `indestructible`; a raw hp write never does. A destroyed part lingers dead, fires
   on_death once (`__part_destroyed` latch, cleared by any heal above 0) and
   kills the parent if vital. Negative amounts are refused.
   `damage_spread(target, total[, mode, fragments, origin, radius])` divides
@@ -3986,8 +3993,8 @@ lists what isn't built; 1093-1122).
 
 ### 7.24 The damage pipeline
 
-#25 (`damage.py`, design `docs/damage_reactions_design.md` §10; part 1
-built: packets, steps, writes, commands; 1123-1129).
+#25 (`damage.py`, design `docs/damage_reactions_design.md` §10; built
+in full: 1123-1139).
 - **Packets** (`damage.run_packet(m, kind, target, damage, pool=, tags=,
   packet_tags=, dealer=, source=, forecast=, trace=)`, kind `damage` or
   `healing`, `KINDS` holds every per-kind name): components `{amount,
@@ -4023,8 +4030,69 @@ built: packets, steps, writes, commands; 1123-1129).
   damage_records[eid]` (`damage_taken` / `damage_dealt` / `healing_received`
   / `healing_given`, `packet_record`), saved, undo state, dropped in
   `Entity.remove`.
+- **After the writes** (`_write_pools`, then `run_packet`): the target's
+  statuses that break on damage (`_break_statuses`, #235: a status field
+  `removed_on_damage` true, or `break_at_damage: N` counting
+  `damage_counted` in the instance, both narrowed by `damage_filter`;
+  `counted_damage` = per pool the damage taken times the matching share
+  of its positive components; removed_by `damage`), the packet's line
+  (`*_message_format`, `Match.render_unit_message`: unit placeholders,
+  `{amounts}`, `{damage_taken.<pool>}`, `{components}`, `{attacker}` as a
+  say() name marker, `{?key?}...{/?}`; tagged as a line about the target;
+  `quiet` skips it), the event-log entry (`damage` / `healing`; the hp
+  writes run under `logic.PACKET_WRITE`, so write_var logs no
+  `hp_change`, which a raw hp write logs), the records, a body part's
+  share, then the hooks (`_fire_hooks`): `on_damage_taken` on the target,
+  then `on_damage_dealt` on the dealer (`on_healing_received` /
+  `on_healing_given`), extras `hook_extras` (damage_taken / damage_lost
+  per pool, components as dicts), firing on 0 too. The target's death
+  check is held (`_death_check_deferred_ids`, run_packet) through all of
+  it, the hooks' own writes to the target included, and runs ONCE after
+  the hooks under `logic.PACKET_KILLER`, so on_death binds `killer`
+  (`Match.packet_killer`: the target or its body); then a body part at 0
+  hp is destroyed. So on a killing blow the hooks see the defender in
+  the match at 0 hp, and one that heals it saves it (user call: on_damage
+  passives often prevent a death); a hook that mustn't act on a lethal
+  hit tests the defender's hp (1139). Packets dealt from the hooks nest
+  `Match._damage_hook_depth` deep, past `damage_hook_recursion_limit`
+  (16, ceiling) no hooks, one ⚠️ per chain.
+- **Body parts** (design §10.5): a packet on a part (also `damage_part`,
+  `damage_spread`, which route through it) plans the share BEFORE writing
+  (`_plan_share`, so a bad knob refuses the hit): per component above 0,
+  the part's `damage_to_main_percent` var (a number or a dict of tag
+  filter -> percent with `default`) else
+  `part_damage_to_main_percent_default`; healing: the part's
+  `heal_to_main_percent`, else `part_heal_to_main_percent_default` when
+  it is a number, else the damage lookup (`same`; an explicit heal
+  percent wins, user call),
+  the damage share capped as a whole by `to_main_cap` from the part's hp
+  before the hit; tagged `true_damage` / `true_healing` under
+  `part_*_share_mode` `true`. The part's hp stops at 0; then the share
+  goes to the parent as its own packet (packet tag `part_share`, same
+  dealer and source, `_send_share`), and after the part's hooks a part
+  at 0 hp is destroyed (`_process_part_death` under PACKET_KILLER). A destroyed part still
+  takes packets while its body lives. The share rounds by
+  `damage_rounding` (rounding_mode is transform's alone now).
+- **Status source** (#227): `apply_status(..., source=)` stores the
+  applier in the instance (`STATUS_SOURCE_KEY` `__source`; a `none`
+  stack mode changes nothing), `status_apply` / `status_force` default it
+  to the running action's actor (`action.ACTION_ORIGIN`), `!status apply
+  ... source=`; `Match.status_source` reads it while that unit is in the
+  match. `Entity.remove` scrubs it from every unit's statuses;
+  `without_zone_grants` (statblocks, templates, prefabs, copies) and
+  corpses strip it. A status tick's packet takes it as its default
+  attacker.
 - **Forecast**: steps run, then `_rollback_match`, history rewind and the
-  RNG position put back; no writes, no records.
+  RNG position put back; no writes, no records. In a `prepare`
+  (`reactions._prepare` sets `damage.PREPARE_FORECAST`) it records per
+  target `damage_raw` / `damage_taken` (healing_raw / healing_received),
+  summed, and the RNG position of the first one; `_new_exchange` puts them
+  in the targets' `incoming` copies (read `incoming.damage_taken.hp`:
+  `reactions.IncomingDict` reads keys as attributes) and keeps
+  `forecast_rng`; `_body_phase` sets the RNG there before the body (the
+  dice rewind) and after it never leaves it behind where it was. A step's
+  `incoming` is the defender's copy of the exchange whose body runs
+  (`damage.PACKET_EXCHANGE`), else None.
 - **Defaults** (formula.py `_packet_defaults`): a status tick (`status:<n>`),
   a zone hook, a tile hook, else `action.ACTION_ORIGIN` (set by run_action
   around its programs: the actor and `action:<path>`; a reaction's half is
@@ -4035,10 +4103,10 @@ built: packets, steps, writes, commands; 1123-1129).
   `!ent damage` / `!ent heal` (`_ent_packet`), `!damage` / `!healing`
   (`!heal` is a common alias name; `_packet_root`: `step add | edit |
   move | rename | remove | list | info`, `explain` and `last` host-only
-  reads), `!system damage|healing` (`_system_steps`). `!ent hp` stays a
-  silent write. Not built yet (design §10.5, §10.7, §10.1's incoming and
-  dice): body-part shares, break-on-damage statuses, damage lines, hooks,
-  kill credit, packet event-log entries, the forecast feeding `incoming`.
+  reads), `!system damage|healing` (`_system_steps`), `!status
+  removed_on_damage | break_at_damage | damage_filter` (level entries
+  too), `status_source(eid, name)` (read). `!ent hp` stays a silent
+  write (an `hp_change` log entry, no hooks).
 
 ## 8. Open questions, planned work, deferred and rejected ideas
 
@@ -4137,9 +4205,8 @@ hasn't named the next.
   units costs ~1 ms past its own work.
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
-  hit_location), AP / FP / ARC action economy, the damage pipeline (#25,
-  agreed in `docs/damage_reactions_design.md` §10, next to build;
-  reactions are built, §7.23), fancier revive (regrow from a template). Interactive Discord
+  hit_location), AP / FP / ARC action economy (the damage pipeline,
+  #25, and reactions are built, §7.23-§7.24), fancier revive (regrow from a template). Interactive Discord
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.

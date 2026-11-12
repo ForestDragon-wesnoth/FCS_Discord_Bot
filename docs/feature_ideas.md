@@ -13,7 +13,7 @@ full (everything its entry asks for or assumes), its number moves to
 part keeps its entry, trimmed to what is still open. When the user strikes
 or rejects one, it moves to "Off the list".
 
-**Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
+**Shipped:** #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
 #75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #135 (`pending_request_expiry_seconds`), #221 (`default_passives_existing_units`, on by default), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
@@ -42,10 +42,8 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#6 Map markers.** `!map mark <x> <y> [glyph] [label] [turns=N]` puts a temporary mark on the map, optionally visible to one team only. Marks show in the legend.
 - **#10 Once-per-turn / once-per-round limits on passives.** Today each one needs a counter var plus a second passive that resets it.
   - Note: the limits should key on `turns_elapsed`, so they work under ATB. #24's `uses_per_turn` would cover them.
-- **#14 Left-over follow-ups.** One item remains, marked "decide later" by you: configurable side names for the directional functions. (`to_main_percent` per damage type is part of #25's design, §10.5.)
+- **#14 Left-over follow-ups.** One item remains, marked "decide later" by you: configurable side names for the directional functions.
 - **#55 Enable/disable passives and watchers.** `!passive disable/enable`, the same on `!gpassive` and `!watch`, plus a formula function. Useful for testing and for "silenced" statuses.
-- **#56 Status source tracking.** An optional `source` on `status_apply` records who applied it. That gives kill credit for damage over time, "dispel only your own", and "the curse ends when the caster dies".
-  - From the combat systems: covered by #227's `source=`; the source is a tracked reference (#209), so it clears when the unit that applied it leaves the match.
 - **#57 Labelled rolls.** `!roll 1d20+5 attack` labels the result. (Repeats, `!roll 6x 4d6kh3`, shipped with #217.)
 - **#59 `!turn roll [selector]`.** Rerolls initiative for the selected units with an `initiative_roll_formula` rule.
 - **#66 `!redo`.** Keeps the snapshots an undo dropped until the next state-changing command, so an undo can be taken back.
@@ -147,15 +145,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
     - NCS Bulwark (blocks everything) and NCS Rest (no reactions);
     - Solis's crit penalty (a critted hunter loses several actions on their next turn).
   - Every status in all three systems counts down the same way; each tick in the prototypes repeats the decrement and the removal.
-- **#235 Statuses that break on damage.**
-  - Part of #25's design (`docs/damage_reactions_design.md` §10.7): `removed_on_damage` and `break_at_damage` count the damage packets a unit takes, with a tag filter on what counts.
-  - `removed_on_damage: true`: Sleep (all three systems; the turn is skipped, or spent resting in FCS1 and NCS) and Solis Shutdown last until the unit takes any damage.
-  - `break_at_damage: N` counts the damage taken while the status is active and removes it past N:
-    - FCS1 charged actions: "dealing 100 damage will cancel this action", progress shown as "damage: 25/100";
-    - FCS1 Umbral Hound Grab: "deal 400 damage or more in one turn to force the hound to drop them";
-    - FCS1 Focus Arcana: "if damaged, cancel this action".
-  - "Damage" is an hp decrease, or the GM names the var (`damage_var`).
-  - Today this is an hp var hook per status, filtered by status name (`ncs.txt` sleep, `fcs1b.txt` charging).
 - **#236 Short names for item actions.**
   - `!action hero potion.use` (the item's container name plus the action name) and `!action hero use potion` both reach `inventory.potion.actions.use`.
   - Today two items that both have an action called `use` make `!action hero use` ask for the full path, `inventory.potion.actions.use`, and `inventory.potion.use` is refused (`dupact.out`). Items in all three systems share action names (use, attack, block); the groups' old bot had `!use <item>`.
@@ -189,7 +178,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - The game need: Solis dodges ("you can't dodge in the direction of the attacking enemy", some attacks "can't be sidestepped" or "can't be dodged backwards") and FCS1 Lance ("only moves towards the target count").
   - It composes today from two distance comparisons; it is a convenience, under the "simplify only what GMs repeat" rule.
 - **#247 HP change lines.**
-  - Part of #25's design (§10.7): `damage_message_format` / `healing_message_format`, on by default, for packets; a raw `!ent hp` write stays silent.
+  - Packets print their own lines (shipped with #25: `damage_message_format` / `healing_message_format`); what stays open is a line for a raw hp write:
   - A rule `hp_change_message_format` ("{name} takes {amount} damage ({hp}/{max_hp})", plus a heal twin), printed through the same tagged path as the death lines, so a POV that can't see the unit drops it. Empty (the default) prints nothing.
   - The game need: Solis's rules say "after each hp-affecting action, the host must edit the battlers' hp". Today a write from an action or a tick is silent; only `!ent hp` reports ("Damaged `b` by 3").
 - **#248 Roster after each action or turn.**
@@ -280,8 +269,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
       - Solis Agility status: +1 standard move;
       - Solis Slow: −2 sprint speed, and −1 move for units with more than one.
     - Sprint as a resource exchange: Solis spends the standard action for 2 extra tiles; FCS1 pays stamina per extra tile ("cost 5 stamina per extra tile"). FCS1's "prevents the use of ranged attacks that turn" becomes a `this_turn` flag (#243).
-- **#25 Damage pipeline.** Designed with you and agreed; the whole design is `docs/damage_reactions_design.md` §10. Part 1 is built (packets, steps, writes, forecast, records, `!damage` / `!healing`); still open: body-part shares, break-on-damage statuses, damage lines, hooks, kill credit, event-log entries, the forecast feeding `incoming`. `deal_damage` / `heal` run a packet of components (`{amount, pool, tags}`) through a system's ordered `damage_steps` / `healing_steps` (attacker phase, then defender phase), write each pool once, then run the break-on-damage statuses, the damage line, `on_damage_taken` / `on_damage_dealt` (healing twins) and the event-log entry. It folds in #235, #247, #227's `source` and #239's `killer` binding, and #14's per-type share to the main body.
-  - The combat systems it was checked against: Solis (Fire Arrow's +25%, then armor, weakness, resistance), FCS1 (attacker buffs, then block, the defender's percentages, resistance capped at 90%), NCS (block, resistances up to 50%, weaknesses); conversions between pools (FCS1 Brittle, Hollow Bones, Freeze; NCS Magical Body) are steps; true damage is the `true_damage` tag the default step filter leaves out.
 - **#26 Ready / delay a turn.** `!turn delay <after_eid>` moves the current unit to act after another unit this round.
 - **#28 Player-controlled units.** A `controllers` list on a unit; a player's commands on their own unit skip approval.
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
@@ -384,16 +371,14 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - The engine has no combat or inventory by design, so a new GM starts from an empty system. The scenarios show every piece on its own and none of them as a game. A starter system shows the composition, and doubles as a realistic board for the chaos harnesses.
   - Shape depends on #162 (system packs) or a bundled `!store load` save.
 - **#227 Status application options.**
-  - `source=` is part of #25's design (§10.6), for kill credit from damage over time; `data=`, `cap=` and the definition fields stay open here.
-  - `status_apply(eid, name, level=None, duration=None, data=None, source=None, cap=None)`, and the same keys on `!status apply`:
+  - `source=` shipped with #25 (`status_source`, a tick's default attacker); `data=`, `cap=` and the definition fields stay open.
+  - `status_apply(..., data=None, cap=None)`, and the same keys on `!status apply`:
     - `data` is merged into the instance before any add hook runs (L8: possession's new side, the taunter of a Taunted unit);
-    - `source` records who applied it, readable as `status_source(eid, name)` (#56: kill credit for damage over time, "dispel only your own", "the curse ends when the caster dies", NCS Taunted ending with its taunter);
     - `cap` limits the resulting level for this application only (FCS1 weapons: "inflicts lvl 1 burn, can stack up to lvl 2"; the attack scales the cap by the attacker's damage buffs).
   - Definition fields:
     - `cancels: <token>` with `cancel_mode: remove_both | subtract` (Solis: a burn on a frozen unit removes the freeze and doesn't apply; FCS1: burn and freeze subtract levels and the remainder lands);
   - Removes D7 and most of D16. FCS1's "only on ≥ 1 damage" stays in the GM's attack, where the damage is known.
   - From the combat systems:
-    - `source` feeds #239's kill credit for damage over time.
     - FCS1 "statuses from attacks only apply if the target takes at least 1 point of damage" as an `on_damage_only` flag that the GM's damage step reads.
 - **#231 Rules handbook export.**
   - `!match handbook [file]` / `!system handbook <name> [file]` writes a Markdown file to the saves folder (or posts it in parts):
@@ -404,8 +389,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - The user's groups keep their rules as documents (like the three evaluated here) and implement them by hand; this shows the bot's actual version next to the document and keeps the two in step.
   - Reuses #202's function table for formulas it quotes.
 - **#239 Kill credit and damage attribution.**
-  - The `killer` binding on `on_death` is part of #25's design (§10.7); the per-pair tally stays open here, with #240.
-  - `on_death` binds `killer`: the unit whose action, reaction or status tick made the lethal write (a tick through the status's source, #227).
+  - The `killer` binding on `on_death` shipped with #25; the per-pair tally stays open, with #240.
   - The engine keeps a per-match tally of damage dealt and taken per pair of units.
   - The game need: FCS1 rewards that depend on who killed whom.
     - A base human gains 40% of their stamina capacity per kill; Bloodthirst adds more.
@@ -478,7 +462,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 ## Suggested groupings
 
 - **Formula ergonomics:** #89, #194
-- **Status bundle:** #56, #114, #115, #116, #150
+- **Status bundle:** #114, #115, #116, #150
 - **Zone bundle:** #117, #118, #119
 - **Discord table play:** #128, #148, #182, then #28 and #198
 - **Tactical combat:** #16 → #24 → #36
@@ -486,8 +470,8 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 From the combat-systems review (docs/combat_systems_fit.md):
 
-- **Hosting turn-based combat systems:** #28 → #36 slice → #24 + #22 + #23 (with #243, #234, #233) → #227 + #232 → #150 → #222 → #220, #224, #225, #229, #235, #217, #218, #219, #228, #226
-- **Status bundle for the three systems:** #233, #234, #235, #232, #227, #150, #222
+- **Hosting turn-based combat systems:** #28 → #36 slice → #24 + #22 + #23 (with #243, #234, #233) → #227 + #232 → #150 → #222 → #220, #224, #225, #229, #217, #218, #219, #228, #226
+- **Status bundle for the three systems:** #233, #234, #232, #227, #150, #222
 - **After the battle:** #239 → #240, #241; #158 with #251
 - **Discord table comfort:** #247, #248, #254, #255, #244, #245
 - **Behaviour kept in its data:** #200, #208, #201
