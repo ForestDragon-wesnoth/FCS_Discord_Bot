@@ -201,6 +201,11 @@ REACT_STEP: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = \
 # half runs at its exchange's depth + 1; an action's own body at its depth.
 REACT_ORIGIN: "contextvars.ContextVar[Optional[Tuple[int, bool]]]" = \
     contextvars.ContextVar("vtt_react_origin", default=None)
+# The action whose programs run now: (its actor, its full path). A
+# deal_damage / heal in it defaults to that unit and action (#25); a
+# reaction's half runs as its own action, so it names the reacting unit.
+ACTION_ORIGIN: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = \
+    contextvars.ContextVar("vtt_action_origin", default=None)
 
 
 class _RefundWord(str):
@@ -1850,6 +1855,8 @@ async def run_action(
                 # cmd() lines too: `cmd('assert ...')` read through the
                 # caller's reader, so the outcome hung on who ran it (L45).
                 reader_token = VAR_READER.set(None)
+                origin_token = ACTION_ORIGIN.set((actor_id,
+                                                  action.full_path))
                 try:
                     carried: Dict[str, Any] = dict(preset_locals or {})
                     for kind, src in programs:
@@ -1874,6 +1881,7 @@ async def run_action(
                                 body_out.clear()
                                 body_out.update(out_locals)
                 finally:
+                    ACTION_ORIGIN.reset(origin_token)
                     VAR_READER.reset(reader_token)
                     _CROSS_LEVELS.reset(levels_token)
                     CROSS_MATCH_GUARD.reset(guard_token)

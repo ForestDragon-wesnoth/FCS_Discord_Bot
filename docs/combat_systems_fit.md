@@ -180,7 +180,7 @@ Each recipe below was built and run. The cost is what a GM has to write or keep 
 - **D6 Damage calculations shared by all attacks.**
   - Recipe: two to four `!func` expressions, each nested into one line (L7):
     - Solis: armor subtracted (halved against the damage type it is weak to), then the weakness percentage, then the resistance status;
-    - FCS1: percentage buffs added up, with resistance capped at 90% on its own;
+    - FCS1: the attacker's percentage buffs added up, then block, then the defender's percentage effects, with resistance capped at 90% on its own (the rule text's "block, then percentage buffs" meant the defender's, user call);
     - NCS: block first, then resistances added up to 50% (past that the single highest), then weaknesses.
   - All three work (`solis1.out`, `fcs1.out`, `ncs.out`); none is readable.
   - Fix: #216; #25 for ordered steps.

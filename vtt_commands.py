@@ -22,7 +22,7 @@ from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
-from logic import STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
+from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
@@ -216,7 +216,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
 # next`, `!history undo`). Only the bare invocation downgrades — `!undo`,
 # whose bare form itself mutates, deliberately stays gated.
 READ_ONLY_BARE_ROOTS: frozenset = frozenset({
-    "turn", "history", "match", "react",
+    "turn", "history", "match", "react", "damage", "healing",
 })
 # Commands that dispatch arbitrary inner content of their own, so their real
 # authority is NOT visible in args[0]. `!foreach`'s read-only downgrade refuses
@@ -2229,7 +2229,9 @@ def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
                           ("tables", "tables"), ("macros", "macros"),
                           ("tag_vocabulary", "tag vocabulary"),
                           ("watchers", "watchers"),
-                          ("var_labels", "var labels")):
+                          ("var_labels", "var labels"),
+                          ("damage_steps", "damage steps"),
+                          ("healing_steps", "healing steps")):
             la, lb = a.get(lib) or {}, b.get(lib) or {}
             names = sorted(k for k in set(la) | set(lb)
                            if la.get(k) != lb.get(k))
@@ -2539,6 +2541,8 @@ _HOST_READS: Dict[str, Optional[frozenset]] = {
     "map": frozenset({"full"}),
     "list": frozenset({"full"}),
     "state": frozenset({"full"}),
+    "damage": frozenset({"explain", "last"}),
+    "healing": frozenset({"explain", "last"}),
 }
 
 
@@ -4597,12 +4601,14 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                  "funcs": "formula_functions",
                  "statuses": "status_definitions", "tables": "tables",
                  "macros": "macros", "zones": "zone_definitions",
-                 "watchers": "watchers"}
+                 "watchers": "watchers", "damage": "damage_steps",
+                 "healing": "healing_steps"}
         singular = {"aliases": "alias", "tiles": "tile template",
                     "funcs": "formula function",
                     "statuses": "status definition", "tables": "table",
                     "macros": "macro", "zones": "zone definition",
-                    "watchers": "watcher"}
+                    "watchers": "watcher", "damage": "damage step",
+                    "healing": "healing step"}
         kind = args[1].lower()
         if kind not in kinds and kind != "all":
             raise VTTError(f"`{args[1]}` — sync one of: "
@@ -4623,7 +4629,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                "them.")
         _check_tail(["sync", kind] + rest, 3 if kind != "all" else 2, (),
                     "!match sync <aliases|tiles|funcs|statuses|tables|"
-                    "macros|zones|watchers> [name] [reapply] [diff] | "
+                    "macros|zones|watchers|damage|healing> [name] "
+                    "[reapply] [diff] | "
                     "!match sync all [reapply] [diff]")
         want = rest[0] if rest else None
         sysobj = mgr.get_system(m.system_name)
@@ -4921,11 +4928,12 @@ registry.annotate_sub(
           "(the seed predicts every roll); not an undo step."))
 registry.annotate_sub(
     "match", "sync",
-    usage=("!match sync <aliases|tiles|funcs|statuses|tables|macros|zones> "
-           "[name] [reapply] [diff] | !match sync all [reapply] [diff]"),
+    usage=("!match sync <aliases|tiles|funcs|statuses|tables|macros|zones|"
+           "watchers|damage|healing> [name] [reapply] [diff] | !match sync "
+           "all [reapply] [diff]"),
     desc=("Copy the GameSystem's aliases, tile templates, formula "
-          "functions, status definitions, tables, macros or zone "
-          "definitions (its own and "
+          "functions, status definitions, tables, macros, zone "
+          "definitions, watchers or damage / healing steps (its own and "
           "inherited ones; one by name, or all) over this match's. A "
           "system's libraries reach only matches created after an edit by "
           "themselves; this brings a live match up to date. Entries only "
@@ -10448,6 +10456,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_text_lib(ctx, args, mgr, sub)
     if sub == "watch":
         return await _system_watch(ctx, args, mgr)
+    if sub in ("damage", "healing"):
+        return await _system_steps(ctx, args, mgr, sub)
 
     # ---- system alias <subcommand> -----------------------------------
     # System-level alias library. These don't affect any currently live
@@ -10731,6 +10741,11 @@ def _match_formula_slots(m: Match):
             for act in acts:
                 yield from _action_slots(f"`{eid}` action `{act.full_path}`",
                                          act)
+    for lib_name, noun in (("damage_steps", "damage"),
+                           ("healing_steps", "healing")):
+        for sname, step in sorted(getattr(m, lib_name).items()):
+            yield (f"{noun} step `{sname}`", step.get("formula"), "exec",
+                   frozenset(), True)
     for wname, w in sorted(m.watchers.items()):
         yield (f"watcher `{wname}` condition", w.get("condition"), "eval",
                frozenset(), False)
@@ -10906,6 +10921,12 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         check_name(f"function `{fname}`", fname, fn.params)
         check(f"function `{fname}`", fn.body, "exec", sys_known,
               frozenset(fn.params), soft=True)
+    for lib_name, noun in (("damage_steps", "damage"),
+                           ("healing_steps", "healing")):
+        for sname, step in sorted(mgr.system_library(s, lib_name).items()):
+            n += 1
+            check(f"{noun} step `{sname}`", step.get("formula"), "exec",
+                  sys_known, action_mode=True, soft=True)
     for sname, sdef in sorted(
             mgr.system_library(s, "status_definitions").items()):
         sdef = sdef if isinstance(sdef, dict) else {}
@@ -11083,6 +11104,12 @@ def _sync_change(lib_name: str, name: str, old: Any, new: Any) -> str:
         return (f"  `{name}`: "
                 + (f"`{_clip(old, 40)}` → " if old is not None else "")
                 + f"`{_clip(new, 40)}`")
+    if lib_name in ("damage_steps", "healing_steps"):
+        if old is None:
+            return f"  `{name}`: new step ({new.get('side')})"
+        keys = sorted(k for k in set(old) | set(new)
+                      if not same_value(old.get(k), new.get(k)))
+        return f"  `{name}`: changes " + ", ".join(keys)
     if lib_name in ("status_definitions", "zone_definitions"):
         if old is None:
             return f"  `{name}`: new definition"
@@ -13176,6 +13203,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Facing of `{eid}` set to {canon}.")
 
     # hp
+    if sub in ("damage", "heal"):
+        return await _ent_packet(ctx, m, sub, args)
     if sub == "hp":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "hp"):
             return
@@ -13915,6 +13944,24 @@ registry.annotate_sub(
           "changed the result. Optional bypass_clamp=yes skips the clamps "
           "(overheal).")
 )
+registry.annotate_sub(
+    "ent", "damage",
+    usage=("!ent damage <id> <amount> [pool=<var>] [tags=<a,b>] "
+           "[packet_tags=<a,b>] [from=<unit>] [quiet]"),
+    desc=("Deal damage through the damage pipeline (#25): the match's "
+          "damage steps run (attacker steps, then defender steps), then "
+          "each pool is lowered once and the unit's death is checked. "
+          "`pool=` picks the var (default: damage_default_pool, the hp "
+          "var), `tags=` the component's types, `packet_tags=` the hit's, "
+          "`from=` the attacker. `!ent hp` stays a plain write that fires "
+          "nothing of the pipeline."))
+registry.annotate_sub(
+    "ent", "heal",
+    usage=("!ent heal <id> <amount> [pool=<var>] [tags=<a,b>] "
+           "[packet_tags=<a,b>] [from=<unit>] [quiet]"),
+    desc=("Heal through the healing pipeline (#25): the match's healing "
+          "steps run (giver steps, then receiver steps), then each pool is "
+          "raised once. Options as `!ent damage`."))
 registry.annotate_sub(
     "ent", "init",
     usage="!ent init <id> <n>",
@@ -27010,6 +27057,562 @@ registry.annotate_sub("react", "skip", usage="!react skip",
                       desc="(A host) close the open reaction window for "
                            "every unit still to answer; what was picked "
                            "runs.")
+
+
+# ---------------------------------------------------------------------------
+# The damage pipeline (#25, damage.py): `!ent damage` / `!ent heal`, the
+# step libraries (`!damage step`, `!heal step`, `!system damage|heal`) and
+# the reads (`explain`, `last`).
+# ---------------------------------------------------------------------------
+
+_STEP_OPTS = ("side", "filter", "before", "after", "desc")
+_STEP_DELETES = ("remove", "del", "delete", "rm", "drop")
+
+
+def _packet_kwargs(ctx: ReplyContext, m: Match, tail: List[str],
+                   allowed: Tuple[str, ...]) -> Tuple[Dict[str, Any], bool]:
+    """`pool= tags= packet_tags= from=` options (and `quiet`) of a packet
+    command."""
+    opts: Dict[str, Any] = {}
+    quiet = False
+    for t in tail:
+        if t.lower() == "quiet" and "quiet" in allowed:
+            quiet = True
+            continue
+        key, eq, val = t.partition("=")
+        key = key.lower()
+        if not eq or key not in allowed:
+            raise VTTError(f"Unexpected `{t}`: options are "
+                           + ", ".join(f"`{k}=`" if k != "quiet" else "`quiet`"
+                                       for k in allowed) + ".")
+        if key == "from":
+            opts["dealer"] = (None if val in ("", "-", "none")
+                              else _resolve_eid(m, val))
+        elif key in ("tags", "packet_tags"):
+            opts[key] = [w for w in val.split(",") if w]
+        else:
+            opts[key] = val
+    return opts, quiet
+
+
+def _amount_arg(raw: str, what: str) -> float:
+    try:
+        v = float(raw)
+    except ValueError:
+        raise VTTError(f"{what} is a number, not `{raw}`.")
+    if not math.isfinite(v):
+        raise VTTError(f"{what} is a finite number.")
+    return int(v) if v == int(v) else v
+
+
+def _packet_line(m: Match, kind: str, eid: str,
+                 res: Dict[str, Any]) -> str:
+    """`hero` takes 18 damage and 5 stamina damage (hp 40 → 22)."""
+    import damage as _damage
+    info = _damage.kind_info(kind)
+    dpool = _damage.resolve_pool(m, None, kind)
+    shown = {p: v for p, v in res["taken"].items() if v} \
+        or dict(list(res["taken"].items())[:1])
+    bits = [f"{v}" + ("" if p == dpool else f" {p}") + f" {info['noun']}"
+            for p, v in shown.items()]
+    text = f"`{eid}` {info['verb']} " + (" and ".join(bits) or
+                                         f"no {info['noun']}")
+    moved = [f"{p} moved by {res['lost'][p]}" for p in res["taken"]
+             if p in res["lost"] and res["lost"][p] != res["taken"][p]]
+    return text + (f" ({'; '.join(moved)})" if moved else "") + "."
+
+
+def _per_pool_text(d: Dict[str, Any]) -> str:
+    return ", ".join(f"{p} {v}" for p, v in d.items()) or "nothing"
+
+
+async def _ent_packet(ctx: ReplyContext, m: Match, sub: str,
+                      args: List[str]):
+    """`!ent damage|heal <id> <amount> [pool=] [tags=] [packet_tags=]
+    [from=] [quiet]`."""
+    import damage as _damage
+    if await return_help_if_not_enough_args(ctx, args, 3, "ent", sub):
+        return
+    kind = "damage" if sub == "damage" else "healing"
+    eid = _resolve_eid(m, args[1])
+    if eid not in m.entities:
+        raise NotFound(f"Entity '{eid}' not found.")
+    amount = _amount_arg(args[2], "the amount")
+    opts, quiet = _packet_kwargs(ctx, m, list(args[3:]),
+                                 ("pool", "tags", "packet_tags", "from",
+                                  "quiet"))
+    res = _damage.run_packet(
+        m, kind, eid, amount, pool=opts.get("pool"), tags=opts.get("tags"),
+        packet_tags=opts.get("packet_tags"), dealer=opts.get("dealer"),
+        source="command")
+    lines = list(res["notes"])
+    if res["skipped"] is None:
+        lines.append(_packet_line(m, kind, eid, res))
+    lines += res["log"]
+    return await ctx.send("\n".join(lines))
+
+
+def _dmg_step_line(name: str, step: Dict[str, Any], src: str = "") -> str:
+    bits = [step.get("side", "?")]
+    if step.get("filter") not in (None, ""):
+        f = step["filter"]
+        bits.append("filter " + (f if isinstance(f, str)
+                                 else ",".join(map(str, f))))
+    line = f"- `{name}` ({', '.join(bits)}){src}"
+    if step.get("description"):
+        line += f": {step['description']}"
+    return line
+
+
+def _steps_listing(kind: str, steps: Dict[str, Dict[str, Any]],
+                   where: str, own: Optional[Dict[str, Any]] = None
+                   ) -> str:
+    import damage as _damage
+    info = _damage.kind_info(kind)
+    if not steps:
+        return f"No {info['noun']} steps on {where}."
+    lines = [f"**{info['noun'].capitalize()} steps on {where}** (in run "
+             f"order: {info['sides'][0]} steps, then {info['sides'][1]} "
+             f"steps):"]
+    for name, step in _damage.ordered_steps(steps, kind):
+        src = ("" if own is None or name in own else " (inherited)")
+        lines.append(_dmg_step_line(name, step, src))
+    return "\n".join(lines)
+
+
+def _step_info(kind: str, name: str, step: Dict[str, Any],
+               where: str, default_filter: str) -> str:
+    flt = step.get("filter")
+    ftxt = (("`" + (flt if isinstance(flt, str) else ",".join(flt)) + "`")
+            if flt not in (None, "") else
+            f"none (the rule's `{default_filter}`)")
+    lines = [f"**{kind} step `{name}`** on {where}",
+             f"Side: {step.get('side')}; order {step.get('order')}",
+             f"Filter: {ftxt}"]
+    if step.get("description"):
+        lines.append(f"Description: {step['description']}")
+    lines.append(f"Formula:\n```\n{formula_text(step.get('formula', ''))}"
+                 f"\n```")
+    return "\n".join(lines)
+
+
+def _step_formula(src: str, known: frozenset, *,
+                  system: bool) -> Optional[str]:
+    """Validate a step formula (action-mode program: `c.amount = ...`).
+    A call to an unknown function refuses on a match and warns on a
+    system (a match may define it later)."""
+    try:
+        validate_program(src, known_funcs=known, action_mode=True)
+    except FormulaError as ex:
+        msg = str(ex)
+        unknown = re.match(r"Function '(\w+)' is not allowed\.", msg)
+        if system and unknown:
+            return (f"⚠️ It calls `{unknown.group(1)}`, which the system "
+                    f"doesn't define: the step fails until a match does.")
+        raise VTTError(f"step formula: {msg}")
+    return None
+
+
+def _steps_edit(kind: str, steps: Dict[str, Dict[str, Any]],
+                action: str, rest: List[str], known: frozenset,
+                usage: str, *, system: bool = False) -> str:
+    """One edit of a step library in place (a match's or a system's
+    effective one); returns the reply."""
+    import damage as _damage
+    info = _damage.kind_info(kind)
+    noun = info["noun"]
+    opts: Dict[str, str] = {}
+    pos: List[str] = []
+    for t in rest:
+        key, eq, val = t.partition("=")
+        if eq and key.lower() in _STEP_OPTS and "\n" not in key \
+                and " " not in key:
+            opts[key.lower()] = val
+        else:
+            pos.append(t)
+    if not pos:
+        raise VTTError(f"Usage: `{usage}`.")
+    name = pos[0]
+    if action in ("add", "edit"):
+        if action == "add":
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise VTTError(f"`{name}`: a step name is letters, digits "
+                               f"and _ (not starting with a digit).")
+            if name in steps:
+                raise VTTError(f"{noun} step `{name}` exists: `edit` "
+                               f"changes it.")
+            if len(pos) != 2:
+                raise VTTError(f"Usage: `{usage}` (the formula is one "
+                               f"quoted word, after the options).")
+            step: Dict[str, Any] = {"side": opts.get("side",
+                                                     info["sides"][1])}
+        else:
+            if name not in steps:
+                raise NotFound(f"no {noun} step `{name}`.")
+            if len(pos) > 2:
+                raise VTTError(f"Usage: `{usage}`.")
+            step = dict(steps[name])
+            if "side" in opts:
+                step["side"] = opts["side"]
+        warn = None
+        if len(pos) == 2:
+            src = normalize_body_source(pos[1]).strip()
+            if not src:
+                raise VTTError("the step's formula is empty.")
+            warn = _step_formula(src, known, system=system)
+            step["formula"] = src
+        if "filter" in opts:
+            if opts["filter"] in ("", "-"):
+                step.pop("filter", None)
+            else:
+                step["filter"] = opts["filter"]
+        if "desc" in opts:
+            if opts["desc"] in ("", "-"):
+                step.pop("description", None)
+            else:
+                step["description"] = opts["desc"]
+        if "before" in opts and "after" in opts:
+            raise VTTError("`before=` or `after=`, not both.")
+        step = _damage.normalize_step(kind, dict(step, order=0))
+        moved = action == "add" or "side" in opts or "before" in opts \
+            or "after" in opts
+        if moved:
+            step["order"] = _damage.place_order(
+                steps, kind, step["side"], before=opts.get("before"),
+                after=opts.get("after"), skip=name)
+        else:
+            step["order"] = steps[name].get("order", 0)
+        steps[name] = step
+        if moved:
+            _damage.renumber(steps, kind)
+        verb = "Added" if action == "add" else "Changed"
+        return (f"{verb} {noun} step `{name}` ({step['side']})."
+                + (f"\n{warn}" if warn else ""))
+    if action == "move":
+        if len(pos) != 1 or not ("before" in opts) ^ ("after" in opts) \
+                or set(opts) - {"before", "after"}:
+            raise VTTError("Usage: `... move <name> before=<step>` or "
+                           "`after=<step>`.")
+        if name not in steps:
+            raise NotFound(f"no {noun} step `{name}`.")
+        steps[name]["order"] = _damage.place_order(
+            steps, kind, steps[name]["side"], before=opts.get("before"),
+            after=opts.get("after"), skip=name)
+        _damage.renumber(steps, kind)
+        return f"Moved {noun} step `{name}`."
+    if opts:
+        raise VTTError(f"Usage: `{usage}`.")
+    if action == "rename":
+        if len(pos) != 2:
+            raise VTTError(f"Usage: `{usage}`.")
+        new = pos[1]
+        if name not in steps:
+            raise NotFound(f"no {noun} step `{name}`.")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", new):
+            raise VTTError(f"`{new}`: a step name is letters, digits and _.")
+        if new in steps:
+            raise VTTError(f"{noun} step `{new}` exists.")
+        items = list(steps.items())
+        steps.clear()
+        steps.update({(new if k == name else k): v for k, v in items})
+        return f"Renamed {noun} step `{name}` to `{new}`."
+    if action in _STEP_DELETES:
+        if len(pos) != 1:
+            raise VTTError(f"Usage: `{usage}`.")
+        if name not in steps:
+            raise NotFound(f"no {noun} step `{name}`.")
+        del steps[name]
+        return f"Removed {noun} step `{name}`."
+    raise VTTError(f"Usage: `{usage}`.")
+
+
+_STEP_ACTIONS = ("list", "info", "add", "edit", "move", "rename",
+                 *_STEP_DELETES)
+
+
+def _step_usage(root: str) -> str:
+    return (f"!{root} step <list | info <name> | add <name> [side=<side>] "
+            f"[filter=<tags>] [before=<step> | after=<step>] [desc=<text>] "
+            f"<formula> | edit <name> [side=<side>] [filter=<tags>|-] "
+            f"[desc=<text>|-] [before=<step> | after=<step>] [<formula>] | "
+            f"move <name> <before=<step> | after=<step>> | rename <name> "
+            f"<new_name> | remove <name>>")
+
+
+def _explain_text(kind: str, res: Dict[str, Any],
+                  trace: List[Dict[str, Any]], dealer: Optional[str],
+                  target: str, m: Match) -> str:
+    import damage as _damage
+    info = _damage.kind_info(kind)
+    dpool = _damage.resolve_pool(m, None, kind)
+    lines = [f"**{info['noun'].capitalize()} forecast** for `{target}`"
+             + (f" from `{dealer}`" if dealer else "") + ":"]
+    side_now = None
+    for i, t in enumerate(trace, 1):
+        if t["side"] != side_now:
+            side_now = t["side"]
+            lines.append(f"{side_now.capitalize()} steps:")
+        flt = t.get("filter")
+        ftxt = (flt if isinstance(flt, str) else ",".join(flt or [])) \
+            if flt not in (None, "") else ""
+        head = f"  {i}. `{t['step']}`" + (f" [{ftxt}]" if ftxt else "")
+        if t["status"] == "skipped":
+            lines.append(head + " skipped"
+                         + (f" ({t['why']})" if t.get("why")
+                            else " (no component matched)"))
+        elif t["status"] == "error":
+            lines.append(head + f" failed, skipped: {t.get('error')}")
+        else:
+            def _ct(cs: List[Dict[str, Any]]) -> str:
+                return "; ".join(_damage.component_text(c, dpool)
+                                 for c in cs) or "nothing"
+            lines.append(head + f": {_ct(t['before'])} → {_ct(t['after'])}")
+    if not trace:
+        lines.append(f"(no {info['noun']} steps)")
+    lines.append(f"Raw ({info['sides'][0]} steps): "
+                 f"{_per_pool_text(res['raw'])}")
+    lines.append(f"Taken ({info['sides'][1]} steps, rounded): "
+                 f"{_per_pool_text(res['taken'])}")
+    for p in res["dropped"]:
+        lines.append(f"Dropped: `{target}` has no number at `{p}`.")
+    return "\n".join(lines)
+
+
+def _record_text(m: Match, kind: str, rec: Dict[str, Any], eid: str,
+                 which: str) -> str:
+    import damage as _damage
+    info = _damage.kind_info(kind)
+    first, second = info["units"]
+    dpool = _damage.resolve_pool(m, None, kind)
+    comps = "; ".join(_damage.component_text(c, dpool)
+                      for c in rec.get("components") or []) or "none"
+    lines = [f"**Last {info['noun']} `{eid}` {which}** (turn "
+             f"{rec.get('turn', 0)}):",
+             f"{first}: {rec.get(first) or 'none'}; {second}: "
+             f"{rec.get(second)}; source: {rec.get('source') or 'none'}",
+             f"Packet tags: {', '.join(rec.get('tags') or []) or 'none'}",
+             f"Components after the steps: {comps}",
+             f"Raw: {_per_pool_text(rec.get(info['raw']) or {})}; taken: "
+             f"{_per_pool_text(rec.get(info['taken']) or {})}; the vars "
+             f"moved by: {_per_pool_text(rec.get(info['lost']) or {})}"]
+    return "\n".join(lines)
+
+
+async def _packet_root(ctx: ReplyContext, args: List[str],
+                       mgr: MatchManager, root: str):
+    import damage as _damage
+    kind = "damage" if root == "damage" else "healing"
+    info = _damage.kind_info(kind)
+    m = active_match(mgr, ctx)
+    if not args:
+        return await ctx.send(_steps_listing(kind, getattr(m, info["lib"]),
+                                             f"`{m.id}`"))
+    sub = args[0].lower()
+    if sub == "step":
+        if len(args) < 2:
+            return await ctx.send(_steps_listing(
+                kind, getattr(m, info["lib"]), f"`{m.id}`"))
+        action = args[1].lower()
+        steps = getattr(m, info["lib"])
+        if action == "list":
+            _check_tail(args, 2, (), f"!{root} step list")
+            return await ctx.send(_steps_listing(kind, steps, f"`{m.id}`"))
+        if action == "info":
+            _check_tail(args, 3, (), f"!{root} step info <name>")
+            if len(args) < 3:
+                raise VTTError(f"Usage: `!{root} step info <name>`.")
+            if args[2] not in steps:
+                raise NotFound(f"no {info['noun']} step `{args[2]}` on "
+                               f"`{m.id}`.")
+            return await ctx.send(_step_info(
+                info["noun"], args[2], steps[args[2]], f"`{m.id}`",
+                str(m.rules.get(info["filter_rule"], ""))))
+        if action not in _STEP_ACTIONS:
+            return await _help_fallback(ctx, [root, "step"], args[1])
+        work = jcopy(steps)
+        reply = _steps_edit(kind, work, action, list(args[2:]),
+                            frozenset(m.formula_functions),
+                            _step_usage(root))
+        setattr(m, info["lib"], work)
+        return await ctx.send(reply)
+    if sub == "explain":
+        if len(args) < 4:
+            raise VTTError(f"Usage: `!{root} explain <{info['sides'][0]} | "
+                           f"-> <target> <amount> [pool=] [tags=] "
+                           f"[packet_tags=]`.")
+        dealer = None if args[1] in ("-", "none") else _query_eid(ctx, m,
+                                                                  args[1])
+        target = _query_eid(ctx, m, args[2])
+        amount = _amount_arg(args[3], "the amount")
+        opts, _q = _packet_kwargs(ctx, m, list(args[4:]),
+                                  ("pool", "tags", "packet_tags"))
+        trace: List[Dict[str, Any]] = []
+        res = _damage.run_packet(
+            m, kind, target, amount, pool=opts.get("pool"),
+            tags=opts.get("tags"), packet_tags=opts.get("packet_tags"),
+            dealer=dealer, source="explain", forecast=True, trace=trace)
+        if res["skipped"]:
+            return await ctx.send("\n".join(res["notes"]))
+        # (The trace names failed steps and dropped pools already.)
+        notes = [n for n in res["notes"] if not n.startswith("ℹ️ `")
+                 and f"{info['noun']} step `" not in n]
+        return await ctx.send("\n".join(
+            [_explain_text(kind, res, trace, dealer, target, m)] + notes))
+    if sub == "last":
+        if len(args) < 2:
+            raise VTTError(f"Usage: `!{root} last <unit> "
+                           + ("[dealt]`." if kind == "damage"
+                              else "[given]`."))
+        which = "taken" if kind == "damage" else "received"
+        if len(args) > 2:
+            want = args[2].lower()
+            other = "dealt" if kind == "damage" else "given"
+            if want != other:
+                raise VTTError(f"`{args[2]}`: the word after the unit is "
+                               f"`{other}`.")
+            _check_tail(args, 3, (), f"!{root} last <unit> [{other}]")
+            which = other
+        eid = _query_eid(ctx, m, args[1])
+        key = info["rec_target"] if which in ("taken", "received") \
+            else info["rec_dealer"]
+        rec = (m.damage_records.get(eid) or {}).get(key)
+        if rec is None:
+            return await ctx.send(f"`{eid}` has no {info['noun']} packet "
+                                  f"{which} on record.")
+        return await ctx.send(_record_text(m, kind, rec, eid, which))
+    return await _help_fallback(ctx, [root], args[0])
+
+
+@registry.command(
+    "damage",
+    usage="!damage [step ... | explain ... | last ...]",
+    desc=(
+        "The damage pipeline (#25): a packet of components {amount, pool, "
+        "tags} runs through the match's ordered damage steps, every "
+        "attacker step then every defender step, and each pool is lowered "
+        "once (`deal_damage`, `!ent damage`). Bare `!damage` lists the "
+        "steps. See docs/damage_reactions_design.md §10."
+    ),
+)
+async def damage_cmd(ctx: ReplyContext, args: List[str],
+                     mgr: MatchManager):
+    return await _packet_root(ctx, args, mgr, "damage")
+
+
+@registry.command(
+    "healing",
+    usage="!healing [step ... | explain ... | last ...]",
+    desc=(
+        "The healing pipeline (#25), the damage pipeline's twin: giver "
+        "steps, then receiver steps, then each pool raised once (`heal`, "
+        "`!ent heal`). Bare `!healing` lists the steps."
+    ),
+)
+async def healing_cmd(ctx: ReplyContext, args: List[str],
+                      mgr: MatchManager):
+    return await _packet_root(ctx, args, mgr, "healing")
+
+
+for _root, _kind_word, _sides, _other in (
+        ("damage", "damage", "attacker / defender", "dealt"),
+        ("healing", "healing", "giver / receiver", "given")):
+    registry.annotate_sub(
+        _root, "step", usage=_step_usage(_root),
+        desc=(f"The match's {_kind_word} steps, in run order: every first-"
+              f"side step, then every second-side one (sides {_sides}; "
+              f"default the second). A step runs once per packet on the "
+              f"components its tag filter matches (their tags, the "
+              f"packet's tags and `pool:<var>`; no filter = the "
+              f"{_kind_word}_step_default_filter rule). Its formula edits "
+              f"them: `for c in components: c.amount = c.amount * 2`, or "
+              f"the step_ functions (step_scale, step_add, step_reduce, "
+              f"step_mods, step_move, step_new, step_drop, step_total). "
+              f"`before=` / `after=` place it among its side's steps; "
+              f"`edit` changes what it names (`filter=-` clears). The "
+              f"system's steps (`!system {_root}`) are copied into each new "
+              f"match; `!match sync {_kind_word}` takes them later."))
+    registry.annotate_sub(
+        _root, "explain",
+        usage=(f"!{_root} explain <{_sides.split(' / ')[0]} | -> <target> "
+               f"<amount> [pool=<var>] [tags=<a,b>] [packet_tags=<a,b>]"),
+        desc=(f"Run a {_kind_word} packet as a forecast (nothing changes) "
+              f"and list each step: the components before and after it, "
+              f"steps skipped (no match) or failed, the raw and the taken "
+              f"amounts per pool. Names steps and filters, never formula "
+              f"text. Hosts only."))
+    registry.annotate_sub(
+        _root, "last",
+        usage=f"!{_root} last <unit> [{_other}]",
+        desc=(f"The last {_kind_word} packet the unit took (`{_other}`: "
+              f"the last one it {_other}), as saved with the match: who, "
+              f"the source, the components after the steps, the amounts "
+              f"per pool. Hosts only."))
+
+
+async def _system_steps(ctx: ReplyContext, args: List[str],
+                        mgr: MatchManager, sub: str):
+    """`!system damage|heal <action> <system> ...`: a system's step
+    library, with the grammar of `!damage step`."""
+    import damage as _damage
+    kind = "damage" if sub == "damage" else "healing"
+    info = _damage.kind_info(kind)
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", sub):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    lib_name = info["lib"]
+    lib = mgr.system_library(s, lib_name)
+    if action == "list":
+        _check_tail(args, 3, (), f"!system {sub} list <system>")
+        return await ctx.send(_steps_listing(
+            kind, lib, f"system `{sys_name}`", own=getattr(s, lib_name))
+            + "".join("\n" + x for x in _system_hidden_line(s, lib_name)))
+    if action == "info":
+        _check_tail(args, 4, (), f"!system {sub} info <system> <name>")
+        if len(args) < 4 or args[3] not in lib:
+            raise NotFound(f"system `{sys_name}` has no {info['noun']} "
+                           f"step `{args[3] if len(args) > 3 else ''}`.")
+        return await ctx.send(_step_info(
+            info["noun"], args[3], lib[args[3]], f"system `{sys_name}`",
+            str(mgr.system_value(s, info["filter_rule"]))))
+    if action == "promote":
+        _check_tail(args, 4, (), f"!system {sub} promote <system> <name>")
+        m = active_match(mgr, ctx)
+        steps = getattr(m, lib_name)
+        if len(args) < 4 or args[3] not in steps:
+            raise NotFound(f"{info['noun']} step "
+                           f"`{args[3] if len(args) > 3 else ''}` isn't on "
+                           f"match `{m.id}`.")
+        prior = lib.get(args[3])
+        lib[args[3]] = jcopy(steps[args[3]])
+        mgr.system_library_write(s, lib_name, lib)
+        return await ctx.send(_promoted_line(
+            f"{info['noun']} step", f"`{args[3]}`", m.id, sys_name,
+            prior is not None, prior == lib[args[3]]))
+    if action not in _STEP_ACTIONS:
+        return await _help_fallback(ctx, ["system", sub], args[1])
+    known = frozenset(mgr.system_library(s, "formula_functions"))
+    reply = _steps_edit(kind, lib, action, list(args[3:]), known,
+                        _step_usage(f"system {sub}").replace(
+                            "step <", "<").replace("<list", "<list <system>"),
+                        system=True)
+    mgr.system_library_write(s, lib_name, lib)
+    return await ctx.send(reply + f" (system `{sys_name}`)")
+
+
+for _sub, _kind_word in (("damage", "damage"), ("healing", "healing")):
+    registry.annotate_sub(
+        "system", _sub,
+        usage=(f"!system {_sub} <list <system> | info <system> <name> | "
+               f"add <system> <name> ... | edit <system> <name> ... | "
+               f"move <system> <name> ... | rename <system> <name> "
+               f"<new_name> | remove <system> <name> | promote <system> "
+               f"<name>>"),
+        desc=(f"A GameSystem's {_kind_word} steps, with the grammar of "
+              f"`!{_sub} step` (the system name after the action). Copied "
+              f"into every NEW match on the system; a live match takes "
+              f"them with `!match sync {_kind_word}`. `promote <sys> "
+              f"<name>` copies one from the channel's match."))
 
 
 def _reaction_held(name: str, args: List[str]) -> bool:

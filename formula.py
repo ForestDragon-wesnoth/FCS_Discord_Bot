@@ -395,7 +395,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy
 
 
 class FormulaError(VTTError):
@@ -2925,6 +2925,13 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
     # Reactions (#36): how many reactions a unit used since a point.
     "reactions_used",
+    # The damage pipeline (#25, damage.py): packets through the steps, the
+    # forecasts, the saved last packets and the step_ helpers (only inside
+    # a damage or healing step).
+    "deal_damage", "heal", "damage_forecast", "healing_forecast",
+    "last_damage", "last_healing",
+    "step_scale", "step_add", "step_reduce", "step_mods", "step_move",
+    "step_new", "step_drop", "step_total",
     # Void cells: cells of a map's rectangle that don't exist.
     "is_void", "void_cells", "void_add", "void_remove",
     # A status's layers (layered stacking), [[level, duration], ...].
@@ -3055,6 +3062,11 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
 # reminder, never a silent default-allow). The _ALLOWED_FUNCS pure helpers
 # (min/max/roll/distance/band/...) are all read-only and always permitted.
 ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    # The forecasts run the GM's steps (rolled back after), and the step_
+    # helpers only work inside a step.
+    "deal_damage", "heal", "damage_forecast", "healing_forecast",
+    "step_scale", "step_add", "step_reduce", "step_mods", "step_move",
+    "step_new", "step_drop", "step_total",
     "map_var_set", "map_var_del", "transfer_entity",
     "grant_turn", "clear_extra_turns",
     "void_add", "void_remove",
@@ -3100,6 +3112,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "reactions_used",
+    "last_damage", "last_healing",
     "is_void", "void_cells",
     "status_layers",
     'watch_exists', 'watchers_of',
@@ -3592,6 +3605,15 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # `incoming.cancel = True`); the units the action directly affects;
     # and the word `fail(refund)` reads (None outside an action body).
     "incoming", "affected", "refund",
+    # The damage pipeline (#25): what a damage / healing step sees. The
+    # unit bindings are attacker / defender (above) for damage and
+    # healing_giver / healing_receiver for healing; `components` are the
+    # components the step's filter matched (editable), the *_components
+    # every one of the packet (read-only).
+    "healing_giver", "healing_receiver",
+    "damage_source", "damage_tags", "damage_components",
+    "healing_source", "healing_tags", "healing_components",
+    "components",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -3708,7 +3730,9 @@ _ANY_MODE_ATTR_ROOTS = frozenset({"incoming"})
 # `for x in target:` work for *_list target types. The runtime will
 # error cleanly if the loop runs against a non-iterable (e.g. for a
 # target=entity action where the GM iterates `target`).
-_ACTION_LOOPABLE_NAMES = frozenset({"target", "affected"})
+_ACTION_LOOPABLE_NAMES = frozenset({"target", "affected", "components",
+                                    "damage_components",
+                                    "healing_components"})
 
 
 def _collect_program_locals(tree: ast.AST,
@@ -9316,6 +9340,179 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(str(ex))
         ns["reactions_used"] = _reactions_used
+
+        # ---- the damage pipeline (#25, damage.py) ----
+        _UNSET = object()
+
+        def _packet_defaults(dealer: Any, source: Any) -> Tuple[Any, Any]:
+            """The dealer and source a packet gets from where the formula
+            runs: a status tick (the status), a zone or tile hook, an
+            action body or a reaction's half (its unit and the action)."""
+            import action as _action
+            ex = ctx.extras or {}
+            d_dealer, d_source = None, None
+            if ex.get("status_name"):
+                d_source = f"status:{ex['status_name']}"
+            elif ex.get("zone_name"):
+                d_source = f"zone:{ex['zone_name']}"
+            elif ex.get("tile_x") is not None:
+                d_source = (f"tile:{ex.get('tile_x')},{ex.get('tile_y')}"
+                            + (f",{ex['tile_map']}" if ex.get("tile_map")
+                               else ""))
+            else:
+                origin = _action.ACTION_ORIGIN.get()
+                if origin is not None:
+                    d_dealer, d_source = origin[0], f"action:{origin[1]}"
+            if dealer is not _UNSET:
+                if dealer is None:
+                    d_dealer = None
+                else:
+                    d_dealer, _e = _resolve_entity(dealer, "deal_damage")
+            if source is not _UNSET:
+                d_source = None if source is None else str(source)
+            return d_dealer, d_source
+
+        def _packet(kind: str, fname: str, target: Any, amount: Any,
+                    pool: Any, tags: Any, packet_tags: Any, dealer: Any,
+                    source: Any, forecast: bool) -> Dict[str, Any]:
+            import damage as _damage
+            tid, _te = _resolve_entity(target, fname)
+            who, src = _packet_defaults(dealer, source)
+            try:
+                res = _damage.run_packet(
+                    match, kind, tid, amount, pool=pool, tags=tags,
+                    packet_tags=packet_tags, dealer=who, source=src,
+                    forecast=forecast)
+            except VTTError as ex:
+                raise FormulaError(f"{fname}: {ex}")
+            match.surface_log(res["notes"] + res["log"])
+            return res
+
+        def _deal_damage(target: Any, damage: Any, pool: Any = None,
+                         tags: Any = None, packet_tags: Any = None,
+                         attacker: Any = _UNSET, source: Any = _UNSET,
+                         quiet: Any = False) -> Dict[str, Any]:
+            """deal_damage(target, damage, pool=None, tags=None,
+            packet_tags=None, attacker=..., source=..., quiet=False): run a
+            damage packet through the match's damage steps (attacker steps,
+            then defender steps) and lower each pool once. `damage` is a
+            number (one component) or a list of {amount, pool, tags};
+            `pool` / `tags` fill in components without their own (pool
+            default: the damage_default_pool rule, the hp var). `attacker`
+            and `source` default from where it runs (an action: its unit
+            and the action; a status tick, a tile or zone hook: that).
+            Returns the damage taken per pool ({'hp': 18})."""
+            return dict(_packet("damage", "deal_damage", target, damage,
+                                pool, tags, packet_tags, attacker, source,
+                                False)["taken"])
+
+        def _heal(target: Any, healing: Any, pool: Any = None,
+                  tags: Any = None, packet_tags: Any = None,
+                  healer: Any = _UNSET, source: Any = _UNSET,
+                  quiet: Any = False) -> Dict[str, Any]:
+            """heal(target, healing, pool=None, tags=None, packet_tags=None,
+            healer=..., source=..., quiet=False): run a healing packet
+            through the match's healing steps (giver steps, then receiver
+            steps) and raise each pool once; as deal_damage. Returns the
+            healing received per pool."""
+            return dict(_packet("healing", "heal", target, healing, pool,
+                                tags, packet_tags, healer, source,
+                                False)["taken"])
+
+        def _damage_forecast(target: Any, damage: Any, pool: Any = None,
+                             tags: Any = None, packet_tags: Any = None,
+                             attacker: Any = _UNSET,
+                             source: Any = _UNSET) -> Dict[str, Any]:
+            """damage_forecast(target, damage, ...): what deal_damage would
+            do, changing nothing (the steps run, then the match is put
+            back): {'damage_raw': {pool: n}, 'damage_taken': {pool: n}},
+            raw after the attacker's steps, taken after the defender's."""
+            res = _packet("damage", "damage_forecast", target, damage, pool,
+                          tags, packet_tags, attacker, source, True)
+            return {"damage_raw": dict(res["raw"]),
+                    "damage_taken": dict(res["taken"])}
+
+        def _healing_forecast(target: Any, healing: Any, pool: Any = None,
+                              tags: Any = None, packet_tags: Any = None,
+                              healer: Any = _UNSET,
+                              source: Any = _UNSET) -> Dict[str, Any]:
+            """healing_forecast(target, healing, ...): what heal would do,
+            changing nothing: {'healing_raw': ..., 'healing_received':
+            ...} per pool."""
+            res = _packet("healing", "healing_forecast", target, healing,
+                          pool, tags, packet_tags, healer, source, True)
+            return {"healing_raw": dict(res["raw"]),
+                    "healing_received": dict(res["taken"])}
+
+        def _last_packet(fname: str, kind: str, eid_t: Any,
+                         which: Any) -> Any:
+            import damage as _damage
+            eid, _e = _resolve_entity(eid_t, fname)
+            info = _damage.kind_info(kind)
+            keys = ({"taken": info["rec_target"],
+                     "dealt": info["rec_dealer"]} if kind == "damage"
+                    else {"received": info["rec_target"],
+                          "given": info["rec_dealer"]})
+            if which not in keys:
+                raise FormulaError(
+                    f"{fname}(eid, which): which is "
+                    + ("taken or dealt" if kind == "damage"
+                       else "received or given") + f", not {which!r}.")
+            rec = (match.damage_records.get(eid) or {}).get(keys[which])
+            return jcopy(rec) if rec is not None else None
+
+        def _last_damage(eid_t: Any, which: Any = "taken") -> Any:
+            """last_damage(eid, which='taken'): the last damage packet unit
+            `eid` took (`dealt`: the last one it dealt), or None: attacker,
+            defender, source, tags, damage_raw / damage_taken /
+            damage_lost per pool, components, turn."""
+            return _last_packet("last_damage", "damage", eid_t, which)
+
+        def _last_healing(eid_t: Any, which: Any = "received") -> Any:
+            """last_healing(eid, which='received'): the last healing packet
+            unit `eid` received (`given`: the last one it gave), or None."""
+            return _last_packet("last_healing", "healing", eid_t, which)
+
+        ns["deal_damage"] = _deal_damage
+        ns["heal"] = _heal
+        ns["damage_forecast"] = _damage_forecast
+        ns["healing_forecast"] = _healing_forecast
+        ns["last_damage"] = _last_damage
+        ns["last_healing"] = _last_healing
+
+        def _step_fn(name: str, doc: str):
+            import damage as _damage
+            impl = getattr(_damage, name)
+
+            def call(*a: Any, **k: Any) -> Any:
+                try:
+                    return impl(*a, **k)
+                except VTTError as ex:
+                    raise FormulaError(f"{name}: {ex}")
+            call.__doc__ = doc
+            call.__wrapped__ = impl
+            return call
+        for _sn, _sd in (
+                ("step_scale", "step_scale(factor): multiply the amount of "
+                 "each component the damage / healing step matched."),
+                ("step_add", "step_add(n): add n to each matched "
+                 "component's amount (a negative n takes it off each)."),
+                ("step_reduce", "step_reduce(n): take n off the matched "
+                 "components as a whole, in order, until n is used up "
+                 "(armor once per hit); returns what it took."),
+                ("step_mods", "step_mods(stat): fold each matched component "
+                 "through the step's unit's modifiers for `stat` "
+                 "(apply_mods), with the component's tags, the packet's "
+                 "and its pool:<var> tag."),
+                ("step_move", "step_move(pool): move the matched components "
+                 "to another pool (a var path or @hp)."),
+                ("step_new", "step_new(amount, pool=None, tags=None): add a "
+                 "component to the packet (the step's matched ones too)."),
+                ("step_drop", "step_drop(): remove the matched components "
+                 "from the packet."),
+                ("step_total", "step_total(): the matched components' "
+                 "amounts summed.")):
+            ns[_sn] = _step_fn(_sn, _sd)
 
         def _turn_index() -> int:
             """turn_index(): the 0-based position of the acting entity

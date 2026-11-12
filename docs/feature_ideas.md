@@ -42,9 +42,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#6 Map markers.** `!map mark <x> <y> [glyph] [label] [turns=N]` puts a temporary mark on the map, optionally visible to one team only. Marks show in the legend.
 - **#10 Once-per-turn / once-per-round limits on passives.** Today each one needs a counter var plus a second passive that resets it.
   - Note: the limits should key on `turns_elapsed`, so they work under ATB. #24's `uses_per_turn` would cover them.
-- **#14 Left-over follow-ups.** Two items remain, both marked "decide later" by you:
-  - configurable side names for the directional functions;
-  - `to_main_percent` per damage type.
+- **#14 Left-over follow-ups.** One item remains, marked "decide later" by you: configurable side names for the directional functions. (`to_main_percent` per damage type is part of #25's design, §10.5.)
 - **#55 Enable/disable passives and watchers.** `!passive disable/enable`, the same on `!gpassive` and `!watch`, plus a formula function. Useful for testing and for "silenced" statuses.
 - **#56 Status source tracking.** An optional `source` on `status_apply` records who applied it. That gives kill credit for damage over time, "dispel only your own", and "the curse ends when the caster dies".
   - From the combat systems: covered by #227's `source=`; the source is a tracked reference (#209), so it clears when the unit that applied it leaves the match.
@@ -150,6 +148,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
     - Solis's crit penalty (a critted hunter loses several actions on their next turn).
   - Every status in all three systems counts down the same way; each tick in the prototypes repeats the decrement and the removal.
 - **#235 Statuses that break on damage.**
+  - Part of #25's design (`docs/damage_reactions_design.md` §10.7): `removed_on_damage` and `break_at_damage` count the damage packets a unit takes, with a tag filter on what counts.
   - `removed_on_damage: true`: Sleep (all three systems; the turn is skipped, or spent resting in FCS1 and NCS) and Solis Shutdown last until the unit takes any damage.
   - `break_at_damage: N` counts the damage taken while the status is active and removes it past N:
     - FCS1 charged actions: "dealing 100 damage will cancel this action", progress shown as "damage: 25/100";
@@ -190,6 +189,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - The game need: Solis dodges ("you can't dodge in the direction of the attacking enemy", some attacks "can't be sidestepped" or "can't be dodged backwards") and FCS1 Lance ("only moves towards the target count").
   - It composes today from two distance comparisons; it is a convenience, under the "simplify only what GMs repeat" rule.
 - **#247 HP change lines.**
+  - Part of #25's design (§10.7): `damage_message_format` / `healing_message_format`, on by default, for packets; a raw `!ent hp` write stays silent.
   - A rule `hp_change_message_format` ("{name} takes {amount} damage ({hp}/{max_hp})", plus a heal twin), printed through the same tagged path as the death lines, so a POV that can't see the unit drops it. Empty (the default) prints nothing.
   - The game need: Solis's rules say "after each hp-affecting action, the host must edit the battlers' hp". Today a write from an action or a tick is silent; only `!ent hp` reports ("Damaged `b` by 3").
 - **#248 Roster after each action or turn.**
@@ -280,23 +280,8 @@ capabilities `!server perms` and per-role `!host access ... role=`).
       - Solis Agility status: +1 standard move;
       - Solis Slow: −2 sprint speed, and −1 move for units with more than one.
     - Sprint as a resource exchange: Solis spends the standard action for 2 extra tiles; FCS1 pays stamina per extra tile ("cost 5 stamina per extra tile"). FCS1's "prevents the use of ranged attacks that turn" becomes a `this_turn` flag (#243).
-- **#25 Damage pipeline with interception.** `deal_damage` runs through GM-ordered steps, with `on_damage_taken` / `on_damage_dealt` handlers that can change the amount (shields, resistances, reflection).
-  - From the combat systems:
-    - Damage packets with several parts:
-      - Solis Fire Arrow: "+25% damage, with the added damage being fire damage", one hit with two damage types;
-      - FCS1 hits deal damage and stamina damage together;
-      - NCS has arcana damage.
-    - Conversions between pools as steps:
-      - FCS1 Brittle: stamina damage becomes hp damage;
-      - FCS1 Hollow Bones: a hit's damage grows by its stamina damage;
-      - FCS1 Freeze: stamina damage past 0 becomes hp damage;
-      - NCS Magical Body: stamina effects hit arcana.
-    - `true` damage that skips every step but the last (NCS true damage).
-  - Note: the three systems order their steps differently.
-  - Solis: armor, then weakness, then the resistance status.
-  - FCS1: block, then percentage buffs, then resistance with its own cap.
-  - NCS: block, then resistances up to 50%, then weaknesses.
-  - An ordered list of GM formulas per system fits all three; #216 makes each step readable.
+- **#25 Damage pipeline.** Designed with you and agreed; the whole design is `docs/damage_reactions_design.md` §10. Part 1 is built (packets, steps, writes, forecast, records, `!damage` / `!healing`); still open: body-part shares, break-on-damage statuses, damage lines, hooks, kill credit, event-log entries, the forecast feeding `incoming`. `deal_damage` / `heal` run a packet of components (`{amount, pool, tags}`) through a system's ordered `damage_steps` / `healing_steps` (attacker phase, then defender phase), write each pool once, then run the break-on-damage statuses, the damage line, `on_damage_taken` / `on_damage_dealt` (healing twins) and the event-log entry. It folds in #235, #247, #227's `source` and #239's `killer` binding, and #14's per-type share to the main body.
+  - The combat systems it was checked against: Solis (Fire Arrow's +25%, then armor, weakness, resistance), FCS1 (attacker buffs, then block, the defender's percentages, resistance capped at 90%), NCS (block, resistances up to 50%, weaknesses); conversions between pools (FCS1 Brittle, Hollow Bones, Freeze; NCS Magical Body) are steps; true damage is the `true_damage` tag the default step filter leaves out.
 - **#26 Ready / delay a turn.** `!turn delay <after_eid>` moves the current unit to act after another unit this round.
 - **#28 Player-controlled units.** A `controllers` list on a unit; a player's commands on their own unit skip approval.
   - A sketch written against the combat systems (docs/combat_systems_fit.md):
@@ -399,6 +384,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - The engine has no combat or inventory by design, so a new GM starts from an empty system. The scenarios show every piece on its own and none of them as a game. A starter system shows the composition, and doubles as a realistic board for the chaos harnesses.
   - Shape depends on #162 (system packs) or a bundled `!store load` save.
 - **#227 Status application options.**
+  - `source=` is part of #25's design (§10.6), for kill credit from damage over time; `data=`, `cap=` and the definition fields stay open here.
   - `status_apply(eid, name, level=None, duration=None, data=None, source=None, cap=None)`, and the same keys on `!status apply`:
     - `data` is merged into the instance before any add hook runs (L8: possession's new side, the taunter of a Taunted unit);
     - `source` records who applied it, readable as `status_source(eid, name)` (#56: kill credit for damage over time, "dispel only your own", "the curse ends when the caster dies", NCS Taunted ending with its taunter);
@@ -418,6 +404,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - The user's groups keep their rules as documents (like the three evaluated here) and implement them by hand; this shows the bot's actual version next to the document and keeps the two in step.
   - Reuses #202's function table for formulas it quotes.
 - **#239 Kill credit and damage attribution.**
+  - The `killer` binding on `on_death` is part of #25's design (§10.7); the per-pair tally stays open here, with #240.
   - `on_death` binds `killer`: the unit whose action, reaction or status tick made the lethal write (a tick through the status's source, #227).
   - The engine keeps a per-match tally of damage dealt and taken per pair of units.
   - The game need: FCS1 rewards that depend on who killed whom.
