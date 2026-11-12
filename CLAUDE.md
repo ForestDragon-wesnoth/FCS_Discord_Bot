@@ -445,7 +445,8 @@ back, load the schema with `ToolSearch` before calling
   definitions / tags and prefabs (#31; built, §7.12 and §7.19).
 - **`docs/damage_reactions_design.md`**: the design of reactions (#36,
   agreed, built but for its §13 list, §7.23) and the damage pipeline (#25,
-  agreed in §10, part 1 built, §7.24), which meet at `incoming`. Read it whole before touching
+  agreed in §10, built, §7.24; §10.9 the choices made while building),
+  which meet at `incoming`. Read it whole before touching
   either.
 - **`docs/tags_design.md`**: the agreed design for widening tags (#260):
   one filter rule, unit / corpse / container / team / map / library tags,
@@ -968,8 +969,9 @@ Every class below shipped at least once and was fixed in an audit pass
   the top-level `run_action` flushes it afterwards. Don't drive coroutines
   with `.send(None)`.
 - **The harness masks escape handling** (§4 "Body sources").
-- **Harness-author mistakes that looked like engine bugs:** there is no `!ent
-  damage` (use `!ent hp x -5`; a bare `!ent hp x 5` SETS 5); `!passive add`
+- **Harness-author mistakes that looked like engine bugs:** `!ent damage`
+  runs a damage packet (steps, lines, hooks) while `!ent hp x -5` is a
+  silent write (a bare `!ent hp x 5` SETS 5); `!passive add`
   takes `target=` / `scope=` BEFORE the quoted formula; `!ent move <id> <n>
   <dir>` (count first) but `!ent push <id> <dir> [n]`; the default soft clamp
   caps hp at max_hp, which defaults to the spawn hp; spawning onto an occupied
@@ -2417,11 +2419,11 @@ hardcodes**.
   front / back / left / right / center / all / corners; drawn over the parent
   only with a custom glyph, `part_custom_glyph_priority`). 0/0 parts are
   indestructible pass-throughs (`is_indestructible`).
-- **Damage:** only `damage_part(part, n)` routes to main: `to_main_percent`
-  (default `part_to_main_percent_default`), `to_main_cap` (none / max_hp /
-  remaining_hp / absolute:<n ≥ 0> — a typo is refused), `vital`,
-  `indestructible`; the transfer is computed from pre-hit values and applied
-  to the parent first; `rounding_mode`. A destroyed part lingers dead, fires
+- **Damage:** a damage packet on a part (deal_damage, `damage_part(part,
+  n)`, `damage_spread`, `!ent damage`) sends a share to main (§7.24
+  "Body parts": `damage_to_main_percent`, `to_main_cap` (none / max_hp /
+  remaining_hp / absolute:<n ≥ 0> — a typo is refused), the share modes),
+  `vital`, `indestructible`; a raw hp write never does. A destroyed part lingers dead, fires
   on_death once (`__part_destroyed` latch, cleared by any heal above 0) and
   kills the parent if vital. Negative amounts are refused.
   `damage_spread(target, total[, mode, fragments, origin, radius])` divides
