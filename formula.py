@@ -2831,14 +2831,15 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "give_template", "template_of",
     # Death / corpse family. kill / revive route through the same
     # death pipeline as the natural-death chokepoint; the introspection
-    # trio (has_corpse, corpse_at, all_corpses) reads tile-data
-    # corpse entries with the tile location as the authoritative
-    # position (never the embedded snapshot's x/y).
+    # trio (has_corpse, corpse_at, all_corpses) reads the maps' corpse
+    # stores, with each record's x / y as the authoritative position
+    # (never the embedded snapshot's x/y).
     #   kill(eid)           -> bool (death triggered)
     #   revive(eid)         -> str (new entity id; raises if no corpse)
     #   transform(eid, template, stash_path=None) -> eid (statblock swap)
     #   revert(eid, stash_path)                    -> eid (restore stash)
     #   has_corpse(eid)     -> bool
+    #   remove_corpse(eid)  -> bool (the corpse taken away; its id frees)
     #   corpse_at(eid)      -> (x, y); raises if no such corpse
     #   all_corpses()       -> list of corpse ids (loopable)
     #   corpse_has(eid, path)        -> bool (dotted vars path resolves
@@ -2847,7 +2848,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                   dotted path (raises if missing
     #                                   unless a default is supplied)
     "kill", "revive", "transform", "replace_form", "revert", "has_corpse",
-    "corpse_at", "all_corpses",
+    "corpse_at", "all_corpses", "remove_corpse",
     "corpse_has", "corpse_var",
     "corpse_status_has", "corpse_status_get", "corpse_status_names",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
@@ -3092,6 +3093,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "summon_template", "summon_template_near", "give_template",
     "stamp_prefab",
     "kill", "revive", "transform", "replace_form", "revert",
+    "remove_corpse",
     "schedule", "schedule_on", "cancel_schedule",
     # They run a `!func` or a lambda per item, and a `!func` may write.
     "map_with", "filter_with", "sort_by",
@@ -5121,8 +5123,8 @@ class FormulaEngine:
             return True
 
         def _tile_clear(x: Any, y: Any) -> bool:
-            """tile_clear(x, y): remove a cell's tile data (corpses lying there
-            stay); False when it had none."""
+            """tile_clear(x, y): remove a cell's tile data; False when it had
+            none."""
             if not isinstance(x, int) or isinstance(x, bool):
                 raise FormulaError(
                     f"tile_clear(x, y): x must be int, got "
@@ -5135,7 +5137,7 @@ class FormulaEngine:
                 )
             if (x, y) not in _cur_map().tiles:
                 return False
-            _cur_map().clear_tile_keep_corpses(x, y)   # bodies stay
+            _cur_map().tiles.pop((x, y), None)
             return True
 
         ns["tile_set"] = _tile_set
@@ -7394,7 +7396,7 @@ class FormulaEngine:
         def _tile_place(template: Any, x: Any, y: Any, data: Any = None) -> bool:
             """tile_place(template, x, y, data=None): place tile template
             `template` (`!tile def`) at the cell, as `!tile place` does: the
-            cell's tile data is replaced (corpses lying there stay) and the
+            cell's tile data is replaced and the
             fields of the `data` dict override the template's. Returns True."""
             if not isinstance(template, str) or not template:
                 raise FormulaError("tile_place(template, x, y): template must "
@@ -8328,6 +8330,14 @@ class FormulaEngine:
             engine._note_affected(new_id)
             return new_id
 
+        def _remove_corpse(eid_t: Any) -> bool:
+            """remove_corpse(eid): take the corpse of unit `eid` off the map
+            (it rots, burns, is carried off). Its id, and the ids of the
+            body parts it held, are free again. Returns True, False when
+            no such corpse lies anywhere."""
+            eid = str(_eid(eid_t))
+            return match.remove_corpse(eid)
+
         def _transform(eid_t: Any, template: Any, stash_path: Any = None) -> str:
             """transform(eid, template, stash_path=None): swap eid's statblock
             (name/vars/passives/clamps/parts) for `template`, KEEPING its
@@ -8463,6 +8473,7 @@ class FormulaEngine:
 
         ns["kill"]         = _kill
         ns["revive"]       = _revive
+        ns["remove_corpse"] = _remove_corpse
         ns["transform"]    = _transform
         ns["replace_form"] = _replace_form
         ns["revert"]       = _revert

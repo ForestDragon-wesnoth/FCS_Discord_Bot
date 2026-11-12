@@ -68,15 +68,16 @@ def same_value(a: Any, b: Any) -> bool:
 # autosave_full_snapshot_interval and, under autosave_round_snapshot_mode
 # `full`, a round autosave are full states (keyframes). A diff names what changed at the grain of the
 # serialization caches: top-level fields whole, units by id, maps by name and
-# in each map its fields, tiles by cell and zones by name. Its parts are
+# in each map its fields, tiles by cell, zones by name and corpses by id. Its parts are
 # {"s": {key: new value}, "d": [deleted keys], "c": {key: nested diff},
 # "o": [every key, in order]} ("o" when the keys of an ordered dict were
-# added, removed or moved: units act in creation order). Tiles and zones are
-# kept sorted, so they carry no order. The event log (append-only, trimmed
+# added, removed or moved: units act in creation order). Tiles, zones and
+# corpses are kept sorted, so they carry no order. The event log (append-only, trimmed
 # from the front) is {"n": its length before, "drop": entries trimmed from
 # the front, "add": [entries appended]}.
 _MAP_SPEC: Dict[str, Tuple[str, Any]] = {"tiles": ("tiles", None),
-                                         "zones": ("sorted", None)}
+                                         "zones": ("sorted", None),
+                                         "corpses": ("sorted", None)}
 _STATE_SPEC: Dict[str, Tuple[str, Any]] = {"entities": ("ordered", None),
                                            "maps": ("ordered", _MAP_SPEC),
                                            "event_log": ("log", None)}

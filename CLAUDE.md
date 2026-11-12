@@ -330,16 +330,17 @@ Each of these was learned from a shipped bug.
   differential (§5).
 - **A path that places units, zones or corpses in place** (a direct
   `e.x =` is fine, a direct `e.vars[...]` write of a footprint var, a
-  zone's `cells` or a corpse written into tile data is not): mark the
+  zone's `cells` or a corpse record's `x` / `y` is not): mark the
   spatial index (`match._spatial.touch(eid)`, `mp.zone_touch(name)`,
-  `mp.note_corpse(x, y)`, §7.1) and run the regression under
+  `mp.corpse_changed(cid)`, §7.1; lay and take corpses with
+  `mp.lay_corpse` / `mp.take_corpse`) and run the regression under
   `FCS_SPATIAL_CHECK=1`.
 - **A path that changes a unit, tile, zone, fog memory, a reveal or voids
   IN PLACE** (anything but a field assignment on an Entity, `write_var` /
   `remove_var` or `_emit_status_diff`: a direct `e.vars[...]` / `e.status`
   / `e.passives` edit, a write into a dict read from `mp.tiles` or
   `mp.zones`, a corpse edited where it lies): mark the serialization cache
-  (`e.mark_changed()`, `mp.tile_touch(x, y)` or `mp.note_corpse(x, y)`,
+  (`e.mark_changed()`, `mp.tile_touch(x, y)`, `mp.corpse_changed(cid)`,
   `mp.zone_changed(name)`, `mp.runs_changed(kind)`, §7.16 "Serialization
   caches") and run the regression under `FCS_SPATIAL_CHECK=1`, which
   compares every cached piece with a fresh build on every use.
@@ -950,7 +951,7 @@ Every class below shipped at least once and was fixed in an audit pass
   (`scene_for_png`) and only draws pixels.
 - **POV leaks.** Any reply naming units, positions, vars or events can leak
   what a fogged team shouldn't see: listings, `!ent info`, `!dist`, `!find`,
-  diffs, logs, camera centering, corpses inside tile data. See §7 "Access,
+  diffs, logs, camera centering, corpses lying in a cell. See §7 "Access,
   POV".
 - **Type-blind equality.** Python's `==` takes 1, 1.0 and True (0, 0.0,
   False) for one value, and the engine reads them differently: a type
@@ -1324,10 +1325,11 @@ hardcodes**.
   `Map._zone_ix` (cell -> zone names) refiles a zone on `Map.zone_touch`,
   which every change of a zone's cells or existence calls (a new site
   must too); a replaced `zones` dict rebuilds it. `Map._corpse_ix`
-  (`CorpseIndex`: corpse cells, corpse id and held part id -> cells) is
-  told of each corpse laid by `Map.note_corpse(x, y)` (a new site must
-  call it) and checks stale entries on read; `find_corpse`, `all_corpses`
-  and `Match.id_taken` (spawn and `mint_entity_id` test one id) read it.
+  (`CorpseIndex`: cell -> corpse ids, held part id -> corpse) is built
+  from the corpse store `Map.corpses` (a `CorpseTable`, unit id -> record
+  with its `x` / `y`) and refiles each corpse the store marks (set,
+  removed, `corpse_changed`); `all_corpses`, `corpse_ids_at` and
+  `Match.id_taken` (spawn and `mint_entity_id` test one id) read it.
   `UnitFlags` (`Match._uflags`) caches per unit whether its own data
   holds `watchers` and whether a status carries a zone grant's marker,
   for `has_watchers` / `_grants_present`; it and the size sweep listen
@@ -2543,11 +2545,15 @@ hardcodes**.
   (`_pull_surfaced`). A new line about one unit should be tagged the same
   way; turn-flow lines name no unit (769).
 - **Death** (`_process_death`): `death_result` (corpse / delete, per-unit
-  `__death_result`); a corpse is the unit's snapshot in its cell's tile data
-  (`corpses.<id>`, mount links stripped; under `corpse_id_uniqueness` the
-  ids of the parts it holds are taken too, 955; `corpses` is a reserved tile key
-  no tile write sets, and every tile edit keeps it: place, fill, del,
-  clear, `tile_clear`); `corpse_id_uniqueness`. A revive puts the corpse
+  `__death_result`); a corpse is a record in its map's corpse store
+  (`Map.corpses[<id>]`: `x` / `y` its anchor cell, the unit's snapshot as
+  `entity`, mount links stripped, its parts, groups, wrecked maps),
+  apart from the tile data (user call, `docs/terrain_design.md` §2), so
+  no tile edit touches it. An id names one unit, alive or dead, across
+  the match (user call): a corpse's id and the ids of the parts it holds
+  stay taken until the corpse is gone (revived, or dropped with its cell
+  or map, `remove_corpse(id)` / `!ent remove <id>`), so a revive always
+  gets the id back (334-335, 955). A revive puts the corpse
   back when the unit can't be placed (`revive_blocked_mode`: refuse,
   default, or nearest = the free cell nearest the body that fits all of
   it, searched like a dismount, located parts keeping their offsets, the
@@ -2622,7 +2628,7 @@ hardcodes**.
   on_stop / time hooks; a turn or round reads only the tiles that can hold
   a time hook, `Map.hook_cells`: own hooks or a template, kept by the
   serialization cache's marks, `TileDict.also`, 1080). Formulas place a template with `tile_place(template,
-  x, y, data=None)` (`!tile place`: replaces the cell's data, corpses stay,
+  x, y, data=None)` (`!tile place`: replaces the cell's data,
   `data` overrides fields; mutating) and read it back with
   `tile_template_of(x, y)` (892). `!tile def rename` takes the placed tiles
   along (`Match.rename_tile_template`); deleting a used template needs
@@ -2665,8 +2671,7 @@ hardcodes**.
   (`Match.reapply_tile_template`, every map by default) and `!zone def
   reapply <d> [reset]` (`reapply_zone_definition`): the template's /
   definition's data keys overwrite the tile's / zone's same keys, the
-  others stay; `reset` makes the data a copy (a tile keeps its corpses
-  only). A zone definition pushes its facing too (a tile's is data).
+  others stay; `reset` makes the data a copy. A zone definition pushes its facing too (a tile's is data).
   Hooks, the other look fields and tags are live already. `!match sync
   tiles|zones|all [name] reapply` syncs then reapplies; `!system zone` has
   no reapply (a system's definitions have no zones).
@@ -2862,7 +2867,7 @@ hardcodes**.
   non-host), `!action` (actor and targets; a corpse target and `!ent
   revive` through `_query_corpse`, 870), `!dist`, `!find`, `!foreach`, `!turn`,
   `!map center/cell`, `!part`, `!mount`, `!action`, `!passive`, `!clamp`,
-  `!mod`, `!schedule`, `!tile info` (corpses inside tile data too).
+  `!mod`, `!schedule`, `!tile info`, `!map cell` (corpses too).
   Every unit id a NON-HOST's typed command names (any root an override
   opened: `!part info`, `!status`, `!turn set`, `!mount`, `!template
   give`, ...) reads through the view in `_resolve_eid`
@@ -3164,7 +3169,8 @@ hardcodes**.
   edits of vars, passives, clamps, statuses and `actions_seen`), each
   map's `ser_tiles` (per cell; `Map.tiles` is a `TileDict`, which records
   the cells set, replaced, removed or handed out by `setdefault`, and a
-  write into a tile's dict calls `tile_touch` / `note_corpse`), `ser_zones`
+  write into a tile's dict calls `tile_touch`), `ser_corpses` (per corpse;
+  `Map.corpses` is a `CorpseTable`; `corpse_changed`), `ser_zones`
   (per zone; `Map.zones` is a `ZoneTable`; `zone_touch` / `zone_changed`;
   every `!zone` command re-serializes the channel match's zones) and the
   row runs of fog memory, reveals and voids (`runs_changed`). A command
@@ -3885,8 +3891,7 @@ dump` is the raw data for the GM.
   formula runs; `privacy_applies` decides, walking without copying, and
   `logic.PRIVATE_SCAN` memoizes per top-level command which units need a
   copy and the copy itself, dropped by a write to the unit or a replaced
-  vars dict, X21), `!tile info`'s corpse snapshots
-  (`_reader_tile_data`), Tab var paths, and a disguise's decoys (judged
+  vars dict, X21), Tab var paths, and a disguise's decoys (judged
   with the real unit's lists too). A list's dicts are read like the dicts
   around them (`*.<key>` and a container flag hide there too; an item's
   index is a path segment). While anything on the match is private
