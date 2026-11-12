@@ -1362,7 +1362,11 @@ hardcodes**.
   unit is gone (ghost firing, §5) (882); once a passive removes or kills
   the hook's unit, the rest of that hook's passives, global and team
   ones too, don't run on it, while a hook fired for a unit already gone
-  (on_death, a despawn) still reaches its globals (937).
+  (on_death, a despawn) still reaches its globals (937). A passive's or
+  status hook's lines (`fired on <unit>`, its result or error) are tagged
+  as lines about the unit it fired on (`logic._hook_line_tag`: where it
+  stands, else its corpse's cell), so a channel whose view can't see it
+  drops them (987).
 - **Default passives** (`default_entity_passives`, `!defpassive`): copied
   onto every unit at `Entity.spawn` (`_apply_default_passives`). With
   `default_passives_existing_units` on (default; #221, user call, 1091-1092)

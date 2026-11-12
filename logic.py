@@ -8070,10 +8070,32 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str,
     passive can't cripple the whole hook fire.
     """
     m = getattr(engine, "_match", None)
-    return hook_output(m, *_run_passive_line(engine, p, ctx,
-                                             target_id=target_id,
-                                             is_global=is_global,
-                                             label=label))
+    tag = _hook_line_tag(m, target_id)
+    lines = hook_output(m, *_run_passive_line(engine, p, ctx,
+                                              target_id=target_id,
+                                              is_global=is_global,
+                                              label=label))
+    return Match.tag_lines(tag or _hook_line_tag(m, target_id), lines)
+
+
+def _hook_line_tag(m: Any, eid: str) -> str:
+    """The unit tag for a hook's `fired on <eid>` line: the unit where it
+    stands, else its corpse's cell, else "" (a channel whose view can't
+    see the unit drops the tagged line, as a death line)."""
+    if m is None or not eid:
+        return ""
+    tag = m.unit_tag(eid)
+    if tag:
+        return tag
+    try:
+        found = m.find_corpse(eid)
+    except Exception:
+        found = None
+    if not found:
+        return ""
+    x, y, mp = found[0], found[1], found[3]
+    mname = getattr(mp, "name", mp) or ""
+    return f"{UNIT_LINE_TAG}{m.id}|{eid}|{x}|{y}|{mname}{UNIT_LINE_TAG}"
 
 
 def _run_passive_line(engine, p: "Passive", ctx, *, target_id: str,

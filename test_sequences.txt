@@ -33287,11 +33287,19 @@ SCENARIO 987 — Zone grants and watchers on a unit the channel's view hides sta
 ?! zqxspy
 !as owner
 !assert "entity[zqxspy].seenc == 1 and entity[zqxspy].litc == 1"
+!passive add zqxspy hurt on_damage_taken "entity[self].hurtc = 1"
+!eval "deal_damage('zqxspy', 1)"
+?! zqxspy
+?! Spy
+!assert "entity[zqxspy].hurtc == 1 and entity[zqxspy].hp == 19"
 !match unbind
 !match use m1
 !ent move scout 1 left
 !ent move scout 1 right
 ?? ⚠ watcher `alarm` on `zqxspy` effect error
+!eval "deal_damage('zqxspy', 1)"
+?? 🩸 **Spy** (`zqxspy`) takes 1 damage.
+?? passive `zqxspy.hurt` fired on `zqxspy` (on_damage_taken)
 
 Expected: bob's channel shows red's view, which hides the blue spy. His
 scout's aura grants `lit` to the spy and a watcher the spy holds turns
@@ -33299,7 +33307,11 @@ true: the hook and passive lines of the spy's grant and the watcher's
 effect error are tagged as lines about the spy, so his reply drops them
 and shows only the scout's own lines. `!watch show` lists only the units
 the view shows. Everything still happened (the spy holds `seenc` and
-`litc`). In an unbound channel the same watcher error names the spy.
+`litc`). A host in that channel damaging the spy by a formula sees
+neither the damage line nor the `fired on` line of the spy's own passive
+(passive and status-hook lines are tagged with the unit they fired on),
+while the passive ran. In an unbound channel the same watcher error, the
+damage line and the passive line name the spy.
 
 SCENARIO 988 — Held commands run as their holder; a pause lets the channel point elsewhere
 --------------------------------------------------------------------------------------------
