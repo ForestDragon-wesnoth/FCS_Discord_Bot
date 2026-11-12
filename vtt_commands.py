@@ -211,6 +211,11 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
 # gated by default. A host can open it per match with
 # `!host access set "ent dump" all`.
 
+# Exact two-word read forms of a host-gated subcommand: `!turn grant list`
+# shows the extra-turn queue through the view, as bare `!turn` does
+# (L52), while `!turn grant <id>` queues a turn.
+_READ_ONLY_FORMS = frozenset({("turn", "grant", "list")})
+
 # Host-gated roots whose NO-ARGUMENT (view) form is read-only and should
 # be player-available, even though their subcommands mutate (`!turn
 # next`, `!history undo`). Only the bare invocation downgrades — `!undo`,
@@ -768,6 +773,9 @@ class CommandRegistry:
         if base == "host" and args and (name, args[0].lower()) in _HOST_ONLY_SUBS:
             base = "host_only"
         elif base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS.get(name, ()):
+            base = "all"
+        elif base == "host" and len(words) == 2 and (
+                name, words[0].lower(), words[1].lower()) in _READ_ONLY_FORMS:
             base = "all"
         elif base == "host" and not args and name in READ_ONLY_BARE_ROOTS:
             # Bare view form of a root that mutates only via subcommands.
@@ -2102,6 +2110,15 @@ def _record_server_changes(mgr: MatchManager, ctx: ReplyContext, name: str,
     mgr._skip_system_step = False
     post_text = mgr.server_state_text()
     changed = post_text != pre_text
+    # A recovery replaces the systems (no undo step across it), but the
+    # matches' journals still record the chains they run on from then,
+    # also when it only moved matches to `default` and changed no system
+    # (J18: the replay kept the old system).
+    recovering = name.lower() == "server" and args \
+        and str(args[0]).lower() == "recover"
+    if recovering:
+        _journal_systems(mgr, ctx, json.loads(pre_text),
+                         json.loads(post_text), pre_matches, name, args)
     if not changed and not notes:
         return
     label = _command_label(name, args)
@@ -2123,11 +2140,7 @@ def _record_server_changes(mgr: MatchManager, ctx: ReplyContext, name: str,
         elif not skip_step:
             mgr.record_system_step(pre_text, pre_matches, label, by)
     mgr.record_audit(label, by, lines)
-    # A recovery replaces the systems (no undo step across it), but the
-    # matches' journals still record the chains they run on from then.
-    recovering = name.lower() == "server" and args \
-        and str(args[0]).lower() == "recover"
-    if changed and (not replacing or recovering):
+    if changed and not replacing and not recovering:
         _journal_systems(mgr, ctx, json.loads(pre_text), json.loads(post_text),
                          pre_matches, name, args)
 
@@ -9425,6 +9438,10 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                 st_state = copy.deepcopy(stored)
                 st_state["id"] = mid        # `as=` renames the match
                 _rollback_match(m, mgr, st_state)
+                # The stored state's system, when the replay has it (a
+                # recovery moved the match to `default`, J18).
+                if st_state.get("system_name") in mgr.systems:
+                    m.system_name = st_state["system_name"]
                 if m.system_name in mgr.systems:
                     mgr.apply_system_rules(m)
                 rng = e.get("rng")
@@ -14298,9 +14315,18 @@ def _turn_forecast_text(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
             n = int(rest[0])
         except ValueError:
             raise VTTError(f"`{rest[0]}` isn't a number of turns.")
-    entries, notes = m.turn_forecast(n)
     pov = _query_pov(ctx, m)
     hidden_mode = m.rules.get("turn_forecast_hidden_units", "omit")
+    want = n
+    if n is not None and pov is not None and hidden_mode != "text":
+        # `n` counts the turns the view shows: the forecast runs to the
+        # owner limit and the listing stops at n shown (V23: hidden turns
+        # counted toward n, so a short listing told where they fell).
+        m.turn_forecast(n)                  # the same refusals
+        n = owner_limit("turn_forecast_limit")
+    entries, notes = m.turn_forecast(n)
+    if want is not None and n != want:
+        notes = [x for x in notes if "turn_forecast_limit" not in x]
     hidden_text = str(m.rules.get("turn_forecast_hidden_text", "") or "")
     fmt = str(m.rules.get("turn_forecast_line_format", "") or "") \
         or "`{short_id}` **{name}**"
@@ -14318,6 +14344,8 @@ def _turn_forecast_text(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
             # Left out whole: no number or round break gives it away.
             continue
         if not ent["now"]:
+            if want is not None and k >= want:
+                break
             k += 1
         if ent["round"] is not None and ent["round"] != last_round:
             last_round = ent["round"]
@@ -15160,6 +15188,14 @@ def _preview_cells(ctx, m, toks: List[str],
     # Clipped to the map while building, like the formula functions, so
     # the cost follows the map, not the numbers typed.
     bounds = (mp.grid_width, mp.grid_height, mp.voids)
+    # Under void_under_fog fog a void the channel's view can't see is drawn
+    # and counted like the fogged cells around it (V24: the preview marked
+    # every existing cell through the fog, outlining a secret void).
+    pov = _view_pov(ctx, m, [])
+    fog_voids = (pov is not None and mp.voids and m.fog_on(mp)
+                 and m.rules.get("void_under_fog", "show") == "fog")
+    if fog_voids:
+        bounds = (mp.grid_width, mp.grid_height, frozenset())
     shape = toks[0].lower()
 
     def done(i: int, maxn: int) -> None:
@@ -15212,6 +15248,11 @@ def _preview_cells(ctx, m, toks: List[str],
         desc = f"rect ({x1},{y1}) to ({x2},{y2})"
     else:
         raise VTTError(f"Unknown preview shape `{toks[0]}`. Usage: {_PREVIEW_USAGE}")
+    if fog_voids:
+        return desc, sorted(
+            {(cx, cy) for (cx, cy) in cells if mp.in_rect(cx, cy) and (
+                (cx, cy) not in mp.voids
+                or not m._fog_terrain_visible(pov, cx, cy, mp))})
     return desc, sorted({(cx, cy) for (cx, cy) in cells if mp.in_bounds(cx, cy)})
 
 
@@ -18297,11 +18338,13 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             while f"{base}-{k}" in m.history.manual_saves:
                 k += 1
             name, replaced = f"{base}-{k}", False
-        # The imported snapshot keeps its OLD sequence number, which
-        # could collide with the current match's sequence space. That's
-        # fine for the manual_saves dict (keyed by name, not seq), but
-        # we re-stamp the kind to "manual" so a later !history list
-        # categorizes it correctly.
+        # A fresh sequence from this match's counter, as a full state: the
+        # export's own number names a snapshot file, a diff base and a
+        # lookup here too (every match counts from 1), so keeping it
+        # replaced the match's snapshot of that number and the diffs
+        # built on it (W10).
+        snap.sequence = m.history._next_seq()
+        snap.base, snap.depth, snap.path = None, 0, None
         snap.kind = "manual"
         snap.label = name
         m.history.manual_saves[name] = snap
@@ -26744,6 +26787,11 @@ def _eval_all_or_nothing(m: Match, mgr: MatchManager, engine: Any,
     sink_mark = len(sink) if sink is not None else 0
     gtoken = CROSS_MATCH_GUARD.set(guard)
     ltoken = _CROSS_LEVELS.set((cross,))
+    # The library as the caller's commands see it: a creator-level
+    # template another host's `!eval` spawns, gives or reads answers as
+    # missing (V22), as `!template spawn` / `give` do.
+    prev_view = getattr(m, "_view_templates", None)
+    m._view_templates = TEMPLATE_VIEWER.get()
     try:
         return engine.eval_program(src, eval_ctx)
     except FormulaError as ex:
@@ -26758,6 +26806,7 @@ def _eval_all_or_nothing(m: Match, mgr: MatchManager, engine: Any,
         sep = " " if msg.endswith((".", "!", "?")) else ". "
         raise FormulaError(f"{msg}{sep}Nothing was changed.")
     finally:
+        m._view_templates = prev_view
         _CROSS_LEVELS.reset(ltoken)
         CROSS_MATCH_GUARD.reset(gtoken)
 

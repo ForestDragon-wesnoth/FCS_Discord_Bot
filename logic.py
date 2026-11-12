@@ -10144,36 +10144,8 @@ class Entity:
                         inst.get(STATUS_SOURCE_KEY) == self.id:
                     del inst[STATUS_SOURCE_KEY]
                     o.mark_changed()
-        # scrub from turn order & clamp active index
-        if self.id in m.turn_order:
-            idx = m.turn_order.index(self.id)
-            m.turn_order.remove(self.id)
-            if m.turn_vacated == "wrap":
-                # No unit holds the turn: the next one opens a new round
-                # from the top, whoever else leaves meanwhile (a second
-                # removal at index 0 used to turn this into "same").
-                m.active_index = 0
-            elif m.round_started and idx == m.active_index:
-                # The unit whose turn it is is gone. The next unit in the
-                # order now sits at active_index — or, if it was last, the
-                # next turn opens a new round from the top. next_turn reads
-                # this so it neither fires the gone actor's turn-end on
-                # someone else nor advances past the next unit.
-                if idx < len(m.turn_order):
-                    m.turn_vacated = "same"
-                else:
-                    m.turn_vacated = "wrap"
-                    m.active_index = 0
-            elif m.active_index >= len(m.turn_order):
-                m.active_index = max(0, len(m.turn_order) - 1)
-            elif m.active_index > idx:
-                m.active_index = max(0, m.active_index - 1)
-        # Extra turns (#224): a gone unit's queued extra turns go with it,
-        # and an extra turn under way ends with nothing to fire on.
-        if self.id in m.extra_turns:
-            m.extra_turns = [x for x in m.extra_turns if x != self.id]
-        if m.extra_turn == self.id:
-            m.extra_turn = ""
+        # scrub from turn order & clamp active index, drop its extra turns
+        m._leave_turns(self.id)
         m._scrub_entity_from_groups(self.id)
         # Drop any entity-attached scheduled effects bound to this entity
         # — a dead/despawned entity's pending turn-delayed effects don't
@@ -10714,6 +10686,7 @@ class Entity:
             self.vars.pop("__part_destroyed", None)
             self.mark_changed()
             self._match._resume_anchored_zones(self.id)
+            self._match._rebuild_turn_order()
         # Diff old vs new at this path and collect the resulting events
         leaf_events = _diff_subtree(path, old_post_attempt, value)
         # Now we can fill in new_value for the ancestor events by re-resolving
@@ -19529,7 +19502,10 @@ class Match:
             if not mp.in_bounds(cx, cy):
                 raise OutOfBounds(
                     f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
-                    f"({cx},{cy}) is outside the {mp.size_text()} grid.")
+                    f"({cx},{cy}) " + ("is a void cell."
+                                       if mp.in_rect(cx, cy) else
+                                       f"is outside the {mp.size_text()} "
+                                       f"grid."))
         if e.is_cell_stackable:
             return
         ignore = self._occupancy_ignore(e, extra_ignore)
@@ -20158,6 +20134,41 @@ class Match:
 
         return result
 
+    def _leave_turns(self, eid: str) -> None:
+        """Unit `eid` takes no more turns: out of the turn order (the
+        pointer kept on the right unit; `turn_vacated` when it held the
+        turn), its queued extra turns dropped and an extra turn under way
+        ended. A removal and a destroyed body part (T10) call it."""
+        if eid in self.turn_order:
+            idx = self.turn_order.index(eid)
+            self.turn_order.remove(eid)
+            if self.turn_vacated == "wrap":
+                # No unit holds the turn: the next one opens a new round
+                # from the top, whoever else leaves meanwhile (a second
+                # removal at index 0 used to turn this into "same").
+                self.active_index = 0
+            elif self.round_started and idx == self.active_index:
+                # The unit whose turn it is is gone. The next unit in the
+                # order now sits at active_index — or, if it was last, the
+                # next turn opens a new round from the top. next_turn reads
+                # this so it neither fires the gone actor's turn-end on
+                # someone else nor advances past the next unit.
+                if idx < len(self.turn_order):
+                    self.turn_vacated = "same"
+                else:
+                    self.turn_vacated = "wrap"
+                    self.active_index = 0
+            elif self.active_index >= len(self.turn_order):
+                self.active_index = max(0, len(self.turn_order) - 1)
+            elif self.active_index > idx:
+                self.active_index = max(0, self.active_index - 1)
+        # Extra turns (#224): a gone unit's queued extra turns go with it,
+        # and an extra turn under way ends with nothing to fire on.
+        if eid in self.extra_turns:
+            self.extra_turns = [x for x in self.extra_turns if x != eid]
+        if self.extra_turn == eid:
+            self.extra_turn = ""
+
     def _rebuild_turn_order(self, full: bool = False):
         """Sort the alive, initiative-bearing entities into `self.turn_order`
         according to the active rules. Preserves the currently-acting
@@ -20313,11 +20324,6 @@ class Match:
         live = self._turn_policy() == "live"
         rnd = self.round_number
 
-        def due(ptr: int) -> Optional[int]:
-            idx = range(len(order)) if live else (
-                list(range(ptr + 1, len(order))) + list(range(0, ptr + 1)))
-            return next((j for j in idx if order[j] not in acted), None)
-
         upcoming: List[Tuple[int, str]] = []
         ptr = min(max(self.active_index, 0), len(order) - 1)
         # An extra turn under way (#224) is the turn now; the regular
@@ -20339,13 +20345,22 @@ class Match:
             # "same": the unit holding the gone actor's slot goes next.
             upcoming.append((rnd, order[ptr]))
             acted.add(order[ptr])
-        while True:
-            d = due(ptr)
-            if d is None:
+        # The rest of the round in ONE pass (X24: a scan from the top per
+        # turn cost the order's length squared): under 'live' the next
+        # unit still to act always sits after the last one listed, so the
+        # order read once from the top lists them; under 'deferred' the
+        # order read once from after the pointer, wrapping to it. Stops
+        # once `n` turns (and the extra turns before them) are listed.
+        stop = (None if n is None
+                else n + len(self.extra_turns) + 1)
+        idx = range(len(order)) if live else (
+            list(range(ptr + 1, len(order))) + list(range(0, ptr + 1)))
+        for j in idx:
+            if stop is not None and len(upcoming) >= stop:
                 break
-            upcoming.append((rnd, order[d]))
-            acted.add(order[d])
-            ptr = d
+            if order[j] not in acted:
+                upcoming.append((rnd, order[j]))
+                acted.add(order[j])
         # Queued extra turns come right after the turn under way (before
         # the first turn, after it). Marked by the -1 round placeholder.
         at = 0 if self.round_started else min(1, len(upcoming))
@@ -21467,8 +21482,12 @@ class Match:
             skipping = self._skipping_statuses(e)
             if not skipping:
                 return True
-            if cur in seen:
+            if cur in seen and seen.issuperset(self.turn_order):
                 return False
+            # Met again before every unit was looked at: a round wrapped
+            # inside the pass and this is its turn of the new round, so it
+            # is skipped again (T9: the pass ended on it as if everyone
+            # were skippable, and the round rested on the stunned unit).
             seen.add(cur)
             matched = ", ".join(sorted(skipping))
             # A skipped turn is this round's turn.
@@ -25524,6 +25543,10 @@ class Match:
             return []
         p.vars["__part_destroyed"] = True   # raw set: no write_var recursion
         p.mark_changed()
+        # A part with its own initiative takes no more turns while it lies
+        # destroyed, and its queued extra turns go, as a dead unit's do
+        # (T10); a heal that brings it back puts it in the order again.
+        self._leave_turns(p.id)
         self.log_event("part_destroyed", entity=p.id, name=p.name,
                        part_of=p.part_of or "")
         self._announce("death_message_format", p.id, p.name, p.x, p.y,
@@ -27931,6 +27954,9 @@ class Match:
             rules={**copy.deepcopy(DEFAULT_SYSTEM_SETTINGS),
                    **copy.deepcopy(d.get("rules") or {})},
         )
+        # Rules the state didn't carry (match and snapshot files leave them
+        # out): the stand-ins above are no rules this match ran under.
+        m._rules_stub = not d.get("rules")
         first_map = next(iter(maps))
         for eid, ed in d.get("entities", {}).items():
             e = Entity.from_dict(ed)
@@ -32545,11 +32571,22 @@ class MatchManager:
                 old.get("default_entity_passives"),
                 m.rules.get("default_entity_passives"))]
         # A changed turn-order rule re-sorts the order (as a changed
-        # initiative does, under turnorder_change_policy); a match loaded
-        # from disk has no rules to compare yet and keeps its saved order.
-        if old and any(old.get(k) != m.rules.get(k) for k in m.rules
-                       if k.startswith("turnorder_")):
+        # initiative does, under turnorder_change_policy); a match built
+        # from a state without rules (a load, an undo restore: files leave
+        # them out) has only the registry's stand-ins to compare, so it
+        # keeps its saved order (T11: every restart marked it changed).
+        stub = getattr(m, "_rules_stub", False)
+        m._rules_stub = False
+        if old and not stub and any(
+                old.get(k) != m.rules.get(k) for k in m.rules
+                if k.startswith("turnorder_")):
+            before = len(m._var_event_warnings)
             m._mark_turn_order_dirty("turn-order rules changed")
+            # The deferred note goes on the reply of the edit that made
+            # it, not on the next var write of the match.
+            notes += [f"`{m.id}`: {w}"
+                      for w in m._var_event_warnings[before:]]
+            del m._var_event_warnings[before:]
         if old and not old.get("atb_enabled") and m.rules.get("atb_enabled"):
             m.reveals_to_turn_clock()
         # Which units of a body hold zone grants changed (#136): they settle
@@ -32744,6 +32781,7 @@ class MatchManager:
                 if m.system_name not in systems:
                     m.system_name = default_name
                 m.rules = self._build_rules_dict(systems[m.system_name])
+                m._rules_stub = False
                 notes += [f"{m.id}: {n}" for n in m.sync_all_var_names()]
                 for e in m.entities.values():
                     e.bind(m, set_spawn_facing=False)
@@ -32957,6 +32995,11 @@ class Workspaces:
         lock = getattr(mgr, "_command_lock", None)
         if lock is not None and lock.locked():
             return "a command is running on it"
+        # Expiry is lazy: a request past its time is dropped here, so
+        # it no longer keeps the server loaded (L53).
+        for m in mgr.matches.values():
+            if m.pending_requests:
+                m.expire_pending_requests()
         if any(m.pending_requests for m in mgr.matches.values()):
             return "an approval request is waiting"
         for guard in self.unload_guards:
@@ -32995,8 +33038,20 @@ class Workspaces:
         if hours <= 0 or self.storage is None or not self.storage.persist:
             return []
         gone = []
-        for key, mgr in self.items():
-            if now - getattr(mgr, "last_used", now) >= hours * 3600 \
-                    and self.unload(key):
-                gone.append(key)
+        for key, mgr in list(self.items()):
+            if now - getattr(mgr, "last_used", now) < hours * 3600:
+                continue
+            try:
+                if self.unload(key):
+                    gone.append(key)
+            except Exception as ex:  # noqa: BLE001 - one disk, one server
+                # Its write failed: it stays loaded with its changes, the
+                # error goes to the crash log once (counting repeats) and
+                # the sweep goes on; the command that ran the sweep, on
+                # another server, never sees it (W11).
+                print(f"⚠️ [{key}] unloading after idle hours failed: "
+                      f"{ex!r}; kept loaded.")
+                mgr._save_failure_ref = self.crashes.record(
+                    "saving to disk", ex, server=key,
+                    repeat_of=getattr(mgr, "_save_failure_ref", None))
         return gone
