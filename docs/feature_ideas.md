@@ -354,7 +354,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
     - a template save stores them relative to the root, as part ids are;
     - a transfer strips refs to units left behind.
   - Probe on 836e3af: `hero.pet = summon(wolf)`, then `remove_entity(wolf)`, then a new, unrelated summon is minted `wolf` again, and `entity[entity[hero].pet].hp` reads the new wolf's 9. `!ent clone hero hero2` copies `pet = 'wolf'` too.
-  - This is CLAUDE.md §5's dangling-relational-id class moved into GM data, where nothing guards it. A smaller first step: a `reuse_unit_ids` rule (off = a match never mints an id it has used before, as `corpse_id_uniqueness` does for corpse ids).
+  - This is CLAUDE.md §5's dangling-relational-id class moved into GM data, where nothing guards it. A smaller first step: a `reuse_unit_ids` rule (off = a match never mints an id it has used before, as a corpse's id stays taken while the corpse lies).
   - Builds on it: #56 (status source), #138 (tethers), #223 (`summoned_by`), NCS Taunted (the taunter), FCS1 Grab (the carried unit).
 - **#210 One coordinate grammar.**
   - Commands: every `<x> <y>` slot also takes one word `x,y` or `x,y,map`, and `@point` once #76 exists; `map=` stays.

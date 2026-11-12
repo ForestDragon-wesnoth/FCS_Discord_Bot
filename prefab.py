@@ -4,7 +4,7 @@ The agreed design is docs/zones_prefabs_design.md §5-§9. A prefab holds:
 
   {"kind": "prefab", "width": W, "height": H, "system": <system it was
    saved under>, "definitions_all": bool, "var_names": {rule: var},
-   "tiles": [[dx, dy, data], ...],          tile data without corpses
+   "tiles": [[dx, dy, data], ...],          tile data
    "corpses": [[dx, dy, id, corpse], ...],  corpse snapshots, cells relative
    "zones": {name: zone dict},              cells relative, an aura's
                                             `anchor` names a saved unit
@@ -199,29 +199,27 @@ def capture_prefab(mgr: Any, m: Match, mp: Map, x1: int, y1: int, x2: int,
             kept = [i for i in members if i in saved_ids]
             if kept:
                 data["groups"][g] = kept
-    if "tiles" in kinds or "corpses" in kinds:
+    if "tiles" in kinds:
         for (tx, ty), cell in sorted(mp.tiles.items(),
                                      key=lambda kv: (kv[0][1], kv[0][0])):
-            if not inside(tx, ty) or not isinstance(cell, dict):
+            if inside(tx, ty) and isinstance(cell, dict) and cell:
+                data["tiles"].append([tx - xa, ty - ya, copy.deepcopy(cell)])
+    if "corpses" in kinds:
+        for tx, ty, cid, corpse in sorted(
+                m.all_corpses(mp), key=lambda r: (r[1], r[0], r[2])):
+            if not inside(tx, ty):
                 continue
-            if "tiles" in kinds:
-                tdata = {k: copy.deepcopy(v) for k, v in cell.items()
-                         if k != "corpses"}
-                if tdata:
-                    data["tiles"].append([tx - xa, ty - ya, tdata])
-            if "corpses" in kinds:
-                for cid, corpse in sorted((cell.get("corpses") or {}).items()):
-                    if not all(inside(*c)
-                               for c in m.corpse_cells(tx, ty, corpse, mp)):
-                        notes.append(f"⚠️ The corpse of `{cid}` was left "
-                                     f"out: it reaches past the rectangle.")
-                        continue
-                    c = _relative_corpse(corpse, xa, ya)
-                    if c.pop("maps", None):
-                        notes.append(f"⚠️ The corpse of `{cid}` holds a "
-                                     f"wrecked map; the prefab keeps the "
-                                     f"corpse without it.")
-                    data["corpses"].append([tx - xa, ty - ya, cid, c])
+            if not all(inside(*c)
+                       for c in m.corpse_cells(tx, ty, corpse, mp)):
+                notes.append(f"⚠️ The corpse of `{cid}` was left "
+                             f"out: it reaches past the rectangle.")
+                continue
+            c = _relative_corpse(corpse, xa, ya)
+            if c.pop("maps", None):
+                notes.append(f"⚠️ The corpse of `{cid}` holds a "
+                             f"wrecked map; the prefab keeps the "
+                             f"corpse without it.")
+            data["corpses"].append([tx - xa, ty - ya, cid, c])
     if "zones" in kinds:
         for zname, z in sorted(mp.zones.items()):
             if not isinstance(z, dict):
@@ -244,8 +242,11 @@ def capture_prefab(mgr: Any, m: Match, mp: Map, x1: int, y1: int, x2: int,
 
 def _relative_corpse(corpse: Dict[str, Any], ox: int, oy: int
                      ) -> Dict[str, Any]:
-    """A corpse snapshot with its body's positions relative to (ox, oy)."""
+    """A corpse snapshot with its body's positions relative to (ox, oy)
+    (the record's own cell is the prefab entry's dx / dy)."""
     c = copy.deepcopy(corpse)
+    c.pop("x", None)
+    c.pop("y", None)
     for body in [c.get("entity")] + list(c.get("parts") or []):
         if isinstance(body, dict):
             body.pop("map", None)
@@ -419,10 +420,6 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                            f"{{data}}].")
         cell(t[0], t[1], "a tile")
         not_void(t[0], t[1], "a tile")
-        if "corpses" in t[2]:
-            raise VTTError(f"Prefab `{name}`: tile data can't hold "
-                           f"`corpses` (corpses are listed under "
-                           f"`corpses`).")
         # What a tile write would store: a value the store limits accept
         # (depth, size), and a `facing` that names a direction (L31, L25).
         try:
@@ -904,9 +901,8 @@ def replace_victims(m: Match, mp: Map, x: int, y: int, w: int, h: int
         if any(inside(*c) for u in tree for c in _unit_cells(m, u)):
             tops.append(top.id)
             seen |= {u.id for u in tree}
-    corpses = [cid for (cx, cy), cell in mp.tiles.items()
-               if isinstance(cell, dict) and inside(cx, cy)
-               for cid in sorted(cell.get("corpses") or {})]
+    corpses = [cid for cx, cy, cid, _c in m.all_corpses(mp)
+               if inside(cx, cy)]
     return tops, sorted(corpses)
 
 
@@ -1123,6 +1119,8 @@ def _clear_rect(m: Match, mp: Map, x: int, y: int, w: int, h: int,
     for cx in range(x, x + w):
         for cy in range(y, y + h):
             mp.tiles.pop((cx, cy), None)
+            for cid in mp.corpse_ids_at(cx, cy):
+                mp.take_corpse(cid)
     for zname in list(mp.zones):
         z = mp.zones[zname]
         cells = z.get("cells") or set()
@@ -1187,7 +1185,7 @@ def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
         nx, ny = turn.point(dx, dy)
         cx, cy = x + nx, y + ny
         old = mp.tiles.get((cx, cy))
-        has_data = isinstance(old, dict) and any(k != "corpses" for k in old)
+        has_data = bool(old)
         if mode == "keep" and has_data:
             continue
         new = copy.deepcopy(tdata)
@@ -1200,8 +1198,6 @@ def _stamp_tiles(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
             # template of the name takes it over (Z1+).
             del new["_template"]
             missing.add(str(tn))
-        if isinstance(old, dict) and old.get("corpses"):
-            new["corpses"] = old["corpses"]
         mp.tiles[(cx, cy)] = new
     if missing:
         notes.append("Tile template(s) " + ", ".join(
@@ -1257,8 +1253,9 @@ def _stamp_corpses(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
                              if isinstance(p, dict)]:
             notes += m._sync_unit_dict(body, m.rules,
                                        f"corpse `{body.get('id', nid)}`")
-        mp.tile_data(ent["x"], ent["y"]).setdefault("corpses", {})[nid] = c
-        mp.note_corpse(ent["x"], ent["y"])
+        c.pop("x", None)
+        c.pop("y", None)
+        mp.lay_corpse(nid, c, ent["x"], ent["y"])
 
 
 def _spawn_units(m: Match, mp: Map, pf: Dict[str, Any],

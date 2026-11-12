@@ -12747,6 +12747,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub in ("remove", "del", "rm"):# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "remove"):
             return
+        # An id names a living unit or a corpse, never both: a corpse's
+        # id removes the corpse (its id is free again).
+        if args[1] not in m.entities and m.find_corpse(args[1]) is not None:
+            _query_corpse(ctx, m, args[1])
+            m.remove_corpse(args[1])
+            return await ctx.send(f"Removed the corpse of `{args[1]}` from "
+                                  f"the match; its id is free again.")
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             return await ctx.send(f"❌ Entity `{eid}` not found.")
@@ -13323,9 +13330,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # produces stackable clones — they bypass the per-cell
         # occupancy check the same way Entity.spawn does.
         src_stackable = m.entities[src_id].is_cell_stackable
-        # Honor the corpse_id_uniqueness rule: a clone's id is taken
-        # if it's a live entity OR (under the default rule) a corpse.
-        taken_ids = m.entities.keys() if not bool(m.rules.get("corpse_id_uniqueness", True)) else m._taken_entity_ids()
+        # A clone's id is taken by a living unit or a corpse.
+        taken_ids = m._taken_entity_ids()
         # Build the (id, x, y) plan and validate everything up front.
         plan: List[Tuple[str, int, int]] = []
         seen_cells = set()
@@ -13842,7 +13848,8 @@ registry.annotate_sub(
 registry.annotate_sub(
     "ent", "remove", #"del", "rm",
     usage="!ent remove <id>",
-    desc="Remove an entity from the match. Alt aliases: del, rm."
+    desc="Remove a unit from the match, or the corpse of a dead one (its "
+         "id is free again once the corpse is gone). Alt aliases: del, rm."
 )
 registry.annotate_sub(
     "ent", "rename",
@@ -14900,45 +14907,10 @@ def _map_render_reply(ctx: ReplyContext, m, args: List[str],
 def _visible_tile_data(m, x: int, y: int, pov: Optional[str],
                        mp: "Map") -> Optional[Dict[str, Any]]:
     """The tile data at (x, y) as `pov` may see it, or None when there's no
-    tile or it's hidden. Corpses are stored inside tile data, so the ones
-    the POV can't see (corpse_visibility_condition, fog) are dropped; a tile
-    holding only hidden corpses reads as no tile."""
+    tile or it's hidden."""
     if (x, y) not in mp.tiles or not m.tile_visible_to(x, y, pov, mp):
         return None
-    data = mp.tiles[(x, y)]
-    if pov is None or not isinstance(data.get("corpses"), dict):
-        return data
-    seen = {cid: c for cid, c in data["corpses"].items()
-            if m.corpse_visible_to(cid, c, x, y, pov, mp)}
-    view = {k: v for k, v in data.items() if k != "corpses"}
-    if seen:
-        view["corpses"] = seen
-    return view or None
-
-
-def _reader_tile_data(m, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Tile data with each corpse snapshot's vars (and its parts') as the
-    command's reader may read them (private vars, V17)."""
-    reader = VAR_READER.get()
-    corpses = data.get("corpses")
-    if reader is None or not isinstance(corpses, dict):
-        return data
-    view = dict(data)
-    view["corpses"] = {}
-    for cid, c in corpses.items():
-        if not isinstance(c, dict):
-            view["corpses"][cid] = c
-            continue
-        c2 = dict(c)
-        if isinstance(c.get("entity"), dict):
-            c2["entity"] = dict(c["entity"])
-            c2["entity"]["vars"] = m.corpse_reader_vars(c, reader)
-        if isinstance(c.get("parts"), list):
-            c2["parts"] = [
-                dict(pd, vars=m.corpse_reader_vars({"entity": pd}, reader))
-                if isinstance(pd, dict) else pd for pd in c["parts"]]
-        view["corpses"][cid] = c2
-    return view
+    return mp.tiles[(x, y)]
 
 
 def _cell_spec_source(m, x: int, y: int, key: str,
@@ -15024,8 +14996,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             units.append(e)
     lines.append("Units: " + ("; ".join(_entity_line(e, pov) for e in units)
                               if units else "none"))
-    data = _visible_tile_data(m, x, y, pov, mp)
-    tile_data = {k: v for k, v in (data or {}).items() if k != "corpses"}
+    tile_data = _visible_tile_data(m, x, y, pov, mp)
     if tile_data:
         shown = json.dumps(_hide_formula_fields(tile_data), sort_keys=True,
                            default=str)
@@ -16482,10 +16453,10 @@ async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
             lines.append(f"{marker} {_entity_line(e, pov)}")
     # Dead: section. Each corpse rendered via _corpse_line which honors
     # the corpse_line_format rule (the corpse equivalent of
-    # entity_line_format — no hardcoded shape). The tile coords (NOT
-    # the embedded snapshot's x/y) are authoritative for position.
+    # entity_line_format — no hardcoded shape). The corpse record's x / y
+    # (not the embedded snapshot's) are authoritative for position.
     # Gated by show_corpses_in_entity_list — when false we silently
-    # omit the section (corpses still exist in tile data).
+    # omit the section (the corpses still exist).
     if bool(m.rules.get("show_corpses_in_entity_list", True)):
         corpses = [(x, y, eid, c, cmp) for (cmp, x, y, eid, c)
                    in m.every_corpse()
@@ -18733,6 +18704,7 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     many = len(set(maps_a) | set(maps_b)) > 1
     tile_lines: List[str] = []
     zone_lines: List[str] = []
+    corpse_lines: List[str] = []
     map_other: List[str] = []
     for mname in list(maps_a) + [n for n in maps_b if n not in maps_a]:
         if mname not in maps_a or mname not in maps_b:
@@ -18762,8 +18734,23 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
                         else "cells moved" if za[name].get("cells") != zb[name].get("cells")
                         else "changed")
                 zone_lines.append(f"  ~ zone `{name}`{at}: {what}")
+        ca, cb = ma.get("corpses") or {}, mb.get("corpses") or {}
+        for cid in sorted(set(ca) | set(cb), key=str):
+            if cid not in ca:
+                c = cb[cid]
+                corpse_lines.append(f"  + corpse `{cid}`{at} at "
+                                    f"({c.get('x')},{c.get('y')})")
+            elif cid not in cb:
+                corpse_lines.append(f"  - corpse `{cid}`{at}")
+            elif not same_value(ca[cid], cb[cid]):
+                pa, pb = ((c.get("x"), c.get("y")) for c in (ca[cid], cb[cid]))
+                corpse_lines.append(
+                    f"  ~ corpse `{cid}`{at}: "
+                    + (f"({pa[0]},{pa[1]}) -> ({pb[0]},{pb[1]})" if pa != pb
+                       else "changed"))
         for k in sorted(set(ma) | set(mb)):
-            if k not in ("tiles", "zones") and not same_value(ma.get(k), mb.get(k)):
+            if k not in ("tiles", "zones", "corpses") \
+                    and not same_value(ma.get(k), mb.get(k)):
                 map_other.append(f"`{mname}.{k}`" if many else f"`{k}`")
     if tile_lines:
         lines.append("- Tiles:")
@@ -18771,6 +18758,9 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     if zone_lines:
         lines.append("- Zones:")
         lines.extend(zone_lines)
+    if corpse_lines:
+        lines.append("- Corpses:")
+        lines.extend(corpse_lines)
     ga, gb = sa.get("groups") or {}, sb.get("groups") or {}
     group_lines = []
     for name in sorted(set(ga) | set(gb), key=str):
@@ -20654,25 +20644,14 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if (x1, y1) == (x2, y2):
             raise VTTError("The source and destination are the same cell.")
         src = mp.tiles.get((x1, y1))
-        # Corpses are bodies lying on the cell, stored in its tile data:
-        # they stay where they are (a copy would duplicate corpse ids).
-        data = {k: copy.deepcopy(v) for k, v in (src or {}).items()
-                if k != "corpses"}
-        if not data:
+        if not src:
             return await ctx.send(f"❌ tile ({x1},{y1}) has no tile data to "
                                   f"{'move' if move else 'copy'}.")
-        dest_corpses = (mp.tiles.get((x2, y2)) or {}).get("corpses")
-        if dest_corpses:
-            data["corpses"] = dest_corpses
-        replaced = (x2, y2) in mp.tiles and any(
-            k != "corpses" for k in mp.tiles[(x2, y2)])
+        data = copy.deepcopy(src)
+        replaced = bool(mp.tiles.get((x2, y2)))
         mp.tiles[(x2, y2)] = data
         if move:
-            src_corpses = src.get("corpses")
-            if src_corpses:
-                mp.tiles[(x1, y1)] = {"corpses": src_corpses}
-            else:
-                del mp.tiles[(x1, y1)]
+            del mp.tiles[(x1, y1)]
         verb = "Moved" if move else "Copied"
         return await ctx.send(
             f"{verb} tile ({x1},{y1}) to ({x2},{y2})"
@@ -20692,7 +20671,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if data is None:
             return await ctx.send(f"tile ({x},{y}): no data.")
         tags = m.tile_tags(x, y, mp)
-        data = _hide_formula_fields(_reader_tile_data(m, data))
+        data = _hide_formula_fields(data)
         return await ctx.send(
             f"**tile ({x},{y})**\n```json\n{json.dumps(data, indent=2, sort_keys=True)}\n```"
             + (f"\nTags (its template's and its own): {', '.join(tags)}"
@@ -20731,11 +20710,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"⚠️ This would clear all {n} special tile(s) in this match. "
                 f"To proceed: `!tile clear confirm`."
             )
-        for key in list(mp.tiles):
-            mp.clear_tile_keep_corpses(*key)
-        return await ctx.send(f"Cleared {n} tile(s)."
-                              + (" Corpses stay where they lie."
-                                 if mp.tiles else ""))
+        mp.tiles.clear()
+        return await ctx.send(f"Cleared {n} tile(s).")
 
     # ---- hook add|del|list ----
     # Tile hooks are formulas stored under tiles[(x,y)]["hooks"][when]
@@ -21202,14 +21178,11 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             overrides[k] = _parse_scalar(v)
         if name not in m.tile_templates:
             return await ctx.send(f"❌ template `{name}` not found.")
-        # Empty = in-bounds cell with no existing tile data (a cell holding
-        # only corpses counts as empty: they ride inside tile data). With
-        # several maps (map=a,b / all) the N are scattered over all their
-        # empty cells together, every cell equally likely.
+        # Empty = in-bounds cell with no tile data. With several maps
+        # (map=a,b / all) the N are scattered over all their empty cells
+        # together, every cell equally likely.
         def _tile_empty(emp, x, y):
-            cell = emp.tiles.get((x, y))
-            return cell is None or (isinstance(cell, dict)
-                                    and set(cell) <= {"corpses"})
+            return not emp.tiles.get((x, y))
         empty = [
             (i, x, y)
             for i, emp in enumerate(maps)
@@ -21442,8 +21415,7 @@ registry.annotate_sub(
     desc=(
         "Copy one cell's tile data — template link, glyph, block / opaque, "
         "hooks, every field — onto another cell, replacing what was there. "
-        "`move` also clears the source. Corpses lying on either cell stay "
-        "put (they're bodies, not terrain)."
+        "`move` also clears the source."
     ),
 )
 registry.annotate_sub(
@@ -21504,7 +21476,7 @@ registry.annotate_sub(
         "tiles placed from it like its data (#257). `reapply` pushes the template's "
         "data to its placed tiles on every map (or map=): its keys "
         "overwrite theirs, their other keys stay; `reset` makes each tile's "
-        "data a copy of the template's again (corpses stay). `rename` "
+        "data a copy of the template's again. `rename` "
         "takes the placed tiles along. Deleting a "
         "template that still has placed instances requires the "
         "trailing `confirm` token and detaches them: they keep their data, "

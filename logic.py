@@ -3656,9 +3656,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "enum", "choices": ["delete", "corpse"]},
         "desc": (
             "What happens when an entity dies. `corpse` (default) "
-            "stores the Entity.to_dict snapshot in the entity's cell "
-            "tile data under a corpses-by-id map "
-            "(`tile[(x,y)].corpses.<eid>`) and removes the entity from "
+            "lays a corpse holding the Entity.to_dict snapshot on its "
+            "cell (the map's corpse store, under the unit's id, which "
+            "stays taken while the corpse lies) and removes the entity from "
             "turn order — actions can later `revive(<eid>)` it. "
             "`delete` removes the entity outright (no corpse left). "
             "Per-entity override: set `__death_result` in the "
@@ -3726,23 +3726,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "section below the live entity roster, displaying every "
             "corpse's id, name, position, and final hp/max_hp. False "
             "hides corpses from the entity-list output (they still "
-            "exist in tile data; `!find` / `entity_actions` etc. on "
+            "exist; `!find` / `entity_actions` etc. on "
             "corpses use the explicit corpse-targeting surface)."
-        ),
-    },
-    "corpse_id_uniqueness": {
-        "default": True,
-        "schema": {"type": "bool"},
-        "desc": (
-            "When true (default), entity-id allocation considers CORPSE "
-            "ids as well as live entity ids: `summon` / `mint_entity_id` "
-            "won't reuse a corpse's id, and `!ent add` / `Entity.spawn` "
-            "refuses an explicit id that matches a corpse. Prevents the "
-            "'goblin1 dies → new goblin1 spawned → revive(goblin1) is "
-            "forced to a different id' breakage. Turn off only if a "
-            "system wants id reuse and the GM is OK with revive deciding "
-            "which entity gets the id back (the current naming-collision "
-            "semantics)."
         ),
     },
     "default_kill_function_effects": {
@@ -6816,7 +6801,7 @@ def state_text(state: Dict[str, Any], match: Optional["Match"] = None,
     """json.dumps of a match state (Match.to_dict), the same text, built
     from the cached text of each unit, tile and zone of `match` whose
     serialized form the state holds (Entity.ser_dict, Map.ser_tiles /
-    ser_zones): a command that changed one unit encodes that unit. `sort`
+    ser_zones / ser_corpses): a command that changed one unit encodes that unit. `sort`
     = the journal hash's form (sorted keys, default separators), else the
     files' (compact). A state of another time (a snapshot read back)
     encodes its pieces anew."""
@@ -6879,7 +6864,7 @@ def state_text(state: Dict[str, Any], match: Optional["Match"] = None,
         if mp is None or type(md) is not dict:
             return ekey(md)
         return obj(md, lambda k, v: pieces(mp, k, v)
-                   if k in ("tiles", "zones") else ekey(v))
+                   if k in ("tiles", "zones", "corpses") else ekey(v))
 
     def top(k: str, v: Any) -> str:
         if k == "entities" and type(v) is dict:
@@ -8187,10 +8172,7 @@ def _run_passive_line(engine, p: "Passive", ctx, *, target_id: str,
 # don't need a template — they're written as ad-hoc instances via
 # !tile set + !tile hook add, which keep working unchanged. Templates
 # exist purely as a reuse convenience for tile KINDS that recur.
-TILE_RESERVED_KEYS = frozenset({"_template", "hooks", "corpses"})
-_CORPSES_RESERVED = ("`corpses` in tile data is where the engine keeps the "
-                     "dead lying there: it can't be set or deleted as tile "
-                     "data.")
+TILE_RESERVED_KEYS = frozenset({"_template", "hooks"})
 # Keys in a tile dict that aren't user data:
 #   _template — name of the template this instance was placed from
 #               (absent on ad-hoc instances)
@@ -10018,15 +10000,12 @@ class Entity:
             raise VTTError(f"Entity '{self.id}' is already in a match")
         match.check_unit_room(1, f"`{self.id}`")
         self.map = match.get_map(map_name).name
-        # ID collision check honors `corpse_id_uniqueness` — under the
-        # default true setting a corpse's id reserves the name too, so
-        # spawning a fresh `goblin1` while a `goblin1` corpse exists
-        # raises here instead of orphaning the corpse's identity.
+        # A corpse's id (and the ids of the parts it holds) stays taken
+        # until the corpse is gone, so its revive gets the id back.
         if match.id_taken(self.id):
             raise DuplicateId(
                 f"Entity id '{self.id}' already exists in this match "
-                f"(as a live entity or a corpse — see the "
-                f"`corpse_id_uniqueness` rule)."
+                f"(as a living unit or a corpse)."
             )
 
         # Fill missing vars from the system's default_entity_vars BEFORE
@@ -11339,17 +11318,44 @@ def _ix_set(table: Dict[Any, Any], key: Any, cells: List[Any]) -> None:
 
 
 class CorpseIndex:
-    """A map's corpse index (Map._corpse_ix): the cells holding corpses,
-    and per corpse id and per id of a body part a corpse holds the cell
-    holding it (a set of cells when there are several). Entries can be stale (a corpse taken away); readers check
-    the cell. `pending`: cells written since, read on the next lookup."""
-    __slots__ = ("cells", "ids", "parts", "pending")
+    """A map's corpse index (Map._corpse_ix), built from Map.corpses:
+    cell -> the ids of the corpses whose anchor lies there, body part id ->
+    the corpse holding it, and per corpse what it was filed under (`rec`),
+    so a corpse filed again leaves its old entries. Kept by the store's
+    marks (CorpseTable.also)."""
+    __slots__ = ("cells", "parts", "rec")
 
     def __init__(self) -> None:
-        self.cells: Set[Tuple[int, int]] = set()
-        self.ids: Dict[str, Any] = {}
-        self.parts: Dict[str, Any] = {}
-        self.pending: Set[Tuple[int, int]] = set()
+        self.cells: Dict[Tuple[int, int], Set[str]] = {}
+        self.parts: Dict[str, str] = {}
+        self.rec: Dict[str, Tuple[Tuple[int, int], List[str]]] = {}
+
+    def file(self, cid: str, corpse: Any) -> None:
+        cell = _corpse_cell(corpse)
+        pids = _corpse_part_ids(corpse)
+        self.rec[cid] = (cell, pids)
+        self.cells.setdefault(cell, set()).add(cid)
+        for pid in pids:
+            self.parts[pid] = cid
+
+    def unfile(self, cid: str) -> None:
+        old = self.rec.pop(cid, None)
+        if old is None:
+            return
+        cell, pids = old
+        held = self.cells.get(cell)
+        if held is not None:
+            held.discard(cid)
+            if not held:
+                del self.cells[cell]
+        for pid in pids:
+            if self.parts.get(pid) == cid:
+                del self.parts[pid]
+
+
+def _corpse_cell(corpse: Any) -> Tuple[int, int]:
+    """A corpse record's anchor cell (its `x` / `y`)."""
+    return int(corpse["x"]), int(corpse["y"])
 
 
 @dataclass
@@ -11364,8 +11370,8 @@ class Map:
     grid_width: int
     grid_height: int
     # Special-tile data, sparse: (x, y) -> a free-form dict of named
-    # "features" (e.g. {"flame": {"burn_damage": 5}, "glyph": "*"}). Corpses
-    # live here too (`corpses.<id>`). Reads from formulas go through
+    # "features" (e.g. {"flame": {"burn_damage": 5}, "glyph": "*"}). Reads
+    # from formulas go through
     # tile_get / tile_has. Serialized with "x,y" string keys.
     tiles: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
     # Zone registry: name -> {"cells": Set[(x,y)], "data": {...}, "hooks":
@@ -11374,6 +11380,12 @@ class Map:
     # that can overlap tiles and other zones and be reshaped or shifted;
     # `cells` is a set in memory, a sorted list of [x, y] on disk.
     zones: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # The corpses lying on the map (CorpseTable): unit id -> the corpse
+    # record {x, y, entity, died_round, groups?, parts?, maps?}, x / y its
+    # anchor cell. An id names one unit, alive or dead, across the match,
+    # so a corpse keeps its id until it is gone (revived, removed or
+    # dropped with its map). Kept out of the tile data (user call).
+    corpses: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Per-team set of explored cells (fog memory): team -> {(x, y)} ever seen
     # by that team while fog memory is on. Saved as row runs.
     explored: Dict[str, "set"] = field(default_factory=dict)
@@ -11398,13 +11410,9 @@ class Map:
     # the rectangle (in_rect) stays the frame for coordinates, rulers,
     # resize and the cell limits. Saved as row runs.
     voids: Set[Tuple[int, int]] = field(default_factory=set)
-    # The corpse index (CorpseIndex): which cells hold corpses, by corpse
-    # id and by the ids of the body parts a corpse holds, so finding,
-    # listing and id checks read the corpses, never every tile (#154).
-    # Runtime-only; None = built from the tiles on its next use (a replaced
-    # `tiles` dict resets it). Every write that lays a corpse calls
-    # note_corpse on its cell, which the next lookup reads again; a corpse
-    # taken away is noticed when its cell is read.
+    # The corpse index (CorpseIndex) over `corpses`: corpse ids by cell and
+    # the ids of the body parts corpses hold, so cell reads and id checks
+    # never scan every corpse. Runtime-only; None = built on its next use.
     _corpse_ix: Optional["CorpseIndex"] = field(
         default=None, repr=False, compare=False)
 
@@ -11447,6 +11455,10 @@ class Map:
                                   compare=False)
     _zser_out: Optional[Dict[str, Any]] = field(default=None, repr=False,
                                                 compare=False)
+    _cser: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                  compare=False)
+    _cser_out: Optional[Dict[str, Any]] = field(default=None, repr=False,
+                                                compare=False)
     _runs: Dict[str, Any] = field(default_factory=dict, repr=False,
                                   compare=False)
     _ser_frozen: Dict[str, Any] = field(default_factory=dict, repr=False,
@@ -11464,14 +11476,18 @@ class Map:
             value = TileDict(value)
         elif name == "zones" and type(value) is not ZoneTable:
             value = ZoneTable(value)
+        elif name == "corpses" and type(value) is not CorpseTable:
+            value = CorpseTable(value)
         object.__setattr__(self, name, value)
         if name == "tiles":
-            object.__setattr__(self, "_corpse_ix", None)
             object.__setattr__(self, "_tser_out", None)
             object.__setattr__(self, "_hook_ix", None)
         elif name == "zones":
             object.__setattr__(self, "_zone_ix", None)
             object.__setattr__(self, "_zser_out", None)
+        elif name == "corpses":
+            object.__setattr__(self, "_corpse_ix", None)
+            object.__setattr__(self, "_cser_out", None)
         elif name in ("explored", "fog_reveals", "voids"):
             self.__dict__.get("_runs", {}).pop(name, None)
 
@@ -11688,88 +11704,100 @@ class Map:
             self._zone_dirty.clear()
         return ix
 
-    def note_corpse(self, x: int, y: int) -> None:
-        """A corpse was laid on (x, y), or one lying there changed."""
-        self.tile_touch(x, y)
-        ix = self._corpse_ix
-        if ix is not None:
-            ix.pending.add((x, y))
+    def corpse_changed(self, cid: str) -> None:
+        """The corpse of `cid` changed in place (its record, its cell, the
+        parts it holds): its serialized form and index entry are stale."""
+        self.corpses.mark(cid)
 
-    def _corpses_on(self, c: Tuple[int, int]) -> Optional[Dict[str, Any]]:
-        cell = self.tiles.get(c)
-        corpses = cell.get("corpses") if isinstance(cell, dict) else None
-        return corpses if isinstance(corpses, dict) and corpses else None
+    def lay_corpse(self, cid: str, corpse: Dict[str, Any], x: int,
+                   y: int) -> None:
+        """Lay `corpse` (a corpse record) for unit `cid` with its anchor on
+        (x, y)."""
+        corpse["x"], corpse["y"] = int(x), int(y)
+        self.corpses[cid] = corpse
+
+    def take_corpse(self, cid: str) -> Optional[Dict[str, Any]]:
+        """Take the corpse of `cid` off the map; None when none lies here."""
+        return self.corpses.pop(cid, None)
 
     def _corpse_index(self) -> "CorpseIndex":
         ix = self._corpse_ix
-        if ix is None:
+        t = self.corpses
+        if ix is None or t.also is None:
             ix = CorpseIndex()
-            ix.pending = {c for c, cell in self.tiles.items()
-                          if isinstance(cell, dict) and cell.get("corpses")}
+            for cid, corpse in t.items():
+                ix.file(cid, corpse)
             object.__setattr__(self, "_corpse_ix", ix)
-        if ix.pending:
-            for c in ix.pending:
-                corpses = self._corpses_on(c)
-                if not corpses:
-                    continue
-                ix.cells.add(c)
-                for cid, corpse in corpses.items():
-                    _ix_add(ix.ids, cid, c)
-                    for pid in _corpse_part_ids(corpse):
-                        _ix_add(ix.parts, pid, c)
-            ix.pending = set()
+            t.also = set()
+        elif t.also:
+            for cid in t.also:
+                ix.unfile(cid)
+                corpse = t.get(cid)
+                if corpse is not None:
+                    ix.file(cid, corpse)
+            t.also = set()
+        if SPATIAL_CHECK:
+            fresh = CorpseIndex()
+            for cid, corpse in t.items():
+                fresh.file(cid, corpse)
+            if (fresh.cells, fresh.parts) != (ix.cells, ix.parts):
+                raise SpatialCheckError(
+                    f"map `{self.name}`: the corpse index differs from the "
+                    f"corpses")
         return ix
 
+    def corpse_ids_at(self, x: int, y: int) -> List[str]:
+        """The ids of the corpses whose anchor lies on (x, y), sorted."""
+        held = self._corpse_index().cells.get((x, y))
+        return sorted(held) if held else []
+
     def corpse_cells_of(self, cid: str) -> List[Tuple[int, int]]:
-        """The cells holding a corpse of unit `cid`, sorted (one, unless
-        corpse ids aren't unique)."""
-        ids = self._corpse_index().ids
-        held = ids.get(cid)
-        if held is None:
-            return []
-        cells = held if isinstance(held, set) else (held,)
-        live = [c for c in cells if cid in (self._corpses_on(c) or ())]
-        if len(live) != len(cells):
-            _ix_set(ids, cid, live)
-        return sorted(live)
+        """[the anchor cell of the corpse of `cid`], [] when none lies
+        here."""
+        corpse = self.corpses.get(cid)
+        return [_corpse_cell(corpse)] if corpse is not None else []
 
     def corpse_holds_part(self, pid: str) -> bool:
         """Whether a corpse on this map holds a body part with id `pid`
         (its revive brings the part back under that id)."""
-        parts = self._corpse_index().parts
-        held = parts.get(pid)
-        if held is None:
-            return False
-        cells = held if isinstance(held, set) else (held,)
-        live = [c for c in cells
-                if any(pid in _corpse_part_ids(corpse)
-                       for corpse in (self._corpses_on(c) or {}).values())]
-        if len(live) != len(cells):
-            _ix_set(parts, pid, live)
-        return bool(live)
+        return pid in self._corpse_index().parts
 
     def corpse_entries(self) -> List[Tuple[int, int, str, Dict[str, Any]]]:
         """Every corpse on the map as (x, y, unit id, corpse), sorted by
         cell then id."""
         ix = self._corpse_index()
+        t = self.corpses
         out: List[Tuple[int, int, str, Dict[str, Any]]] = []
-        gone = []
-        tiles = self.tiles
         for c in sorted(ix.cells):
-            cell = tiles.get(c)
-            corpses = cell.get("corpses") if type(cell) is dict else None
-            if not corpses or type(corpses) is not dict:
-                gone.append(c)
-                continue
             x, y = c
-            if len(corpses) == 1:
-                for cid, corpse in corpses.items():
-                    out.append((x, y, cid, corpse))
-            else:
-                for cid in sorted(corpses):
-                    out.append((x, y, cid, corpses[cid]))
-        if gone:
-            ix.cells.difference_update(gone)
+            for cid in sorted(ix.cells[c]):
+                out.append((x, y, cid, t[cid]))
+        return out
+
+    def ser_corpses(self) -> Dict[str, Any]:
+        """The `corpses` of to_dict (id -> record, sorted by id), cached:
+        only the corpses marked since the last call are copied again."""
+        t = self.corpses
+        out = self._cser_out
+        ch = t.changed
+        if out is None or ch is None:
+            cache = {cid: jcopy(c) for cid, c in t.items()}
+            object.__setattr__(self, "_cser", cache)
+            out = {cid: cache[cid] for cid in sorted(cache)}
+        elif ch:
+            cache = self._cser
+            for cid in ch:
+                c = t.get(cid)
+                if c is None:
+                    cache.pop(cid, None)
+                else:
+                    cache[cid] = jcopy(c)
+            out = {cid: cache[cid] for cid in sorted(cache)}
+        t.changed = set()
+        object.__setattr__(self, "_cser_out", out)
+        if SPATIAL_CHECK:
+            self._check_cached("corpses", out, {
+                cid: jcopy(c) for cid, c in sorted(t.items())})
         return out
 
     def size_text(self) -> str:
@@ -11858,15 +11886,6 @@ class Map:
             d = d[key]
         return True
 
-    def clear_tile_keep_corpses(self, x: int, y: int) -> None:
-        """Drop cell (x, y)'s tile data but not the corpses lying on it."""
-        cell = self.tiles.get((x, y))
-        corpses = cell.get("corpses") if isinstance(cell, dict) else None
-        if corpses:
-            self.tiles[(x, y)] = {"corpses": corpses}
-        else:
-            self.tiles.pop((x, y), None)
-
     def tile_set_path(self, x: int, y: int, path: str, value: Any) -> None:
         """Set tile_data[x,y][a][b][c] = value, creating intermediate
         dicts as needed (same write semantics as Entity.write_var,
@@ -11878,8 +11897,6 @@ class Map:
                 f"({x},{y}) {self.off_text(x, y)}"
             )
         check_store_path(path, "tile path")
-        if path.split(".")[0] == "corpses":
-            raise VTTError(_CORPSES_RESERVED)
         value = checked_facing_data(path, value)
         # Checked before any container on the path is made: a refused
         # value left an empty `{}` tile behind (L35).
@@ -11912,11 +11929,8 @@ class Map:
         if (x, y) not in self.tiles:
             return  # nothing to do — symmetric with remove_var_silent
         if not path:
-            # The corpses lying there stay: bodies, not terrain.
-            self.clear_tile_keep_corpses(x, y)
+            self.tiles.pop((x, y), None)
             return
-        if path.split(".")[0] == "corpses":
-            raise VTTError(_CORPSES_RESERVED)
         # Walk down, tracking each parent dict so we can prune empties
         # on the way back up.
         parts = path.split(".")
@@ -12254,6 +12268,7 @@ class Map:
             "vehicle": self.vehicle,
             "tiles": self.ser_tiles(),
             "zones": self.ser_zones(),
+            "corpses": self.ser_corpses(),
             # cell sets as row runs [y, x_from, x_to] (_cells_to_runs)
             "explored": self._runs_ser("explored"),
             "fog_reveals": self._runs_ser("fog_reveals"),
@@ -12297,6 +12312,19 @@ class Map:
             z = mp._zone_from_dict(zdef)
             if z is not None:
                 mp.zones[zname] = z
+        # A corpse whose anchor is off the map couldn't be reached; it is
+        # dropped like a tile there.
+        for cid, corpse in (d.get("corpses") or {}).items():
+            if not isinstance(cid, str) or not isinstance(corpse, dict):
+                continue
+            try:
+                x, y = int(corpse["x"]), int(corpse["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if mp.in_bounds(x, y):
+                c = jcopy(corpse)
+                c["x"], c["y"] = x, y
+                mp.corpses[cid] = c
         gw, gh = mp.grid_width, mp.grid_height
         raw_expl = d.get("explored", {})
         mp.explored = {
@@ -12399,6 +12427,12 @@ class TileDict(ChangeDict):
 
 
 class ZoneTable(ChangeDict):
+    __slots__ = ()
+
+
+class CorpseTable(ChangeDict):
+    """Map.corpses: `changed` feeds ser_corpses, `also` the corpse
+    index."""
     __slots__ = ()
 
 
@@ -14512,7 +14546,7 @@ class Match:
             kept = corpse.get("maps")
             if isinstance(kept, list) and name in kept:
                 corpse["maps"] = [k for k in kept if k != name]
-                _mp.note_corpse(_x, _y)
+                _mp.corpse_changed(_cid)
         # Tagged with the gone map: only an unfiltered view reads it.
         for n in sorted(before - set(self.maps) - {name}):
             log.append(f"{UNIT_LINE_TAG}{self.id}||0|0|{n}{UNIT_LINE_TAG}"
@@ -14579,8 +14613,7 @@ class Match:
         stores += [d.get("data") for d in self.zone_definitions.values()]
         stores += [t.data for t in self.tile_templates.values()]
         for m2 in self.maps.values():
-            # Tile data holds the corpses too: their vars and statuses.
-            stores += [m2.vars, m2.tiles]
+            stores += [m2.vars, m2.tiles, m2.corpses]
             stores += [z.get("data") for z in m2.zones.values()]
         for _mp, _x, _y, _cid, corpse in self.every_corpse():
             for body in [corpse.get("entity")] + list(corpse.get("parts") or []):
@@ -14596,11 +14629,12 @@ class Match:
         for m2 in self.maps.values():
             m2.tiles.mark_all()
             m2.zones.changed = None
+            m2.corpses.changed = None
         return n
 
     def copy_map(self, name: str, new: str) -> Tuple["Map", Dict[str, str]]:
-        """A copy of map `name` called `new`: its size, tiles (without
-        corpses), zones and map vars; no units, corpses or fog memory.
+        """A copy of map `name` called `new`: its size, tiles, zones and map
+        vars; no units, corpses or fog memory.
         Zone names are unique across the match, so each copied zone gets a
         new name (`<zone>_<new>`, numbered on a clash); auras (zones bound
         to a unit) are left out. Returns the map and {old zone: new zone}."""
@@ -14612,11 +14646,7 @@ class Match:
         mp = Map.from_dict(new, src.to_dict())
         mp.explored, mp.fog_reveals = {}, {}
         mp.vehicle = None
-        for key in list(mp.tiles):
-            cell = mp.tiles[key]
-            cell.pop("corpses", None)
-            if not cell:
-                del mp.tiles[key]
+        mp.corpses = {}
         renamed: Dict[str, str] = {}
         zones: Dict[str, Dict[str, Any]] = {}
         taken = set(self.zone_names())
@@ -14992,14 +15022,14 @@ class Match:
                             children.setdefault(u.part_of, []).append(u)
         for _mp, _x, _y, _cid, c in self.every_corpse():
             if self._settle_corpse_size(c):
-                _mp.note_corpse(_x, _y)
+                _mp.corpse_changed(_cid)
         return log
 
     def _settle_corpse_size(self, c: Any) -> bool:
         """A corpse's category read from the total it died with (a corpse
         keeps that total while sizes are off: nothing could derive it
         again); only its category follows the scale. True when it changed
-        (the caller marks its cell, Map.note_corpse)."""
+        (the caller marks it, Map.corpse_changed)."""
         cv = _corpse_vars(c)
         if not isinstance(cv, dict):
             return False
@@ -15391,7 +15421,7 @@ class Match:
                     kept = loc[2].setdefault("maps", [])
                     if name not in kept:
                         kept.append(name)
-                    loc[3].note_corpse(loc[0], loc[1])
+                    loc[3].corpse_changed(vid)
                 wreck = vars_.get(str(self.rules.get(
                     "map_vehicle_wreck_var", "wreck_formula")))
                 if not isinstance(wreck, str):
@@ -15432,13 +15462,7 @@ class Match:
             finally:
                 LEGACY_IDS_OK.reset(token)
             spot = self._eject_spot(body, outer, box, block_mode=None)
-            cell = mp.tiles.get((x, y), {})
-            del cell["corpses"][cid]
-            mp.tile_touch(x, y)
-            if not cell["corpses"]:
-                cell.pop("corpses")
-            if not cell:
-                mp.tiles.pop((x, y), None)
+            mp.take_corpse(cid)
             if spot is None:
                 # Tagged with the corpse's cell on the dying map: a view
                 # that couldn't see it there doesn't learn of it.
@@ -15453,8 +15477,7 @@ class Match:
                     d["map"] = outer.name
                     if isinstance(d.get("x"), int) and isinstance(d.get("y"), int):
                         d["x"], d["y"] = d["x"] + dx, d["y"] + dy
-            outer.tile_data(*spot).setdefault("corpses", {})[cid] = corpse
-            outer.note_corpse(spot[0], spot[1])
+            outer.lay_corpse(cid, corpse, spot[0], spot[1])
         return log
 
     def _kill_all_on_map(self, name: str) -> List[str]:
@@ -15621,17 +15644,30 @@ class Match:
             e.y += oy
             self._shift_snake_path_vars(e.vars, ox, oy)
 
-        # Re-key tiles (corpses ride along inside tile data); drop off-grid.
+        # Re-key tiles and corpses; drop off-grid.
         old_tiles = len(mp.tiles)
-        dropped_corpses = sorted(
-            str(cid)
-            for (x, y), cell in mp.tiles.items()
-            if not in_new(x + ox, y + oy) and isinstance(cell, dict)
-            for cid in (cell.get("corpses") or {}))
         mp.tiles = {(x + ox, y + oy): cell
                     for (x, y), cell in mp.tiles.items()
                     if in_new(x + ox, y + oy)}
         dropped_tiles = old_tiles - len(mp.tiles)
+        dropped_corpses: List[str] = []
+        kept_corpses: Dict[str, Dict[str, Any]] = {}
+        for cid, corpse in mp.corpses.items():
+            x, y = _corpse_cell(corpse)
+            if in_new(x + ox, y + oy):
+                corpse["x"], corpse["y"] = x + ox, y + oy
+                # The bodies' own cells too: a located part revives at its
+                # stored cell.
+                for d in [corpse.get("entity")] + list(
+                        corpse.get("parts") or []):
+                    if isinstance(d, dict) and isinstance(d.get("x"), int) \
+                            and isinstance(d.get("y"), int):
+                        d["x"], d["y"] = d["x"] + ox, d["y"] + oy
+                kept_corpses[cid] = corpse
+            else:
+                dropped_corpses.append(str(cid))
+        dropped_corpses.sort()
+        mp.corpses = kept_corpses
 
         # Shift + clip zone cells.
         clipped_cells = 0
@@ -15721,12 +15757,9 @@ class Match:
                 + ", ".join(f"`{i}`" for i in roots)
                 + ". Move them first, or set map_void_occupied_mode=kill "
                   "to kill them instead.")
-        lost_tiles = sorted(c for c in added
-                            if any(k != "corpses"
-                                   for k in (mp.tiles.get(c) or {})))
-        lost_corpses = sorted(
-            str(cid) for c in added
-            for cid in ((mp.tiles.get(c) or {}).get("corpses") or {}))
+        lost_tiles = sorted(c for c in added if mp.tiles.get(c))
+        lost_corpses = sorted(str(cid) for c in added
+                              for cid in mp.corpse_ids_at(*c))
         lost_zones = sorted(name for name, z in mp.zones.items()
                             if not z.get("anchor")
                             and any(c in added for c in z.get("cells", ())))
@@ -15768,13 +15801,14 @@ class Match:
                 log.extend(klog)
                 killed.append(eid)
             cut = cut_ids()
-        dropped_corpses = sorted(
-            str(cid) for c in added
-            for cid in ((mp.tiles.get(c) or {}).get("corpses") or {}))
+        dropped_corpses = sorted(str(cid) for c in added
+                                 for cid in mp.corpse_ids_at(*c))
+        for cid in dropped_corpses:
+            mp.take_corpse(cid)
         dropped_tiles = 0
         for c in added:
             cell = mp.tiles.pop(c, None)
-            if isinstance(cell, dict) and any(k != "corpses" for k in cell):
+            if cell:
                 dropped_tiles += 1
         clipped = 0
         for zname, z in mp.zones.items():
@@ -19169,10 +19203,6 @@ class Match:
                     overrides[FACING_FIELD])})
             tile.update(copy.deepcopy(overrides))
         tile["_template"] = name
-        # Placing terrain keeps the corpses lying on the cell.
-        old = mp.tiles.get((x, y))
-        if isinstance(old, dict) and old.get("corpses"):
-            tile["corpses"] = old["corpses"]
         mp.tiles[(x, y)] = tile
         return tile
 
@@ -19181,8 +19211,7 @@ class Match:
         """Push tile template `name`'s data to the tiles placed from it on
         `maps` (#258): its keys overwrite the tile's same keys, the tile's
         other keys stay; with `reset` the tile's data becomes a copy of the
-        template's (its own hooks and tags data go too). Corpses always
-        stay. Hooks and tags of the template are read live already.
+        template's (its own hooks and tags data go too). Hooks and tags of the template are read live already.
         Returns the number of tiles whose data changed."""
         tpl = self.tile_templates.get(name)
         if tpl is None:
@@ -19195,8 +19224,6 @@ class Match:
                 if reset:
                     new = copy.deepcopy(tpl.data)
                     new["_template"] = name
-                    if old.get("corpses"):
-                        new["corpses"] = old["corpses"]
                 else:
                     new = dict(old)
                     new.update(copy.deepcopy(tpl.data))
@@ -22093,6 +22120,8 @@ class Match:
                     hit = True
                 if self._rename_status_refs(body.get("vars"), old, new, ""):
                     hit = True
+            if hit:
+                _mp.corpse_changed(_cid)
             counts["corpses"] += hit
         # The zones and zone definitions granting it (#136).
         counts["zone grants"] = 0
@@ -22104,7 +22133,6 @@ class Match:
                 counts["zone grants"] += 1
         for mp in self.maps.values():
             mp.zones.changed = None
-            mp.tiles.mark_all()     # corpses' statuses
         return counts
 
     def _rename_status_refs(self, node: Any, old: str, new: str,
@@ -24692,29 +24720,24 @@ class Match:
             _SAVING_TO_LIBRARY.reset(token)
 
     def _taken_entity_ids(self) -> "set[str]":
-        """Return the set of entity ids that should be considered
-        already-in-use for collision purposes. Always includes live
-        entity ids; ALSO includes corpse ids when the
-        `corpse_id_uniqueness` rule is true (default), and the ids of the
-        body parts a corpse holds, which come back with its revive under
-        their ids (K9). Costs every unit and corpse: a test of one id is
-        id_taken."""
+        """The ids a new unit can't take: the living units', the corpses'
+        and those of the body parts the corpses hold, which come back with
+        a revive under their ids (K9). An id names one unit, alive or dead,
+        until its corpse is gone (user call). Costs every unit and corpse:
+        a test of one id is id_taken."""
         taken: set = set(self.entities.keys())
-        if bool(self.rules.get("corpse_id_uniqueness", True)):
-            for (_mp, _x, _y, eid, c) in self.every_corpse():
-                taken.add(eid)
-                taken.update(_corpse_part_ids(c))
+        for (_mp, _x, _y, eid, c) in self.every_corpse():
+            taken.add(eid)
+            taken.update(_corpse_part_ids(c))
         return taken
 
     def id_taken(self, eid: str) -> bool:
         """Whether a new unit can't take id `eid` (the test behind
-        _taken_entity_ids, for one id: the units, plus the corpses and
-        the parts they hold under corpse_id_uniqueness), read from the
-        corpse indexes."""
-        taken = eid in self.entities or (
-            bool(self.rules.get("corpse_id_uniqueness", True))
-            and any(mp.corpse_cells_of(eid) or mp.corpse_holds_part(eid)
-                    for mp in self.maps.values()))
+        _taken_entity_ids, for one id), read from the corpse stores and
+        indexes."""
+        taken = eid in self.entities or any(
+            eid in mp.corpses or mp.corpse_holds_part(eid)
+            for mp in self.maps.values())
         if SPATIAL_CHECK and taken != (eid in self._taken_entity_ids()):
             raise SpatialCheckError(f"corpse index: id_taken({eid!r}) = {taken}")
         return taken
@@ -24722,10 +24745,9 @@ class Match:
     def mint_entity_id(self, prefix: str,
                        also: Optional[Set[str]] = None) -> str:
         """Return an id not currently in use, derived from `prefix`.
-        `prefix` itself if free, else prefix2, prefix3, ... Honors the
-        `corpse_id_uniqueness` rule: when true (default) the scan
-        considers corpse ids too, so a summoned skeleton becomes
-        `skeleton2` if a `skeleton` corpse is already lying around.
+        `prefix` itself if free, else prefix2, prefix3, ... A corpse's id
+        is taken, so a summoned skeleton becomes `skeleton2` while a
+        `skeleton` corpse lies around.
         Prefix is sanitized to a reasonable id token (whitespace/dots
         stripped) and lower-cased; falls back to 'summon' if empty.
         `also`: ids to treat as taken too (minted for units not spawned
@@ -25107,14 +25129,11 @@ class Match:
         return out
 
     # ---- death / corpse machinery ----------------------------------------
-    # A "corpse" is an entry under `tile[(x,y)].corpses.<eid>` carrying
-    # the dead entity's full Entity.to_dict (so revive can spawn it back
-    # exactly). The corpse's authoritative position is the TILE
-    # coordinate, never the embedded entity dict's `x`/`y` (those are
-    # snapshotted at death and not read by engine code afterward — this
-    # is the desync prevention the user called out). Multi-corpse-per-
-    # cell is supported via the id-keyed map; a second death on the same
-    # cell adds a new key, not an overwrite.
+    # A corpse is a record in its map's corpse store (Map.corpses[<eid>])
+    # carrying the dead entity's full Entity.to_dict (so revive can spawn
+    # it back exactly). Its authoritative position is the record's x / y;
+    # the embedded entity dict's x / y are the snapshot at death. Any
+    # number of corpses can lie on one cell.
 
     def _effective_death_condition(self, e: "Entity") -> Tuple[str, str]:
         """Resolve the (condition_formula, mode) pair to evaluate for
@@ -25895,18 +25914,10 @@ class Match:
         return to_main, log
 
     def _store_corpse(self, e: "Entity") -> None:
-        """Snapshot `e` into a corpse entry under tile (e.x, e.y) at
-        `corpses.<eid>`. Stores the full Entity.to_dict (including id,
-        x, y) so revive can spawn it back exactly. Multi-corpse-per-
-        cell: existing corpses on the cell aren't disturbed."""
+        """Lay `e`'s corpse on its map (Map.corpses[e.id]), anchored at
+        (e.x, e.y). Stores the full Entity.to_dict (including id, x, y) so
+        revive can spawn it back exactly."""
         cmap = self.map_of(e)
-        cell = cmap.tile_data(e.x, e.y)
-        corpses = cell.setdefault("corpses", {})
-        if not isinstance(corpses, dict):
-            # Tile data shape was hand-written into something else;
-            # bulldoze with a fresh dict (corpses is engine-owned).
-            corpses = {}
-            cell["corpses"] = corpses
         snap = e.to_dict()
         # A rider that dies falls OFF its vehicle — don't carry the mount
         # links into the corpse, or revive_corpse would restore a phantom-
@@ -25918,7 +25929,7 @@ class Match:
         # Who applied its statuses goes (#227): a revive may come after
         # that unit left and its id went to another.
         snap["status"] = without_zone_grants(snap.get("status"))
-        corpses[e.id] = {
+        corpse: Dict[str, Any] = {
             "entity": snap,
             "died_round": self.round_number,
         }
@@ -25928,7 +25939,7 @@ class Match:
                   for u in [e] + self.entity_part_subtree(e.id)}
         member = {k: v for k, v in member.items() if v}
         if member:
-            corpses[e.id]["groups"] = member
+            corpse["groups"] = member
         # Snapshot the whole attached part SUBTREE (parts, their parts, ...)
         # alongside the parent so a later revive_corpse restores the whole
         # creature — multi-level limbs included (BFS order = parents before
@@ -25940,42 +25951,23 @@ class Match:
         for pd in part_dicts:
             pd["status"] = without_zone_grants(pd.get("status"))
         if part_dicts:
-            corpses[e.id]["parts"] = part_dicts
+            corpse["parts"] = part_dicts
         # A death in the middle of a size derivation (the total written,
         # the category not yet) leaves the pair half done: the corpse
         # takes its category from its total now, as the scale gives it.
-        self._settle_corpse_size(corpses[e.id])
-        cmap.note_corpse(e.x, e.y)
+        self._settle_corpse_size(corpse)
+        cmap.lay_corpse(e.id, corpse, e.x, e.y)
 
     def find_corpse(self, eid: str
                     ) -> Optional[Tuple[int, int, Dict[str, Any], "Map"]]:
-        """Locate a corpse by its dead-entity id, on any map. Returns
-        (x, y, corpse_dict, map) or None. The tile coords are the
-        AUTHORITATIVE position; the embedded entity dict's x/y are
-        the snapshot at death and may differ if a (rare) GM hack
-        moved corpses around manually — engine code never reads them
-        for placement, this method always returns the tile's coords.
-        Reads the maps' corpse index (Map.corpse_cells_of); with corpse
-        ids that aren't unique, the first map's lowest cell."""
-        found = None
+        """Locate the corpse of unit `eid`, on any map: (x, y, corpse,
+        map) with (x, y) its anchor cell, or None."""
         for mp in self.maps.values():
-            cells = mp.corpse_cells_of(eid)
-            if cells:
-                x, y = cells[0]
-                found = (x, y, mp.tiles[(x, y)]["corpses"][eid], mp)
-                break
-        if SPATIAL_CHECK:
-            scan = [(mp, c) for mp in self.maps.values()
-                    for c, cell in mp.tiles.items() if isinstance(cell, dict)
-                    and isinstance(cell.get("corpses"), dict)
-                    and eid in cell["corpses"]]
-            if (found is None) != (not scan) or (found is not None and not any(
-                    m2 is found[3] and c == (found[0], found[1])
-                    for m2, c in scan)):
-                raise SpatialCheckError(
-                    f"corpse index: find_corpse({eid!r}) = {found and found[:2]}"
-                    f", scan {[(m2.name, c) for m2, c in scan]}")
-        return found
+            corpse = mp.corpses.get(eid)
+            if corpse is not None:
+                x, y = _corpse_cell(corpse)
+                return x, y, corpse, mp
+        return None
 
     def every_corpse(self) -> List[Tuple["Map", int, int, str, Dict[str, Any]]]:
         """Every corpse on every map, as (map, x, y, eid, corpse_dict)."""
@@ -25985,25 +25977,19 @@ class Match:
     def all_corpses(self, mp: Optional["Map"] = None
                     ) -> List[Tuple[int, int, str, Dict[str, Any]]]:
         """List every corpse on map `mp` (None = the only map) as
-        (x, y, eid, corpse_dict). Sorted by (x, y, eid) for stable
-        iteration; the order matches what `!list`'s Dead: section
-        renders. Reads the map's corpse index."""
+        (x, y, eid, corpse_dict), sorted by (x, y, eid): the order `!list`'s
+        Dead: section renders."""
         mp = mp or self.get_map()
-        out = mp.corpse_entries()
-        if SPATIAL_CHECK:
-            scan: List[Tuple[int, int, str, Dict[str, Any]]] = []
-            for (x, y) in sorted(mp.tiles.keys()):
-                cell = mp.tiles[(x, y)]
-                corpses = cell.get("corpses") if isinstance(cell, dict) else None
-                if isinstance(corpses, dict):
-                    for eid in sorted(corpses.keys()):
-                        scan.append((x, y, eid, corpses[eid]))
-            if [(a, b, c) for a, b, c, _ in scan] != \
-                    [(a, b, c) for a, b, c, _ in out]:
-                raise SpatialCheckError(
-                    f"corpse index on {mp.name}: {[o[:3] for o in out][:5]} "
-                    f"!= scan {[o[:3] for o in scan][:5]}")
-        return out
+        return mp.corpse_entries()
+
+    def remove_corpse(self, eid: str) -> bool:
+        """Take the corpse of unit `eid` off its map; its id (and its
+        parts' ids) are free again. False when none lies anywhere."""
+        loc = self.find_corpse(eid)
+        if loc is None:
+            return False
+        loc[3].take_corpse(eid)
+        return True
 
     def revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
         """Resurrect the corpse keyed by `eid` (see _revive_corpse). Its
@@ -26050,19 +26036,9 @@ class Match:
         entity_dict["x"] = x
         entity_dict["y"] = y
         e = Entity.from_dict(entity_dict)
-        # Remove corpse FIRST so spawn doesn't see its own cell as
-        # already-corpse-occupied for any future invariants and so the
-        # tile's `corpses` key is gone if it becomes empty.
-        cell = cmap.tiles.get((x, y), {})
-        corpses = cell.get("corpses") if isinstance(cell, dict) else None
-        if isinstance(corpses, dict) and eid in corpses:
-            del corpses[eid]
-            cmap.tile_touch(x, y)
-            if not corpses:
-                cell.pop("corpses", None)
-            # Drop an empty tile dict entirely so tile listings stay clean.
-            if isinstance(cell, dict) and not cell:
-                cmap.tiles.pop((x, y), None)
+        # Taken FIRST: its id is free for the spawn, which refuses an id a
+        # corpse holds.
+        cmap.take_corpse(eid)
         # Suppress death checks FOR THIS ENTITY across the spawn +
         # revive-effects window. The corpse snapshot carries the entity's
         # DEATH-state vars (typically hp<=0), so the entity momentarily
@@ -26112,9 +26088,7 @@ class Match:
             except VTTError:
                 # Nothing was revived: the corpse goes back where it lay
                 # (it used to be lost with the refusal).
-                cmap.tiles.setdefault((loc[0], loc[1]), {}).setdefault(
-                    "corpses", {})[eid] = corpse
-                cmap.note_corpse(loc[0], loc[1])
+                cmap.lay_corpse(eid, corpse, loc[0], loc[1])
                 raise
             spawn_log = moved_note + list(spawn_log)
             # Restore the creature's body parts at the parent's cell. Each
@@ -26319,7 +26293,7 @@ class Match:
                         d, self.rules, f"corpse `{d.get('id', cid)}`")
                 except VTTError as ex:
                     notes.append(f"{ex} It keeps its old var names.")
-            _mp.note_corpse(_x, _y)
+            _mp.corpse_changed(cid)
         return notes
 
     def var_name_conflicts(self, rules: Dict[str, Any]) -> List[str]:
@@ -27603,7 +27577,7 @@ class Match:
                                         for pid, d in work.items()}
                     hit = True
             if hit:
-                mp.note_corpse(x, y)
+                mp.corpse_changed(cid)
         notes = []
         for pid in ids:
             put, off = counts[pid]
@@ -28041,22 +28015,18 @@ class Match:
         for e in m.entities.values():
             _legacy_vars(e.vars, e.var_names, f"unit `{e.id}`")
         for mp in maps.values():
-            for cell in mp.tiles.values():
-                corpses = cell.get("corpses") if isinstance(cell, dict) \
-                    else None
-                for cid, c in (corpses or {}).items() \
-                        if isinstance(corpses, dict) else ():
-                    if isinstance(c, dict):
-                        ce = c.get("entity")
-                        if isinstance(ce, dict):
-                            _legacy_vars(ce.get("vars"), ce.get("var_names"),
-                                         f"corpse `{cid}`")
-                        for pd in c.get("parts") or () \
-                                if isinstance(c.get("parts"), list) else ():
-                            if isinstance(pd, dict):
-                                _legacy_vars(pd.get("vars"),
-                                             pd.get("var_names"),
-                                             f"corpse `{cid}` part")
+            for cid, c in mp.corpses.items():
+                if isinstance(c, dict):
+                    ce = c.get("entity")
+                    if isinstance(ce, dict):
+                        _legacy_vars(ce.get("vars"), ce.get("var_names"),
+                                     f"corpse `{cid}`")
+                    for pd in c.get("parts") or () \
+                            if isinstance(c.get("parts"), list) else ():
+                        if isinstance(pd, dict):
+                            _legacy_vars(pd.get("vars"),
+                                         pd.get("var_names"),
+                                         f"corpse `{cid}` part")
         # COPY on load too (the load-side twin): otherwise the restored match
         # shares the snapshot's list, and the next Entity.remove would mutate
         # the retained snapshot in place — corrupting it for a second restore.
