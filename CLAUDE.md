@@ -2687,7 +2687,14 @@ hardcodes**.
   never moves); anything standing on the ground (a trap, a chest, a
   fire) is a zone, usually a one-cell zone of a definition: `!zone place
   <def> <x> <y> [name=]` / `zone_place(def, x, y)`, named like unit ids
-  (1152).
+  (1152). Rule of thumb for GMs (user call): **ground is a tile, anything
+  standing on the ground is a zone** — walls, floors, water, mud, lava,
+  pits, conveyors, a fixed one-way door are tiles; traps, chests, loot,
+  fire, landmines, an openable door, a buzzsaw are zones. `!help tile` /
+  `!help zone` carry it (`vtt_commands._TILES_OR_ZONES`), and the
+  commands that make either point there (`_TILES_OR_ZONES_POINTER`). The
+  scenarios follow it: object examples are zones (185, 186, 320, 456,
+  624, 845), tile-machinery ones use ground themes (lava, acid, mud).
 - **Draw layer** (1152): zones and tiles draw by one number in both
   renderers: a zone's `sprite_layer` (a ZONE_LOOK_FIELD, its own else its
   definition's, `!zone layer` / `!zone def layer`) else

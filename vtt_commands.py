@@ -20492,17 +20492,34 @@ def _parse_xy(args: List[str], offset: int = 1) -> Tuple[int, int]:
     return x, y
 
 
+# The "tiles or zones" guidance (docs/terrain_design.md §1), shown in
+# `!help tile` and `!help zone`; the commands that make either point at it.
+_TILES_OR_ZONES = (
+    "\n**Tiles or zones.** Ground is a tile; anything standing on the "
+    "ground is a zone. Walls, floors, water, mud, lava, pits, a conveyor "
+    "belt, a fixed one-way door: tiles. A trap, a chest, loot on the "
+    "floor, a fire, a landmine, a door that opens, a buzzsaw: zones, "
+    "usually one-cell zones of a zone definition (`!zone def`, then "
+    "`!zone place <definition> <x> <y>`). A tile is its cell: one per "
+    "cell, never moving, each cell keeping its own state (a wall of "
+    "tiles loses one segment at a time). A zone is a named thing: any "
+    "number share a cell, one spans several cells, and it moves (`!zone "
+    "move`) with its hooks firing for the units it moves onto.")
+_TILES_OR_ZONES_POINTER = " Ground or object? See `!help tile`."
+
 @registry.command(
     "tile",
-    usage=("!tile <set|line|fill|copy|del|info|list|clear|face|face_area> ..."),
+    usage=("!tile <set|line|fill|fill_pattern|copy|del|info|list|clear|face|face_area|def|place|place_area|place_random|find|hook|test|tags> ..."),
     desc=(
-        "Special-tile data store. Each (x, y) tile has a free-form "
-        "data dict — set arbitrary nested keys with `set`, read with "
-        "`info`, drop with `del`. A tile's \"glyph\" key (if set to "
-        "a single character) overrides the default \".\" rendering "
-        "in !map when no entity stands on the cell. Tile data is "
-        "readable from formulas via tile_get(x, y, \"path\") and "
-        "tile_has(x, y, \"path\")."
+        "The ground of each cell. A tile is that cell's own free-form "
+        "data dict: set nested keys with `set`, read them with `info`, "
+        "drop them with `del` (formulas: tile_get, tile_has, tile_set). "
+        "Its data gives it a look (`glyph`, `color`, `sprite`), "
+        "`block` / `opaque` conditions, hooks for units stepping on it "
+        "and for turn and round times (`!tile hook`), tags and a "
+        "facing; a tile template (`!tile def`) describes a kind of "
+        "ground once, placed with `!tile place`."
+        + _TILES_OR_ZONES
     ),
 )
 async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -20788,8 +20805,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _help_fallback(ctx, ["tile", "hook"], args[1] if len(args) > 1 else None)
 
     # ---- def: template management --------------------------------------
-    # Templates are reusable tile-kind definitions (e.g. "flame",
-    # "spike_trap"). Define once, then place at any coordinate. See the
+    # Templates are reusable tile-kind definitions (e.g. "lava",
+    # "mud"). Define once, then place at any coordinate. See the
     # SpecialTileTemplate class in logic.py for the storage shape and
     # Match.place_tile_template for the placement semantics (data is
     # deep-copied at place time, hooks are looked up live at fire
@@ -21136,7 +21153,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if name not in m.tile_templates:
             # Surface the typo loudly — a silent "0 found" would hide
-            # a real mistake (defining 'fire' and searching 'flame').
+            # a real mistake (defining 'lava' and searching 'lavva').
             return await ctx.send(
                 f"❌ template `{name}` not found. (Searching for a "
                 f"template that doesn't exist is almost always a typo. "
@@ -21380,16 +21397,17 @@ registry.annotate_sub(
     usage="!tile set <x> <y> <path> <value> [map=<map>]",
     desc=(
         "Set tile (x,y).path = value, creating intermediate dicts. "
-        "Path uses dotted notation: `flame.burn_damage` sets the "
-        "burn_damage key inside the flame feature. Value is parsed "
+        "Path uses dotted notation: `lava.burn_damage` sets the "
+        "burn_damage key inside the lava feature. Value is parsed "
         "as int → float → string (use quotes for strings with spaces)."
+        + _TILES_OR_ZONES_POINTER
     ),
 )
 registry.annotate_sub(
     "tile", "del",
     usage="!tile del <x> <y> [<path>] [map=<map>]",
     desc=(
-        "Delete one path from a tile (e.g. `flame.spreads`) or drop "
+        "Delete one path from a tile (e.g. `lava.spreads`) or drop "
         "the entire tile entry if no path is given. Parent dicts that "
         "go empty as a result are pruned automatically — the sparse-"
         "dict invariant means !tile list never shows no-op coords."
@@ -21464,7 +21482,7 @@ registry.annotate_sub(
     ),
     desc=(
         "Manage reusable tile templates. A template defines a kind of "
-        "tile (e.g. `flame`, `spike`, `treasure_chest`) with default "
+        "ground (e.g. `lava`, `mud`, `stone_floor`) with default "
         "data fields and hook formulas. Place instances at coordinates "
         "with `!tile place`. Template data is deep-copied into each "
         "instance at placement (per-instance edits don't propagate), "
@@ -21482,6 +21500,7 @@ registry.annotate_sub(
         "trailing `confirm` token and detaches them: they keep their data, "
         "lose the template's hooks, look and tags, and stop naming it "
         "(`!undo command` brings it back)."
+        + _TILES_OR_ZONES_POINTER
     ),
 )
 registry.annotate_sub(
@@ -21514,8 +21533,9 @@ registry.annotate_sub(
         "template's data with `_template` set to the template name. "
         "Optional `key=value` tokens after the coords override "
         "individual fields on this instance (e.g. "
-        "`!tile place flame 3 3 burn_damage=20` to make this flame "
-        "hit harder without redefining the template)."
+        "`!tile place lava 3 3 burn_damage=20` to make this lava "
+        "burn hotter without redefining the template)."
+        + _TILES_OR_ZONES_POINTER
     ),
 )
 registry.annotate_sub(
@@ -21528,8 +21548,8 @@ registry.annotate_sub(
         "this is the multi-cell version of `!tile place` and has the "
         "same single-cell replace semantics. Optional `key=value` "
         "overrides apply to EVERY placed instance (e.g. "
-        "`!tile place_area flame 1 1 5 5 burn_damage=10` paints a "
-        "5x5 block of stronger-than-default flames). All-or-nothing: "
+        "`!tile place_area lava 1 1 5 5 burn_damage=10` paints a "
+        "5x5 block of hotter-than-default lava). All-or-nothing: "
         "if any corner is off-grid the command fails without placing "
         "anything."
     ),
@@ -21598,14 +21618,17 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|tags|face|setdef|grant|ungrant|grant_condition|grant_bodies|def|info|list|cells|hook> ..."),
+    usage=("!zone <new|place|drop|rename|add|remove|fill|shift|move|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|layer|tags|face|setdef|grant|ungrant|grant_condition|grant_bodies|def|info|list|cells|hook> ..."),
     desc=(
-        "Named multi-cell regions. A zone is a SET of cells plus a "
+        "Named things on the map. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
-        "— think 'the gas cloud', 'the throne room', 'the lava field'. "
-        "Unlike a tile (one cell), a zone spans many cells and can be "
-        "reshaped (`add`/`remove`/`fill`) or moved wholesale (`shift`, "
-        "for a drifting cloud). Data is set/read with dotted paths "
+        "— an object standing on the ground ('the trap', 'the chest', "
+        "a one-cell zone `!zone place` puts down), a region ('the "
+        "throne room', 'the gas cloud') or an aura around a unit "
+        "(`anchor`). Any number share a cell; a zone can be reshaped "
+        "(`add`/`remove`/`fill`), moved as one piece with its hooks "
+        "firing (`move`) or translated silently (`shift`), and drawn "
+        "above or below the ground (`layer`). Data is set/read with dotted paths "
         "(`set`/`del`/`clear`/`info`) exactly like tile data, and is "
         "readable from formulas via zone_get/zone_has plus membership "
         "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
@@ -21614,7 +21637,9 @@ registry.annotate_sub(
         "like glyph), color, legend, tags, setdef, grant / ungrant / "
         "grant_condition / grant_bodies (statuses the units inside "
         "have), def (zone definitions: "
-        "a kind of zone described once), info, list, cells, hook."
+        "a kind of zone described once), place, move, layer, info, list, "
+        "cells, hook."
+        + _TILES_OR_ZONES
     ),
 )
 async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -22458,9 +22483,10 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
     if sub == "new":
         _check_tail(args, 2, (), prefix.format(sub="new") + " <name>")
         m.define_zone_def(name)
-        return (f"Defined zone definition `{name}`. Make a zone of it with "
-                f"`!zone new <name> def={name}` (or `!zone new def={name}`, "
-                f"which names it for you).")
+        return (f"Defined zone definition `{name}`. Place a one-cell zone "
+                f"of it with `!zone place {name} <x> <y>`, or make a zone "
+                f"of any shape with `!zone new [<name>] def={name}` (without "
+                f"a name, one is made for you).")
     if sub == "rename":
         _check_tail(args, 3, (), prefix.format(sub="rename")
                     + " <name> <new_name>")
@@ -24202,7 +24228,8 @@ registry.annotate_sub(
           "def`): the definition's data is copied in, and its hooks, glyph, "
           "colour, sprite, legend and tags apply live wherever the zone "
           "doesn't set its own. With a definition and no name, the name is "
-          "made from the definition's (`poison_cloud`, `poison_cloud2`, ...)."),
+          "made from the definition's (`poison_cloud`, `poison_cloud2`, ...)."
+          + _TILES_OR_ZONES_POINTER),
 )
 registry.annotate_sub(
     "zone", "setdef",
@@ -24306,10 +24333,11 @@ registry.annotate_sub(
     "zone", "def",
     usage=_ZONE_DEF_USAGE,
     desc=(
-        "Zone DEFINITIONS describe a kind of zone once (`poison_cloud`), the "
-        "way a tile template describes a kind of tile. A zone made with "
-        "`!zone new [<name>] def=<definition>` (or given one with `!zone "
-        "setdef`) names its definition: the definition's hooks, glyph, "
+        "Zone DEFINITIONS describe a kind of zone once (`poison_cloud`, "
+        "`landmine`), the way a tile template describes a kind of ground. "
+        "A zone placed with `!zone place <definition> <x> <y>` or made "
+        "with `!zone new [<name>] def=<definition>` (or given one with "
+        "`!zone setdef`) names its definition: the definition's hooks, glyph, "
         "colour, sprite, legend and tags apply LIVE (editing the definition "
         "changes every zone of it) wherever the zone doesn't set its own; "
         "its data is COPIED into the zone when the zone is made (a later "
@@ -24332,6 +24360,7 @@ registry.annotate_sub(
         "grants (`!help zone grant`), read live: a zone's own grant of a "
         "status replaces the definition's, its own condition and bodies "
         "setting win."
+        + _TILES_OR_ZONES_POINTER
     ),
 )
 registry.annotate_sub(
@@ -24403,6 +24432,7 @@ registry.annotate_sub(
         "the ground (a trap, a chest, a fire). Named after the definition "
         "(`buzzsaw`, `buzzsaw2`, ...) unless `name=` gives one. Formula: "
         "zone_place(definition, x, y)."
+        + _TILES_OR_ZONES_POINTER
     ),
 )
 registry.annotate_sub(

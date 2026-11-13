@@ -1,7 +1,8 @@
 # Ground tiles, object zones, moving zones and the corpse store: agreed design
 
 Status: design agreed with the user (chat after #178, questions 1-18).
-Built in three PRs, in the order of §6: PR 1 (§2) and PR 2 (§3, §4) built. Read this whole file before
+Built in three PRs, in the order of §6: all three built (PR 1 §2, PR 2 §3
+and §4, PR 3 §5). Read this whole file before
 touching tiles, zones or corpses.
 
 ## 1. Roles
