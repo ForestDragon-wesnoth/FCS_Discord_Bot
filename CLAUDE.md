@@ -438,7 +438,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-44 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-51 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
@@ -937,7 +937,17 @@ Every class below shipped at least once and was fixed in an audit pass
   state back and preserves an explicit list of runtime fields (event stack,
   summon budget, pending requests, held commands, undo history, ...); a
   stale list once wiped live emit frames and all undo history on any failed
-  action. `_restore_snapshot` carries the approval queue and held commands,
+  action. A flag saved under another key while set
+  (`action._SERIALIZED_FLAGS`: the deferred re-sort, the skipped ATB
+  turn, the watcher backlog) is STATE: it comes from the pre-state, never
+  from the preserve list (a `!simulate` past a round end cleared a pending
+  re-sort for good, 1157); the drift guard checks both ways. A rollback
+  can run in the MIDDLE of an engine operation that goes on afterwards
+  (`damage_forecast`, a failing `use_action` in a movement hook), so a
+  unit or map present on both sides keeps its OBJECT with the restored
+  state inside (a walk's later steps moved an object no longer in the
+  match, 1158); a unit the rolled-back run removed still comes back as a
+  new object. `_restore_snapshot` carries the approval queue and held commands,
   keeps live bindings per `undo_channel_bindings_mode`, keeps `paused`, the
   RNG (seed, position, live generator) and the command journal, and
   re-copies `rules` from the system.
@@ -1374,7 +1384,8 @@ hardcodes**.
   status hook's lines (`fired on <unit>`, its result or error) are tagged
   as lines about the unit it fired on (`logic._hook_line_tag`: where it
   stands, else its corpse's cell), so a channel whose view can't see it
-  drops them (987).
+  drops them (987); a tile's or zone's hook lines (`fired for <unit>`)
+  the same way (`Match._hook_lines_about`, 1159).
 - **Default passives** (`default_entity_passives`, `!defpassive`): copied
   onto every unit at `Entity.spawn` (`_apply_default_passives`). With
   `default_passives_existing_units` on (default; #221, user call, 1091-1092)
@@ -1937,7 +1948,8 @@ hardcodes**.
   {action}, {target} as the checks left it, a cell as (x,y), lists joined;
   {actor_name} / {target_name} as say() markers, so a view reads names
   as it sees each unit; the actor's own placeholders; empty = no line;
-  1148).
+  1148; an exchange stores a cell as [x, y, map, named] and reads it back
+  with `target_from_json` for the line, 1153).
 - **`run_action`** is transactional: pre-state captured, body run,
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo
@@ -2442,8 +2454,12 @@ hardcodes**.
   refused) or `!part
   add/attach/detach/remove/glue/locate/region/segment/list/info`. `attach`
   refuses a loop, a map carrier, a snake segment, a snake head with
-  segments and a rider (a corpse's kept rider too), and
-  re-stamps the unit's auras, riders and parts; a loaded loop is cut and a
+  segments and a rider (a corpse's kept rider too), makes the unit a GLUED
+  part (a located or region part of another body, or a detached unit
+  still carrying the var, loses that mode: it used to share the parent's
+  cell as a second occupant, 1154) and
+  re-stamps the unit's auras, riders and parts; `remove` takes body
+  parts only (`!ent remove` removes a unit); a loaded loop is cut and a
   map a part carries freed. A living detached part steps to the nearest
   free cell; detach and locate carry the part's own auras, glued parts and
   riders. `glue` / `region` refuse a snake segment. A group move leaves
@@ -2561,11 +2577,16 @@ hardcodes**.
   is alive; the corpse records the groups of the body and its parts
   (`groups`) and a revive rejoins those that still exist, for the units
   it restored only (a part whose id was taken meanwhile is named in a ⚠️)
-  (814, 820, 824). `kill` /
+  (814, 820, 824). The revived body and its parts face as the corpse
+  did (a spawn would turn them the spawn_face_toward_center way, moving
+  region parts and seats; 1155). `kill` /
   `revive` run `default_kill_function_effects` /
   `default_revive_function_effects`; a kill whose effects already brought
   a death (and maybe a revive by a vehicle-death effect) runs no second
-  death (873). Prims: has_corpse, corpse_at,
+  death (873). One death per unit: while a unit's death pipeline runs
+  (`Match._dying_ids`, runtime) a `kill()` of it does nothing and answers
+  True, so two units that kill each other in on_death, or `kill(self)`
+  there, die once each (1156). Prims: has_corpse, corpse_at,
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
   corpse / corpse_list action targets.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
@@ -4241,6 +4262,17 @@ rejected already. Update this section in the PR that resolves an item.
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
   only that pair. A layer-aware version of each is open.
+
+- **Deaths caused inside another unit's on_death** (asked, awaiting the
+  user's call): while a unit's death pipeline runs, the match-wide
+  `_death_processing` guard holds EVERY unit's automatic death check, and
+  nothing re-runs the held ones: an on_death passive that deals lethal
+  damage to another unit (a barrel chain) leaves it alive at hp <= 0
+  until some later write to it. `kill()` there does kill (it bypasses
+  the check), a destroyed body part's on_death raises no guard, and the
+  two vehicle-death paths lift it by hand. Options: re-check the held
+  units when the outermost death finishes (deaths in sequence, bounded by
+  a limit rule), a per-unit guard (nested deaths), or leave it.
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose

@@ -22017,21 +22017,35 @@ class Match:
         # Log-line tag: show "for `eid`" when there's an acting entity,
         # otherwise "(no acting entity)" for time hooks during a wrap.
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        # Read before the hook runs: it may remove the unit.
+        about = _hook_line_tag(self, entity_id or "")
         try:
             result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return hook_output(self, "error",
-                               f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
-                               f"FAILED: {ex}")
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
+                f"⚠️ tile ({x},{y}) hook `{when}` {tag} FAILED: {ex}"))
         except Exception as ex:
             # Defensive: any non-FormulaError exception is a bug, but
             # don't bring down the move on it.
             ref = crash_ref(f"tile ({x},{y}) hook `{when}` {tag}", ex)
-            return hook_output(self, "error",
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
                 f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
-        return self._hook_fired(f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}",
-                                result)
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"))
+        return self._hook_lines_about(entity_id, about, self._hook_fired(
+            f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}", result))
+
+    def _hook_lines_about(self, entity_id: Optional[str], about: str,
+                          lines: List[str]) -> List[str]:
+        """A tile or zone hook's lines (fired, result, error) tagged as
+        lines about the unit it fired for, like a passive's
+        (_run_passive_safely): a channel whose view can't see that unit
+        drops them. They used to name a hidden unit, and print what the
+        hook returned about it, in a team's channel. `about` is the tag
+        read before the hook ran (it may have removed the unit)."""
+        return Match.tag_lines(
+            about or _hook_line_tag(self, entity_id or ""), lines)
 
     def _hook_fired(self, line: str, result: Any) -> List[str]:
         """A tile or zone hook's fired line (with `→ result` when its
@@ -22083,19 +22097,22 @@ class Match:
             extras=extras,
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        # Read before the hook runs: it may remove the unit.
+        about = _hook_line_tag(self, entity_id or "")
         try:
             result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return hook_output(self, "error",
-                               f"⚠️ zone `{name}` hook `{when}` {tag} "
-                               f"FAILED: {ex}")
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
+                f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"))
         except Exception as ex:
             ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
-            return hook_output(self, "error",
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
-        return self._hook_fired(f"⚙️ zone `{name}` hook `{when}` fired {tag}",
-                                result)
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"))
+        return self._hook_lines_about(entity_id, about, self._hook_fired(
+            f"⚙️ zone `{name}` hook `{when}` fired {tag}", result))
 
     def fire_zone_exit_hooks(self, entity_id: Optional[str],
                              fx: int, fy: int, tx: int, ty: int,
@@ -22341,19 +22358,22 @@ class Match:
                     "zone_map": mp.name, "hook_name": when, **(extra or {})},
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        # Read before the hook runs: it may remove the unit.
+        about = _hook_line_tag(self, entity_id or "")
         try:
             result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return hook_output(self, "error",
-                               f"⚠️ zone `{name}` hook `{when}` {tag} "
-                               f"FAILED: {ex}")
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
+                f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"))
         except Exception as ex:
             ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
-            return hook_output(self, "error",
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
-        return self._hook_fired(f"⚙️ zone `{name}` hook `{when}` fired {tag}",
-                                result)
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"))
+        return self._hook_lines_about(entity_id, about, self._hook_fired(
+            f"⚙️ zone `{name}` hook `{when}` fired {tag}", result))
 
     # ---- status definitions (self-describing statuses) --------------
     # A status DEFINITION holds the behaviour a status of that name has:

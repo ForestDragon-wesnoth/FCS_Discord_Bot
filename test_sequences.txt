@@ -41723,3 +41723,56 @@ hp stays 50); its walk of 4 ends on (5,3) with its whole body there. A
 zone whose on_moved hook forecasts walks its 5 steps. The orc the
 forecasts were about is untouched. A unit and a map present before and
 after a rollback now keep their objects, holding the restored state.
+
+
+SCENARIO 1159 — Tile and zone hook lines about a unit a team view can't see are dropped there, like a passive's: a moving zone, a walk, a turn start (a 2-wide lurker)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new hv HV 12 6
+!match use hv
+!ent add scout Scout 20 1 1 9
+!ent add lurker Lurker 20 10 5 5
+!ent set_vars scout team=blue fog_vision_radius=2
+!ent set_vars lurker team=red fog_vision_radius=2 footprint_w=2
+!match fog on
+!zone fill saw 9 5 9 5
+!zone hook add saw on_enter "deal_damage(self, 3)"
+!zone hook add saw on_turn_start "entity[self].hp"
+!tile set 10 4 hooks.on_enter "entity[self].hp"
+!tile set 2 1 hooks.on_enter "entity[self].hp"
+!zone move saw right 1
+?? ⚙️ zone `saw` hook `on_enter` fired for `lurker` → {'hp': 3}
+?? takes 3 damage
+!as view blue
+!zone move saw left 1
+!zone move saw right 1
+?? Zone `saw` stepped 1 of 1 cell(s) right.
+?! lurker
+?! 'hp': 3
+!ent move lurker 1 up
+?! fired
+?! → 14
+!ent move scout 1 right
+?? ⚙️ tile (2,1) hook `on_enter` fired for `scout` → 20
+!turn next
+!turn next
+?? an unseen unit's turn
+?! lurker
+?! fired
+!as view clear
+!ent move lurker 1 down
+!turn next
+!turn next
+?? ⚙️ zone `saw` hook `on_turn_start` fired for `lurker` → 11
+
+Expected: under fog the blue scout can't see the red lurker (2 cells
+wide). In the omniscient channel a zone moving onto the lurker prints its
+hook line ("zone `saw` hook `on_enter` fired for `lurker` → {'hp': 3}")
+and the damage line. Under the blue view the same move prints only the
+zone's own reply: a tile's or zone's hook line is a line about the unit
+it fired for, tagged like a passive's or a status hook's, so a channel
+whose view can't see that unit drops it. It used to name the hidden
+unit and print what the hook returned about it (here its hp) in the
+team's channel, on a zone move, on the unit's walk over a tile hook and
+at its turn start. Hook lines about a unit the view sees (the scout's
+tile hook) still show, and the omniscient channel sees all of them.

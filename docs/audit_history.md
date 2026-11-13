@@ -2568,3 +2568,58 @@ differential on the whole suite.
     reaching the units inside (L40).
   - Left open: the action half of X13 (every action serializes the
     match) and formula namespaces at ~2 ms for other conditions.
+
+## Pass 51 (chaos on the newest features: moving zones, the corpse store, damage packets, reactions)
+
+By hand, after #178-#180. A stateful chaos harness (about 90 command
+shapes on a two-map board with a 2x2 body with glued / located / region
+parts, a snake, a vehicle with a rider in a region seat, an aura, granting
+and moving zones, zone definitions placed as objects, lava tiles, voids,
+a corpse, damage steps, reactions, a watcher, templates and a prefab,
+and hostile global passives and zone hooks added at random: kill(self),
+remove_entity(self), delete_zone, zone_step), with the live board feeding
+the id pools. After every command: no 💥 / Runtime error / console
+traceback, the JSON round trip of every match, no dangling part / mount /
+follow / map-vehicle ids, bodies and zone cells on the map, the turn
+order's ids, guards at rest, one occupant per cell, all under
+FCS_SPATIAL_CHECK=1; the full state compared across every `!as restart`;
+at the end each match's journal exported and replayed on a fresh server.
+About 14,000 commands over 40 seeds (the restart and replay checks on
+the last 24). No crash; the findings came from the
+invariants, the replay and from reading replies. Scenarios 1153-1159;
+verified after: 1159/1159, also under FCS_SPATIAL_CHECK=1.
+  - **Rollbacks** (1157, 1158): three flags saved under other key names
+    (the deferred re-sort, the skipped ATB turn, the watcher backlog) were
+    still in `_rollback_match`'s preserve list, so a `!simulate` / `!dry`
+    / failed action kept what its run left: one that played past a round
+    end cancelled a pending deferred re-sort (found as a replay
+    divergence: the dry run isn't journaled, the flag is hashed). And a
+    rollback replaced every Entity and Map object: `damage_forecast` or a
+    failing `use_action` inside on_entity_step left the walk moving an
+    object out of the match (reply: 3 steps; the unit: 1). Units and maps
+    present on both sides keep their objects now.
+  - **Deaths** (1156): `kill()` of a unit whose on_death was running
+    started its death again (two units killing each other there, or
+    kill(self)): unbounded recursion to Python's stack limit, dozens of
+    death lines and log entries; a stack overflow between the guard's
+    increment and its `try` left `_death_processing` raised, after which
+    no unit of the match died of its hp until a restart. One death per
+    unit (`_dying_ids`).
+  - **Bodies** (1154, 1155): a located / region part attached to another
+    body kept its mode and stood on the new parent's cell as a second
+    occupant; `!part remove` removed any unit; a revive re-faced the body
+    and its parts the spawn way, moving region parts and seats.
+  - **Lines** (1153, 1159): the action-used line of a resolved exchange
+    listed a cell target's stored form ("on `4, 4, main, False`"); the
+    event log printed `Coord(4, 4)`; tile and zone hook lines named a
+    unit the channel's view can't see (passive lines were tagged in pass
+    50, these weren't).
+  - Asked, not changed: lethal damage dealt from another unit's on_death
+    leaves its victim alive at hp <= 0 (the match-wide death guard holds
+    the check and nothing re-runs it); CLAUDE.md §8 "Undecided".
+  - Clean: the corpse store (id reservation against spawns, clones,
+    template and prefab ids, transfers and copies into a match holding the
+    corpse, resize, replace stamps, revive of parts), zone draw layers and
+    facing across prefabs / map copies / resizes / restarts, zone move
+    argument forms and access, damage packets against odd pools and
+    amounts, reactions when the attacker or the target dies mid-window.
