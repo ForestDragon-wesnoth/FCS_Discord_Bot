@@ -744,6 +744,10 @@ def _log_target_str(target: Any) -> str:
         return ""
     if isinstance(target, str):
         return target
+    if isinstance(target, Coord):
+        # A location target is a Coord (its repr, `Coord(4, 4)`, went into
+        # the log).
+        return f"({target.x},{target.y})"
     if isinstance(target, (tuple, list)):
         if (len(target) == 2 and all(isinstance(c, int) for c in target)):
             return f"({target[0]},{target[1]})"
@@ -2327,6 +2331,13 @@ def _target_tag_lines(action: Action, actor_id: str, tid: str,
 _ROLLBACK_FIELDS_CHECKED = False
 
 
+# Match fields saved under another key (Match.to_dict), restored by a
+# rollback like the rest of the state.
+_SERIALIZED_FLAGS = {"_atb_last_skipped": "atb_turn_skipped",
+                     "_turn_order_dirty": "turn_order_dirty",
+                     "_watcher_backlog": "watcher_backlog"}
+
+
 def _check_rollback_fields(preserved_attrs) -> None:
     """Drift guard, run once: every Match field the rollback pre-state does
     NOT carry must be in `preserved_attrs`, or a rollback silently resets it
@@ -2338,9 +2349,23 @@ def _check_rollback_fields(preserved_attrs) -> None:
     from logic import Match, default_maps
     probe = Match(id="_probe", name="_probe", maps=default_maps(1, 1),
                   system_name="default")
+    # Flags saved under another name, and only while set: game state, which
+    # a rollback restores from the pre-state. They sat in preserved_attrs,
+    # so a `!dry` / `!simulate` / failed action kept the value its run left
+    # (a round wrap inside one cleared a deferred re-sort for good).
+    for attr in _SERIALIZED_FLAGS:
+        setattr(probe, attr, True)
     carried = probe.to_dict(include_history=False)
+    unsaved = [a for a, key in _SERIALIZED_FLAGS.items()
+               if carried.get(key) is not True or a in preserved_attrs]
+    if unsaved:
+        raise RuntimeError(
+            f"action._rollback_match: flag(s) {unsaved} are listed as "
+            f"serialized (_SERIALIZED_FLAGS) but Match.to_dict doesn't save "
+            f"them, or preserved_attrs keeps them across a rollback.")
     missing = [f.name for f in dataclasses.fields(Match)
-               if f.name not in carried and f.name not in preserved_attrs]
+               if f.name not in carried and f.name not in preserved_attrs
+               and f.name not in _SERIALIZED_FLAGS]
     if missing:
         raise RuntimeError(
             f"action._rollback_match: Match field(s) {missing} are neither "
@@ -2433,16 +2458,16 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_choice_answers", "_choice_cursor",
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
-        "_death_check_deferred_ids", "_deleting_maps", "_watcher_backlog",
-        "_alive_eval_depth", "_vision_memo", "_spatial", "_uflags", "_size_touch", "_turn_order_dirty",
+        "_dying_ids", "_death_check_deferred_ids", "_deleting_maps",
+        "_alive_eval_depth", "_vision_memo", "_spatial", "_uflags", "_size_touch",
         "_request_seq", "pending_requests", "held_commands",
         # Wall clock of the open reaction window (expiry; runtime).
         "_reaction_opened",
         # Event bus: the live emit stack/depth + warning latch. Resetting
         # these mid-emit corrupts the outer emit (the verified crash).
         "_event_depth", "_event_stack", "_event_warned", "_event_warnings",
-        # ATB latches (one-time dormant-round warning + last-actor-skipped).
-        "_atb_round_warned", "_atb_last_skipped",
+        # ATB latch (the one-time dormant-round warning).
+        "_atb_round_warned",
         # The undo history. The pre-state is taken WITHOUT history, so
         # from_dict builds an empty one; copying that over wiped every
         # autosave AND manual save on each failed action.
@@ -2455,6 +2480,8 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
     _check_rollback_fields(preserved_attrs)
     preserved = {a: getattr(match, a) for a in preserved_attrs
                  if hasattr(match, a)}
+    live_units = dict(match.entities)
+    live_maps = dict(match.maps)
     # Replace serialized state. We iterate a snapshot of restored's
     # __dict__ to avoid mutating-while-iterating shenanigans.
     for k, v in vars(restored).items():
@@ -2462,6 +2489,24 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
     # Restore runtime-only state.
     for a, v in preserved.items():
         setattr(match, a, v)
+    # A unit or a map that stands on both sides keeps its OBJECT, holding
+    # the restored state. A rollback can run in the middle of an engine
+    # operation that goes on afterwards (damage_forecast or a failing
+    # use_action inside a movement hook): its unit and map references used
+    # to be left pointing at objects no longer in the match, so a walk's
+    # remaining steps moved nothing while the reply counted them.
+    for eid, fresh in list(match.entities.items()):
+        kept = live_units.get(eid)
+        if kept is not None and kept is not fresh:
+            kept.__dict__.clear()
+            kept.__dict__.update(fresh.__dict__)
+            match.entities[eid] = kept
+    for name, fresh_map in list(match.maps.items()):
+        kept_map = live_maps.get(name)
+        if kept_map is not None and kept_map is not fresh_map:
+            kept_map.__dict__.clear()
+            kept_map.__dict__.update(fresh_map.__dict__)
+            match.maps[name] = kept_map
     # Re-parent entities so their _match backref points at the live
     # match instance (Match.from_dict set them to `restored`).
     for e in match.entities.values():

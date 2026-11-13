@@ -41482,3 +41482,244 @@ for each zone of it (chest, chest2; box's own hook replaces it), read
 through the zone hook index; deleted, it fires no more. `!help tile` and `!help zone` carry the
 "tiles or zones" guidance (ground is a tile, anything standing on it a
 zone), and the commands that make either point at it.
+
+
+SCENARIO 1153 — A cell target in the action-used line and the event log while a unit holds a reaction: `(4,4)`, a list of cells, a 2x2 unit
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new au AU 8 6
+!match use au
+!ent add mage Mage 30 3 2 20
+!ent add orc Orc 30 5 2 10
+!ent set_var mage actions.bolt.target location
+!ent set_var mage actions.bolt.body "x = 1"
+!action mage bolt 4 4
+?? `mage` used action `bolt` on `(4,4)`.
+!ent set_var orc actions.thorns.after "x = 1"
+!action mage bolt 4 4
+?? `mage` used action `bolt` on `(4,4)`.
+?! main
+!log 2
+?? used `bolt` → (4,4).
+?! Coord
+!ent set_var mage actions.rain.target location_list
+!ent set_var mage actions.rain.body "x = 1"
+!action mage rain 4 4 5 5
+!log 1
+!ent add ogre Ogre 50 6 4 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var mage actions.zap.target entity
+!ent set_var mage actions.zap.body "x = 1"
+!action mage zap ogre
+
+Expected: the mage's `bolt` targets a cell. With no reaction on the
+board the line reads "used action `bolt` on `(4,4)`". Once the orc holds a
+reaction (`thorns`), a typed action runs as an exchange, which keeps a
+cell as [x, y, map, named]: the action-used line read that list as four
+targets ("on `4, 4, main, False`"); it now reads the cell back as the
+action did, so the line is the same with or without reactions on the
+board. The event log's entry showed the target's Python form
+(`Coord(4, 4)`); it shows `(4,4)`, and a location_list as `(4,4), (5,5)`.
+A unit target (the 2x2 ogre) reads as before.
+
+
+SCENARIO 1154 — `!part remove` takes body parts only; a located or region part attached to another body arrives glued (a 2x2 ogre's head)
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+!match new pa PA 9 6
+!match use pa
+!ent add mage Mage 30 3 2 20
+!ent add ogre Ogre 50 5 1 10
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre head Head 10 10
+!part locate head 7 4
+!part add ogre belly Belly 12 12
+!part region belly center
+!part remove mage
+?? ❌ `mage` is not a body part (`!ent remove mage` removes a unit).
+!assert "cell_entity(3, 2) == 'mage'"
+!part attach mage head
+?? `head` is now a body part of `mage`.
+!assert "entity[head].x == 3 and entity[head].y == 2 and cell_entity(3, 2) == 'mage' and not var_has('head', '__part_located')"
+!ent tp mage 1 5
+!assert "entity[head].x == 1 and entity[head].y == 5 and cell_entity(7, 4) == ''"
+!part attach mage belly
+!assert "not var_has('belly', '__part_region') and entity[belly].x == 1"
+!part locate head 2 5
+!part detach head
+!part attach ogre head
+!assert "entity[head].x == 5 and entity[head].y == 1 and entities_at(5, 1) == ['ogre']"
+!part remove head
+?? Removed body part `head`.
+!assert "not has_part('ogre', 'Head')"
+
+Expected: `!part remove mage` is refused: the mage is no body part
+(it used to be removed, the reply calling it one); `!ent remove` removes a
+unit. The 2x2 ogre's head is a located part on (7,4). `!part attach mage
+head` moves it onto the mage's cell as a glued part: it used to keep
+`__part_located`, so it stood on (3,2) as a second occupant of the mage's
+cell. Glued, it follows the mage's teleport and its old cell is free. The
+ogre's `belly` (a region part) loses its region the same way. A located
+part detached (a free unit that still carried the var) and attached to
+the ogre arrives glued too: (5,1) holds only the ogre. `!part remove head`
+removes a real part.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1155 — A revive keeps the facing: a 2x2 body with a region part, a seat and a located part; a single unit
+------------------------------------------------------------------------------------------------------------------
+
+!match new rf RF 10 8
+!match use rf
+!ent add ogre Ogre 50 4 3 10
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var ogre slots.seat.capacity 1
+!ent set_var ogre slots.seat.region front
+!part add ogre tail Tail 10 10
+!part region tail back
+!part add ogre head Head 10 10
+!part locate head 7 3
+!ent face ogre left
+!ent face head up
+!ent add imp Imp 5 1 1 3
+!ent face imp right
+!mount imp ogre seat
+!assert "entity[imp].x == 4 and facing_of('ogre') == 'left' and facing_of('head') == 'up'"
+!ent kill ogre
+!ent revive ogre
+?? ✨ **Ogre** (`ogre`) was revived.
+!assert "facing_of('ogre') == 'left' and facing_of('head') == 'up' and entity[head].x == 7"
+!eval "footprint_cells('tail')"
+?? [[5, 3], [5, 4]]
+!ent kill imp
+!ent revive imp
+!assert "facing_of('imp') == 'right'"
+
+Expected: the 2x2 ogre faces left, its located head up, its `tail`
+covers the `back` region (the right column while it faces left) and the
+imp rides the `front` seat. Killed and revived, the ogre faces left again
+and the head up: a revive spawned the body and each part anew, which
+turned them the spawn_face_toward_center way, so a revived body's region
+parts and seats moved to other cells. The tail's region is the right
+column as before. A single unit (the imp, facing right) keeps its facing
+across its own death and revive too. A template's unit, a prefab's and a
+transform's restored parts already kept theirs.
+
+
+SCENARIO 1156 — One death per unit: soul-bonded units that kill each other in on_death, kill(self) in on_death; deaths still work afterwards
+--------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sb SB 8 6
+!match use sb
+!ent add ann Ann 20 1 1 9
+!ent add bob Bob 20 3 1 8
+!ent add cat Cat 20 5 1 7
+!ent add dan Dan 20 7 1 6
+!match var set deaths ""
+!gpassive add count on_death "match.deaths = match.deaths + self + ' '"
+!passive add ann bond on_death "kill('bob')"
+!passive add bob bond on_death "kill('ann')"
+!ent kill ann
+?! maximum recursion
+!assert "match.deaths == 'ann bob ' and has_corpse('ann') and has_corpse('bob')"
+!passive add cat spite on_death "kill(self)"
+!ent damage cat 30
+?? 💀 **Cat** (`cat`) died.
+?! FAILED
+!assert "match.deaths == 'ann bob cat '"
+!ent hp dan 0
+?? 💀 **Dan** (`dan`) died.
+!assert "match.deaths == 'ann bob cat dan '"
+!log type=death
+
+Expected: Ann and Bob each hold an on_death passive killing the other.
+`!ent kill ann` runs Ann's death, whose passive kills Bob, whose passive
+kills Ann again: her death is under way, so the kill does nothing (it
+answers True) and each dies once (`match.deaths` is `ann bob `, both
+leave a corpse). It used to start Ann's death again from the top, each
+level firing on_death anew until Python's stack ran out ("maximum
+recursion depth exceeded", dozens of death lines and log entries). Cat's
+`kill(self)` in its own on_death is the same case: one death, no error.
+A stack overflow there could also leave the death guard raised, after
+which no unit of the match died of its hp until a restart; Dan dying of
+`!ent hp dan 0` afterwards shows deaths still run. The event log holds
+four death entries.
+
+
+SCENARIO 1157 — A rollback restores a deferred re-sort: `!simulate` and `!dry` across a round end, a dry run that would have marked one
+---------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rb RB 8 6
+!match use rb
+!system set default turnorder_change_policy deferred
+!ent add a1 A1 5 1 1 5
+!ent add a2 A2 5 2 1 9
+!turn next
+!ent set_var a1 initiative 20
+?? New order takes effect at round end.
+!simulate 1 steps=3 !turn next
+!dry !batch turn next ; turn next
+!turn next
+!turn next
+?? 🔄 turn order re-sorted at round end.
+?? It is now **A1**'s turn
+!dry !ent set_var a2 initiative 30
+?? New order takes effect at round end.
+!turn next
+!turn next
+?! re-sorted
+?? It is now **A1**'s turn
+!assert "entity[a2].initiative == 9"
+
+Expected: under turnorder_change_policy deferred, A1's initiative
+rises to 20 mid-round, so the order is re-sorted at the round end. A
+`!simulate` and a `!dry` that play past the round end re-sort inside
+their run and are rolled back; the pending re-sort is game state (saved
+with the match), so the rollback puts it back: round 2 opens with "turn
+order re-sorted at round end" and A1 first. The rollback used to keep
+the flag as the run left it (cleared), so the promised re-sort never
+came and A2 went first. The other direction: `!dry !ent set_var a2
+initiative 30` marks a re-sort inside the dry run only, so round 3 opens
+without a re-sort line (it used to print one) and A2's initiative is
+still 9. The skipped-ATB-turn and watcher-backlog flags are restored the
+same way.
+
+
+SCENARIO 1158 — A rollback in the middle of a walk: damage_forecast and a failing use_action in on_entity_step (a 2x2 ogre), a forecast in a moving zone's on_moved
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new fw FW 10 8
+!match use fw
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 50 1 3 4
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add orc Orc 30 9 8 3
+!system set default hook_output_lines none
+!passive add hero fc on_entity_step "entity[self].seen = damage_forecast('orc', 5)"
+!ent move hero 3 right
+?? Moved `hero` 3 step(s) to (4,1)
+!assert "entity[hero].x == 4 and cell_entity(4, 1) == 'hero' and cell_entity(2, 1) == '' and entity[orc].hp == 30"
+!ent set_var ogre actions.oops.target none
+!ent set_var ogre actions.oops.body "entity[self].hp = 1\nfail('no')"
+!passive add ogre trip on_entity_step "use_action(self, 'oops')"
+!ent move ogre 4 right
+?? Moved `ogre` 4 step(s) to (5,3)
+!assert "entity[ogre].x == 5 and entity[ogre].hp == 50 and cell_entity(6, 4) == 'ogre' and cell_entity(1, 3) == ''"
+!zone fill cloud 1 6 1 6
+!zone hook add cloud on_moved "match.fc = damage_forecast('orc', 2)"
+!zone move cloud right 5
+?? Zone `cloud` stepped 5 of 5 cell(s) right.
+!assert "zone_cells('cloud') == [[6, 6]] and entity[orc].hp == 30"
+!ent push hero down 3
+!assert "entity[hero].y == 4"
+
+Expected: the hero's on_entity_step passive calls damage_forecast,
+which runs the packet and rolls the match back in place. `!ent move hero
+3 right` walks all three cells to (4,1): the rollback used to replace
+every unit's object, so the walk went on moving an object no longer in
+the match (the reply said 3 steps, the hero stood on (2,1)). The 2x2
+ogre's passive uses an action that fails (rolled back the same way: its
+hp stays 50); its walk of 4 ends on (5,3) with its whole body there. A
+zone whose on_moved hook forecasts walks its 5 steps. The orc the
+forecasts were about is untouched. A unit and a map present before and
+after a rollback now keep their objects, holding the restored state.

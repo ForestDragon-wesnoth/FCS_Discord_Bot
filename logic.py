@@ -13454,6 +13454,12 @@ class Match:
     _death_check_suppressed_ids: Set[str] = field(
         default_factory=set, repr=False, compare=False
     )
+    # The units whose death pipeline is running (_process_death): a kill()
+    # of one of them from an on_death passive doesn't start it again. Not
+    # serialized.
+    _dying_ids: Set[str] = field(
+        default_factory=set, repr=False, compare=False
+    )
     # Units whose automatic death check waits until a multi-var command
     # (`!ent set_vars`) has written every var; the command runs the check
     # itself afterwards. Unlike _death_check_suppressed_ids it leaves the
@@ -16648,7 +16654,8 @@ class Match:
 
     def attach_part(self, parent_id: str, part_id: str) -> "Entity":
         """Link an EXISTING entity as a body part of `parent_id`, moving it
-        onto the parent's cell with its auras, riders and glued parts. Raises
+        onto the parent's cell (glued: a located or region part of another
+        body loses that mode) with its auras, riders and glued parts. Raises
         NotFound / VTTError for itself, another map, a parent that is one of
         its own parts (a loop), a map carrier, a snake segment or a mounted
         rider; a part of someone else just re-points."""
@@ -16691,8 +16698,16 @@ class Match:
         if p.mounted_on:
             raise VTTError(f"`{part_id}` is riding `{p.mounted_on}`; "
                            f"dismount it first.")
+        # It arrives glued, on the parent's cell: a part located on (or a
+        # region of) its old body, or a detached one still carrying the
+        # var, stood on the new parent's cell as a second occupant.
+        for k in ("__part_located", "__part_region"):
+            if k in p.vars:
+                p.vars.pop(k, None)
+                p.mark_changed()
         p.part_of = parent_id
         p.x, p.y = parent.x, parent.y
+        self._spatial.touch(p.id)       # its kind of part changed
         # What it carries comes along: its auras, riders and glued parts.
         self._restamp_anchors_for(part_id)
         self._restamp_parts_for(part_id)
@@ -25574,7 +25589,12 @@ class Match:
         # into the PARENT's corpse, not the part's own.
         if e.is_part:
             return self._process_part_death(e)
-        self._death_processing += 1
+        # One death per unit: a kill() of a unit whose on_death is running
+        # (its own passive, or the unit it just killed striking back: two
+        # soul-bonded units) used to start its death again, each level
+        # firing on_death anew until Python's stack ran out.
+        if entity_id in self._dying_ids:
+            return []
         # Capture identity/position now — after e.remove() the entity is
         # detached, so the log event must read these up front.
         dead_name, dead_x, dead_y, dead_map = e.name, e.x, e.y, e.map
@@ -25582,6 +25602,11 @@ class Match:
         dead_box = (e.x, e.y) + self.entity_footprint(e)
         dead_vehicles: List[Tuple[str, Dict[str, Any], Tuple[int, int, int, int],
                                   str]] = []
+        # Counted right before the `try` that takes it back: an error
+        # between the two (a stack overflow in the copy above) left the
+        # guard up, and no unit of the match could die until a restart.
+        self._death_processing += 1
+        self._dying_ids.add(entity_id)
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id],
                                  extras={"killer": self.packet_killer(
@@ -25632,6 +25657,7 @@ class Match:
                            dead_x, dead_y, dead_vars, map_name=dead_map)
         finally:
             self._death_processing = max(0, self._death_processing - 1)
+            self._dying_ids.discard(entity_id)
         # Its riders, then the occupants of the maps it carried. Outside
         # the death guard, so a death effect that kills a rider or an
         # occupant (or a unit near it) runs that death.
@@ -25777,6 +25803,10 @@ class Match:
         the `!ent kill` command."""
         if eid not in self.entities:
             return False, []
+        if eid in self._dying_ids:
+            # Its death is under way (a kill from its own on_death, or
+            # from the on_death of a unit it killed): it dies once.
+            return True, []
         # The unit as it stands: a death the effects trip (and a revive a
         # vehicle-death effect or hook runs after it) leaves another object
         # under the id, which isn't killed again.
@@ -26413,6 +26443,14 @@ class Match:
                 cmap.lay_corpse(eid, corpse, loc[0], loc[1])
                 raise
             spawn_log = moved_note + list(spawn_log)
+            # A spawn turns a unit the spawn_face_toward_center way; a
+            # revived unit is the one that died, so it faces as it did (its
+            # region parts and seats turn with it), like a template's or a
+            # prefab's unit.
+            saved_facing = entity_dict.get("facing")
+            if saved_facing in FACING_VECTORS and self.entities.get(e.id) is e \
+                    and e.facing != saved_facing:
+                e.facing = saved_facing
             # Restore the creature's body parts at the parent's cell. Each
             # snapshot carries its part_of (-> e.id) so it re-attaches; a
             # part already taking that id (somehow still alive) is skipped.
@@ -26467,6 +26505,10 @@ class Match:
                             plog = [f"⚠️ part `{pid}` couldn't return to "
                                     f"({px},{py}) ({ex}); placed at "
                                     f"({near[0]},{near[1]})."] + list(plog)
+                        back_part = self.entities.get(pid)
+                        if back_part is not None \
+                                and pdc.get("facing") in FACING_VECTORS:
+                            back_part.facing = pdc["facing"]
                         spawn_log += plog
                     except VTTError as ex:
                         # Skipped rather than aborting the whole revive.

@@ -23975,6 +23975,10 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         part_id = _resolve_eid(m, args[1])
         if part_id not in m.entities:
             return await ctx.send(f"❌ Entity `{part_id}` not found.")
+        if not m.entities[part_id].part_of:
+            # It removed any unit and called it a body part.
+            return await ctx.send(f"❌ `{part_id}` is not a body part "
+                                  f"(`!ent remove {part_id}` removes a unit).")
         sever = m.despawn_entity(m.entities[part_id])
         return await ctx.send("\n".join([f"Removed body part `{part_id}`."]
                                          + sever))
