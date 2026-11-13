@@ -3813,15 +3813,15 @@ the move.
 
 
 SCENARIO 179 — Special-tile data storage and map glyphs
---------------------------------------------------------
+-------------------------------------------------------
 
 !match new mtile1 TileBasics 8 8
 !match use mtile1
 !tile list
-!tile set 3 3 flame.burn_damage 5
+!tile set 3 3 lava.burn_damage 5
 !tile set 3 3 glyph *
-!tile set 5 5 loot.gold 100
-!tile set 5 5 loot.gems 3
+!tile set 5 5 ore.gold 100
+!tile set 5 5 ore.gems 3
 !tile set 5 5 glyph $
 !tile info 3 3
 !tile info 5 5
@@ -3829,9 +3829,9 @@ SCENARIO 179 — Special-tile data storage and map glyphs
 !map
 !ent add hero Hero 30 5 5 10
 !map
-!tile del 5 5 loot.gems
+!tile del 5 5 ore.gems
 !tile info 5 5
-!tile del 5 5 loot.gold
+!tile del 5 5 ore.gold
 !tile info 5 5
 !tile del 5 5 glyph
 !tile info 5 5
@@ -3839,42 +3839,42 @@ SCENARIO 179 — Special-tile data storage and map glyphs
 
 Expected: Tiles start out empty (`!tile list` says so). `!tile set`
 writes dotted-path values into a sparse `(x, y) → data dict` store
-on the match; `flame.burn_damage` and `loot.gems` create intermediate
+on the match; `lava.burn_damage` and `ore.gems` create intermediate
 dicts on the way down. `!tile info` shows the full nested data as
 pretty-printed JSON; `!tile list` shows the top-level feature names
 per coordinate.
 
 The map render picks up the tile's `glyph` key when it's exactly one
-character: (3,3) shows `*` for the flame and (5,5) shows `$` for the
-loot. Spawning Hero at (5,5) hides the `$` because the entity takes
+character: (3,3) shows `*` for the lava and (5,5) shows `$` for the
+ore. Spawning Hero at (5,5) hides the `$` because the entity takes
 precedence in rendering — `!map` shows the entity arrow instead.
 
-`!tile del` removes one path at a time. After dropping `loot.gems`
-the loot feature still has gold; after dropping `loot.gold` the
-empty `loot` dict is auto-pruned (so !tile info shows just the
+`!tile del` removes one path at a time. After dropping `ore.gems`
+the ore feature still has gold; after dropping `ore.gold` the
+empty `ore` dict is auto-pruned (so !tile info shows just the
 glyph); after dropping `glyph` the whole tile (5,5) entry is gone
 from the sparse store. The final `!tile list` only shows (3,3)
 because (5,5) has been fully cleared.
 
 
 SCENARIO 180 — Formula access to tile data via tile_get / tile_has
--------------------------------------------------------------------
+------------------------------------------------------------------
 
 !match new mtile2 TileFormula 8 8
 !match use mtile2
 !ent add hero Hero 30 1 1 10
-!tile set 3 3 flame.burn_damage 5
-!tile set 3 3 flame.spreads 1
-!tile set 5 5 spikes.damage 8
-!eval 'tile_get(3, 3, "flame.burn_damage")'
-!eval 'tile_get(3, 3, "flame.spreads")'
-!eval 'tile_has(3, 3, "flame.burn_damage")'
-!eval 'tile_has(3, 3, "spikes.damage")'
-!eval 'tile_has(99, 99, "flame.burn_damage")'
-!eval 'tile_get(3, 3, "spikes.damage")'
+!tile set 3 3 lava.burn_damage 5
+!tile set 3 3 lava.spreads 1
+!tile set 5 5 acid.damage 8
+!eval 'tile_get(3, 3, "lava.burn_damage")'
+!eval 'tile_get(3, 3, "lava.spreads")'
+!eval 'tile_has(3, 3, "lava.burn_damage")'
+!eval 'tile_has(3, 3, "acid.damage")'
+!eval 'tile_has(99, 99, "lava.burn_damage")'
+!eval 'tile_get(3, 3, "acid.damage")'
 !ent tp hero 3 3
-!eval 'entity[hero].hp - tile_get(entity[hero].x, entity[hero].y, "flame.burn_damage")'
-!passive add hero burn on_turn_start "entity[self].hp = entity[self].hp - tile_get(entity[self].x, entity[self].y, \"flame.burn_damage\") if tile_has(entity[self].x, entity[self].y, \"flame.burn_damage\") else entity[self].hp"
+!eval 'entity[hero].hp - tile_get(entity[hero].x, entity[hero].y, "lava.burn_damage")'
+!passive add hero burn on_turn_start "entity[self].hp = entity[self].hp - tile_get(entity[self].x, entity[self].y, \"lava.burn_damage\") if tile_has(entity[self].x, entity[self].y, \"lava.burn_damage\") else entity[self].hp"
 !turn next
 !ent info hero short
 !ent tp hero 1 1
@@ -3886,7 +3886,7 @@ SCENARIO 180 — Formula access to tile data via tile_get / tile_has
 
 Expected: tile_get returns the value at a dotted path on a tile;
 missing paths raise ❌ FormulaError ("tile (3,3) has no value at
-'spikes.damage'") so the GM gets a precise error rather than the
+'acid.damage'") so the GM gets a precise error rather than the
 formula silently returning None. tile_has is the boolean guard —
 returns True/False, never raises, and returns False for both
 "path missing" and "coordinate out of grid" so a formula can
@@ -3894,22 +3894,22 @@ defensively pass entity-derived coords without first bounds-checking
 them.
 
 The chained read `tile_get(entity[hero].x, entity[hero].y,
-"flame.burn_damage")` is the user-facing pattern: "what's the burn
+"lava.burn_damage")` is the user-facing pattern: "what's the burn
 damage on whatever tile this entity is standing on?". With Hero
 teleported to (3,3), the eval returns 30 - 5 = 25 (hero.hp minus
 the tile's burn_damage).
 
 The `burn` passive bakes that into an on_turn_start hook with
 tile_has as a guard so the passive is a no-op when the entity
-isn't on a fire tile. Across three turn-nexts the hero's HP path
+isn't on a lava tile. Across three turn-nexts the hero's HP path
 is:
-  - on (3,3): turn fires, has flame → -5, hp = 25
+  - on (3,3): turn fires, has lava → -5, hp = 25
   - on (1,1): turn fires, no tile → no damage, hp = 25
-  - on (5,5): turn fires, has spikes but NOT flame.burn_damage →
+  - on (5,5): turn fires, has acid but NOT lava.burn_damage →
               guard is False, no damage, hp = 25
-Even though (5,5) has spikes.damage, the passive only fires when
-flame.burn_damage exists — exact path matching, no wildcards. A
-more complete fire-or-spikes passive would chain two tile_has
+Even though (5,5) has acid.damage, the passive only fires when
+lava.burn_damage exists — exact path matching, no wildcards. A
+more complete lava-or-acid passive would chain two tile_has
 checks via if/elif.
 
 Note the shell quoting: the formula's string literal (the dotted
@@ -3917,19 +3917,19 @@ path argument) needs inner double quotes to survive shlex
 tokenization. Wrap the whole !eval argument in outer single
 quotes so the inner double quotes reach the formula parser
 intact — without the outer single quotes, shlex strips the inner
-ones and the formula sees `flame.burn_damage` as an attribute
-access on an undefined `flame` identifier, which the validator
+ones and the formula sees `lava.burn_damage` as an attribute
+access on an undefined `lava` identifier, which the validator
 rejects.
 
 
 SCENARIO 181 — Tile data round-trips through !store save/load
---------------------------------------------------------------
+-------------------------------------------------------------
 
 !match new mtile3 TilePersist 8 8
 !match use mtile3
-!tile set 2 2 flame.burn_damage 7
+!tile set 2 2 lava.burn_damage 7
 !tile set 2 2 glyph %
-!tile set 4 4 loot.gold 500
+!tile set 4 4 ore.gold 500
 !tile list
 !store save _tile_store_test.json
 !match delete mtile3
@@ -3938,7 +3938,7 @@ SCENARIO 181 — Tile data round-trips through !store save/load
 !tile list
 !tile info 2 2
 !tile info 4 4
-!eval 'tile_get(4, 4, "loot.gold")'
+!eval 'tile_get(4, 4, "ore.gold")'
 
 Expected: All tile data survives a save+delete+load roundtrip with
 identical structure. The serialized form uses "x,y" string keys
@@ -3948,71 +3948,71 @@ the reloaded match both return the original values exactly.
 
 
 SCENARIO 182 — Define a tile template and place instances
-----------------------------------------------------------
+---------------------------------------------------------
 
 !match new mtpl1 TplBasics 8 8
 !match use mtpl1
 !ent add hero Hero 30 1 1 10
 !tile def list
-!tile def new flame
-!tile def data flame burn_damage 5
-!tile def data flame glyph F
-!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile def new lava
+!tile def data lava burn_damage 5
+!tile def data lava glyph F
+!tile def hook lava on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
 !tile def list
-!tile def info flame
-!tile place flame 3 1
-!tile place flame 4 1
-!tile place flame 5 1
+!tile def info lava
+!tile place lava 3 1
+!tile place lava 4 1
+!tile place lava 5 1
 !tile info 3 1
 !tile list
 !ent move hero 5 right
 !ent info hero short
 
 Expected: The match starts with no templates ("No tile templates
-defined."). Defining `flame` creates an empty template that's then
+defined."). Defining `lava` creates an empty template that's then
 filled with two data fields and one on_enter hook formula. The
 formula reads `tile_get(tile_x, tile_y, "burn_damage")` so each
 instance's own burn_damage value drives the damage — making the
 template generic over per-instance tuning.
 
-Placing flame at (3,1), (4,1), (5,1) writes three independent
+Placing lava at (3,1), (4,1), (5,1) writes three independent
 tile dicts, each one a deep copy of the template's data plus a
-`_template: "flame"` tag. `!tile info 3 1` shows the instance
-dict (burn_damage=5, glyph=F, _template=flame); `!tile list` shows
+`_template: "lava"` tag. `!tile info 3 1` shows the instance
+dict (burn_damage=5, glyph=F, _template=lava); `!tile list` shows
 all three placements. Hooks are NOT copied — they're looked up
 live from the template at fire time.
 
 `!ent move hero 5 right` walks (1,1) → (6,1), transiting (2,1)
-(empty, no hook), (3,1), (4,1), (5,1) (three flames), and stops
-at (6,1). The three flame on_enter hooks fire in order; each
+(empty, no hook), (3,1), (4,1), (5,1) (three lava), and stops
+at (6,1). The three lava on_enter hooks fire in order; each
 deals 5 damage. !ent info: hp = 15. The hook firing message
 lists each fire so the GM can verify per-tile triggering.
 
 
 SCENARIO 183 — Template hook edits propagate; template data edits do NOT
--------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 !match new mtpl2 TplLive 8 8
 !match use mtpl2
 !ent add hero Hero 100 1 1 10
-!tile def new spike
-!tile def data spike damage 5
-!tile def hook spike on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "damage")'
-!tile place spike 3 3
-!tile place spike 5 5
+!tile def new acid
+!tile def data acid damage 5
+!tile def hook acid on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "damage")'
+!tile place acid 3 3
+!tile place acid 5 5
 !ent tp hero 3 3
 !ent info hero short
-!tile def data spike damage 999
+!tile def data acid damage 999
 !tile info 3 3
 !ent tp hero 1 1
 !ent tp hero 3 3
 !ent info hero short
-!tile def hook spike on_enter 'entity[self].hp = entity[self].hp - 50'
+!tile def hook acid on_enter 'entity[self].hp = entity[self].hp - 50'
 !ent tp hero 1 1
 !ent tp hero 5 5
 !ent info hero short
 
-Expected: Two spikes are placed from the same template. Stepping
+Expected: Two acid pools are placed from the same template. Stepping
 on the first deals 5 damage (hp 95). Editing the template's
 `damage` to 999 changes the TEMPLATE'S default — but the already-
 placed instance at (3,3) still has `damage: 5` (copied at place
@@ -4028,16 +4028,16 @@ looked up live; data is snapshotted.
 
 
 SCENARIO 184 — Placement overrides and per-tile hook override
---------------------------------------------------------------
+-------------------------------------------------------------
 
 !match new mtpl3 TplOverride 8 8
 !match use mtpl3
 !ent add hero Hero 100 1 1 10
-!tile def new flame
-!tile def data flame burn_damage 5
-!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
-!tile place flame 3 3
-!tile place flame 4 3 burn_damage=20
+!tile def new lava
+!tile def data lava burn_damage 5
+!tile def hook lava on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place lava 3 3
+!tile place lava 4 3 burn_damage=20
 !tile info 3 3
 !tile info 4 3
 !ent tp hero 3 3
@@ -4049,7 +4049,7 @@ SCENARIO 184 — Placement overrides and per-tile hook override
 !ent tp hero 4 3
 !ent info hero short
 
-Expected: Two flames are placed. The first uses template defaults
+Expected: Two lava are placed. The first uses template defaults
 (burn_damage=5); the second uses a placement override
 (`burn_damage=20`). `!tile info` shows the override on the
 instance dict — overrides merge over template defaults at place
@@ -4064,77 +4064,65 @@ granularity is preserved (the template's on_exit / on_stop would
 still apply if defined, since only on_enter was overridden).
 
 
-SCENARIO 185 — Landmine: template-based self-destruct
-------------------------------------------------------
+SCENARIO 185 — Landmines are zones: one definition, placed objects that self-destruct
+------------------------------------------------------------------------------------
 
 !match new mtpl4 Landmines 8 8
 !match use mtpl4
 !ent add hero Hero 100 1 1 10
-!tile def new landmine
-!tile def data landmine glyph *
-!tile def hook landmine on_enter 'entity[self].hp = entity[self].hp - 25; tile_clear(tile_x, tile_y)'
-!tile place landmine 3 3
-!tile place landmine 5 5
-!tile def list
+!zone def new landmine
+!zone def glyph landmine *
+!zone def hook landmine on_enter 'entity[self].hp = entity[self].hp - 25; delete_zone(zone_name)'
+!zone place landmine 3 3
+?? `landmine`
+!zone place landmine 5 5
+?? `landmine2`
+!zone def info landmine
 !ent tp hero 3 3
-!ent info hero short
-!tile info 3 3
+!assert "entity[hero].hp == 75 and not zone_exists('landmine') and zone_exists('landmine2')"
 !ent tp hero 5 5
-!ent info hero short
-!tile info 5 5
+!assert "entity[hero].hp == 50 and not zone_exists('landmine2')"
 !ent tp hero 1 1
 !ent tp hero 3 3
-!ent info hero short
+!assert "entity[hero].hp == 50 and zones_at(3, 3) == []"
+!zone def info landmine
 
-Expected: Define a `landmine` template once. Place two instances.
-Stepping on the first detonates it: -25 damage AND `tile_clear`
-wipes the tile entirely (instance data is gone, no `_template`
-reference remains — the cell is empty). The template itself is
-untouched and still has 1 placed instance left.
+Expected: A landmine is an object standing on the ground, so it is a
+zone: the `landmine` zone definition is described once and `!zone place`
+puts two one-cell zones of it on the map (`landmine` at (3,3),
+`landmine2` at (5,5)). Stepping onto the first fires the definition's
+on_enter hook: -25 hp and `delete_zone(zone_name)` removes that mine,
+leaving the ground under it as it was. The second detonates on its own
+(hp 100 → 75 → 50). Teleporting back onto (3,3) finds no zone there, so
+hp stays at 50. The definition outlives its zones (`!zone def info`
+still shows it).
 
-Stepping on the second mine detonates that one too — independent
-self-destruct (hp 100 → 75 → 50). After both are detonated,
-`!tile def list` would still show the template with 0 placed
-instances. Teleporting back onto (3,3) finds an empty tile (no
-hook to fire) so hp stays at 50.
-
-This is exactly the user's landmine pattern, except now ONE
-template definition covers any number of placements rather than
-needing a separate `!tile hook add` per cell.
-
-
-SCENARIO 186 — Ad-hoc tiles are still supported (unique loot chest)
---------------------------------------------------------------------
+SCENARIO 186 — A one-off object is a zone without a definition (unique loot chest)
+----------------------------------------------------------------------------------
 
 !match new mtpl5 AdHoc 8 8
 !match use mtpl5
 !ent add hero Hero 30 1 1 10
 !ent set_var hero gold 0
-!tile set 4 4 contents.gold 50
-!tile set 4 4 contents.note 'a small treasure chest'
-!tile set 4 4 glyph C
-!tile hook add 4 4 on_enter 'entity[self].gold = entity[self].gold + tile_get(tile_x, tile_y, "contents.gold"); tile_clear(tile_x, tile_y)'
-!tile info 4 4
+!zone new chest
+!zone add chest 4 4
+!zone set chest contents.gold 50
+!zone set chest contents.note 'a small treasure chest'
+!zone glyph chest C
+!zone hook add chest on_enter 'entity[self].gold = entity[self].gold + zone_get(zone_name, "contents.gold"); delete_zone(zone_name)'
+!zone info chest
 !ent tp hero 4 4
-!ent info hero short
-!tile info 4 4
+!assert "entity[hero].gold == 50 and not zone_exists('chest')"
+!assert "not tile_has(4, 4, 'contents')"
 
-Expected: A one-off treasure chest at (4,4) with no template
-behind it — just an ad-hoc instance with custom data and an
-ad-hoc on_enter hook. Templates are for REUSABLE tile kinds; a
-single unique chest doesn't need one. The hook awards the
-entity 50 gold and tile_clears the chest.
-
-Hero teleports onto (4,4): hero.gold goes from 0 to 50, and the
-tile is gone. !tile info confirms. This is the "unique
-instance" path the user called out — unique tiles are still
-instances, not free-floating hooks attached to a coordinate,
-and they go through the same fire_tile_hook code path with
-identical context bindings.
-
+Expected: A one-off treasure chest at (4,4) is a zone with no definition
+behind it: its own data, glyph and on_enter hook. Definitions are for
+REUSABLE kinds of objects; a single unique chest doesn't need one. The
+hero teleports onto (4,4): the hook awards 50 gold (0 → 50) and deletes
+the chest, and the ground at (4,4) never held any of it.
 
 SCENARIO 187 — Group move fires per-member template hooks
-----------------------------------------------------------
+---------------------------------------------------------
 
 !match new mtpl6 GroupTpl 8 8
 !match use mtpl6
@@ -4143,16 +4131,16 @@ SCENARIO 187 — Group move fires per-member template hooks
 !ent group new party
 !ent group add party soldier
 !ent group add party wizard
-!tile def new flame
-!tile def data flame burn_damage 3
-!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
-!tile place flame 2 6
-!tile place flame 3 6
+!tile def new lava
+!tile def data lava burn_damage 3
+!tile def hook lava on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place lava 2 6
+!tile place lava 3 6
 !ent move group:party 1 down
 !ent info soldier short
 !ent info wizard short
 
-Expected: One `flame` template covers two placed instances at
+Expected: One `lava` template covers two placed instances at
 (2,6) and (3,6). The party group steps onto them simultaneously
 via group-move. Each member's on_enter fires independently
 through the SAME template formula — soldier resolves
@@ -4165,53 +4153,53 @@ triggered it.
 
 
 SCENARIO 188 — Deleting a used tile template detaches its placed tiles
------------------------------------------------------------------------
+----------------------------------------------------------------------
 
 !match new mtpl7 Orphans 8 8
 !match use mtpl7
 !ent add hero Hero 50 1 1 10
-!tile def new flame
-!tile def data flame burn_damage 5
-!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
-!tile place flame 3 3
-!tile def del flame
+!tile def new lava
+!tile def data lava burn_damage 5
+!tile def hook lava on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place lava 3 3
+!tile def del lava
 ?? still has 1 placed instance(s)
 ?? `!undo command` after the delete brings the template and the links back.
-!tile def del flame confirm
-?? Deleted template `flame` (1 placed tile(s) detached; `!undo command` brings it back).
+!tile def del lava confirm
+?? Deleted template `lava` (1 placed tile(s) detached; `!undo command` brings it back).
 !tile info 3 3
 ?! _template
 ?? burn_damage
 !undo command
-!assert "tile_template_of(3, 3) == 'flame'"
+!assert "tile_template_of(3, 3) == 'lava'"
 !tile def list
-?? flame
-!tile def del flame confirm
-!tile def new flame
-!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - 40'
+?? lava
+!tile def del lava confirm
+!tile def new lava
+!tile def hook lava on_enter 'entity[self].hp = entity[self].hp - 40'
 !ent tp hero 3 3
 !assert "entity[hero].hp == 50 and tile_template_of(3, 3) == None"
 
-Expected: `!tile def del flame` without `confirm` warns the GM
+Expected: `!tile def del lava` without `confirm` warns the GM
 that 1 placed instance still exists, naming `!undo command`. With
 `confirm` it deletes the template and detaches the placed tile: it
 keeps its data (burn_damage) and loses `_template` (user call, the
 zone-definition rule). The undo brings the template and the link
-back. After a second delete, a new `flame` template with a harsher
+back. After a second delete, a new `lava` template with a harsher
 hook takes none of the old tiles over: the hero steps on (3,3) and
 keeps 50 hp.
 
 
 SCENARIO 189 — Tile templates persist through save/load
---------------------------------------------------------
+-------------------------------------------------------
 
 !match new mtpl8 TplPersist 8 8
 !match use mtpl8
 !ent add hero Hero 50 1 1 10
-!tile def new flame
-!tile def data flame burn_damage 7
-!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
-!tile place flame 4 4
+!tile def new lava
+!tile def data lava burn_damage 7
+!tile def hook lava on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place lava 4 4
 !store save tpl_save
 !match new mfresh Fresh 8 8
 !match use mfresh
@@ -4221,17 +4209,17 @@ SCENARIO 189 — Tile templates persist through save/load
 !store load tpl_save
 !match use mtpl8
 !tile def list
-!tile def info flame
+!tile def info lava
 !ent tp hero 4 4
 !ent info hero short
 
 Expected: Template definitions and placed instances both survive
-a !store save / !store load round-trip. After defining `flame`
+a !store save / !store load round-trip. After defining `lava`
 and placing it at (4,4), we save. In a fresh match (no template,
 no tile), tp to (4,4) deals no damage (hp stays 50). Loading the
 save brings back the original match WITH templates and placed
 tiles intact — hero on the restored match takes 7 damage from
-the (4,4) flame via the restored template hook.
+the (4,4) lava via the restored template hook.
 
 
 SCENARIO 190 — Turn order: an initiative change before the first turn rebuilds at once
@@ -4885,28 +4873,28 @@ default for subsequent scenarios.
 
 
 SCENARIO 211 — !tile place_area: bulk-fill a rectangle with one template
--------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 !match new mpa1 PlaceArea 10 10
 !match use mpa1
-!tile def new flame
-!tile def data flame burn_damage 5
-!tile def data flame glyph &
-!tile place_area flame 2 2 4 4
-!tile find flame
+!tile def new lava
+!tile def data lava burn_damage 5
+!tile def data lava glyph &
+!tile place_area lava 2 2 4 4
+!tile find lava
 !tile info 2 2
 !tile info 3 3
 !tile info 4 4
-!tile place_area flame 7 6 5 8 burn_damage=20
-!tile find flame
+!tile place_area lava 7 6 5 8 burn_damage=20
+!tile find lava
 !tile info 5 8
 
 Expected: `!tile place_area` fills the inclusive rectangle between
 its two corner arguments. A 3x3 fill from (2,2) to (4,4) writes
-nine tiles; `!tile find flame` lists all nine in sorted (x,y) order.
+nine tiles; `!tile find lava` lists all nine in sorted (x,y) order.
 Each placed tile is an independent copy of the template's data —
 `!tile info` on any cell shows `burn_damage: 5` and
-`_template: "flame"`.
+`_template: "lava"`.
 
 Corners can be given in any order — the second call passes (7,6)
 and (5,8), which normalizes to (5,6)..(7,8). The `burn_damage=20`
@@ -4917,26 +4905,26 @@ override took effect.
 
 
 SCENARIO 212 — !tile place_area: corners off-grid → all-or-nothing failure
----------------------------------------------------------------------------
+--------------------------------------------------------------------------
 
 !match new mpa2 PlaceAreaOOB 8 8
 !match use mpa2
-!tile def new flame
-!tile def data flame glyph &
-!tile place_area flame 5 5 12 12
-!tile find flame
-!tile place_area flame 2 2 4 4
-!tile place_area flame 3 3 9 4
-!tile find flame
+!tile def new lava
+!tile def data lava glyph &
+!tile place_area lava 5 5 12 12
+!tile find lava
+!tile place_area lava 2 2 4 4
+!tile place_area lava 3 3 9 4
+!tile find lava
 !tile place_area missing 1 1 2 2
 
 Expected: An off-grid corner is rejected BEFORE any placement
 happens — the engine validates the rectangle against the grid
 bounds, and only proceeds if both corners fit. So
-`!tile place_area flame 5 5 12 12` (the second corner is off the
-8x8 grid) fails with an error and `!tile find flame` reports zero
+`!tile place_area lava 5 5 12 12` (the second corner is off the
+8x8 grid) fails with an error and `!tile find lava` reports zero
 placed instances afterward. Following that with a valid call
-`!tile place_area flame 2 2 4 4` places 9 cells cleanly.
+`!tile place_area lava 2 2 4 4` places 9 cells cleanly.
 
 The third call's second corner (9,4) is off the 8-wide grid (max
 x = 8) — it also fails without partial fill, and the grand total
@@ -4946,37 +4934,37 @@ template lookup happens up front.
 
 
 SCENARIO 213 — !tile find: empty list, missing template, and template del
---------------------------------------------------------------------------
+-------------------------------------------------------------------------
 
 !match new mtf1 TileFind 8 8
 !match use mtf1
-!tile def new flame
-!tile find flame
-!tile place flame 3 3
-!tile place flame 5 5
-!tile find flame
-!tile def new spike
-!tile find spike
-!tile place spike 7 1
-!tile place spike 7 7
-!tile find spike
-!tile find flame
+!tile def new lava
+!tile find lava
+!tile place lava 3 3
+!tile place lava 5 5
+!tile find lava
+!tile def new acid
+!tile find acid
+!tile place acid 7 1
+!tile place acid 7 7
+!tile find acid
+!tile find lava
 !tile find nonexistent_template
 
 Expected: A newly-defined template with no placements gives a
-"No placed instances of template `flame`" message — an empty
+"No placed instances of template `lava`" message — an empty
 listing rather than an error, since "zero" is a valid count.
-After two placements, `!tile find flame` reports both coords in
+After two placements, `!tile find lava` reports both coords in
 sorted order: (3,3), (5,5).
 
-Two templates can coexist independently: defining `spike` and
-placing it at (7,1) and (7,7) gives a `!tile find spike` of two
-coords, and `!tile find flame` still returns the original two.
+Two templates can coexist independently: defining `acid` and
+placing it at (7,1) and (7,7) gives a `!tile find acid` of two
+coords, and `!tile find lava` still returns the original two.
 
 Searching for an undefined template name (`!tile find
 nonexistent_template`) errors loudly — a silent empty result
-would mask the common typo case (e.g. searching for "fire" when
-the template is named "flame").
+would mask the common typo case (e.g. searching for "lavva" when
+the template is named "lava").
 
 
 SCENARIO 214 — !undo: shortcut for `!history undo`
@@ -5743,26 +5731,26 @@ behavior. (As in 234, the assertion is that the two matches'
 draw sequences are equal; the specific letters depend on the seed.)
 
 SCENARIO 230 — !tile place_random: scatter instances across empty cells
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 
 !match new mtr1 PlaceRandom 4 4
 !match use mtr1
-!tile def new flame
-!tile def data flame burn 5
-!tile place_random flame 5
-!tile find flame
-!tile place_random flame 3 burn=20
-!tile find flame
-!tile place_random flame 100
-!tile place_random flame 0
+!tile def new lava
+!tile def data lava burn 5
+!tile place_random lava 5
+!tile find lava
+!tile place_random lava 3 burn=20
+!tile find lava
+!tile place_random lava 100
+!tile place_random lava 0
 
 Expected: `!tile place_random <template> <count>` scatters `count`
 instances across random cells that have no existing tile data
 (entity-occupied cells are still eligible — tiles and entities
-coexist). On a 4x4 grid (16 cells), placing 5 flames then listing
+coexist). On a 4x4 grid (16 cells), placing 5 lava then listing
 shows exactly 5 placed cells (the exact coordinates are random, so
 this test asserts the COUNT, not positions). A second
-`place_random flame 3 burn=20` adds 3 more (now 8 total); the
+`place_random lava 3 burn=20` adds 3 more (now 8 total); the
 `burn=20` override applies to those 3. Asking for 100 on a grid
 with only 8 empty cells left fails all-or-nothing: "only 8 empty
 cell(s) available; cannot place 100" — nothing is placed. A count
@@ -6076,7 +6064,7 @@ later scenarios run with the normal cap.
 
 
 SCENARIO 248 — group_members and tuple-unpack for-loop
--------------------------------------------------------
+------------------------------------------------------
 
 !match new mfor3 GroupAndCoords 10 10
 !match use mfor3
@@ -6092,7 +6080,7 @@ SCENARIO 248 — group_members and tuple-unpack for-loop
 !tile def new mark
 !tile def data mark glyph X
 !eval "for (cx, cy) in cells_in_line(2, 2, 5, 2): tile_set(cx, cy, 'marked', 1)"
-!eval "for (cx, cy) in cells_in_burst(7, 7, 1, 'manhattan_distance'): tile_set(cx, cy, 'flame', 1)"
+!eval "for (cx, cy) in cells_in_burst(7, 7, 1, 'manhattan_distance'): tile_set(cx, cy, 'lava', 1)"
 
 Expected: `group_members(name)` returns the member list in
 insertion order and is loopable. The loop applies -1 hp to every
@@ -6179,7 +6167,7 @@ subtree alongside the existing inventory.
 
 
 SCENARIO 251 — tile_keys + entity_groups + rule_get
-----------------------------------------------------
+---------------------------------------------------
 
 !match new mintro3 MiscIntro 8 8
 !match use mintro3
@@ -6190,10 +6178,10 @@ SCENARIO 251 — tile_keys + entity_groups + rule_get
 !ent group add heroes hero ally
 !ent group new mages
 !ent group add mages mage hero
-!tile def new flame
-!tile def data flame burn 5
-!tile def data flame glyph F
-!tile place flame 5 5
+!tile def new lava
+!tile def data lava burn 5
+!tile def data lava glyph F
+!tile place lava 5 5
 !eval "tile_keys(5, 5)"
 !eval "tile_keys(7, 7)"
 !eval --as hero "entity_groups(self)"
@@ -6204,7 +6192,7 @@ SCENARIO 251 — tile_keys + entity_groups + rule_get
 !eval "rule_get('nonexistent_rule')"
 
 Expected: `tile_keys(x, y)` lists the top-level keys in a tile's
-data dict. The placed flame instance shows the placement keys
+data dict. The placed lava instance shows the placement keys
 (burn, glyph, _template). An empty tile (7,7) returns [].
 
 `entity_groups(eid)` is the reverse index of `group_members`: it
@@ -6431,17 +6419,17 @@ firing semantics consistent.
 
 
 SCENARIO 257 — Tile time hooks fire at round/turn lifecycle
-------------------------------------------------------------
+-----------------------------------------------------------
 
 !match new mev3 TileTimeHooks 6 6
 !match use mev3
 !ent add hero Hero 30 1 1 10
 !ent set_var hero max_hp 100
-!ent set_var hero beacon_count 0
-!tile def new beacon
-!tile def data beacon glyph B
-!tile def hook beacon on_round_end "entity[this].beacon_count = entity[this].beacon_count + 1"
-!tile place beacon 5 5
+!ent set_var hero blessings 0
+!tile def new hallowed
+!tile def data hallowed glyph +
+!tile def hook hallowed on_round_end "entity[this].blessings = entity[this].blessings + 1"
+!tile place hallowed 5 5
 !ent dump hero
 !turn next
 !ent dump hero
@@ -6455,14 +6443,14 @@ on_round_end / on_turn_start / on_turn_end) in addition to the
 movement hooks (on_enter / on_exit / on_stop). Time hooks fire on
 the tile itself at the round/turn lifecycle moment, without
 requiring an entity transit. Each registered tile fires once per
-matching tick — useful for "beacon pulses every round end",
-"trap rearms at turn start", terrain-driven effects in general.
+matching tick — useful for "hallowed ground blesses at round end", "the tide floods the shore at
+turn start", terrain-driven effects in general.
 
 The first `!turn next` opens round 1; no round_end yet, so
-beacon_count = 0. With only hero in turn_order, every subsequent
+blessings = 0. With only hero in turn_order, every subsequent
 `!turn next` immediately wraps the round, firing on_round_end on
 every relevant tile (just (5,5) here). After 2nd turn next:
-beacon_count = 1. After 3rd: 2.
+blessings = 1. After 3rd: 2.
 
 `self` inside a time hook resolves to the current-turn entity at
 the moment of fire (hero here); for round_* hooks during a wrap
@@ -6471,16 +6459,16 @@ new order.
 
 
 SCENARIO 258 — !tile test fires a tile hook manually
------------------------------------------------------
+----------------------------------------------------
 
 !match new mev4 TileTest 6 6
 !match use mev4
 !ent add hero Hero 30 1 1 10
 !ent set_var hero max_hp 100
 !ent set_var hero touched 0
-!tile def new spike
-!tile def hook spike on_enter "entity[self].touched = entity[self].touched + 1"
-!tile place spike 4 4
+!tile def new mud
+!tile def hook mud on_enter "entity[self].touched = entity[self].touched + 1"
+!tile place mud 4 4
 !tile test 4 4 on_enter --as hero
 !tile test 4 4 on_enter --as hero
 !ent dump hero
@@ -6493,7 +6481,7 @@ Expected: `!tile test <x> <y> <hook_name> [--as <eid>]` fires the
 named tile hook immediately, without requiring an entity to walk
 onto the cell. Pure debugging UX — you can verify a hook formula
 works in isolation, fire it for testing without spawning a phantom
-entity, or use it as the "trigger this trap manually" admin
+entity, or use it as the "trigger this terrain manually" admin
 command.
 
 Two `!tile test 4 4 on_enter --as hero` fires bump `touched` to 2.
@@ -6506,18 +6494,18 @@ would surface the standard "'self' is unbound" error.
 
 
 SCENARIO 259 — fire_tile_hook from formulas (chained tile effects)
--------------------------------------------------------------------
+------------------------------------------------------------------
 
 !match new mev5 ChainedTiles 8 8
 !match use mev5
 !ent add hero Hero 30 1 1 10
 !ent set_var hero max_hp 100
 !ent set_var hero burned 0
-!tile def new flame
-!tile def hook flame on_enter "entity[self].burned = entity[self].burned + 1"
-!tile place flame 3 3
-!tile place flame 4 3
-!tile place flame 5 3
+!tile def new lava
+!tile def hook lava on_enter "entity[self].burned = entity[self].burned + 1"
+!tile place lava 3 3
+!tile place lava 4 3
+!tile place lava 5 3
 !eval --as hero "fire_tile_hook(3, 3, 'on_enter')"
 !eval --as hero "for (cx, cy) in cells_in_line(3, 3, 5, 3): fire_tile_hook(cx, cy, 'on_enter')"
 !ent dump hero
@@ -6530,15 +6518,15 @@ tile hook from a formula. Returns the number of log lines emitted
 tile). Defaults `self` to the caller's ctx.target; pass an
 explicit eid as the fourth arg to override.
 
-The first call fires flame on (3,3) once → burned = 1. The
+The first call fires lava on (3,3) once → burned = 1. The
 for-loop over cells_in_line iterates (3,3)→(5,3) and fires
-each of the three flames → burned += 3 → burned = 4. Off-grid
+each of the three lava → burned += 3 → burned = 4. Off-grid
 (9,9) returns 0 (no tile data, no hook to fire). An unknown
 hook name errors with the allowed-list message.
 
 This is the "chained effects" primitive: a tile's own on_enter
 hook could call `fire_tile_hook(cx, cy, 'on_enter')` on
-neighbors to spread fire, propagate damage, etc. — without the
+neighbors to spread a flood, propagate damage, etc. — without the
 GM scripting the propagation manually.
 
 
@@ -8110,34 +8098,38 @@ the imps cluster around the boss. (Imps have no spawner passive
 themselves, so they don't cascade.)
 
 
-SCENARIO 320 — Graveyard tile summons a skeleton on a countdown
-----------------------------------------------------------------
+SCENARIO 320 — A graveyard zone summons a skeleton on a countdown
+-----------------------------------------------------------------
 
 !match new msm4 SummonTile 8 8
 !match use msm4
 !ent add hero Hero 30 1 1 10
 !ent add skel_proto Skeleton 8 7 7 5
 !ent set_var skel_proto undead true
-!eval "tile_set(4, 4, 'minion', entity_snapshot('skel_proto'))"
-!eval "tile_set(4, 4, 'countdown', 2)"
+!zone new graveyard
+!zone add graveyard 4 4
+!eval "zone_set('graveyard', 'minion', entity_snapshot('skel_proto'))"
+!zone set graveyard countdown 2
 !ent remove skel_proto
-!tile hook add 4 4 on_round_start "tile_set(tile_x, tile_y, 'countdown', tile_get(tile_x, tile_y, 'countdown') - 1)\nif tile_get(tile_x, tile_y, 'countdown') <= 0:\n    summon_near(tile_get(tile_x, tile_y, 'minion'), tile_x, tile_y, 3)\n    tile_set(tile_x, tile_y, 'countdown', 2)"
+!zone hook add graveyard on_round_start "zone_set(zone_name, 'countdown', zone_get(zone_name, 'countdown') - 1)\nif zone_get(zone_name, 'countdown') <= 0:\n    c = get(zone_cells(zone_name), 0)\n    summon_near(zone_get(zone_name, 'minion'), coord_x(c), coord_y(c), 3)\n    zone_set(zone_name, 'countdown', 2)"
+!turn next
+!turn next
 !turn next
 !turn next
 !turn next
 !turn next
 !list
+!assert "entity[skeleton].undead and entity[skeleton2].undead"
 
-Expected: The graveyard tile at (4,4) stores a Skeleton
-template plus a countdown in its own data. Each round start
-decrements the countdown; when it hits 0 the tile summons a
-skeleton near (4,4) and resets the countdown to 2. Over four
-turn advances (each a fresh round, since hero is the only
-turn-order member initially) the countdown reaches 0 twice, so
-two skeletons (`skeleton`, `skeleton2`) appear near the
-graveyard. The cadence lives entirely in the tile's data — no
-round-number primitive needed.
-
+Expected: The graveyard is an object on the ground, a one-cell zone at
+(4,4) holding a Skeleton snapshot and a countdown in its own data. Each
+round start decrements the countdown; when it hits 0 the zone summons a
+skeleton near its cell and resets the countdown to 2. The countdown reaches 0
+in round 2 (`skeleton` appears on the graveyard's own cell, the nearest
+free one, and joins the turn order, so a round takes two turns from then
+on) and again in round 4 (`skeleton2`, beside it). Six turn advances
+reach round 4. The cadence lives entirely in
+the zone's data — no round-number primitive needed.
 
 SCENARIO 321 — Strict summon fails on occupied; summon_near searches
 ---------------------------------------------------------------------
@@ -9352,14 +9344,14 @@ binding-based POV is the Discord path — one channel per team;
 `!as view` is the CLI preview equivalent.)
 
 
-SCENARIO 365 — tile & zone visibility: hidden trap / secret region filtered from a team POV
--------------------------------------------------------------------------------------------
+SCENARIO 365 — tile & zone visibility: hidden pit / secret region filtered from a team POV
+------------------------------------------------------------------------------------------
 
 !match new tvis TVis 8 8
 !match use tvis
 !system set default tile_visibility_condition "not tile_has(tile_x, tile_y, 'hidden')"
 !system set default zone_visibility_condition "not zone_has(zone_name, 'secret')"
-!tile set 3 3 glyph T
+!tile set 3 3 glyph O
 !tile set 3 3 hidden true
 !tile set 5 5 glyph V
 !zone new secret
@@ -9383,14 +9375,14 @@ SCENARIO 365 — tile & zone visibility: hidden trap / secret region filtered fr
 Expected: With the tile rule, a tile carrying a `hidden` flag is
 invisible to a team POV; with the zone rule, a zone whose data
 has `secret` is too. As red (a player POV), `!tile list` shows
-only (5,5) — the hidden trap at (3,3) is omitted; `!tile info 3
-3` reports "no data" (it won't even confirm the trap exists);
+only (5,5) — the hidden pit at (3,3) is omitted; `!tile info 3
+3` reports "no data" (it won't even confirm the pit exists);
 `!zone list` shows only `open`; `!zone info secret` reports "not
-found". On `!map`, neither the trap glyph T at (3,3) nor the
+found". On `!map`, neither the pit glyph O at (3,3) nor the
 secret zone glyph S at (2,2) is painted, but the visible tile V
 (5,5) and open zone O (6,6) are. `!as view omniscient` lifts
 the filter: `!tile list` now includes (3,3), `!zone list`
-includes `secret`, and the map paints both T and S. (Tiles and
+includes `secret`, and the map paints both O and S. (Tiles and
 zones store their map glyph differently — `!tile set ... glyph`
 vs the dedicated `!zone glyph` — but both filter identically.)
 
@@ -9915,7 +9907,7 @@ entity). entities_in_rect(7,7,8,8) is [] (no entity covers those cells).
 This scenario exercises the union-vision and nearest-cell distance paths.
 
 
-SCENARIO 385 — 2×2 crossing a fire band: per-cell tile hooks; zone membership
+SCENARIO 385 — 2×2 crossing a lava band: per-cell tile hooks; zone membership
 -----------------------------------------------------------------------------
 
 !match new burn BURN 12 6
@@ -9923,13 +9915,13 @@ SCENARIO 385 — 2×2 crossing a fire band: per-cell tile hooks; zone membership
 !ent add dragon Dragon 100 1 1 10
 !ent set_var dragon footprint_w 2
 !ent set_var dragon footprint_h 2
-!tile def new flame
-!tile def data flame burn_damage 5
-!tile def hook flame on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn_damage')"
-!tile place flame 4 1
-!tile place flame 4 2
-!tile place flame 5 1
-!tile place flame 5 2
+!tile def new lava
+!tile def data lava burn_damage 5
+!tile def hook lava on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn_damage')"
+!tile place lava 4 1
+!tile place lava 4 2
+!tile place lava 5 1
+!tile place lava 5 2
 !ent move dragon 4 right
 !ent info dragon short
 !zone new gas
@@ -9938,9 +9930,9 @@ SCENARIO 385 — 2×2 crossing a fire band: per-cell tile hooks; zone membership
 !eval "in_zone('dragon', 'gas')"
 !eval "entities_in_zone('gas')"
 
-Expected: A 2×2 fire band fills columns x=4 and x=5 (rows 1-2). The 2×2
-dragon walks east from anchor (1,1); its body ENTERS four flame cells —
-(4,1),(4,2) on one step and (5,1),(5,2) on the next — firing the flame
+Expected: A 2×2 lava band fills columns x=4 and x=5 (rows 1-2). The 2×2
+dragon walks east from anchor (1,1); its body ENTERS four lava cells —
+(4,1),(4,2) on one step and (5,1),(5,2) on the next — firing the lava
 on_enter hook once per cell, for 4×5 = 20 damage. !ent info: hp=80.
 Then a one-cell zone `gas` at (8,1): teleporting the dragon to anchor
 (7,1) makes its footprint cover (7,1),(8,1),(7,2),(8,2), overlapping the
@@ -11740,7 +11732,7 @@ arm part. Switching back to Source, `!list` still has knight (copied, not
 moved) but no rogue (transferred away).
 
 
-SCENARIO 456 — Match outcome: manual victory + prims + a goal-tile win condition
+SCENARIO 456 — Match outcome: manual victory + prims + a goal-zone win condition
 --------------------------------------------------------------------------------
 
 !match new win Win 8 6
@@ -11753,18 +11745,19 @@ SCENARIO 456 — Match outcome: manual victory + prims + a goal-tile win conditi
 !match win clear
 !eval "match_over()"
 !ent add runner Runner 10 1 1 5
-!tile set 4 1 hooks.on_enter "declare_winner('blue', 'reached the goal')"
+!zone new goal
+!zone add goal 4 1
+!zone hook add goal on_enter "declare_winner('blue', 'reached the goal')"
 !ent tp runner 4 1
 !match outcome
 
 Expected: no outcome at first (match_over False). `!match win red ...` declares
 a manual victory; match_winner() = 'red', match_over() True, `!match outcome`
 shows red. `!match win clear` resets it (match_over False again, play resumes).
-Then a GOAL TILE: the cell (4,1) carries an on_enter hook that calls
+Then a GOAL: a one-cell zone at (4,1) carries an on_enter hook that calls
 declare_winner. Teleporting the runner onto it fires the hook, so `!match
 outcome` now shows blue won. There is NO built-in objective evaluator — the win
-condition is just a tile hook calling the declare_winner primitive.
-
+condition is just a zone hook calling the declare_winner primitive.
 
 SCENARIO 457 — Win conditions from an action and an on_death passive
 --------------------------------------------------------------------
@@ -13099,20 +13092,20 @@ to_dict deepcopy fixes from earlier audit passes).
 
 
 SCENARIO 508 — Restore doesn't corrupt nested tile data (load-side deepcopy)
---------------------------------------------------------------------------
+----------------------------------------------------------------------------
 
 !match new lt LoadTile 5 5
 !match use lt
-!tile set 2 2 trap.dmg 10
+!tile set 2 2 acid.dmg 10
 !history save tb
-!tile set 2 2 trap.dmg 20
+!tile set 2 2 acid.dmg 20
 !history restore tb confirm
-!tile set 2 2 trap.dmg 30
+!tile set 2 2 acid.dmg 30
 !history restore tb confirm
-!eval "tile_get(2, 2, 'trap.dmg')"
+!eval "tile_get(2, 2, 'acid.dmg')"
 
 Expected: same shape as 507 but for a tile's nested data. The save `tb` has
-trap.dmg=10; after restore, an in-place `!tile set` to 30 must not corrupt the
+acid.dmg=10; after restore, an in-place `!tile set` to 30 must not corrupt the
 snapshot, so the second restore yields 10. Before the fix, Match.from_dict reused
 the snapshot's tile dict by reference (`m.tiles[(x,y)] = val`), so the edit
 corrupted the retained save and the second restore returned 30.
@@ -16677,26 +16670,28 @@ copy stands at (1, 1) in the other match. `!gpassive hooks` lists the new hook.
 
 
 SCENARIO 624 — on_entity_despawned in real use: a despawning unit drops its loot
----------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
 
 !match new h624 Loot 12 8
 !match use h624
-!gpassive add drop on_entity_despawned "if var_has(self, 'loot'):\n    tile_set(entity[self].x, entity[self].y, 'loot', entity[self].loot)"
+!zone def new loot
+!zone def glyph loot $
+!gpassive add drop on_entity_despawned "if var_has(self, 'loot'):\n    z = zone_place('loot', entity[self].x, entity[self].y, name='loot_' + self)\n    zone_set(z, 'item', entity[self].loot)"
 !ent add sprite Sprite 5 2 2 3
 !ent set_var sprite loot gem
 !ent remove sprite
-!assert "tile_get(2, 2, 'loot') == 'gem'" the summon dropped its gem on its cell
+!assert "zone_get('loot_sprite', 'item') == 'gem' and zones_at(2, 2) == ['loot_sprite']" the summon dropped its gem on its cell
 !ent add wolf Wolf 8 4 4 2
 !ent set_var wolf loot pelt
 !ent kill wolf
-!assert "not tile_has(4, 4, 'loot')" a kill is not a despawn
+!assert "zones_at(4, 4) == []" a kill is not a despawn
 !ent add ogre Ogre 40 8 3 5
 !ent add gob Gob 10 2 6 2
 !part add ogre oarm arm 10 10
 !ent set_var oarm loot claw
 !ent store_entity_into_var gob ogre forms.small
 !ent transform ogre forms.small
-!assert "tile_get(8, 3, 'loot') == 'claw' and not has_part('ogre', 'oarm')" the arm of the old form despawned and dropped its claw
+!assert "zone_get('loot_oarm', 'item') == 'claw' and zones_at(8, 3) == ['loot_oarm'] and not has_part('ogre', 'oarm')" the arm of the old form despawned and dropped its claw
 !ent add head Worm 30 2 7 4
 !part segment head s1 Seg 5 5
 !part segment head s2 Seg 5 5
@@ -16705,10 +16700,11 @@ SCENARIO 624 — on_entity_despawned in real use: a despawning unit drops its lo
 !assert "entity[s3].x == 1 and entity[s3].y == 5"
 !system set default segment_removal_mode cascade
 !ent remove s2
-!assert "tile_get(1, 5, 'loot') == 'scale' and has_part('head', 's1') and not has_part('head', 's3')" the cut takes the tail with it
+!assert "zone_get('loot_s3', 'item') == 'scale' and zones_at(1, 5) == ['loot_s3'] and has_part('head', 's1') and not has_part('head', 's3')" the cut takes the tail with it
 
-Expected: A global `drop` passive on `on_entity_despawned` writes a
-departing unit's `loot` onto the tile it stood on. Removing the sprite
+Expected: A global `drop` passive on `on_entity_despawned` places a
+`loot` zone (an object on the ground, named after the unit) holding the
+departing unit's `loot` on the cell it stood on. Removing the sprite
 leaves its gem at (2, 2). Killing the wolf is a death, so nothing drops
 at (4, 4). Transforming the ogre into the goblin's statblock despawns the
 old form's arm, whose claw lands on the ogre's cell (8, 3). With
@@ -17252,7 +17248,7 @@ host's `!again` still reruns the host's `!list` (the CLI's `!as` identity
 switch is never remembered).
 
 
-SCENARIO 640 — !tile copy: a trap tile copied (with its hook) and moved
+SCENARIO 640 — !tile copy: a lava cell copied (with its hook) and moved
 -----------------------------------------------------------------------
 
 !match new t640 Tiles 10 6
@@ -17263,7 +17259,7 @@ SCENARIO 640 — !tile copy: a trap tile copied (with its hook) and moved
 !tile hook add 4 2 on_enter "entity[self].hp = entity[self].hp - 5"
 !ent add rat Rat 3 6 4 1
 !ent kill rat
-!tile set 6 4 glyph ~
+!tile set 6 4 glyph ,
 !tile copy 4 2 6 4
 ?? Copied tile (4,2) to (6,4) (its old data replaced)
 !assert "tile_get(6, 4, 'glyph') == '^' and has_corpse('rat')" the copy replaced the glyph; the corpse stayed
@@ -17271,17 +17267,17 @@ SCENARIO 640 — !tile copy: a trap tile copied (with its hook) and moved
 !assert "tile_get(3, 3, 'glyph') == '^' and not tile_has(4, 2, 'glyph')"
 !ent set_var hero flying true
 !ent tp hero 3 3
-!assert "entity[hero].hp == 25" the moved trap still fires
+!assert "entity[hero].hp == 25" the moved lava still burns
 !tile copy 4 2 5 5
 ?? has no tile data
 !tile copy 3 3 11 1
 ?? off the
 
-Expected: HARNESS-ALLOWS-ERRORS. Copying the trap at (4, 2) onto (6, 4)
-replaces the `~` glyph there with the trap's glyph, block condition and
+Expected: HARNESS-ALLOWS-ERRORS. Copying the lava at (4, 2) onto (6, 4)
+replaces the `,` glyph there with the lava's glyph, block condition and
 on_enter hook, while the rat's corpse lying on (6, 4) stays put. Moving
-it to (3, 3) empties (4, 2). A flying hero (the block condition lets it
-in) teleports onto (3, 3) and the moved hook fires (30 → 25). An empty
+it to (3, 3) empties (4, 2). A flying hero (the block condition keeps walkers out and lets it
+in) teleports onto (3, 3) and the moved hook scorches it (30 → 25). An empty
 source and an off-map destination are ❌.
 
 
@@ -18055,7 +18051,7 @@ formula) is refused instead of applied as given.
 
 
 SCENARIO 663 — a dict copied through a formula is a copy, not a shared object
-------------------------------------------------------------------------------
+-----------------------------------------------------------------------------
 
 !match new s663 Alias 8 8
 !match use s663
@@ -18073,9 +18069,9 @@ SCENARIO 663 — a dict copied through a formula is a copy, not a shared object
 !eval "team_set('blue', 'stash.k', 50)"
 !assert "team_get('red', 'stash.k') == 1"
 !eval "match_var_set('mv', var_get('b', 'inv'))"
-!eval "tile_set(2, 2, 'loot', var_get('b', 'inv'))"
+!eval "tile_set(2, 2, 'buried', var_get('b', 'inv'))"
 !eval "entity[b].inv.sword.dmg = 3"
-!assert "match_var_get('mv.sword.dmg') == 5 and tile_get(2, 2, 'loot.sword.dmg') == 5"
+!assert "match_var_get('mv.sword.dmg') == 5 and tile_get(2, 2, 'buried.sword.dmg') == 5"
 !eval "entity[a].ranks = {1: 'gold', 2: 'silver'}"
 !assert "var_get('a', 'ranks.1') == 'gold'" "a stored dict's keys are strings, reachable by path"
 
@@ -21979,60 +21975,60 @@ name and a duplicate parameter are refused; a call to an unknown
 function is stored with a ⚠️ (a match may define it later).
 
 SCENARIO 758 — GameSystem tile template library: !system tile, multi-tile use
-----------------------------------------------------------------------
+-----------------------------------------------------------------------------
 
 !system new skirm parent=default
-!system tile new default flame
-?? Defined empty tile template `flame` on system `default`
-!system tile data default flame burn 3
-!system tile data default flame glyph F
-!system tile hook default flame on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
-?? Set `default` tile template `flame` `on_enter` hook.
-!system tile data skirm flame burn 4
-!system tile info skirm flame
+!system tile new default lava
+?? Defined empty tile template `lava` on system `default`
+!system tile data default lava burn 3
+!system tile data default lava glyph F
+!system tile hook default lava on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
+?? Set `default` tile template `lava` `on_enter` hook.
+!system tile data skirm lava burn 4
+!system tile info skirm lava
 ?? "burn": 4
-!system tile info default flame
+!system tile info default lava
 ?? "burn": 3
 !system tile list skirm
-?? `flame` (hooks: on_enter)
-!system tile new default flame
-?? ❌ tile template `flame` already exists on system `default`
-!system tile data default flame _template x
+?? `lava` (hooks: on_enter)
+!system tile new default lava
+?? ❌ tile template `lava` already exists on system `default`
+!system tile data default lava _template x
 ?? ❌ template data may not use reserved keys
-!system tile hook default flame on_teleport "x = 1"
+!system tile hook default lava on_teleport "x = 1"
 ?? ❌ Unknown tile hook 'on_teleport'
-!system tile hook default flame on_exit "[i for i in range(2)]"
+!system tile hook default lava on_exit "[i for i in range(2)]"
 ?? ❌ Invalid hook formula
-!system tile data default flame block "[i for i in range(2)]"
+!system tile data default lava block "[i for i in range(2)]"
 ?? ⚠️ `block` isn't a working formula
-!system tile del-data default flame block
-!system tile info nobody flame
+!system tile del-data default lava block
+!system tile info nobody lava
 ?? ❌
 !match new t758 Skirm 8 8 --system skirm
 !match use t758
-!tile place flame 3 2
-!tile place flame 3 3
+!tile place lava 3 2
+!tile place lava 3 3
 !ent add ogre Ogre 30 1 2 5
 !ent set_vars ogre footprint_w=2 footprint_h=2
 !ent move ogre 1 right
 !assert "entity[ogre].hp == 22"
-!system tile del-hook skirm flame on_enter
-!system tile info skirm flame
+!system tile del-hook skirm lava on_enter
+!system tile info skirm lava
 ?! on_enter
-!system tile del default flame
+!system tile del default lava
 !system tile list default
 ?? No tile templates on system `default`
 !system tile list skirm
-?? `flame`
+?? `lava`
 
 Expected: HARNESS-ALLOWS-ERRORS. `!system tile` edits a GameSystem's
 tile template library with the `!tile def` grammar. The child's data
-edit (burn 4) makes `flame` its own entry; the parent keeps burn 3.
+edit (burn 4) makes `lava` its own entry; the parent keeps burn 3.
 Duplicates, reserved data keys, unknown hook names and broken hook
 formulas are refused; a broken `block` formula is stored with a ⚠️ (it
-fails open). A match on the child gets the child's flame at creation: a
-2×2 ogre stepping right onto a column of two flames burns once per
-covered flame cell, 30 - 4 - 4 = 22. Dropping the child's hook and then
+fails open). A match on the child gets the child's lava at creation: a
+2×2 ogre stepping right onto a column of two lava burns once per
+covered lava cell, 30 - 4 - 4 = 22. Dropping the child's hook and then
 deleting the parent's template leaves the child's own copy in place.
 
 SCENARIO 759 — System libraries: promote from a match, !match sync, undo, restart
@@ -22174,12 +22170,12 @@ friendlyfire, and fog_los inherited from skirmish. A description shows
 in `!system list` and clears with `-`. Everything survives a restart.
 
 SCENARIO 761 — !system lint and !help rule
-----------------------------------------------------------------------
+------------------------------------------
 
 !system new lab parent=default
 !system func def lab dbl x "x * 2"
-!system tile new lab trap
-!system tile hook lab trap on_enter "entity[self].hp = helper(entity[self].hp)"
+!system tile new lab bog
+!system tile hook lab bog on_enter "entity[self].hp = helper(entity[self].hp)"
 ?? ⚠️ Function 'helper'
 !match new t761 Lab 6 6 --system lab
 !match use t761
@@ -22189,8 +22185,8 @@ SCENARIO 761 — !system lint and !help rule
 !watch add w "dbl(entity[a].hp) > 30" "log('big')"
 !system lint lab
 ?? 1 problem(s), 1 warning(s)
-?? ❌ match `t761` tile template `trap` hook `on_enter`: Function 'helper' is not allowed.
-?? ⚠️ tile template `trap` hook `on_enter`: calls `helper`, which isn't in the system's functions
+?? ❌ match `t761` tile template `bog` hook `on_enter`: Function 'helper' is not allowed.
+?? ⚠️ tile template `bog` hook `on_enter`: calls `helper`, which isn't in the system's functions
 !func def helper x "x"
 !system lint lab
 ?? 0 problem(s), 1 warning(s)
@@ -26234,8 +26230,8 @@ fits. The helpers are read-only, so `$()` takes them; Tab completes
 the new words and map names. A copy of a carried map is a map of its own; a despawned carrier's
 maps become maps of their own.
 
-SCENARIO 845 — Boarding a map vehicle: an action in, a hatch tile out, lurches
-----------------------------------------------------------------------
+SCENARIO 845 — Boarding a map vehicle: an action in, a hatch zone out, lurches
+------------------------------------------------------------------------------
 
 !match new nb NB 8 8
 !match use nb
@@ -26248,7 +26244,9 @@ SCENARIO 845 — Boarding a map vehicle: an action in, a hatch tile out, lurches
 !ent set_var sailor gear.actions.board.target entity
 !ent set_var sailor gear.actions.board.body "if entity_distance(self, target) > 1:\n    fail('the hatch is out of reach')\nmove_entity(self, 2, 1, map=get(inner_maps(target), 0))"
 !passive add sailor lurch on_map_vehicle_moved "entity[self].lurches = entity[self].lurches + 1"
-!tile hook add 1 1 on_enter "move_entity(self, free_cell_near(entity[map_carrier()].x, entity[map_carrier()].y, 2, self, map=outer_map()))" map=deck
+!zone def new hatch
+!zone def hook hatch on_enter "move_entity(self, free_cell_near(entity[map_carrier()].x, entity[map_carrier()].y, 2, self, map=outer_map()))"
+!zone place hatch 1 1 map=deck
 !ent add crate Crate 5 3 2 map=deck
 !ent set_vars crate footprint_w=2 footprint_h=2
 !action sailor board ship
@@ -26266,7 +26264,7 @@ SCENARIO 845 — Boarding a map vehicle: an action in, a hatch tile out, lurches
 ?? the hatch is out of reach
 !ent move ship 1 right
 !assert "entity[sailor].lurches == 2"
-!tile hook add 3 1 on_enter "move_entity(self, free_cell_near(entity[map_carrier()].x, entity[map_carrier()].y, 2, self, map=outer_map()))" map=deck
+!zone place hatch 3 1 map=deck
 !ent tp sailor 4 1 deck
 !ent move sailor 2 left
 ?? Moved `sailor`; a triggered effect took it to
@@ -26277,8 +26275,8 @@ Expected: HARNESS-ALLOWS-ERRORS. Boarding is composed: the sailor's
 `board` action checks it stands beside the ship and moves it onto the
 ship's deck (inner_maps). A 2x2 ship moving two steps right lurches the
 deck's units once per move (on_map_vehicle_moved: the sailor's counter
-goes to 1), and a teleport lurches them again (2). The hatch tile on the
-deck moves a unit that steps on it beside the ship on its outer map
+goes to 1), and a teleport lurches them again (2). The hatch on the
+deck (a one-cell zone of the `hatch` definition) moves a unit that steps on it beside the ship on its outer map
 (map_carrier / outer_map / free_cell_near), after which the ship's moves
 no longer reach it. Out of reach, the action fails. A walk ends where a
 hook put the walker: two steps left onto a second hatch leave the sailor
@@ -26354,7 +26352,7 @@ rat's earlier one are lost (the pod's `__map_vehicle_corpses` and
 `__map_vehicle_existing_corpses` = lose).
 
 SCENARIO 847 — Wrecks: the wreck formula, revive re-attaches, delete when empty, despawn
-----------------------------------------------------------------------
+----------------------------------------------------------------------------------------
 
 !match new nw NW 8 8
 !match use nw
@@ -26362,7 +26360,7 @@ SCENARIO 847 — Wrecks: the wreck formula, revive re-attaches, delete when empt
 !map new hull 3 3
 !map new boot 2 2
 !ent add tank Tank 30 2 2 map=main
-!ent set_var tank wreck_formula "tile_set(2, 2, 'fire', True)\nmap_var_set('wreck_of', map_vehicle)"
+!ent set_var tank wreck_formula "tile_set(2, 2, 'scorched', True)\nmap_var_set('wreck_of', map_vehicle)"
 !map attach hull tank
 !ent add driver Driver 10 1 1 map=hull
 !ent add rat Rat 1 3 3 map=hull
@@ -26370,7 +26368,7 @@ SCENARIO 847 — Wrecks: the wreck formula, revive re-attaches, delete when empt
 !ent kill tank
 ?? 💀 **Tank** (`tank`) died.
 !assert "map_of('driver') == 'main' and map_carrier('hull') == None"
-!assert "tile_get(2, 2, 'fire', map='hull') and map_var_get('wreck_of', map='hull') == 'tank'"
+!assert "tile_get(2, 2, 'scorched', map='hull') and map_var_get('wreck_of', map='hull') == 'tank'"
 !assert "corpse_at('rat') == [3, 3, 'hull'] and corpse_at('tank') == [2, 2, 'main']"
 !ent revive tank
 !assert "map_carrier('hull') == 'tank'"
@@ -28438,44 +28436,44 @@ spawned. A revive is refused at the cap (the corpse stays), a copy into
 another match counts against that match, and -1 lifts the cap.
 
 
-SCENARIO 892 — tile_place / tile_template_of: an attack that leaves a fire tile behind
---------------------------------------------------------------------------------------
+SCENARIO 892 — tile_place / tile_template_of: a spell that turns the ground to lava
+-----------------------------------------------------------------------------------
 
 !match new tp TP 8 6
 !match use tp
-!tile def new fire
-!tile def data fire glyph ^
-!tile def data fire burn 2
-!tile def hook fire on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
+!tile def new lava
+!tile def data lava glyph ^
+!tile def data lava burn 2
+!tile def hook lava on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
 !ent add mage Mage 20 1 1 10
 !ent add orc Orc 20 4 3 5
-!ent set_var mage actions.scorch.target location
-!ent set_var mage actions.scorch.body "tile_place('fire', target, data={'burn': 5})"
-!action mage scorch 3 3
-!assert "tile_template_of(3, 3) == 'fire' and tile_get(3, 3, 'burn') == 5"
+!ent set_var mage actions.melt.target location
+!ent set_var mage actions.melt.body "tile_place('lava', target, data={'burn': 5})"
+!action mage melt 3 3
+!assert "tile_template_of(3, 3) == 'lava' and tile_get(3, 3, 'burn') == 5"
 !ent move orc 1 left
 !assert "entity[orc].hp == 15"
 !ent kill orc
-!eval "tile_place('fire', 3, 3)"
+!eval "tile_place('lava', 3, 3)"
 !assert "tile_get(3, 3, 'burn') == 2 and has_corpse('orc')"
-!assert "tile_template_of(5, 5) == None and tile_template_of([3, 3]) == 'fire'"
+!assert "tile_template_of(5, 5) == None and tile_template_of([3, 3]) == 'lava'"
 !eval "tile_place('ice', 2, 2)"
 ?? ❌ tile_place: tile template 'ice' not found.
-!eval "tile_place('fire', 20, 2)"
+!eval "tile_place('lava', 20, 2)"
 ?? ❌ tile_place: (20,2) outside 8x6
-!eval "tile_place('fire', 2, 2, ['burn'])"
+!eval "tile_place('lava', 2, 2, ['burn'])"
 ?? ❌ tile_place: data must be a dict of fields, got list.
-!eval "tile_place('fire', 2, 2, {'_template': 'x'})"
+!eval "tile_place('lava', 2, 2, {'_template': 'x'})"
 ?? reserved keys: _template
 !ent set_var mage n "$(tile_template_of(3, 3))"
-!assert "entity[mage].n == 'fire'"
-!ent set_var mage m "$(tile_place('fire', 5, 5))"
+!assert "entity[mage].n == 'lava'"
+!ent set_var mage m "$(tile_place('lava', 5, 5))"
 ?? ❌ function 'tile_place' changes game state and is banned in a $() inline argument
 !assert "tile_template_of(5, 5) == None"
 
 Expected: HARNESS-ALLOWS-ERRORS. tile_place(template, x, y, data=None) is
-`!tile place` from a formula: an action targeting a cell leaves a fire tile
-there with its burn overridden to 5 (a location target passes whole), the
+`!tile place` from a formula: an action targeting a cell turns the ground
+there to lava with its burn overridden to 5 (a location target passes whole), the
 template's on_enter hook burns the orc that walks in (20 -> 15), and a
 second placement on the orc's corpse cell replaces the tile data while the
 corpse stays. tile_template_of reads the template name back (None for a
@@ -29240,26 +29238,26 @@ Everything survives `!as restart`.
 
 
 SCENARIO 907 — Tile template rename and tags; a zone's block read through its definition
--------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------
 
 !match new tt TT 8 4
 !match use tt
 !ent add hero Hero 10 1 2
-!tile def new spikes
-!tile def data spikes dmg 3
-!tile def hook spikes on_enter "entity[self].hp = entity[self].hp - 3"
-!tile def tags spikes trap
-!tile place spikes 2 2
-!tile def rename spikes caltrops
-?? Renamed tile template `spikes` to `caltrops` (1 placed tile(s) follow it).
-!assert "tile_template_of(2, 2) == 'caltrops'"
-!assert "tile_has_tag(2, 2, 'trap')"
+!tile def new mud
+!tile def data mud dmg 3
+!tile def hook mud on_enter "entity[self].hp = entity[self].hp - 3"
+!tile def tags mud wet
+!tile place mud 2 2
+!tile def rename mud bog
+?? Renamed tile template `mud` to `bog` (1 placed tile(s) follow it).
+!assert "tile_template_of(2, 2) == 'bog'"
+!assert "tile_has_tag(2, 2, 'wet')"
 !ent move hero 1 right
 !assert "entity[hero].hp == 7"
-!tile def rename caltrops caltrops
+!tile def rename bog bog
 ?? already exists
-!tile def tags caltrops -
-!assert "not tile_has_tag(2, 2, 'trap')"
+!tile def tags bog -
+!assert "not tile_has_tag(2, 2, 'wet')"
 !zone def new wall
 !zone def data wall block true
 !zone new w def=wall
@@ -29291,7 +29289,7 @@ tags, copy and rename too.
 
 
 SCENARIO 908 — Prefabs: save a rectangle, stamp it in another match, ids, zones, groups, definitions, the event
------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------
 
 !match new src Src 10 8
 !match use src
@@ -29301,11 +29299,11 @@ SCENARIO 908 — Prefabs: save a rectangle, stamp it in another match, ids, zone
 !ent add orc2 Orc 10 3 3 4
 !ent set_var orc2 team red
 !ent group add guards orc1 orc2
-!tile def new campfire
-!tile def data campfire glyph *
-!tile def tags campfire fire
-!tile place campfire 4 2
-!tile set 2 4 note "a dropped map"
+!tile def new flagstone
+!tile def data flagstone glyph #
+!tile def tags flagstone paved
+!tile place flagstone 4 2
+!tile set 2 4 note "a worn path"
 !zone def new smoke
 !zone def glyph smoke ~
 !zone def tags smoke obscuring
@@ -29319,7 +29317,7 @@ SCENARIO 908 — Prefabs: save a rectangle, stamp it in another match, ids, zone
 !prefab save camp 2 2 5 5
 ?? 💾 Saved prefab `camp` — 4x4, 2 units, 2 tiles, 1 zone, system `default`
 !prefab show camp
-?? Carries: function `double`, status `burn`, tile template `campfire`, zone definition `smoke`
+?? Carries: function `double`, status `burn`, tile template `flagstone`, zone definition `smoke`
 ?? *
 !prefab list
 ?? `camp` — 4x4
@@ -29334,8 +29332,8 @@ SCENARIO 908 — Prefabs: save a rectangle, stamp it in another match, ids, zone
 !assert "entity[orc].x == 3 and entity[orc].y == 3 and facing_of('orc') == 'right'"
 !assert "entity[orc2].x == 4 and entity[orc2].y == 4 and entity[orc2].team == 'red'"
 !assert "status_has('orc2', 'burn')"
-!assert "tile_has_tag(5, 3, 'fire') and tile_template_of(5, 3) == 'campfire'"
-!assert "tile_get(3, 5, 'note') == 'a dropped map'"
+!assert "tile_has_tag(5, 3, 'paved') and tile_template_of(5, 3) == 'flagstone'"
+!assert "tile_get(3, 5, 'note') == 'a worn path'"
 !assert "zone_def_of('smoke2') == 'smoke' and zone_has_tag('smoke2', 'obscuring')"
 !assert "zone_cells('smoke2') == [[4, 5], [4, 6], [5, 5], [5, 6]]"
 !assert "sorted(group_members('guards')) == ['orc', 'orc2']"
@@ -30823,32 +30821,32 @@ facing down faces left; the vent facing left faces up). A tile with no facing an
 rock) gets none. A horizontal flip mirrors right to left and leaves down.
 
 SCENARIO 932 — Reapply: tile templates and zone definitions push their data
--------------------------------------------------------------------------
+---------------------------------------------------------------------------
 
 !match new ra Ra 6 4
 !match use ra
 !map new cellar 4 4
-!tile def new trap
-!tile def data trap damage 3
-!tile def data trap armed true
-!tile place trap 1 1 map=main
-!tile place trap 2 1 map=main
-!tile place trap 1 1 map=cellar
+!tile def new acid
+!tile def data acid damage 3
+!tile def data acid potent true
+!tile place acid 1 1 map=main
+!tile place acid 2 1 map=main
+!tile place acid 1 1 map=cellar
 !tile set 1 1 damage 9 map=main
 !tile set 1 1 note rusty map=main
 !ent add mook Mook 5 3 3 5 map=main
 !ent kill mook
-!tile place trap 3 3 map=main
-!tile def data trap damage 5
-!tile place trap 4 1 map=main
-!tile def reapply trap
+!tile place acid 3 3 map=main
+!tile def data acid damage 5
+!tile place acid 4 1 map=main
+!tile def reapply acid
 ?? 4 of 5 placed tile(s) changed.
 !assert "tile_get(1, 1, 'damage', map='main') == 5 and tile_get(1, 1, 'note', map='main') == 'rusty' and tile_get(1, 1, 'damage', map='cellar') == 5"
 !map cell 3 3 map=main
 ?? mook
-!tile def reapply trap reset map=main
+!tile def reapply acid reset map=main
 ?? 1 of 4 placed tile(s) changed.
-!assert "not tile_has(1, 1, 'note', map='main') and tile_get(1, 1, 'armed', map='main') == True"
+!assert "not tile_has(1, 1, 'note', map='main') and tile_get(1, 1, 'potent', map='main') == True"
 !map cell 3 3 map=main
 ?? mook
 !undo command
@@ -30869,16 +30867,16 @@ SCENARIO 932 — Reapply: tile templates and zone definitions push their data
 !zone def reapply mire reset
 !assert "not zone_has('bog', 'smell') and zone_get('bog', 'slow') == 3"
 !system new realm
-!system tile new realm spikes
-!system tile data realm spikes hurt 1
+!system tile new realm scree
+!system tile data realm scree hurt 1
 !system zone new realm smog
 !system zone data realm smog choke 1
 !match new rb Rb 4 4 realm
 !match use rb
-!tile place spikes 1 1
+!tile place scree 1 1
 !zone new cloud def=smog
 !zone add cloud 2 2
-!system tile data realm spikes hurt 4
+!system tile data realm scree hurt 4
 !system zone data realm smog choke 2
 !system zone reapply realm smog
 ?? ❌
@@ -30893,7 +30891,7 @@ SCENARIO 932 — Reapply: tile templates and zone definitions push their data
 Expected: HARNESS-ALLOWS-ERRORS. `!tile def reapply` pushes a template's
 data to every tile placed from it, on every map by default: its keys
 overwrite theirs (damage 9 back to 5), their other keys stay (the note),
-the corpse lying there stays (corpses aren't tile data); the reply counts the tiles that changed (the trap placed
+the corpse lying there stays (corpses aren't tile data); the reply counts the tiles that changed (the acid placed
 after the edit already matches). `reset` makes each
 tile's data a copy of the template's again (the note goes, the corpse stays),
 here on map= main only. One undo step. `!zone def reapply` does the same
@@ -31858,10 +31856,10 @@ SCENARIO 955 — Corpse part ids, stamped corpses and stamped links
 !system set default hp_var health
 !prefab stamp camp 9 1
 !assert "corpse_var('orc3', 'health') == 0"
-!prefab import hot {"kind": "prefab", "width": 1, "height": 1, "system": "default", "tiles": [[0, 0, {"_template": "spikes", "dmg": 3}]]}
+!prefab import hot {"kind": "prefab", "width": 1, "height": 1, "system": "default", "tiles": [[0, 0, {"_template": "acid", "dmg": 3}]]}
 !prefab stamp hot 1 11
 ?? aren't in this match
-!tile def new spikes
+!tile def new acid
 !assert "tile_template_of(1, 11) == None and tile_get(1, 11, 'dmg') == 3"
 !tile set 2 11 _template nosuch
 ?? names one of this match's tile templates
@@ -31872,21 +31870,21 @@ a stamp of the dead orc mints a new id for its part, so both corpses
 revive with their heads. A corpse stamped after `hp_var health` lists
 its hp under `health`, as a live corpse does. A stamped tile naming a
 template the match no longer holds keeps its data and names none (a
-note says so), so a later `lava` takes nothing over, and `!tile set ...
+note says so), so a later `acid` takes nothing over, and `!tile set ...
 _template` refuses a template the match lacks.
 
 
 SCENARIO 956 — Optional words, the help index, stored values in replies
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 
 !match new ow956 Words 8 8
 !match use ow956
-!tile def new trap
-!tile place trap 2 2
-!tile set 2 2 note mine
-!tile def reapply trap rset
+!tile def new mud
+!tile place mud 2 2
+!tile set 2 2 note deep
+!tile def reapply mud rset
 ?? Unexpected `rset`
-!assert "tile_get(2, 2, 'note') == 'mine'"
+!assert "tile_get(2, 2, 'note') == 'deep'"
 !store save campaign typo
 ?? Unexpected `typo`
 !help
@@ -38158,9 +38156,9 @@ SCENARIO 1079 — Edits made in place reach the save (#197): tile template renam
 !match new ip Ip 8 6
 !match use ip
 !map new cellar 4 4
-!tile def new spikes map=main
-!tile place spikes 2 2 map=main
-!tile def rename spikes thorns
+!tile def new mud map=main
+!tile place mud 2 2 map=main
+!tile def rename mud bog
 !zone new gust map=main
 !zone fill gust 4 4 5 5
 !zone face gust right
@@ -38172,7 +38170,7 @@ SCENARIO 1079 — Edits made in place reach the save (#197): tile template renam
 !status rename burn fire
 !map rename cellar basement
 !as restart
-!assert "tile_template_of(2, 2, map='main') == 'thorns' and zone_facing('gust') == 'right'"
+!assert "tile_template_of(2, 2, map='main') == 'bog' and zone_facing('gust') == 'right'"
 !assert "corpse_status_has('d', 'fire') and not corpse_status_has('d', 'burn')"
 !assert "corpse_var('d', 'home') == [2, 2, 'basement']"
 
@@ -38184,7 +38182,7 @@ writes it: after a restart all four read back as edited.
 
 
 SCENARIO 1080 — Tile turn hooks are found through an index (#197): hooks added, placed, retemplated and removed between turns all fire as they stand
-------------------------------------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------------------------------
 
 !match new th TH 8 6
 !match use th
@@ -38195,30 +38193,30 @@ SCENARIO 1080 — Tile turn hooks are found through an index (#197): hooks added
 !tile hook add 2 2 on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 1)'
 !turn next
 !assert "match_var_get('ticks') == 1" a hook added after the first turn fires
-!tile def new beacon
-!tile def hook beacon on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 10)'
-!tile place beacon 3 3
+!tile def new geyser
+!tile def hook geyser on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 10)'
+!tile place geyser 3 3
 !turn next
 !assert "match_var_get('ticks') == 12" a tile placed from a template with the hook fires
-!tile def new dud
-!tile def hook dud on_turn_end 'match_var_set("ticks", match_var_get("ticks") + 1000)'
-!tile place dud 4 4
-!tile def hook dud on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 100)'
+!tile def new bog
+!tile def hook bog on_turn_end 'match_var_set("ticks", match_var_get("ticks") + 1000)'
+!tile place bog 4 4
+!tile def hook bog on_turn_start 'match_var_set("ticks", match_var_get("ticks") + 100)'
 !turn next
 !assert "match_var_get('ticks') == 1123" the template that gained an on_turn_start hook fires, and its on_turn_end too
 !tile hook del 2 2 on_turn_start
 !tile del 3 3
 !turn next
-!assert "match_var_get('ticks') == 2223" only the dud tile hooks are left
+!assert "match_var_get('ticks') == 2223" only the bog tile hooks are left
 
 Expected: a turn reads only the tiles that can have a time hook: a
 tile's own hooks and its template's, kept current by the same marks as
 the save. The hook added on (2,2) after the index was built fires at the
-next turn start (1). The beacon placed from a template adds 10 (12). The
-dud tile, placed with only an on_turn_end hook, gains an on_turn_start
+next turn start (1). The geyser placed from a template adds 10 (12). The
+bog tile, placed with only an on_turn_end hook, gains an on_turn_start
 hook through its template: the next turn change runs its turn-end hook
 (+1000) and its turn-start hook (+100) besides the others (+11): 1123.
-With (2,2)'s hook deleted and the beacon tile cleared, only the dud
+With (2,2)'s hook deleted and the geyser tile cleared, only the bog
 fires: +1100, 2223.
 
 
@@ -38298,7 +38296,7 @@ tile.
 
 
 SCENARIO 1083 — say() and print() from an action, a status tick and a tile hook (#215)
----------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------
 
 !match new sy SY 8 8
 !match use sy
@@ -38314,17 +38312,17 @@ SCENARIO 1083 — say() and print() from an action, a status tick and a tile hoo
 !status when burn turn_start
 !status tick burn "entity[self].hp = entity[self].hp - 2\nsay('{self} burns ({hp} left)', hp=entity[self].hp)"
 !status apply ogre burn 1 3
-!tile def new fire
-!tile def hook fire on_enter "say('{self} steps into the fire at {x},{y}', x=tile_x, y=tile_y)"
-!tile place fire 6 4
+!tile def new lava
+!tile def hook lava on_enter "say('{self} steps into the lava at {x},{y}', x=tile_x, y=tile_y)"
+!tile place lava 6 4
 !ent move ogre 1 up
-?? Ogre steps into the fire at 6,4
+?? Ogre steps into the lava at 6,4
 !turn next
 !turn next
 ?? Ogre burns (34 left)
 !log type=say
 ?? 💬 Hero hits Ogre for 4
-?? 💬 Ogre steps into the fire at 6,4
+?? 💬 Ogre steps into the lava at 6,4
 ?? 💬 Ogre burns (34 left)
 !eval "say('{x} and {y}', x=1)"
 ?? say(...): no y= argument for {y}
@@ -38338,8 +38336,8 @@ Expected: say() and print() are one function, a line in the reply of
 the command that set the formula off. The action's two lines show with
 its reply (`{0}` / `{name}` fields filled as fmt() fills them, a unit
 id printing the unit's name). A status tick (burn on the 2x2 ogre, at
-its turn start) and a tile hook (one of the ogre's four cells steps on
-the fire tile at (6,4), so the hook runs once) say theirs in the reply
+its turn start) and a tile hook (one of the ogre's four cells steps into
+the lava at (6,4), so the hook runs once) say theirs in the reply
 of `!ent move` and `!turn next`; `{self}` is the formula's unit. Each
 public line is also an event-log entry of type `say` (💬). A field
 without its argument is refused, naming it, and say() is a mutating
@@ -38586,9 +38584,9 @@ SCENARIO 1088 — hook_output_lines: all, with_result, none; errors held for a h
 !gpassive add val on_turn_start "1 + 1"
 !gpassive add quiet on_turn_start "x = 1"
 !gpassive add talk on_turn_start "say('{self} wakes')"
-!tile def new spring
-!tile def hook spring on_enter "'splash'"
-!tile place spring 2 1
+!tile def new water
+!tile def hook water on_enter "'splash'"
+!tile place water 2 1
 !turn next
 ?? `val` fired on `hero` (on_turn_start) → 2
 ?? `quiet` fired on `hero` (on_turn_start)
@@ -38622,7 +38620,7 @@ SCENARIO 1088 — hook_output_lines: all, with_result, none; errors held for a h
 
 Expected: under `all` (default) every passive prints its fired line,
 with `→ value` when its formula returned one. `with_result` keeps only
-the lines with a value (val's `→ 2`, the spring tile hook's
+the lines with a value (val's `→ 2`, the water tile hook's
 `→ 'splash'`, a value a tile or zone hook now shows too); say() lines
 show under every value. `none` prints no fired lines. A failing passive's
 error still shows to a host in a channel without a team view; under the
@@ -41409,7 +41407,7 @@ can't (refused, nothing moves). A move is one undo step.
 
 
 SCENARIO 1152 — Objects on the ground: `!zone place` / zone_place, the draw layer in text and image, a definition's time hook reaching its zones
----------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------
 
 !match new zp ZonePlace 6 3
 !match use zp
@@ -41417,6 +41415,7 @@ SCENARIO 1152 — Objects on the ground: `!zone place` / zone_place, the draw la
 !tile set 2 2 glyph ,
 !tile set 3 2 glyph ,
 !zone def new chest
+?? Place a one-cell zone of it with `!zone place chest <x> <y>`
 !zone def glyph chest $
 !zone place chest 2 2
 ?? Placed zone `chest` of definition `chest` at (2,2).
@@ -41459,6 +41458,14 @@ SCENARIO 1152 — Objects on the ground: `!zone place` / zone_place, the draw la
 !zone def del-hook chest on_round_start
 !turn next
 !assert "match.n == 2"
+!help tile
+?? **Tiles or zones.** Ground is a tile; anything standing on the ground is a zone.
+!help zone
+?? **Tiles or zones.** Ground is a tile
+!help zone place
+?? Ground or object? See `!help tile`.
+!help tile place
+?? Ground or object? See `!help tile`.
 HARNESS-ALLOWS-ERRORS
 
 Expected: a zone definition `chest` (glyph `$`) is placed as one-cell
@@ -41472,4 +41479,6 @@ shows the field, and `-` goes back to the definition's. An off-map cell,
 a stray word, a missing definition and a non-number layer are refused.
 A definition's round-start hook added after its zones were made fires
 for each zone of it (chest, chest2; box's own hook replaces it), read
-through the zone hook index; deleted, it fires no more.
+through the zone hook index; deleted, it fires no more. `!help tile` and `!help zone` carry the
+"tiles or zones" guidance (ground is a tile, anything standing on it a
+zone), and the commands that make either point at it.
