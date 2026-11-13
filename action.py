@@ -2458,7 +2458,8 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_choice_answers", "_choice_cursor",
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
-        "_dying_ids", "_death_check_deferred_ids", "_deleting_maps",
+        "_dying_ids", "_death_recheck", "_death_depth", "_death_draining",
+        "_death_check_deferred_ids", "_deleting_maps",
         "_alive_eval_depth", "_vision_memo", "_spatial", "_uflags", "_size_touch",
         "_request_seq", "pending_requests", "held_commands",
         # Wall clock of the open reaction window (expiry; runtime).

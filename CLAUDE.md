@@ -867,7 +867,8 @@ so scenarios mask a missing call — test with raw shlex input).
 
 **Runtime guards** (all restored in `finally`): `_var_event_depth` (var-hook
 recursion), `_event_depth` / `_event_stack` (the event bus), `_action_depth`
-(also suspends per-command snapshots), `_death_processing`,
+(also suspends per-command snapshots), `_death_processing` (with
+`_dying_ids`, `_death_depth` and the held checks of §7.11),
 `_alive_eval_depth`, `MatchManager._macro_depth`, `_summon_count` (per-command
 summon budget).
 
@@ -2586,7 +2587,19 @@ hardcodes**.
   death (873). One death per unit: while a unit's death pipeline runs
   (`Match._dying_ids`, runtime) a `kill()` of it does nothing and answers
   True, so two units that kill each other in on_death, or `kill(self)`
-  there, die once each (1156). Prims: has_corpse, corpse_at,
+  there, die once each (1156). **Deaths set off by a death** (user call,
+  1160): while a death runs, `_death_processing` holds every unit's
+  automatic death check; a check held for ANOTHER unit is recorded
+  (`Match._death_recheck`, with the damage packet's kill credit) and run
+  when the outermost `_process_death` has finished its whole pipeline
+  (`_drain_held_deaths`: riders, carried maps and grants first), one
+  unit after another in the order they were hit, each death adding the
+  units it brought down. So an on_death passive that deals lethal damage
+  kills (a barrel chain), in sequence, nesting nothing; `killer` is the
+  packet's dealer. At most `death_chain_limit` (200, ceiling) deaths
+  follow one death, then one ⚠️ names the units left at their death
+  condition (they die at their next change). `kill()` inside on_death
+  still kills at once, nested. Prims: has_corpse, corpse_at,
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
   corpse / corpse_list action targets.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
@@ -4076,6 +4089,9 @@ lists what isn't built; 1093-1122).
   window resolves it in that command. Holds (`_reaction_held`, refused
   before the queue in `_run_body` and for gated batch lines): `!action`,
   `!ent move / push / pull / swap / action`, `!turn next / set / grant`.
+  Host tools run during a window (`!ent tp`, `!ent damage`, `!ent kill`,
+  `!zone move`: user call, a zone moved mid-window fires its hooks before
+  the pending action resolves).
   Expiry (`settle_expiry`, at the start of the next command on the match
   but `!as`) journals the command as state; `!as wait` ages windows.
 - **Resolution** (`_advance`, phases before -> before_run -> body ->
@@ -4262,17 +4278,6 @@ rejected already. Update this section in the PR that resolves an item.
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
   only that pair. A layer-aware version of each is open.
-
-- **Deaths caused inside another unit's on_death** (asked, awaiting the
-  user's call): while a unit's death pipeline runs, the match-wide
-  `_death_processing` guard holds EVERY unit's automatic death check, and
-  nothing re-runs the held ones: an on_death passive that deals lethal
-  damage to another unit (a barrel chain) leaves it alive at hp <= 0
-  until some later write to it. `kill()` there does kill (it bypasses
-  the check), a destroyed body part's on_death raises no guard, and the
-  two vehicle-death paths lift it by hand. Options: re-check the held
-  units when the outermost death finishes (deaths in sequence, bounded by
-  a limit rule), a per-unit guard (nested deaths), or leave it.
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose

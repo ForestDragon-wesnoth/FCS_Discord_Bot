@@ -2963,6 +2963,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "knockback pushing the next unit) makes one move per hop."
         ),
     },
+    "death_chain_limit": {
+        "default": 200,
+        "schema": {"type": "int", "min": 1, "max": 100000, "ceiling": True},
+        "desc": (
+            "Max deaths one death may set off in turn. While a unit dies, "
+            "its on_death effects can bring other units to their death "
+            "condition (an exploding barrel damaging its neighbours); "
+            "their death checks wait until that death has finished, then "
+            "run one after another in the order the units were hit, each "
+            "new death adding the units it brought down (a chain of "
+            "barrels). Past this count the units still at their death "
+            "condition stay as they are, with one warning: two effects "
+            "that revive and kill each other would never end. kill() "
+            "inside on_death kills at once and isn't counted."
+        ),
+    },
     "move_hook_recursion_limit": {
         "default": 16,
         "schema": {"type": "int", "min": 1, "max": 48, "ceiling": True},
@@ -13460,6 +13476,18 @@ class Match:
     _dying_ids: Set[str] = field(
         default_factory=set, repr=False, compare=False
     )
+    # Death checks held while another unit's death ran (check_death under
+    # _death_processing): unit id -> the damage packet's kill credit at
+    # that moment (PACKET_KILLER) or None, in the order the units were hit.
+    # Re-run one after another when the outermost death finishes
+    # (_drain_held_deaths), so an on_death effect that brings another unit
+    # to its death condition does kill it. _death_depth counts the
+    # _process_death calls under way (the whole pipeline, riders and maps
+    # included); _death_draining marks the re-run. Not serialized.
+    _death_recheck: Dict[str, Any] = field(
+        default_factory=dict, repr=False, compare=False)
+    _death_depth: int = field(default=0, repr=False, compare=False)
+    _death_draining: bool = field(default=False, repr=False, compare=False)
     # Units whose automatic death check waits until a multi-var command
     # (`!ent set_vars`) has written every var; the command runs the check
     # itself afterwards. Unlike _death_check_suppressed_ids it leaves the
@@ -25531,11 +25559,23 @@ class Match:
 
         Re-entry guarded via _death_processing — a death-firing passive
         that itself writes vars must not retrigger the check on the
-        already-dying entity. Returns empty list on guard hit. A specific
+        already-dying entity. Returns empty list on guard hit; a check
+        held that way for ANOTHER unit runs once the death has finished
+        (_drain_held_deaths). A specific
         entity can also be shielded via _death_check_suppressed_ids (used
         by revive to defer the revived entity's check until its post-
         revive state settles)."""
         if self._death_processing > 0:
+            # Held, and run again once the death under way has finished
+            # (_drain_held_deaths). The unit dying itself needs none. A
+            # packet's kill credit is kept for that later check.
+            if entity_id not in self._dying_ids \
+                    and entity_id in self.entities:
+                credit = PACKET_KILLER.get()
+                if credit is not None and credit[0] != self.id:
+                    credit = None
+                if credit is not None or entity_id not in self._death_recheck:
+                    self._death_recheck[entity_id] = credit
             return []
         if (entity_id in self._death_check_suppressed_ids
                 or entity_id in self._death_check_deferred_ids):
@@ -25595,9 +25635,69 @@ class Match:
         return None
 
     def _process_death(self, entity_id: str) -> List[str]:
-        """Run the death pipeline for `entity_id`: fire on_death (entity
-        still in match), apply the death_result (corpse-store or
-        delete), remove from turn order. Returns log lines."""
+        """Run the death pipeline for `entity_id` (_process_death_one), then,
+        when this was the outermost death, the death checks it held for
+        other units (_drain_held_deaths). Returns log lines."""
+        self._death_depth += 1
+        try:
+            log = self._process_death_one(entity_id)
+        finally:
+            self._death_depth = max(0, self._death_depth - 1)
+        if self._death_depth == 0 and self._death_recheck \
+                and not self._death_draining:
+            log.extend(self._drain_held_deaths())
+        return log
+
+    def _drain_held_deaths(self) -> List[str]:
+        """Run the death checks held while a death was under way, one unit
+        after another in the order they were hit (user call: an on_death
+        effect that deals lethal damage kills, each death in sequence, so a
+        chain of 200 barrels nests nothing). A death here may hold more
+        checks; they join the queue. At most death_chain_limit deaths, then
+        the rest stay as they are with one warning."""
+        log: List[str] = []
+        try:
+            limit = int(self.rules.get("death_chain_limit", 200))
+        except (TypeError, ValueError):
+            limit = 200
+        deaths = 0
+        self._death_draining = True
+        try:
+            while self._death_recheck:
+                eid = next(iter(self._death_recheck))
+                credit = self._death_recheck.pop(eid)
+                before = self.entities.get(eid)
+                if before is None:
+                    continue
+                if deaths >= limit:
+                    left = [eid] + [i for i in self._death_recheck
+                                    if i in self.entities]
+                    self._death_recheck.clear()
+                    shown = ", ".join(f"`{i}`" for i in left[:8])
+                    more = f" and {len(left) - 8} more" if len(left) > 8 else ""
+                    log.append(
+                        f"⚠️ {limit} deaths followed one another "
+                        f"(death_chain_limit): the death checks of {shown}"
+                        f"{more} were not run. A unit still at its death "
+                        f"condition dies at its next change.")
+                    break
+                token = PACKET_KILLER.set(credit) if credit is not None \
+                    else None
+                try:
+                    log.extend(self.check_death(eid))
+                finally:
+                    if token is not None:
+                        PACKET_KILLER.reset(token)
+                if self.entities.get(eid) is not before:
+                    deaths += 1
+        finally:
+            self._death_draining = False
+        return log
+
+    def _process_death_one(self, entity_id: str) -> List[str]:
+        """One unit's death pipeline: fire on_death (entity still in
+        match), apply the death_result (corpse-store or delete), remove
+        from turn order. Returns log lines."""
         e = self.entities.get(entity_id)
         if e is None:
             return []

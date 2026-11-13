@@ -41776,3 +41776,53 @@ unit and print what the hook returned about it (here its hp) in the
 team's channel, on a zone move, on the unit's walk over a tile hook and
 at its turn start. Hook lines about a unit the view sees (the scout's
 tile hook) still show, and the omniscient channel sees all of them.
+
+
+SCENARIO 1160 — A barrel chain: lethal damage dealt from on_death kills, one death after another; kill credit; death_chain_limit (a 2x2 keg)
+--------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new bc BC 12 6
+!match use bc
+!ent add b1 Barrel 5 1 1 5
+!ent add b2 Barrel 5 2 1 5
+!ent add b3 Barrel 5 3 1 5
+!ent add keg Keg 8 4 1 5
+!ent set_vars keg footprint_w=2 footprint_h=2
+!ent add b4 Barrel 5 6 2 5
+!ent add hero Hero 30 7 3 9
+!match var set deaths ""
+!gpassive add boom on_death "match.deaths = match.deaths + self + '<' + str(killer) + ' '\nif self != 'hero':\n    for u in entities_within(self, 1):\n        deal_damage(u, 10, attacker=self)"
+!system set default hook_output_lines none
+!ent add archer Archer 20 12 6 8
+!ent damage b1 10 from=archer
+?? 💀 **Barrel** (`b1`) died.
+?? 💀 **Keg** (`keg`) died.
+?? 💀 **Barrel** (`b4`) died.
+?? 🩸 **Hero** (`hero`) takes 10 damage from Barrel.
+!assert "match.deaths == 'b1<archer b2<b1 b3<b2 keg<b3 b4<keg '"
+!assert "entity[hero].hp == 20 and has_corpse('keg') and len(all_corpses()) == 5"
+!undo command
+!assert "entity[b2].hp == 5 and match.deaths == ''"
+!system set default death_chain_limit 2
+!ent damage b1 10
+?? ⚠️ 2 deaths followed one another (death_chain_limit): the death checks of `keg` were not run.
+!assert "match.deaths == 'b1<None b2<b1 b3<b2 ' and entity[keg].hp == -2 and entity[b4].hp == 5"
+!ent hp keg -1
+?? 💀 **Keg** (`keg`) died.
+!assert "has_corpse('keg') and has_corpse('b4') and entity[hero].hp == 20"
+
+Expected: every barrel's on_death deals 10 damage to the units within 1
+cell, naming itself as the attacker. The archer's shot kills b1; its
+explosion brings b2 to -5 hp while b1's death is still under way, where a
+unit's death check is held. Once b1's death has finished the held checks
+run, one unit after another in the order they were hit: b2 dies and its
+explosion reaches b3, b3's the 2x2 keg (within 1 of its nearest cell),
+the keg's b4, b4's the hero, who survives at 20. Each on_death reads its
+`killer`: the archer for b1, then each barrel for the next (`b1<archer
+b2<b1 b3<b2 keg<b3 b4<keg`). Before, b2 stayed in the match alive at -5 hp
+and the chain stopped there. One `!undo command` takes the whole chain
+back. With death_chain_limit 2 the first death may set off two more (b2,
+b3); the keg, brought to -2 hp by b3, is named in the warning and stays,
+and b4 is untouched. Its next change (`!ent hp keg -1`) runs its death,
+and the chain goes on through b4 to the hero. kill() inside on_death
+still kills at once (1156).

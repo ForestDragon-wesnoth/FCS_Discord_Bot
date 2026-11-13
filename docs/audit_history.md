@@ -2614,9 +2614,12 @@ verified after: 1159/1159, also under FCS_SPATIAL_CHECK=1.
     event log printed `Coord(4, 4)`; tile and zone hook lines named a
     unit the channel's view can't see (passive lines were tagged in pass
     50, these weren't).
-  - Asked, not changed: lethal damage dealt from another unit's on_death
-    leaves its victim alive at hp <= 0 (the match-wide death guard holds
-    the check and nothing re-runs it); CLAUDE.md §8 "Undecided".
+  - Answered after the pass (user call, 1160): lethal damage dealt from
+    another unit's on_death left its victim alive at hp <= 0 (the
+    match-wide death guard held the check and nothing re-ran it). Held
+    checks are re-run when the outermost death finishes, in sequence, up
+    to `death_chain_limit`. `!zone move` stays unheld during a reaction
+    window, like `!ent tp`.
   - Clean: the corpse store (id reservation against spawns, clones,
     template and prefab ids, transfers and copies into a match holding the
     corpse, resize, replace stamps, revive of parts), zone draw layers and
