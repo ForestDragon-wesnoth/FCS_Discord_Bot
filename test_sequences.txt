@@ -41215,3 +41215,261 @@ the channel's view sees each unit: in a blue-view channel the red boss
 reads as its disguise (Rock), in an unbound channel the real names. An
 empty format prints no line. Boss took 3 damage from each of three
 shoots (40 → 31).
+
+
+SCENARIO 1149 — A buzzsaw: a one-cell zone that walks a row, bounces off a wall, cuts what it moves onto and what starts a turn on it (a 2x2 ogre)
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new saw Saw 8 5
+!match use saw
+!ent add hero Hero 30 6 4 20
+!ent add ogre Ogre 50 3 1 10
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!tile set 7 2 glyph #
+!tile tags 7 2 wall
+!tile set 6 2 glyph ,
+!zone def new buzzsaw
+!zone def glyph buzzsaw *
+!zone def layer buzzsaw 60
+!zone def data buzzsaw dmg 5
+!zone def data buzzsaw dir right
+!zone def data buzzsaw move_block "tile_has_tag(tile_x, tile_y, 'wall')"
+!zone def hook buzzsaw on_round_start "d = zone_get(zone_name, 'dir')\nif zone_step(zone_name, d, 1, face=True) == 0:\n    d = 'left' if d == 'right' else 'right'\n    zone_set(zone_name, 'dir', d)\n    zone_step(zone_name, d, 1, face=True)"
+!zone def hook buzzsaw on_enter "if zone_moved:\n    deal_damage(self, zone_get(zone_name, 'dmg'))"
+!zone def hook buzzsaw on_turn_start "if in_zone(self, zone_name):\n    deal_damage(self, zone_get(zone_name, 'dmg'))"
+!system set default hook_output_lines none
+!zone place buzzsaw 1 2
+?? Placed zone `buzzsaw` of definition `buzzsaw` at (1,2).
+!turn next
+!assert "zone_cells('buzzsaw') == [[2, 2]] and zone_facing('buzzsaw') == 'right'"
+!turn next
+!turn next
+?? (`ogre`) takes 5 damage.
+!assert "zone_cells('buzzsaw') == [[3, 2]] and entity[ogre].hp == 45"
+!turn next
+!assert "entity[ogre].hp == 40"
+!turn next
+!assert "zone_cells('buzzsaw') == [[4, 2]] and entity[ogre].hp == 40"
+!turn next
+!assert "entity[ogre].hp == 35"
+!turn next
+!turn next
+!turn next
+!assert "zone_cells('buzzsaw') == [[6, 2]] and entity[ogre].hp == 35"
+!map
+?? *
+?! ,
+!turn next
+!turn next
+!assert "zone_cells('buzzsaw') == [[5, 2]] and zone_facing('buzzsaw') == 'left' and zone_get('buzzsaw', 'dir') == 'left'"
+!map
+?? ,
+
+Expected: the buzzsaw is a zone definition (glyph `*`, draw layer 60,
+damage and direction as data, a `move_block` formula that reads the
+wall tag) placed as a one-cell zone with `!zone place`. Its round-start
+hook steps it one cell with zone_step(..., face=True) and, when the step
+is refused (0 steps), turns around and steps the other way. Its on_enter
+hook cuts a unit the saw moves onto (`zone_moved` is true there; a unit
+walking in would read false), and its on_turn_start hook cuts the unit
+whose turn starts on it. The 2x2 ogre covers (3,1)-(4,2): the saw
+arrives on (3,2) in round 2 (50 → 45) and cuts it again at its turn
+start (40). In round 3 it steps to (4,2), still over the ogre, so the
+ogre gets no second on_enter (it was covered before and after the step,
+as a unit walking inside a zone gets none); its turn start there cuts it
+(35). Then the saw leaves it. At (6,2) the saw draws over the `,`
+ground tile (layer 60 above the tile's 50); the wall at (7,2) refuses
+the next step, so the saw turns left, back to (5,2), and the ground shows
+again at (6,2).
+
+
+SCENARIO 1150 — A zone moving over a 2x2 unit fires the hooks a unit walking would: enter, cell enter, stop, exits, `zone_moved`, on_moved's bindings, hooks=False
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new zm ZoneMoves 9 5
+!match use zm
+!ent add golem Golem 40 4 1 5
+!ent set_vars golem footprint_w=2 footprint_h=2
+!ent add hero Hero 20 1 4 9
+!zone fill cloud 1 2 2 2
+!system set default hook_output_lines none
+!zone hook add cloud on_enter "match.t = match_var_get('t', []) + ['enter@' + str(tile_x) + ',' + str(tile_y) + ':' + self + ':' + str(zone_moved)]"
+!zone hook add cloud on_cell_enter "match.t = match_var_get('t', []) + ['cell_enter@' + str(tile_x) + ',' + str(tile_y)]"
+!zone hook add cloud on_stop "match.t = match_var_get('t', []) + ['stop@' + str(tile_x) + ',' + str(tile_y)]"
+!zone hook add cloud on_cell_stop "match.t = match_var_get('t', []) + ['cell_stop@' + str(tile_x) + ',' + str(tile_y)]"
+!zone hook add cloud on_cell_exit "match.t = match_var_get('t', []) + ['cell_exit@' + str(tile_x) + ',' + str(tile_y)]"
+!zone hook add cloud on_exit "match.t = match_var_get('t', []) + ['exit@' + str(tile_x) + ',' + str(tile_y)]"
+!zone hook add cloud on_moved "match.t = match_var_get('t', []) + ['moved:' + str(zone_dx) + ',' + str(zone_dy) + ':' + str(move_dir) + ':' + join(zone_covered, '+')]"
+!zone move cloud right 3
+?? Zone `cloud` stepped 3 of 3 cell(s) right.
+!eval "join(match.t, ' | ')"
+?? = `'moved:1,0:right: | enter@4,2:golem:True | cell_enter@4,2 | moved:1,0:right:golem | cell_enter@5,2 | moved:1,0:right:golem | stop@4,2 | cell_stop@4,2 | cell_stop@5,2'`
+!eval "match.t = []"
+!zone move cloud right 2
+!eval "join(match.t, ' | ')"
+?? = `'cell_exit@4,2 | moved:1,0:right:golem | exit@5,2 | cell_exit@5,2 | moved:1,0:right:'`
+!eval "match.t = []"
+!zone move cloud -5 2
+?? Moved zone `cloud` by (-5,2).
+!assert "zone_cells('cloud') == [[1, 4], [2, 4]]"
+!eval "join(match.t, ' | ')"
+?? = `'enter@1,4:hero:True | cell_enter@1,4 | moved:-5,2:None:hero | stop@1,4 | cell_stop@1,4'`
+!eval "match.t = []"
+!ent move hero 2 right
+!ent move hero 1 left
+!eval "join(match.t, ' | ')"
+?? exit@2,4
+?? enter@2,4:hero:False
+!ent move hero 1 right
+!eval "match.t = []"
+!eval "zone_step('cloud', 'up', 1, hooks=False)"
+?? = `1`
+!assert "match.t == [] and zone_cells('cloud') == [[1, 3], [2, 3]]"
+!zone move cloud 0 -1
+!assert "zone_cells('cloud') == [[1, 2], [2, 2]]"
+!eval "zone_move('cloud', 2, 0, hooks=False) and zone_can_move('cloud', 1, 0)"
+?? = `True`
+
+Expected: the cloud (two cells on row 2) walks right with `!zone move
+cloud right 3`, a cell at a time, and the 2x2 golem on (4,1)-(5,2) gets
+the hooks a unit walking into the cloud would: on the second step the
+cloud newly covers (4,2), so the golem's on_enter fires once (at that
+cell, `zone_moved` true) and on_cell_enter for it; the third step adds
+(5,2), an on_cell_enter only (the golem was already in the cloud). After
+the last step the golem, newly covered by this move, gets on_stop once
+and on_cell_stop per covered cell. on_moved follows each step with
+zone_dx / zone_dy, move_dir and zone_covered. Moving on, the cloud
+uncovers (4,2) (on_cell_exit) and then (5,2), where the golem leaves it
+whole (on_exit once, then on_cell_exit). A jump (`!zone move cloud -5
+2`) has no move_dir (None) and lands on the hero: enter, cell enter,
+on_moved, stop. When the hero walks out of the cloud and back in, its
+hooks read `zone_moved` false. `hooks=False` moves without firing
+anything; zone_can_move tests a move without making it.
+
+
+SCENARIO 1151 — What stops a moving zone: the zone_move_block_condition rule, a zone's move_block, voids, the map edge; auras, step counts, diagonals and $() refused
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new zb ZoneBlocks 8 5
+!match use zb
+!ent add hero Hero 30 5 2 9
+!zone fill rock 1 2 1 3
+!system set default zone_move_block_condition "cell_entity(tile_x, tile_y) != ''"
+!zone move rock right 6
+?? Zone `rock` stepped 3 of 6 cell(s) right. Stopped: (5,2) blocks it.
+!assert "zone_cells('rock') == [[4, 2], [4, 3]] and not zone_can_move('rock', 1, 0) and zone_can_move('rock', 0, 1)"
+!eval "zone_move('rock', 2, 0, hooks=False) and zone_move('rock', -2, 0)"
+?? = `True`
+!zone move rock 1 0
+?? ❌ Zone `rock` can't move by (1,0): (5,2) blocks it.
+!zone set rock move_block false
+!zone move rock 1 0
+?? Moved zone `rock` by (1,0).
+!assert "zone_cells('rock') == [[5, 2], [5, 3]] and in_zone('hero', 'rock')"
+!map void add 8 3 map=main
+!zone move rock right 3
+?? Stopped: (8,3) is a void cell.
+!assert "zone_cells('rock') == [[7, 2], [7, 3]]"
+!zone move rock 0 3
+?? ❌ Zone `rock` can't move by (0,3): (7,6) outside 8x5.
+!zone move rock right 9
+?? ❌ A zone takes 0 to 8 steps on map `main` (its longer side), not 9.
+!zone move rock down_left
+?? ❌ Diagonal direction 'down_left' is not allowed
+!zone move rock up 1 2
+?? ❌ Usage:
+!zone fill glow 5 2 5 2
+!zone anchor glow hero 1
+!zone move glow 1 0
+?? ❌ Zone `glow` is an aura of `hero`: it moves with its anchor.
+!ent set_var hero note "$(zone_can_move('rock', -1, 0))"
+?? vars.note = True
+!ent set_var hero note "$(zone_move('rock', -1, 0))"
+?? ❌
+!assert "zone_cells('rock') == [[7, 2], [7, 3]] and entity[hero].note == True"
+!zone move rock left 2
+!undo command
+!assert "zone_cells('rock') == [[7, 2], [7, 3]]"
+HARNESS-ALLOWS-ERRORS
+
+Expected: the rock is a 1x2 zone. With zone_move_block_condition
+`cell_entity(tile_x, tile_y) != ''`, `!zone move rock right 6` walks
+until the step onto the hero's cell (5,2) is refused: 3 of 6 steps, the
+reply naming the cell, and a zone moves whole, so the free (5,3) doesn't
+help. zone_can_move tests a move without making it. A jump checks the
+cells it lands on: a jump of 2 passes over the hero (and back), one of 1
+lands on the hero and is refused. The rock's own `move_block` data
+overrides the rule (false: the jump of 1 lands on the hero's cell). A void and the map's edge always block: the walk stops
+before the void at (8,3), the jump past the bottom edge is refused. A
+walk longer than the map's longer side, a diagonal while
+allow_diagonal_movement is off, a stray word and moving an aura (it
+follows its anchor) are refused. zone_can_move is a read, so a `$()`
+argument may call it; zone_move changes the match, so a `$()` argument
+can't (refused, nothing moves). A move is one undo step.
+
+
+SCENARIO 1152 — Objects on the ground: `!zone place` / zone_place, the draw layer in text and image, a definition's time hook reaching its zones
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new zp ZonePlace 6 3
+!match use zp
+!ent add hero Hero 20 6 3 5
+!tile set 2 2 glyph ,
+!tile set 3 2 glyph ,
+!zone def new chest
+!zone def glyph chest $
+!zone place chest 2 2
+?? Placed zone `chest` of definition `chest` at (2,2).
+!eval "zone_place('chest', 3, 2)"
+?? = `'chest2'`
+!zone place chest 4 2 name=box
+?? Placed zone `box`
+?tab "!zone place ch"
+?? → '!zone place chest '
+?tab "!zone mo"
+?? → '!zone move '
+!map
+?? 2 . , , $ . .
+!zone def layer chest 60
+!map
+?? 2 . $ $ $ . .
+!map scene list
+?? zone `box` at (4,2) — glyph $ (layer 60)
+!zone layer chest2 10
+?? Zone `chest2` draws at layer 10
+!map
+?? 2 . $ , $ . .
+!zone info chest2
+?? "sprite_layer": 10
+!zone layer chest2 -
+!map
+?? 2 . $ $ $ . .
+!zone place chest 9 9
+?? ❌
+!zone place chest 1 1 junk
+?? ❌ Unexpected `junk`
+!zone place nochest 1 1
+?? ❌ No zone definition `nochest`.
+!zone layer box high
+?? ❌ A draw layer is a whole number
+!zone def hook chest on_round_start "match.n = match_var_get('n', 0) + 1"
+!zone hook add box on_round_start "match.m = 1"
+!turn next
+!assert "match.n == 2 and match.m == 1"
+!zone def del-hook chest on_round_start
+!turn next
+!assert "match.n == 2"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a zone definition `chest` (glyph `$`) is placed as one-cell
+zones: `!zone place` names the first `chest`, zone_place mints `chest2`,
+`name=` gives `box`; Tab completes the definition and the subcommand. Zones draw at the sprite_layer_zone rule's layer
+(25) under tiles (50), so the `,` ground tiles hide the chests on (2,2)
+and (3,2). `!zone def layer chest 60` puts every chest over the ground,
+in the text map and in the image's scene (the placement lists layer
+60); `!zone layer chest2 10` sends one back under its tile, `!zone info`
+shows the field, and `-` goes back to the definition's. An off-map cell,
+a stray word, a missing definition and a non-number layer are refused.
+A definition's round-start hook added after its zones were made fires
+for each zone of it (chest, chest2; box's own hook replaces it), read
+through the zone hook index; deleted, it fires no more.

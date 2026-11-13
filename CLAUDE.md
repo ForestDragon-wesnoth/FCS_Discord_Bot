@@ -2682,6 +2682,46 @@ hardcodes**.
   formulas. entities_in_zone / cell_in_zone / in_zone / zone_has /
   zone_size answer empty for a missing zone with a ⚠️ once per command
   (`_known_zone`, user call); zone_exists is the silent test (946).
+- **Ground and objects** (user design, `docs/terrain_design.md`): a tile
+  is the ground of its cell (per-cell state, identified by its cell,
+  never moves); anything standing on the ground (a trap, a chest, a
+  fire) is a zone, usually a one-cell zone of a definition: `!zone place
+  <def> <x> <y> [name=]` / `zone_place(def, x, y)`, named like unit ids
+  (1152).
+- **Draw layer** (1152): zones and tiles draw by one number in both
+  renderers: a zone's `sprite_layer` (a ZONE_LOOK_FIELD, its own else its
+  definition's, `!zone layer` / `!zone def layer`) else
+  `sprite_layer_zone` (25), a tile's `sprite_layer` data else
+  `sprite_layer_tile` (50) (`Match.zone_draw_layer` /
+  `tile_draw_layer`). Text maps show each cell's highest layer; a tie
+  goes to a tile, then to the zone made later (the scene's stable sort);
+  a colour without a glyph tints the cell when it is the highest colour
+  there. A parity harness (3,000 random boards, 38,764 cells) matched.
+- **Moving zones** (1149-1151): `Match.zone_move(name, dx, dy)` jumps,
+  `zone_step(name, dir, n, face=)` walks a cell at a time (`!zone move
+  <name> <dx> <dy> | <dir> [n] [face]`, formulas `zone_move` /
+  `zone_step` / `zone_can_move`); a zone moves whole, and a cell it would
+  newly cover off the map, on a void or blocked (`zone_move_problem`: its
+  `move_block` data, else its definition's, else the rule
+  `zone_move_block_condition`, fail-open, self = the acting unit) stops
+  it; at most the map's longer side in steps; an aura is refused (it
+  follows its anchor). Each move or step (`_zone_step_once`) fires, per
+  unit it moves onto or off (`_zone_cover`: alive, no glued part or
+  hidden rider, by footprint cell, units in turn order), the hooks a
+  unit walking would get: on_exit once when the body leaves the zone,
+  on_cell_exit per cell lost, on_enter once when it enters, on_cell_enter
+  per cell gained, with the binding `zone_moved` True (False for a
+  walking unit); then the zone's `on_moved` (`zone_dx`, `zone_dy`,
+  `move_dir`, `zone_covered`); after the move or the last step, on_stop /
+  on_cell_stop on the units the call newly covered (`_zone_stop_hooks`).
+  Every hook re-checks the zone and the unit (ghost firing). The moves
+  count in the move-hook chain (`move_hook_level`, the recursion and
+  event limits). `zone_shift` stays the clipping, hook-free translate.
+- **Zone time hooks** read an index (`Map.zone_hook_names`: zone -> its
+  own hook names, kept by `ZoneTable.also`, which `zone_changed` /
+  `zone_touch` and every `!zone` command mark) plus the zones of a
+  definition holding the hook (`_zones_by_def`), so a turn costs the
+  zones with hooks, not every zone; `FCS_SPATIAL_CHECK` compares both.
 - **Zone definitions** (`docs/zones_prefabs_design.md` §1-§4; `!zone def`,
   `Match.zone_definitions`, `normalize_zone_def`, a system library): a kind
   of zone described once, the tile-template pattern (user call, for
@@ -2912,8 +2952,8 @@ hardcodes**.
 
 ### 7.15 Rendering
 
-- **ASCII** (`render_ascii` → `_render_ascii_impl`): layers zones < tiles <
-  units < fog; glyphs (`glyphs.<facing>` > `glyph` > facing arrow; one
+- **ASCII** (`render_ascii` → `_render_ascii_impl`): layers zones and
+  tiles by draw layer (§7.12; by default zones under tiles) < units < fog; glyphs (`glyphs.<facing>` > `glyph` > facing arrow; one
   character), colours (`color` var — a palette name or a formula with
   self = the unit, falling through when it fails or isn't a palette name,
   shared by both renderers via `entity_color` (772) — > `team_colors` /
