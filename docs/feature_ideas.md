@@ -257,6 +257,13 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#362 `!table odds <name>`.** Each entry's chance, including #253's adjustments.
 - **#363 Action sweeps queue behind a window.** An `!action` line of a batch or `!foreach` that meets an open reaction window waits in the reaction queue, as formula-started actions already do. Today the hold refuses it, so "every archer fires" stops after the first shot that opens a window.
 - **#364 Clamps beyond units.** `!clamp` on team data, match vars and zone data paths: a shared mana pool stops at 0, a door's hp at its maximum.
+- **#365 Explain a reaction.** `!react why <eid> [reaction]`: for the open or last window, why the unit was or wasn't offered each reaction (reacts_to, reacts_on, the condition's result or error, its mode, the per-window limit, self_trigger).
+- **#366 Explain a grant.** `!zone grant why <zone> <eid>`: the bodies rule, the condition's result, immunity, blocked_by, a part redirect, linger.
+- **#367 Explain the turn order.** `!turn why [eid]`: the initiative value, tiebreak var, tiebreaker, team grouping, acted memory and deferred placement behind a unit's slot.
+- **#368 Explain privacy.** `!ent privacy <eid> [path]`: the rule, unit list or container marker that makes a path private, and for which readers.
+- **#369 What a step triggers.** `!map cell <x> <y> for=<eid>` also lists the tile and zone hooks that would fire for that unit entering or stopping there, by name, under formula_text_visibility.
+- **#370 `!template usedby <partial>`.** The templates, prefabs and live units referencing a partial. Today that list appears only inside a rename or delete refusal.
+- **#371 Spawn warnings for missing definitions.** A template spawn or summon ends with a ⚠️ naming statuses the match has no definition for and functions its actions and passives call that the match lacks. Prefabs carry their definitions; entity templates arrive without them.
 
 ## Medium (a subsystem slice)
 
@@ -584,6 +591,7 @@ From the #264-#348 reviews:
 
 From the #349-#385 review:
 
+- **Explaining the engine:** #365, #366, #367, #368, #369, #370, #371
 - **Formula language:** #349, #350, #351, #352, #353, #354, #373
 - **Macros and sweeps:** #355, #363
 - **Actions and objects:** #356, #357, #358, #364
