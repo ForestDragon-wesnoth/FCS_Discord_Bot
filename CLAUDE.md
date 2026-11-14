@@ -438,7 +438,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-53 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-54 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
@@ -2031,9 +2031,14 @@ hardcodes**.
   ❌ and undoes the lines before it (every match restored in place, created
   matches removed, deleted ones restored as the original object even when
   a line made a new match under the id, pointers and rules restored;
-  bot-wide settings are not; a line that crashes undoes like a ❌, and a
+  bot-wide settings are not; a line that crashes undoes like a ❌, as does
+  an unknown command (`_ErrorWatchCtx`: a typo'd line used to be skipped
+  and the lines after it ran), and a
   deleted match comes back with its history, saves and journal) (692-693,
-  816). **`!run <file>`** reads a saves-folder file (admin). Both nest
+  816, 1167). A dispatched line may keep its `!` (`dispatch_no_snapshot`
+  strips it): the line splitter drops it only for a typed batch / sweep
+  with a `;`, so a one-line `!batch !ent ...` and a batch or sweep under
+  `!dry` / `!simulate` answered "Unknown command `!ent`" (1167). **`!run <file>`** reads a saves-folder file (admin). Both nest
   within `macro_recursion_limit`.
 - **Lines of `!batch` / `!foreach` are gated** (`_GATE_LINES`, checked in
   `dispatch_no_snapshot`): each typed line passes the per-match gate as its
@@ -2115,6 +2120,13 @@ hardcodes**.
   one turn. `tally=` (read-only) records a value per run. The steps of all
   runs share the owner limit `simulate_step_limit` (1000); a run it cuts
   is left out with a ⚠️. Runs yield the event loop between them. A run
+  with a ❌ or an unknown-command reply counts as failed. Reaction
+  windows (user call): `reactions=stop` (default) ends a run at a window
+  that waits for answers, the action unresolved, and the report counts
+  those runs; `reactions=pass` closes each such window after the step as
+  if its units had passed (`_sim_pass_windows`, at most
+  `_SIM_WINDOW_PASSES` per step), with a note. Units in auto mode react
+  either way, and a batch or macro can answer with `!react` lines (1168). A run
   puts back only the matches it reached (`logic.MATCHES_TOUCHED`:
   `MatchManager.get`, `copy_entity`, `require_target_host`) plus any
   deleted or replaced; every match goes back once at the end (X16).
@@ -4111,6 +4123,12 @@ lists what isn't built; 1093-1122).
   Host tools run during a window (`!ent tp`, `!ent damage`, `!ent kill`,
   `!zone move`: user call, a zone moved mid-window fires its hooks before
   the pending action resolves).
+  A command that leaves nobody to answer the window (its last undecided
+  unit died, left the match or lost its reaction to a host edit, a hook or
+  a watcher's effect) closes it, and the pending action resolves in that
+  command (user call; `reactions.close_unanswered`, called after the
+  handler in `_run_body` and `dispatch_no_snapshot` and after a watcher
+  poll that fired, never for a read or inside an action body; 1169).
   Expiry (`settle_expiry`, at the start of the next command on the match
   but `!as`) journals the command as state; `!as wait` ages windows.
 - **Resolution** (`_advance`, phases before -> before_run -> body ->
@@ -4134,7 +4152,11 @@ lists what isn't built; 1093-1122).
   `after_on` against `unit_outcome` (a dropped unit sees cancelled); then
   `_after_run` runs continuations and after-only picks. Every step
   re-fetches the exchange by seq (`_ex`) after a `run_action` (a
-  rollback replaces it).
+  rollback replaces it). A half, a cost or a body whose formula ERRORS
+  (not a fail()) fails that step like a fail(): the `run()` closures
+  turn the VTTError into a failed result. Left to propagate, the exchange
+  stayed at that step with its window open and nobody to answer, and
+  every `!react skip` ran the broken formula again (1170).
 - **`reactions_used(eid, since='own_turn', tag=None)`** (ARG_SAFE):
   own_turn / round (refused under ATB) / turn / action (`reaction_seq`) /
   ever.

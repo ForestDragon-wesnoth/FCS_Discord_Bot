@@ -4948,8 +4948,10 @@ class FormulaEngine:
                 # (e.g. `self_id()` outside a passive). Distinguish from
                 # an arbitrary None so the message is actionable.
                 raise FormulaError(
-                    "entity id is None — 'self', 'this', or 'current' "
-                    "was used but is unbound in this context."
+                    "no unit was given (the value is None): 'self', "
+                    "'this' or 'current' is unbound in this context, or "
+                    "a variable holds no unit (an action's `target` once "
+                    "its target dropped out)."
                 )
             if not isinstance(token, str):
                 raise FormulaError(

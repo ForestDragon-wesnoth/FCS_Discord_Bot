@@ -2679,3 +2679,51 @@ design); pyflakes over the code (no undefined names).
     answered "template must be a dict"; it says what a form is and how
     to get one.
 
+## Pass 54 (wrappers around commands; reaction windows whose units die or leave; fresh chaos seeds)
+
+By hand: the death chain of pass 51 against body parts, a vital part and a
+vehicle with a rider (clean: a packet destroys a part under the death
+guard, a raw hp write on a part destroys nothing, as outside a death);
+clone, transfer, copy, removal and kills during an open reaction window;
+moving zones over a 2x2 vehicle with a region seat and a hidden rider;
+approvals and `!again` against a pause; `!dry` and `!simulate` wrapped
+around batches, sweeps, macros and actions that open a window. The full
+reply text of every scenario (90,353 lines) grepped for raw Python text
+(exception names, reprs, object addresses): nothing but GM formula errors
+and rule values. The chaos harness on three boards with six new seeds
+each (5,400 commands): 0 findings but the known disguise-name false
+positive.
+  - **Line prefix** (1167): `dispatch_no_snapshot` looked a line's first
+    word up as typed, and only the splitter of a typed `!batch a ; b` /
+    `!foreach` dropped a line's `!`. A one-line `!batch !ent hp hero -1`
+    answered "Unknown command `!ent`", and so did every line of a batch
+    or sweep under `!dry` / `!simulate`, whose tails are split as plain
+    words.
+  - **Silent failures** (1167): `!simulate` counted only ❌ replies as
+    failed runs, so the unknown commands above came out as "No unit
+    changed in any run."; `!batch strict` skipped a typo'd line and ran
+    the lines after it.
+  - **`!simulate` and windows** (1168): a simulated action whose target
+    holds a reaction in `ask` mode stopped at the window in every run and
+    the report said only "No unit changed in any run." It now counts
+    those runs and says why.
+  - **Wording** (1168): a body run after its only target dropped out
+    (design: it still resolves) failed in `deal_damage(target, ...)` with
+    "'self', 'this', or 'current' was used but is unbound"; the refusal
+    names a variable holding no unit.
+  - Answered after the pass (user calls): a command that leaves nobody
+    to answer the open window closes it and the pending action resolves
+    in that command (1169); `!simulate` takes `reactions=pass|stop`,
+    `stop` the default (1168); `!ent transform` keeps taking a statblock
+    only (`template_data(name)` for a library template).
+  - **Stuck exchange** (1170, found while building the first answer): a
+    half, cost or body whose formula errored (an unknown name, a bad
+    argument; not a fail()) escaped the exchange as an exception. The
+    exchange stayed at that step with its window open and nobody to
+    answer, `!turn next` and `!action` were held, and every `!react skip`
+    ran the broken formula again; only an undo or fixing the formula got
+    the match out. The step now fails like a fail().
+  - After those changes: the replay differential over scenarios
+    1090-1170 (85 replays, 0 problems), the chaos harness on the
+    reactions board (four seeds) and the main board (one): 0 findings.
+
