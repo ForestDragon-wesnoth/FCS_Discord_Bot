@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #418). #264-#418 come from review passes by
+(the highest so far is #450). #264-#450 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -289,6 +289,28 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#408 Explain aliveness.** `!ent why <id>`: the alive and death conditions with their values, a per-unit override, indestructibility, a held death check, the destroyed latch.
 - **#409 Stamp remaps.** `remap=wall:ice_wall,orc:orc_elite` on `!prefab stamp` swaps tile templates, zone definitions or unit templates by name for one stamp. One layout serves several biomes or difficulty tiers.
 - **#410 Scenario lint.** `run_scenarios.py --lint` lists scenarios with no `!assert` or `??`, prose showing ❌ without the allow marker, and checks placed after `Expected:` where nothing runs.
+- **#419 Units that block passage.** A rule `unit_block_condition` (an expression with the mover as `self` and the standing unit as `other`, fail-open, empty by default). Today a walk passes through any unit and only the final cell has to be free: in a probe `a` at (1,1) walked two cells right through `b` at (2,1). "Enemies block, allies let you through" has no switch.
+- **#420 Hp follows max hp.** A rule `max_hp_change_mode` (`keep` / `delta` / `ratio`). Today a raised max hp leaves hp where it was and a lowered one clamps it.
+- **#421 Event lines for spawns, despawns, mounts and transforms.** Format rules like the death and revive lines, tagged as lines about the unit, empty by default. A summon made by a formula arrives silently today.
+- **#422 Grouped damage lines.** A rule `damage_line_grouping` (`per_packet` / `per_action`): one line per action listing its targets ("Fireball: gob1 −8, gob2 −8, gob3 −12"), each target's part shown only to views that see it. An area attack posts a line per target today.
+- **#424 Who sees this unit.** `!ent seenby <eid>`: per team, visible or hidden and why (own team, in range of which member, a reveal, line of sight, the visibility condition). Complements #277.
+- **#425 `!mod list <eid>`.** Every stat with modifier records on the unit, grouped, with sources. `!mod show` needs the stat's name, so a GM has to know what to ask for.
+- **#426 Assertion values.** A failed `!assert` shows both sides of its comparison ("left is 10"). Today the reply is "entity[a].hp == 7 is False".
+- **#427 Lint for arity and bindings.** Stored formulas calling a function with the wrong number of arguments or an unknown keyword, or reading a binding their hook never supplies (`killer` in a turn-start passive). The twin of #279.
+- **#428 Effective stats in cards.** A placeholder `{mod:<stat>[:<base var>]}` for the roster line, card and description, printing the value through `apply_mods`. Modifiers are pure queries, so the card shows raw vars and players never see the folded number.
+- **#429 Preview a pending request.** `!pending <id> preview` runs the queued command under `!dry` as its requester and shows the replies and changes. `!dry` refuses approvals today, so a host approves blind.
+- **#430 Sweep summaries.** A `summary` word on `!foreach` and `!batch`: one reply with the outcomes ("18 done, 2 refused" plus the refusals). A sweep posts a reply per line today, up to the message cap.
+- **#431 Walrus in expressions.** `(d := entity_distance(self, target)) <= 3 and d > 1`, so a condition computes a value once. Expression-mode formulas can't bind anything today.
+- **#432 Results from nested actions.** `action_result(key)` after `use_action` reads the nested body's locals (how much it dealt). Today `use_action` gives True, False or None.
+- **#433 Selectors as list targets.** `!action hero bless group:party` and `!action hero volley team=blue near:hero:5`, resolved through the view like `!find`. The scenarios type list targets id by id.
+- **#434 `!ent add` with initial vars.** `!ent add gob Goblin 10 3 3 team=red speed=2`. Its usage has no slot for a team, so every hand-made unit needs a second command.
+- **#435 Reveal a unit.** `reveal_unit(team, eid, turns=None)` and `!reveal_fog <team> unit <eid>`: the unit shows to that team through fog while the reveal lasts and follows it as it moves. For a tracking dart or a hunter's mark.
+- **#436 Containers beyond units.** `var_move`, `item_add` and `item_consume` to and from team data, match vars and zone data. A party stash and a chest that holds its loot; the container functions work on unit vars today.
+- **#437 Private zone and tile data.** A `private_zone_data` rule and a per-zone marker, read through #70's reader. In a probe a player's `!zone info chest` printed the chest's whole data, so a chest's loot or a trap's damage is open.
+- **#438 Zones listen to events.** `event:<name>` hooks on zones and definitions. A lever emits `lever_pulled` and the door's own hook opens it; today the handler has to be a global passive stored outside the door.
+- **#439 Status-carried auras.** A definition field `aura: {definition, radius, metric}`: the engine makes the anchored zone when the status arrives and removes it with the status on every exit path (expiry, death, transform). Composing it takes two hooks today, and each exit path needs its own cleanup.
+- **#440 Match trash.** `!match delete` asks for `confirm` and keeps the match with its history and journal in the trash for 24 hours, with `!match restore <id>`. In a probe one typed line deleted a match for good.
+- **#441 Sessions.** `!session start [name]` / `end` put marks in the event log and history; `!log session=` and `!history list session=` filter by them, and the recap (#34) can cover one session.
 
 ## Medium (a subsystem slice)
 
@@ -529,6 +551,14 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#416 Prefab anchors.** Named points inside a prefab (`anchors: {door_n: [3, 0]}`) and `align=door_n@x,y` on a stamp, so rooms snap together at their doors; `prefab_anchor(name, anchor)` reads one. Builds toward #32.
 - **#417 Lazy matches.** A server loads each match on its first use; today a server's folder loads whole. Fits #197 and #299.
 - **#418 Slim CLAUDE.md.** Move §7's subsystem reference into `docs/reference/<subsystem>.md`, read when a task touches that subsystem, and keep philosophy, process, the map and the bug classes in CLAUDE.md. Every session reads its 4,471 lines before the first edit.
+- **#442 Window prompts reach the reactors.** A reaction window's option lines also post in the channels bound with the reacting unit's team view. They print where the action was typed, so in team-channel play the defender never sees the prompt.
+- **#443 Preview a system edit.** `preview` on `!system set` and the library editors: per match, what the edit would change (renamed vars, re-sorted orders, size sweeps, capped statuses). `!dry` refuses server-wide edits, and a system edit reaches every match at once.
+- **#444 Pin a match's rules.** `!match pin system`: the match keeps a copy of its system chain and stops following live edits until `unpin`, the rule twin of `template_pinning`. A fight in progress stays as it began while the admin edits the system for the next one.
+- **#445 Part actions on the body.** A body's `!action list` includes its living parts' actions (`via tail`), runnable through the body with `source` bound to the part; a destroyed part's actions drop out. Today the player has to know and type the part's id.
+- **#446 Directional auras.** `shape=cone|front|rear arc=<deg>` and an offset on `!zone anchor`, re-stamped on moves and facing changes. A shield wall's front arc, a lighthouse beam, a guard's watched cone; an aura is a radius today.
+- **#448 Player-facing lines audit.** Move the engine-worded lines that remain into format rules: turn skipped, turn passes, reaction window options, block refusals, move replies. Follows "when in doubt, gamerule".
+- **#449 Persona lines on Discord.** With a rule on, `say()` lines about a unit post under the unit's display name and sprite through a channel webhook. For tables that roleplay in the same channel; it can serve as a built-in stand-in for Tupperbox.
+- **#450 Compressed history and journal files.** Undo snapshots and journal segments written gzipped (JSON shrinks roughly tenfold). The storage layer writes plain JSON, and undo history is the largest share of a server's quota.
 
 ## Large (arcs of several PRs)
 
@@ -645,3 +675,13 @@ From the #386-#418 review:
 - **Prefabs:** #409, #416
 - **GM tooling:** #413, #414, #415
 - **Scaling and upkeep:** #417, #418
+
+From the #419-#450 review (probed against the bot):
+
+- **Rules and lines:** #419, #420, #421, #422, #448, #449
+- **Explaining the engine:** #424, #425, #426, #427, #428
+- **Hosting tools:** #429, #430, #443, #444
+- **Formulas and actions:** #431, #432, #433, #434, #435, #445
+- **Objects and containers:** #436, #437, #438, #439, #446
+- **Safety and bookkeeping:** #440, #441, #450
+- **Team-channel play:** #442
