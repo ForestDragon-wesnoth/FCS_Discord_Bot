@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #306). #264-#306 come from a review pass by
+(the highest so far is #348). #264-#348 come from review passes by
 another model and share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -235,6 +235,29 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#287 Target count limits.** `min_targets` / `max_targets` on list targets, a number or an expression ("up to 3 targets", "one per level").
 - **#288 Tile sprite variants.** `sprite_variants: [grass1, grass2, grass3]` on a tile or template, picked by a hash of the cell so the map stays stable. Graphics only.
 - **#289 Host handover.** `!host owner <user>`: the owner passes the match on; an administrator can do it for an owner who left the server.
+- **#307 `actions_used(eid, since='own_turn', tag=None, name=None)`.** The action twin of `reactions_used`, over a saved log of successful uses. "One attack per turn" and "no action twice in a row" become one line in a cost or condition, before #24 exists.
+- **#308 Own-turn-only actions.** A rule `actions_need_own_turn` (default off) with a per-action `any_time` field and a refusal format rule. Today every body tests `current_id()` itself.
+- **#309 Status gain and loss lines.** `status_applied_message_format` / `status_removed_message_format`, a per-definition override, tagged as lines about the unit, empty by default. The status twin of #247; today a status applied by a formula arrives silently.
+- **#310 Ticks on the applier's clock.** `tick_when: source_turn_start | source_turn_end`, for "until the end of the caster's next turn". Builds on `__source`, pairs with #267.
+- **#311 Zone targets.** Action target types `zone` and `zone_list`: a checked name, seen through the channel's view, bound with `.name` and `.cells`. Doors, chests and traps are zones by the ground / object rule (CLAUDE.md §7.12), and today an action on one takes its name as raw text.
+- **#312 Unit-or-cell targets.** `target: entity_or_location`, for a spell cast at a creature or at a point.
+- **#313 Relative directions.** `forward`, `back`, `left`, `right` in `!ent move`, `!ent push`, `!ent face` and `move_step`, read from the unit's facing. Pairs with #265.
+- **#314 Thick lines.** `width=` on `cells_in_line`, the line searches and `!map preview line`, for beams and charges wider than one cell.
+- **#318 Rule categories.** Each registry rule carries a category; `!help rules [category]` browses them. With 600+ rules the only route today is a word search.
+- **#321 Per-server command prefix.** bot.py hardcodes `!`, which collides with other bots on a shared server.
+- **#322 Storage warning.** Administrators get one line a day once the server passes an owner-set share of its limit. Today the first notice is a rolled-back command.
+- **#323 `!help mine`.** The commands and subcommands open to the caller in this channel, judged by the gate with every override. Pairs with #284.
+- **#324 `return` in programs.** An early `return <value>` in `!func` bodies, passives and action programs. Today a program's value is its trailing expression, so guard clauses become nested ifs.
+- **#325 Dict helpers.** `merge(a, b)`, `items(d)` (loopable pairs), `with_key(d, k, v)`, `without_key(d, k)`, each returning a new dict. Building a dict in a loop takes var writes today.
+- **#326 `exists(eid)` and `is_alive(eid)`.** The function list has `zone_exists`, `watch_exists` and `has_corpse` and no unit twin; a formula holding a stored id has no direct test.
+- **#327 Tag filter on passives.** `tag=<filter>` on global, team and default passives, tested natively before the formula runs, as `each` watchers already do. It saves a namespace build per unit per hook and removes the guard line from every body.
+- **#328 Default match vars.** A merge rule `default_match_vars` filling a new match's vars, the twin of `default_entity_vars` and `default_map_vars`.
+- **#329 Move a corpse.** `corpse_move(id, x, y, map=None)` and `!ent tp` accepting a corpse id, for dragging the fallen. Pairs with #268.
+- **#330 Hit-location odds.** `!part odds <target> <x> <y> [aim=]` prints each part's chance from that position, the way `!roll odds` prints a distribution.
+- **#331 Team rename.** `!team rename <old> <new>` moves unit team vars, team data, team passives, colours, POV bindings, reveals, fog memory, `actions_seen` and last actors in one undo step.
+- **#333 Concept pages.** `!help topic <name>` for the ideas commands assume: turn models, access and approvals, privacy, tiles and zones, templates / partials / prefabs.
+- **#334 Per-channel line detail.** `lines=all|results|none` on `!match bind`, a channel-level `hook_output_lines`, so a player channel shows results while the GM channel shows every ⚙️ line.
+- **#335 Zone outlines in images.** A zone look `draw: outline`: only the zone's edge is drawn, so a large aura stays readable over the units inside.
 
 ## Medium (a subsystem slice)
 
@@ -446,6 +469,17 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#301 Live roster and turn-order boards.** `!list autoupdate` and `!turn autoupdate`: a Discord message that refreshes as map boards do. #248 appends a roster to replies; this is the pinned version.
 - **#302 Recipe book.** `!help recipe [topic]`: the composed patterns (channeling, charge-up, summon lifetime, a reach-aura attack, corpse decay, a one-way door) as searchable entries, each backed by a scenario in the suite so it keeps working. It helps a GM by showing how to build common composite mechanics, the companion to the "compose it from primitives" rule.
 - **#304 Neighbour-aware tile sprites.** A tile template's `sprite_auto: wall` picks `wall_<mask>` by which neighbours share the template, so walls and coasts join up. Graphics only.
+- **#336 `!simulate compare`.** Two commands run on the same seeds, reported side by side with the difference. For balancing weapon A against weapon B.
+- **#337 Seat bonuses.** A mount slot's `modifiers` and `grants_unit_tags` apply to its rider while seated (a gunner's seat, a howdah's cover). Slots carry actions today and nothing else.
+- **#338 Zone-granted actions.** A zone's or definition's actions are offered to units in or next to it (a reach field), discovered like seat actions, with `source` bound to the zone. The lever's "pull" and the chest's "open" then live in the object. Pairs with #311.
+- **#339 Destructible objects.** A zone with pool vars takes damage packets (`deal_damage` on a zone, steps and hooks included, an `on_destroyed` hook). Completes the object story with #311 and #338; today a breakable door has to be a unit.
+- **#340 Suppressed statuses.** A definition's `suspended_while` expression or `suspended_by` token: the status stays on the unit while its modifiers, restrictions, grants and ticks pause (an antimagic field, a silence). A field decides whether the duration keeps counting.
+- **#341 Sighting events.** `on_unit_sighted` fires when a unit first enters a team's sight under fog, and a rule `sighting_stops_movement` ends a walk at that step, as Wesnoth does. Cost is a sight check per step, charged to `sight_check_limit`.
+- **#342 Revealed private vars.** `reveal_var(eid, path, team)` / `!ent reveal`: that team reads the private var from then on, stored per unit like `actions_seen`. For Analyze and Identify skills.
+- **#343 Banded display of private numbers.** A rule `private_var_bands` (`hp: healthy:75%, wounded:40%, critical`): a reader without access sees the band, as sizes show a category. Gives "bloodied" without exposing the number.
+- **#344 Status-held team change.** A status field `team_while`: the bearer counts as that team while it holds the status and returns on removal, the newest winning when two overlap. Charm and possession appear in all three of the group's combat systems; hooks that stash and restore the team by hand break on overlap.
+- **#346 Scenario coverage report.** `run_scenarios.py --coverage` lists the subcommands, rules and formula functions no scenario exercises. Points the next audit pass at untested code.
+- **#347 Benchmark suite.** `tools/bench.py` times fixed boards (1,000 units on 150×150, 10,000 units) per command against a stored baseline and fails on a slowdown. Keeps the #197 gains from eroding.
 
 ## Large (arcs of several PRs)
 
@@ -502,6 +536,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Open questions: cycles between derived vars; whether var hooks fire when a derived value changes; how saves and undo store them; the cost per read. This is a larger shift than the rest of the list, since modifiers are pure queries today by design.
 
 - **#306 Encounter library.** A saved bundle of a prefab, the watchers, macros, reminders and match vars that go with it, and a turn-order setup, stamped into a match in one command. Sits between prefabs (#31) and system packs (#162).
+- **#348 Module split.** vtt_commands.py and logic.py are about 29,000 lines each; split them into packages by subsystem with pure moves. Every session reads less to find its way, and parallel PRs conflict less.
 
 ## Suggested groupings
 
@@ -525,9 +560,14 @@ From the combat-systems review (docs/combat_systems_fit.md):
 - **Before a public rollout:** #177, #178, #197, #206, #214
 - **Onboarding:** #213, #202, #231
 
-From the #264-#306 review:
+From the #264-#348 reviews:
 
-- **Explaining the engine to a GM:** #277, #278, #279, #280, #281, #284, #300, #302
-- **Map looks:** #264, #288, #304
-- **Status order and lifetime:** #266, #267, #290, #296
-- **Targeting:** #269, #270, #275, #286, #287, #291, #292
+- **Explaining the engine to a GM:** #277, #278, #279, #280, #281, #284, #300, #302, #318, #323, #333
+- **Map looks:** #264, #288, #304, #335
+- **Targeting:** #269, #270, #275, #286, #287, #291, #292, #311, #312, #313, #314
+- **Objects as zones:** #311, #338, #339
+- **Action limits:** #307, #308, #24
+- **Status order and lifetime:** #266, #267, #290, #296, #309, #310, #340, #344
+- **Private information:** #342, #343
+- **Formula ergonomics (review):** #324, #325, #326, #272
+- **Engine upkeep:** #346, #347, #348
