@@ -438,7 +438,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-44 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-53 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
@@ -867,7 +867,8 @@ so scenarios mask a missing call — test with raw shlex input).
 
 **Runtime guards** (all restored in `finally`): `_var_event_depth` (var-hook
 recursion), `_event_depth` / `_event_stack` (the event bus), `_action_depth`
-(also suspends per-command snapshots), `_death_processing`,
+(also suspends per-command snapshots), `_death_processing` (with
+`_dying_ids`, `_death_depth` and the held checks of §7.11),
 `_alive_eval_depth`, `MatchManager._macro_depth`, `_summon_count` (per-command
 summon budget).
 
@@ -937,7 +938,17 @@ Every class below shipped at least once and was fixed in an audit pass
   state back and preserves an explicit list of runtime fields (event stack,
   summon budget, pending requests, held commands, undo history, ...); a
   stale list once wiped live emit frames and all undo history on any failed
-  action. `_restore_snapshot` carries the approval queue and held commands,
+  action. A flag saved under another key while set
+  (`action._SERIALIZED_FLAGS`: the deferred re-sort, the skipped ATB
+  turn, the watcher backlog) is STATE: it comes from the pre-state, never
+  from the preserve list (a `!simulate` past a round end cleared a pending
+  re-sort for good, 1157); the drift guard checks both ways. A rollback
+  can run in the MIDDLE of an engine operation that goes on afterwards
+  (`damage_forecast`, a failing `use_action` in a movement hook), so a
+  unit or map present on both sides keeps its OBJECT with the restored
+  state inside (a walk's later steps moved an object no longer in the
+  match, 1158); a unit the rolled-back run removed still comes back as a
+  new object. `_restore_snapshot` carries the approval queue and held commands,
   keeps live bindings per `undo_channel_bindings_mode`, keeps `paused`, the
   RNG (seed, position, live generator) and the command journal, and
   re-copies `rules` from the system.
@@ -1374,7 +1385,8 @@ hardcodes**.
   status hook's lines (`fired on <unit>`, its result or error) are tagged
   as lines about the unit it fired on (`logic._hook_line_tag`: where it
   stands, else its corpse's cell), so a channel whose view can't see it
-  drops them (987).
+  drops them (987); a tile's or zone's hook lines (`fired for <unit>`)
+  the same way (`Match._hook_lines_about`, 1159).
 - **Default passives** (`default_entity_passives`, `!defpassive`): copied
   onto every unit at `Entity.spawn` (`_apply_default_passives`). With
   `default_passives_existing_units` on (default; #221, user call, 1091-1092)
@@ -1700,7 +1712,12 @@ hardcodes**.
   capabilities", G8) and runs at the resume as the holder
   (`_HolderCtx`, COMMAND_USER: handler checks and the log judge and name
   the holder, G7); `!match use / new / bind / unbind / clone` and `!map
-  use` aren't held (`_pause_control`, L39) (988).
+  use` aren't held (`_pause_control`, L39) (988). Whether a command
+  "changes the match" is judged by its own level as well as the level
+  after `!host access` / `command_access` overrides: a command an
+  override opened to players is still refused to them while paused, and
+  held for a host under `pause_affects_hosts` (it read as a read, so the
+  pause stopped neither; 1163).
 - **Reminders** (`!remind [secret] <n> <text> | list | remove <id>`;
   `Match.reminders` / `reminder_seq` / `held_reminders`, saved, undo
   state): due at `turns_elapsed` + n, fired by `_begin_turn`
@@ -1927,7 +1944,8 @@ hardcodes**.
   `has_action`. A list target lists each unit / cell / corpse once: a repeat
   is merged with a ⚠️ (user call: to act on one twice, run the action
   twice; `dedupe_targets`). A location target must be on the map and is a `Coord`
-  (`.x` / `.y` / `.map`) that stores as [x, y]; a typed `map=<map>` names
+  (`.x` / `.y` / `.map`) that stores as [x, y] and prints as `(x,y)` (in
+  fmt() / say() text and the event log, 1162); a typed `map=<map>` names
   the map of a location / location_list target's cells (the actor's by
   default; not an action arg there, 880); `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
@@ -1937,7 +1955,8 @@ hardcodes**.
   {action}, {target} as the checks left it, a cell as (x,y), lists joined;
   {actor_name} / {target_name} as say() markers, so a view reads names
   as it sees each unit; the actor's own placeholders; empty = no line;
-  1148).
+  1148; an exchange stores a cell as [x, y, map, named] and reads it back
+  with `target_from_json` for the line, 1153).
 - **`run_action`** is transactional: pre-state captured, body run,
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo
@@ -2071,7 +2090,11 @@ hardcodes**.
   `dispatch_no_snapshot` refuse, also inside a batch / macro / foreach it
   runs, what a match rollback can't undo (`_dry_refusal`): server-wide
   edits, files, template writes, undo / history (kept across a rollback),
-  approvals, `!match delete/pause/resume`, a nested `!dry` (768).
+  approvals, `!match delete/pause/resume`, a nested `!dry` (768). Before
+  it lists the changes a dry run settles sizes and zone grants, polls the
+  watchers (their lines print with the command's; grants settle again
+  when one fired) and sweeps `__delete_when_empty` maps, as the command
+  itself would (1165).
 - **`!simulate <n> [seed=] [steps=] [until=] [tally= ...] [units=] [vars=]
   <command ...>`** (#230, hosts only, 971-974) runs a command n times on
   `!dry`'s machinery (`_DRY_ACTIVE` holds the root, `"dry"` or
@@ -2442,8 +2465,12 @@ hardcodes**.
   refused) or `!part
   add/attach/detach/remove/glue/locate/region/segment/list/info`. `attach`
   refuses a loop, a map carrier, a snake segment, a snake head with
-  segments and a rider (a corpse's kept rider too), and
-  re-stamps the unit's auras, riders and parts; a loaded loop is cut and a
+  segments and a rider (a corpse's kept rider too), makes the unit a GLUED
+  part (a located or region part of another body, or a detached unit
+  still carrying the var, loses that mode: it used to share the parent's
+  cell as a second occupant, 1154) and
+  re-stamps the unit's auras, riders and parts; `remove` takes body
+  parts only (`!ent remove` removes a unit); a loaded loop is cut and a
   map a part carries freed. A living detached part steps to the nearest
   free cell; detach and locate carry the part's own auras, glued parts and
   riders. `glue` / `region` refuse a snake segment. A group move leaves
@@ -2561,11 +2588,28 @@ hardcodes**.
   is alive; the corpse records the groups of the body and its parts
   (`groups`) and a revive rejoins those that still exist, for the units
   it restored only (a part whose id was taken meanwhile is named in a ⚠️)
-  (814, 820, 824). `kill` /
+  (814, 820, 824). The revived body and its parts face as the corpse
+  did (a spawn would turn them the spawn_face_toward_center way, moving
+  region parts and seats; 1155). `kill` /
   `revive` run `default_kill_function_effects` /
   `default_revive_function_effects`; a kill whose effects already brought
   a death (and maybe a revive by a vehicle-death effect) runs no second
-  death (873). Prims: has_corpse, corpse_at,
+  death (873). One death per unit: while a unit's death pipeline runs
+  (`Match._dying_ids`, runtime) a `kill()` of it does nothing and answers
+  True, so two units that kill each other in on_death, or `kill(self)`
+  there, die once each (1156). **Deaths set off by a death** (user call,
+  1160): while a death runs, `_death_processing` holds every unit's
+  automatic death check; a check held for ANOTHER unit is recorded
+  (`Match._death_recheck`, with the damage packet's kill credit) and run
+  when the outermost `_process_death` has finished its whole pipeline
+  (`_drain_held_deaths`: riders, carried maps and grants first), one
+  unit after another in the order they were hit, each death adding the
+  units it brought down. So an on_death passive that deals lethal damage
+  kills (a barrel chain), in sequence, nesting nothing; `killer` is the
+  packet's dealer. At most `death_chain_limit` (200, ceiling) deaths
+  follow one death, then one ⚠️ names the units left at their death
+  condition (they die at their next change). `kill()` inside on_death
+  still kills at once, nested. Prims: has_corpse, corpse_at,
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
   corpse / corpse_list action targets.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
@@ -2761,7 +2805,9 @@ hardcodes**.
 - **Auras:** a zone anchored to a unit (`!zone anchor <name> <eid> [radius]
   [metric]`): cells re-stamped around every footprint cell when the anchor
   moves or its footprint var changes (`_body_reshaped`, which also re-seats
-  riders), without firing the aura's own enter/exit. On anchor loss
+  riders), without firing the aura's own enter/exit. The command reads
+  its unit through `_resolve_eid` (tokens, and the channel's view for a
+  non-host an override opened it to, 1166). On anchor loss
   `anchored_zone_on_anchor_loss`: delete / freeze / suspend (cells cleared,
   binding kept, resumes on revive or a part heal). The binding is by id, so
   a suspended aura also resumes around a LATER unit that reuses the id
@@ -2894,7 +2940,10 @@ hardcodes**.
   buttons last as long as the request and the message says when it
   expired. `!as wait <seconds>` (CLI / harness) ages every request. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
-  `_channel_pointed_at`).
+  `_channel_pointed_at`). A request whose command an open reaction
+  window holds stays queued (`approval_waits`: `!approve`, `!approve
+  all` and the Discord button answer why it waits and use nothing up;
+  1164).
 - **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner
   only), plus every holder of the `gm` capability (§3 "Role
   capabilities"; `caller_hosts`). A check on the caller's host authority
@@ -4053,8 +4102,15 @@ lists what isn't built; 1093-1122).
   passes, reaches `__reactions_per_window` / the rule, or has nothing
   left (`_refresh_done`, re-reading conditions); the command closing the
   window resolves it in that command. Holds (`_reaction_held`, refused
-  before the queue in `_run_body` and for gated batch lines): `!action`,
+  before the queue in `_run_body` and for every line
+  `dispatch_no_snapshot` runs: batch, macro, foreach, `!run`, `!dry`,
+  `!simulate`; never a `cmd()` line of an action that is running,
+  `_action_depth`, since the halves and the body resolve inside one;
+  1161): `!action`,
   `!ent move / push / pull / swap / action`, `!turn next / set / grant`.
+  Host tools run during a window (`!ent tp`, `!ent damage`, `!ent kill`,
+  `!zone move`: user call, a zone moved mid-window fires its hooks before
+  the pending action resolves).
   Expiry (`settle_expiry`, at the start of the next command on the match
   but `!as`) journals the command as state; `!as wait` ages windows.
 - **Resolution** (`_advance`, phases before -> before_run -> body ->

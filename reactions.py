@@ -1358,7 +1358,11 @@ async def _body_phase(env: _Env, seq: int) -> str:
         for name, v in body_vals.items():
             if name not in CONTROL_KEYS:
                 c[name] = jcopy(v)
-    line = m.action_used_line(ex["actor"], act.name, ex.get("target"))
+    # The exchange keeps a cell as [x, y, map, named]: the line reads the
+    # target as the action did (a Coord), or it would list those four.
+    line = m.action_used_line(
+        ex["actor"], act.name,
+        target_from_json(ex["target_type"], jcopy(ex.get("target"))))
     if line:
         env.out.append(line)
     return "ok"

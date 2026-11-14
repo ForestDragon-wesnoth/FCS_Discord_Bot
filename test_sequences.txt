@@ -41482,3 +41482,621 @@ for each zone of it (chest, chest2; box's own hook replaces it), read
 through the zone hook index; deleted, it fires no more. `!help tile` and `!help zone` carry the
 "tiles or zones" guidance (ground is a tile, anything standing on it a
 zone), and the commands that make either point at it.
+
+
+SCENARIO 1153 — A cell target in the action-used line and the event log while a unit holds a reaction: `(4,4)`, a list of cells, a 2x2 unit
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new au AU 8 6
+!match use au
+!ent add mage Mage 30 3 2 20
+!ent add orc Orc 30 5 2 10
+!ent set_var mage actions.bolt.target location
+!ent set_var mage actions.bolt.body "x = 1"
+!action mage bolt 4 4
+?? `mage` used action `bolt` on `(4,4)`.
+!ent set_var orc actions.thorns.after "x = 1"
+!action mage bolt 4 4
+?? `mage` used action `bolt` on `(4,4)`.
+?! main
+!log 2
+?? used `bolt` → (4,4).
+?! Coord
+!ent set_var mage actions.rain.target location_list
+!ent set_var mage actions.rain.body "x = 1"
+!action mage rain 4 4 5 5
+!log 1
+!ent add ogre Ogre 50 6 4 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var mage actions.zap.target entity
+!ent set_var mage actions.zap.body "x = 1"
+!action mage zap ogre
+
+Expected: the mage's `bolt` targets a cell. With no reaction on the
+board the line reads "used action `bolt` on `(4,4)`". Once the orc holds a
+reaction (`thorns`), a typed action runs as an exchange, which keeps a
+cell as [x, y, map, named]: the action-used line read that list as four
+targets ("on `4, 4, main, False`"); it now reads the cell back as the
+action did, so the line is the same with or without reactions on the
+board. The event log's entry showed the target's Python form
+(`Coord(4, 4)`); it shows `(4,4)`, and a location_list as `(4,4), (5,5)`.
+A unit target (the 2x2 ogre) reads as before.
+
+
+SCENARIO 1154 — `!part remove` takes body parts only; a located or region part attached to another body arrives glued (a 2x2 ogre's head)
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+!match new pa PA 9 6
+!match use pa
+!ent add mage Mage 30 3 2 20
+!ent add ogre Ogre 50 5 1 10
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre head Head 10 10
+!part locate head 7 4
+!part add ogre belly Belly 12 12
+!part region belly center
+!part remove mage
+?? ❌ `mage` is not a body part (`!ent remove mage` removes a unit).
+!assert "cell_entity(3, 2) == 'mage'"
+!part attach mage head
+?? `head` is now a body part of `mage`.
+!assert "entity[head].x == 3 and entity[head].y == 2 and cell_entity(3, 2) == 'mage' and not var_has('head', '__part_located')"
+!ent tp mage 1 5
+!assert "entity[head].x == 1 and entity[head].y == 5 and cell_entity(7, 4) == ''"
+!part attach mage belly
+!assert "not var_has('belly', '__part_region') and entity[belly].x == 1"
+!part locate head 2 5
+!part detach head
+!part attach ogre head
+!assert "entity[head].x == 5 and entity[head].y == 1 and entities_at(5, 1) == ['ogre']"
+!part remove head
+?? Removed body part `head`.
+!assert "not has_part('ogre', 'Head')"
+
+Expected: `!part remove mage` is refused: the mage is no body part
+(it used to be removed, the reply calling it one); `!ent remove` removes a
+unit. The 2x2 ogre's head is a located part on (7,4). `!part attach mage
+head` moves it onto the mage's cell as a glued part: it used to keep
+`__part_located`, so it stood on (3,2) as a second occupant of the mage's
+cell. Glued, it follows the mage's teleport and its old cell is free. The
+ogre's `belly` (a region part) loses its region the same way. A located
+part detached (a free unit that still carried the var) and attached to
+the ogre arrives glued too: (5,1) holds only the ogre. `!part remove head`
+removes a real part.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1155 — A revive keeps the facing: a 2x2 body with a region part, a seat and a located part; a single unit
+------------------------------------------------------------------------------------------------------------------
+
+!match new rf RF 10 8
+!match use rf
+!ent add ogre Ogre 50 4 3 10
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var ogre slots.seat.capacity 1
+!ent set_var ogre slots.seat.region front
+!part add ogre tail Tail 10 10
+!part region tail back
+!part add ogre head Head 10 10
+!part locate head 7 3
+!ent face ogre left
+!ent face head up
+!ent add imp Imp 5 1 1 3
+!ent face imp right
+!mount imp ogre seat
+!assert "entity[imp].x == 4 and facing_of('ogre') == 'left' and facing_of('head') == 'up'"
+!ent kill ogre
+!ent revive ogre
+?? ✨ **Ogre** (`ogre`) was revived.
+!assert "facing_of('ogre') == 'left' and facing_of('head') == 'up' and entity[head].x == 7"
+!eval "footprint_cells('tail')"
+?? [[5, 3], [5, 4]]
+!ent kill imp
+!ent revive imp
+!assert "facing_of('imp') == 'right'"
+
+Expected: the 2x2 ogre faces left, its located head up, its `tail`
+covers the `back` region (the right column while it faces left) and the
+imp rides the `front` seat. Killed and revived, the ogre faces left again
+and the head up: a revive spawned the body and each part anew, which
+turned them the spawn_face_toward_center way, so a revived body's region
+parts and seats moved to other cells. The tail's region is the right
+column as before. A single unit (the imp, facing right) keeps its facing
+across its own death and revive too. A template's unit, a prefab's and a
+transform's restored parts already kept theirs.
+
+
+SCENARIO 1156 — One death per unit: soul-bonded units that kill each other in on_death, kill(self) in on_death; deaths still work afterwards
+--------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sb SB 8 6
+!match use sb
+!ent add ann Ann 20 1 1 9
+!ent add bob Bob 20 3 1 8
+!ent add cat Cat 20 5 1 7
+!ent add dan Dan 20 7 1 6
+!match var set deaths ""
+!gpassive add count on_death "match.deaths = match.deaths + self + ' '"
+!passive add ann bond on_death "kill('bob')"
+!passive add bob bond on_death "kill('ann')"
+!ent kill ann
+?! maximum recursion
+!assert "match.deaths == 'ann bob ' and has_corpse('ann') and has_corpse('bob')"
+!passive add cat spite on_death "kill(self)"
+!ent damage cat 30
+?? 💀 **Cat** (`cat`) died.
+?! FAILED
+!assert "match.deaths == 'ann bob cat '"
+!ent hp dan 0
+?? 💀 **Dan** (`dan`) died.
+!assert "match.deaths == 'ann bob cat dan '"
+!log type=death
+
+Expected: Ann and Bob each hold an on_death passive killing the other.
+`!ent kill ann` runs Ann's death, whose passive kills Bob, whose passive
+kills Ann again: her death is under way, so the kill does nothing (it
+answers True) and each dies once (`match.deaths` is `ann bob `, both
+leave a corpse). It used to start Ann's death again from the top, each
+level firing on_death anew until Python's stack ran out ("maximum
+recursion depth exceeded", dozens of death lines and log entries). Cat's
+`kill(self)` in its own on_death is the same case: one death, no error.
+A stack overflow there could also leave the death guard raised, after
+which no unit of the match died of its hp until a restart; Dan dying of
+`!ent hp dan 0` afterwards shows deaths still run. The event log holds
+four death entries.
+
+
+SCENARIO 1157 — A rollback restores a deferred re-sort: `!simulate` and `!dry` across a round end, a dry run that would have marked one
+---------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rb RB 8 6
+!match use rb
+!system set default turnorder_change_policy deferred
+!ent add a1 A1 5 1 1 5
+!ent add a2 A2 5 2 1 9
+!turn next
+!ent set_var a1 initiative 20
+?? New order takes effect at round end.
+!simulate 1 steps=3 !turn next
+!dry !batch turn next ; turn next
+!turn next
+!turn next
+?? 🔄 turn order re-sorted at round end.
+?? It is now **A1**'s turn
+!dry !ent set_var a2 initiative 30
+?? New order takes effect at round end.
+!turn next
+!turn next
+?! re-sorted
+?? It is now **A1**'s turn
+!assert "entity[a2].initiative == 9"
+
+Expected: under turnorder_change_policy deferred, A1's initiative
+rises to 20 mid-round, so the order is re-sorted at the round end. A
+`!simulate` and a `!dry` that play past the round end re-sort inside
+their run and are rolled back; the pending re-sort is game state (saved
+with the match), so the rollback puts it back: round 2 opens with "turn
+order re-sorted at round end" and A1 first. The rollback used to keep
+the flag as the run left it (cleared), so the promised re-sort never
+came and A2 went first. The other direction: `!dry !ent set_var a2
+initiative 30` marks a re-sort inside the dry run only, so round 3 opens
+without a re-sort line (it used to print one) and A2's initiative is
+still 9. The skipped-ATB-turn and watcher-backlog flags are restored the
+same way.
+
+
+SCENARIO 1158 — A rollback in the middle of a walk: damage_forecast and a failing use_action in on_entity_step (a 2x2 ogre), a forecast in a moving zone's on_moved
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new fw FW 10 8
+!match use fw
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 50 1 3 4
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add orc Orc 30 9 8 3
+!system set default hook_output_lines none
+!passive add hero fc on_entity_step "entity[self].seen = damage_forecast('orc', 5)"
+!ent move hero 3 right
+?? Moved `hero` 3 step(s) to (4,1)
+!assert "entity[hero].x == 4 and cell_entity(4, 1) == 'hero' and cell_entity(2, 1) == '' and entity[orc].hp == 30"
+!ent set_var ogre actions.oops.target none
+!ent set_var ogre actions.oops.body "entity[self].hp = 1\nfail('no')"
+!passive add ogre trip on_entity_step "use_action(self, 'oops')"
+!ent move ogre 4 right
+?? Moved `ogre` 4 step(s) to (5,3)
+!assert "entity[ogre].x == 5 and entity[ogre].hp == 50 and cell_entity(6, 4) == 'ogre' and cell_entity(1, 3) == ''"
+!zone fill cloud 1 6 1 6
+!zone hook add cloud on_moved "match.fc = damage_forecast('orc', 2)"
+!zone move cloud right 5
+?? Zone `cloud` stepped 5 of 5 cell(s) right.
+!assert "zone_cells('cloud') == [[6, 6]] and entity[orc].hp == 30"
+!ent push hero down 3
+!assert "entity[hero].y == 4"
+
+Expected: the hero's on_entity_step passive calls damage_forecast,
+which runs the packet and rolls the match back in place. `!ent move hero
+3 right` walks all three cells to (4,1): the rollback used to replace
+every unit's object, so the walk went on moving an object no longer in
+the match (the reply said 3 steps, the hero stood on (2,1)). The 2x2
+ogre's passive uses an action that fails (rolled back the same way: its
+hp stays 50); its walk of 4 ends on (5,3) with its whole body there. A
+zone whose on_moved hook forecasts walks its 5 steps. The orc the
+forecasts were about is untouched. A unit and a map present before and
+after a rollback now keep their objects, holding the restored state.
+
+
+SCENARIO 1159 — Tile and zone hook lines about a unit a team view can't see are dropped there, like a passive's: a moving zone, a walk, a turn start (a 2-wide lurker)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new hv HV 12 6
+!match use hv
+!ent add scout Scout 20 1 1 9
+!ent add lurker Lurker 20 10 5 5
+!ent set_vars scout team=blue fog_vision_radius=2
+!ent set_vars lurker team=red fog_vision_radius=2 footprint_w=2
+!match fog on
+!zone fill saw 9 5 9 5
+!zone hook add saw on_enter "deal_damage(self, 3)"
+!zone hook add saw on_turn_start "entity[self].hp"
+!tile set 10 4 hooks.on_enter "entity[self].hp"
+!tile set 2 1 hooks.on_enter "entity[self].hp"
+!zone move saw right 1
+?? ⚙️ zone `saw` hook `on_enter` fired for `lurker` → {'hp': 3}
+?? takes 3 damage
+!as view blue
+!zone move saw left 1
+!zone move saw right 1
+?? Zone `saw` stepped 1 of 1 cell(s) right.
+?! lurker
+?! 'hp': 3
+!ent move lurker 1 up
+?! fired
+?! → 14
+!ent move scout 1 right
+?? ⚙️ tile (2,1) hook `on_enter` fired for `scout` → 20
+!turn next
+!turn next
+?? an unseen unit's turn
+?! lurker
+?! fired
+!as view clear
+!ent move lurker 1 down
+!turn next
+!turn next
+?? ⚙️ zone `saw` hook `on_turn_start` fired for `lurker` → 11
+
+Expected: under fog the blue scout can't see the red lurker (2 cells
+wide). In the omniscient channel a zone moving onto the lurker prints its
+hook line ("zone `saw` hook `on_enter` fired for `lurker` → {'hp': 3}")
+and the damage line. Under the blue view the same move prints only the
+zone's own reply: a tile's or zone's hook line is a line about the unit
+it fired for, tagged like a passive's or a status hook's, so a channel
+whose view can't see that unit drops it. It used to name the hidden
+unit and print what the hook returned about it (here its hp) in the
+team's channel, on a zone move, on the unit's walk over a tile hook and
+at its turn start. Hook lines about a unit the view sees (the scout's
+tile hook) still show, and the omniscient channel sees all of them.
+
+
+SCENARIO 1160 — A barrel chain: lethal damage dealt from on_death kills, one death after another; kill credit; death_chain_limit (a 2x2 keg)
+--------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new bc BC 12 6
+!match use bc
+!ent add b1 Barrel 5 1 1 5
+!ent add b2 Barrel 5 2 1 5
+!ent add b3 Barrel 5 3 1 5
+!ent add keg Keg 8 4 1 5
+!ent set_vars keg footprint_w=2 footprint_h=2
+!ent add b4 Barrel 5 6 2 5
+!ent add hero Hero 30 7 3 9
+!match var set deaths ""
+!gpassive add boom on_death "match.deaths = match.deaths + self + '<' + str(killer) + ' '\nif self != 'hero':\n    for u in entities_within(self, 1):\n        deal_damage(u, 10, attacker=self)"
+!system set default hook_output_lines none
+!ent add archer Archer 20 12 6 8
+!ent damage b1 10 from=archer
+?? 💀 **Barrel** (`b1`) died.
+?? 💀 **Keg** (`keg`) died.
+?? 💀 **Barrel** (`b4`) died.
+?? 🩸 **Hero** (`hero`) takes 10 damage from Barrel.
+!assert "match.deaths == 'b1<archer b2<b1 b3<b2 keg<b3 b4<keg '"
+!assert "entity[hero].hp == 20 and has_corpse('keg') and len(all_corpses()) == 5"
+!undo command
+!assert "entity[b2].hp == 5 and match.deaths == ''"
+!system set default death_chain_limit 2
+!ent damage b1 10
+?? ⚠️ 2 deaths followed one another (death_chain_limit): the death checks of `keg` were not run.
+!assert "match.deaths == 'b1<None b2<b1 b3<b2 ' and entity[keg].hp == -2 and entity[b4].hp == 5"
+!ent hp keg -1
+?? 💀 **Keg** (`keg`) died.
+!assert "has_corpse('keg') and has_corpse('b4') and entity[hero].hp == 20"
+
+Expected: every barrel's on_death deals 10 damage to the units within 1
+cell, naming itself as the attacker. The archer's shot kills b1; its
+explosion brings b2 to -5 hp while b1's death is still under way, where a
+unit's death check is held. Once b1's death has finished the held checks
+run, one unit after another in the order they were hit: b2 dies and its
+explosion reaches b3, b3's the 2x2 keg (within 1 of its nearest cell),
+the keg's b4, b4's the hero, who survives at 20. Each on_death reads its
+`killer`: the archer for b1, then each barrel for the next (`b1<archer
+b2<b1 b3<b2 keg<b3 b4<keg`). Before, b2 stayed in the match alive at -5 hp
+and the chain stopped there. One `!undo command` takes the whole chain
+back. With death_chain_limit 2 the first death may set off two more (b2,
+b3); the keg, brought to -2 hp by b3, is named in the warning and stays,
+and b4 is untouched. Its next change (`!ent hp keg -1`) runs its death,
+and the chain goes on through b4 to the hero. kill() inside on_death
+still kills at once (1156).
+
+
+SCENARIO 1161 — An open reaction window holds a macro's lines, `!dry` and `!simulate` like typed commands; a reaction's own cmd() still runs (a 2x2 attacker)
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rh RH 8 8
+!match use rh
+!ent add orc Orc 30 1 1 5
+!ent set_vars orc footprint_w=2 footprint_h=2
+!ent add hero Hero 30 3 1 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = 10"
+!ent set_var orc actions.cleave.body "deal_damage(target, damage)"
+!ent set_var hero actions.sidestep.reacts_to melee
+!ent set_var hero actions.sidestep.before "incoming.damage = incoming.damage - 6\ncmd('ent move ' + self + ' 1 right')"
+!macro set adv "turn next"
+!macro set hit "action orc cleave hero"
+!macro set round "action orc cleave hero\nreact hero pass\nturn next"
+!turn next
+!action orc cleave hero
+?? `!react hero sidestep`
+!macro run adv
+?? ❌ A reaction window is open
+!macro run hit
+?? ❌ A reaction window is open
+!dry !turn next
+?? ❌ A reaction window is open
+!simulate 1 !action orc cleave hero
+?? 1 run(s) had a ❌ reply
+!assert "entity[hero].hp == 30 and turns_elapsed() == 1"
+!react hero sidestep
+?? `orc` used action `cleave`
+!assert "entity[hero].hp == 26 and entity[hero].x == 4"
+!macro run round
+?? It is now **Hero**'s turn
+!assert "entity[hero].hp == 16 and turns_elapsed() == 2"
+!system set default reaction_hold_commands false
+!action orc cleave hero
+!macro run adv
+?? It is now **Orc**'s turn
+!react hero pass
+!assert "entity[hero].hp == 6"
+
+Expected: the 2x2 orc's cleave on the hero opens a before window. While
+it is open, `!turn next` and `!action` are refused however they arrive: a
+host's macro (`adv`, `hit`), `!dry` (its report shows the refusal the real
+command would get) and `!simulate` (the run counts as one with a ❌
+reply). The hold used to be checked only for typed commands and the gated
+lines of a batch or foreach, so a macro advanced the turn under the
+window and a macro's action resolved at once, unoffered. Nothing moved
+(hero 30, one turn elapsed). The hero's `sidestep` then answers: its
+before half lowers the damage and steps the hero aside with `cmd('ent
+move ...')`, a line an action body dispatches, which the window doesn't
+hold (26 hp, x 4). A macro that answers its own window (`round`: the
+action, `react hero pass`, `turn next`) runs through. With
+reaction_hold_commands off nothing is held, as before.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1162 — A cell target prints as a cell in a formula's own text: str(target), fmt(), a list of cells
+-----------------------------------------------------------------------------------------------------------
+
+!match new cs CS 8 6
+!match use cs
+!ent add mage Mage 30 3 2 20
+!ent set_var mage actions.bolt.target location
+!ent set_var mage actions.bolt.body "say('bolt lands on ' + str(target))"
+!ent set_var mage actions.rain.target location_list
+!ent set_var mage actions.rain.body "entity[self].note = fmt('cells {c}', c=target)"
+!ent set_var mage actions.fizz.target location
+!ent set_var mage actions.fizz.body "fail('no')"
+!gpassive add f on_action_failed "say('failed at ' + str(target), about=None)"
+!action mage bolt 4 4
+?? bolt lands on (4,4)
+?! Coord
+!action mage rain 4 4 5 5
+!eval "entity[mage].note"
+?? cells [(4,4), (5,5)]
+!action mage fizz 6 1
+?? failed at (6,1)
+
+Expected: a location target is a cell object with `.x` / `.y`. Turned
+into text by a formula (`str(target)`, a `fmt()` field, alone or in a
+location_list) it reads as the cell, `(4,4)`, the way replies write one;
+it used to print its Python form (`Coord(4, 4)`). The on_action_failed
+passive of a failing action reads its target the same way.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1163 — A pause stops the commands a host opened to players, and holds a host's under pause_affects_hosts; an opened read still works (a 2x2 ogre)
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new pz PZ 8 6
+!match use pz
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var ogre actions.wave.target none
+!ent set_var ogre actions.wave.body "entity[self].waved = entity[self].waved + 1"
+!ent set_var ogre waved 0
+!host access set action all
+!host access set "ent move" all
+!host access set "ent dump" all
+!as player bob
+!ent move ogre 1 right
+?? Moved `ogre` 1 step(s) to (3,2)
+!as host
+!match pause rules question
+!as player bob
+!ent move ogre 1 right
+?? ⏸ **PZ** is paused
+!action ogre wave
+?? ⏸ **PZ** is paused
+!foreach hp>0 ; ent move $id 1 down
+?? ⏸ **PZ** is paused
+!ent dump ogre
+?? "waved": 0
+!ent info ogre short
+?? Position: (3,2)
+!as host
+!ent move ogre 1 down
+?? Moved `ogre` 1 step(s) to (3,3)
+!system set default pause_affects_hosts true
+!action ogre wave
+?? `!action ogre wave` is held
+!assert "entity[ogre].waved == 0 and entity[ogre].y == 3"
+!match resume
+?? `ogre` used action `wave`.
+!as player bob
+!action ogre wave
+?? `ogre` used action `wave`.
+!as host
+!assert "entity[ogre].waved == 2"
+
+Expected: the host opened `!action`, `!ent move` and the read `!ent
+dump` to players (`!host access set ... all`), so bob moves the 2x2 ogre
+without approval. During a pause his move, his action and a `!foreach`
+of moves are refused with the pause message: they change the match,
+whatever the access override says. The pause used to judge "changes the
+match" by the overridden level, so a command opened to players read as
+a read and kept running through every pause. The opened read (`!ent
+dump`) and the ordinary reads still work. A host keeps playing; with
+pause_affects_hosts on, the host's own `!action` is held (it used to
+run for the same reason) and runs at `!match resume`. After the resume
+bob's action runs again (waved 2).
+
+
+SCENARIO 1164 — Approving a request whose command an open reaction window holds keeps the request; `!approve all` runs the rest
+-------------------------------------------------------------------------------------------------------------------------------
+
+!match new ra RA 8 8
+!match use ra
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = 10"
+!ent set_var orc actions.cleave.body "deal_damage(target, damage)"
+!ent set_var hero actions.block.reacts_to melee
+!ent set_var hero actions.block.before "incoming.damage = incoming.damage - 6"
+!turn next
+!as player bob
+!turn next
+?? needs host approval (request `r1`
+!ent hp hero -1
+?? needs host approval (request `r2`
+!as host
+!action orc cleave hero
+?? `!react hero block`
+!approve r1
+?? ⏳ `r1` (`!turn next`, by bob) waits: a reaction window is open
+?? The request stays pending
+!approve all
+?? ⏳ `r1` (`!turn next`, by bob) waits
+?? ✅ Approved `r2` (!ent hp hero -1, by bob).
+!pending
+?? `r1` by bob: `!turn next`
+?! r2
+!assert "entity[hero].hp == 29 and turns_elapsed() == 1"
+!react hero block
+!approve r1
+?? ✅ Approved `r1` (!turn next, by bob).
+?? It is now **Hero**'s turn
+!assert "entity[hero].hp == 25 and turns_elapsed() == 2"
+
+Expected: bob's `!turn next` (r1) and `!ent hp hero -1` (r2) wait for
+approval when the orc's cleave opens a reaction window. `!approve r1` is
+answered with why it waits, and the request stays pending: it used to be
+marked approved and used up while the window refused the command, so the
+player's request was lost under a reply saying it "waits". `!approve all`
+skips r1 the same way and runs r2 (a silent hp write the window doesn't
+hold: hero 29). `!pending` still lists r1. Once the hero has answered
+(block: 10 - 6 = 4 damage, hero 25) the same `!approve r1` runs the turn
+change. The Discord Approve button answers the same way and keeps its
+buttons.
+
+
+SCENARIO 1165 — !dry shows what a command's watchers would do
+--------------------------------------------------------------
+!match new dw DW 8 6
+!match use dw
+!ent add ogre Ogre 30 1 1 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add hero Hero 30 6 5 3
+!status def wet
+!zone fill pond 4 4 5 5
+!zone grant pond wet
+!watch add low "entity[ogre].hp < 5" "say('the ogre staggers', about=None)\nentity[ogre].staggered = 1"
+!watch add soaked "status_has('ogre', 'wet')" "entity[hero].saw_it = 1"
+!dry !ent hp ogre 3
+?? the ogre staggers
+?? vars.staggered: (unset) -> 1
+?? vars.hp: 30 -> 3
+!assert "entity[ogre].hp == 30 and not var_has('ogre', 'staggered')"
+!dry !ent tp ogre 3 3
+?? status.wet: added
+?? vars.saw_it: (unset) -> 1
+!assert "not status_has('ogre', 'wet') and not var_has('hero', 'saw_it')"
+!ent hp ogre 3
+?? the ogre staggers
+!assert "entity[ogre].staggered == 1"
+!ent tp ogre 3 3
+!assert "status_has('ogre', 'wet') and entity[hero].saw_it == 1"
+
+Expected: a 2x2 ogre, a watcher `low` on its hp and a watcher `soaked` on
+the status the pond zone grants. `!dry !ent hp ogre 3` prints the
+watcher's line ("the ogre staggers") and lists `vars.staggered` beside
+the hp change; `!dry !ent tp ogre 3 3` (one of the ogre's four cells in
+the pond) lists the granted status and the write of the watcher that
+status set off. A dry run used to stop before the watcher poll, so it
+showed less than the command then did. Nothing is kept either time; the
+real commands then do exactly what the dry runs listed.
+
+
+SCENARIO 1166 — !zone anchor reads its unit through the channel's view; transform names its form
+--------------------------------------------------------------------------------------------------
+!match new za ZA 12 6
+!match use za
+!ent add scout Scout 20 1 1 9
+!ent add lurker Lurker 20 10 5 5
+!ent set_vars scout team=blue fog_vision_radius=2
+!ent set_vars lurker team=red fog_vision_radius=2 footprint_w=2
+!match fog on
+!zone fill glow 1 1 1 1
+!host access set "zone anchor" all
+!as player bob
+!as view blue
+!zone anchor glow lurker 1
+?? ❌ Could not find a unit named `lurker`. Either it does not exist, or this channel currently does not have permission to view it.
+!zone anchor glow nobody 1
+?? ❌ Could not find a unit named `nobody`. Either it does not exist, or this channel currently does not have permission to view it.
+!zone anchor glow scout 1
+?? Anchored `glow` to `scout`
+!as view clear
+!as host
+!zone anchor glow lurker 1
+?? Anchored `glow` to `lurker` (radius 1, square_radius): 12 cell(s).
+!zone anchor glow current
+?? Anchored `glow` to `scout`
+!eval "transform('scout', 'lurker', 'form')"
+?? ❌ transform: the form is a statblock dict (entity_snapshot(<unit>), template_data(<template>) or a var holding one), got 'lurker'.
+!eval "transform('scout', entity_snapshot('lurker'), 'form')"
+?? = `'scout'`
+!assert "footprint_width('scout') == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!zone anchor` opened to players: under
+blue's view the fogged 2-wide `lurker` reads exactly like a unit that
+doesn't exist (the command used to answer "Anchored" for the hidden unit
+and "Entity 'nobody' not found" for the missing one, an existence
+oracle, and anchored the aura to a unit the view can't see). A host
+still anchors to it (12 cells around the 2x1 body) and can name the unit
+by token (`current`). `transform()` given a unit id for its form says
+what a form is; with `entity_snapshot('lurker')` the scout takes the
+2-wide body.

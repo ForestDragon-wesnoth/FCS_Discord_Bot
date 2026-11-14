@@ -2568,3 +2568,114 @@ differential on the whole suite.
     reaching the units inside (L40).
   - Left open: the action half of X13 (every action serializes the
     match) and formula namespaces at ~2 ms for other conditions.
+
+## Pass 51 (chaos on the newest features: moving zones, the corpse store, damage packets, reactions)
+
+By hand, after #178-#180. A stateful chaos harness (about 90 command
+shapes on a two-map board with a 2x2 body with glued / located / region
+parts, a snake, a vehicle with a rider in a region seat, an aura, granting
+and moving zones, zone definitions placed as objects, lava tiles, voids,
+a corpse, damage steps, reactions, a watcher, templates and a prefab,
+and hostile global passives and zone hooks added at random: kill(self),
+remove_entity(self), delete_zone, zone_step), with the live board feeding
+the id pools. After every command: no 💥 / Runtime error / console
+traceback, the JSON round trip of every match, no dangling part / mount /
+follow / map-vehicle ids, bodies and zone cells on the map, the turn
+order's ids, guards at rest, one occupant per cell, all under
+FCS_SPATIAL_CHECK=1; the full state compared across every `!as restart`;
+at the end each match's journal exported and replayed on a fresh server.
+About 14,000 commands over 40 seeds (the restart and replay checks on
+the last 24). No crash; the findings came from the
+invariants, the replay and from reading replies. Scenarios 1153-1159;
+verified after: 1159/1159, also under FCS_SPATIAL_CHECK=1.
+  - **Rollbacks** (1157, 1158): three flags saved under other key names
+    (the deferred re-sort, the skipped ATB turn, the watcher backlog) were
+    still in `_rollback_match`'s preserve list, so a `!simulate` / `!dry`
+    / failed action kept what its run left: one that played past a round
+    end cancelled a pending deferred re-sort (found as a replay
+    divergence: the dry run isn't journaled, the flag is hashed). And a
+    rollback replaced every Entity and Map object: `damage_forecast` or a
+    failing `use_action` inside on_entity_step left the walk moving an
+    object out of the match (reply: 3 steps; the unit: 1). Units and maps
+    present on both sides keep their objects now.
+  - **Deaths** (1156): `kill()` of a unit whose on_death was running
+    started its death again (two units killing each other there, or
+    kill(self)): unbounded recursion to Python's stack limit, dozens of
+    death lines and log entries; a stack overflow between the guard's
+    increment and its `try` left `_death_processing` raised, after which
+    no unit of the match died of its hp until a restart. One death per
+    unit (`_dying_ids`).
+  - **Bodies** (1154, 1155): a located / region part attached to another
+    body kept its mode and stood on the new parent's cell as a second
+    occupant; `!part remove` removed any unit; a revive re-faced the body
+    and its parts the spawn way, moving region parts and seats.
+  - **Lines** (1153, 1159): the action-used line of a resolved exchange
+    listed a cell target's stored form ("on `4, 4, main, False`"); the
+    event log printed `Coord(4, 4)`; tile and zone hook lines named a
+    unit the channel's view can't see (passive lines were tagged in pass
+    50, these weren't).
+  - Answered after the pass (user call, 1160): lethal damage dealt from
+    another unit's on_death left its victim alive at hp <= 0 (the
+    match-wide death guard held the check and nothing re-ran it). Held
+    checks are re-run when the outermost death finishes, in sequence, up
+    to `death_chain_limit`. `!zone move` stays unheld during a reaction
+    window, like `!ent tp`.
+  - Clean: the corpse store (id reservation against spawns, clones,
+    template and prefab ids, transfers and copies into a match holding the
+    corpse, resize, replace stamps, revive of parts), zone draw layers and
+    facing across prefabs / map copies / resizes / restarts, zone move
+    argument forms and access, damage packets against odd pools and
+    amounts, reactions when the attacker or the target dies mid-window.
+
+## Pass 52 (the nested dispatch path against the typed one; the replay differential over the whole suite)
+
+By hand, on the code pass 51 touched and the two paths a command takes
+(`_run_body` for a typed command, `dispatch_no_snapshot` for a line of a
+batch / macro / foreach / `!run` / `!dry` / `!simulate`). Harnesses: the
+stateful chaos harness on two more boards (statuses, transforms, mounts,
+a nested map and templates; reactions with open windows), invariants,
+restart differential and journal replay after every step; the replay
+differential over every scenario (1,255 journals, 0 differences); a POV
+sweep as a blue-view player.
+  - **Reaction window** (1161): the hold was checked for typed commands
+    and for gated lines only, so a host's macro, a `!run` file, `!dry`
+    and `!simulate` ran `!turn next` or an action under an open window
+    (the action resolving unoffered, the turn moving on under a pending
+    exchange). Every dispatched line is held now, outside a running
+    action's own `cmd()` lines.
+  - **Pause** (1163): "changes the match" read the access level AFTER
+    overrides, so `!host access set "ent move" all` made a paused match
+    take players' moves, and under `pause_affects_hosts` a host's too.
+    Judged by the command's own level as well.
+  - **Cell text** (1162): a location target inside `fmt()` / `say()` /
+    `log()` printed `Coord(4, 4)`; it prints `(4,4)`.
+  - Clean: journals of every scenario replay to the recorded hash; the
+    POV sweep's hits were a corpse sharing a hidden unit's name and
+    visible units presenting a hidden unit's disguise.
+
+## Pass 53 (approvals, `!dry` fidelity, existence oracles on opened commands, command-vs-formula parity)
+
+Harnesses: command-vs-formula parity on identical boards (57 operation
+pairs: 51 identical end states, the rest by design, such as a packet's
+`source` naming `command`); the existence-oracle detector as a blue-view
+player over ~200 commands, 64 of them opened by overrides (0 differences
+left but `$()` reading a hidden unit, which `inline_args_access` closes);
+a model-based undo differential (its hits were turn autosaves, by
+design); pyflakes over the code (no undefined names).
+  - **Approvals** (1164): `!approve` of a command an open reaction window
+    holds marked the request approved and used it up while the window
+    refused the command; the reply said it "waits" and the request was
+    gone. It stays queued (`approval_waits`), in `!approve all` and the
+    Discord button too.
+  - **`!dry`** (1165): a dry run stopped before the watcher poll and the
+    empty-map sweep, so it listed less than the command then did (no
+    watcher effects, no statuses a watcher's write granted, a
+    `__delete_when_empty` map still listed).
+  - **Oracle** (1166): `!zone anchor` took its unit id raw: for a player
+    it was opened to, a fogged unit answered "Anchored" and a missing one
+    "not found", and the aura anchored to a unit the view can't see; no
+    tokens (`current`) either.
+  - **Wording** (1166): `transform()` given a unit id or a template name
+    answered "template must be a dict"; it says what a form is and how
+    to get one.
+

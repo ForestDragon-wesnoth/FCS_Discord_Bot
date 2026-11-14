@@ -711,11 +711,16 @@ class CommandRegistry:
                            f"foreach or player-written macro for you: it "
                            f"needs a host (send it on its own).")
             return
-        if _GATE_LINES.get():
-            held = _reaction_hold_refusal(ctx, mgr, name, args)
-            if held:
-                await ctx.send(held)
-                return
+        # An open reaction window holds every dispatched line as it holds a
+        # typed command (it was checked for gated lines only, so a host's
+        # macro, a `!run` file, `!dry` and `!simulate` ran `!turn next` or
+        # an action under the window, the action resolving unoffered).
+        # Lines an action body dispatches aren't held: the halves and the
+        # body resolving the window run inside one.
+        held = _reaction_hold_refusal(ctx, mgr, name, args)
+        if held:
+            await ctx.send(held)
+            return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
         # caller's current context. Same raw_args gate as run().
@@ -1198,12 +1203,26 @@ class CommandRegistry:
         # pause_affects_hosts a host's are held for `!match resume`.
         if not admin_cmd and not _library_edit_ok(ctx, name, args):
             pm = self._paused_match(ctx, mgr)
-            if pm is not None and self._effective_access(
-                    name, args, pm, ctx_user(ctx), ctx_role_ids(ctx)) != "all":
+            # "Changes the match" is the command's OWN level: an access
+            # override opening `!action` or `!ent move` to players made
+            # them read as reads here, so the pause stopped neither the
+            # players' moves nor, under pause_affects_hosts, a host's.
+            if pm is not None and (
+                    self._effective_access(
+                        name, args, pm, ctx_user(ctx),
+                        ctx_role_ids(ctx)) != "all"
+                    or self._effective_access(
+                        name, args, None, ctx_user(ctx),
+                        ctx_role_ids(ctx)) != "all"):
                 if gate == "queue":
                     return await ctx.send(_paused_msg(pm))
+                control = _pause_control(name, args)
+                if not control and not _acts_as_host(ctx, pm):
+                    # Opened to this player by an override: still a
+                    # command that changes the match.
+                    return await ctx.send(_paused_msg(pm))
                 if (bool(pm.rules.get("pause_affects_hosts", False))
-                        and not _pause_control(name, args)):
+                        and not control):
                     return await self._hold_command(pm, name, args, ctx)
         # An open reaction window holds the commands that would move the
         # game on under it (reaction_hold_commands, #36): refused, never
@@ -9055,6 +9074,12 @@ async def approve_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("No pending requests.")
         rids = sorted(m.pending_requests.keys(), key=lambda r: int(r[1:]))
         for rid in rids:
+            m = mgr.matches.get(m.id, m)    # an approved undo replaces it
+            waits = approval_waits(m, m.pending_requests.get(rid) or {
+                "name": "", "args": []})
+            if waits:
+                await ctx.send(waits)
+                continue
             req = m.pop_pending_request(rid)
             if req is None:     # an earlier approved command dropped it
                 continue
@@ -9069,10 +9094,35 @@ async def approve_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     for req in gone:
         if req["id"] == target:
             return await ctx.send(_expired_refusal(m, req))
+    waits = approval_waits(m, m.pending_requests.get(target) or {
+        "name": "", "args": []})
+    if waits:
+        return await ctx.send(waits)
     req = m.pop_pending_request(target)
     if req is None:
         return await ctx.send(f"❌ No pending request `{target}`.")
     await _run_approved(req, ctx, mgr)
+
+
+def approval_waits(m: Any, req: dict) -> Optional[str]:
+    """Why approving `req` has to wait, else None: its command is one an
+    open reaction window on `m` holds (reaction_hold_commands). Approved
+    anyway, the request was used up and the command refused, so the
+    player's request was lost while the reply said it "waits". The request
+    stays queued."""
+    if m is None or m.reaction_exchange is None \
+            or not m.rules.get("reaction_hold_commands", True) \
+            or not _reaction_held(req["name"], list(req["args"])):
+        return None
+    import reactions
+    if reactions.expired(m):
+        return None
+    cmd = "!" + req["name"] + (" " + " ".join(req["args"])
+                               if req["args"] else "")
+    return (f"⏳ `{req['id']}` (`{cmd}`, by {req['user_name']}) waits: a "
+            f"reaction window is open (`!react` shows it), and this "
+            f"command can't run under it. The request stays pending: "
+            f"approve it once the window is closed.")
 
 
 async def _run_approved(req: dict, ctx: ReplyContext, mgr: MatchManager):
@@ -21864,7 +21914,10 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "anchor"):
             return
         name = args[1]
-        eid = args[2]
+        # Through the view, like every unit a typed command names: a
+        # player the command was opened to anchored a zone to a unit their
+        # view hides, and learned it exists.
+        eid = _resolve_eid(m, args[2])
         radius = 0
         metric = "square_radius"
         if len(args) >= 4:
@@ -23975,6 +24028,10 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         part_id = _resolve_eid(m, args[1])
         if part_id not in m.entities:
             return await ctx.send(f"❌ Entity `{part_id}` not found.")
+        if not m.entities[part_id].part_of:
+            # It removed any unit and called it a body part.
+            return await ctx.send(f"❌ `{part_id}` is not a body part "
+                                  f"(`!ent remove {part_id}` removes a unit).")
         sever = m.despawn_entity(m.entities[part_id])
         return await ctx.send("\n".join([f"Removed body part `{part_id}`."]
                                          + sever))
@@ -24981,6 +25038,7 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     await ctx.send(f"🧪 Dry run of `!{' '.join([name] + rest)}` — none of "
                    f"this is kept:")
     token = _DRY_ACTIVE.set("dry")
+    watcher_lines: List[str] = []
     try:
         await registry.dispatch_no_snapshot(name, rest, ctx, mgr)
     finally:
@@ -24992,6 +25050,20 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             after.surface_log(after.sync_touched_sizes())
         if after is not None and after._grants_present():
             after.surface_log(after.sync_zone_grants())
+        # The watchers it would fire, as the real command's poll does
+        # (`!simulate` polled, `!dry` didn't: a watcher's effect was
+        # missing from its lines and its change list), then the grants a
+        # watcher's effect moved and a wreck left empty.
+        if after is not None and getattr(after, "_action_depth", 0) == 0:
+            if after.has_watchers():
+                fired = getattr(after, "_watchers_fired", 0)
+                watcher_lines.extend(str(ln) for ln in after.fire_watchers())
+                if getattr(after, "_watchers_fired", 0) != fired \
+                        and after._grants_present():
+                    after.surface_log(after.sync_zone_grants())
+            if any(mp.vars.get("__delete_when_empty") is True
+                   for mp in after.maps.values()):
+                watcher_lines.extend(after.sweep_empty_maps())
         post = after.to_dict(include_history=False) if after is not None \
             else None
         _restore_all_matches(mgr, snap)
@@ -25011,6 +25083,9 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     x._rng = CountingRandom(gen_seed)
                 x._rng.setstate(state)
                 x._rng_seed = gen_seed
+    await _flush_formula_log(ctx)
+    if watcher_lines:
+        await ctx.send("\n".join(watcher_lines))
     pre = snap["matches"].get(mid)
     if post is None:
         return await ctx.send("🧪 It would have deleted this match; rolled "
@@ -27941,6 +28016,8 @@ def _reaction_hold_refusal(ctx: ReplyContext, mgr: MatchManager,
     if m is None or m.reaction_exchange is None \
             or not m.rules.get("reaction_hold_commands", True):
         return None
+    if getattr(m, "_action_depth", 0) > 0:
+        return None         # a cmd() line of an action that is running
     import reactions
     if reactions.expired(m):
         return None

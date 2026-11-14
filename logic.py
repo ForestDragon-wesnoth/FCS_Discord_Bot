@@ -2963,6 +2963,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "knockback pushing the next unit) makes one move per hop."
         ),
     },
+    "death_chain_limit": {
+        "default": 200,
+        "schema": {"type": "int", "min": 1, "max": 100000, "ceiling": True},
+        "desc": (
+            "Max deaths one death may set off in turn. While a unit dies, "
+            "its on_death effects can bring other units to their death "
+            "condition (an exploding barrel damaging its neighbours); "
+            "their death checks wait until that death has finished, then "
+            "run one after another in the order the units were hit, each "
+            "new death adding the units it brought down (a chain of "
+            "barrels). Past this count the units still at their death "
+            "condition stay as they are, with one warning: two effects "
+            "that revive and kill each other would never end. kill() "
+            "inside on_death kills at once and isn't counted."
+        ),
+    },
     "move_hook_recursion_limit": {
         "default": 16,
         "schema": {"type": "int", "min": 1, "max": 48, "ceiling": True},
@@ -13454,6 +13470,24 @@ class Match:
     _death_check_suppressed_ids: Set[str] = field(
         default_factory=set, repr=False, compare=False
     )
+    # The units whose death pipeline is running (_process_death): a kill()
+    # of one of them from an on_death passive doesn't start it again. Not
+    # serialized.
+    _dying_ids: Set[str] = field(
+        default_factory=set, repr=False, compare=False
+    )
+    # Death checks held while another unit's death ran (check_death under
+    # _death_processing): unit id -> the damage packet's kill credit at
+    # that moment (PACKET_KILLER) or None, in the order the units were hit.
+    # Re-run one after another when the outermost death finishes
+    # (_drain_held_deaths), so an on_death effect that brings another unit
+    # to its death condition does kill it. _death_depth counts the
+    # _process_death calls under way (the whole pipeline, riders and maps
+    # included); _death_draining marks the re-run. Not serialized.
+    _death_recheck: Dict[str, Any] = field(
+        default_factory=dict, repr=False, compare=False)
+    _death_depth: int = field(default=0, repr=False, compare=False)
+    _death_draining: bool = field(default=False, repr=False, compare=False)
     # Units whose automatic death check waits until a multi-var command
     # (`!ent set_vars`) has written every var; the command runs the check
     # itself afterwards. Unlike _death_check_suppressed_ids it leaves the
@@ -16648,7 +16682,8 @@ class Match:
 
     def attach_part(self, parent_id: str, part_id: str) -> "Entity":
         """Link an EXISTING entity as a body part of `parent_id`, moving it
-        onto the parent's cell with its auras, riders and glued parts. Raises
+        onto the parent's cell (glued: a located or region part of another
+        body loses that mode) with its auras, riders and glued parts. Raises
         NotFound / VTTError for itself, another map, a parent that is one of
         its own parts (a loop), a map carrier, a snake segment or a mounted
         rider; a part of someone else just re-points."""
@@ -16691,8 +16726,16 @@ class Match:
         if p.mounted_on:
             raise VTTError(f"`{part_id}` is riding `{p.mounted_on}`; "
                            f"dismount it first.")
+        # It arrives glued, on the parent's cell: a part located on (or a
+        # region of) its old body, or a detached one still carrying the
+        # var, stood on the new parent's cell as a second occupant.
+        for k in ("__part_located", "__part_region"):
+            if k in p.vars:
+                p.vars.pop(k, None)
+                p.mark_changed()
         p.part_of = parent_id
         p.x, p.y = parent.x, parent.y
+        self._spatial.touch(p.id)       # its kind of part changed
         # What it carries comes along: its auras, riders and glued parts.
         self._restamp_anchors_for(part_id)
         self._restamp_parts_for(part_id)
@@ -22002,21 +22045,35 @@ class Match:
         # Log-line tag: show "for `eid`" when there's an acting entity,
         # otherwise "(no acting entity)" for time hooks during a wrap.
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        # Read before the hook runs: it may remove the unit.
+        about = _hook_line_tag(self, entity_id or "")
         try:
             result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return hook_output(self, "error",
-                               f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
-                               f"FAILED: {ex}")
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
+                f"⚠️ tile ({x},{y}) hook `{when}` {tag} FAILED: {ex}"))
         except Exception as ex:
             # Defensive: any non-FormulaError exception is a bug, but
             # don't bring down the move on it.
             ref = crash_ref(f"tile ({x},{y}) hook `{when}` {tag}", ex)
-            return hook_output(self, "error",
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
                 f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
-        return self._hook_fired(f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}",
-                                result)
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"))
+        return self._hook_lines_about(entity_id, about, self._hook_fired(
+            f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}", result))
+
+    def _hook_lines_about(self, entity_id: Optional[str], about: str,
+                          lines: List[str]) -> List[str]:
+        """A tile or zone hook's lines (fired, result, error) tagged as
+        lines about the unit it fired for, like a passive's
+        (_run_passive_safely): a channel whose view can't see that unit
+        drops them. They used to name a hidden unit, and print what the
+        hook returned about it, in a team's channel. `about` is the tag
+        read before the hook ran (it may have removed the unit)."""
+        return Match.tag_lines(
+            about or _hook_line_tag(self, entity_id or ""), lines)
 
     def _hook_fired(self, line: str, result: Any) -> List[str]:
         """A tile or zone hook's fired line (with `→ result` when its
@@ -22068,19 +22125,22 @@ class Match:
             extras=extras,
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        # Read before the hook runs: it may remove the unit.
+        about = _hook_line_tag(self, entity_id or "")
         try:
             result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return hook_output(self, "error",
-                               f"⚠️ zone `{name}` hook `{when}` {tag} "
-                               f"FAILED: {ex}")
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
+                f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"))
         except Exception as ex:
             ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
-            return hook_output(self, "error",
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
-        return self._hook_fired(f"⚙️ zone `{name}` hook `{when}` fired {tag}",
-                                result)
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"))
+        return self._hook_lines_about(entity_id, about, self._hook_fired(
+            f"⚙️ zone `{name}` hook `{when}` fired {tag}", result))
 
     def fire_zone_exit_hooks(self, entity_id: Optional[str],
                              fx: int, fy: int, tx: int, ty: int,
@@ -22326,19 +22386,22 @@ class Match:
                     "zone_map": mp.name, "hook_name": when, **(extra or {})},
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        # Read before the hook runs: it may remove the unit.
+        about = _hook_line_tag(self, entity_id or "")
         try:
             result = engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return hook_output(self, "error",
-                               f"⚠️ zone `{name}` hook `{when}` {tag} "
-                               f"FAILED: {ex}")
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
+                f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"))
         except Exception as ex:
             ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
-            return hook_output(self, "error",
+            return self._hook_lines_about(entity_id, about, hook_output(
+                self, "error",
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED{ref}: {type(ex).__name__}: {ex}")
-        return self._hook_fired(f"⚙️ zone `{name}` hook `{when}` fired {tag}",
-                                result)
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"))
+        return self._hook_lines_about(entity_id, about, self._hook_fired(
+            f"⚙️ zone `{name}` hook `{when}` fired {tag}", result))
 
     # ---- status definitions (self-describing statuses) --------------
     # A status DEFINITION holds the behaviour a status of that name has:
@@ -25496,11 +25559,23 @@ class Match:
 
         Re-entry guarded via _death_processing — a death-firing passive
         that itself writes vars must not retrigger the check on the
-        already-dying entity. Returns empty list on guard hit. A specific
+        already-dying entity. Returns empty list on guard hit; a check
+        held that way for ANOTHER unit runs once the death has finished
+        (_drain_held_deaths). A specific
         entity can also be shielded via _death_check_suppressed_ids (used
         by revive to defer the revived entity's check until its post-
         revive state settles)."""
         if self._death_processing > 0:
+            # Held, and run again once the death under way has finished
+            # (_drain_held_deaths). The unit dying itself needs none. A
+            # packet's kill credit is kept for that later check.
+            if entity_id not in self._dying_ids \
+                    and entity_id in self.entities:
+                credit = PACKET_KILLER.get()
+                if credit is not None and credit[0] != self.id:
+                    credit = None
+                if credit is not None or entity_id not in self._death_recheck:
+                    self._death_recheck[entity_id] = credit
             return []
         if (entity_id in self._death_check_suppressed_ids
                 or entity_id in self._death_check_deferred_ids):
@@ -25560,9 +25635,69 @@ class Match:
         return None
 
     def _process_death(self, entity_id: str) -> List[str]:
-        """Run the death pipeline for `entity_id`: fire on_death (entity
-        still in match), apply the death_result (corpse-store or
-        delete), remove from turn order. Returns log lines."""
+        """Run the death pipeline for `entity_id` (_process_death_one), then,
+        when this was the outermost death, the death checks it held for
+        other units (_drain_held_deaths). Returns log lines."""
+        self._death_depth += 1
+        try:
+            log = self._process_death_one(entity_id)
+        finally:
+            self._death_depth = max(0, self._death_depth - 1)
+        if self._death_depth == 0 and self._death_recheck \
+                and not self._death_draining:
+            log.extend(self._drain_held_deaths())
+        return log
+
+    def _drain_held_deaths(self) -> List[str]:
+        """Run the death checks held while a death was under way, one unit
+        after another in the order they were hit (user call: an on_death
+        effect that deals lethal damage kills, each death in sequence, so a
+        chain of 200 barrels nests nothing). A death here may hold more
+        checks; they join the queue. At most death_chain_limit deaths, then
+        the rest stay as they are with one warning."""
+        log: List[str] = []
+        try:
+            limit = int(self.rules.get("death_chain_limit", 200))
+        except (TypeError, ValueError):
+            limit = 200
+        deaths = 0
+        self._death_draining = True
+        try:
+            while self._death_recheck:
+                eid = next(iter(self._death_recheck))
+                credit = self._death_recheck.pop(eid)
+                before = self.entities.get(eid)
+                if before is None:
+                    continue
+                if deaths >= limit:
+                    left = [eid] + [i for i in self._death_recheck
+                                    if i in self.entities]
+                    self._death_recheck.clear()
+                    shown = ", ".join(f"`{i}`" for i in left[:8])
+                    more = f" and {len(left) - 8} more" if len(left) > 8 else ""
+                    log.append(
+                        f"⚠️ {limit} deaths followed one another "
+                        f"(death_chain_limit): the death checks of {shown}"
+                        f"{more} were not run. A unit still at its death "
+                        f"condition dies at its next change.")
+                    break
+                token = PACKET_KILLER.set(credit) if credit is not None \
+                    else None
+                try:
+                    log.extend(self.check_death(eid))
+                finally:
+                    if token is not None:
+                        PACKET_KILLER.reset(token)
+                if self.entities.get(eid) is not before:
+                    deaths += 1
+        finally:
+            self._death_draining = False
+        return log
+
+    def _process_death_one(self, entity_id: str) -> List[str]:
+        """One unit's death pipeline: fire on_death (entity still in
+        match), apply the death_result (corpse-store or delete), remove
+        from turn order. Returns log lines."""
         e = self.entities.get(entity_id)
         if e is None:
             return []
@@ -25574,7 +25709,12 @@ class Match:
         # into the PARENT's corpse, not the part's own.
         if e.is_part:
             return self._process_part_death(e)
-        self._death_processing += 1
+        # One death per unit: a kill() of a unit whose on_death is running
+        # (its own passive, or the unit it just killed striking back: two
+        # soul-bonded units) used to start its death again, each level
+        # firing on_death anew until Python's stack ran out.
+        if entity_id in self._dying_ids:
+            return []
         # Capture identity/position now — after e.remove() the entity is
         # detached, so the log event must read these up front.
         dead_name, dead_x, dead_y, dead_map = e.name, e.x, e.y, e.map
@@ -25582,6 +25722,11 @@ class Match:
         dead_box = (e.x, e.y) + self.entity_footprint(e)
         dead_vehicles: List[Tuple[str, Dict[str, Any], Tuple[int, int, int, int],
                                   str]] = []
+        # Counted right before the `try` that takes it back: an error
+        # between the two (a stack overflow in the copy above) left the
+        # guard up, and no unit of the match could die until a restart.
+        self._death_processing += 1
+        self._dying_ids.add(entity_id)
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id],
                                  extras={"killer": self.packet_killer(
@@ -25632,6 +25777,7 @@ class Match:
                            dead_x, dead_y, dead_vars, map_name=dead_map)
         finally:
             self._death_processing = max(0, self._death_processing - 1)
+            self._dying_ids.discard(entity_id)
         # Its riders, then the occupants of the maps it carried. Outside
         # the death guard, so a death effect that kills a rider or an
         # occupant (or a unit near it) runs that death.
@@ -25777,6 +25923,10 @@ class Match:
         the `!ent kill` command."""
         if eid not in self.entities:
             return False, []
+        if eid in self._dying_ids:
+            # Its death is under way (a kill from its own on_death, or
+            # from the on_death of a unit it killed): it dies once.
+            return True, []
         # The unit as it stands: a death the effects trip (and a revive a
         # vehicle-death effect or hook runs after it) leaves another object
         # under the id, which isn't killed again.
@@ -26413,6 +26563,14 @@ class Match:
                 cmap.lay_corpse(eid, corpse, loc[0], loc[1])
                 raise
             spawn_log = moved_note + list(spawn_log)
+            # A spawn turns a unit the spawn_face_toward_center way; a
+            # revived unit is the one that died, so it faces as it did (its
+            # region parts and seats turn with it), like a template's or a
+            # prefab's unit.
+            saved_facing = entity_dict.get("facing")
+            if saved_facing in FACING_VECTORS and self.entities.get(e.id) is e \
+                    and e.facing != saved_facing:
+                e.facing = saved_facing
             # Restore the creature's body parts at the parent's cell. Each
             # snapshot carries its part_of (-> e.id) so it re-attaches; a
             # part already taking that id (somehow still alive) is skipped.
@@ -26467,6 +26625,10 @@ class Match:
                             plog = [f"⚠️ part `{pid}` couldn't return to "
                                     f"({px},{py}) ({ex}); placed at "
                                     f"({near[0]},{near[1]})."] + list(plog)
+                        back_part = self.entities.get(pid)
+                        if back_part is not None \
+                                and pdc.get("facing") in FACING_VECTORS:
+                            back_part.facing = pdc["facing"]
                         spawn_log += plog
                     except VTTError as ex:
                         # Skipped rather than aborting the whole revive.
@@ -26925,7 +27087,14 @@ class Match:
         through the same swap. on_transformed fires at the end with
         `transform_kind` = `kind`. Returns log lines."""
         if not isinstance(statblock, dict):
-            raise VTTError("transform: statblock must be a dict.")
+            # A formula's transform(eid, 'orc') lands here: the command
+            # resolves a unit id or var path, the function takes the form.
+            got = f", got {statblock!r:.60}" if isinstance(
+                statblock, (str, int, float)) else ""
+            raise VTTError(
+                "transform: the form is a statblock dict "
+                "(entity_snapshot(<unit>), template_data(<template>) or a "
+                f"var holding one){got}.")
         sb = copy.deepcopy(statblock)
         # Checked before anything changes: a form kept in a var is data a
         # GM edits freely, and a bad field used to crash halfway, after the
