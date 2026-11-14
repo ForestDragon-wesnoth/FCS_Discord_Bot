@@ -2,7 +2,8 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #263). Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #306). #264-#306 come from a review pass by
+another model and share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
@@ -209,6 +210,32 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Players see names on the map and in `!list`; today only ids work ("Entity 'Hopper1' not found", `names.out`).
 - **#256 GUI option: keep the picked map.** A GUI setting (a toolbar checkbox, remembered in `local_settings.json`) so a map picked in the GUI's map menu stays shown until changed, as `!map use` does. Today a pick lasts until the next turn change, like a Discord board's map buttons; the user found that fine for now.
 
+- **#264 Looks by state.** A unit's `looks` list of `{condition, glyph, sprite, color}`; the first entry whose condition holds decides how it draws (bloodied, enraged, burrowed). Today `color` takes a formula and `glyph` / `sprite` are fixed vars.
+- **#265 Facing follows movement.** A rule `move_sets_facing` (`off` / `walk` / `all`, with a per-unit override): a step turns the unit the way it stepped. Today a walk leaves facing alone, so a `side_hit` game needs `!ent face` after every move.
+- **#266 Status tick order.** `tick_priority` on a status definition, highest first as passives run. Today ticks run in the order the unit received its statuses, so "regen before poison" depends on application order.
+- **#267 Statuses that end with their source.** A definition field `source_lost: keep | remove`: when the applier dies or leaves, the status goes (removed_by `source`). For taunts, grapples and concentration buffs; builds on the `__source` field from #25.
+- **#268 Corpse writes.** `corpse_var_set`, `corpse_var_del`, and `var_move` taking a corpse as either end. Today corpse data is read-only (`corpse_var`, `corpse_has`), so looting a body means reviving it or deleting it.
+- **#269 Cell-set helpers.** Pure `cells_union`, `cells_minus`, `cells_intersect`. A minimum-range weapon is `cells_minus(burst 5, burst 1)`; a blast clipped to a zone is an intersect.
+- **#270 A cell in a direction.** `cell_toward(x, y, dir, n=1)` and `cell_behind(target, from)`, the inverse of `direction_to`. For knockback landing cells and "the cell behind the target".
+- **#271 Dice as a list.** `roll_dice('4d6')` returns the kept dice (the engine's `roll_detail` already computes them). For doubles, "count the sixes" and "highest die".
+- **#272 Default parameters for `!func`.** `!func def mitigated raw,armor=0 "..."`, plus keyword calls.
+- **#273 Descriptions on GM definitions.** A `describe` subcommand on `!func`, `!macro`, `!alias`, `!table`, `!watch`, tile templates and zone definitions, shown in their lists and in `!help function`, and ready for the handbook export (#231).
+- **#274 Spawn overrides.** `!template spawn orc 3 3 team=red vars.hp=20 name="Orc Chief"` and an `overrides=` dict on `summon_template`. Plain values; #251 covers formulas evaluated at spawn.
+- **#275 Unit-anchored previews.** `!map preview burst from=<eid> 5` measures from the unit's whole body through `aoe_origin`. Today a preview takes a cell.
+- **#277 Explain sight.** `!map los <from> <to> [for=<team>]` walks the line and names the first opaque cell, the condition that made it opaque, the fog range and the visibility condition's result. The sight twin of `!map cell ... for=`.
+- **#278 Swallowed-error list.** `!match problems` (hosts) lists the fail-open conditions that errored: block, opaque, visibility, slot and grant conditions, with a count and the last error. Today each shows only where the GM happens to look.
+- **#279 Lint for var-path typos.** `!system lint` reports `entity[...].<path>` reads and writes whose path no default var, template or unit holds. A typo in a fail-open block condition currently never blocks and never complains.
+- **#280 `!history trace <eid> <path>`.** Walks the autosave diffs and lists each command where the var changed, old → new, with its author. Answers "why is hp 3?".
+- **#281 Trace for any command.** `!dry trace <command ...>` gives the `!eval --trace` list (reads, writes, hook writes marked) for a whole action or turn.
+- **#282 Typed twins of the container functions.** `!ent var_add <id> <path> <n>`, `!ent var_move <id> <path> <dest id> <path>`, `!ent var_copy`. A player can then hand an item over through the approval queue; today that takes `!eval`.
+- **#283 Send a saves file.** `!store send <name>` posts a file from the saves folder as a Discord attachment (admin or the `files` role). Exports written by `!store save`, `!history export` and `!match journal export` stay on the host's disk, out of a Discord admin's reach. Download only.
+- **#284 Access explain.** `!host access check <command ...> [user=|role=]` reports the level that applies and which layer set it: read-only downgrade, elevated arg, per-player, per-role, match or system override.
+- **#285 Turn card.** A rule `turn_start_card` (`none` / `card` / `actions`): the turn line is followed by the acting unit's card and its usable action names, as the channel's view sees them.
+- **#286 Direction targets.** `target: direction` on an action: `!action hero breath up`, checked against `allow_diagonal_facing`, bound with `.dx` / `.dy`. Pairs with directional patterns (#219).
+- **#287 Target count limits.** `min_targets` / `max_targets` on list targets, a number or an expression ("up to 3 targets", "one per level").
+- **#288 Tile sprite variants.** `sprite_variants: [grass1, grass2, grass3]` on a tile or template, picked by a hash of the cell so the map stays stable. Graphics only.
+- **#289 Host handover.** `!host owner <user>`: the owner passes the match on; an administrator can do it for an owner who left the server.
+
 ## Medium (a subsystem slice)
 
 ### Still open
@@ -405,6 +432,21 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - `!match export defs` prints a match's definitions (status definitions, global and team passives, functions, tables, tile templates, watchers, macros, aliases) as one JSON block. `!match import defs <json>` loads them into another match, on any server, through the same checks as each command.
   - This is how `!template import` already moves units between servers, and a step toward #162 system packs without the packaging.
 
+- **#290 Status-granting tiles.** `grants` on a tile template, settled by the zone-grant machinery. Terrain bonuses as in Wesnoth: a forest tile gives a status carrying a defence modifier while a unit stands on it. Today ground needs enter / exit hooks that every teleport, death and revive has to keep in step.
+- **#291 Typed action arguments.** Builds on #228: `args: {dest: {type: location}, ally: {type: entity}}`, parsed, coerced and view-checked like the main target. For "throw an ally to a cell" and "swap two units". Today a second target is raw text with no existence or view check.
+- **#292 Action area preview.** `!action <eid> <name> <target> preview` marks the cells and lists the units the action's `affects` gives for that target; nothing runs and no dice roll. Complements #238, which reports refusals.
+- **#293 Timed entries in the turn order.** `!turn event add <name> <initiative> <formula> [once]`: a named entry that fires when the order reaches it, then the order moves on. For lair actions, "at initiative 10 the lava rises", reinforcement waves. It appears in the forecast; today the GM parks an invisible unit somewhere.
+- **#294 Team seats.** `!team seat <team> <player ...>` assigns users to sides. A seated player's commands on their own side's units skip approval for the commands on a `seat_commands` rule list, and the turn line can name the side's players. A per-side cousin of #28's per-unit controllers, sharing its gate.
+- **#295 Per-match rule layer.** `!match rule set <rule> <value>`: a last layer after the system chain, saved with the match, undoable, shown by `!help rule`. For "this one fight has friendly fire"; today that takes a child system per match.
+- **#296 Conditional tags.** A system library `tag_rules` (`bloodied: "entity[self].hp * 2 <= entity[self].max_hp"`): a unit carries the tag while the expression holds, so every tag filter (action immunity, `!find tag:`, modifiers, step filters) reacts to state. Cost is one evaluation per rule per unit read, so it needs a per-command memo and an owner limit.
+- **#297 Bags.** Tables drawn without replacement: `!table bag <name>`, `table_draw`, `table_left`, `table_reset`, on the match RNG, saved and undone with the match. For card initiative, loot decks and chit-pull activation.
+- **#298 Campaign vars.** `!server var set|get|del|list` and `server_var_get` in formulas: values shared by every match of the server (a day counter, faction reputation). Reads go into the journal the way prefab reads do.
+- **#299 Match archive.** `!match archive <id>` / `unarchive`: a finished match leaves memory and the lists, keeps its files and refuses commands until brought back.
+- **#300 `!match doctor`.** The chaos harness's invariants run on the live match: dangling ids, units off the map or on voids, statuses without a definition, actions calling missing functions, units standing on cells that block them, the turn pointer. `fix` repairs the ones with a single right answer.
+- **#301 Live roster and turn-order boards.** `!list autoupdate` and `!turn autoupdate`: a Discord message that refreshes as map boards do. #248 appends a roster to replies; this is the pinned version.
+- **#302 Recipe book.** `!help recipe [topic]`: the composed patterns (channeling, charge-up, summon lifetime, a reach-aura attack, corpse decay, a one-way door) as searchable entries, each backed by a scenario in the suite so it keeps working. It helps a GM by showing how to build common composite mechanics, the companion to the "compose it from primitives" rule.
+- **#304 Neighbour-aware tile sprites.** A tile template's `sprite_auto: wall` picks `wall_<mask>` by which neighbours share the template, so walls and coasts join up. Graphics only.
+
 ## Large (arcs of several PRs)
 
 ### Still open
@@ -459,6 +501,8 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - The game need: NCS multiplies HP bonuses from class, armor and items, and Solis Endurance raises max hp by a percentage. A derived max hp would need no recomputation when gear changes.
   - Open questions: cycles between derived vars; whether var hooks fire when a derived value changes; how saves and undo store them; the cost per read. This is a larger shift than the rest of the list, since modifiers are pure queries today by design.
 
+- **#306 Encounter library.** A saved bundle of a prefab, the watchers, macros, reminders and match vars that go with it, and a turn-order setup, stamped into a match in one command. Sits between prefabs (#31) and system packs (#162).
+
 ## Suggested groupings
 
 - **Formula ergonomics:** #89, #194
@@ -480,3 +524,10 @@ From the combat-systems review (docs/combat_systems_fit.md):
 - **Integrity of GM data:** #209, #210, #223
 - **Before a public rollout:** #177, #178, #197, #206, #214
 - **Onboarding:** #213, #202, #231
+
+From the #264-#306 review:
+
+- **Explaining the engine to a GM:** #277, #278, #279, #280, #281, #284, #300, #302
+- **Map looks:** #264, #288, #304
+- **Status order and lifetime:** #266, #267, #290, #296
+- **Targeting:** #269, #270, #275, #286, #287, #291, #292
