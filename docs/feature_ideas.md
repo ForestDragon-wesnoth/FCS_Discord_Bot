@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #450). #264-#450 come from review passes by
+(the highest so far is #482). #264-#482 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -311,6 +311,33 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#439 Status-carried auras.** A definition field `aura: {definition, radius, metric}`: the engine makes the anchored zone when the status arrives and removes it with the status on every exit path (expiry, death, transform). Composing it takes two hooks today, and each exit path needs its own cleanup.
 - **#440 Match trash.** `!match delete` asks for `confirm` and keeps the match with its history and journal in the trash for 24 hours, with `!match restore <id>`. In a probe one typed line deleted a match for good.
 - **#441 Sessions.** `!session start [name]` / `end` put marks in the event log and history; `!log session=` and `!history list session=` filter by them, and the recap (#34) can cover one session.
+- **#451 Case-insensitive unit ids.** An optional gamerule (off by default): `Hero` and `HERO` resolve to `hero` when one unit matches. In a probe both were refused ("Entity 'Hero' not found"), and phone keyboards capitalise the first letter.
+- **#452 More selectors.** `zone:<name>`, `part_of:<eid>`, `riding:<eid>` and `sees:<eid>` for `!find` and `!foreach`. `zone:gas` is an unrecognised predicate today.
+- **#453 Aggregates in `!find`.** `sum:<var>`, `avg:<var>`, `min:` and `max:` beside `count` ("total hp of the red team").
+- **#454 Corpse sweeps.** `!find dead ...` and `!foreach dead ; ...` over corpses with `$id $x $y`, for a mass revive or looting the field.
+- **#455 Cell sweeps.** `!foreach cells:<rect | zone:name | tag:filter> ; <command with $x $y>`. Map building in one line ("fire on every cell of the gas zone"); `!foreach` walks units only.
+- **#456 `has=<path>` on template lists.** `!template list has=actions.bite` and `has=fly`, beside the prefix, kind, author and tag filters.
+- **#457 `entities_in_cells(cells, relation=None, tag=None)`.** The units covering any cell of a list, the reader for shapes built with the cell-set helpers. The `entities_in_*` functions each take a centre and a fixed shape.
+- **#458 Repeating schedules.** `every=<n>` on `schedule`, `schedule_on` and `!schedule`. Today a body reschedules itself through a `!func`.
+- **#459 Table entries that roll.** A sub-table reference (`@treasure_b`) and dice inside an entry (`{2d6} gold`).
+- **#460 Text helpers.** `plural(n, word)`, `ordinal(n)` and `list_text(items)` ("a, b and c") for `say()` lines.
+- **#461 Passive guards.** `if=<expression>` on any passive, shown in the lists and read natively for the simple shapes the death condition already uses, so a guarded passive skips the namespace build. Pairs with #327.
+- **#462 One-shot passives.** A `once` word on a passive: it fires one time and removes itself ("the first time you drop below half"). Watchers have it; passives do not.
+- **#463 Passive error limit.** A rule `passive_error_limit`: a passive that errors that many times running is switched off with a ⚠️ until a host re-enables it. A broken global passive prints its error for every unit on every hook.
+- **#464 Collapsed repeat lines.** Identical ⚠️ and ⚙️ lines in one reply fold into one with a count ("×12").
+- **#465 Per-reaction modes.** `!react mode <eid> <reaction> ask|auto|never`: a player's standing order per reaction ("always dodge, ask about block"). `__reaction_mode` covers all of a unit's reactions at once, and `auto_when` belongs to the GM.
+- **#466 Expiring access overrides.** `turns=N`, `until=round_end` and `once` on `!host access`: "bob may `!ent tp` once". Fits the deployment route named when #145 was struck.
+- **#467 Team display names.** Team data `name` printed by roster headings and turn lines and offered as `{team_name}`; the team var stays the id.
+- **#468 Map on turn start.** A rule `post_map` (never / turn / move): the reply carries the map from the channel's view. Boards edit one pinned message; play-by-post wants a map per turn in the scrollback. The map twin of #248.
+- **#469 Tag labels.** A vocabulary entry gains a label (text or emoji) used wherever lines print tags: "🔥 8" in a damage line.
+- **#470 Distance units.** Rules for a unit label and scale, so `!dist` and previews print "15 ft"; formulas keep counting cells.
+- **#471 Map hooks.** on_enter, on_exit and time hooks stored on a map: the cave applies Darkness to whoever enters. Today that is a global passive on on_entity_changed_map testing `to_map`.
+- **#472 Default ground.** A map var naming the tile template every cell without tile data reads (an ocean map, a cave floor). `!tile fill` stores a tile per cell.
+- **#473 `!ent diff <id> since=turn|round|<save>`.** What changed on one unit since then. `!ent diff` compares two units, and #280 follows one path.
+- **#474 Sight from elsewhere.** `!map ent_sight <eid> at=<x> <y>`: what the unit would see from that cell, for planning a move.
+- **#475 Footprint previews.** `!map preview body <eid|template> <x> <y> [facing]`: the cells a body with its located parts and segments would cover there, and whether it fits.
+- **#476 Bestiary cards.** `!template card <name>`: a template rendered through the entity description formats under the privacy rules, so players read a monster type the way they read a unit. `!template show` prints JSON.
+- **#477 CLI batch mode.** `python cli.py --run <file>` runs a script and exits non-zero on a failed `!assert`. A GM keeping a ruleset's setup and tests in git gets CI for it.
 
 ## Medium (a subsystem slice)
 
@@ -559,6 +586,11 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#448 Player-facing lines audit.** Move the engine-worded lines that remain into format rules: turn skipped, turn passes, reaction window options, block refusals, move replies. Follows "when in doubt, gamerule".
 - **#449 Persona lines on Discord.** With a rule on, `say()` lines about a unit post under the unit's display name and sprite through a channel webhook. For tables that roleplay in the same channel; it can serve as a built-in stand-in for Tupperbox.
 - **#450 Compressed history and journal files.** Undo snapshots and journal segments written gzipped (JSON shrinks roughly tenfold). The storage layer writes plain JSON, and undo history is the largest share of a server's quota.
+- **#478 Observer passives.** A unit's own passive with `watch=allies|enemies|any [within=<r>]` fires when the hook happens to another unit, with `self` the owner and `subject` that unit. "When an ally dies I gain rage" then lives in the unit; today a team or global passive has to find the holders. Indexed per hook name, so units without one cost nothing.
+- **#479 Aura occlusion.** An option on anchored zones: the aura covers only the cells its anchor has a clear line to, so a bless aura or a torch stops at walls. Auras are stamped by radius alone today; #107 covers the burst builders.
+- **#480 Simulate under other rules.** `rules=<rule>:<value>,...` on `!simulate` and `!dry` runs under temporary rule values, so a rule choice is compared by outcome before anyone edits the system.
+- **#481 Personal aliases for commands.** `!my alias <name> <command ...>` per user, resolved before the gate and still gated. With the `me` token (#400) a player types `!slash gob1` on a phone instead of the full `!action`.
+- **#482 RNG commitments.** `!match rng commit` publishes a hash of the seed, and `reveal` at the end lets players check through the journal replay that every roll came from it. For duels between the user's groups, where the host is also a player.
 
 ## Large (arcs of several PRs)
 
@@ -685,3 +717,12 @@ From the #419-#450 review (probed against the bot):
 - **Objects and containers:** #436, #437, #438, #439, #446
 - **Safety and bookkeeping:** #440, #441, #450
 - **Team-channel play:** #442
+
+From the #451-#482 review:
+
+- **Selectors and sweeps:** #451, #452, #453, #454, #455, #456
+- **Formula helpers:** #457, #458, #459, #460
+- **Passives:** #461, #462, #463, #478
+- **Table play:** #464, #465, #466, #467, #468, #469, #470, #481
+- **Maps and reads:** #471, #472, #473, #474, #475, #476, #479
+- **Tooling:** #477, #480, #482
