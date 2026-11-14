@@ -532,7 +532,8 @@ def _roll_impl(rng, spec: Any) -> int:
     return roll_detail(rng, spec)[0]
 
 
-def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
+def roll_detail(rng, spec: Any, dice_out: "Optional[list]" = None,
+                all_dice: bool = False) -> "Tuple[int, list]":
     """Evaluate dice notation; return (total, parts) where parts is a list of
     human-readable per-term strings (e.g. "2d6 [4, 5]", "4d6kh3 [6,5,4,2]→keep
     [6,5,4]", "+3"). Shared by the formula roll() binding and the `!roll`
@@ -549,7 +550,9 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
                  disadvantage.
     Examples: "d20", "2d6+3", "1d8-1", "3d6+2d4+1", "4d6kh3", "2d20kl1",
     "10d6!". Whitespace and case are ignored. Each die is an independent
-    randint(1, M)."""
+    randint(1, M). With `dice_out` a list, each group's kept dice (every die
+    rolled with `all_dice`) are appended to it in the order they were
+    rolled, an exploded die as its chain's total (roll_dice)."""
     if not isinstance(spec, str):
         raise FormulaError(
             f"roll(spec): spec must be a dice string like '2d6+3', got "
@@ -617,6 +620,15 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
                 detail = f"{term.lstrip('+')} {rolled}"
             total += sgn * sum(kept)
             parts.append(detail)
+            if dice_out is not None:
+                if all_dice or keep_mode is None:
+                    dice_out.extend(rolled)
+                else:
+                    left = list(kept)
+                    for v in rolled:
+                        if v in left:
+                            left.remove(v)
+                            dice_out.append(v)
             continue
         fm = _ROLL_FLAT_RE.match(term)
         if fm is not None:
@@ -822,6 +834,44 @@ def _roll(spec: Any) -> int:
     match-bound seeded RNG so a session's rolls become reproducible —
     see the random_seed rule docs (same mechanism as random_int)."""
     return _roll_impl(random, spec)
+
+
+def _roll_dice_impl(rng, spec: Any, all: Any = False) -> list:
+    if not isinstance(all, bool):
+        raise FormulaError("roll_dice(spec, all=False): all= must be True or "
+                           "False.")
+    out: list = []
+    try:
+        roll_detail(rng, spec, dice_out=out, all_dice=all)
+    except FormulaError as ex:
+        raise FormulaError(str(ex).replace("roll(spec)", "roll_dice(spec)",
+                                           1))
+    return out
+
+
+def _roll_dice(spec: Any, all: Any = False) -> list:
+    """roll_dice(spec, all=False): roll dice as roll() does and return the
+    dice instead of the total: the kept dice of every group, in the order
+    they were rolled (flat modifiers left out). all=True returns every die,
+    the ones a kh / kl keep dropped included. An exploding die is one entry,
+    its chain's total. For doubles, "count the sixes" (count) and "the
+    highest die" (max). Honors random_seed like roll()."""
+    return _roll_dice_impl(random, spec, all)
+
+
+def _chance_impl(rng, percent: Any) -> bool:
+    if not _is_num(percent) or not math.isfinite(percent):
+        raise FormulaError(
+            f"chance(percent): percent must be a number, got "
+            f"{'None' if percent is None else type(percent).__name__}.")
+    return rng.random() * 100 < percent
+
+
+def _chance(percent: Any) -> bool:
+    """chance(percent): True with that percent chance (chance(25) is true
+    one time in four; 0 or less never, 100 or more always). One draw of the
+    match RNG every call, so it honors random_seed and replays."""
+    return _chance_impl(random, percent)
 
 
 # Distance modes accepted by the distance() formula function. The full
@@ -2295,6 +2345,127 @@ def _zip(a: Any, b: Any) -> list:
     return [[x, y] for x, y in zip(_list_arg(a, "zip"), _list_arg(b, "zip"))]
 
 
+def _cell_key(c: Any, fname: str) -> tuple:
+    """A cell of a cell list as a hashable key: [x, y] or [x, y, map]."""
+    if (isinstance(c, (list, tuple)) and len(c) in (2, 3)
+            and all(_is_num(v) and v == int(v) for v in c[:2])
+            and (len(c) == 2 or isinstance(c[2], str))):
+        return (int(c[0]), int(c[1])) + tuple(c[2:])
+    raise FormulaError(
+        f"{fname}(...): every item must be a cell, [x, y] or [x, y, map]; "
+        f"got {_echo(c)}.")
+
+
+def _cell_lists(lists: tuple, fname: str, least: int) -> list:
+    if len(lists) < least:
+        raise FormulaError(f"{fname}(...) takes at least {least} cell lists.")
+    return [[_cell_key(c, fname) for c in _list_arg(v, fname)]
+            for v in lists]
+
+
+def _cells_union(*lists: Any) -> list:
+    """cells_union(a, b, ...): every cell in any of the lists, each once, in
+    the order first met (a's cells first). A cell is [x, y] or [x, y, map];
+    [3, 3] and [3, 3, 'main'] are different cells."""
+    seen: set = set()
+    out = []
+    for cells in _cell_lists(lists, "cells_union", 1):
+        for k in cells:
+            if k not in seen:
+                seen.add(k)
+                out.append(list(k))
+    return out
+
+
+def _cells_minus(a: Any, *others: Any) -> list:
+    """cells_minus(a, b, ...): the cells of a found in none of the others, in
+    a's order, each once. A minimum-range weapon is cells_minus(
+    cells_in_burst(x, y, 5), cells_in_burst(x, y, 1))."""
+    first, *rest = _cell_lists((a,) + others, "cells_minus", 2)
+    gone = {k for cells in rest for k in cells}
+    seen: set = set()
+    out = []
+    for k in first:
+        if k not in gone and k not in seen:
+            seen.add(k)
+            out.append(list(k))
+    return out
+
+
+def _cells_intersect(a: Any, *others: Any) -> list:
+    """cells_intersect(a, b, ...): the cells of a found in every other list,
+    in a's order, each once (a blast clipped to a zone:
+    cells_intersect(cells_in_burst(x, y, 3), zone_cells('room')))."""
+    first, *rest = _cell_lists((a,) + others, "cells_intersect", 2)
+    sets = [set(cells) for cells in rest]
+    seen: set = set()
+    out = []
+    for k in first:
+        if k not in seen and all(k in s for s in sets):
+            seen.add(k)
+            out.append(list(k))
+    return out
+
+
+def _cell_toward(x: Any, y: Any, direction: Any, n: Any = 1) -> list:
+    """cell_toward(x, y, dir, n=1): the cell n steps from (x, y) in a
+    direction (up, down, left, right, up_left, up_right, down_left,
+    down_right): cell_toward(3, 3, 'right', 2) is [5, 3]. A negative n goes
+    the other way. Pure geometry: the cell may be off the map (check with
+    in_bounds). The inverse of direction_to."""
+    if not (_is_num(x) and _is_num(y)):
+        raise FormulaError("cell_toward(x, y, dir, n=1): x and y must be "
+                           "numbers.")
+    canon = normalize_direction(direction) if isinstance(direction, str) \
+        else None
+    if canon not in DIRECTION_VECTORS:
+        raise FormulaError(
+            f"cell_toward(x, y, dir, n=1): unknown direction "
+            f"{_echo(direction)!r}; use up, down, left, right or a diagonal "
+            f"(up_left, ...).")
+    steps = _whole(n, "cell_toward", "n")
+    dx, dy = DIRECTION_VECTORS[canon]
+    return [int(x) + dx * steps, int(y) + dy * steps]
+
+
+def _dict_items(v: Any) -> list:
+    """items(dict): the dict's [key, value] pairs in insertion order
+    (loopable: `for k, v in items(d):`)."""
+    return [[k, copy.deepcopy(x)]
+            for k, x in _data_items(_dict_arg(v, "items"))]
+
+
+def _merge(a: Any, *others: Any) -> dict:
+    """merge(a, b, ...): a new dict holding a's keys, then each later dict's
+    keys over them (a later dict wins a key; a nested dict is replaced
+    whole). The arguments are left as they were."""
+    out = copy.deepcopy(_dict_arg(a, "merge"))
+    for d in others:
+        out.update(copy.deepcopy(_dict_arg(d, "merge")))
+    return out
+
+
+def _with_key(v: Any, key: Any, value: Any) -> dict:
+    """with_key(dict, key, value): a new dict with `key` set to `value` (one
+    key, no dotted path: use var writes for nested stores). The dict passed
+    in is left as it was."""
+    if not isinstance(key, str):
+        raise FormulaError("with_key(dict, key, value): key must be text.")
+    out = copy.deepcopy(_dict_arg(v, "with_key"))
+    out[key] = copy.deepcopy(value)
+    return out
+
+
+def _without_key(v: Any, key: Any) -> dict:
+    """without_key(dict, key): a new dict without `key` (the same keys when
+    it had none). The dict passed in is left as it was."""
+    if not isinstance(key, str):
+        raise FormulaError("without_key(dict, key): key must be text.")
+    out = copy.deepcopy(_dict_arg(v, "without_key"))
+    out.pop(key, None)
+    return out
+
+
 def _unique(v: Any) -> list:
     """unique(list): the list without repeats, keeping each item's first
     position. Items compare with ==, so 1 and 1.0 count as one; equal lists
@@ -2546,6 +2717,16 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "reverse": _reverse,
     "flatten": _flatten,
     "zip": _zip,
+    "cells_union": _cells_union,
+    "cells_minus": _cells_minus,
+    "cells_intersect": _cells_intersect,
+    "cell_toward": _cell_toward,
+    "items": _dict_items,
+    "merge": _merge,
+    "with_key": _with_key,
+    "without_key": _without_key,
+    "chance": _chance,
+    "roll_dice": _roll_dice,
     "upper": _upper,
     "lower": _lower,
     "strip": _strip,
@@ -3053,6 +3234,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                  per the aoe_origin_mode rule
     "footprint_width", "footprint_height", "footprint_cells",
     "occupies", "cell_entity", "entity_center", "aoe_origin",
+    # A unit by its id: in the match at all / living (#326); the cell past
+    # a unit's body seen from a unit or a cell (#270).
+    "exists", "is_alive", "cell_behind",
 )
 
 # ----------------------------------------------------------------------------
@@ -3122,6 +3306,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "reactions_used",
+    "exists", "is_alive", "cell_behind",
     "last_damage", "last_healing", "status_source",
     "is_void", "void_cells", "zone_can_move",
     "status_layers",
@@ -3394,6 +3579,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "unique",
     "take", "drop", "slice", "remove_at", "insert_at", "reverse", "flatten",
     "zip",
+    "cells_union", "cells_minus", "cells_intersect", "items", "roll_dice",
     "shuffle",
     "team_members",
     "entities_at",
@@ -4846,7 +5032,9 @@ class FormulaEngine:
             # The list helpers build lists too (#205).
             **{n: (lambda f, n: lambda *a: _charge(f(*a), n))(_ALLOWED_FUNCS[n], n)
                for n in ("take", "drop", "slice", "remove_at", "insert_at",
-                         "reverse", "flatten", "zip")},
+                         "reverse", "flatten", "zip", "cells_union",
+                         "cells_minus", "cells_intersect", "items",
+                         "roll_dice")},
             "replace": lambda *a: _replace(*a, limit=size_limit),
             "join": lambda *a: _join(*a, limit=size_limit),
             "str": lambda *a: (_text_of(a[0], size_limit) if len(a) == 1
@@ -4903,7 +5091,15 @@ class FormulaEngine:
 
             def roll(spec):
                 return _roll_impl(rng, spec)
-            for fn in (random_int, random_string, pick, shuffle, roll):
+
+            def chance(percent):
+                return _chance_impl(rng, percent)
+
+            def roll_dice(spec, all=False):
+                return _charge(_roll_dice_impl(rng, spec, all), "roll_dice")
+            for fn in (random_int, random_string, pick, shuffle, roll,
+                       chance, roll_dice):
+                fn.__wrapped__ = _ALLOWED_FUNCS[fn.__name__]
                 fn.__qualname__ = fn.__name__     # "pick() takes 1 ..."
                 ns[fn.__name__] = fn
 
@@ -5768,6 +5964,76 @@ class FormulaEngine:
         ns["cell_entity"] = _cell_entity
         ns["entity_center"] = _entity_center
         ns["aoe_origin"] = _aoe_origin
+
+        def _exists(eid_t: Any) -> bool:
+            """exists(eid): True while a unit of that id is in the match,
+            alive or not (a destroyed body part still attached counts); False
+            for an id nothing holds, or None. A corpse isn't a unit:
+            has_corpse(eid) tests one."""
+            if eid_t is None:
+                return False
+            return _eid(eid_t) in match.entities
+
+        def _is_alive(eid_t: Any) -> bool:
+            """is_alive(eid): True when a unit of that id is in the match and
+            alive (the alive_condition rule, else hp above 0 or
+            indestructible); False for a dead or destroyed one, an id nothing
+            holds, or None."""
+            if eid_t is None:
+                return False
+            e = match.entities.get(_eid(eid_t))
+            return e is not None and bool(e.is_alive)
+
+        def _cell_behind(target_t: Any, origin: Any) -> Any:
+            """cell_behind(target, from): the cell just past the target's
+            body, seen from `from` (a unit, read at its body's centre, or a
+            cell [x, y]): where a knockback lands or a backstabber stands.
+            Seen from a cell level with a side of the body it is the cell
+            straight across, level with `from`; seen from past a corner, the
+            cell past the opposite corner. None when it is off the map or a
+            void, when `from` is on another map, or when `from` is inside
+            the body."""
+            e = _require_e(target_t, "cell_behind")
+            mp = match.map_of(e)
+            if isinstance(origin, (list, tuple)):
+                if len(origin) not in (2, 3) or not all(
+                        _is_num(v) for v in origin[:2]):
+                    raise FormulaError("cell_behind(target, from): from must "
+                                       "be a unit or a cell [x, y].")
+                if len(origin) == 3 and origin[2] != mp.name:
+                    return None
+                ox, oy = float(origin[0]), float(origin[1])
+            else:
+                o = _require_e(origin, "cell_behind")
+                if o.map != e.map:
+                    return None
+                ocx, ocy = match.body_center(o)
+                ox, oy = float(ocx), float(ocy)
+            cells = match.entity_cells(e)
+            xs = [c[0] for c in cells]
+            ys = [c[1] for c in cells]
+            x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+            # Past the body along each axis `from` lies outside of; level
+            # with `from` along an axis it shares with the body.
+            dx = 1 if ox < x0 else -1 if ox > x1 else 0
+            dy = 1 if oy < y0 else -1 if oy > y1 else 0
+            if dx == 0 and dy == 0:
+                return None
+
+            def along(d: int, o: float, lo: int, hi: int) -> int:
+                if d > 0:
+                    return hi + 1
+                if d < 0:
+                    return lo - 1
+                return int(min(max(round(o), lo), hi))
+            bx, by = along(dx, ox, x0, x1), along(dy, oy, y0, y1)
+            if not mp.in_bounds(bx, by):
+                return None
+            return _unit_cells(e, [bx, by])
+
+        ns["exists"] = _exists
+        ns["is_alive"] = _is_alive
+        ns["cell_behind"] = _cell_behind
 
         # ---- group iteration ----
         def _group_members(name: Any) -> list:

@@ -22,6 +22,7 @@ from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
+from logic import reserved_var_path_error
 from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
@@ -167,8 +168,8 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "alias":      frozenset({"list", "info"}),
     "clamp":      frozenset({"list"}),
     "defpassive": frozenset({"list"}),
-    "defvar":     frozenset({"list", "map"}),
-    "ent":        frozenset({"info"}),
+    "defvar":     frozenset({"list", "map", "match"}),
+    "ent":        frozenset({"info", "get"}),
     "func":       frozenset({"list", "info"}),
     "gclamp":     frozenset({"list"}),
     "gpassive":   frozenset({"list", "info"}),
@@ -416,7 +417,7 @@ def _systems_capability(name: str, sub: str, args: List[str]) -> bool:
     capability)."""
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
-        if name == "defvar" and sub == "map":
+        if name == "defvar" and sub in ("map", "match"):
             return len(args) >= 2 and args[1].lower() != "list"
         return bool(args) and sub != "list"
     if name == "system":
@@ -1984,7 +1985,8 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
 
 # Subcommands of a command registered without undo snapshots that change
 # the match and take a command snapshot of their own.
-_SNAPSHOT_SUBS = frozenset({("turn", "set"), ("turn", "grant")})
+_SNAPSHOT_SUBS = frozenset({("turn", "set"), ("turn", "grant"),
+                            ("turn", "roll")})
 
 # Commands that only read the match (no undo snapshot either): the journal
 # doesn't serialize it around them.
@@ -12275,6 +12277,7 @@ registry.annotate_sub(
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
         "stack <system> <name> <layered|refresh|add_level|extend|replace|none> | "
         "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
+        "tick_priority <system> <name> <n|-> | "
         "resist_affects <system> <name> <level|duration|both|-> | "
         "resist_rounding <system> <name> <floor|ceil|round|-> | "
         "on_transform <system> <name> <keep|drop|-> | "
@@ -12792,6 +12795,102 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         finally:
             if token is not None:
                 VAR_READER.reset(token)
+
+    # --- get: one var or subtree, as the caller may read it (#111) ---
+    if sub == "get":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "get"):
+            return
+        _check_tail(args, 3, (), "!ent get <id> <path>")
+        eid = _query_eid(ctx, m, args[1])
+        e = m.entities[eid]
+        path = str(args[2])
+        check_store_path(path, "var path")
+        host = ctx_is_admin(ctx) or _acts_as_host(ctx, m)
+        # Engine bookkeeping (`__` keys: private lists, links, markers) is
+        # the host's to read (`!ent dump`); a player meets it as missing.
+        hidden = not host and any(seg.startswith("__")
+                                  for seg in path.split("."))
+        found, val = (False, None) if hidden else _entity_path_value(
+            m, e, path, _query_pov(ctx, m))
+        if not found:
+            raise NotFound(f"`{args[1]}` has no var at `{path}` that this "
+                           f"channel can read.")
+        if not host:
+            val = _without_engine_keys(val)
+        val = _hide_formula_at(path, val)
+        shown = m.entity_display_name(e, _query_pov(ctx, m))
+        if isinstance(val, (dict, list)):
+            return await ctx.send(
+                f"**{shown}** `{path}`:\n```json\n"
+                f"{json.dumps(val, indent=2, ensure_ascii=False)}\n```")
+        return await ctx.send(f"**{shown}** `{path}` = {val!r}")
+
+    # --- typed twins of var_add / var_move / var_copy (#282) ---
+    if sub == "var_add":
+        if await return_help_if_not_enough_args(ctx, args, 4, "ent", "var_add"):
+            return
+        _check_tail(args, 4, (), "!ent var_add <id> <path> <n>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{args[1]}' not found.")
+        e, path = m.entities[eid], str(args[2])
+        check_store_path(path, "var path")
+        msg = reserved_var_path_error(path, f"!ent var_add {eid} {path}")
+        if msg:
+            raise VTTError(msg)
+        delta = _parse_scalar(args[3])
+        if isinstance(delta, bool) or not isinstance(delta, (int, float)) \
+                or not math.isfinite(delta):
+            raise VTTError("`<n>` must be a number (negative to subtract).")
+        found, cur = _resolve_dotted_var(e.vars, path)
+        if not found:
+            cur = 0
+        elif isinstance(cur, bool) or not isinstance(cur, (int, float)):
+            raise VTTError(f"`{eid}` vars.{path} holds {cur!r}, which isn't "
+                           f"a number to add to.")
+        log = e.write_var(path, cur + delta)
+        _, now = _resolve_dotted_var(e.vars, path) if eid in m.entities \
+            else (False, cur + delta)
+        return await ctx.send("\n".join(
+            [f"`{eid}` vars.{path}: {cur!r} -> {now!r}"] + list(log)))
+
+    if sub in ("var_move", "var_copy"):
+        if await return_help_if_not_enough_args(ctx, args, 5, "ent", sub):
+            return
+        _check_tail(args, 5, (), f"!ent {sub} <id> <path> <dest_id> "
+                                 f"<dest_path>")
+        src_id = _resolve_eid(m, args[1])
+        dest_id = _resolve_eid(m, args[3])
+        for tok, rid in ((args[1], src_id), (args[3], dest_id)):
+            if rid not in m.entities:
+                raise NotFound(f"Entity '{tok}' not found.")
+        src_path, dest_path = str(args[2]), str(args[4])
+        for p_ in (src_path, dest_path):
+            check_store_path(p_, "var path")
+        msg = reserved_var_path_error(dest_path, f"!ent {sub} (destination)")
+        if sub == "var_move":
+            msg = msg or reserved_var_path_error(src_path,
+                                                 f"!ent {sub} (source)")
+        if msg:
+            raise VTTError(msg)
+        se, de = m.entities[src_id], m.entities[dest_id]
+        found, val = _resolve_dotted_var(se.vars, src_path)
+        if not found:
+            raise NotFound(f"`{src_id}` has no var at `{src_path}`.")
+        if sub == "var_move" and src_id == dest_id:
+            if dest_path == src_path:
+                return await ctx.send(f"`{src_id}` vars.{src_path} is "
+                                      f"already there; nothing moved.")
+            if dest_path.startswith(src_path + "."):
+                raise VTTError(f"`{dest_path}` is inside `{src_path}`, which "
+                               f"the move deletes.")
+        log = list(de.write_var(dest_path, copy.deepcopy(val)))
+        if sub == "var_move" and src_id in m.entities:
+            log.extend(m.entities[src_id].remove_var(src_path))
+        verb = "Moved" if sub == "var_move" else "Copied"
+        return await ctx.send("\n".join(
+            [f"{verb} `{src_id}` vars.{src_path} to `{dest_id}` "
+             f"vars.{dest_path}."] + log))
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -13917,6 +14016,43 @@ registry.annotate_sub(
           "!ent dump (hosts)."),
 )
 registry.annotate_sub(
+    "ent", "get",
+    usage="!ent get <id> <path>",
+    desc=(
+        "Read one var or subtree of a unit (`!ent get hero inventory.potion`), "
+        "a player read: the channel's view decides which units it names, "
+        "private vars read as missing, a disguise shows its decoys, and "
+        "engine keys (`__...`) are a host's (`!ent dump` shows everything)."
+    ),
+)
+registry.annotate_sub(
+    "ent", "var_add",
+    usage="!ent var_add <id> <path> <n>",
+    desc=(
+        "Add n to a number var (`-n` subtracts), making it n when absent: "
+        "the command twin of var_add. A player's goes to the approval "
+        "queue like any write."
+    ),
+)
+registry.annotate_sub(
+    "ent", "var_move",
+    usage="!ent var_move <id> <path> <dest_id> <dest_path>",
+    desc=(
+        "Move a var or a whole subtree to another unit or path (hand an "
+        "item over: `!ent var_move hero inventory.potion ally "
+        "inventory.potion`), the command twin of var_move. The source "
+        "goes; var hooks fire on both units."
+    ),
+)
+registry.annotate_sub(
+    "ent", "var_copy",
+    usage="!ent var_copy <id> <path> <dest_id> <dest_path>",
+    desc=(
+        "Copy a var or a whole subtree to another unit or path and keep "
+        "the source, the command twin of var_copy."
+    ),
+)
+registry.annotate_sub(
     "ent", "dump",
     usage="!ent dump <id>",
     desc=("Show ALL state stored on an entity (raw, template-free): every "
@@ -14343,6 +14479,27 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("\n".join(lines))
     if sub == "grant":
         return await ctx.send(_turn_grant(ctx, m, args[1:]))
+    if sub == "roll":
+        # #59: new initiatives from the initiative_roll_formula rule, for
+        # the units a `!find` selector picks (default: the turn order).
+        if len(args) > 1:
+            predicates = _bind_find_maps(
+                ctx, m, [_parse_find_selector(t) for t in args[1:]])
+            ids = [e.id for e in m.entities_in_turn_order()
+                   if _find_match_entity(m, e, predicates, None)]
+        else:
+            ids = list(m.turn_order)
+        if not ids:
+            return await ctx.send("No units match; nothing rolled.")
+        done, log = m.roll_initiative(ids)
+        head = (f"🎲 Rolled initiative for {len(done)} unit(s)"
+                if len(done) == len(ids) else
+                f"🎲 Rolled initiative for {len(done)} of {len(ids)} unit(s)")
+        lines = [head + (":" if done else ".")]
+        for eid, old, new in done:
+            lines.extend(m.tag_lines(m.unit_tag(eid), [
+                f"- `{eid}`: {old!r} -> {new!r}"]))
+        return await ctx.send("\n".join(lines + list(log)))
     # Fallback: show authoritative help
     return await _help_fallback(ctx, ["turn"], args[0] if args else None)
 
@@ -14483,6 +14640,18 @@ registry.annotate_sub(
           "turn_forecast_hidden_text (turn_forecast_hidden_units). Under "
           "ATB it extends the charge bars at their rates now, an "
           "estimate. The formula function next_turns gives the ids.")
+)
+registry.annotate_sub(
+    "turn", "roll",
+    usage="!turn roll [<selector> ...]",
+    desc=(
+        "Roll a new initiative for each unit in the turn order (or the "
+        "units a `!find` selector picks: `!turn roll team=red`) from the "
+        "initiative_roll_formula rule, self = the unit, and re-sort per the "
+        "turnorder_change_policy rule. A unit whose roll fails keeps its "
+        "initiative, with a ⚠️. The initiative_reroll_each_round rule rolls "
+        "every unit as each round starts."
+    ),
 )
 registry.annotate_sub(
     "turn", "grant",
@@ -15170,6 +15339,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
 
 _PREVIEW_USAGE = (
     "`!map preview burst <x> <y>|<eid> <r> [metric]` | "
+    "`burst from=<eid> <r> [metric]` | "
     "`cone <x> <y>|<eid> <dir> <length> [half_angle]` | "
     "`line <x1> <y1>|<eid> <x2> <y2>|<eid>` | `rect <x1> <y1> <x2> <y2>` "
     "[color=<r,g,b|#rrggbb>] [opacity=<0-100>]")
@@ -15229,8 +15399,39 @@ def _preview_num(toks: List[str], i: int, what: str) -> float:
         raise VTTError(f"`!map preview`: {what} must be a number, got `{toks[i]}`.")
 
 
+def _body_burst_cells(ctx, m, token: str, r: Any, metric: str,
+                      mp: "Map", limit: int,
+                      bounds: tuple) -> Tuple[str, List[Tuple[int, int]]]:
+    """`!map preview burst from=<eid> <r>` (#275): every cell within r of the
+    unit's WHOLE body (its nearest covered cell, as distances to a body
+    measure: cell_entity_distance), on the box around the body clipped to
+    the map and charged to formula_cell_limit."""
+    eid = _query_eid(ctx, m, token)
+    e = m.entities[eid]
+    if e.map != mp.name:
+        raise VTTError(f"`{token}` is on map `{e.map}`, not `{mp.name}`.")
+    if not isinstance(r, (int, float)) or r < 0:
+        raise VTTError("`!map preview`: the radius must be 0 or more.")
+    w, h, voids = bounds
+    xs = [c[0] for c in m.entity_cells(e)]
+    ys = [c[1] for c in m.entity_cells(e)]
+    reach = int(math.ceil(r))
+    x0, x1 = max(1, min(xs) - reach), min(w, max(xs) + reach)
+    y0, y1 = max(1, min(ys) - reach), min(h, max(ys) + reach)
+    if x1 >= x0 and y1 >= y0 and (x1 - x0 + 1) * (y1 - y0 + 1) > limit:
+        raise VTTError(f"`!map preview`: that area holds more than "
+                       f"formula_cell_limit ({limit}) cells.")
+    cells = [(cx, cy) for cy in range(y0, y1 + 1)
+             for cx in range(x0, x1 + 1)
+             if (cx, cy) not in voids
+             and m.cell_entity_distance(cx, cy, e, metric) <= r]
+    shown = m.entity_display_name(e, _query_pov(ctx, m))
+    return f"burst r{r} from {shown}'s body [{metric}]", cells
+
+
 def _preview_cells(ctx, m, toks: List[str],
-                   mp: "Map") -> Tuple[str, List[Tuple[int, int]]]:
+                   mp: "Map", origin: Optional[str] = None
+                   ) -> Tuple[str, List[Tuple[int, int]]]:
     """(description, cells) for a `!map preview` shape. Same geometry as the
     cells_in_* formula functions, bounded by formula_cell_limit, clipped to
     the grid."""
@@ -15257,7 +15458,23 @@ def _preview_cells(ctx, m, toks: List[str],
             raise VTTError(f"Unexpected `{' '.join(toks[maxn:])}` — usage: "
                            f"{_PREVIEW_USAGE}")
 
-    if shape == "burst":
+    if origin is not None and shape != "burst":
+        raise VTTError("`from=<eid>` measures a burst from a unit's whole "
+                       "body; the other shapes take a cell or a unit's id "
+                       "as their point.")
+    if shape == "burst" and origin is not None:
+        r = _preview_num(toks, 1, "the radius")
+        metric = "square_radius"
+        if len(toks) > 2:
+            low = toks[2].lower()
+            if low not in _DIST_METRICS:
+                raise VTTError(f"Unknown metric `{toks[2]}` — use "
+                               f"square_radius, manhattan or euclidean.")
+            metric = _DIST_METRICS[low]
+        done(1, 3)
+        desc, cells = _body_burst_cells(ctx, m, origin, r, metric, mp,
+                                        limit, bounds)
+    elif shape == "burst":
         x, y, i = _preview_point(ctx, m, toks, 1, "the centre", mp)
         r = _preview_num(toks, i, "the radius")
         metric = "square_radius"
@@ -15320,10 +15537,11 @@ async def _map_preview(ctx, m, args: List[str], mp: "Map"):
     the channel can't see reads as missing) and aren't listed."""
     opts = [a for a in args if "=" in a]
     toks = [a for a in args if "=" not in a]
-    _check_options(opts, {"color", "opacity"}, "map preview")
+    _check_options(opts, {"color", "opacity", "from"}, "map preview")
     kv = {a.split("=", 1)[0].lower(): a.split("=", 1)[1] for a in opts}
+    origin = kv.pop("from", None)
     rgb, opacity = _mark_style(m, kv)
-    desc, cells = _preview_cells(ctx, m, toks, mp)
+    desc, cells = _preview_cells(ctx, m, toks, mp, origin=origin)
     pov = _view_pov(ctx, m, [])
     area = set(cells)
     inside = []
@@ -15646,7 +15864,7 @@ async def _map_shape(ctx: ReplyContext, m: "Match", args: List[str]):
 for _sub, _usage in (
         ("colors", "!map colors"),
         ("cell", "!map cell <x> <y> [for=<eid>] [dir=<dir>] [as=<team>] [map=<map>]"),
-        ("preview", "!map preview <burst|cone|line|rect> <shape args ...> [map=<map>]"),
+        ("preview", "!map preview <burst|cone|line|rect> <shape args ...> [from=<eid>] [map=<map>]"),
         ("ent_sight", "!map ent_sight <eid> [color=<r,g,b>] [opacity=<0-100>]"),
         ("background", "!map background <key|clear> [stretch|tile|center] [map=<map>]"),
         ("border", "!map border <on | off | clear | color <name> | opacity <0-100>> [map=<map>]"),
@@ -15957,7 +16175,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                    f"del / list.")
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out), and `dir=<dir>` judges it for a step entering the cell that way (the block conditions' move_dir / from_x / from_y: a one-way door). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map attach <map> <eid>` makes a unit carry a map (a map vehicle: a ship's deck, a building's interior), `!map detach <map>` frees it; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` (a point is `x y` or a unit's id, read at its aoe_origin cell; `burst from=<eid> <r>` measures from the unit's whole body, as unit distances do) shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out), and `dir=<dir>` judges it for a step entering the cell that way (the block conditions' move_dir / from_x / from_y: a one-way door). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map attach <map> <eid>` makes a unit carry a map (a map vehicle: a ship's deck, a building's interior), `!map detach <map>` frees it; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     args, mapspec = _pop_map_opt(args)
@@ -16683,6 +16901,17 @@ def _fmt_status_names(e) -> str:
             show_lvl = False
         out.append(f"{name}({lvl})" if show_lvl else str(name))
     return "/".join(out)
+
+
+def _without_engine_keys(v: Any) -> Any:
+    """A copy of a var value without its `__` keys at any depth (engine
+    bookkeeping a player's `!ent get` doesn't show)."""
+    if isinstance(v, dict):
+        return {k: _without_engine_keys(x) for k, x in v.items()
+                if not str(k).startswith("__")}
+    if isinstance(v, list):
+        return [_without_engine_keys(x) for x in v]
+    return v
 
 
 def _resolve_dotted_var(vars_dict: Dict[str, Any], path: str) -> Tuple[bool, Any]:
@@ -18000,9 +18229,13 @@ def _confirm_message(action_label: str, n: int, scope: str,
     )
 
 
+# Longest `!history note` (#134): a note is a one-line label.
+HISTORY_NOTE_MAX = 200
+
+
 @registry.command(
     "history",
-    usage=("!history <list|save|delete|restore|undo|export|import> ..."),
+    usage=("!history <list|save|note|delete|restore|undo|export|import|diff> ..."),
     desc=(
         "Per-match save & undo system. Three flavors of autosave are "
         "taken automatically — round-start (after on_round_start hooks), "
@@ -18111,6 +18344,30 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"seq {s.sequence})"
             + (f", replacing the old `{name}`." if replaced else ".")
         )
+
+    if sub == "note":
+        # #134: a label on the latest snapshot, shown by the listings and
+        # the undo previews; `-` clears it.
+        if await return_help_if_not_enough_args(ctx, args, 2, "history", "note"):
+            return
+        text = " ".join(str(a) for a in args[1:]).strip()
+        snaps = [x for x in (m.history.round_saves + m.history.turn_saves
+                             + m.history.command_saves
+                             + list(m.history.manual_saves.values()))]
+        if not snaps:
+            raise VTTError("This match has no snapshot to note yet.")
+        snap = max(snaps, key=lambda x: x.sequence)
+        if text == "-":
+            snap.note = ""
+            return await ctx.send(
+                f"Cleared the note on seq {snap.sequence} "
+                f"({snap.plain_summary()}).")
+        if "\n" in text or len(text) > HISTORY_NOTE_MAX:
+            raise VTTError(f"A note is one line of at most "
+                           f"{HISTORY_NOTE_MAX} characters.")
+        snap.note = text
+        return await ctx.send(f"📝 Noted seq {snap.sequence} "
+                              f"({snap.plain_summary()}): {text}")
 
     if sub == "delete":
         if await return_help_if_not_enough_args(ctx, args, 2, "history", "delete"):
@@ -18490,6 +18747,8 @@ async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
         "now", what, _diff_rule_text(ctx, m))
     lines[0] = (f"🔍 **Undo preview** — `{what}` would make these changes "
                 f"(nothing restored yet):")
+    if snap.note:
+        lines.insert(1, f"📝 {snap.note}")
     lines[1:1] = _authors_line(m, snap.sequence, None, undone=True)
     later = sum(1 for x in (m.history.round_saves + m.history.turn_saves
                             + m.history.command_saves)
@@ -18893,6 +19152,17 @@ registry.annotate_sub(
         "Create or overwrite a named manual save bookmarked at the "
         "current state. Manual saves never auto-prune; delete them "
         "explicitly with `!history delete <name>`."
+    ),
+)
+registry.annotate_sub(
+    "history", "note",
+    usage="!history note <text ...>",
+    desc=(
+        "Label the latest snapshot (an autosave or a manual save) with a "
+        "note, one line: `!history list` and the undo previews show it "
+        "beside the snapshot, so a later undo knows what it goes back to "
+        "(\"before the dragon fight\"). A new note replaces the old one; "
+        "`-` clears it."
     ),
 )
 registry.annotate_sub(
@@ -20077,7 +20347,7 @@ registry.annotate_sub(
 # same GameSystem-persist + refresh-live-matches pattern.
 @registry.command(
     "defvar",
-    usage="!defvar <add|remove|list> ...",
+    usage="!defvar <add|remove|list|map|match> ...",
     desc=(
         "Manage the active match's game-system `default_entity_vars` rule "
         "— var defaults applied to EVERY entity at creation (!ent add, "
@@ -20098,11 +20368,11 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # `!defvar map <add|remove|list> ...` edits default_map_vars, the vars
     # every new map starts with, the same way.
     rule, kind = "default_entity_vars", "entity"
-    if sub == "map":
+    if sub in ("map", "match"):
         if len(args) < 2:
-            raise VTTError("Usage: `!defvar map <add <path> <value> | remove "
-                           "<path> | list>`.")
-        rule, kind = "default_map_vars", "map"
+            raise VTTError(f"Usage: `!defvar {sub} <add <path> <value> | "
+                           f"remove <path> | list>`.")
+        rule, kind = f"default_{sub}_vars", sub
         args = args[1:]
         sub = args[0].lower()
 
@@ -20124,16 +20394,17 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         path = args[1]
         check_store_path(path, "var path")
-        if kind == "map":
+        if kind in ("map", "match"):
             value = _parse_scalar(args[2])
-            _check_tail(args, 3, (), "!defvar map add <path> <value>")
+            _check_tail(args, 3, (), f"!defvar {kind} add <path> <value>")
             existing = _read_vars()
             existing[path] = value
             refreshed = _write_vars(existing)
+            made = "maps" if kind == "map" else "matches"
             return await ctx.send(
-                f"Default map var `{path}` = {value!r} on system `{sys_name}` "
-                f"[refreshed {refreshed} live "
-                f"match{'es' if refreshed != 1 else ''}]. Applies to maps "
+                f"Default {kind} var `{path}` = {value!r} on system "
+                f"`{sys_name}` [refreshed {refreshed} live "
+                f"match{'es' if refreshed != 1 else ''}]. Applies to {made} "
                 f"created from now on (fills only when the var is missing).")
         if path.split(".", 1)[0] in RESERVED_VAR_PATHS:
             return await ctx.send(
@@ -20170,10 +20441,11 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         del existing[path]
         refreshed = _write_vars(existing)
         return await ctx.send(
-            f"Removed default {'map ' if kind == 'map' else ''}var `{path}` "
-            f"from system `{sys_name}` [refreshed {refreshed} live "
+            f"Removed default {'' if kind == 'entity' else kind + ' '}var "
+            f"`{path}` from system `{sys_name}` [refreshed {refreshed} live "
             f"match{'es' if refreshed != 1 else ''}]. Already-"
-            + ("made maps" if kind == "map" else "spawned entities")
+            + {"map": "made maps", "match": "made matches"}.get(
+                kind, "spawned entities")
             + " keep their value."
         )
 
@@ -20191,6 +20463,15 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     raise VTTError(f"Unknown !defvar subcommand: {sub}")
 
 
+registry.annotate_sub(
+    "defvar", "match",
+    usage="!defvar match <add <path> <value> | remove <path> | list>",
+    desc=(
+        "The default MATCH vars (the default_match_vars rule): every new "
+        "match starts with the ones it lacks (a day counter, the weather, a "
+        "score). Matches made earlier keep their vars."
+    ),
+)
 registry.annotate_sub(
     "defvar", "map",
     usage="!defvar map <add <path> <value> | remove <path> | list>",
@@ -22863,6 +23144,15 @@ registry.annotate_sub(
           "share of its components that match. `-` or none clears it."),
 )
 registry.annotate_sub(
+    "status", "tick_priority",
+    usage="!status tick_priority <name> <n|->",
+    desc=("The order a unit's statuses tick in when several tick at the same "
+          "moment: highest first, as passives run (any number, default 0; "
+          "ties keep the order the unit gained them). So regeneration at 10 "
+          "ticks before poison at 0 whichever came first. A level entry or "
+          "the instance can hold its own. `-` goes back to 0."),
+)
+registry.annotate_sub(
     "status", "resist_rounding",
     usage="!status resist_rounding <name> <floor|ceil|round|->",
     desc=("How this status's resisted level or duration rounds, over the "
@@ -22940,7 +23230,8 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2,
                     "level": 3, "resist_affects": 3, "resist_rounding": 3,
                     "on_transform": 3, "removed_on_damage": 3,
-                    "break_at_damage": 3, "damage_filter": 2}
+                    "break_at_damage": 3, "damage_filter": 2,
+                    "tick_priority": 3}
 
 # `!status level` (#259): a level entry's field -> the `!status`
 # subcommand that edits that field of a definition (run on a scratch
@@ -22955,6 +23246,7 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "removed_on_damage": "removed_on_damage",
                      "break_at_damage": "break_at_damage",
                      "damage_filter": "damage_filter",
+                     "tick_priority": "tick_priority",
                      **{f: f for f in ACTION_RESTRICTION_FIELDS},
                      **{f + UNLESS_SUFFIX: f + UNLESS_SUFFIX
                         for f in ACTION_RESTRICTION_FIELDS}}
@@ -23368,6 +23660,27 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                 f"bearer takes adds up in the instance's `damage_counted`, "
                 f"and the status goes once it reaches {sdef[sub]}.")
 
+    if sub == "tick_priority":
+        # #266: the order a unit's statuses tick in, highest first.
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
+            return ""
+        name, val = args[1], args[2]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <n|->")
+        if val.lower() in ("-", "default", "clear"):
+            m.status_definitions[name].pop(sub, None)
+            return f"`{name}` tick_priority cleared (0)."
+        try:
+            n = float(val)
+        except ValueError:
+            n = None
+        if n is None or not math.isfinite(n):
+            return "❌ tick_priority must be a number (or `-`)."
+        m.status_definitions[name][sub] = int(n) if n == int(n) else n
+        return (f"`{name}` tick_priority = {m.status_definitions[name][sub]}"
+                f": a unit's statuses tick highest first.")
+
     if sub in ("resist_affects", "resist_rounding", "on_transform"):
         # #232: what resistance changes on this status, and how its result
         # rounds (over the status_resist_rounding rule); what a transform
@@ -23532,7 +23845,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|data|tags|"
+    usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|tick_priority|data|tags|"
            "removes|blockedby|forbids_actions_with_tag|forbids_actions_with_name|"
            "immune_to_actions_with_tag|immune_to_actions_with_name|"
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
@@ -23578,7 +23891,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         "`immune_to_actions_with_tag|immune_to_actions_with_name` keep "
         "such actions off it; each takes a `<field>_unless <name> "
         "<formula>` lifting it while true. "
-        "Subcommands: def, drop, rename, copy, tick, hook, display, when, stack, maxlevel, "
+        "Subcommands: def, drop, rename, copy, tick, hook, display, when, stack, maxlevel, tick_priority, "
         "data, tags, removes, blockedby, the action restrictions, list, info, "
         "apply, force, dispel, transfer, sprite."
     ),

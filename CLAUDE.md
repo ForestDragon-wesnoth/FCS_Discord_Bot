@@ -1268,7 +1268,9 @@ hardcodes**.
   (`logic._simple_var_test`) instead of building a formula namespace,
   which costs ~2 ms (X15); anything else runs the formula, including a
   number with leading zeros or leading whitespace, which the formula
-  engine refuses (L42).
+  engine refuses (L42). `exists(eid)` is true for any unit in the match (a
+  destroyed body part too; a corpse is `has_corpse`), `is_alive(eid)`
+  follows `alive_condition` (1171).
 - **Commands:** `!ent` add / remove / rename / info / dump / diff / set_var /
   set_vars / delete_var / hp / init / tp / move / push / pull / swap / face /
   kill / revive / clone / copy / transfer / transform / revert / status /
@@ -1281,6 +1283,12 @@ hardcodes**.
   after every var is written (`_death_check_deferred_ids`), and a rollback
   drops the lines its writes surfaced. `!ent set_var` coerces only lowercase
   `true` / `false` to bools and keeps `inf` / `nan` as text.
+  `!ent get <id> <path>` (a player read) prints one var or subtree (a dict
+  as JSON) through the channel's view and the reader (§7.22): a private
+  var reads as missing, and for a non-host `__` keys read as missing and
+  leave subtrees. `!ent var_add <id> <path> <n>` / `var_move` / `var_copy
+  <id> <path> <dest id> <dest path>` are the typed container helpers
+  (undo steps; a player's go to the approval queue) (1177).
 - **Container helpers** (the engine has no inventory concept): `var_add`,
   `var_move` (looting), `var_copy`, `var_sum_field`, `item_add` /
   `item_consume` (drops the container at 0; `amount_field` rule; `var_move`
@@ -1291,7 +1299,10 @@ hardcodes**.
   `reverse`, `flatten` (one level), `zip` (pure, loopable, charged to the
   list budget, 887). keys / values / each / len / pick / shuffle /
   roll_table skip a partial template's `__template` marker
-  (`formula._data_items`), as var_keys skips every `__` key. Authoring notes: in an item's action `source.<path>` is
+  (`formula._data_items`), as var_keys skips every `__` key. Dict helpers
+  (pure, each returning a new dict, 1173): `merge(a, b, ...)` (shallow,
+  later wins), `items(d)` (loopable [key, value] pairs), `with_key(d, k,
+  v)`, `without_key(d, k)`. Authoring notes: in an item's action `source.<path>` is
   the ITEM's container and `entity[self]` the HOLDER; dict keys are unique, so
   identical items stack through an amount field; `!ent set_var hero
   inventory.potion 99` replaces the whole item dict.
@@ -1690,6 +1701,20 @@ hardcodes**.
 - **Status ticks** (`fire_status_tick`): per status, the definition's `tick`
   at its `tick_when`, else the global `status_tick_formula` at
   `status_tick_when` (default never); stops for a unit removed mid-tick.
+  Order (`Match.status_tick_order`): highest `tick_priority` first
+  (`status_field`, so an instance key or a level entry sets it; `!status
+  tick_priority <name> <n|->`), ties in the order the unit gained them
+  (1175).
+- **Round lines and initiative rolls** (1174): `match_start_message_format`
+  prints before the first round (`next_turn`'s first turn; ATB's first
+  turn), `round_end_message_format` at each wrap before the on_round_end
+  hooks (`logic.round_message_line`; both empty by default).
+  `initiative_roll_formula` (expression, self = the unit) gives `!turn roll
+  [selector ...]` (the `!find` grammar, default the turn order; an undo
+  step) its numbers through `Match.roll_initiative`: a result that isn't a
+  whole number keeps the old value with a ⚠️ tagged as about the unit.
+  `initiative_reroll_each_round` rolls every unit in the order before
+  round 1 and after each wrap, then re-sorts (`_round_initiative_reroll`).
 - **ATB** (`atb_enabled`, system-wide): no rounds; each turn goes to the unit
   whose charge bar (`atb_charge_var`, rate `atb_charge_formula`) fills
   soonest (ties: higher rate, then id; rate ≤ 0 can't act); reset via
@@ -2442,7 +2467,14 @@ hardcodes**.
   has_los, the line searches; 935). Builders are clipped to the map
   and charged to `formula_cell_limit` (`!map preview` under
   `void_under_fog fog` marks and counts a void the view can't see like
-  the fog around it, V24, 1146). `!dist` and `!map preview
+  the fog around it, V24, 1146). Cell sets (pure, 1172): `cells_union`
+  (each cell once, first met first), `cells_minus(a, *others)`,
+  `cells_intersect(a, *others)` (a cell naming its map is its own cell);
+  `cell_toward(x, y, dir, n=1)` (pure); `cell_behind(target, origin)`
+  (origin a unit's body centre or a cell; the cell past the target's body
+  on the far side, measured by the body's ranges, None off the map or from
+  inside the body). `!map preview burst from=<eid> <r>` measures from
+  every cell of the body (`_body_burst_cells`). `!dist` and `!map preview
   <burst|cone|line|rect>` show the same geometry. Block conditions also
   see the step (`move_dir`, §7.12 "Facing").
 
@@ -3216,7 +3248,9 @@ hardcodes**.
   match and in the system chain with its source), `!match sync ... diff`
   (what a sync would change) (760-762).
 - **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
-  `match_var_del`. **Groups:** `!ent group`, `group:<name>` selectors and
+  `match_var_del`; `default_match_vars` (MERGE rule, `!defvar match
+  add|remove|list`, `logic.fill_default_vars`) fills a NEW match's missing
+  vars (1176). **Groups:** `!ent group`, `group:<name>` selectors and
   group moves.
 - **Attribution:** each command snapshot records who ran it
   (`Snapshot.by`) and each event-log entry its command's author
@@ -3333,6 +3367,9 @@ hardcodes**.
   named with `as` says it replaced the old one (1036); it takes the next
   sequence of the match's counter and is stored whole (W10, 1141: the
   export's own number replaced the match's snapshot of that number).
+  `!history note <text|->` labels the newest snapshot (`Snapshot.note`,
+  saved in the history index, one line of at most `HISTORY_NOTE_MAX`);
+  `!history list` and the undo previews show it (1176).
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -3343,7 +3380,10 @@ hardcodes**.
   through `roll_table_pick`) and a leading `<n>x` repeating any roll, at
   most `roll_repeat_limit` (owner ceiling) (888); `roll_table`
   (finite weights, keyed entries), `band` (ranges may be negative; an
-  unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
+  unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`;
+  `roll_dice(spec, all=False)` (the kept dice as a list, every die rolled
+  with `all=True`, flat modifiers left out; `roll_detail(dice_out=)`) and
+  `chance(percent)` (1171). All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
   `random_seed` rule when set, else the match's own `rng_seed` (made at
   creation, fresh for a clone), counting the 32-bit words drawn

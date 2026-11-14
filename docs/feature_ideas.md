@@ -2,8 +2,8 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #348). #264-#348 come from review passes by
-another model and share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #385). #264-#385 come from review passes by
+another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
 System); their background, the rule terms they use and the limits and costs
@@ -16,7 +16,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #135 (`pending_request_expiry_seconds`), #221 (`default_passives_existing_units`, on by default), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #135 (`pending_request_expiry_seconds`), #221 (`default_passives_existing_units`, on by default), #89, #326, #269, #270, #271, #325 (formula helpers: `chance`, `exists` / `is_alive`, cell sets, `cell_toward` / `cell_behind`, `roll_dice`, dict helpers), #123, #134, #328, #266, #111, #282, #275, #59 and #124 (`!turn roll`, `initiative_reroll_each_round`), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), #31 (zone definitions and tags, prefabs, see
 `docs/zones_prefabs_design.md`), parts of #14, parts of #190 (Discord-role
@@ -28,7 +28,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   export` + `!history import` into a new match), #137 (a reach aura: a zone
   anchored to the unit, whose `on_enter` / `on_exit` hooks fire once per body
   crossing, `zone_anchor_of` naming the standing unit).
-- Struck by the user: #7, #11 (summon lifetime: the summoning action
+- Struck by the user: #57 (labelled rolls), #83 (a roll against a target), #7, #11 (summon lifetime: the summoning action
   gives the summon an expiring status whose on_removed hook despawns it,
   scenario 1089), #44, #45, #156, #145 (deployment phase: a player
   asks the host to place their unit, or the host opens `!ent tp` to them with
@@ -45,17 +45,13 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Note: the limits should key on `turns_elapsed`, so they work under ATB. #24's `uses_per_turn` would cover them.
 - **#14 Left-over follow-ups.** One item remains, marked "decide later" by you: configurable side names for the directional functions.
 - **#55 Enable/disable passives and watchers.** `!passive disable/enable`, the same on `!gpassive` and `!watch`, plus a formula function. Useful for testing and for "silenced" statuses.
-- **#57 Labelled rolls.** `!roll 1d20+5 attack` labels the result. (Repeats, `!roll 6x 4d6kh3`, shipped with #217.)
-- **#59 `!turn roll [selector]`.** Rerolls initiative for the selected units with an `initiative_roll_formula` rule.
 - **#66 `!redo`.** Keeps the snapshots an undo dropped until the next state-changing command, so an undo can be taken back.
   - Note: undo replaces the Match object, and the journal records undo as state. Redo snapshots have to be dropped by any state change on the match from any channel, approvals and watchers included, and a redo needs its own journal entry.
 - **#71 Progress clocks.** `!clock add/tick` keeps named clocks, shown in the `!state` header, firing a `clock_filled` event when one fills.
 - **#73 `!rest <selector>`.** Runs a GM-defined `rest_formula` rule on each selected unit.
 - **#76 Named map points.** `@gate` works anywhere a command takes `x y`, and `point_x` / `point_y` read it in formulas.
 - **#79 `!note add/list/remove`.** Per-match GM notes; pinned notes are visible to players and shown in `!state`.
-- **#83 `!roll <dice> <op> <n>`.** A roll against a target, e.g. "17 — success".
 - **#87 `line_walkable(eid, x, y)`.** Checks a straight-line walk for the unit's whole body, for charges and dashes.
-- **#89 `chance(percent)`** on the match RNG, so it respects `random_seed`.
 - **#95 Vision radius through `apply_mods`,** so items and statuses can change sight.
 - **#98 Turn-order markers in `!list`.** Marks units that will skip their next turn and units with no initiative.
 - **#104 Dice pools in the dice grammar,** the same in `roll()`, `!roll` and `!roll odds`:
@@ -65,7 +61,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - `d%`.
 - **#105 `opposed(spec_a, spec_b)` and `degree(roll, target, step)`.** An opposed roll returns its margin; success tiers cover hard/extreme (CoC) and 7–9/10+ (PbtA). These are generic helpers for the GM's own resolution.
 - **#107 Line-of-effect areas.** A `los=True` option on `cells_in_burst` / `cells_in_cone` and `!map preview`, so an explosion stops at walls.
-- **#111 `!ent get <id> <path>`.** Reads one var or subtree. Players can use it under the POV rules and #70's private vars; today reading needs `!ent dump` (host-only) or a `$()`.
 - **#112 Bar placeholders** for `entity_line_format` and #68: `{hp_bar}` (▰▰▰▱▱, width from a rule), and `{bar:mana:max_mana}` for any pair of vars.
 - **#114 Status glyph and color on the ASCII map.** A status definition's `glyph` / `color` (with a priority) show on the bearer. This is the text twin of status overlay sprites.
 - **#115 Hidden statuses.** A definition flag (or a visibility formula) keeps a status out of non-host views: `!ent info`, `show:status`, `status:` selectors. For curses and tracking marks.
@@ -76,12 +71,9 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#119 One-shot hooks.** A `once` flag on tile and zone hooks, for pressure plates and mines.
 - **#120 `on_move_blocked` hook.** Fires on the mover when a walk, push, pull or swap is stopped, binding the blocker (a unit id or a cell) and the kind of move. It covers bump-to-attack, collision damage on knockback, and "you walk into the wall".
 - **#121 Per-unit ATB threshold.** An override var for the `atb_threshold` rule.
-- **#123 `round_end_message_format` and `match_start_message_format` rules,** twins of the round-start line.
-- **#124 Initiative reroll every round.** A rule that re-runs #59's formula at each round start.
 - **#128 `!whisper <team> <text>`.** A host posts to every channel bound with that team's POV (handouts, secret info).
 - **#129 `!ent export <id>` / `!ent import <json>`.** A unit with its parts as JSON pasted in chat, to share between matches or bots without file access. Import goes through the template checks.
 - **#133 `!map around=<eid> [r]`.** A one-off window centered on a unit; the channel camera stays where it is.
-- **#134 `!history note <text>`.** Labels the latest snapshot, so `!history list` and undo previews say what it was.
 
 ### New
 
@@ -212,22 +204,16 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 - **#264 Looks by state.** A unit's `looks` list of `{condition, glyph, sprite, color}`; the first entry whose condition holds decides how it draws (bloodied, enraged, burrowed). Today `color` takes a formula and `glyph` / `sprite` are fixed vars.
 - **#265 Facing follows movement.** A rule `move_sets_facing` (`off` / `walk` / `all`, with a per-unit override): a step turns the unit the way it stepped. Today a walk leaves facing alone, so a `side_hit` game needs `!ent face` after every move.
-- **#266 Status tick order.** `tick_priority` on a status definition, highest first as passives run. Today ticks run in the order the unit received its statuses, so "regen before poison" depends on application order.
 - **#267 Statuses that end with their source.** A definition field `source_lost: keep | remove`: when the applier dies or leaves, the status goes (removed_by `source`). For taunts, grapples and concentration buffs; builds on the `__source` field from #25.
 - **#268 Corpse writes.** `corpse_var_set`, `corpse_var_del`, and `var_move` taking a corpse as either end. Today corpse data is read-only (`corpse_var`, `corpse_has`), so looting a body means reviving it or deleting it.
-- **#269 Cell-set helpers.** Pure `cells_union`, `cells_minus`, `cells_intersect`. A minimum-range weapon is `cells_minus(burst 5, burst 1)`; a blast clipped to a zone is an intersect.
-- **#270 A cell in a direction.** `cell_toward(x, y, dir, n=1)` and `cell_behind(target, from)`, the inverse of `direction_to`. For knockback landing cells and "the cell behind the target".
-- **#271 Dice as a list.** `roll_dice('4d6')` returns the kept dice (the engine's `roll_detail` already computes them). For doubles, "count the sixes" and "highest die".
 - **#272 Default parameters for `!func`.** `!func def mitigated raw,armor=0 "..."`, plus keyword calls.
 - **#273 Descriptions on GM definitions.** A `describe` subcommand on `!func`, `!macro`, `!alias`, `!table`, `!watch`, tile templates and zone definitions, shown in their lists and in `!help function`, and ready for the handbook export (#231).
 - **#274 Spawn overrides.** `!template spawn orc 3 3 team=red vars.hp=20 name="Orc Chief"` and an `overrides=` dict on `summon_template`. Plain values; #251 covers formulas evaluated at spawn.
-- **#275 Unit-anchored previews.** `!map preview burst from=<eid> 5` measures from the unit's whole body through `aoe_origin`. Today a preview takes a cell.
 - **#277 Explain sight.** `!map los <from> <to> [for=<team>]` walks the line and names the first opaque cell, the condition that made it opaque, the fog range and the visibility condition's result. The sight twin of `!map cell ... for=`.
 - **#278 Swallowed-error list.** `!match problems` (hosts) lists the fail-open conditions that errored: block, opaque, visibility, slot and grant conditions, with a count and the last error. Today each shows only where the GM happens to look.
 - **#279 Lint for var-path typos.** `!system lint` reports `entity[...].<path>` reads and writes whose path no default var, template or unit holds. A typo in a fail-open block condition currently never blocks and never complains.
 - **#280 `!history trace <eid> <path>`.** Walks the autosave diffs and lists each command where the var changed, old → new, with its author. Answers "why is hp 3?".
 - **#281 Trace for any command.** `!dry trace <command ...>` gives the `!eval --trace` list (reads, writes, hook writes marked) for a whole action or turn.
-- **#282 Typed twins of the container functions.** `!ent var_add <id> <path> <n>`, `!ent var_move <id> <path> <dest id> <path>`, `!ent var_copy`. A player can then hand an item over through the approval queue; today that takes `!eval`.
 - **#283 Send a saves file.** `!store send <name>` posts a file from the saves folder as a Discord attachment (admin or the `files` role). Exports written by `!store save`, `!history export` and `!match journal export` stay on the host's disk, out of a Discord admin's reach. Download only.
 - **#284 Access explain.** `!host access check <command ...> [user=|role=]` reports the level that applies and which layer set it: read-only downgrade, elevated arg, per-player, per-role, match or system override.
 - **#285 Turn card.** A rule `turn_start_card` (`none` / `card` / `actions`): the turn line is followed by the acting unit's card and its usable action names, as the channel's view sees them.
@@ -248,16 +234,29 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#322 Storage warning.** Administrators get one line a day once the server passes an owner-set share of its limit. Today the first notice is a rolled-back command.
 - **#323 `!help mine`.** The commands and subcommands open to the caller in this channel, judged by the gate with every override. Pairs with #284.
 - **#324 `return` in programs.** An early `return <value>` in `!func` bodies, passives and action programs. Today a program's value is its trailing expression, so guard clauses become nested ifs.
-- **#325 Dict helpers.** `merge(a, b)`, `items(d)` (loopable pairs), `with_key(d, k, v)`, `without_key(d, k)`, each returning a new dict. Building a dict in a loop takes var writes today.
-- **#326 `exists(eid)` and `is_alive(eid)`.** The function list has `zone_exists`, `watch_exists` and `has_corpse` and no unit twin; a formula holding a stored id has no direct test.
 - **#327 Tag filter on passives.** `tag=<filter>` on global, team and default passives, tested natively before the formula runs, as `each` watchers already do. It saves a namespace build per unit per hook and removes the guard line from every body.
-- **#328 Default match vars.** A merge rule `default_match_vars` filling a new match's vars, the twin of `default_entity_vars` and `default_map_vars`.
 - **#329 Move a corpse.** `corpse_move(id, x, y, map=None)` and `!ent tp` accepting a corpse id, for dragging the fallen. Pairs with #268.
 - **#330 Hit-location odds.** `!part odds <target> <x> <y> [aim=]` prints each part's chance from that position, the way `!roll odds` prints a distribution.
 - **#331 Team rename.** `!team rename <old> <new>` moves unit team vars, team data, team passives, colours, POV bindings, reveals, fog memory, `actions_seen` and last actors in one undo step.
 - **#333 Concept pages.** `!help topic <name>` for the ideas commands assume: turn models, access and approvals, privacy, tiles and zones, templates / partials / prefabs.
 - **#334 Per-channel line detail.** `lines=all|results|none` on `!match bind`, a channel-level `hook_output_lines`, so a player channel shows results while the GM channel shows every ⚙️ line.
 - **#335 Zone outlines in images.** A zone look `draw: outline`: only the zone's edge is drawn, so a large aura stays readable over the units inside.
+- **#349 Augmented assignment.** `entity[self].hp -= 5` and `total += x`, compiled to a read and a write. Today the sandbox refuses `-=`, so every change spells the path twice.
+- **#350 Destructuring.** `x, y = nearest_cell(...)`. Today tuple assignment is refused and a coordinate is read with `coord_x` / `coord_y` (a `for k, v in items(d)` loop already unpacks).
+- **#351 Read subscripts.** `cells[0]` and `d['key']`, compiled to `get(...)`; `entity[...]` keeps its meaning.
+- **#352 f-strings.** `f"{name} takes {dmg}"`, compiled to `fmt`.
+- **#353 Type tests.** `is_number`, `is_text`, `is_list`, `is_dict`, for `!func`s and action args that accept several shapes.
+- **#354 Line numbers in formula errors.** A multi-line body's runtime error names the line and quotes it. Today the reply carries the error text alone.
+- **#355 Macro variables.** A `let name = $(expr)` line whose value later lines read as `$name`, plus `stop`. Today a macro parks intermediate values in match vars.
+- **#356 Actor tag filters.** `actor_requires_tags` / `actor_refuses_tags` on an action, the twins of `target_requires_tags` ("flyers only", "no undead").
+- **#357 Hook filters on zones and tiles.** A `filter` (tag filter) and, for an aura, a relation to its anchor, tested natively before the hook formula. The twin of #327.
+- **#358 Zone owner.** An owner unit on a zone (`zone_spawn(..., owner=)`), a `zone_owner(name)` read, a rule for the owner's removal (keep / delete), and packets dealt by the zone's hooks defaulting their dealer to the owner. A wall of fire then credits its caster with the kill.
+- **#359 Damage breakdown placeholder.** `{breakdown}` in the damage and healing line formats: each step's change ("12 fire − 4 armor = 8"), which `!damage explain` shows hosts today. A rule picks the views that get it.
+- **#360 Live numbers in descriptions.** `{...}` placeholders in an action's, item's or status's `description`, filled from the holder's data at read time through the reader, so privacy applies ("Deals {source.damage} fire").
+- **#361 Dice odds in formulas.** `roll_mean(spec)` and `roll_odds(spec, op, n)` on the exact-distribution code behind `!roll odds`; read-only, no RNG drawn.
+- **#362 `!table odds <name>`.** Each entry's chance, including #253's adjustments.
+- **#363 Action sweeps queue behind a window.** An `!action` line of a batch or `!foreach` that meets an open reaction window waits in the reaction queue, as formula-started actions already do. Today the hold refuses it, so "every archer fires" stops after the first shot that opens a window.
+- **#364 Clamps beyond units.** `!clamp` on team data, match vars and zone data paths: a shared mana pool stops at 0, a door's hp at its maximum.
 
 ## Medium (a subsystem slice)
 
@@ -480,6 +479,16 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#344 Status-held team change.** A status field `team_while`: the bearer counts as that team while it holds the status and returns on removal, the newest winning when two overlap. Charm and possession appear in all three of the group's combat systems; hooks that stash and restore the team by hand break on overlap.
 - **#346 Scenario coverage report.** `run_scenarios.py --coverage` lists the subcommands, rules and formula functions no scenario exercises. Points the next audit pass at untested code.
 - **#347 Benchmark suite.** `tools/bench.py` times fixed boards (1,000 units on 150×150, 10,000 units) per command against a stored baseline and fails on a slowdown. Keeps the #197 gains from eroding.
+- **#373 Bracket access for zones, teams and maps.** `zone[trap3].armed = false`, `team[red].gold += 5`, `map[deck].alarm`: the `entity[...]` syntax for the other stores, compiled onto their get / set functions. Pairs with the object ideas (#311, #338, #339).
+- **#374 Initiative through modifiers.** A rule making the sort read `apply_mods` over the turn-order var, with a status change that alters it re-sorting as an initiative write does. Haste and slow become modifier records that end with their status; the twin of #95.
+- **#375 Edge walls.** Tile data `walls: [up, right]`: thin walls on a cell's edges, blocking a step and sight across that edge from both sides. Today a one-way door through `move_dir` needs both cells authored, and sight has no edge concept.
+- **#376 The event log records who saw each entry.** The teams able to see the unit when the entry was written, as `actions_seen` records them. It gives players a `!log` and is the base for the recap (#34), the log channel (#148) and "what changed" (#146). Today `!log` turns host-only once anything is hidden.
+- **#377 Action forecast text.** An action field `forecast` (a read-only expression with the target bound) shown by `!action info <eid> <name> <target>`: "65% to hit, 8-14 fire". GM-authored and RNG-free, so players may read it while #238 keeps real outcomes with hosts. Uses #361.
+- **#378 Command deadline.** An owner limit `command_time_limit_seconds`, tested at the points limits are already charged (loop iterations, cells, hook fires, macro steps); past it the command stops and rolls back with a note. A wall-clock stand-in for the deferred per-server work budget; a stopped command writes no journal entry, so replays stay consistent.
+- **#379 Save format version.** Every file the storage layer writes carries a format number and loads run numbered migrations; the existing fix-ups (`LEGACY_IDS_OK`, `legacy_template_fixes`) become the first ones. For the public rollout.
+- **#380 Reply snapshots.** `run_scenarios.py --snapshot` writes every scenario's full replies; `--diff` lists the replies a change altered. It catches drift no `??` asserts, and a PR can state "these 14 replies changed".
+- **#381 Record a session as a scenario.** CLI `!as record <file>` writes the typed commands in scenario format with `??` lines taken from the observed replies. A bug found while testing after a merge becomes a scenario in one step.
+- **#382 Parallel scenario runs.** `-j N`; scenarios already run in separate temp folders, and the suite runs twice per change (plain and under `FCS_SPATIAL_CHECK=1`).
 
 ## Large (arcs of several PRs)
 
@@ -537,6 +546,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 - **#306 Encounter library.** A saved bundle of a prefab, the watchers, macros, reminders and match vars that go with it, and a turn-order setup, stamped into a match in one command. Sits between prefabs (#31) and system packs (#162).
 - **#348 Module split.** vtt_commands.py and logic.py are about 29,000 lines each; split them into packages by subsystem with pure moves. Every session reads less to find its way, and parallel PRs conflict less.
+- **#385 Server isolation.** Each server's commands run in their own worker process, so one server's slow command no longer delays the others. Locks, storage and routing are per server already; this removes the shared event loop behind most of the limit rules and ceilings.
 
 ## Suggested groupings
 
@@ -571,3 +581,15 @@ From the #264-#348 reviews:
 - **Private information:** #342, #343
 - **Formula ergonomics (review):** #324, #325, #326, #272
 - **Engine upkeep:** #346, #347, #348
+
+From the #349-#385 review:
+
+- **Formula language:** #349, #350, #351, #352, #353, #354, #373
+- **Macros and sweeps:** #355, #363
+- **Actions and objects:** #356, #357, #358, #364
+- **Telling players the numbers:** #359, #360, #361, #362, #377
+- **Turn order:** #374
+- **Map geometry:** #375
+- **Player-readable history:** #376
+- **Before a public rollout:** #378, #379, #385
+- **Test tooling:** #380, #381, #382

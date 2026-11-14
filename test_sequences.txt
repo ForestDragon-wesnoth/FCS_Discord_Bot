@@ -42314,3 +42314,378 @@ used to escape the exchange: it stayed at that step with its window open
 and nobody to answer, `!turn next` and `!action` were held, and every
 `!react skip` ran the broken formula again; only an undo or fixing the
 formula got the match out.
+
+SCENARIO 1171 — chance, roll_dice, exists and is_alive in an action, a 2x2 unit with a body part, and in $()
+-----------------------------------------------------------------------------------------------------------
+
+!match new fh FH 10 8
+!match use fh
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 40 5 4 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre oarm Arm 5 5
+!ent set_var hero actions.volley.target entity
+!ent set_var hero actions.volley.body "dice = roll_dice('6d6')\nsixes = count(dice, 6)\nhits = 0\nfor d in each(dice):\n    if d >= 4:\n        hits = hits + 1\nentity[self].last_hits = hits\nentity[self].last_dice = len(dice)\nentity[self].sure = chance(100) and not chance(0)"
+!action hero volley ogre
+!assert "entity[hero].last_dice == 6 and 0 <= entity[hero].last_hits <= 6 and entity[hero].sure"
+!assert "len(roll_dice('4d6kh3')) == 3 and len(roll_dice('4d6kh3', all=True)) == 4"
+!assert "min(roll_dice('10d6')) >= 1 and max(roll_dice('10d6')) <= 6" dice in range
+!eval "x = roll_dice('2d6+1d4+3')\n[len(x), get(x, 2) <= 4]"
+?? = `[3, True]`
+!assert "exists('ogre') and exists('oarm') and is_alive('oarm') and not exists('ghost') and not is_alive(None)"
+!ent hp oarm 0
+!assert "exists('oarm') and not is_alive('oarm')" a destroyed part is still in the match
+!ent kill ogre
+!assert "not exists('ogre') and has_corpse('ogre') and not is_alive('ogre')" a corpse is no unit
+!ent set_var hero n "$(len(roll_dice('3d6')))"
+!assert "entity[hero].n == 3"
+!ent set_var hero c "$(exists('hero'))"
+!assert "entity[hero].c == True"
+!ent set_var hero d "$(var_add('hero', 'gold', 5))"
+?? banned in a $() inline argument
+!assert "not var_has('hero', 'gold')"
+!eval "roll_dice('4d6', all='yes')"
+?? all= must be True or False
+!eval "chance('half')"
+?? chance(percent): percent must be a number
+!eval "roll_dice('0d6')"
+?? roll_dice(spec)
+!help function roll_dice
+?? the kept dice of every group
+HARNESS-ALLOWS-ERRORS
+
+Expected: roll_dice returns the dice where roll returns the total: an
+action rolling 6d6 counts its hits from the list (six dice, each 1-6);
+`4d6kh3` gives the three kept dice and `all=True` all four; flat
+modifiers are left out (`2d6+1d4+3` gives three dice, the third a d4).
+chance(100) is always true and chance(0) never. exists names a unit in
+the match, a destroyed body part included (the 2x2 ogre's arm at 0 hp is
+still there but not alive); after the ogre dies its id is a corpse, so
+exists is false and has_corpse true. All four read the match without
+changing it, so they work in `$()`, where a mutator (var_add) is
+refused and nothing is written. Bad arguments are refused with the
+function's name.
+
+SCENARIO 1172 — Cell sets and directions: a minimum-range attack and a knockback behind a 2x2 body
+---------------------------------------------------------------------------------------------------
+
+!match new cs CS 12 8
+!match use cs
+!ent add hero Hero 30 2 4 5
+!ent add ogre Ogre 40 5 4 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add imp Imp 10 3 4 2
+!eval "cells_minus(cells_in_burst(2, 4, 2), cells_in_burst(2, 4, 1))"
+?? = `[[1, 2], [1, 6], [2, 2], [2, 6], [3, 2], [3, 6], [4, 2], [4, 3], [4, 4], [4, 5], [4, 6]]`
+!eval "cells_intersect([[1, 1], [2, 2], [5, 5]], cells_in_rect(2, 2, 6, 6))"
+?? = `[[2, 2], [5, 5]]`
+!eval "cells_union([[1, 1]], [[1, 1], [2, 2, 'main']], [[3, 3]])"
+?? = `[[1, 1], [2, 2, 'main'], [3, 3]]`
+!eval "[cell_toward(3, 3, 'right', 2), cell_toward(3, 3, 'up_left'), cell_toward(3, 3, 'down', -1)]"
+?? = `[[5, 3], [2, 2], [3, 2]]`
+!eval "[cell_behind('ogre', 'hero'), cell_behind('ogre', [5, 1]), cell_behind('ogre', [3, 6]), cell_behind('ogre', [5, 4])]"
+?? = `[[7, 4], [5, 6], [7, 3], None]`
+!ent set_var hero actions.shove.target entity
+!ent set_var hero actions.shove.body "dest = cell_behind(target, self)\nif dest == None:\n    fail('no room behind')\nmove_entity(target, dest)"
+!action hero shove imp
+!assert "entity[imp].x == 4 and entity[imp].y == 4" the imp lands behind itself, away from the hero
+!ent tp imp 12 4
+!action hero shove imp
+?? no room behind
+!assert "entity[imp].x == 12"
+!eval "cells_minus([[1, 1]])"
+?? takes at least 2 cell lists
+!eval "cells_union([[1, 'a']])"
+?? every item must be a cell
+!eval "cell_toward(1, 1, 'sideways')"
+?? unknown direction
+HARNESS-ALLOWS-ERRORS
+
+Expected: cells_minus takes a burst of 2 and leaves out the burst of 1,
+the ring of a minimum-range weapon; cells_intersect keeps the first
+list's cells found in every other list; cells_union lists each cell
+once, first met first, and a cell naming its map is a cell of its own.
+cell_toward walks n cells in a direction (a negative n goes back).
+cell_behind measures from the target's whole body: from the hero, level
+with the ogre's top row, it is the cell past the right side on that row
+(7,4); from straight above the left column, the cell below the body
+(5,6); from past the lower-left corner, the cell past the upper-right
+corner (7,3); from a cell inside the body, None. A shove action moves its
+target onto that cell (the imp, 3,4 -> 4,4), and fails when the cell is
+off the map (the imp against the map's edge stays at x 12). Bad arguments are
+refused.
+
+SCENARIO 1173 — Dict helpers: merge, items, with_key, without_key build a loot table in an action
+-------------------------------------------------------------------------------------------------
+
+!match new dh DH 8 6
+!match use dh
+!ent add hero Hero 30 1 1 5
+!ent add chest Chest 5 3 1 1
+!ent set_var chest loot.gold 10
+!ent set_var chest loot.gem 1
+!ent set_var hero bag.gold 5
+!ent set_var hero actions.take.target entity
+!ent set_var hero actions.take.body "got = entity[target].loot\nmine = entity[self].bag\nfor k, v in items(got):\n    mine = with_key(mine, k, get(mine, k, 0) + v)\nentity[self].bag = mine\nentity[target].loot = without_key(got, 'gold')"
+!action hero take chest
+!assert "entity[hero].bag == {'gold': 15, 'gem': 1} and entity[chest].loot == {'gem': 1}"
+!eval "merge({'a': 1, 'b': {'x': 1}}, {'b': {'y': 2}}, {'c': 3})"
+?? = `{'a': 1, 'b': {'y': 2}, 'c': 3}`
+!eval "d = {'a': 1}\ne = with_key(d, 'b', 2)\nf = without_key(e, 'a')\n[d, e, f, without_key(d, 'zzz')]"
+?? = `[{'a': 1}, {'a': 1, 'b': 2}, {'b': 2}, {'a': 1}]`
+!eval "items(entity[hero].bag)"
+?? = `[['gold', 15], ['gem', 1]]`
+!eval "items([1, 2])"
+?? items(dict): expected a dict
+!eval "with_key({}, 3, 1)"
+?? key must be text
+HARNESS-ALLOWS-ERRORS
+
+Expected: an action loots a chest with the helpers, each returning a new
+dict: items() loops the loot's pairs, with_key adds each to the hero's
+bag (gold 5 + 10 = 15, the gem new) and without_key takes the gold out
+of the chest. merge lets a later dict win a key and replaces a nested
+dict whole; the dicts passed in are left as they were. A list or a
+non-text key is refused.
+
+SCENARIO 1174 — Round lines, `!turn roll` and initiative rerolled each round
+---------------------------------------------------------------------------
+
+!match new ir IR 10 6
+!match use ir
+!ent add hero Hero 30 1 1 5
+!ent add orc Orc 20 4 1 3
+!ent add bat Bat 5 6 1 1
+!ent set_vars bat footprint_w=2 footprint_h=2
+!system set default match_start_message_format "⚔ {match} begins"
+!system set default round_end_message_format "— end of round {round} —"
+!turn roll
+?? Set the initiative_roll_formula rule first
+!system set default initiative_roll_formula "100 + entity[self].hp"
+!turn roll
+?? - `hero`: 5 -> 130
+?? - `bat`: 1 -> 105
+!assert "entity[orc].initiative == 120"
+!turn roll team=none
+?? No units match; nothing rolled.
+!system set default initiative_roll_formula "'fast'"
+!turn roll name=Bat
+?? Rolled initiative for 0 of 1 unit(s).
+?? ⚠️ initiative roll for `bat`: gave 'fast', not a whole number (kept 105).
+!system set default initiative_roll_formula "roll('1d20')"
+!system set default initiative_reroll_each_round true
+!turn next
+?? ⚔ IR begins
+?? — Round 1 —
+!assert "min(entity[hero].initiative, entity[orc].initiative, entity[bat].initiative) >= 1 and max(entity[hero].initiative, entity[orc].initiative, entity[bat].initiative) <= 20" rolled at round 1
+!turn next
+!turn next
+!turn next
+?? — end of round 1 —
+?? — Round 2 —
+!system set default round_end_message_format ""
+!system set default initiative_reroll_each_round false
+!ent set_var hero initiative 50
+!turn next
+!turn next
+!turn next
+?! end of round
+!assert "entity[hero].initiative == 50" no reroll with the rule off
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!turn roll` needs the initiative_roll_formula rule. With
+`100 + entity[self].hp` every unit in the turn order gets its hp plus
+100 (hero 130, orc 120, the 2x2 bat 105). A selector picks units the way
+`!find` does: `team=none` matches no unit here and nothing is rolled;
+`name=Bat` picks the bat, and a formula giving no whole number leaves it
+as it was with a ⚠️ ("0 of 1 unit(s)"). With
+initiative_reroll_each_round on, the first `!turn next` prints the
+match-start line and rolls every unit 1d20 before round 1; each round
+end prints the round-end line. With the rule off nothing rerolls.
+
+SCENARIO 1175 — tick_priority: regeneration ticks before poison whatever came first
+-----------------------------------------------------------------------------------
+
+!match new tp TP 8 6
+!match use tp
+!ent add hero Hero 20 1 1 5
+!ent set_var hero max_hp 30
+!status def poison
+!status when poison turn_start
+!status tick poison "entity[self].log = entity[self].log + 'P'"
+!status def regen
+!status when regen turn_start
+!status tick regen "entity[self].log = entity[self].log + 'R'"
+!ent set_var hero log ""
+!status apply hero poison
+!status apply hero regen
+!turn next
+!assert "entity[hero].log == 'PR'" without priorities, the order they were gained
+!status tick_priority regen 10
+?? `regen` tick_priority = 10
+!turn next
+!assert "entity[hero].log == 'PRRP'"
+!status level regen 2+ tick_priority -5
+!status apply hero regen 2
+!turn next
+!assert "entity[hero].log == 'PRRPPR'" at level 2 regen ranks below poison
+!status tick_priority regen high
+?? tick_priority must be a number
+!status tick_priority nothing 1
+?? No status definition
+!status tick_priority regen -
+?? cleared
+!system status def default bless
+!system status tick_priority default bless 3
+?? `bless` tick_priority = 3
+!status info regen
+HARNESS-ALLOWS-ERRORS
+
+Expected: two statuses ticking at turn start run in the order the unit
+gained them (poison, then regen: `PR`). With regen's tick_priority 10 it
+ticks first (`RP`). A level entry sets its own (`2+` at -5), so at level
+2 regen ranks below poison again (`PR`). A non-number and a missing
+definition are refused, `-` clears the field, and a system's status
+definitions take it too.
+
+SCENARIO 1176 — `!history note` labels the latest snapshot; `!defvar match` fills a new match's vars
+---------------------------------------------------------------------------------------------------
+
+!match new hn HN 8 6
+!match use hn
+!ent add hero Hero 20 1 1 5
+!history note
+?? Usage: `!history note <text ...>`
+!turn next
+!history note before the ambush
+?? 📝 Noted seq
+?? : before the ambush
+!history list turns
+?? — 📝 before the ambush
+!ent hp hero 5
+!undo turn preview
+?? 📝 before the ambush
+!as restart
+!match use hn
+!history list turns
+?? — 📝 before the ambush
+!history note -
+?? Cleared the note on seq
+!history list commands
+?! 📝
+!defvar match add weather rain
+?? Default match var `weather` = 'rain'
+!defvar match add day.n 1
+!defvar match list
+?? `day.n` = 1
+!match new hn2 HN2 5 5
+!match use hn2
+!assert "match_var_get('weather') == 'rain' and match_var_get('day.n') == 1"
+!match use hn
+!assert "not match_var_has('weather')" a match made earlier keeps its vars
+!defvar match remove weather
+?? Already-made matches keep their value
+!as player bob
+!defvar match add day.n 2
+?? administrator
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!history note <text>` labels the newest snapshot (here the
+turn autosave of round 1); `!history list` and the undo preview show it,
+and it survives a restart (it lives in the history index). `-` clears
+it. `!defvar match add` (the default_match_vars rule) fills the vars of a
+match created afterwards, dotted paths nesting; matches made earlier
+keep their vars, and a player can't edit the system's defaults.
+
+SCENARIO 1177 — `!ent get` reads one var as the channel may; `!ent var_add / var_move / var_copy`
+-------------------------------------------------------------------------------------------------
+
+!match new eg EG 8 6
+!match use eg
+!ent add hero Hero 20 1 1 5
+!ent add ally Ally 20 3 1 4
+!ent set_var hero team blue
+!ent set_var ally team blue
+!ent set_var hero inventory.potion.amount 2
+!ent set_var hero inventory.potion.__note gm
+!ent set_var hero gold 10
+!ent get hero inventory.potion
+?? "amount": 2
+?? "__note": "gm"
+!ent get hero inventory.potion.amount
+?? **Hero** `inventory.potion.amount` = 2
+!ent get hero nothing
+?? has no var at `nothing`
+!system set default private_vars gold
+!as player bob
+!ent get hero gold
+?? has no var at `gold` that this channel can read
+!ent get hero inventory.potion
+?! __note
+!ent get hero inventory.potion.__note
+?? has no var
+!ent var_move hero inventory.potion ally inventory.potion
+?? needs host approval
+!as host
+!approve all
+!assert "var_has('ally', 'inventory.potion.amount') and not var_has('hero', 'inventory.potion')"
+!ent var_copy ally inventory.potion hero inventory.potion
+!assert "entity[hero].inventory.potion.amount == 2 and entity[ally].inventory.potion.amount == 2"
+!ent var_add hero gold -3
+?? `hero` vars.gold: 10 -> 7
+!ent var_add hero arrows 12
+?? `hero` vars.arrows: 0 -> 12
+!ent var_add hero inventory 1
+?? isn't a number to add to
+!ent var_add hero gold lots
+?? `<n>` must be a number
+!ent var_move hero gold hero gold.x
+?? is inside `gold`
+!ent var_move hero zzz ally z
+?? has no var at `zzz`
+!ent var_copy hero x ally name
+?? reserved
+!undo command
+!assert "not var_has('hero', 'arrows') or entity[hero].arrows == 12"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!ent get` prints one var or subtree (a dict as JSON). A
+player reads through the channel's view and the private vars: the
+private gold reads as missing, and engine keys (`__...`) are left out of
+a subtree and read as missing by name; a host sees them. A player's
+`!ent var_move` goes to the approval queue; approved, the potion moves
+from the hero to the ally. var_copy keeps the source; var_add adds to a
+number (or starts one), refuses a dict and a non-number; a move into
+its own subtree, a missing source and a reserved destination are
+refused. Each is an undo step.
+
+SCENARIO 1178 — `!map preview burst from=<eid>` measures from a 2x2 body
+-----------------------------------------------------------------------
+
+!match new pv PV 10 8
+!match use pv
+!ent add ogre Ogre 40 4 3 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add imp Imp 5 7 3 2
+!map preview burst from=ogre 1
+?? burst r1 from Ogre's body [square_radius] — 16 cell(s)
+?? In area: Ogre (`ogre`)
+!map preview burst from=ogre 2 manhattan
+?? [manhattan]
+?? Imp (`imp`)
+!map preview burst ogre 1
+?? 9 cell(s)
+!map preview cone from=ogre up 3
+?? measures a burst from a unit's whole body
+!map preview burst from=nobody 1
+?? Entity 'nobody' not found.
+!map preview burst from=ogre 1 sideways
+?? Unknown metric
+HARNESS-ALLOWS-ERRORS
+
+Expected: `from=<eid>` measures a burst from every cell of the unit's
+body (the nearest one, as distances to a unit do): radius 1 around the
+2x2 ogre is a 4x4 square of 16 cells, and the manhattan radius 2 reaches
+the imp two cells past its right side. The plain `<eid>` point reads the
+unit's aoe_origin cell (its centre, rounded down): a 3x3 square of 9
+cells. from= is for bursts; an unknown unit or metric is refused.
