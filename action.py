@@ -1083,7 +1083,10 @@ class Coord:
         self.named = named
 
     def __repr__(self) -> str:
-        return f"Coord({self.x}, {self.y})"
+        # What a formula's str(target) / fmt() / say() prints, alone or in
+        # a list: the cell as replies write one. It was the class's Python
+        # form ("failed on Coord(4, 4)").
+        return f"({self.x},{self.y})"
 
     def store_value(self) -> List[Any]:
         """How a var stores it: a coordinate list [x, y], like every other

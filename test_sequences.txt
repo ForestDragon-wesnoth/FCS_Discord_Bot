@@ -41826,3 +41826,148 @@ b3); the keg, brought to -2 hp by b3, is named in the warning and stays,
 and b4 is untouched. Its next change (`!ent hp keg -1`) runs its death,
 and the chain goes on through b4 to the hero. kill() inside on_death
 still kills at once (1156).
+
+
+SCENARIO 1161 — An open reaction window holds a macro's lines, `!dry` and `!simulate` like typed commands; a reaction's own cmd() still runs (a 2x2 attacker)
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rh RH 8 8
+!match use rh
+!ent add orc Orc 30 1 1 5
+!ent set_vars orc footprint_w=2 footprint_h=2
+!ent add hero Hero 30 3 1 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = 10"
+!ent set_var orc actions.cleave.body "deal_damage(target, damage)"
+!ent set_var hero actions.sidestep.reacts_to melee
+!ent set_var hero actions.sidestep.before "incoming.damage = incoming.damage - 6\ncmd('ent move ' + self + ' 1 right')"
+!macro set adv "turn next"
+!macro set hit "action orc cleave hero"
+!macro set round "action orc cleave hero\nreact hero pass\nturn next"
+!turn next
+!action orc cleave hero
+?? `!react hero sidestep`
+!macro run adv
+?? ❌ A reaction window is open
+!macro run hit
+?? ❌ A reaction window is open
+!dry !turn next
+?? ❌ A reaction window is open
+!simulate 1 !action orc cleave hero
+?? 1 run(s) had a ❌ reply
+!assert "entity[hero].hp == 30 and turns_elapsed() == 1"
+!react hero sidestep
+?? `orc` used action `cleave`
+!assert "entity[hero].hp == 26 and entity[hero].x == 4"
+!macro run round
+?? It is now **Hero**'s turn
+!assert "entity[hero].hp == 16 and turns_elapsed() == 2"
+!system set default reaction_hold_commands false
+!action orc cleave hero
+!macro run adv
+?? It is now **Orc**'s turn
+!react hero pass
+!assert "entity[hero].hp == 6"
+
+Expected: the 2x2 orc's cleave on the hero opens a before window. While
+it is open, `!turn next` and `!action` are refused however they arrive: a
+host's macro (`adv`, `hit`), `!dry` (its report shows the refusal the real
+command would get) and `!simulate` (the run counts as one with a ❌
+reply). The hold used to be checked only for typed commands and the gated
+lines of a batch or foreach, so a macro advanced the turn under the
+window and a macro's action resolved at once, unoffered. Nothing moved
+(hero 30, one turn elapsed). The hero's `sidestep` then answers: its
+before half lowers the damage and steps the hero aside with `cmd('ent
+move ...')`, a line an action body dispatches, which the window doesn't
+hold (26 hp, x 4). A macro that answers its own window (`round`: the
+action, `react hero pass`, `turn next`) runs through. With
+reaction_hold_commands off nothing is held, as before.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1162 — A cell target prints as a cell in a formula's own text: str(target), fmt(), a list of cells
+-----------------------------------------------------------------------------------------------------------
+
+!match new cs CS 8 6
+!match use cs
+!ent add mage Mage 30 3 2 20
+!ent set_var mage actions.bolt.target location
+!ent set_var mage actions.bolt.body "say('bolt lands on ' + str(target))"
+!ent set_var mage actions.rain.target location_list
+!ent set_var mage actions.rain.body "entity[self].note = fmt('cells {c}', c=target)"
+!ent set_var mage actions.fizz.target location
+!ent set_var mage actions.fizz.body "fail('no')"
+!gpassive add f on_action_failed "say('failed at ' + str(target), about=None)"
+!action mage bolt 4 4
+?? bolt lands on (4,4)
+?! Coord
+!action mage rain 4 4 5 5
+!eval "entity[mage].note"
+?? cells [(4,4), (5,5)]
+!action mage fizz 6 1
+?? failed at (6,1)
+
+Expected: a location target is a cell object with `.x` / `.y`. Turned
+into text by a formula (`str(target)`, a `fmt()` field, alone or in a
+location_list) it reads as the cell, `(4,4)`, the way replies write one;
+it used to print its Python form (`Coord(4, 4)`). The on_action_failed
+passive of a failing action reads its target the same way.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1163 — A pause stops the commands a host opened to players, and holds a host's under pause_affects_hosts; an opened read still works (a 2x2 ogre)
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new pz PZ 8 6
+!match use pz
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var ogre actions.wave.target none
+!ent set_var ogre actions.wave.body "entity[self].waved = entity[self].waved + 1"
+!ent set_var ogre waved 0
+!host access set action all
+!host access set "ent move" all
+!host access set "ent dump" all
+!as player bob
+!ent move ogre 1 right
+?? Moved `ogre` 1 step(s) to (3,2)
+!as host
+!match pause rules question
+!as player bob
+!ent move ogre 1 right
+?? ⏸ **PZ** is paused
+!action ogre wave
+?? ⏸ **PZ** is paused
+!foreach hp>0 ; ent move $id 1 down
+?? ⏸ **PZ** is paused
+!ent dump ogre
+?? "waved": 0
+!ent info ogre short
+?? Position: (3,2)
+!as host
+!ent move ogre 1 down
+?? Moved `ogre` 1 step(s) to (3,3)
+!system set default pause_affects_hosts true
+!action ogre wave
+?? `!action ogre wave` is held
+!assert "entity[ogre].waved == 0 and entity[ogre].y == 3"
+!match resume
+?? `ogre` used action `wave`.
+!as player bob
+!action ogre wave
+?? `ogre` used action `wave`.
+!as host
+!assert "entity[ogre].waved == 2"
+
+Expected: the host opened `!action`, `!ent move` and the read `!ent
+dump` to players (`!host access set ... all`), so bob moves the 2x2 ogre
+without approval. During a pause his move, his action and a `!foreach`
+of moves are refused with the pause message: they change the match,
+whatever the access override says. The pause used to judge "changes the
+match" by the overridden level, so a command opened to players read as
+a read and kept running through every pause. The opened read (`!ent
+dump`) and the ordinary reads still work. A host keeps playing; with
+pause_affects_hosts on, the host's own `!action` is held (it used to
+run for the same reason) and runs at `!match resume`. After the resume
+bob's action runs again (waved 2).

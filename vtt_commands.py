@@ -711,11 +711,16 @@ class CommandRegistry:
                            f"foreach or player-written macro for you: it "
                            f"needs a host (send it on its own).")
             return
-        if _GATE_LINES.get():
-            held = _reaction_hold_refusal(ctx, mgr, name, args)
-            if held:
-                await ctx.send(held)
-                return
+        # An open reaction window holds every dispatched line as it holds a
+        # typed command (it was checked for gated lines only, so a host's
+        # macro, a `!run` file, `!dry` and `!simulate` ran `!turn next` or
+        # an action under the window, the action resolving unoffered).
+        # Lines an action body dispatches aren't held: the halves and the
+        # body resolving the window run inside one.
+        held = _reaction_hold_refusal(ctx, mgr, name, args)
+        if held:
+            await ctx.send(held)
+            return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
         # caller's current context. Same raw_args gate as run().
@@ -1198,12 +1203,26 @@ class CommandRegistry:
         # pause_affects_hosts a host's are held for `!match resume`.
         if not admin_cmd and not _library_edit_ok(ctx, name, args):
             pm = self._paused_match(ctx, mgr)
-            if pm is not None and self._effective_access(
-                    name, args, pm, ctx_user(ctx), ctx_role_ids(ctx)) != "all":
+            # "Changes the match" is the command's OWN level: an access
+            # override opening `!action` or `!ent move` to players made
+            # them read as reads here, so the pause stopped neither the
+            # players' moves nor, under pause_affects_hosts, a host's.
+            if pm is not None and (
+                    self._effective_access(
+                        name, args, pm, ctx_user(ctx),
+                        ctx_role_ids(ctx)) != "all"
+                    or self._effective_access(
+                        name, args, None, ctx_user(ctx),
+                        ctx_role_ids(ctx)) != "all"):
                 if gate == "queue":
                     return await ctx.send(_paused_msg(pm))
+                control = _pause_control(name, args)
+                if not control and not _acts_as_host(ctx, pm):
+                    # Opened to this player by an override: still a
+                    # command that changes the match.
+                    return await ctx.send(_paused_msg(pm))
                 if (bool(pm.rules.get("pause_affects_hosts", False))
-                        and not _pause_control(name, args)):
+                        and not control):
                     return await self._hold_command(pm, name, args, ctx)
         # An open reaction window holds the commands that would move the
         # game on under it (reaction_hold_commands, #36): refused, never
@@ -27945,6 +27964,8 @@ def _reaction_hold_refusal(ctx: ReplyContext, mgr: MatchManager,
     if m is None or m.reaction_exchange is None \
             or not m.rules.get("reaction_hold_commands", True):
         return None
+    if getattr(m, "_action_depth", 0) > 0:
+        return None         # a cmd() line of an action that is running
     import reactions
     if reactions.expired(m):
         return None
