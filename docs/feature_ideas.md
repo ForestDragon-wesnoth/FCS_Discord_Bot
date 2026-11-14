@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #385). #264-#385 come from review passes by
+(the highest so far is #418). #264-#418 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -264,6 +264,31 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#369 What a step triggers.** `!map cell <x> <y> for=<eid>` also lists the tile and zone hooks that would fire for that unit entering or stopping there, by name, under formula_text_visibility.
 - **#370 `!template usedby <partial>`.** The templates, prefabs and live units referencing a partial. Today that list appears only inside a rename or delete refusal.
 - **#371 Spawn warnings for missing definitions.** A template spawn or summon ends with a ⚠️ naming statuses the match has no definition for and functions its actions and passives call that the match lacks. Prefabs carry their definitions; entity templates arrive without them.
+- **#386 Unit-side zone and tile hooks.** `on_zone_entered`, `on_zone_exited` and `on_tile_entered` as passive hooks on the unit, with the zone's name and tags bound. A vampire's sunlight weakness then lives in the vampire; today only the zone or tile can hold the hook.
+- **#387 on_kill.** Fires on the killer (own, team and global passives) with `victim` bound. Today "heal when I kill" is a global on_death passive comparing `killer`.
+- **#388 on_part_destroyed on the body.** Fires on the root when one of its parts is destroyed, with `part` bound.
+- **#389 Blocked status applications.** An `on_status_blocked` hook and a `status_blocked_message_format` line ("Immune!") carrying the reason: immune, resisted to 0, blocked_by, a tag block. Pairs with #309.
+- **#390 `move_kind` in movement hooks.** walk / tp / push / pull / swap / carried bound in on_entity_moved, on_entity_step and the tile and zone enter / exit / stop hooks. #220 gives it to block conditions; hooks need it for "the trap springs on a walk, the lava burns on any entry".
+- **#391 Actions that end the turn.** An action field `ends_turn` and a formula `end_turn()`: the turn passes once the action and its reaction exchange have resolved, when the actor is the acting unit. Solis's standard action works this way; today the player types `!turn next`, and no formula can advance the turn.
+- **#392 Reveal fog from formulas.** `reveal_cells(team, cells, turns=None)` and `reveal_clear`. A flare or a scouting skill needs it; `!reveal_fog` exists as a command only.
+- **#393 Parts from formulas.** `part_detach`, `part_attach`, `part_remove`. A lizard dropping its tail, a severed limb becoming a free unit; today the `!part` commands are the only route.
+- **#394 Passives from formulas.** `passive_add(eid, id, when, formula, ...)` and `passive_remove`, for an ability learned mid-fight. #55 covers enabling and disabling.
+- **#395 `teams()` and `group_names()`.** Loopable lists, for scoring and "each team" loops.
+- **#396 Corpse position and search.** `corpse_cell(id)` and `corpses_within(x, y, r)`, so a corpse target can be range-checked (necromancy, looting).
+- **#397 Turn-start position.** `turn_start_cell(eid)` and `cells_moved(eid)`, kept by the engine from the unit's turn start. For charge bonuses (FCS1 Lance counts tiles moved), "you may not end where you began" and disengage rules.
+- **#398 `!deny <id> <reason>`.** The reason reaches the requester.
+- **#399 `!approve <id> always`.** Approving also stores a per-player override for that command and subcommand in the existing `@user` layer, so the same ask skips the queue next time.
+- **#400 A `me` token.** `!ent focus <eid>` sets the caller's unit for the channel; `me` then resolves to it wherever a command takes a unit (`!action me slash gob1`, `!ent info me`). A light step toward #254 that needs no controllers.
+- **#401 Numbered display names.** A rule that numbers the display names of template spawns sharing a name ("Orc 2"). Ids are numbered already; the names players read on the map and roster stay identical, and #255 depends on unique names.
+- **#402 Looks by state for zones and tiles.** #264's looks list on zones, definitions, tiles and templates, with their data in the conditions: a door open or closed, a trap armed or sprung.
+- **#403 Facing marker in images.** A rule drawing a small arrow on a sprite that has no per-facing variants. ASCII shows facing through the arrow glyph; such a sprite shows none.
+- **#404 Lifetime successors.** With #117: `expires_into: <template|definition>`, so ice becomes water and fire becomes ash.
+- **#405 Header line format.** A rule `state_header_format` filling the `!state` / `!list` header from match vars (objective counters, weather, the round's phase).
+- **#406 Team card.** `!team info <team>`: members, tags, passives, data, seats and colour in one card with a `team_info_format` rule.
+- **#407 Describe a container.** `!ent item <eid> <path>`: what one item gives, namely its tags, actions, modifiers, watchers and resistances, through the reader. Today the pieces sit in `!action list`, `!mod show` and `!watch held`.
+- **#408 Explain aliveness.** `!ent why <id>`: the alive and death conditions with their values, a per-unit override, indestructibility, a held death check, the destroyed latch.
+- **#409 Stamp remaps.** `remap=wall:ice_wall,orc:orc_elite` on `!prefab stamp` swaps tile templates, zone definitions or unit templates by name for one stamp. One layout serves several biomes or difficulty tiers.
+- **#410 Scenario lint.** `run_scenarios.py --lint` lists scenarios with no `!assert` or `??`, prose showing ❌ without the allow marker, and checks placed after `Expected:` where nothing runs.
 
 ## Medium (a subsystem slice)
 
@@ -496,6 +521,14 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#380 Reply snapshots.** `run_scenarios.py --snapshot` writes every scenario's full replies; `--diff` lists the replies a change altered. It catches drift no `??` asserts, and a PR can state "these 14 replies changed".
 - **#381 Record a session as a scenario.** CLI `!as record <file>` writes the typed commands in scenario format with `??` lines taken from the observed replies. A bug found while testing after a merge becomes a scenario in one step.
 - **#382 Parallel scenario runs.** `-j N`; scenarios already run in separate temp folders, and the suite runs twice per change (plain and under `FCS_SPATIAL_CHECK=1`).
+- **#411 Status-borne passives.** Passive records in a status definition (`passives: {thorns: {when: on_damage_taken, formula: ...}}`) fire as the bearer's own while it holds the status, level entries included. A definition today has a tick and three lifecycle hooks, so Thorns, a counter stance or "heal on kill" need a global passive that tests `status_has` on every unit. The twin of #208.
+- **#412 Status-granted actions.** A status's actions are offered while it is held: Rage adds Frenzy, Grappled adds Break Free. Discovery reads unit vars and mount slots today.
+- **#413 Restore one unit.** `!history restore <save> unit=<eid>` and `!undo command N unit=<eid>` put one unit's body back from a snapshot and leave the rest of the match alone. For a mistake noticed five commands late.
+- **#414 Parameter sweeps in `!simulate`.** `vary=hero.str:10..20` runs n times per value and prints one row per value, for balance curves.
+- **#415 Dormant maps.** A map var marks a map inactive: its units leave the turn order and their ticks and schedules pause until it wakes. The hold of a ship while the fight is on deck.
+- **#416 Prefab anchors.** Named points inside a prefab (`anchors: {door_n: [3, 0]}`) and `align=door_n@x,y` on a stamp, so rooms snap together at their doors; `prefab_anchor(name, anchor)` reads one. Builds toward #32.
+- **#417 Lazy matches.** A server loads each match on its first use; today a server's folder loads whole. Fits #197 and #299.
+- **#418 Slim CLAUDE.md.** Move §7's subsystem reference into `docs/reference/<subsystem>.md`, read when a task touches that subsystem, and keep philosophy, process, the map and the bug classes in CLAUDE.md. Every session reads its 4,471 lines before the first edit.
 
 ## Large (arcs of several PRs)
 
@@ -600,4 +633,15 @@ From the #349-#385 review:
 - **Map geometry:** #375
 - **Player-readable history:** #376
 - **Before a public rollout:** #378, #379, #385
-- **Test tooling:** #380, #381, #382
+- **Test tooling:** #380, #381, #382, #410
+
+From the #386-#418 review:
+
+- **Hooks:** #386, #387, #388, #389, #390
+- **Formula twins of commands:** #391, #392, #393, #394, #395, #396, #397
+- **Approvals and players:** #398, #399, #400, #401
+- **Looks and reads:** #402, #403, #404, #405, #406, #407, #408
+- **Statuses that carry behaviour:** #411, #412
+- **Prefabs:** #409, #416
+- **GM tooling:** #413, #414, #415
+- **Scaling and upkeep:** #417, #418
