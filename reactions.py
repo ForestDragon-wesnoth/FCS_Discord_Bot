@@ -1074,6 +1074,12 @@ async def _half(env: _Env, seq: int, n: int, half: str, pays: bool) -> str:
                     extra_bindings=extra_bindings)
         except ActionEngineFault as ef:
             return False, ("", ef.message)
+        except VTTError as err:
+            # A formula that errors (not a fail()): run_action has put the
+            # match back; the step counts as failed. Left to propagate, the
+            # exchange stayed at this step, its window open with nobody to
+            # answer, and every `!react skip` ran the broken formula again.
+            return False, ("", str(err))
         finally:
             REACT_ORIGIN.reset(otoken)
     st, res = await _run_step(env, seq, f"half:{n}:{half}", run,
@@ -1314,6 +1320,12 @@ async def _body_phase(env: _Env, seq: int) -> str:
                     extra_bindings=bindings, body_out=bout, fail_out=fout)
         except ActionEngineFault as ef:
             return False, ("", ef.message)
+        except VTTError as err:
+            # A formula that errors (not a fail()): run_action has put the
+            # match back; the step counts as failed. Left to propagate, the
+            # exchange stayed at this step, its window open with nobody to
+            # answer, and every `!react skip` ran the broken formula again.
+            return False, ("", str(err))
         finally:
             PACKET_EXCHANGE.reset(xtoken)
             REACT_ORIGIN.reset(otoken)
@@ -1399,6 +1411,8 @@ async def _cancelled(env: _Env, seq: int, act: Any,
                         preset_locals=preset)
             except ActionEngineFault as ef:
                 return False, ("", ef.message)
+            except VTTError as err:
+                return False, ("", str(err))    # as a half or the body
             finally:
                 REACT_ORIGIN.reset(otoken)
         st, res = await _run_step(env, seq, "cost", run)
@@ -1883,6 +1897,35 @@ async def maybe_close(ctx: Any, mgr: Any, m: Any) -> None:
     _refresh_done(m, ex)
     if not waiting(ex):
         await _drive(_Env(ctx, mgr, m))
+
+
+async def close_unanswered(ctx: Any, mgr: Any, m: Any) -> bool:
+    """User call: a command that leaves nobody to answer the open window
+    (its last undecided unit died, left the match or lost its reaction to
+    a host tool or a hook) closes it, and the pending action resolves in
+    that command, as after the last `!react`. The window used to stay
+    open, holding `!turn next` and `!action`, until `!react skip` or its
+    expiry. True when it closed one."""
+    m = mgr.matches.get(m.id, m)
+    ex = m.reaction_exchange
+    if ex is None:
+        return False
+    before = waiting(ex)
+    if not before:
+        return False
+    _refresh_done(m, ex)
+    if waiting(ex):
+        return False
+    gone = [u for u in before
+            if u not in m.entities or not m.entities[u].is_alive]
+    who = (", ".join(_name(m, u) for u in before)
+           + (" is" if len(before) == 1 else " are"))
+    why = ("gone" if len(gone) == len(before)
+           else "left with no reaction to give")
+    await ctx.send(f"⏭ Nobody is left to answer the reaction window "
+                   f"({who} {why}); it closes.")
+    await _drive(_Env(ctx, mgr, m))
+    return True
 
 
 def expired(m: Any) -> bool:

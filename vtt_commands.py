@@ -750,6 +750,7 @@ class CommandRegistry:
         vtoken = _TYPED_UNIT_VIEW.set(_typed_unit_view(ctx, mgr, mid))
         try:
             result = await h(ctx, args, mgr)
+            await _close_unanswered_window(ctx, mgr, name, args)
         except VTTError as e:
             await ctx.send(f"❌ {e}")
             # A failed `!assert` stops the enclosing batch / run / foreach /
@@ -1382,6 +1383,7 @@ class CommandRegistry:
                 import reactions
                 await reactions.settle_expiry(ctx, mgr, rm)
             result = await h(ctx, args, mgr)
+            await _close_unanswered_window(ctx, mgr, name, args)
         except VTTError as e:
             await ctx.send(f"❌ {e}")
         except Exception as e:
@@ -1516,6 +1518,13 @@ class CommandRegistry:
                         and wm._grants_present():
                     wm.surface_log(wm.sync_zone_grants())
                     await _flush_formula_log(ctx)
+                # A watcher's effect may have taken the last unit a
+                # reaction window waited for.
+                if getattr(wm, "_watchers_fired", 0) != fired:
+                    try:
+                        await _close_unanswered_window(ctx, mgr, name, args)
+                    except VTTError as e:
+                        await ctx.send(f"❌ {e}")
             finally:
                 FORMULA_TEXT_HIDDEN.reset(hide_tok)
                 _JOURNAL_AS_STATE.reset(jstate_token)
@@ -1981,6 +1990,24 @@ _SNAPSHOT_SUBS = frozenset({("turn", "set"), ("turn", "grant")})
 # doesn't serialize it around them.
 _JOURNAL_READS = frozenset({"assert", "dist", "dry", "find", "pending",
                             "roll", "simulate", "whoami"})
+
+
+async def _close_unanswered_window(ctx: ReplyContext, mgr: MatchManager,
+                                   name: str, args: List[str]) -> None:
+    """After a command's handler: when it left nobody to answer the
+    channel match's open reaction window, the window closes and the
+    pending action resolves in this command (reactions.close_unanswered,
+    user call). Never from a read, and never from a line an action body
+    dispatches (the halves and the body resolving a window run in one)."""
+    if _settles_nothing(name, args) or name.lower() == "as":
+        return
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    if m is None or m.reaction_exchange is None \
+            or getattr(m, "_action_depth", 0) > 0:
+        return
+    import reactions
+    await reactions.close_unanswered(ctx, mgr, m)
 
 
 def _settles_nothing(name: str, args: List[str]) -> bool:
@@ -25123,7 +25150,33 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # machinery (snapshot every match, run under _DRY_ACTIVE so the nested
 # refusals hold, roll back, put each match's RNG back).
 
-_SIM_OPTIONS = ("seed", "steps", "until", "tally", "units", "vars")
+_SIM_OPTIONS = ("seed", "steps", "until", "tally", "units", "vars",
+                "reactions")
+# reactions=pass: at most this many windows are closed after one step (an
+# after window, queued exchanges), then the run ends with one waiting.
+_SIM_WINDOW_PASSES = 64
+
+
+async def _sim_pass_windows(sctx: Any, mgr: MatchManager, mid: str) -> bool:
+    """`!simulate reactions=pass`: every reaction window the step left
+    waiting for answers closes as if its units had passed (units in auto
+    mode have reacted already), so the action under it resolves. True
+    when it closed one."""
+    import reactions
+    did = False
+    for _ in range(_SIM_WINDOW_PASSES):
+        cur = mgr.matches.get(mid)
+        if cur is None or cur.reaction_exchange is None:
+            break
+        did = True
+        try:
+            await reactions.react_skip(
+                sctx, mgr, cur, "(reactions=pass: the units still to "
+                                "answer pass)")
+        except VTTError as e:
+            await sctx.send(f"❌ {e}")
+            break
+    return did
 _SIM_LIST_CAP = 8           # values shown per distribution
 _SIM_LINE_CAP = 40          # unit / var / status lines shown
 
@@ -25263,7 +25316,7 @@ def _sim_status_level(inst: Any) -> Any:
     "simulate", raw_args=True, snapshot=False, access="host_only",
     usage=("!simulate <n> [seed=<text>] [steps=<n>] [until=<formula>] "
            "[tally=<formula> ...] [units=<ids>] [vars=<paths>] "
-           "<command ...>"),
+           "[reactions=<mode>] <command ...>"),
     desc=(
         "Run a command n times, each time on a throwaway copy of every "
         "match with its own random rolls, and report what the runs did on "
@@ -25282,7 +25335,12 @@ def _sim_status_level(inst: Any) -> Any:
         "number of them) records a value at the end of each run. `units=` "
         "/ `vars=` (comma lists) narrow the report. Status hooks, "
         "passives and watchers run as in a real command; choices need "
-        "`answer=` tokens. Refused for what `!dry` refuses. The steps of "
+        "`answer=` tokens. `reactions=stop` (default): a run whose action "
+        "opens a reaction window that waits for answers ends there, the "
+        "action unresolved, and the report counts those runs; "
+        "`reactions=pass`: the units still to answer pass, so the action "
+        "resolves (units whose reaction mode is auto react either way; a "
+        "batch or macro can answer with its own `!react` lines). Refused for what `!dry` refuses. The steps of "
         "all runs together are capped by the owner limit "
         "simulate_step_limit. Hosts only."),
 )
@@ -25322,6 +25380,12 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
     if i >= len(args):
         return await ctx.send(
             f"❌ `!simulate` needs a command to run — usage: `{usage}`")
+    react_mode = str(opts.get("reactions", "stop")).lower()
+    if react_mode not in ("pass", "stop"):
+        return await ctx.send(
+            f"❌ `reactions={opts['reactions']}` — `pass` (the units still "
+            f"to answer a reaction window pass) or `stop` (the run ends at "
+            f"the window; default).")
     m = active_match(mgr, ctx)
     mid = m.id
     until = normalize_body_source(opts["until"]) if opts.get("until") \
@@ -25418,6 +25482,9 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                 sink = FORMULA_LOG_SINK.set([])
                 try:
                     await registry.dispatch_no_snapshot(name, rest, sctx, mgr)
+                    if react_mode == "pass" and await _sim_pass_windows(
+                            sctx, mgr, mid):
+                        rec["passed"] = True
                     cur = mgr.matches.get(mid)
                     if cur is not None:
                         cur.surface_log(cur.sync_touched_sizes())
@@ -25653,9 +25720,15 @@ def _sim_report(name: str, rest: List[str], runs: List[Dict[str, Any]],
         lines.append(
             f"⚠️ {waiting} run(s) ended with a reaction window waiting for "
             f"answers, so the action under it didn't resolve: nobody "
-            f"answers in a simulation. A unit whose `__reaction_mode` is "
+            f"answers in a simulation. `reactions=pass` makes the units "
+            f"still to answer pass; a unit whose `__reaction_mode` is "
             f"`auto` or `never` (or the rule reaction_mode) needs no "
             f"answer.")
+    passed = sum(1 for r in runs if r.get("passed"))
+    if passed:
+        lines.append(
+            f"ℹ️ reactions=pass: in {passed} run(s) the units still to "
+            f"answer a reaction window passed.")
     if error_runs:
         lines.append(f"❗ {error_runs} run(s) had a ❌ / ❓ reply, e.g.: "
                      + " / ".join(e.strip() for e in errors))

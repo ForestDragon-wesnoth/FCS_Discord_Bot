@@ -2711,8 +2711,19 @@ positive.
     (design: it still resolves) failed in `deal_damage(target, ...)` with
     "'self', 'this', or 'current' was used but is unbound"; the refusal
     names a variable holding no unit.
-  - Asked: a window nobody is left to answer stays open until `!react
-    skip` or its expiry when the last undecided unit dies or leaves by a
-    host tool; whether `!simulate` should resolve a waiting window by
-    itself.
+  - Answered after the pass (user calls): a command that leaves nobody
+    to answer the open window closes it and the pending action resolves
+    in that command (1169); `!simulate` takes `reactions=pass|stop`,
+    `stop` the default (1168); `!ent transform` keeps taking a statblock
+    only (`template_data(name)` for a library template).
+  - **Stuck exchange** (1170, found while building the first answer): a
+    half, cost or body whose formula errored (an unknown name, a bad
+    argument; not a fail()) escaped the exchange as an exception. The
+    exchange stayed at that step with its window open and nobody to
+    answer, `!turn next` and `!action` were held, and every `!react skip`
+    ran the broken formula again; only an undo or fixing the formula got
+    the match out. The step now fails like a fail().
+  - After those changes: the replay differential over scenarios
+    1090-1170 (85 replays, 0 problems), the chaos harness on the
+    reactions board (four seeds) and the main board (one): 0 findings.
 
