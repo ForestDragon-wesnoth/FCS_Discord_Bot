@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #482). #264-#482 come from review passes by
+(the highest so far is #513). #264-#513 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -338,6 +338,23 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#475 Footprint previews.** `!map preview body <eid|template> <x> <y> [facing]`: the cells a body with its located parts and segments would cover there, and whether it fits.
 - **#476 Bestiary cards.** `!template card <name>`: a template rendered through the entity description formats under the privacy rules, so players read a monster type the way they read a unit. `!template show` prints JSON.
 - **#477 CLI batch mode.** `python cli.py --run <file>` runs a script and exits non-zero on a failed `!assert`. A GM keeping a ruleset's setup and tests in git gets CI for it.
+- **#483 Unknown `__` var warnings.** A write of an engine-style `__` key the engine doesn't know (`__reaction_mod` for `__reaction_mode`) ends with a ⚠️ and a close-name suggestion. The per-unit overrides are many, and a typo in one does nothing, silently.
+- **#484 Warnings for malformed engine-shaped data.** A write under `actions`, `slots`, `modifiers`, `watchers` or `shields` that the engine couldn't use (an unknown target type, a modifier without a stat) is stored with a ⚠️ naming the problem. Today it surfaces at use, or never.
+- **#485 `!why`.** After a ❌, `!why` gives the long form of the caller's last refusal: the check that refused, the rule or condition behind it and where to change it. Refusals stay one line; the detail is on request.
+- **#486 Explain a status instance.** `!status view <eid> <name>`: every effective field at the instance's level with its origin (instance, definition, which level entry). Per-level layering makes that hard to read off `!status info`.
+- **#487 Explain a clamp.** `!clamp why <eid> <path>`: the clamps that apply (unit, system default), each bound's current value and whether a soft clamp is dormant.
+- **#488 Bracket access for statuses and corpses.** `status[self].burn.level -= 1`, `corpse[gob3].inventory`, and `rule.<name>` as a read. Extends #373 to the remaining stores.
+- **#489 Passives on several hooks.** `when=on_turn_start,on_revive`: one body, several hooks. Today the passive is added once per hook.
+- **#490 Query events.** `ask(name, payload, target=None)` fires the event's handlers and returns their values as a list. A system gets its own extension points ("does anything forbid this?", "bonus to hit from anyone"); `emit` returns nothing to its caller.
+- **#491 Turn-clock schedules.** `clock='turns'` on `schedule`: a match-level schedule counting turn boundaries. `schedule` raises under ATB, and `schedule_on` needs a unit.
+- **#492 `!func rename`.** Renames a function and rewrites its calls in every stored formula, listing what it changed. Statuses, zones, tables and macros rename this way; `!func` has def and list.
+- **#493 Replace across formulas.** `replace=<new>` on #203's search, with a preview: one text swapped in every stored formula and body.
+- **#494 Tag-filter blocking.** `block_tags` and `opaque_tags` on tiles, templates and zones (`"not (flying or swimming)"`), read natively against the mover's or viewer's tags. Water that stops non-swimmers needs a condition formula per tile type today.
+- **#495 Summed zone grants.** A grant option `combine: highest | sum`: overlapping zones of one definition add their levels ("each fire you stand in adds a level"). Grants take the highest today.
+- **#497 Target restrictions from statuses.** Status fields `must_target_source` and `cannot_target_source`, with a tag filter for the actions they cover and an `_unless` expression. Taunt, charm and fear, built on `__source`; the #234 fields restrict by action today, never by target.
+- **#498 Confirm list.** A rule naming the commands that need `confirm` (ent remove, map delete, zone del), so a table picks its own safety level.
+- **#499 `!again` with a swap.** `!again gob1=gob2` reruns the caller's last command with one word replaced. Ten goblins making the same attack become one typed line and nine short ones.
+- **#500 Stepped macros.** `!macro step <name>` runs a macro's next line each call, the pointer saved with the match. A cue list for a scripted encounter: gates open, reinforcements arrive, the bridge falls.
 
 ## Medium (a subsystem slice)
 
@@ -591,6 +608,52 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#480 Simulate under other rules.** `rules=<rule>:<value>,...` on `!simulate` and `!dry` runs under temporary rule values, so a rule choice is compared by outcome before anyone edits the system.
 - **#481 Personal aliases for commands.** `!my alias <name> <command ...>` per user, resolved before the gate and still gated. With the `me` token (#400) a player types `!slash gob1` on a phone instead of the full `!action`.
 - **#482 RNG commitments.** `!match rng commit` publishes a hash of the seed, and `reveal` at the end lets players check through the journal replay that every roll came from it. For duels between the user's groups, where the host is also a player.
+- **#501 Roster views.** Today `!list [full] [as=<team>]` (`_list_cmd_impl`) prints every visible unit in turn order through one format, `entity_line_format` (`_entity_line`); a multi-map match groups through `_roster_groups`. One format has to serve combat, inventory and initiative reading at once.
+  - Surface: rule `roster_views` (view name → line format, a MERGE rule so a child system adds views to its parent's); `!list view=<name> [sort=<var path>[:desc]]`, the same two options on `!state`; rule `roster_default_view` (empty = `entity_line_format`).
+  - Behaviour: a view's format takes every entity_line_format placeholder and passes the same validation (`_FORMAT_RULE_CHECKS`). `sort=` is a stable sort inside each group (map and team headings kept); a unit without a number at the path goes last; without `sort=` the order stays the turn order. The → marker, the part and mount suffixes and the Dead: section stay. Sorting reads through the command's VAR_READER, so a private var counts as missing for a reader who may not read it and the order reveals nothing. An unknown view is refused with the list of views.
+  - Where: `_list_cmd_impl`, `_entity_line` (a format argument), `_roster_groups`, the `!state` handler, completion.py (a view slot).
+  - Scenarios: a view changes the columns; `sort=hp:desc` with one unit lacking the var; a team-view channel sorting by a private var (order unchanged for hidden values); a two-map match keeps its headings; a 2×2 unit with a located part keeps its suffix.
+  - Open question: whether a view may carry its own corpse line (`{line: ..., corpse: ...}`) or corpses always use `corpse_line_format`; the plain string form first is the recommendation.
+- **#502 `in=<zone>` on spawns.** Today `!template spawn <name> <x> <y> [near=] [count=] [map=]`; count goes through `_spawn_many` (the free cells nearest (x, y), all or nothing). A random spot in a zone works for one unit through `$(random_free_cell(...))` and has no form for several distinct spots.
+  - Surface: `!template spawn <name> in=<zone> [count=<n>] [fit=body|anchor]`, x and y left out.
+  - Behaviour: each copy takes a random free cell where its whole body fits, drawn from `m.formula_rng()` (the journal's RNG positions cover it). `fit=body` (default): every body cell inside the zone; `fit=anchor`: the anchor inside and the body on the map. The zone's own map is the spawn map; a `map=` naming another is refused; an aura counts as a zone. All or nothing, worded like `_spawn_many`: "Only 1 of 3 ogre fit in zone north_gate; spawned none".
+  - Where: the spawn branch of `!template`, `_spawn_many` (a cell-picker argument), `formula._random_free_cell` for the shared fit logic, the `annotate_sub("template", "spawn")` usage.
+  - Scenarios: five 1×1 units in a 3×3 zone on five distinct cells inside it; a 2×2 body with count=2 in a 3×3 zone refused whole; `fit=anchor` lets the body overhang; a zone on another map than `map=`; a fixed `random_seed` gives the same cells twice.
+  - Open question: a formula twin `summon_template_in(name, zone, count=1)`, recommended in the same PR for command-vs-formula parity.
+- **#503 Pending notice for hosts.** Today a queued request is announced once, in the requester's channel; a host working elsewhere sees it only by typing `!pending`.
+  - Surface: rule `pending_request_notice` (off / count / list, default count).
+  - Behaviour: after a host's command on the match in a channel without a team view, the reply ends with "🕓 2 requests waiting (!pending)"; `list` adds each request's id, requester and command. It sits beside the held reminders in `CommandRegistry._run` with their test (`_acts_as_host`, `_view_pov(...) is None`, not `!as`). It shows once per change of the queue: a runtime dict keyed by (match, channel, host) remembers the ids shown, outside match state, undo and the journal, like the private-var reminder cooldown. `expire_pending_requests` runs first; `!pending`, `!approve`, `!deny` and `!cancel` print no notice.
+  - Scenarios: a player queues from a team channel and the host's next command in the GM channel carries the notice once; a second host command carries none; a new request brings it back; `!as wait` past the expiry removes it; a host typing in a team-view channel gets none.
+- **#504 Fork from the past.** Today `MatchManager.clone_match` copies the present state, resets owner / co-hosts, bindings, cameras, pending requests and pause, and gives the copy a fresh RNG seed, uid and an empty history.
+  - Surface: `!match clone <new_id> [name] at=<save name | command:N | turn:N | round:N>`.
+  - Behaviour: the snapshot is resolved the way `!history restore` and `!undo` resolve theirs, and its `Snapshot.state` becomes the copy's state. A snapshot has no rules, so the copy takes its rules from the source's current system through `apply_system_rules`, following `_restore_snapshot` (var-name sync, the stub-rules marker). Everything `clone_match` resets is reset; the source, its history and journal stay untouched. A missing or unreadable snapshot is refused with the reason.
+  - Where: `clone_match` (a `state=` argument), the clone branch of `!match`, `_restore_snapshot` as the model; `_require_match_creator` already guards it.
+  - Scenarios: save, play three turns, `!match clone fork at=start` gives a round-1 board while the source keeps its turn; `at=command:2`; an unknown save; the fork rolls from its own seed; a fork of a match with template pins keeps them.
+- **#505 System glossary.** Tags have descriptions (`tag_vocabulary`), statuses and actions have description fields, and system terms ("bloodied", "standard action") have no home.
+  - Surface: a `glossary` library in SYSTEM_LIBRARIES (term → text), read live like `tag_vocabulary` and `var_labels`; `!system glossary list|set|remove <system> [<term> <text ...>]` (administrator or the `systems` capability, modelled on `_system_labels`); `!help term [<word>]` for everyone, modelled on `_help_tag` (no word lists the terms of the channel's system).
+  - Behaviour: lookup ignores case and a miss offers close names; `!help find` searches terms and texts; Tab completes terms (a term slot). Limits beside `VAR_LABEL_MAX`: a term up to 40 characters, a text of one line up to 500. Inheritance, hides, `!system unset glossary:<term>`, info / diff, server undo and the audit come with SYSTEM_LIBRARIES. The handbook export (#231) prints the glossary first.
+  - Scenarios: set and read a term; a child system overrides one term and hides another; a player reads it in a channel with no match; an over-long text refused; `!system undo` takes an edit back.
+- **#506 Sprite sheets.** Today `SpriteLoader.get(key)` loads `<key>.png` from the server's sprites folder, then the shared one (PNG only, `_safe_path`, cached by path and mtime, shrunk past `_SPRITE_MAX_SIDE`); each sprite is its own file.
+  - Surface: a sprite key `sheet:<file>:<col>,<row>` (1-based) or `sheet:<file>:<name>`, wherever a sprite key goes.
+  - Behaviour: a sidecar `<file>.sheet.json` holds `{"cell": [w, h], "margin": 0, "spacing": 0, "names": {"orc": [3, 2]}}`, a server-side file like the sprites. The loader caches the sheet and each cropped cell, refreshed when either file changes. A sheet keeps its full size under its own larger limit (the 2048 px shrink would move every cell); each cell obeys the normal one. A cell outside the sheet, a missing or malformed sidecar gives None and the renderer falls back to the glyph.
+  - Where: `SpriteLoader` only; check that the places validating or printing keys (`!map scene list`, any key character check) accept `:` and `,`.
+  - Testing: the harness can't see pixels, so a direct test builds a 2×2 sheet in a temp folder, renders through `render_scene_png` and compares the cell's pixels.
+- **#508 Part-borne modifiers and tags.** Today `_raw_modifier_records` gathers from statuses, match vars, map vars, team data, the `modifiers` var and the `modifier_sources` roots, and `unit_tag_sources` passes tags from a root down to its parts. Nothing flows from a part up to its body, so a crippled leg needs hooks to slow the creature.
+  - Surface: a part var `body_modifiers` (a bundle shaped like `modifiers`); a part var `body_tags` (a checked tag list, engine tags refused, like `grants_unit_tags`); a rider var `vehicle_modifiers`, with a slot field `rider_modifiers` (default true) to switch a seat off.
+  - Behaviour: every living part of a root's subtree (hp above 0 or indestructible, the `__part_destroyed` latch clear) contributes its records sourced `part:<part id>.<key>` and its tags sourced `part:<id>`, to the root only. A destroyed part contributes nothing until healed above 0; a detached part stops; the read is live, no hook. `value` and `condition` run with self = the body root and `part` bound. A mounted rider (hidden ones included) contributes to its vehicle. `!mod show` lists them with their source, and `{tags_sourced}` names the part.
+  - Where: `_raw_modifier_records`, `unit_tag_sources`, `checked_tag_vars`, `Match._children_index` for the body walk (a per-node subtree scan cost 12 s on a large board, X18).
+  - Scenarios: a leg with `body_modifiers` speed +2, destroyed, then healed; a nested part (claw on an arm) reaching the root; a glued part and a region part; a detached part; a driver's `vehicle_modifiers` and a seat with `rider_modifiers: false`; a `body_tags` entry feeding `immune_to_actions_with_tag`.
+  - Open question: self = the root with `part` bound (recommended), or self = the part.
+- **#511 Per-map rule overrides.** Today gameplay rules are read as `self.rules.get(...)` with no map involved; display settings already have the pattern (`Match.map_setting(mp, setting)`: a map var, else the rule).
+  - Surface: a map var holding rule → value, named by a new MAP_VAR_NAME_RULES entry (`map_rules_var`, default `rules`); `!map rule set|unset|list [<rule> [<value>]] [map=<map>]` (host, strict map resolution); a whitelist `MAP_OVERRIDABLE_RULES`.
+  - Behaviour: `Match.map_rule(mp, key)` returns the map's value, else `self.rules[key]`, and every read site of a whitelisted rule moves to it (each has a map in scope). A value passes the rule's own schema check, a formula value its mode; a rule outside the whitelist is refused with the list. Layer order with #295: system chain, match layer, then the map. `!help rule` adds the map's value as a source line; `!map cell ... for=` names a map override when it decided the answer. A drift guard at import fails the build when a whitelisted rule is read through `rules.get`.
+  - Scenarios: diagonal movement off on one map and on in the other, tried with a 2×2 body; `los_corner_mode` differing between a deck and the sea; a non-whitelisted rule refused; an invalid value refused; a map copy carrying its overrides; undo of `!map rule set`.
+  - Open question: the first whitelist; the proposal is allow_diagonal_movement, allow_diagonal_facing, block_walk / tp / push / swap, los_corner_mode, fog_los, fog_range_mode, friendlyfire and the tile / zone / corpse block and opaque condition rules, adding others as games ask.
+- **#513 Owner switch for a command.** Today a command found exploitable on a public bot stays reachable on every server until a redeploy.
+  - Surface: `!owner disable <command> [<sub>] [server=<key>|all] [reason ...]`, `!owner enable <command> [<sub>] [server=...]`, `!owner disabled`.
+  - Behaviour: stored in `data/bot_settings.json` beside the ceilings and owner limits, per server key or `*`, with the reason. Tested in both `CommandRegistry.run` and `dispatch_no_snapshot`, after alias resolution and next to the administrator check, so batch, macro, foreach and `!run` lines, action `cmd()` lines, approved requests and held commands all meet it. The refusal: "`!ent tp` is switched off by the bot owner (reason)." `owner`, `help` and `whoami` can't be disabled.
+  - Scenarios: a disabled subcommand refused when typed, inside a batch, through an alias, through an action's `cmd()` and through an approved request; `server=` scoping with `!as server`; the switch surviving `!as restart`; enabling again.
+  - Open questions: whether the bot owner bypasses it (recommended: no, the goal is to close the code path); whether `!match replay` runs an entry whose command is switched off (recommended: refuse it and report the entry); a twin for formula functions (`!owner disable function <name>`) for an exploit through `$()` or a formula, recommended as a follow-up.
 
 ## Large (arcs of several PRs)
 
@@ -649,6 +712,13 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#306 Encounter library.** A saved bundle of a prefab, the watchers, macros, reminders and match vars that go with it, and a turn-order setup, stamped into a match in one command. Sits between prefabs (#31) and system packs (#162).
 - **#348 Module split.** vtt_commands.py and logic.py are about 29,000 lines each; split them into packages by subsystem with pure moves. Every session reads less to find its way, and parallel PRs conflict less.
 - **#385 Server isolation.** Each server's commands run in their own worker process, so one server's slow command no longer delays the others. Locks, storage and routing are per server already; this removes the shared event loop behind most of the limit rules and ceilings.
+- **#509 Prefabs and templates carry inner maps** (medium to large). Today `capture_prefab` leaves a map carrier out with a ⚠️, so a ship with decks is rebuilt by hand in every match. The corpse of a wrecked map vehicle already stores a map inside a record (`maps`, re-attached by a revive, §7.8), which is the shape to reuse.
+  - Surface: no new command. `!prefab save` keeps carriers; `!template save` of a carrier keeps its maps; `stamp_prefab`, `!prefab stamp`, `!template spawn` and `summon_template` rebuild them.
+  - Prefab shape: a `maps` entry per carried map: its size, tiles, zones, voids and map vars, the saved id of its vehicle, the units and corpses on it (entity entries at offsets), and its own carried maps, recursively. Fog memory and reveals stay out.
+  - Stamping: each map is created under its saved name, or a minted one on a clash (`deck`, `deck2`), and attached to the new id of its vehicle. One id map covers the whole stamp; inner zones are minted on a clash too; stored `[x, y, map]` lists naming a saved map follow its new name (as `_rename_map_coords` does). `rotate=` and `flip=` turn the outer rectangle; inner maps keep their orientation. `match_cell_limit` over the summed area, the owner limit `map_nesting_depth` and the unit cap are checked before the first unit spawns; a failure leaves nothing (`_rollback_match`). `_collect_definitions` scans the inner maps, and `check_prefab` validates them (bounds, voids, a vehicle that exists in the prefab, no carrying loop).
+  - Templates: an entity template of a carrier stores its maps' terrain, zones and map vars.
+  - Scenarios: save and stamp a ship with one deck and two crew; stamp it twice (minted map and zone names); a ship whose deck holds a boat carrying a map of its own; a stamp over the cell limit refused whole; a ship template spawned twice; a rotated stamp.
+  - Open question: whether a carrier template also stores the units on its maps; recommended: terrain only for templates (a ship design), units for prefabs (a crewed ship).
 
 ## Suggested groupings
 
@@ -726,3 +796,15 @@ From the #451-#482 review:
 - **Table play:** #464, #465, #466, #467, #468, #469, #470, #481
 - **Maps and reads:** #471, #472, #473, #474, #475, #476, #479
 - **Tooling:** #477, #480, #482
+
+From the #483-#513 review (#501 and later come with a build sketch and the open questions):
+
+- **Catching silent mistakes:** #483, #484, #485, #498
+- **Explain tools:** #486, #487
+- **Formulas and hooks:** #488, #489, #490, #491, #492, #493
+- **Rules as data:** #494, #495, #497, #511
+- **Table comfort:** #499, #500, #501, #503, #505
+- **Building encounters:** #502, #504, #509
+- **Looks:** #506
+- **Bodies:** #508
+- **Running a public bot:** #513
