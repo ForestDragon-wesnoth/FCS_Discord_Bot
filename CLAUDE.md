@@ -438,7 +438,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-53 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-54 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
@@ -2031,9 +2031,14 @@ hardcodes**.
   ❌ and undoes the lines before it (every match restored in place, created
   matches removed, deleted ones restored as the original object even when
   a line made a new match under the id, pointers and rules restored;
-  bot-wide settings are not; a line that crashes undoes like a ❌, and a
+  bot-wide settings are not; a line that crashes undoes like a ❌, as does
+  an unknown command (`_ErrorWatchCtx`: a typo'd line used to be skipped
+  and the lines after it ran), and a
   deleted match comes back with its history, saves and journal) (692-693,
-  816). **`!run <file>`** reads a saves-folder file (admin). Both nest
+  816, 1167). A dispatched line may keep its `!` (`dispatch_no_snapshot`
+  strips it): the line splitter drops it only for a typed batch / sweep
+  with a `;`, so a one-line `!batch !ent ...` and a batch or sweep under
+  `!dry` / `!simulate` answered "Unknown command `!ent`" (1167). **`!run <file>`** reads a saves-folder file (admin). Both nest
   within `macro_recursion_limit`.
 - **Lines of `!batch` / `!foreach` are gated** (`_GATE_LINES`, checked in
   `dispatch_no_snapshot`): each typed line passes the per-match gate as its
@@ -2115,6 +2120,10 @@ hardcodes**.
   one turn. `tally=` (read-only) records a value per run. The steps of all
   runs share the owner limit `simulate_step_limit` (1000); a run it cuts
   is left out with a ⚠️. Runs yield the event loop between them. A run
+  with a ❌ or an unknown-command reply counts as failed; a run that ends
+  with a reaction window waiting for answers is counted and named (nobody
+  answers in a simulation: a batch with `!react` lines, or units whose
+  reaction mode is auto / never, resolve it; 1168). A run
   puts back only the matches it reached (`logic.MATCHES_TOUCHED`:
   `MatchManager.get`, `copy_entity`, `require_target_host`) plus any
   deleted or replaced; every match goes back once at the end (X16).

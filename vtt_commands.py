@@ -659,6 +659,12 @@ class CommandRegistry:
         into one outer snapshot (the wrapping command's own snapshot).
         VTTError still surfaces as `❌ ...`; unexpected exceptions still
         propagate so the caller can decide whether to abort."""
+        # A line may keep its `!` (the line splitter drops it only for a
+        # typed `!batch a ; b`): a one-line `!batch !ent ...`, and a batch
+        # or sweep under `!dry` / `!simulate`, answered "Unknown command
+        # `!ent`".
+        if isinstance(name, str) and len(name) > 1 and name.startswith("!"):
+            name = name.lstrip("!") or name
         name, args = self._resolve_alias(name, args, mgr, ctx)
         h = self._handlers.get(name)
         if not h:
@@ -24903,8 +24909,11 @@ class _ErrorWatchCtx:
             setattr(object.__getattribute__(self, "_inner"), name, value)
 
     async def send(self, message: str, *a: Any, **k: Any) -> Any:
+        # An unknown command is a line that failed too (a typo'd line of a
+        # strict batch was skipped and the lines after it ran).
         if isinstance(message, str) and any(
-                ln.lstrip().startswith("❌") for ln in message.split("\n")):
+                ln.lstrip().startswith(("❌", "❓ Unknown command"))
+                for ln in message.split("\n")):
             object.__setattr__(self, "error_seen", True)
         return await object.__getattribute__(self, "_inner").send(
             message, *a, **k)
@@ -25462,8 +25471,13 @@ async def simulate_cmd(ctx: ReplyContext, args: List[str],
                         break
             elif cur is None:
                 rec["deleted"] = True
+            # A run that ended with a reaction window waiting for answers:
+            # its action never resolved (nobody answers in a simulation),
+            # and the report said only "No unit changed in any run."
+            if cur is not None and cur.reaction_exchange is not None:
+                rec["window"] = True
             bad = [ln for r in sctx.replies for ln in r.split("\n")
-                   if ln.lstrip().startswith("❌")]
+                   if ln.lstrip().startswith(("❌", "❓ Unknown command"))]
             if bad:
                 error_runs += 1
                 if len(errors) < 3 and bad[0] not in errors:
@@ -25627,6 +25641,7 @@ def _sim_report(name: str, rest: List[str], runs: List[Dict[str, Any]],
             counts = [r.get("new", []).count(nm) for r in live]
             body.append(f"Spawned `{nm}`: {_sim_num(sum(counts) / done)} per "
                         f"run on average (max {max(counts)})")
+    waiting = sum(1 for r in runs if r.get("window"))
     if not body and not errors:
         body.append("No unit changed in any run.")
     if len(body) > _SIM_LINE_CAP:
@@ -25634,8 +25649,15 @@ def _sim_report(name: str, rest: List[str], runs: List[Dict[str, Any]],
         body = body[:_SIM_LINE_CAP] + [
             f"… {cut} more lines (narrow with `units=` / `vars=`)."]
     lines += body
+    if waiting:
+        lines.append(
+            f"⚠️ {waiting} run(s) ended with a reaction window waiting for "
+            f"answers, so the action under it didn't resolve: nobody "
+            f"answers in a simulation. A unit whose `__reaction_mode` is "
+            f"`auto` or `never` (or the rule reaction_mode) needs no "
+            f"answer.")
     if error_runs:
-        lines.append(f"❗ {error_runs} run(s) had a ❌ reply, e.g.: "
+        lines.append(f"❗ {error_runs} run(s) had a ❌ / ❓ reply, e.g.: "
                      + " / ".join(e.strip() for e in errors))
     return "\n".join(lines)
 

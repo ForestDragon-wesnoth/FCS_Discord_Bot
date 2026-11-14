@@ -32781,7 +32781,7 @@ SCENARIO 974 — !simulate: refusals, the step limit, hosts only
 !simulate 2 until="entity[zz].hp > 0" !ent hp ogre -1
 ?? couldn't be read
 !simulate 2 !batch ent hp ogre -1 ; system set default friendlyfire true
-?? ❗ 2 run(s) had a ❌ reply
+?? ❗ 2 run(s) had a ❌ / ❓ reply
 ?? can't run `!system set`
 !assert "rule_get('friendlyfire') == False and entity[ogre].hp == 40"
 !owner ceiling simulate_step_limit 10
@@ -41855,7 +41855,7 @@ SCENARIO 1161 — An open reaction window holds a macro's lines, `!dry` and `!si
 !dry !turn next
 ?? ❌ A reaction window is open
 !simulate 1 !action orc cleave hero
-?? 1 run(s) had a ❌ reply
+?? 1 run(s) had a ❌ / ❓ reply
 !assert "entity[hero].hp == 30 and turns_elapsed() == 1"
 !react hero sidestep
 ?? `orc` used action `cleave`
@@ -42100,3 +42100,96 @@ still anchors to it (12 cells around the 2x1 body) and can name the unit
 by token (`current`). `transform()` given a unit id for its form says
 what a form is; with `entity_snapshot('lurker')` the scout takes the
 2-wide body.
+
+
+SCENARIO 1167 — A batch line may keep its `!`; an unknown command stops a strict batch
+----------------------------------------------------------------------------------------
+!match new bx BX 8 6
+!match use bx
+!ent add hero Hero 30 2 2 3
+!ent add ogre Ogre 30 4 2 2
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!batch !ent hp hero -1
+?? Damaged `hero` by 1.
+?! Unknown command
+!dry !batch !ent hp hero -1 ; !ent hp ogre -2
+?? vars.hp: 29 -> 28
+?? vars.hp: 30 -> 28
+?! Unknown command
+!dry !foreach hp>0 ; !ent hp $id -1
+?? Damaged `ogre` by 1.
+?! Unknown command
+!simulate 3 !batch !ent hp hero -1 ; !ent hp ogre -2
+?? `hero.hp`: -1 ×100%
+?? `ogre.hp`: -2 ×100%
+!simulate 3 !batch !ent hp hero -1 ; !bogus ogre
+?? ❗ 3 run(s) had a ❌ / ❓ reply, e.g.: ❓ Unknown command `bogus`
+!assert "entity[hero].hp == 29 and entity[ogre].hp == 30"
+!batch strict ent hp hero -1 ; bogus x ; ent hp ogre -1
+?? ⏹ strict batch stopped at line 2 (`bogus`): it failed, so the 1 line(s) before it were undone and 1 line(s) were not run.
+!assert "entity[hero].hp == 29 and entity[ogre].hp == 30"
+!batch ent hp hero -1 ; bogus x ; ent hp ogre -1
+?? ❓ Unknown command `bogus`
+!assert "entity[hero].hp == 28 and entity[ogre].hp == 29"
+
+Expected: HARNESS-ALLOWS-ERRORS. A one-line `!batch !ent hp hero -1` runs
+its line (it answered "Unknown command `!ent`": the line splitter drops a
+line's `!` only for a typed batch with a `;`). The same batch and a
+`!foreach` under `!dry` and `!simulate` run their lines too (hero 29 ->
+28 and the 2x2 ogre 30 -> 28 in the dry run; -1 and -2 in every simulated
+run): under those wrappers every line was an unknown command, and
+`!simulate` reported that as "No unit changed in any run." A simulated
+batch with a typo'd line now counts its runs as failed and quotes the
+reply. `!batch strict` stops at an unknown command and undoes the line
+before it (hero stays 29; it used to skip the typo and run the lines
+after it); a plain batch still goes on past one (hero 28, ogre 29).
+
+
+SCENARIO 1168 — !simulate says when its runs stopped at a reaction window
+---------------------------------------------------------------------------
+!match new sw SW 10 6
+!match use sw
+!ent add orc Orc 30 2 2 5
+!ent add hero Hero 30 4 2 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = 10"
+!ent set_var orc actions.cleave.body "deal_damage(target, damage)"
+!ent set_var hero actions.block.reacts_to melee
+!ent set_var hero actions.block.before "incoming.damage = incoming.damage - 6"
+!turn next
+!simulate 4 !action orc cleave hero
+?? No unit changed in any run.
+?? ⚠️ 4 run(s) ended with a reaction window waiting for answers
+!simulate 4 !batch !action orc cleave hero ; !react hero block
+?? `hero.hp`: -4 ×100%
+?! waiting for answers
+!simulate 4 !batch !action orc cleave hero ; !react hero pass
+?? `hero.hp`: -10 ×100%
+!ent set_var hero __reaction_mode auto
+!simulate 4 !action orc cleave hero
+?? `hero.hp`: -4 ×100%
+?! waiting for answers
+!ent set_var hero __reaction_mode ask
+!action orc cleave hero
+?? `!react hero block`
+!ent kill hero
+!react skip
+?? ⚠️ hero drops out of `cleave`: hero is gone.
+?? no unit was given (the value is None)
+?? `target` once its target dropped out
+!assert "not has_corpse('orc') and entity[orc].hp == 30"
+
+Expected: HARNESS-ALLOWS-ERRORS. The hero answers the orc's cleave with a
+block (10 - 6 = 4). `!simulate 4 !action orc cleave hero` can't answer the
+window, so no run resolves the action: the report keeps "No unit changed
+in any run." and now adds why (4 runs ended with a window waiting). A
+simulated batch that answers the window itself reports the result (-4
+with the block, -10 with a pass), as does a hero whose `__reaction_mode`
+is `auto`. Then the real action: the host kills the hero while the window
+is open and closes it with `!react skip`. The hero drops out, the body
+still runs (design: an action with no target left resolves), and its
+`deal_damage(target, ...)` fails with a message naming a `target` that
+dropped out (it blamed an unbound 'self' / 'this' / 'current'). The
+failed body changes nothing.
+
