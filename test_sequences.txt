@@ -41971,3 +41971,132 @@ dump`) and the ordinary reads still work. A host keeps playing; with
 pause_affects_hosts on, the host's own `!action` is held (it used to
 run for the same reason) and runs at `!match resume`. After the resume
 bob's action runs again (waved 2).
+
+
+SCENARIO 1164 — Approving a request whose command an open reaction window holds keeps the request; `!approve all` runs the rest
+-------------------------------------------------------------------------------------------------------------------------------
+
+!match new ra RA 8 8
+!match use ra
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = 10"
+!ent set_var orc actions.cleave.body "deal_damage(target, damage)"
+!ent set_var hero actions.block.reacts_to melee
+!ent set_var hero actions.block.before "incoming.damage = incoming.damage - 6"
+!turn next
+!as player bob
+!turn next
+?? needs host approval (request `r1`
+!ent hp hero -1
+?? needs host approval (request `r2`
+!as host
+!action orc cleave hero
+?? `!react hero block`
+!approve r1
+?? ⏳ `r1` (`!turn next`, by bob) waits: a reaction window is open
+?? The request stays pending
+!approve all
+?? ⏳ `r1` (`!turn next`, by bob) waits
+?? ✅ Approved `r2` (!ent hp hero -1, by bob).
+!pending
+?? `r1` by bob: `!turn next`
+?! r2
+!assert "entity[hero].hp == 29 and turns_elapsed() == 1"
+!react hero block
+!approve r1
+?? ✅ Approved `r1` (!turn next, by bob).
+?? It is now **Hero**'s turn
+!assert "entity[hero].hp == 25 and turns_elapsed() == 2"
+
+Expected: bob's `!turn next` (r1) and `!ent hp hero -1` (r2) wait for
+approval when the orc's cleave opens a reaction window. `!approve r1` is
+answered with why it waits, and the request stays pending: it used to be
+marked approved and used up while the window refused the command, so the
+player's request was lost under a reply saying it "waits". `!approve all`
+skips r1 the same way and runs r2 (a silent hp write the window doesn't
+hold: hero 29). `!pending` still lists r1. Once the hero has answered
+(block: 10 - 6 = 4 damage, hero 25) the same `!approve r1` runs the turn
+change. The Discord Approve button answers the same way and keeps its
+buttons.
+
+
+SCENARIO 1165 — !dry shows what a command's watchers would do
+--------------------------------------------------------------
+!match new dw DW 8 6
+!match use dw
+!ent add ogre Ogre 30 1 1 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add hero Hero 30 6 5 3
+!status def wet
+!zone fill pond 4 4 5 5
+!zone grant pond wet
+!watch add low "entity[ogre].hp < 5" "say('the ogre staggers', about=None)\nentity[ogre].staggered = 1"
+!watch add soaked "status_has('ogre', 'wet')" "entity[hero].saw_it = 1"
+!dry !ent hp ogre 3
+?? the ogre staggers
+?? vars.staggered: (unset) -> 1
+?? vars.hp: 30 -> 3
+!assert "entity[ogre].hp == 30 and not var_has('ogre', 'staggered')"
+!dry !ent tp ogre 3 3
+?? status.wet: added
+?? vars.saw_it: (unset) -> 1
+!assert "not status_has('ogre', 'wet') and not var_has('hero', 'saw_it')"
+!ent hp ogre 3
+?? the ogre staggers
+!assert "entity[ogre].staggered == 1"
+!ent tp ogre 3 3
+!assert "status_has('ogre', 'wet') and entity[hero].saw_it == 1"
+
+Expected: a 2x2 ogre, a watcher `low` on its hp and a watcher `soaked` on
+the status the pond zone grants. `!dry !ent hp ogre 3` prints the
+watcher's line ("the ogre staggers") and lists `vars.staggered` beside
+the hp change; `!dry !ent tp ogre 3 3` (one of the ogre's four cells in
+the pond) lists the granted status and the write of the watcher that
+status set off. A dry run used to stop before the watcher poll, so it
+showed less than the command then did. Nothing is kept either time; the
+real commands then do exactly what the dry runs listed.
+
+
+SCENARIO 1166 — !zone anchor reads its unit through the channel's view; transform names its form
+--------------------------------------------------------------------------------------------------
+!match new za ZA 12 6
+!match use za
+!ent add scout Scout 20 1 1 9
+!ent add lurker Lurker 20 10 5 5
+!ent set_vars scout team=blue fog_vision_radius=2
+!ent set_vars lurker team=red fog_vision_radius=2 footprint_w=2
+!match fog on
+!zone fill glow 1 1 1 1
+!host access set "zone anchor" all
+!as player bob
+!as view blue
+!zone anchor glow lurker 1
+?? ❌ Could not find a unit named `lurker`. Either it does not exist, or this channel currently does not have permission to view it.
+!zone anchor glow nobody 1
+?? ❌ Could not find a unit named `nobody`. Either it does not exist, or this channel currently does not have permission to view it.
+!zone anchor glow scout 1
+?? Anchored `glow` to `scout`
+!as view clear
+!as host
+!zone anchor glow lurker 1
+?? Anchored `glow` to `lurker` (radius 1, square_radius): 12 cell(s).
+!zone anchor glow current
+?? Anchored `glow` to `scout`
+!eval "transform('scout', 'lurker', 'form')"
+?? ❌ transform: the form is a statblock dict (entity_snapshot(<unit>), template_data(<template>) or a var holding one), got 'lurker'.
+!eval "transform('scout', entity_snapshot('lurker'), 'form')"
+?? = `'scout'`
+!assert "footprint_width('scout') == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!zone anchor` opened to players: under
+blue's view the fogged 2-wide `lurker` reads exactly like a unit that
+doesn't exist (the command used to answer "Anchored" for the hidden unit
+and "Entity 'nobody' not found" for the missing one, an existence
+oracle, and anchored the aura to a unit the view can't see). A host
+still anchors to it (12 cells around the 2x1 body) and can name the unit
+by token (`current`). `transform()` given a unit id for its form says
+what a form is; with `entity_snapshot('lurker')` the scout takes the
+2-wide body.

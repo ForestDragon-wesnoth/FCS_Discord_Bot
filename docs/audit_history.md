@@ -2626,3 +2626,56 @@ verified after: 1159/1159, also under FCS_SPATIAL_CHECK=1.
     facing across prefabs / map copies / resizes / restarts, zone move
     argument forms and access, damage packets against odd pools and
     amounts, reactions when the attacker or the target dies mid-window.
+
+## Pass 52 (the nested dispatch path against the typed one; the replay differential over the whole suite)
+
+By hand, on the code pass 51 touched and the two paths a command takes
+(`_run_body` for a typed command, `dispatch_no_snapshot` for a line of a
+batch / macro / foreach / `!run` / `!dry` / `!simulate`). Harnesses: the
+stateful chaos harness on two more boards (statuses, transforms, mounts,
+a nested map and templates; reactions with open windows), invariants,
+restart differential and journal replay after every step; the replay
+differential over every scenario (1,255 journals, 0 differences); a POV
+sweep as a blue-view player.
+  - **Reaction window** (1161): the hold was checked for typed commands
+    and for gated lines only, so a host's macro, a `!run` file, `!dry`
+    and `!simulate` ran `!turn next` or an action under an open window
+    (the action resolving unoffered, the turn moving on under a pending
+    exchange). Every dispatched line is held now, outside a running
+    action's own `cmd()` lines.
+  - **Pause** (1163): "changes the match" read the access level AFTER
+    overrides, so `!host access set "ent move" all` made a paused match
+    take players' moves, and under `pause_affects_hosts` a host's too.
+    Judged by the command's own level as well.
+  - **Cell text** (1162): a location target inside `fmt()` / `say()` /
+    `log()` printed `Coord(4, 4)`; it prints `(4,4)`.
+  - Clean: journals of every scenario replay to the recorded hash; the
+    POV sweep's hits were a corpse sharing a hidden unit's name and
+    visible units presenting a hidden unit's disguise.
+
+## Pass 53 (approvals, `!dry` fidelity, existence oracles on opened commands, command-vs-formula parity)
+
+Harnesses: command-vs-formula parity on identical boards (57 operation
+pairs: 51 identical end states, the rest by design, such as a packet's
+`source` naming `command`); the existence-oracle detector as a blue-view
+player over ~200 commands, 64 of them opened by overrides (0 differences
+left but `$()` reading a hidden unit, which `inline_args_access` closes);
+a model-based undo differential (its hits were turn autosaves, by
+design); pyflakes over the code (no undefined names).
+  - **Approvals** (1164): `!approve` of a command an open reaction window
+    holds marked the request approved and used it up while the window
+    refused the command; the reply said it "waits" and the request was
+    gone. It stays queued (`approval_waits`), in `!approve all` and the
+    Discord button too.
+  - **`!dry`** (1165): a dry run stopped before the watcher poll and the
+    empty-map sweep, so it listed less than the command then did (no
+    watcher effects, no statuses a watcher's write granted, a
+    `__delete_when_empty` map still listed).
+  - **Oracle** (1166): `!zone anchor` took its unit id raw: for a player
+    it was opened to, a fogged unit answered "Anchored" and a missing one
+    "not found", and the aura anchored to a unit the view can't see; no
+    tokens (`current`) either.
+  - **Wording** (1166): `transform()` given a unit id or a template name
+    answered "template must be a dict"; it says what a form is and how
+    to get one.
+

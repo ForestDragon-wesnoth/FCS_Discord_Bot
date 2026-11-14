@@ -27087,7 +27087,14 @@ class Match:
         through the same swap. on_transformed fires at the end with
         `transform_kind` = `kind`. Returns log lines."""
         if not isinstance(statblock, dict):
-            raise VTTError("transform: statblock must be a dict.")
+            # A formula's transform(eid, 'orc') lands here: the command
+            # resolves a unit id or var path, the function takes the form.
+            got = f", got {statblock!r:.60}" if isinstance(
+                statblock, (str, int, float)) else ""
+            raise VTTError(
+                "transform: the form is a statblock dict "
+                "(entity_snapshot(<unit>), template_data(<template>) or a "
+                f"var holding one){got}.")
         sb = copy.deepcopy(statblock)
         # Checked before anything changes: a form kept in a var is data a
         # GM edits freely, and a bad field used to crash halfway, after the

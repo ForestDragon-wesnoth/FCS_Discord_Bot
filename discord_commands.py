@@ -666,6 +666,15 @@ class _ApprovalView(discord.ui.View):
         if await self._refuse_expired(interaction):
             return
         m = self._match()
+        # A command an open reaction window holds: the request stays (the
+        # buttons too), to be approved once the window is closed.
+        if m is not None and m.pending_requests.get(
+                self._req.get("id")) is self._req:
+            waits = vtt_commands.approval_waits(m, self._req)
+            if waits:
+                await interaction.response.send_message(waits,
+                                                        ephemeral=True)
+                return
         req = self._pop_own(m)
         if req is None:
             await interaction.response.send_message(

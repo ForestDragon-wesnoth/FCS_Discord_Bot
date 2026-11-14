@@ -438,7 +438,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-51 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-53 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
@@ -1712,7 +1712,12 @@ hardcodes**.
   capabilities", G8) and runs at the resume as the holder
   (`_HolderCtx`, COMMAND_USER: handler checks and the log judge and name
   the holder, G7); `!match use / new / bind / unbind / clone` and `!map
-  use` aren't held (`_pause_control`, L39) (988).
+  use` aren't held (`_pause_control`, L39) (988). Whether a command
+  "changes the match" is judged by its own level as well as the level
+  after `!host access` / `command_access` overrides: a command an
+  override opened to players is still refused to them while paused, and
+  held for a host under `pause_affects_hosts` (it read as a read, so the
+  pause stopped neither; 1163).
 - **Reminders** (`!remind [secret] <n> <text> | list | remove <id>`;
   `Match.reminders` / `reminder_seq` / `held_reminders`, saved, undo
   state): due at `turns_elapsed` + n, fired by `_begin_turn`
@@ -1939,7 +1944,8 @@ hardcodes**.
   `has_action`. A list target lists each unit / cell / corpse once: a repeat
   is merged with a ⚠️ (user call: to act on one twice, run the action
   twice; `dedupe_targets`). A location target must be on the map and is a `Coord`
-  (`.x` / `.y` / `.map`) that stores as [x, y]; a typed `map=<map>` names
+  (`.x` / `.y` / `.map`) that stores as [x, y] and prints as `(x,y)` (in
+  fmt() / say() text and the event log, 1162); a typed `map=<map>` names
   the map of a location / location_list target's cells (the actor's by
   default; not an action arg there, 880); `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
@@ -2084,7 +2090,11 @@ hardcodes**.
   `dispatch_no_snapshot` refuse, also inside a batch / macro / foreach it
   runs, what a match rollback can't undo (`_dry_refusal`): server-wide
   edits, files, template writes, undo / history (kept across a rollback),
-  approvals, `!match delete/pause/resume`, a nested `!dry` (768).
+  approvals, `!match delete/pause/resume`, a nested `!dry` (768). Before
+  it lists the changes a dry run settles sizes and zone grants, polls the
+  watchers (their lines print with the command's; grants settle again
+  when one fired) and sweeps `__delete_when_empty` maps, as the command
+  itself would (1165).
 - **`!simulate <n> [seed=] [steps=] [until=] [tally= ...] [units=] [vars=]
   <command ...>`** (#230, hosts only, 971-974) runs a command n times on
   `!dry`'s machinery (`_DRY_ACTIVE` holds the root, `"dry"` or
@@ -2795,7 +2805,9 @@ hardcodes**.
 - **Auras:** a zone anchored to a unit (`!zone anchor <name> <eid> [radius]
   [metric]`): cells re-stamped around every footprint cell when the anchor
   moves or its footprint var changes (`_body_reshaped`, which also re-seats
-  riders), without firing the aura's own enter/exit. On anchor loss
+  riders), without firing the aura's own enter/exit. The command reads
+  its unit through `_resolve_eid` (tokens, and the channel's view for a
+  non-host an override opened it to, 1166). On anchor loss
   `anchored_zone_on_anchor_loss`: delete / freeze / suspend (cells cleared,
   binding kept, resumes on revive or a part heal). The binding is by id, so
   a suspended aura also resumes around a LATER unit that reuses the id
@@ -2928,7 +2940,10 @@ hardcodes**.
   buttons last as long as the request and the message says when it
   expired. `!as wait <seconds>` (CLI / harness) ages every request. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
-  `_channel_pointed_at`).
+  `_channel_pointed_at`). A request whose command an open reaction
+  window holds stays queued (`approval_waits`: `!approve`, `!approve
+  all` and the Discord button answer why it waits and use nothing up;
+  1164).
 - **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner
   only), plus every holder of the `gm` capability (§3 "Role
   capabilities"; `caller_hosts`). A check on the caller's host authority
@@ -4087,7 +4102,11 @@ lists what isn't built; 1093-1122).
   passes, reaches `__reactions_per_window` / the rule, or has nothing
   left (`_refresh_done`, re-reading conditions); the command closing the
   window resolves it in that command. Holds (`_reaction_held`, refused
-  before the queue in `_run_body` and for gated batch lines): `!action`,
+  before the queue in `_run_body` and for every line
+  `dispatch_no_snapshot` runs: batch, macro, foreach, `!run`, `!dry`,
+  `!simulate`; never a `cmd()` line of an action that is running,
+  `_action_depth`, since the halves and the body resolve inside one;
+  1161): `!action`,
   `!ent move / push / pull / swap / action`, `!turn next / set / grant`.
   Host tools run during a window (`!ent tp`, `!ent damage`, `!ent kill`,
   `!zone move`: user call, a zone moved mid-window fires its hooks before
