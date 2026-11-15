@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #567). #264-#567 come from review passes by
+(the highest so far is #570). #264-#570 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -761,6 +761,24 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Templates: an entity template of a carrier stores its maps' terrain, zones and map vars.
   - Scenarios: save and stamp a ship with one deck and two crew; stamp it twice (minted map and zone names); a ship whose deck holds a boat carrying a map of its own; a stamp over the cell limit refused whole; a ship template spawned twice; a rotated stamp.
   - Open question: whether a carrier template also stores the units on its maps; recommended: terrain only for templates (a ship design), units for prefabs (a crewed ship).
+- **#568 Formula index.** One analysis layer that parses every stored formula once and answers questions about all of them: where a thing is used, what a rename must touch, what a delete would break.
+  - Today: only function calls are checked when a formula is stored (`validate_formula` / `validate_program`); a name in quotes (status, table, zone, template, event, a function name passed to `map_with`) is plain text until the formula runs. After a rename, `_mentions_note` searches each slot for the exact text `'old'` or `"old"` and lists up to 8 hits in a ⚠️, leaving the formulas as written. Probe: after `!status rename burn scorch`, a passive doing `status_apply(self, 'burn')` was listed and now applies an undefined status; a passive building the name (`'bu' + 'rn'`) was missed without notice; `say('burn')` would be a false hit. `!func del` deletes a function its callers still use, silently (only `!system lint` reports it later). Lint finds unknown functions by pattern-matching the compiler's error text (`_system_lint`); a prefab save finds used functions with a regex for `name(` (`prefab._used_funcs`).
+  - Design: an index over every formula slot of a match and of its system. Per distinct formula text it keeps the parse tree and what the formula references: var paths read and written (per unit expression), functions called, and names in known argument positions (statuses, tables, zones, definitions, templates, events, tags); each formula function's signature says which argument is which kind of name. A derived cache in the style of the spatial index: never saved, marked dirty per slot at the store chokepoints (`write_var`, the status / tile / zone writers, the library editors), rebuilt lazily, reset by `_rollback_match` and an undo restore, and compared with a fresh build under `FCS_SPATIAL_CHECK=1`. Queries carry a scope: this match, its system's libraries, the server's templates and prefabs.
+  - Pitfalls the build must handle:
+    - Slot coverage: `_match_formula_slots` was written for lint; the complete list is the formula-text leak probe's (§5), adding modifier value / condition, mount slot condition / cost, colour formulas, `__death_condition`, schedule bodies, formula rules, macros, aliases, templates, prefabs. One shared slot registry for lint, the leak probe and the index, with a test planting a marker in every slot.
+    - Computed names: `status_apply(self, name_var)` can't be resolved; every query result states how many dynamic references it couldn't follow.
+    - Formulas inside formulas: `schedule(2, "...")`, `watch_add(...)`, `cmd('...')` carry a formula or a command as a string; the index recurses into them.
+    - Command text: macro and alias lines contain formulas with `$1` holes; indexed as text with holes, results from them marked less certain.
+    - `entity[name]`: whether `name` is a unit id, a local or a binding depends on the slot (§4); the index needs a table of the bindings each hook supplies, written once and drift-guarded.
+    - Rewrites keep the GM's text: edit the stored source by character spans from the tree, never regenerate text from the tree; spans are computed on the text as stored after `normalize_body_source`.
+    - Size: each distinct text parsed once; a thousand units from one template share their bodies.
+    - Copies: a match holds copies of its system's libraries; snapshots and the journal hold old text and stay untouched. A rename reports which scopes it changed and which still hold the old name.
+    - Privacy: queries are host tools; output in a team-view channel goes through `formula_text_visibility` and the var reader.
+  - Build order: the slot registry and the index, read-only; where-used (#203) on it, checked against `_mentions_note` on every rename in the scenario suite; delete warnings, then rewriting renames (#204, #492), then the lints (#279, #427, #524).
+  - Open question: whether a delete of something still used is refused or warned; a warning with the list and a `confirm` is recommended.
+- **#570 Custom resolution pipelines.** The damage pipeline's machinery for kinds the GM declares: a to-hit bonus, a movement cost, a morale check.
+  - Today: `damage.KINDS` holds two kinds, damage and healing. Each has a step library (`Match.damage_steps` / `healing_steps`, also system libraries), steps with side, order, filter and description (`normalize_step`, `ordered_steps`), the `step_` helpers reading `STEP_FRAME`, and `!damage explain`.
+  - (The entry arrived cut off at this point; the design, surface and open questions are still to come.)
 
 ## Suggested groupings
 
@@ -879,3 +897,8 @@ From the #552-#567 review (#555, #556, #563, #566 and #567 answer items in CLAUD
 - **Statuses:** #563
 - **Undo and identity:** #564, #566
 - **Performance:** #567
+
+From the #568-#570 review:
+
+- **Formula tooling (one index under #203, #204, #279, #427, #492, #524):** #568
+- **Resolution pipelines beyond damage and healing:** #570
