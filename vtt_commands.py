@@ -10692,7 +10692,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 prior == exp))
 
         return await ctx.send(
-            f"Unknown `!system alias` action `{action}`. "
+            f"❌ Unknown `!system alias` action `{action}`. "
             f"Use one of: def, del, list, info, promote."
         )
 
@@ -13246,7 +13246,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 n = int(args[3])
             except ValueError:
                 return await ctx.send(
-                    f"Push distance must be an integer, got '{args[3]}'."
+                    f"❌ Push distance must be an integer, got '{args[3]}'."
                 )
         try:
             steps, hook_log = m.push_entity(eid, args[2], n)
@@ -18569,7 +18569,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
 
         return await ctx.send(
-            f"Unknown undo scope '{scope}'. Use turn/round/command/to."
+            f"❌ Unknown undo scope '{scope}'. Use turn/round/command/to."
         )
 
     # ---- export ------------------------------------------------------
@@ -20750,7 +20750,7 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             n = int(tok)
         except ValueError:
             return await ctx.send(
-                f"Expected a number, `type=`, `who=`, `round=`, `by=`, "
+                f"❌ Expected a number, `type=`, `who=`, `round=`, `by=`, "
                 f"'clear', or 'format'; got '{tok}'."
             )
         if n < 1:

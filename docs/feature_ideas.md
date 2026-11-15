@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #570). #264-#570 come from review passes by
+(the highest so far is #590). #264-#590 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -390,6 +390,19 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#560 A list of valid targets.** `!action hero slash targets` lists who the action can be used on right now; today a player finds out by trying, each wrong try a refusal. It runs the checks before the body (status immunity, the action's target tag filters, `target_condition`) against every unit the channel's view shows and prints those that pass, with the refusal reason for the rest on request. No dice, no costs, nothing changes. Complements the single-target check (#238) and the area preview (#292).
 - **#561 Consistent delete verbs.** One verb per meaning across commands. While probing, `!zone del fire` answered "missing arguments": `!zone del` removes a data key and deleting the zone is `!zone drop`, while elsewhere the same act is `!ent remove`, `!alias del`, `!func del`, `!macro remove`, `!status drop`. `remove` deletes the thing everywhere, with `del`, `delete` and `drop` accepted through `_SUB_ALIASES`; deleting a data key becomes `unset` everywhere. Usage strings, help text and scenarios follow; the old meanings go (backwards compatibility is a non-goal, §1).
 - **#562 Refusals that point at the nearest form.** A usage refusal shows the one form the caller was closest to. Today `!zone def crate glyph C` was refused with the whole usage of `!zone def`, a dozen alternatives in one line. The stray-word check already tokenises every alternative; it scores them by the literal words typed (`glyph` here), shows the best one or two, and when reordering the typed words satisfies one, suggests it: "did you mean `!zone def glyph crate C`?". The full usage stays one `!help` away.
+- **#583 Refusals carry a marker.** A refusal is a kind of reply the engine knows about, whatever its text. Today `_ErrorWatchCtx` decides that a line failed by checking whether the reply starts with ❌ or ❓ Unknown command, so a handler that forgets the emoji silently defeats strict batches, `!simulate` failure counts and the harness (four such replies were found and fixed, scenario 1168). Handlers refuse through one call (`ctx.refuse(text)`, or raising VTTError, which many already do); it adds the ❌ and sets a flag on the context. Strict batches, `!simulate`, the scenario harness and `!why` (#485) read the flag; a check at import or in the regression lists any handler that still sends a hand-written ❌.
+- **#584 Forgiving command forms.** Places where a natural phrasing is refused today accept it, each probed on main:
+  - Count and direction in either order: `!ent move hero right 2` answered "Count must be followed by a direction", and `!ent push gob 2 right` failed the other way, the two verbs taking opposite orders. A number and a direction can't be confused, so both verbs take both orders.
+  - Passive options on either side of the formula: `!passive add hero p1 on_var_changed "1" target=hp` answered "Invalid passive formula: Syntax error", because options must come before the quoted formula.
+  - `;` in a macro: `!macro set m1 "a ; b ; c"` was saved as one line and failed at run time with a usage error about `;`. `!macro set` can split on `;` as `!batch` does.
+  - Bare list forms: `!ent status hero` answered "missing arguments"; it can list, as its list action does.
+  - Bare `!undo`: it prints the help page; it can mean `!undo command 1`, with the usual confirmation thresholds.
+- **#585 Replacing a container asks first.** A typed write that would destroy a container's contents says so before doing it. In a probe `!ent set_var hero inventory.potion.amount 2` then `!ent set_var hero inventory.potion 5` replaced the whole potion item with the number 5 and answered only "hero vars.inventory.potion = 5" (CLAUDE.md lists it as a known authoring trap). When `!ent set_var` / `set_vars` would replace a dict holding keys with a plain value (or delete it), the command refuses and names what would be lost ("inventory.potion holds 1 key: amount"), and `confirm` goes ahead. Formulas keep writing freely; this is for typed commands, where the mistake happens.
+- **#586 Lines that show the real change.** The damage and healing lines report what happened to the unit, with the surplus marked. Today a unit at 21/30 hp healed for 50 printed "💚 Ogre receives 50 healing" and logged "received 50 healing" while its hp rose by 9; a 10-hp unit hit for 100 printed "takes 100 damage". The record holds both numbers (`healing_received: 50`, `healing_gained: 9`); the default lines print only the first. Two summary placeholders, `{effective}` (what the pools really changed by) and `{surplus}` (overkill or overheal), and new default formats: "takes 10 damage (90 overkill)", "gains 9 hp (41 over)". The event-log lines follow; a GM who prefers the offered amount keeps `{amounts}`.
+- **#587 Destroyed parts say so.** A destroyed body part is marked wherever players read parts. After an arm was destroyed, `!part list` (a host tool) said "DESTROYED", while the player-facing `!ent info ogre` listed "Arm (arm): HP 0/5" like any other part. The part line format gets a `{state}` placeholder and a `{?destroyed?}…{/?}` conditional, used by the default `entity_description_part_format`; the roster's part suffix gets the same placeholder.
+- **#588 Failures inside a batch or macro name their line.** When one line of several fails, the reply says which. Today a three-line macro whose second line failed printed "Damaged hero by 1. / ❌ Entity 'nobody' not found. / Damaged hero by 1.", and in a forty-line setup macro matching an error to its line by eye is slow. A failed line's reply is prefixed with its position and text: "❌ line 2 (`!ent hp nobody -1`): Entity 'nobody' not found." Successful lines stay as they are. The same for `!batch`, `!foreach` (with the unit it was on) and `!run` (with the file's line number).
+- **#589 Arguments for `!run` files.** `!run setup.txt level=3 theme=ice` fills `$level` and `$theme` in the file. Today `!run <file>` takes a file name only, so one setup script on disk can't serve two encounters. The file's lines go through the macro substitution (`_macro_args`: positional, named, `${name:default}`) before they run; a `$name` with no argument given stays as written, as in macros, so `!foreach`'s `$id` keeps working inside a file.
+- **#590 Clone without coordinates.** `!ent clone hero hero2` puts the copy on the nearest free cell that fits its body; today it answers "missing arguments (got 2, needs 4)". With no cell given the copy lands as a dismount does: the free cell nearest the source's body, rings outward, the whole footprint fitting. `count=<n>` makes several the same way, all or nothing; `near=<radius>` bounds the search.
 
 ## Medium (a subsystem slice)
 
@@ -902,3 +915,9 @@ From the #568-#570 review:
 
 - **Formula tooling (one index under #203, #204, #279, #427, #492, #524):** #568
 - **Resolution pipelines beyond damage and healing:** #570
+
+From the #583-#590 review:
+
+- **Command wording and safety:** #583, #584, #585, #588, #590
+- **Lines players read:** #586, #587
+- **Scripts:** #589

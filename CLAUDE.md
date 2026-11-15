@@ -305,7 +305,10 @@ Each of these was learned from a shipped bug.
   `require_target_host`; a raw (un-shlexed) tail → `split_command_args`;
   `int()` on user input wrapped to a clean ❌; an optional slot that takes
   any word refuses a word that doesn't fit; a body-accepting command calls
-  `normalize_body_source`.
+  `normalize_body_source`; a refusal starts with ❌ (or raises VTTError):
+  `!batch strict` and `!simulate` tell a failed line by that marker, so a
+  refusal without it ran the next strict line (1168; idea #583 would make
+  the marker structural).
 - **A query that names or lists units:** run it through the POV helpers
   (`_query_eid`, `_pov_hides`) so a fogged player can't probe hidden units;
   that includes ids inside arguments (`near:<eid>` matched the visible units
@@ -1270,7 +1273,7 @@ hardcodes**.
   number with leading zeros or leading whitespace, which the formula
   engine refuses (L42). `exists(eid)` is true for any unit in the match (a
   destroyed body part too; a corpse is `has_corpse`), `is_alive(eid)`
-  follows `alive_condition` (1171).
+  follows `alive_condition` (1172).
 - **Commands:** `!ent` add / remove / rename / info / dump / diff / set_var /
   set_vars / delete_var / hp / init / tp / move / push / pull / swap / face /
   kill / revive / clone / copy / transfer / transform / revert / status /
@@ -1288,7 +1291,7 @@ hardcodes**.
   var reads as missing, and for a non-host `__` keys read as missing and
   leave subtrees. `!ent var_add <id> <path> <n>` / `var_move` / `var_copy
   <id> <path> <dest id> <dest path>` are the typed container helpers
-  (undo steps; a player's go to the approval queue) (1177).
+  (undo steps; a player's go to the approval queue) (1178).
 - **Container helpers** (the engine has no inventory concept): `var_add`,
   `var_move` (looting), `var_copy`, `var_sum_field`, `item_add` /
   `item_consume` (drops the container at 0; `amount_field` rule; `var_move`
@@ -1300,7 +1303,7 @@ hardcodes**.
   list budget, 887). keys / values / each / len / pick / shuffle /
   roll_table skip a partial template's `__template` marker
   (`formula._data_items`), as var_keys skips every `__` key. Dict helpers
-  (pure, each returning a new dict, 1173): `merge(a, b, ...)` (shallow,
+  (pure, each returning a new dict, 1174): `merge(a, b, ...)` (shallow,
   later wins), `items(d)` (loopable [key, value] pairs), `with_key(d, k,
   v)`, `without_key(d, k)`. Authoring notes: in an item's action `source.<path>` is
   the ITEM's container and `entity[self]` the HOLDER; dict keys are unique, so
@@ -1704,8 +1707,8 @@ hardcodes**.
   Order (`Match.status_tick_order`): highest `tick_priority` first
   (`status_field`, so an instance key or a level entry sets it; `!status
   tick_priority <name> <n|->`), ties in the order the unit gained them
-  (1175).
-- **Round lines and initiative rolls** (1174): `match_start_message_format`
+  (1176).
+- **Round lines and initiative rolls** (1175): `match_start_message_format`
   prints before the first round (`next_turn`'s first turn; ATB's first
   turn), `round_end_message_format` at each wrap before the on_round_end
   hooks (`logic.round_message_line`; both empty by default).
@@ -2151,7 +2154,7 @@ hardcodes**.
   those runs; `reactions=pass` closes each such window after the step as
   if its units had passed (`_sim_pass_windows`, at most
   `_SIM_WINDOW_PASSES` per step), with a note. Units in auto mode react
-  either way, and a batch or macro can answer with `!react` lines (1168). A run
+  either way, and a batch or macro can answer with `!react` lines (1169). A run
   puts back only the matches it reached (`logic.MATCHES_TOUCHED`:
   `MatchManager.get`, `copy_entity`, `require_target_host`) plus any
   deleted or replaced; every match goes back once at the end (X16).
@@ -2467,7 +2470,7 @@ hardcodes**.
   has_los, the line searches; 935). Builders are clipped to the map
   and charged to `formula_cell_limit` (`!map preview` under
   `void_under_fog fog` marks and counts a void the view can't see like
-  the fog around it, V24, 1146). Cell sets (pure, 1172): `cells_union`
+  the fog around it, V24, 1146). Cell sets (pure, 1173): `cells_union`
   (each cell once, first met first), `cells_minus(a, *others)`,
   `cells_intersect(a, *others)` (a cell naming its map is its own cell);
   `cell_toward(x, y, dir, n=1)` (pure); `cell_behind(target, origin)`
@@ -3250,7 +3253,7 @@ hardcodes**.
 - **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
   `match_var_del`; `default_match_vars` (MERGE rule, `!defvar match
   add|remove|list`, `logic.fill_default_vars`) fills a NEW match's missing
-  vars (1176). **Groups:** `!ent group`, `group:<name>` selectors and
+  vars (1177). **Groups:** `!ent group`, `group:<name>` selectors and
   group moves.
 - **Attribution:** each command snapshot records who ran it
   (`Snapshot.by`) and each event-log entry its command's author
@@ -3369,7 +3372,7 @@ hardcodes**.
   export's own number replaced the match's snapshot of that number).
   `!history note <text|->` labels the newest snapshot (`Snapshot.note`,
   saved in the history index, one line of at most `HISTORY_NOTE_MAX`);
-  `!history list` and the undo previews show it (1176).
+  `!history list` and the undo previews show it (1177).
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -3383,7 +3386,7 @@ hardcodes**.
   unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`;
   `roll_dice(spec, all=False)` (the kept dice as a list, every die rolled
   with `all=True`, flat modifiers left out; `roll_detail(dice_out=)`) and
-  `chance(percent)` (1171). All use
+  `chance(percent)` (1172). All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
   `random_seed` rule when set, else the match's own `rng_seed` (made at
   creation, fresh for a clone), counting the 32-bit words drawn
@@ -4168,7 +4171,7 @@ lists what isn't built; 1093-1122).
   a watcher's effect) closes it, and the pending action resolves in that
   command (user call; `reactions.close_unanswered`, called after the
   handler in `_run_body` and `dispatch_no_snapshot` and after a watcher
-  poll that fired, never for a read or inside an action body; 1169).
+  poll that fired, never for a read or inside an action body; 1170).
   Expiry (`settle_expiry`, at the start of the next command on the match
   but `!as`) journals the command as state; `!as wait` ages windows.
 - **Resolution** (`_advance`, phases before -> before_run -> body ->
@@ -4196,7 +4199,7 @@ lists what isn't built; 1093-1122).
   (not a fail()) fails that step like a fail(): the `run()` closures
   turn the VTTError into a failed result. Left to propagate, the exchange
   stayed at that step with its window open and nobody to answer, and
-  every `!react skip` ran the broken formula again (1170).
+  every `!react skip` ran the broken formula again (1171).
 - **`reactions_used(eid, since='own_turn', tag=None)`** (ARG_SAFE):
   own_turn / round (refused under ATB) / turn / action (`reaction_seq`) /
   ever.

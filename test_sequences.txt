@@ -42145,7 +42145,41 @@ before it (hero stays 29; it used to skip the typo and run the lines
 after it); a plain batch still goes on past one (hero 28, ogre 29).
 
 
-SCENARIO 1168 — !simulate says when its runs stopped at a reaction window
+SCENARIO 1168 — Refusals that lacked their ❌ stop a strict batch
+------------------------------------------------------------------
+!match new rf RF 8 6
+!match use rf
+!ent add hero Hero 30 2 2 3
+!ent add gob Goblin 10 5 2 2
+!batch strict !ent push gob 2 right ; !ent hp hero -1
+?? ❌ Push distance must be an integer, got 'right'.
+?? ⏹ strict batch stopped at line 1
+!assert "entity[hero].hp == 30"
+!batch strict !undo sideways ; !ent hp hero -1
+?? ❌ Unknown undo scope 'sideways'.
+?? ⏹ strict batch stopped at line 1
+!assert "entity[hero].hp == 30"
+!batch strict !log nonsense ; !ent hp hero -1
+?? ❌ Expected a number
+?? ⏹ strict batch stopped at line 1
+!assert "entity[hero].hp == 30"
+!simulate 2 !batch !ent push gob 2 right ; !ent hp hero -1
+?? ❗ 2 run(s) had a ❌ / ❓ reply
+!ent push gob right 2
+?? Pushed
+!assert "entity[gob].x == 7"
+
+Expected: HARNESS-ALLOWS-ERRORS. Refusals sent without their ❌: `!ent
+push` with a word where the distance goes, an unknown undo scope and an
+unknown `!log` option (and an unknown `!system alias` action, which the
+usage check refuses first when typed). A strict batch recognises a failed
+line by that marker, so it ran the next line anyway (hero lost 1 hp after
+the refused push), and `!simulate` counted the runs as clean. Each now
+starts with ❌: the strict batch stops at line 1 and hero keeps 30 hp, and
+a simulated batch counts both runs as failed. The push in its own order
+still works (gob 5 -> 7).
+
+SCENARIO 1169 — !simulate says when its runs stopped at a reaction window
 ---------------------------------------------------------------------------
 !match new sw SW 10 6
 !match use sw
@@ -42208,7 +42242,7 @@ dropped out (it blamed an unbound 'self' / 'this' / 'current'). The
 failed body changes nothing and the exchange is over.
 
 
-SCENARIO 1169 — A reaction window nobody is left to answer closes in the command that left it so
+SCENARIO 1170 — A reaction window nobody is left to answer closes in the command that left it so
 --------------------------------------------------------------------------------------------------
 !match new nw NW 12 8
 !match use nw
@@ -42273,7 +42307,7 @@ the window is open again; a watcher whose effect kills the ogre closes it
 at the end of the command that fired it.
 
 
-SCENARIO 1170 — A reaction formula that errors fails its step; the exchange goes on
+SCENARIO 1171 — A reaction formula that errors fails its step; the exchange goes on
 --------------------------------------------------------------------------------------
 !match new fe FE 10 6
 !match use fe
@@ -42315,7 +42349,7 @@ and nobody to answer, `!turn next` and `!action` were held, and every
 `!react skip` ran the broken formula again; only an undo or fixing the
 formula got the match out.
 
-SCENARIO 1171 — chance, roll_dice, exists and is_alive in an action, a 2x2 unit with a body part, and in $()
+SCENARIO 1172 — chance, roll_dice, exists and is_alive in an action, a 2x2 unit with a body part, and in $()
 -----------------------------------------------------------------------------------------------------------
 
 !match new fh FH 10 8
@@ -42366,7 +42400,7 @@ changing it, so they work in `$()`, where a mutator (var_add) is
 refused and nothing is written. Bad arguments are refused with the
 function's name.
 
-SCENARIO 1172 — Cell sets and directions: a minimum-range attack and a knockback behind a 2x2 body
+SCENARIO 1173 — Cell sets and directions: a minimum-range attack and a knockback behind a 2x2 body
 ---------------------------------------------------------------------------------------------------
 
 !match new cs CS 12 8
@@ -42415,7 +42449,7 @@ target onto that cell (the imp, 3,4 -> 4,4), and fails when the cell is
 off the map (the imp against the map's edge stays at x 12). Bad arguments are
 refused.
 
-SCENARIO 1173 — Dict helpers: merge, items, with_key, without_key build a loot table in an action
+SCENARIO 1174 — Dict helpers: merge, items, with_key, without_key build a loot table in an action
 -------------------------------------------------------------------------------------------------
 
 !match new dh DH 8 6
@@ -42448,7 +42482,7 @@ of the chest. merge lets a later dict win a key and replaces a nested
 dict whole; the dicts passed in are left as they were. A list or a
 non-text key is refused.
 
-SCENARIO 1174 — Round lines, `!turn roll` and initiative rerolled each round
+SCENARIO 1175 — Round lines, `!turn roll` and initiative rerolled each round
 ---------------------------------------------------------------------------
 
 !match new ir IR 10 6
@@ -42503,7 +42537,7 @@ initiative_reroll_each_round on, the first `!turn next` prints the
 match-start line and rolls every unit 1d20 before round 1; each round
 end prints the round-end line. With the rule off nothing rerolls.
 
-SCENARIO 1175 — tick_priority: regeneration ticks before poison whatever came first
+SCENARIO 1176 — tick_priority: regeneration ticks before poison whatever came first
 -----------------------------------------------------------------------------------
 
 !match new tp TP 8 6
@@ -42548,7 +42582,7 @@ ticks first (`RP`). A level entry sets its own (`2+` at -5), so at level
 definition are refused, `-` clears the field, and a system's status
 definitions take it too.
 
-SCENARIO 1176 — `!history note` labels the latest snapshot; `!defvar match` fills a new match's vars
+SCENARIO 1177 — `!history note` labels the latest snapshot; `!defvar match` fills a new match's vars
 ---------------------------------------------------------------------------------------------------
 
 !match new hn HN 8 6
@@ -42597,7 +42631,7 @@ it. `!defvar match add` (the default_match_vars rule) fills the vars of a
 match created afterwards, dotted paths nesting; matches made earlier
 keep their vars, and a player can't edit the system's defaults.
 
-SCENARIO 1177 — `!ent get` reads one var as the channel may; `!ent var_add / var_move / var_copy`
+SCENARIO 1178 — `!ent get` reads one var as the channel may; `!ent var_add / var_move / var_copy`
 -------------------------------------------------------------------------------------------------
 
 !match new eg EG 8 6
@@ -42659,7 +42693,7 @@ number (or starts one), refuses a dict and a non-number; a move into
 its own subtree, a missing source and a reserved destination are
 refused. Each is an undo step.
 
-SCENARIO 1178 — `!map preview burst from=<eid>` measures from a 2x2 body
+SCENARIO 1179 — `!map preview burst from=<eid>` measures from a 2x2 body
 -----------------------------------------------------------------------
 
 !match new pv PV 10 8
