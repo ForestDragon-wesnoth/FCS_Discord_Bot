@@ -4333,7 +4333,7 @@ rejected already. Update this section in the PR that resolves an item.
   POV can't see) shows there. On hold at the user's request.
 - **Aura id reuse:** a suspended aura resumes around a later unit that takes
   the old anchor's id (§7.12). Distinguishing them needs an identity concept
-  beyond ids.
+  beyond ids (idea #566).
 - **Path-mode snake transfer:** segments overlap early in `path` mode, so
   transferring a fresh snake can fail with "cell occupied".
 - **Snake overlapping its own head:** the head passes through its own body
@@ -4347,7 +4347,7 @@ rejected already. Update this section in the PR that resolves an item.
   stored by name, so when the parent renames that entry (`!system status
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
-  limitation, left as is (user: note it).
+  limitation, left as is (user: note it); idea #555 proposes the fix.
 - **Corpse targets and immunity:** `corpse` / `corpse_list` action
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
@@ -4358,11 +4358,12 @@ rejected already. Update this section in the PR that resolves an item.
   level or duration and a counter set collapse a layered status to the
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
-  only that pair. A layer-aware version of each is open.
+  only that pair. A layer-aware version of each is open (idea #563).
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
-  tile, zone or corpse blocks it. Known issue (user: list it).
+  tile, zone or corpse blocks it. Known issue (user: list it); idea #556
+  proposes a rule.
 
 - **Large match state, what is left** (user: discuss later): the
   serialization caches, diff undo and diff journal entries (#197, §7.16)
@@ -4435,7 +4436,7 @@ hasn't named the next.
   L-shaped footprints and footprint rotation; per-rider footprints inside a
   vehicle, shared vehicle fuel / initiative, positional cover for riders;
   `trail` segment spacing > 1; more modifier context roles; elevation as a
-  rule; vision caching beyond one render; a targeting-fooling "deep illusion"
+  rule; vision caching beyond one render (idea #567); a targeting-fooling "deep illusion"
   disguise; a force / reflect status transfer.
 - **Not interested yet:** branching (tree-shaped) snake bodies.
 
