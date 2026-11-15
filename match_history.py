@@ -371,6 +371,8 @@ class Snapshot:
     # Who ran the command a command snapshot comes before ("" for the
     # automatic and manual ones, and for snapshots saved before it existed).
     by: str = ""
+    # A host's note on the snapshot (`!history note`), shown in listings.
+    note: str = ""
     # A diff snapshot (see state_diff): the sequence of the autosave before
     # it, which its diff applies to; None = a full state (a keyframe).
     base: Optional[int] = None
@@ -452,6 +454,8 @@ class Snapshot:
             "label": self.label,
             "by": self.by,
         }
+        if self.note:
+            d["note"] = self.note
         if self.base is not None:
             d["base"] = self.base
             d["depth"] = self.depth
@@ -472,6 +476,7 @@ class Snapshot:
             label=d.get("label", ""),
             path=path,
             by=str(d.get("by") or ""),
+            note=str(d.get("note") or ""),
             base=int(base) if isinstance(base, int)
             and not isinstance(base, bool) else None,
             depth=int(d.get("depth") or 0) if isinstance(base, int) else 0,
@@ -489,6 +494,7 @@ class Snapshot:
             "label": self.label,
             "by": self.by,
             "state": self.state,
+            **({"note": self.note} if self.note else {}),
         }
 
     @staticmethod
@@ -504,10 +510,17 @@ class Snapshot:
             label=d.get("label", ""),
             _state=d["state"],
             by=str(d.get("by") or ""),
+            note=str(d.get("note") or ""),
         )
 
     def short_summary(self) -> str:
-        """One-line description used in !history list output."""
+        """One-line description used in !history list output, the host's
+        note (`!history note`) after it."""
+        text = self.plain_summary()
+        return f"{text} — 📝 {self.note}" if self.note else text
+
+    def plain_summary(self) -> str:
+        """short_summary without the note."""
         who = f" ({self.active_entity_id}'s turn)" if self.active_entity_id else ""
         if self.kind == "round":
             return f"round-start of round {self.round_at_snapshot}"

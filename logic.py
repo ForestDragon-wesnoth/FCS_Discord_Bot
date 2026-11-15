@@ -2163,6 +2163,30 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "turnorder_var. Ignored entirely when team_grouping='none'."
         ),
     },
+    "initiative_roll_formula": {
+        "default": "",
+        "schema": {"type": "str", "formula": "expression"},
+        "desc": (
+            "The expression `!turn roll` (and initiative_reroll_each_round) "
+            "evaluates per unit for its new initiative (the var "
+            "turnorder_var names), with self = the unit: `roll('1d20') + "
+            "entity[self].dex`. A result that isn't a whole number, or a "
+            "formula that fails, leaves that unit's initiative as it was, "
+            "with a ⚠️. Empty (the default): `!turn roll` is refused and "
+            "nothing rerolls."
+        ),
+    },
+    "initiative_reroll_each_round": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "When on, every unit in the turn order rolls a new initiative "
+            "from initiative_roll_formula as each round starts (round 1 "
+            "included), before the round's order is sorted, so the round "
+            "runs in the new order. Under ATB, which has no rounds, nothing "
+            "rerolls."
+        ),
+    },
     "turnorder_tiebreak_var": {
         "default": "",
         "schema": {"type": "str"},
@@ -4274,6 +4298,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "map lists units in turn order as before."
         ),
     },
+    "default_match_vars": {
+        "default": {},
+        "schema": {"type": "dict"},
+        "desc": (
+            "Map of var-path -> default value given to every new match's "
+            "match vars (`!match new`), filling only vars it lacks: a "
+            "campaign's day counter, weather or score lives here. Merged "
+            "entry by entry down a system chain. Edit via `!defvar match "
+            "add/remove/list`; matches made earlier keep their vars."
+        ),
+    },
     "default_map_vars": {
         "default": {},
         "schema": {"type": "dict"},
@@ -5672,6 +5707,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "{match.<path>} (a match var, e.g. {match.weather}; a missing "
             "var renders empty). Empty = no line. Not used under ATB, which "
             "has no rounds."
+        ),
+    },
+    "round_end_message_format": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line `!turn next` prints when a round ends, ahead of the "
+            "round-end hook output and the next round's line. Placeholders "
+            "as round_start_message_format: {round} (the round ending), "
+            "{match}, {match.<path>}. Empty (the default) = no line. Not "
+            "used under ATB, which has no rounds."
+        ),
+    },
+    "match_start_message_format": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line the match's first `!turn next` prints, ahead of round "
+            "1's line (under ATB, ahead of the first turn). Placeholders as "
+            "round_start_message_format: {round}, {match}, {match.<path>}. "
+            "Empty (the default) = no line."
         ),
     },
     "command_attribution": {
@@ -9046,7 +9102,7 @@ def check_formula_function(name: Any, params: List[Any]) -> None:
 # GameSystem.removed under the same names.
 MERGE_RULES: Dict[str, Optional[str]] = {
     "command_access": None, "default_entity_vars": None,
-    "default_map_vars": None,
+    "default_map_vars": None, "default_match_vars": None,
     "event_log_format": None, "default_clamps": "path",
     "default_entity_passives": "id",
 }
@@ -11402,6 +11458,26 @@ class CorpseIndex:
 def _corpse_cell(corpse: Any) -> Tuple[int, int]:
     """A corpse record's anchor cell (its `x` / `y`)."""
     return int(corpse["x"]), int(corpse["y"])
+
+
+def fill_default_vars(target: Dict[str, Any], defaults: Any) -> None:
+    """Fill `target` (a map's or a match's vars) with the var-path ->
+    value pairs of a default_*_vars rule it lacks, nesting dotted paths
+    and leaving a value already there (or a non-dict on the way) alone."""
+    for path, value in (defaults or {}).items():
+        cur: Any = target
+        parts = str(path).split(".")
+        ok = True
+        for key in parts[:-1]:
+            nxt = cur.get(key) if isinstance(cur, dict) else None
+            if nxt is None:
+                nxt = cur.setdefault(key, {}) if isinstance(cur, dict) else None
+            if not isinstance(nxt, dict):
+                ok = False
+                break
+            cur = nxt
+        if ok and isinstance(cur, dict) and parts[-1] not in cur:
+            cur[parts[-1]] = _own_value(value)
 
 
 @dataclass
@@ -14731,20 +14807,12 @@ class Match:
         for rule in MAP_VAR_NAME_RULES:
             mp.var_names[rule] = str(self.rules.get(
                 rule, RULES_REGISTRY[rule]["default"]))
-        for path, value in (self.rules.get("default_map_vars") or {}).items():
-            cur: Any = mp.vars
-            parts = str(path).split(".")
-            ok = True
-            for key in parts[:-1]:
-                nxt = cur.get(key) if isinstance(cur, dict) else None
-                if nxt is None:
-                    nxt = cur.setdefault(key, {}) if isinstance(cur, dict) else None
-                if not isinstance(nxt, dict):
-                    ok = False
-                    break
-                cur = nxt
-            if ok and isinstance(cur, dict) and parts[-1] not in cur:
-                cur[parts[-1]] = _own_value(value)
+        fill_default_vars(mp.vars, self.rules.get("default_map_vars"))
+
+    def fill_default_match_vars(self) -> None:
+        """Fill the match vars the default_match_vars rule gives that the
+        match lacks (a new match, #328)."""
+        fill_default_vars(self.vars, self.rules.get("default_match_vars"))
 
     def _map_var_moves(self, mp: "Map", rules: Dict[str, Any]
                        ) -> List[Tuple[str, str]]:
@@ -21003,9 +21071,14 @@ class Match:
         # First-ever next_turn call: begin round 1 without advancing.
         if not self.round_started:
             self.round_started = True
-            line = self.round_start_line()
-            if line:
-                log.append(line)
+            if self.rules.get("initiative_reroll_each_round"):
+                log.extend(self._round_initiative_reroll())
+                # Round 1 starts at the top of the rolled order.
+                self.active_index = 0
+            for line in (self.round_message_line("match_start_message_format"),
+                         self.round_start_line()):
+                if line:
+                    log.append(line)
             log.extend(self.fire_hook(
                 "on_round_start",
                 own_only_targets=self._attached_tick_parts(list(self.turn_order))))
@@ -21691,6 +21764,10 @@ class Match:
         # its action surface (act=not _atb_last_skipped).
         vacated, self.turn_vacated = self.turn_vacated, None
         was_started = self.round_started
+        if not was_started:
+            line = self.round_message_line("match_start_message_format")
+            if line:
+                log.append(line)
         if self.extra_turn is not None:
             self._end_extra_turn(log)
         elif (self.round_started and not vacated
@@ -21776,6 +21853,9 @@ class Match:
                 return
             new_index, wrapped = 0, True
         if wrapped:
+            line = self.round_message_line("round_end_message_format")
+            if line:
+                log.append(line)
             log.extend(self.fire_hook(
                 "on_round_end",
                 own_only_targets=self._attached_tick_parts(list(self.turn_order))))
@@ -21786,6 +21866,7 @@ class Match:
         if wrapped:
             self.round_acted = []
             self.round_number += 1
+            log.extend(self._round_initiative_reroll())
             # Flush any deferred turn-order rebuild between on_round_end
             # (ran against the OLD order) and on_round_start (sees the
             # NEW order), with the new round's number: random_stable ties
@@ -21811,16 +21892,73 @@ class Match:
 
     _ROUND_FMT_RE = re.compile(r"\{(round|match)(?:\.([\w.]+))?\}")
 
+    def roll_initiative(self, ids: List[str]
+                        ) -> Tuple[List[Tuple[str, Any, Any]], List[str]]:
+        """Roll a new initiative for each unit of `ids` from the
+        initiative_roll_formula rule (#59), self = the unit, written to the
+        turnorder_var var (write_var: hooks fire, the order re-sorts per the
+        change policy). Returns ([(id, old, new)], log); a unit whose formula
+        fails or gives no whole number keeps its value, with a ⚠️ line about
+        it. Raises when the rule is empty."""
+        src = str(self.rules.get("initiative_roll_formula", "") or "").strip()
+        if not src:
+            raise VTTError("Set the initiative_roll_formula rule first "
+                           "(`!system set <system> initiative_roll_formula "
+                           "\"roll('1d20')\"`).")
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        var = str(self.rules.get("turnorder_var", "initiative"))
+        engine = FormulaEngine(self)
+        done: List[Tuple[str, Any, Any]] = []
+        log: List[str] = []
+        for eid in ids:
+            e = self.entities.get(eid)
+            if e is None:
+                continue
+            old = e.vars.get(var)
+            try:
+                val = engine.eval_expression(
+                    src, EvalCtx(this=self.current_entity_id(), target=eid))
+                if isinstance(val, bool) or not isinstance(val, (int, float)) \
+                        or not math.isfinite(val) or val != int(val):
+                    raise VTTError(f"gave {val!r}, not a whole number")
+                log.extend(e.write_var(var, int(val)))
+            except (FormulaError, VTTError) as ex:
+                log.extend(self.tag_lines(self.unit_tag(eid), [
+                    f"⚠️ initiative roll for `{eid}`: {ex} (kept {old!r})."]))
+                continue
+            if eid in self.entities:
+                done.append((eid, old, self.entities[eid].vars.get(var)))
+        return done, log
+
+    def _round_initiative_reroll(self) -> List[str]:
+        """initiative_reroll_each_round (#124): every unit in the turn order
+        rolls at the round's start, then the order is sorted once."""
+        if not self.rules.get("initiative_reroll_each_round") or \
+                not str(self.rules.get("initiative_roll_formula", "")
+                        or "").strip():
+            return []
+        _done, log = self.roll_initiative(list(self.turn_order))
+        self._rebuild_turn_order(full=True)
+        return log
+
     def round_start_line(self) -> str:
         """The round_start_message_format line for the round that is
         starting now ("" when the rule is empty)."""
-        fmt = str(self.rules.get("round_start_message_format", "") or "")
+        return self.round_message_line("round_start_message_format")
+
+    def round_message_line(self, rule: str,
+                           round_number: Optional[int] = None) -> str:
+        """The line of a round message rule (round_start_ / round_end_ /
+        match_start_message_format), {round} being `round_number` (default
+        the match's round); "" when the rule is empty."""
+        fmt = str(self.rules.get(rule, "") or "")
         if not fmt:
             return ""
+        number = self.round_number if round_number is None else round_number
 
         def sub(mo):
             if mo.group(1) == "round":
-                return str(self.round_number) if mo.group(2) is None else mo.group(0)
+                return str(number) if mo.group(2) is None else mo.group(0)
             if mo.group(2) is None:
                 return self.name
             cur: Any = self.vars
@@ -22782,6 +22920,18 @@ class Match:
 
     # ---- action restrictions (#234) ------------------------------------
 
+    def status_tick_order(self, e: "Entity") -> List[str]:
+        """The unit's status names in the order they tick: highest
+        `tick_priority` first (its instance, definition or level entry,
+        status_field; 0 when none is a number), ties in the order the unit
+        gained them (#266)."""
+        def prio(sname: str) -> float:
+            v = self.status_field(e.status.get(sname), sname, "tick_priority")
+            return float(v) if isinstance(v, (int, float)) \
+                and not isinstance(v, bool) and math.isfinite(v) else 0.0
+        names = list(e.status.keys())
+        return sorted(names, key=lambda n: -prio(n))
+
     def status_field(self, inst: Any, sname: str, key: str) -> Any:
         """Status `sname`'s `key`: the instance's own value when the
         instance holds the key (it replaces the definition's), else the
@@ -23716,8 +23866,8 @@ class Match:
             if e is None:
                 continue
             # Snapshot status names so status_remove during the tick
-            # doesn't break iteration.
-            for sname in list(e.status.keys()):
+            # doesn't break iteration; highest tick_priority first (#266).
+            for sname in self.status_tick_order(e):
                 if extra and sname in e.status and \
                         not self._ticks_on_extra_turn(e.status[sname], sname):
                     continue
@@ -32925,6 +33075,7 @@ class MatchManager:
         for mp in m.maps.values():
             m.fill_default_map_vars(mp)
         m.sync_map_var_names()
+        m.fill_default_match_vars()
         # Seed the per-match auto-legend toggle from the system default
         # (then match state, flipped via `!map legend on|off`).
         m.map_legend_enabled = bool(rules.get("map_legend_by_default", False))
