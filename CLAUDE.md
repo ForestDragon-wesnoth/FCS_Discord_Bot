@@ -160,8 +160,11 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   mismatch or a duplicate number). Only lines ABOVE a scenario's first
   `Expected:` run: a staged scenario labels intermediate prose `Result:`
   (see 13, 26). Multi-line bodies use literal `\n` (`_interpret_escapes`).
-- **What it flags.** `💥` (except the `💥 Unexpected error (ref N)` reply of
-  `!as crash`, the error log's test hook) and "Syntax error" always; `❌ Runtime error:`,
+- **What it flags.** A crash line (`💥 Unexpected error`, a hook's `💥 ...
+  CRASHED`, the harness's own `💥 Uncaught` / `💥 shlex parse error` /
+  `💥 ?file`; game text may hold 💥; the `💥 Unexpected error (ref N)` reply
+  of `!as crash`, the error log's test hook, excepted) and "Syntax error"
+  always; `❌ Runtime error:`,
   `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command"),
   missing arguments ("is missing arguments"), a usage refusal (`❌ Usage:`)
   and stray words ("❌ Unexpected ... — usage:") unless the prose carries
@@ -1062,7 +1065,8 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   rules, system libraries, templates, prefabs, aliases); every root x
   read subcommand x an argument pool run as a player under
   `formula_text_visibility host`; any marker in a reply is a leak (alias
-  expansions excepted, by design).
+  expansions excepted, by design). Include paths one key below a formula
+  (a modifier record's `value`, a hook name) and `!find` selectors.
 - **Existence-oracle detector** (41): the same board; each command run twice
   as the player, once naming a hidden unit (as an arg, `near:<id>:60`,
   `for=<id>`, `to=<id>`, `<id>.hp`) and once naming a nonexistent id; any
@@ -1301,6 +1305,9 @@ hardcodes**.
   without an initiative is named in the reply as outside the turn order,
   and `!turn next` on an empty order names the units outside it and the
   ways in (`_no_turn_order_text`; #434, #538, 1192).
+  A `group:<name>` form runs per member, a member's refusal a ⚠️ line;
+  when every member refuses it ends with a ❌ line, so a strict batch
+  stops (L55).
   `!ent hp` SETS by default (`5`, `=-3`, `max`, `$(...)`);
   a leading sign changes (`+5` heals, `-5` damages); one `write_var`, hook
   output and deaths reported (633-634, 647). `!ent set_vars <id> k=v ...` is
@@ -1630,7 +1637,10 @@ hardcodes**.
   frozen order (pointer forward, then units `!turn set` jumped over),
   then each later round (`_sorted_turn_ids(round)` where the wrap would
   re-sort: a pending change, or `random_stable`, re-sorted per round).
-  Default length: to the end of the next round (round 1 before the first
+  Queued extra turns follow the turn under way, or before the first turn
+  the first unit no skips_turn status passes over; a unit the round rests
+  on (every unit skippable) is listed again in its round, as the next
+  `!turn next` skips it again (L54). Default length: to the end of the next round (round 1 before the first
   turn); at most the owner limit `turn_forecast_limit` (100). The rest of
   the round is read in one pass over the order and stops at n (X24: a
   scan from the top per turn cost the order's length squared). Under ATB
@@ -2016,7 +2026,8 @@ hardcodes**.
   `action_used_message_format` line (`Match.action_used_line`: {actor},
   {action}, {target} as the checks left it, a cell as (x,y), lists joined;
   {actor_name} / {target_name} as say() markers, so a view reads names
-  as it sees each unit; the actor's own placeholders; empty = no line;
+  as it sees each unit (the default uses these, V25); the actor's own
+  placeholders; empty = no line;
   1148; an exchange stores a cell as [x, y, map, named] and reads it back
   with `target_from_json` for the line, 1153).
 - **`run_action`** is transactional: pre-state captured, body run,
@@ -2500,7 +2511,9 @@ hardcodes**.
   square_radius (Chebyshev, default) / manhattan / euclidean — an unknown
   metric is refused. `entities_within`, `nearest_entity` (relation SECOND),
   `entities_in_area/cone/rect/zone`, `cells_in_*`, `chain_targets` (relation
-  judged against the ORIGIN), `entity_distance`, `nearest_cell`,
+  judged against the ORIGIN; every candidate a link examines is a step of
+  formula_loop_limit, and with a max_jump each link reads only the units
+  the cell index finds near the last, X26), `entity_distance`, `nearest_cell`,
   `free_cell_near`, `random_cell`, `random_free_cell(..., fit=body|center|any|
   anchor)`, `entities_at`, `cell_entity`, `grid_width/height`, `in_bounds`;
   `entities_in_cells(cells, relation=None, tag=None, of=None)` (the units
@@ -3124,7 +3137,11 @@ hardcodes**.
   `diff`, a history diff, `rule_get` in `$()`), the raw reads (`!ent
   dump`, `!find ... show:`, `!team get`, `!defvar list`, `!map cell`,
   `!mount info`, match / map var lists; `_hide_formula_at` for one value,
-  a modifier record's `value` included), the history list (a formula
+  a modifier record's `value` included; a path is judged inside its
+  parents, so `modifiers.m1.value` and `gear.hooks.on_x` read hidden like
+  their parent, V26), `!find` selectors, `sort:` and aggregates (a
+  formula text hidden from the caller reads as missing; `show:` prints it
+  `(hidden)`), the history list (a formula
   command's label cut after its subcommand, `logic.formula_label`) and
   an action's or modifier's formula error. A `$()` argument still reads
   any stored value; `inline_args_access host` closes it. Alias
@@ -3139,7 +3156,9 @@ hardcodes**.
 
 - **ASCII** (`render_ascii` → `_render_ascii_impl`): layers zones and
   tiles by draw layer (§7.12; by default zones under tiles) < units < fog; glyphs (`glyphs.<facing>` > `glyph` > facing arrow; one
-  character), colours (`color` var — a palette name or a formula with
+  character one column wide, `logic.glyph_problem`: an emoji or a CJK
+  character is two columns and is refused where a glyph is stored, Y8),
+  colours (`color` var — a palette name or a formula with
   self = the unit, falling through when it fails or isn't a palette name,
   shared by both renderers via `entity_color` (772) — > `team_colors` /
   a palette-named team;
@@ -4231,9 +4250,13 @@ lists what isn't built; 1093-1122).
   after_on, priority / before_priority / after_priority, self_trigger,
   reaction_on_cancel, auto_when, reactable; `cancels` detected from the before
   half's text, `detects_cancel`). A bool `condition` / `auto_when` (a
-  `set_var ... true`) reads as always / never. `reacts_on: any` without a
+  `set_var ... true`) reads as always / never; both read `source` (the
+  reaction's container, through `mount_routing`, as the halves do;
+  `eval_expression(attr_bindings=)`, Y7). `reacts_on: any` without a
   condition and an unparseable `reacts_to` are never offered (named in
-  `!action info`). A reaction without a body can't be used by `!action`.
+  `!action info`). A reaction without a body can't be used by `!action`
+  or use_action; it is refused before an exchange takes a number
+  (`reactions._body_less`), so the refusal changes nothing (L54).
   `UnitFlags.REACTIONS` indexes the units whose vars hold one; a rider is
   offered its seat's reactions (a vehicle isn't offered its seats').
 - **Exchanges** (dicts, JSON): `Match.reaction_stack` (the top is the
@@ -4277,8 +4300,16 @@ lists what isn't built; 1093-1122).
   its start with the RNG set back. A child window's options are those
   read when it opened (`units[uid].options`). Outside any action (a
   passive, a watcher, `!eval`) the action begins at once or waits in
-  the queue (`_queue_use`) and use_action gives None. `COMMAND_CTX`
-  (set in `_run_top`) gives such a formula its reply context.
+  the queue (`_queue_use`, at most `reaction_queue_limit` waiting, a
+  ceiling rule; past it use_action is refused with a line, X25) and
+  use_action gives None. `COMMAND_CTX` (set in `_run_top`) gives such a
+  formula its reply context. A nested action's own fail() in its
+  prepare or body prints `❌ action <name>: ...` once
+  (`reactions._fail_line`; the engine refusals use_action words itself
+  stay as they are, Y6). An exchange whose actor leaves for good
+  (`Entity.remove`, a transfer) is marked `actor_gone`: it doesn't
+  resolve, and the window names "a departed unit" (H2: a unit added
+  under the id answered with its own action).
 - **Windows:** `open_window` fixes the units (candidates in turn order,
   `__reaction_mode` / `reaction_mode` ask / auto / never; auto picks at
   once: a reaction with no target of its own, or one taking one unit,
@@ -4390,19 +4421,24 @@ in full: 1123-1139).
   then `on_damage_dealt` on the dealer (`on_healing_received` /
   `on_healing_given`), extras `hook_extras` (damage_taken / damage_lost
   per pool, components as dicts), firing on 0 too. The target's death
-  check is held (`_death_check_deferred_ids`, run_packet) through all of
-  it, the hooks' own writes to the target included, and runs ONCE after
+  check is held (`_death_check_deferred_ids`, run_packet around
+  `_packet`) from the first step through all of it, the steps' and the
+  hooks' own writes to the target included (L54: a step writing hp 0
+  killed at once), and runs ONCE after
   the hooks under `logic.PACKET_KILLER`, so on_death binds `killer`
   (`Match.packet_killer`: the target or its body); then a body part at 0
   hp is destroyed. So on a killing blow the hooks see the defender in
   the match at 0 hp, and one that heals it saves it (user call: on_damage
   passives often prevent a death); a hook that mustn't act on a lethal
-  hit tests the defender's hp (1139). Packets dealt from the hooks nest
+  hit tests the defender's hp (1139). A step that removes its defender
+  ends the packet (`skipped` "gone", a note). Packets dealt from the hooks nest
   `Match._damage_hook_depth` deep, past `damage_hook_recursion_limit`
   (16, ceiling) no hooks, one ⚠️ per chain.
 - **Body parts** (design §10.5): a packet on a part (also `damage_part`,
   `damage_spread`, which route through it) plans the share BEFORE writing
-  (`_plan_share`, so a bad knob refuses the hit): per component above 0,
+  (`_plan_share`, so a bad knob refuses the hit; worked in exact
+  fractions, H4): per component above 0 in a pool the part holds (a
+  dropped pool sends nothing and leaves the cap's base, H3),
   the part's `damage_to_main_percent` var (a number or a dict of tag
   filter -> percent with `default`) else
   `part_damage_to_main_percent_default`; healing: the part's
@@ -4427,7 +4463,8 @@ in full: 1123-1139).
   corpses strip it. A status tick's packet takes it as its default
   attacker.
 - **Forecast**: steps run, then `_rollback_match`, history rewind and the
-  RNG position put back; no writes, no records. In a `prepare`
+  RNG position put back; no writes, no records. The lines the steps and
+  their hooks print go to a throwaway buffer and log sink (H1). In a `prepare`
   (`reactions._prepare` sets `damage.PREPARE_FORECAST`) it records per
   target `damage_raw` / `damage_taken` (healing_raw / healing_received),
   summed, and the RNG position of the first one; `_new_exchange` puts them
