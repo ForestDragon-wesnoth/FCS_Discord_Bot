@@ -43383,3 +43383,276 @@ dotted path once their partial references are resolved: the scout's
 scout. It combines with the other filters. A player reads through the
 private-var rules, so a private var's path finds nothing for them. A
 malformed path is refused.
+
+
+SCENARIO 1195 — Reading a corpse: `!ent info`, `short` and `!ent get` (#535)
+-----------------------------------------------------------------------------
+
+!match new rc RC 10 10
+!match use rc
+!ent add hero Hero 30 4 4 9 team=blue
+!ent add ogre Ogre 40 5 5 5 team=red footprint_w=2 footprint_h=2 description="A hulking brute." gold=12 gm_note="carried the key"
+!part add ogre arm Arm 5 5
+!status def burn
+!status apply ogre burn 2
+!ent kill ogre
+!ent info ogre
+?? **Ogre** (`ogre`), dead
+?? *A hulking brute.*
+?? HP: 0/40   Position: (5,5)
+?? - burn (level 2)
+?? - gold: 12
+?? - Arm (`arm`): HP 5/5
+!ent info ogre short
+?? HP: 0/40
+!ent get ogre gold
+?? **Ogre (corpse)** `gold` = 12
+!system set default corpse_description_sections "header, data"
+!system set default corpse_description_header_format "{name} lies here (fell in round {died_round})"
+!ent info ogre
+?? Ogre lies here (fell in round
+?! burn
+?! Arm
+!system set default private_vars gm_note
+!as player pleb
+!as view blue
+!ent info ogre
+?? - gold: 12
+?! carried the key
+!ent get ogre gm_note
+?? ❌ `ogre` has no var at `gm_note` that this channel can read.
+!as host
+!system set default corpse_visibility_condition "corpse_team == pov_team"
+!as player pleb
+!ent info ogre
+?? ❌ Could not find a unit named `ogre`. Either it does not exist, or this channel currently does not have permission to view it.
+!ent info nobody
+?? ❌ Could not find a unit named `nobody`. Either it does not exist, or this channel currently does not have permission to view it.
+!as host
+!as view red
+!ent info ogre
+?? Ogre lies here
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!ent info` on a dead unit's id reads its corpse through
+corpse_description_sections (default header, vitals, statuses, data,
+parts): the header from corpse_description_header_format marks it dead,
+the other sections use the unit's formats over the snapshot (hp 0, the
+burn it died with, its vars, its arm). `short` gives the card and `!ent
+get` one var. The two rules reshape it (`{died_round}` among the
+placeholders). A player reads private vars as missing, and a corpse the
+channel's view can't see (corpse_visibility_condition) answers like a
+missing unit, word for word (the ogre lies in the blue hero's sight;
+the visibility condition hides it).
+
+
+SCENARIO 1196 — Writing a corpse's vars and looting it (#268)
+-------------------------------------------------------------
+
+!match new cw2 CW 10 10
+!match use cw2
+!ent add thief Thief 20 3 3 9 gold=0
+!ent add ogre Ogre 40 5 5 5 footprint_w=2 footprint_h=2 gold=12 bag.gem=1
+!ent kill ogre
+!gpassive add spy on_var_written "match_var_set('hooked', 1)"
+!ent set_var ogre gold 15
+?? Corpse `ogre` vars.gold = 15
+!ent set_var ogre note "smells of sulphur"
+!assert "corpse_var('ogre', 'gold') == 15 and corpse_var('ogre', 'note') == 'smells of sulphur'"
+!assert "not match_var_has('hooked')"
+!ent set_var ogre hp lots
+?? ❌ corpse `ogre`: vital var 'hp' must be a finite whole number
+!ent set_var ogre size_total 9
+?? is derived by the engine
+!ent set_var ogre footprint_w 9
+?? ❌ corpse `ogre`: (11,5) outside 10x10 (its body would cover it).
+!ent set_var ogre gold.coins 3
+?? not a dict
+!ent delete_var ogre hp
+?? ❌ corpse `ogre`: `hp` is a vital var and can't be deleted.
+!ent delete_var ogre note
+?? Deleted corpse `ogre` vars.note
+!ent delete_var ogre note
+?? ❌ Corpse `ogre` has no var at `note`.
+!ent var_move ogre gold thief loot
+?? Moved corpse `ogre` vars.gold to `thief` vars.loot.
+!assert "entity[thief].loot == 15 and not corpse_has('ogre', 'gold')"
+!ent set_var thief actions.pilfer.target corpse
+!ent set_var thief actions.pilfer.body "for k in keys(corpse_var(target, 'bag', {})):\n    var_move(target, 'bag.' + k, self, 'pack.' + k)\ncorpse_var_set(target, 'looted', true)"
+!action thief pilfer ogre
+!assert "entity[thief].pack.gem == 1 and corpse_var('ogre', 'looted') == True"
+!eval "corpse_var_set('ogre', 'x', 1)"
+?? reserved
+!eval "corpse_var_set('nobody', 'gold', 1)"
+?? No corpse with id 'nobody'
+!ent set_var ogre gold 4 bypass_clamp=yes
+?? ❌ Unknown option `bypass_clamp=` for `!ent set_var`
+!undo command
+!assert "not corpse_has('ogre', 'looted') and corpse_var('ogre', 'bag.gem') == 1"
+!ent revive ogre
+!assert "entity[ogre].hp == 40 and entity[ogre].bag.gem == 1 and not var_has('ogre', 'gold')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a corpse's vars take writes through `!ent set_var` /
+`delete_var`, `var_move` (either end) and corpse_var_set / corpse_var_del,
+with the store checks only: a vital stays a whole number and can't be
+deleted, the engine's derived size vars and the reserved paths are
+refused, a value can't nest under one, and a footprint that would reach
+off the map is refused. No var hook fires (the global on_var_written spy
+never ran) and no clamp applies. The thief's pilfer action loots the
+ogre's bag item by item and marks the corpse, one undo step: undoing it
+puts the gem back, and the revived ogre comes back with what the corpse
+held then (the gem, no gold). A corpse write takes no `bypass_clamp`.
+
+
+SCENARIO 1197 — Dragging a corpse: `!ent tp` and corpse_move (#329)
+-------------------------------------------------------------------
+
+!match new cm CM 10 10
+!match use cm
+!ent add hero Hero 20 2 2 9
+!ent add ogre Ogre 40 5 5 5 footprint_w=2 footprint_h=2
+!ent add rat Rat 3 8 8 1
+!ent kill ogre
+!ent kill rat
+!zone fill pit 7 1 8 2
+!zone hook add pit on_enter "match_var_set('trap', 1)"
+!ent tp ogre 7 1
+?? Moved the corpse of `ogre` to (7,1).
+!assert "corpse_cell('ogre') == [7, 1] and not match_var_has('trap')"
+!ent tp ogre 2 2
+?? Moved the corpse of `ogre` to (2,2).
+!ent tp ogre 10 10
+?? ❌ corpse `ogre`: (11,10) outside 10x10 (its body would cover it).
+!map void add 5 9
+!ent tp ogre 4 8
+?? ❌ corpse `ogre`: (5,9) is a void cell (its body would cover it).
+!eval "corpse_move('rat', [8, 1])"
+?? = `[8, 1]`
+!map new crypt 4 4
+!ent tp ogre 1 1 crypt
+?? Moved the corpse of `ogre` to (1,1) on map `crypt` (from `main`).
+!eval "corpse_cell('ogre')"
+?? [1, 1, 'crypt']
+!eval "corpse_move('ogre', 4, 4, map='crypt')"
+?? ❌ corpse_move: corpse `ogre`: (5,4) outside 4x4
+!eval "corpse_move('ogre', 3, 3, map='crypt')"
+?? = `[3, 3, 'crypt']`
+!undo command
+!eval "corpse_cell('ogre')"
+?? [1, 1, 'crypt']
+!ent revive ogre
+!assert "entity[ogre].map == 'crypt' and entity[ogre].x == 1 and footprint_width('ogre') == 2"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!ent tp` on a corpse's id drags it (its whole 2x2 body must
+lie on the map and off void cells; the hero standing at (2,2) doesn't
+stop it, as a corpse occupies no cell). Dragging it over the pit fires no
+hook (a known limitation). corpse_move takes a coordinate and map=; a
+fifth word (or map=) moves the corpse to another map. An undo takes a
+move back, and a revive stands the unit up where the corpse lies.
+
+
+SCENARIO 1198 — Corpse sweeps: `!find dead`, `!find all`, `!foreach dead` (#454)
+---------------------------------------------------------------------------------
+
+!match new cs CS 12 12
+!match use cs
+!ent add priest Priest 20 2 2 9 team=blue
+!ent add ogre Ogre 40 5 5 5 team=red footprint_w=2 footprint_h=2 gold=12 size_num=200
+!ent add gob1 Goblin 5 9 9 3 team=red gold=3
+!ent add gob2 Goblin 5 10 2 2 team=red
+!ent add squire Squire 10 3 6 4 team=blue
+!status def burn
+!status apply gob1 burn 1
+!ent group add pack gob1 gob2
+!ent kill ogre
+!ent kill gob1
+!ent kill squire
+!find dead
+?? **3 matches:**
+?? Ogre (`ogre`): HP: 0/40 X,Y: 5,5 (corpse)
+!find dead team=red show:gold sort:gold:desc
+?? - Ogre (`ogre`): HP: 0/40 X,Y: 5,5 (corpse)  [gold=12]
+?? - Goblin (`gob1`): HP: 0/5 X,Y: 9,9 (corpse)  [gold=3]
+!find dead status:burn ids
+?? gob1
+!find dead group:pack ids
+?? gob1
+!find dead near:priest:3 ids
+?? ogre
+?! squire
+!find dead near:priest:4 ids
+?? squire ogre
+!find dead within:7:7:1 ids
+?? ogre
+!find dead team=red sum:gold count
+?? **2** matches.
+?? sum `gold`: **15**
+!find all team=red ids
+?? gob2 ogre gob1
+!find dead action:smite
+?? ❌ `action:` doesn't apply to corpses
+!find dead team=green
+?? No corpses match.
+!foreach dead team=blue ; !ent revive $id
+?? Revived corpse `squire` as `squire`.
+!assert "is_alive('squire') and not exists('ogre')"
+!foreach dead ; !ent set_var $id looted true
+!assert "corpse_var('ogre', 'looted') == True and corpse_var('gob1', 'looted') == True"
+!foreach dead size:large+ ; !ent revive $id
+!assert "is_alive('ogre') and not is_alive('gob1')"
+!undo command
+!assert "not exists('ogre') and has_corpse('ogre')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a leading `dead` turns `!find` / `!foreach` to the corpses: the
+same selectors read each snapshot (its vars, the burn the goblin died
+with, the group it was in, its size category), `near:` and `within:`
+measure from every cell of a corpse's body (the 2x2 ogre corpse is 3 from
+the priest, the squire's 4, and the ogre's 1 from (7,7)), and `show:` / `sort:` / `sum:` / `ids` work
+as for units. `all` lists the units then the corpses. `action:` names
+nothing a corpse can do and is refused. A sweep over the dead revives
+the fallen blue squire, marks every corpse looted, and revives the large
+one; each sweep is one undo step.
+
+
+SCENARIO 1199 — Corpse sweeps through the channel's view and private vars (#454, #535)
+----------------------------------------------------------------------------------------
+
+!match new cv CV 10 10
+!match use cv
+!ent add scout Scout 10 2 2 9 team=blue
+!ent add orc Orc 10 3 3 5 team=red gm_note=ambush
+!ent add wolf Wolf 10 8 8 3 team=red
+!ent kill orc
+!ent kill wolf
+!system set default corpse_visibility_condition "tile_x < 5"
+!system set default private_vars gm_note
+!as player pleb
+!as view blue
+!find dead ids
+?? orc
+?! wolf
+!find dead gm_note=ambush
+?? No corpses match.
+!find dead show:gm_note
+?? [gm_note=—]
+!ent info wolf
+?? ❌ Could not find a unit named `wolf`.
+!ent get orc gm_note
+?? has no var at `gm_note` that this channel can read
+!as host
+!as view omniscient
+!find dead gm_note=ambush ids
+?? orc
+!foreach dead ; !ent set_var $id seen yes
+!assert "corpse_var('orc', 'seen') == 'yes' and corpse_var('wolf', 'seen') == 'yes'"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a player's `!find dead` reads the corpses the channel's view
+shows (the wolf's lies where corpse_visibility_condition hides it) and
+their vars as the player may read them (the private gm_note is missing to
+a selector and to `show:`). `!ent info` on the hidden corpse answers like
+a missing unit. A host's sweep acts on the whole board, as a unit sweep
+does.

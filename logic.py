@@ -1405,6 +1405,10 @@ def _checked_actions_seen(raw: Any) -> Dict[str, List[str]]:
 DESCRIPTION_SECTIONS: Tuple[str, ...] = (
     "header", "vitals", "size", "statuses", "tags", "data", "actions",
     "passives", "parts", "mount")
+# The sections a corpse's description can hold (#535): a corpse uses no
+# actions or passives and rides nothing.
+CORPSE_DESCRIPTION_SECTIONS: Tuple[str, ...] = (
+    "header", "vitals", "size", "statuses", "tags", "data", "parts")
 
 RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # --- Vital variable names (what var keys map to HP / MaxHP / turn-order) ---
@@ -3200,6 +3204,29 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entity_description_<section>_format rule; a section with "
             "nothing to show (no statuses, sizes off, no readable vars) is "
             "left out. Drop a word to drop the section."
+        ),
+    },
+    "corpse_description_sections": {
+        "default": "header, vitals, statuses, data, parts",
+        "schema": {"type": "str",
+                   "word_list": list(CORPSE_DESCRIPTION_SECTIONS)},
+        "desc": (
+            "The sections `!ent info <id>` prints for a corpse (#535), in "
+            "this order: " + ", ".join(CORPSE_DESCRIPTION_SECTIONS) + ". "
+            "The header has its own corpse_description_header_format; the "
+            "others use the unit's entity_description_<section>_format "
+            "over the corpse's snapshot (its vars as the reader may read "
+            "them, the statuses and parts it died with)."
+        ),
+    },
+    "corpse_description_header_format": {
+        "default": ("**{name}** (`{id}`), dead{?description?}\\n"
+                    "*{description}*{/?}"),
+        "schema": {"type": "str"},
+        "desc": (
+            "A corpse description's first section (#535). Placeholders as "
+            "corpse_line_format (`{died_round}` too); `{description}` is "
+            "the snapshot's `description` var."
         ),
     },
     "entity_description_header_format": {
@@ -26680,6 +26707,143 @@ class Match:
             return False
         loc[3].take_corpse(eid)
         return True
+
+    # ---- corpse writes and moves (#268, #329) ---------------------------
+    # A corpse is a stored snapshot, not a live unit: a write to its vars
+    # runs the store checks only (whole-number vitals, text team, checked
+    # tags, no reserved or derived var, a footprint still on the map) and
+    # no clamps, var hooks or death check (user call). Each write puts a NEW
+    # record in the corpse store, so states built before (undo snapshots,
+    # the serialization cache) keep theirs.
+
+    def _corpse_rec(self, cid: str) -> Tuple[int, int, Dict[str, Any], "Map"]:
+        loc = self.find_corpse(cid)
+        if loc is None:
+            raise NotFound(f"No corpse with id '{cid}'.")
+        return loc
+
+    def _store_corpse_vars(self, cid: str, mp: "Map", corpse: Dict[str, Any],
+                           new_vars: Dict[str, Any]) -> None:
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        ent = dict(ent) if isinstance(ent, dict) else {}
+        names = ent.get("var_names") if isinstance(
+            ent.get("var_names"), dict) else {}
+
+        def vname(rule: str, default: str) -> str:
+            v = names.get(rule) or self.rules.get(rule, default)
+            return str(v)
+        vitals = (vname("hp_var", "hp"), vname("max_hp_var", "max_hp"),
+                  vname("turnorder_var", "initiative"))
+        new_vars = checked_unit_vars(
+            new_vars, vitals, f"corpse `{cid}`",
+            team_var=vname("team_var", "team"),
+            tags_var=vname("tags_var", "tags"))
+        rec = dict(corpse)
+        ent["vars"] = new_vars
+        rec["entity"] = ent
+        # A footprint var changed: the body must still lie on the map.
+        for cx, cy in self.corpse_cells(rec["x"], rec["y"], rec, mp):
+            if not mp.in_bounds(cx, cy):
+                raise OutOfBounds(
+                    f"corpse `{cid}`: ({cx},{cy}) {mp.off_text(cx, cy)} "
+                    f"(its body would cover it).")
+        mp.corpses[cid] = rec
+
+    def _corpse_write_check(self, cid: str, path: str,
+                            corpse: Dict[str, Any]) -> None:
+        check_store_path(path, "var path")
+        msg = reserved_var_path_error(path, f"corpse `{cid}`")
+        if msg:
+            raise VTTError(msg)
+        top = path.split(".")[0]
+        _num, size_t, size_total = self.size_names()
+        if top in (size_t, size_total):
+            raise VTTError(
+                f"corpse `{cid}`: `{top}` is derived by the engine (sizes); "
+                f"write its size number instead.")
+
+    def corpse_vars_of(self, cid: str) -> Optional[Dict[str, Any]]:
+        """The vars of the corpse of `cid` (the stored dict, read only), or
+        None without a corpse."""
+        loc = self.find_corpse(cid)
+        if loc is None:
+            return None
+        ent = loc[2].get("entity") if isinstance(loc[2], dict) else None
+        cv = ent.get("vars") if isinstance(ent, dict) else None
+        return cv if isinstance(cv, dict) else {}
+
+    def corpse_var_set(self, cid: str, path: str, value: Any) -> Any:
+        """Write `value` at dotted `path` in the corpse's vars (#268); the
+        value before (None when absent). Store checks only (see above)."""
+        x, y, corpse, mp = self._corpse_rec(cid)
+        self._corpse_write_check(cid, path, corpse)
+        cur = jcopy(self.corpse_vars_of(cid) or {})
+        check_no_value_ancestor(cur, path, f"corpse `{cid}`")
+        keys = path.split(".")
+        node = cur
+        for k in keys[:-1]:
+            nxt = node.get(k)
+            if not isinstance(nxt, dict):
+                nxt = node[k] = {}
+            node = nxt
+        old = node.get(keys[-1])
+        node[keys[-1]] = _own_value(value)
+        self._store_corpse_vars(cid, mp, corpse, cur)
+        return old
+
+    def corpse_var_del(self, cid: str, path: str) -> bool:
+        """Delete dotted `path` from the corpse's vars (#268); False when
+        it isn't there. A vital var can't be deleted."""
+        x, y, corpse, mp = self._corpse_rec(cid)
+        self._corpse_write_check(cid, path, corpse)
+        ent = corpse.get("entity") if isinstance(corpse, dict) else {}
+        names = (ent or {}).get("var_names") or {}
+        vitals = {str(names.get(r) or self.rules.get(r, d)) for r, d in (
+            ("hp_var", "hp"), ("max_hp_var", "max_hp"),
+            ("turnorder_var", "initiative"))}
+        if path in vitals:
+            raise VTTError(f"corpse `{cid}`: `{path}` is a vital var and "
+                           f"can't be deleted.")
+        cur = jcopy(self.corpse_vars_of(cid) or {})
+        keys = path.split(".")
+        node = cur
+        for k in keys[:-1]:
+            node = node.get(k) if isinstance(node, dict) else None
+            if not isinstance(node, dict):
+                return False
+        if not isinstance(node, dict) or keys[-1] not in node:
+            return False
+        del node[keys[-1]]
+        self._store_corpse_vars(cid, mp, corpse, cur)
+        return True
+
+    def corpse_move(self, cid: str, x: int, y: int,
+                    map_name: Optional[str] = None) -> "Map":
+        """Move the corpse of `cid` so its body's top-left cell is (x, y) of
+        map `map_name` (None: the map it lies on) (#329): the whole body on
+        the map and off void cells; units and other corpses don't stop it
+        (a corpse occupies no cell), and no tile or zone hook fires (a known
+        limitation: dragging a body over a trap triggers nothing). Returns
+        the map it lies on now."""
+        ox, oy, corpse, src = self._corpse_rec(cid)
+        dest = src if map_name is None else self.get_map(map_name)
+        held = corpse.get("maps") if isinstance(corpse, dict) else None
+        if dest is not src and isinstance(held, list) and dest.name in held:
+            raise VTTError(f"corpse `{cid}` holds map `{dest.name}` (its "
+                           f"wreck): it can't lie inside it.")
+        for cx, cy in self.corpse_cells(int(x), int(y), corpse, dest):
+            if not dest.in_bounds(cx, cy):
+                raise OutOfBounds(
+                    f"corpse `{cid}`: ({cx},{cy}) {dest.off_text(cx, cy)} "
+                    f"(its body would cover it).")
+        rec = dict(corpse)
+        if dest is src:
+            rec["x"], rec["y"] = int(x), int(y)
+            src.corpses[cid] = rec
+        else:
+            src.take_corpse(cid)
+            dest.lay_corpse(cid, rec, int(x), int(y))
+        return dest
 
     def revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
         """Resurrect the corpse keyed by `eid` (see _revive_corpse). Its

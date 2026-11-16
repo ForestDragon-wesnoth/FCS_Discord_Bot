@@ -3036,7 +3036,7 @@ def _description_paths(text: Any) -> List[str]:
     return [w for w in _re.split(r"[\s,]+", str(text or "")) if w]
 
 
-def _description_vars(m: Match, e: Entity, vars_: Dict[str, Any],
+def _description_vars(m: Match, e: Any, vars_: Dict[str, Any],
                       engine_vars: bool) -> Dict[str, Any]:
     """The vars the description's data section shows: `vars_` without `__`
     keys, action dicts and what entity_description_hidden_vars hides, and
@@ -3485,6 +3485,106 @@ def _corpse_template_context(
             if hidden(str(var)):
                 ctx[alias] = text
     return ctx
+
+
+def _corpse_read_context(m: Match, x: int, y: int, cid: str,
+                         corpse: Dict[str, Any],
+                         mp: Optional["Map"] = None) -> Dict[str, Any]:
+    """The placeholders a read of a corpse fills (#535): the corpse row's,
+    plus its map, its `description` var as the reader may read it, and the
+    `{state}` / `destroyed` pair a body part's line uses."""
+    ctx = _corpse_template_context(m, x, y, cid, corpse)
+    ctx["map"] = mp.name if mp is not None else ""
+    ctx["map_shown"] = (mp.name if mp is not None and len(m.maps) > 1
+                        else "")
+    reader = VAR_READER.get()
+    cv = (m.corpse_reader_vars(corpse, reader) if reader is not None
+          else ((corpse.get("entity") or {}).get("vars") or {}))
+    desc = cv.get("description") if isinstance(cv, dict) else None
+    ctx["description"] = desc if isinstance(desc, str) else ""
+    destroyed = bool(isinstance(cv, dict) and cv.get("__part_destroyed"))
+    ctx.setdefault("state", "destroyed" if destroyed else "")
+    ctx.setdefault("destroyed", destroyed)
+    return ctx
+
+
+def _corpse_card(m: Match, x: int, y: int, cid: str,
+                 corpse: Dict[str, Any], mp: Optional["Map"] = None) -> str:
+    """`!ent info <corpse> short`: entity_info_format over the corpse's
+    snapshot (#535)."""
+    tmpl = m.rules.get("entity_info_format") or DEFAULT_SYSTEM_SETTINGS.get(
+        "entity_info_format", "")
+    return _render_template(tmpl, _corpse_read_context(m, x, y, cid, corpse,
+                                                       mp), _var_labels(m))
+
+
+def _corpse_description(m: Match, x: int, y: int, cid: str,
+                        corpse: Dict[str, Any],
+                        mp: Optional["Map"] = None) -> str:
+    """`!ent info <corpse>` (#535): the sections corpse_description_sections
+    lists, the header from corpse_description_header_format and the rest
+    from the unit's entity_description_<section>_format, over the corpse's
+    snapshot as the command's reader may read it."""
+    from types import SimpleNamespace
+    ent = corpse.get("entity") if isinstance(corpse, dict) else None
+    ent = ent if isinstance(ent, dict) else {}
+    ctx = _corpse_read_context(m, x, y, cid, corpse, mp)
+    reader = VAR_READER.get()
+    labels = _var_labels(m)
+    sections = _description_paths(m.rules.get("corpse_description_sections"))
+    out: List[str] = []
+
+    def fmt(sec: str) -> str:
+        if sec == "header":
+            return _description_rule(m, "corpse_description_header_format")
+        return _description_rule(m, f"entity_description_{sec}_format")
+
+    for sec in sections:
+        text = ""
+        if sec in ("header", "vitals"):
+            text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "size":
+            if m.sizes_on() and ctx.get("size") not in (None, ""):
+                text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "tags":
+            if ctx.get("tags"):
+                text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "statuses":
+            status = ent.get("status")
+            items = _description_statuses(
+                m, status if isinstance(status, dict) else {})
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        elif sec == "data":
+            src = (m.corpse_reader_vars(corpse, reader)
+                   if reader is not None else (ent.get("vars") or {}))
+            shape = SimpleNamespace(var_names=ent.get("var_names") or {})
+            tree = _hide_formula_fields(_description_vars(
+                m, shape, src if isinstance(src, dict) else {}, True))
+            lines: List[str] = []
+            _description_tree(tree, 0, lines, labels)
+            if lines:
+                cap = int(m.rules.get("entity_description_line_limit", 60))
+                if len(lines) > cap:
+                    lines = lines[:cap] + [
+                        f"... ({len(lines) - cap} more lines)"]
+                text = _render_template(fmt(sec), {"items": "\n".join(lines)})
+        elif sec == "parts":
+            pfmt = _description_rule(m, "entity_description_part_format")
+            items = []
+            parts = corpse.get("parts") if isinstance(corpse, dict) else None
+            for pd in sorted((p for p in (parts or [])
+                              if isinstance(p, dict)
+                              and p.get("part_of") == cid),
+                             key=lambda p: str(p.get("id", ""))):
+                pid = str(pd.get("id", ""))
+                items.append(_render_template(pfmt, _corpse_read_context(
+                    m, x, y, pid, {"entity": pd}, mp)))
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        if text.strip():
+            out.append(text.rstrip("\n"))
+    return "\n".join(out) if out else f"`{cid}`"
 
 
 def _corpse_line(
@@ -12793,6 +12893,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             and not _acts_as_host(ctx, m) and _query_pov(ctx, m) is not None):
         if sub == "revive":
             _query_corpse(ctx, m, args[1])
+        elif sub in _ENT_CORPSE_SUBS:
+            # These name a corpse too (#535, #268, #329): one the view
+            # shows passes, a hidden one reads like a missing unit.
+            _query_unit_or_corpse(ctx, m, args[1])
+            if sub in ("var_move", "var_copy") and len(args) >= 4:
+                _query_unit_or_corpse(ctx, m, args[3])
         else:
             _query_eid(ctx, m, args[1])
         # The second unit a subcommand names (a transform's form is a var
@@ -12896,7 +13002,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 or any(w not in ("short", "full") for w in words)):
             raise VTTError(f"Unexpected `{' '.join(args[2:])}` — usage: "
                            f"`!ent info <id> [short] [full]`.")
-        eid = _query_eid(ctx, m, args[1])
+        eid, cloc = _query_unit_or_corpse(ctx, m, args[1])
         if "full" in words:
             # A host shows the private vars on purpose (#70), even in a
             # channel players read.
@@ -12906,6 +13012,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             token = None
         try:
+            if cloc is not None:
+                cx, cy, corpse, cmp = cloc
+                if "short" in words:
+                    return await ctx.send(_corpse_card(m, cx, cy, eid,
+                                                       corpse, cmp))
+                return await ctx.send(_corpse_description(m, cx, cy, eid,
+                                                          corpse, cmp))
             if "short" in words:
                 return await ctx.send(_entity_card(m.entities[eid],
                                                    _query_pov(ctx, m)))
@@ -12920,8 +13033,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "get"):
             return
         _check_tail(args, 3, (), "!ent get <id> <path>")
-        eid = _query_eid(ctx, m, args[1])
-        e = m.entities[eid]
+        eid, cloc = _query_unit_or_corpse(ctx, m, args[1])
+        e = m.entities.get(eid) if cloc is None else None
         path = str(args[2])
         check_store_path(path, "var path")
         host = ctx_is_admin(ctx) or _acts_as_host(ctx, m)
@@ -12929,15 +13042,30 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # the host's to read (`!ent dump`); a player meets it as missing.
         hidden = not host and any(seg.startswith("__")
                                   for seg in path.split("."))
-        found, val = (False, None) if hidden else _entity_path_value(
-            m, e, path, _query_pov(ctx, m))
+        if hidden:
+            found, val = False, None
+        elif cloc is not None:
+            # A corpse's snapshot vars as the reader may read them (#535).
+            reader = VAR_READER.get()
+            cv = (m.corpse_reader_vars(cloc[2], reader) if reader is not None
+                  else ((cloc[2].get("entity") or {}).get("vars") or {}))
+            found, val = True, cv
+            for seg in path.split("."):
+                if not isinstance(val, dict) or seg not in val:
+                    found, val = False, None
+                    break
+                val = val[seg]
+        else:
+            found, val = _entity_path_value(m, e, path, _query_pov(ctx, m))
         if not found:
             raise NotFound(f"`{args[1]}` has no var at `{path}` that this "
                            f"channel can read.")
         if not host:
             val = _without_engine_keys(val)
         val = _hide_formula_at(path, val)
-        shown = m.entity_display_name(e, _query_pov(ctx, m))
+        shown = (m.entity_display_name(e, _query_pov(ctx, m)) if e is not None
+                 else str(((cloc[2].get("entity") or {}).get("name"))
+                          or eid) + " (corpse)")
         if isinstance(val, (dict, list)):
             return await ctx.send(
                 f"**{shown}** `{path}`:\n```json\n"
@@ -12978,10 +13106,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         _check_tail(args, 5, (), f"!ent {sub} <id> <path> <dest_id> "
                                  f"<dest_path>")
-        src_id = _resolve_eid(m, args[1])
-        dest_id = _resolve_eid(m, args[3])
-        for tok, rid in ((args[1], src_id), (args[3], dest_id)):
-            if rid not in m.entities:
+        # Either end may be a corpse (#268): looting a body.
+        src_cid = _typed_corpse(ctx, m, args[1])
+        dest_cid = _typed_corpse(ctx, m, args[3])
+        src_id = src_cid or _resolve_eid(m, args[1])
+        dest_id = dest_cid or _resolve_eid(m, args[3])
+        for tok, rid, cid_ in ((args[1], src_id, src_cid),
+                               (args[3], dest_id, dest_cid)):
+            if cid_ is None and rid not in m.entities:
                 raise NotFound(f"Entity '{tok}' not found.")
         src_path, dest_path = str(args[2]), str(args[4])
         for p_ in (src_path, dest_path):
@@ -12992,8 +13124,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                                  f"!ent {sub} (source)")
         if msg:
             raise VTTError(msg)
-        se, de = m.entities[src_id], m.entities[dest_id]
-        found, val = _resolve_dotted_var(se.vars, src_path)
+        se = m.entities.get(src_id) if src_cid is None else None
+        de = m.entities.get(dest_id) if dest_cid is None else None
+        found, val = _resolve_dotted_var(
+            se.vars if se is not None else (m.corpse_vars_of(src_id) or {}),
+            src_path)
         if not found:
             raise NotFound(f"`{src_id}` has no var at `{src_path}`.")
         if sub == "var_move" and src_id == dest_id:
@@ -13003,13 +13138,23 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if dest_path.startswith(src_path + "."):
                 raise VTTError(f"`{dest_path}` is inside `{src_path}`, which "
                                f"the move deletes.")
-        log = list(de.write_var(dest_path, copy.deepcopy(val)))
-        if sub == "var_move" and src_id in m.entities:
-            log.extend(m.entities[src_id].remove_var(src_path))
+        if de is not None:
+            log = list(de.write_var(dest_path, copy.deepcopy(val)))
+        else:
+            log = []
+            m.corpse_var_set(dest_id, dest_path, copy.deepcopy(val))
+        if sub == "var_move":
+            if src_cid is not None:
+                m.corpse_var_del(src_id, src_path)
+            elif src_id in m.entities:
+                log.extend(m.entities[src_id].remove_var(src_path))
         verb = "Moved" if sub == "var_move" else "Copied"
+
+        def who(rid: str, cid_: Optional[str]) -> str:
+            return f"corpse `{rid}`" if cid_ is not None else f"`{rid}`"
         return await ctx.send("\n".join(
-            [f"{verb} `{src_id}` vars.{src_path} to `{dest_id}` "
-             f"vars.{dest_path}."] + log))
+            [f"{verb} {who(src_id, src_cid)} vars.{src_path} to "
+             f"{who(dest_id, dest_cid)} vars.{dest_path}."] + log))
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -13272,13 +13417,25 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                "<map>` or `map=<map>`.")
             mapspec, args = args[4], args[:4]
         _check_tail(args, 4, (), "!ent tp <id> <x> <y> [<map>]")
-        eid = _resolve_eid(m, args[1]);
-        if eid not in m.entities:
-            raise NotFound(f"Entity '{eid}' not found.")
         try:
             x = int(args[2]); y = int(args[3])
         except ValueError:
             return await ctx.send("❌ x and y must be integers.")
+        cid = _typed_corpse(ctx, m, args[1])
+        if cid is not None:
+            # Dragging a corpse (#329): its body on the map, no hooks.
+            loc = m.find_corpse(cid)
+            tmp = (_one_map(ctx, m, mapspec) if mapspec is not None
+                   else loc[3])
+            before = loc[3].name
+            m.corpse_move(cid, x, y, tmp.name)
+            return await ctx.send(
+                f"Moved the corpse of `{cid}` to ({x},{y})"
+                + (f" on map `{tmp.name}` (from `{before}`)."
+                   if tmp.name != before else "."))
+        eid = _resolve_eid(m, args[1]);
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
         # The unit's own map unless one is named (tier 2 of the hierarchy).
         tmp = _one_map(ctx, m, mapspec, unit=m.entities[eid])
         before = m.entities[eid].map
@@ -13802,6 +13959,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "set_var"):
             return
 
+        cid = _typed_corpse(ctx, m, args[1])
+        if cid is not None:
+            # A corpse's var (#268): store checks only, no hooks or clamps.
+            _check_tail(args, 4, (), "!ent set_var <id> <path> <value>")
+            m.corpse_var_set(cid, args[2], _parse_scalar(args[3]))
+            stored = _var_at(m.corpse_vars_of(cid), args[2])
+            return await ctx.send(f"Corpse `{cid}` vars.{args[2]} = "
+                                  f"{stored!r}")
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -13927,6 +14092,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "delete_var":
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "delete_var"):
             return
+        cid = _typed_corpse(ctx, m, args[1])
+        if cid is not None:
+            if not m.corpse_var_del(cid, args[2]):
+                raise NotFound(f"Corpse `{cid}` has no var at `{args[2]}`.")
+            return await ctx.send(f"Deleted corpse `{cid}` vars.{args[2]}")
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -15209,6 +15379,39 @@ def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
                 f"exist, or this channel currently does not have permission "
                 f"to view it.")
         raise NotFound(f"Entity '{token}' not found.")
+    return eid
+
+
+def _query_unit_or_corpse(ctx: ReplyContext, m: "Match", token: str
+                          ) -> Tuple[str, Optional[Tuple[Any, ...]]]:
+    """A read naming a unit or a corpse (#535): (id, None) for a unit the
+    view may read, (id, (x, y, corpse, map)) for a corpse it may. A unit
+    or corpse the view can't see reads exactly like a missing unit."""
+    eid = _resolve_eid(m, token, view=False)
+    if eid not in m.entities:
+        loc = m.find_corpse(eid)
+        pov = _query_pov(ctx, m)
+        if loc is not None and (pov is None or m.corpse_visible_to(
+                eid, loc[2], loc[0], loc[1], pov, loc[3])):
+            return eid, loc
+    return _query_eid(ctx, m, token), None
+
+
+# The `!ent` subcommands whose first id may name a corpse.
+_ENT_CORPSE_SUBS = frozenset({"info", "get", "set_var", "delete_var", "tp",
+                              "var_move", "var_copy"})
+
+
+def _typed_corpse(ctx: ReplyContext, m: "Match", token: str
+                  ) -> Optional[str]:
+    """The corpse a typed write names (#268, #329), or None when `token`
+    names a living unit or nothing. A host reaches any corpse; anyone else
+    only one the channel's view shows (a hidden one reads as missing)."""
+    eid = _resolve_eid(m, token, view=False)
+    if eid in m.entities or m.find_corpse(eid) is None:
+        return None
+    if not (ctx_is_admin(ctx) or _acts_as_host(ctx, m)):
+        _query_corpse(ctx, m, eid)
     return eid
 
 
@@ -17357,43 +17560,162 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             return False
         # A team is text (Entity.team): `team=1` names team "1".
         rhs = val if key == e._team_var_name() else _coerce_for_compare(val)
-        # true / false aren't the numbers 1 / 0 here: `hp>=true` matched
-        # every unit and `flag<5` a flag set to true.
-        if (isinstance(lhs, (int, float)) and isinstance(rhs, (int, float))
-                and isinstance(lhs, bool) != isinstance(rhs, bool)):
-            if kind == "!=":
-                continue
+        if not _find_compare(kind, lhs, rhs):
             return False
-        # If lhs is numeric-ish and rhs coerced numeric, compare as numbers.
-        # Otherwise the relational ops still attempt the comparison and a
-        # TypeError is treated as "doesn't match".
-        try:
-            if kind == "=":
-                if lhs != rhs:
+    return True
+
+
+def _corpse_path_value(m: Match, loc: Tuple[Any, ...],
+                       path: str) -> Tuple[bool, Any]:
+    """`!find`'s read of `path` on a corpse (#454): x / y from where it
+    lies, `name` / `map` from the snapshot and its map, anything else from
+    its vars as the command's reader may read them."""
+    x, y, corpse, mp = loc
+    ent = corpse.get("entity") if isinstance(corpse, dict) else None
+    ent = ent if isinstance(ent, dict) else {}
+    seg0 = path.split(".", 1)[0]
+    if seg0 in RESERVED_VAR_PATHS:
+        if "." in path:
+            return False, None
+        return True, {"x": x, "y": y, "map": mp.name,
+                      "name": ent.get("name")}.get(seg0)
+    reader = VAR_READER.get()
+    cv = (m.corpse_reader_vars(corpse, reader) if reader is not None
+          else (ent.get("vars") or {}))
+    found, val = _resolve_dotted_var(cv if isinstance(cv, dict) else {}, path)
+    if found and path == str(m.rules.get("team_var", "team")) \
+            and val is not None:
+        val = str(val)
+    return found, val
+
+
+def _corpse_body_box(m: Match, loc: Tuple[Any, ...]) -> Tuple[int, int,
+                                                               int, int]:
+    x, y, corpse, mp = loc
+    w, h = m._corpse_footprint(corpse, mp)
+    return x, y, w, h
+
+
+def _find_match_corpse(m: Match, cid: str, loc: Tuple[Any, ...],
+                       selectors, pov: Optional[str] = None) -> bool:
+    """`!find dead` (#454): whether every selector word matches the corpse
+    of `cid` (`loc` = (x, y, record, map)), read off its snapshot: vars,
+    the statuses and tags it died with, the groups it was in, its map and
+    size category; `near:` / `within:` measure from every cell of its
+    body. `action:` names nothing a corpse can do."""
+    x, y, corpse, mp = loc
+    ent = corpse.get("entity") if isinstance(corpse, dict) else None
+    ent = ent if isinstance(ent, dict) else {}
+
+    def one(kind: str, key: str, val: Optional[str]) -> bool:
+        if kind == "status":
+            st = ent.get("status")
+            return isinstance(st, dict) and key in st
+        if kind == "group":
+            groups = corpse.get("groups") if isinstance(corpse, dict) else None
+            mine = groups.get(cid) if isinstance(groups, dict) else None
+            return isinstance(mine, list) and key in mine
+        if kind == "map":
+            return mp.name == key
+        if kind == "tag":
+            return tag_filter_matches(
+                [t for t, _s in m.corpse_tag_sources(corpse)], key)
+        if kind == "size":
+            if not m.sizes_on():
+                raise VTTError("`size:` needs sizes on (size_enabled is off "
+                               "on this match).")
+            want = m.size_rank_of(key)
+            if want is None:
+                raise VTTError(f"`size:{key}`: not a size category.")
+            _n, text_v, _t = m.size_names()
+            found, cat = _corpse_path_value(m, loc, text_v)
+            have = m.size_rank_of(str(cat)) if found else None
+            if have is None:
+                return False
+            return (have >= want if val == "+" else have <= want
+                    if val == "-" else have == want)
+        if kind == "action":
+            raise VTTError("`action:` doesn't apply to corpses: a corpse "
+                           "uses no actions.")
+        if kind in ("near", "within"):
+            radius = _coerce_for_compare(val)
+            if isinstance(radius, bool) or not isinstance(radius,
+                                                          (int, float)):
+                raise VTTError(f"`{kind}:` radius must be a number, got "
+                               f"`{val}`.")
+            if radius < 0:
+                raise VTTError(f"`{kind}:` radius can't be negative, got "
+                               f"`{val}`.")
+            bx, by, bw, bh = _corpse_body_box(m, loc)
+            if kind == "near":
+                ref = m.entities.get(_resolve_eid(m, key, view=False))
+                if ref is None or _pov_hides(m, pov, ref.id):
+                    raise VTTError(f"`near:` reference entity `{key}` not "
+                                   f"found.")
+                if ref.map != mp.name:
                     return False
-            elif kind == "!=":
-                if lhs == rhs:
-                    return False
-            elif kind == "<":
-                if not (lhs < rhs):
-                    return False
-            elif kind == "<=":
-                if not (lhs <= rhs):
-                    return False
-            elif kind == ">":
-                if not (lhs > rhs):
-                    return False
-            elif kind == ">=":
-                if not (lhs >= rhs):
-                    return False
-        except TypeError:
+                gap = min(m._rect_gap(rx, ry, rw, rh, bx, by, bw, bh)
+                          for rx, ry, rw, rh in m.body_rects(ref))
+                return gap <= radius
+            sx, sy, wmap = (key.split(":") + [""])[:3]
+            try:
+                cx, cy = int(sx), int(sy)
+            except ValueError:
+                raise VTTError("`within:` coordinates must be integers.")
+            if wmap and mp.name != wmap:
+                return False
+            return m._rect_gap(cx, cy, 1, 1, bx, by, bw, bh) <= radius
+        found, lhs = _corpse_path_value(m, loc, key)
+        if not found:
             return False
+        rhs = (val if key == str(m.rules.get("team_var", "team"))
+               else _coerce_for_compare(val))
+        return _find_compare(kind, lhs, rhs)
+
+    for neg, alts in selectors:
+        if any(one(k, key, v) for k, key, v in alts) == neg:
+            return False
+    return True
+
+
+def _find_compare(kind: str, lhs: Any, rhs: Any) -> bool:
+    """One `!find` comparison (`=`, `!=`, `<`, ...) of a value read with the
+    typed one (#454 shares it between units and corpses)."""
+    # true / false aren't the numbers 1 / 0 here: `hp>=true` matched
+    # every unit and `flag<5` a flag set to true.
+    if (isinstance(lhs, (int, float)) and isinstance(rhs, (int, float))
+            and isinstance(lhs, bool) != isinstance(rhs, bool)):
+        return kind == "!="
+    # If lhs is numeric-ish and rhs coerced numeric, compare as numbers.
+    # Otherwise the relational ops still attempt the comparison and a
+    # TypeError is treated as "doesn't match".
+    try:
+        if kind == "=":
+            if lhs != rhs:
+                return False
+        elif kind == "!=":
+            if lhs == rhs:
+                return False
+        elif kind == "<":
+            if not (lhs < rhs):
+                return False
+        elif kind == "<=":
+            if not (lhs <= rhs):
+                return False
+        elif kind == ">":
+            if not (lhs > rhs):
+                return False
+        elif kind == ">=":
+            if not (lhs >= rhs):
+                return False
+    except TypeError:
+        return False
     return True
 
 
 @registry.command(
     "find", access="all",
-    usage="!find <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [sum|avg|min|max:<var> ...] [count|ids]",
+    usage="!find [dead|all] <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [sum|avg|min|max:<var> ...] [count|ids]",
     desc=(
         "Query entities by AND-ed predicates. A leading `!` negates a "
         "predicate (`!status:stunned`; `!team=red` also matches units with no "
@@ -17427,7 +17749,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
         "3 cells of `boss`, showing each one's hp, lowest first. OUTPUT: a "
         "bare `count` prints only the number of matches; a bare `ids` prints "
         "the matching ids space-separated, ready to paste into another "
-        "command (`!find team=red ids`). `sum:<var>`, `avg:<var>`, "
+        "command (`!find team=red ids`). A leading `dead` searches the "
+        "corpses instead (their snapshot's vars, statuses, tags, groups; "
+        "`near:` / `within:` from every cell of the body; `action:` "
+        "refused), `all` the units then the corpses. `sum:<var>`, `avg:<var>`, "
         "`min:<var>` and `max:<var>` print the count and that total over "
         "the matches' numbers instead (`!find team=red sum:hp`; text and "
         "missing vars are left out)."
@@ -17444,6 +17769,10 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
         title, body = registry.help_for(["find"])
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
+    # `dead` searches the corpses, `all` the units and the corpses (#454).
+    scope = "units"
+    if args[0].lower() in ("dead", "all"):
+        scope, args = args[0].lower(), args[1:]
     # Split off the DISPLAY directives (show: / sort:) so they aren't parsed
     # as predicates. Everything else is a filter predicate.
     show_cols: List[str] = []
@@ -17475,16 +17804,36 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                 sort_var = spec
         else:
             pred_tokens.append(t)
+    # A hit is ("unit", Entity) or ("corpse", (id, (x, y, record, map))).
+    hits: List[Tuple[str, Any]] = []
     try:
         predicates = _bind_find_maps(
             ctx, m, [_parse_find_selector(t) for t in pred_tokens])
         pov = _query_pov(ctx, m)
         with m.vision_pass():
-            hits = [e for e in m.entities_in_turn_order()
-                    if not _pov_hides(m, pov, e.id)
-                    and _find_match_entity(m, e, predicates, pov)]
+            if scope in ("units", "all"):
+                hits += [("unit", e) for e in m.entities_in_turn_order()
+                         if not _pov_hides(m, pov, e.id)
+                         and _find_match_entity(m, e, predicates, pov)]
+            if scope in ("dead", "all"):
+                for mp_, cx, cy, cid, corpse in m.every_corpse():
+                    if pov is not None and not m.corpse_visible_to(
+                            cid, corpse, cx, cy, pov, mp_):
+                        continue
+                    loc = (cx, cy, corpse, mp_)
+                    if _find_match_corpse(m, cid, loc, predicates, pov):
+                        hits.append(("corpse", (cid, loc)))
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
+
+    def hit_id(h) -> str:
+        return h[1].id if h[0] == "unit" else h[1][0]
+
+    def hit_value(h, path: str) -> Tuple[bool, Any]:
+        if h[0] == "unit":
+            return _entity_path_value(m, h[1], path, pov)
+        return _corpse_path_value(m, h[1][1], path)
+
     if output == "count" or aggregates:
         head = f"**{len(hits)}** {'match' if len(hits) == 1 else 'matches'}."
         if not aggregates:
@@ -17494,8 +17843,8 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
             # The numbers the caller may read (private vars read as
             # missing); text, bools and missing vars are left out.
             nums = []
-            for e in hits:
-                found, v = _entity_path_value(m, e, path, pov)
+            for h in hits:
+                found, v = hit_value(h, path)
                 if found and isinstance(v, (int, float)) \
                         and not isinstance(v, bool) and math.isfinite(v):
                     nums.append(v)
@@ -17516,10 +17865,11 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
             lines.append(f"{kind} `{path}`: **{val}**{note}")
         return await ctx.send("\n".join(lines))
     if not hits:
-        return await ctx.send("No entities match.")
+        return await ctx.send("No corpses match." if scope == "dead"
+                              else "No entities match.")
     if sort_var:
-        def _sort_key(e):
-            found, v = _entity_path_value(m, e, sort_var, pov)
+        def _sort_key(h):
+            found, v = hit_value(h, sort_var)
             # Missing vars sort last: a (rank, number, string) tuple groups
             # present values together and compares numbers vs strings cleanly
             # within their own kind (a numeric string sorts as a number).
@@ -17536,11 +17886,15 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
         hits.sort(key=_sort_key, reverse=sort_desc)
     if output == "ids":
         # Plain space-separated ids, ready to paste into another command.
-        return await ctx.send(" ".join(e.id for e in hits))
+        return await ctx.send(" ".join(hit_id(h) for h in hits))
     word = "match" if len(hits) == 1 else "matches"
     lines = [f"**{len(hits)} {word}:**"]
-    for e in hits:
-        row = f"- {_entity_line(e, pov)}"
+    for h in hits:
+        if h[0] == "unit":
+            row = f"- {_entity_line(h[1], pov)}"
+        else:
+            cid, (cx, cy, corpse, mp_) = h[1]
+            row = f"- {_corpse_line(m, cx, cy, cid, corpse, mp_)}"
         if show_cols:
             cells = []
             for col in show_cols:
@@ -17548,9 +17902,15 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                     # Statuses live in e.status, NOT in vars, so a plain var
                     # lookup renders '—'. This pseudo-column reads the real
                     # status dict; a level > 1 is shown as name(level).
-                    cells.append(f"{col}={_fmt_status_names(e) or '—'}")
+                    if h[0] == "unit":
+                        names = _fmt_status_names(h[1])
+                    else:
+                        st = (h[1][1][2].get("entity") or {}).get("status")
+                        names = ", ".join(sorted(st)) if isinstance(
+                            st, dict) else ""
+                    cells.append(f"{col}={names or '—'}")
                     continue
-                found, v = _entity_path_value(m, e, col, pov)
+                found, v = hit_value(h, col)
                 v = _hide_formula_at(col, v) if found else v
                 cells.append(f"{col}={v if found else '—'}")
             row += "  [" + ", ".join(cells) + "]"
@@ -18059,12 +18419,14 @@ def _split_foreach_commands(cmd_tokens: List[str]) -> List[List[str]]:
 @registry.command(
     "foreach",
     raw_args=True,
-    usage="!foreach <predicate> [<predicate> ...] ; <command> [; <command> ...]",
+    usage="!foreach [dead|all] <predicate> [<predicate> ...] ; <command> [; <command> ...]",
     desc=(
         "Run one or more commands for every entity matching a `!find` selector. "
         "The selector (same predicates as `!find`: `var=value`, "
         "`status:NAME`, `group:NAME`, `action:NAME`, `near:<eid>:<radius>`, "
-        "`within:<x>:<y>:<radius>`) comes before the first bare `;`. After it, "
+        "`within:<x>:<y>:<radius>`) comes before the first bare `;`; a "
+        "leading `dead` sweeps the corpses (`$id` the corpse's id, `$x $y` "
+        "where it lies), `all` the units then the corpses. After it, "
         "one OR MORE commands (separated by further bare `;`) run once per "
         "matching entity, all commands for one entity before moving to the "
         "next. Per-entity tokens substituted in each command: `$id`, `$name`, "
@@ -18153,6 +18515,11 @@ async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not commands:
         return await ctx.send("❌ foreach command is empty (nothing after `;`).")
     m = active_match(mgr, ctx)
+    # `dead` sweeps the corpses, `all` the units then the corpses (#454).
+    scope = "units"
+    if sel_tokens[0].lower() in ("dead", "all"):
+        scope, sel_tokens = sel_tokens[0].lower(), sel_tokens[1:]
+    targets: List[Tuple[str, str, int, int, str, str]] = []
     try:
         predicates = _bind_find_maps(
             ctx, m, [_parse_find_selector(t) for t in sel_tokens])
@@ -18160,17 +18527,32 @@ async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # read-only) sees what `!find` would: $id/$x/$y would otherwise hand
         # out hidden units' positions. A host's sweep acts on the real board.
         pov = None if _acts_as_host(ctx, m) else _query_pov(ctx, m)
-        hits = [e for e in m.entities_in_turn_order()
-                if not _pov_hides(m, pov, e.id)
-                and _find_match_entity(m, e, predicates, pov)]
+        # Snapshot the substitution values up front so the target set is
+        # fixed even if the per-entity commands move / kill / spawn
+        # entities.
+        if scope in ("units", "all"):
+            targets += [(e.id, e.name, e.x, e.y, (e.team or ""), e.map or "")
+                        for e in m.entities_in_turn_order()
+                        if not _pov_hides(m, pov, e.id)
+                        and _find_match_entity(m, e, predicates, pov)]
+        if scope in ("dead", "all"):
+            team_var = str(m.rules.get("team_var", "team"))
+            for mp_, cx, cy, cid, corpse in m.every_corpse():
+                if pov is not None and not m.corpse_visible_to(
+                        cid, corpse, cx, cy, pov, mp_):
+                    continue
+                loc = (cx, cy, corpse, mp_)
+                if not _find_match_corpse(m, cid, loc, predicates, pov):
+                    continue
+                ent = corpse.get("entity") or {}
+                _f, team = _corpse_path_value(m, loc, team_var)
+                targets.append((cid, str(ent.get("name") or cid), cx, cy,
+                                "" if team is None else str(team), mp_.name))
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
-    if not hits:
-        return await ctx.send("No entities match; nothing to do.")
-    # Snapshot the substitution values up front so the target set is fixed
-    # even if the per-entity commands move / kill / spawn entities.
-    targets = [(e.id, e.name, e.x, e.y, (e.team or ""), e.map or "")
-               for e in hits]
+    if not targets:
+        return await ctx.send(("No corpses match" if scope == "dead"
+                               else "No entities match") + "; nothing to do.")
     total = len(targets)
     noun = "entity" if total == 1 else "entities"
     ncmd = f"{len(commands)} command(s) each" if len(commands) > 1 else "1 command"

@@ -3081,6 +3081,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                   unless a default is supplied)
     "kill", "revive", "transform", "replace_form", "revert", "has_corpse",
     "corpse_at", "all_corpses", "remove_corpse",
+    # Corpse writes and moves (#268, #329): store checks only, no hooks.
+    "corpse_var_set", "corpse_var_del", "corpse_move",
     "corpse_has", "corpse_var",
     "corpse_status_has", "corpse_status_get", "corpse_status_names",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
@@ -3311,6 +3313,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
 # reminder, never a silent default-allow). The _ALLOWED_FUNCS pure helpers
 # (min/max/roll/distance/band/...) are all read-only and always permitted.
 ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    "corpse_var_set", "corpse_var_del", "corpse_move",
     # The forecasts run the GM's steps (rolled back after), and the step_
     # helpers only work inside a step.
     "deal_damage", "heal", "damage_forecast", "healing_forecast",
@@ -7126,13 +7129,44 @@ class FormulaEngine:
             engine._note_affected(eid)
             return new
 
+        def _var_end(token: Any, fname: str) -> Tuple[str, Any]:
+            """One end of var_move / var_copy: (id, the living unit), or
+            (id, None) for a corpse (#268)."""
+            eid = str(_eid(token))
+            e = match.entities.get(eid)
+            if e is not None:
+                return eid, e
+            if match.find_corpse(eid) is not None:
+                return eid, None
+            raise FormulaError(f"{fname}: unknown entity id '{eid}'.")
+
+        def _end_read(eid: str, e: Any, path: str) -> Tuple[bool, Any]:
+            cur: Any = e.vars if e is not None else match.corpse_vars_of(eid)
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return False, None
+                cur = cur[k]
+            return True, cur
+
+        def _end_write(eid: str, e: Any, path: str, val: Any,
+                       fname: str) -> None:
+            try:
+                if e is not None:
+                    match.surface_log(e.write_var(path, val))
+                else:
+                    match.corpse_var_set(eid, path, val)
+            except VTTError as ex:
+                raise FormulaError(f"{fname}: {ex}")
+
         def _var_move(src_t: Any, src_path: Any,
                       dest_t: Any, dest_path: Any) -> bool:
             """var_move(src_eid, src_path, dest_eid, dest_path): MOVE a var (or
             a whole var subtree) from one entity/path to another — reads
             src_path, writes a DEEP COPY to dest_path on the destination, then
             deletes src_path. Returns True iff the source existed (and was
-            moved); False if absent (no-op). The loot / give / drop primitive."""
+            moved); False if absent (no-op). The loot / give / drop primitive.
+            Either end may be a corpse (#268): looting a body, or planting
+            something on one (a corpse write runs no hooks)."""
             if not (isinstance(src_path, str) and src_path):
                 raise FormulaError("var_move: src_path must be a non-empty string.")
             if not (isinstance(dest_path, str) and dest_path):
@@ -7141,9 +7175,10 @@ class FormulaEngine:
                    or reserved_var_path_error(dest_path, "var_move (destination)"))
             if msg:
                 raise FormulaError(msg)
-            seid, se = _resolve_entity(src_t, "var_move")
-            deid, de = _resolve_entity(dest_t, "var_move")
-            if not _var_has(src_t, src_path):
+            seid, se = _var_end(src_t, "var_move")
+            deid, de = _var_end(dest_t, "var_move")
+            found, cur = _end_read(seid, se, src_path)
+            if not found:
                 return False
             if seid == deid:
                 # Onto itself: already there (giving an item to yourself
@@ -7155,10 +7190,13 @@ class FormulaEngine:
                     raise FormulaError(
                         f"var_move: `{dest_path}` is inside `{src_path}`, "
                         f"which the move deletes.")
-            val = copy.deepcopy(_walk_vars(se, src_path, must_exist=True))
-            match.surface_log(de.write_var(dest_path, val))
+            val = copy.deepcopy(cur)
+            _end_write(deid, de, dest_path, val, "var_move")
             try:
-                match.surface_log(se.remove_var(src_path))
+                if se is not None:
+                    match.surface_log(se.remove_var(src_path))
+                else:
+                    match.corpse_var_del(seid, src_path)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(seid)
@@ -7171,7 +7209,8 @@ class FormulaEngine:
             COPY of a var (or a whole subtree) to another entity/path and
             keep the source — var_move without the delete (grant a copy of
             an item, seed a stat block from a template). Returns True iff the
-            source existed; False (no-op) when it's absent."""
+            source existed; False (no-op) when it's absent. Either end may
+            be a corpse (#268)."""
             if not (isinstance(src_path, str) and src_path):
                 raise FormulaError("var_copy: src_path must be a non-empty string.")
             if not (isinstance(dest_path, str) and dest_path):
@@ -7179,13 +7218,18 @@ class FormulaEngine:
             msg = reserved_var_path_error(dest_path, "var_copy (destination)")
             if msg:
                 raise FormulaError(msg)
-            _resolve_entity(src_t, "var_copy")
-            deid, de = _resolve_entity(dest_t, "var_copy")
-            if not _var_has(src_t, src_path):
-                return False
-            _, se = _resolve_entity(src_t, "var_copy")
-            val = copy.deepcopy(_read_entity_path(se, src_path))
-            match.surface_log(de.write_var(dest_path, val))
+            seid, se = _var_end(src_t, "var_copy")
+            deid, de = _var_end(dest_t, "var_copy")
+            if se is not None:
+                if not _var_has(src_t, src_path):
+                    return False
+                val = copy.deepcopy(_read_entity_path(se, src_path))
+            else:
+                found, cur = _end_read(seid, None, src_path)
+                if not found:
+                    return False
+                val = copy.deepcopy(cur)
+            _end_write(deid, de, dest_path, val, "var_copy")
             engine._note_affected(deid)
             return True
 
@@ -8846,6 +8890,64 @@ class FormulaEngine:
                 return [loc[0], loc[1], loc[3].name]
             return [loc[0], loc[1]]
         ns["corpse_cell"]  = _corpse_cell
+
+        def _corpse_var_set(eid_t: Any, path: Any, value: Any) -> Any:
+            """corpse_var_set(eid, path, value): write a var on the corpse of
+            `eid` (#268), returning the value it replaced (None when new).
+            A corpse is a snapshot: the store checks apply (whole-number
+            vitals, text team, checked tags, no reserved or engine-derived
+            var, a footprint still on the map), and no clamps, var hooks or
+            death check run."""
+            if not (isinstance(path, str) and path):
+                raise FormulaError("corpse_var_set: path must be a non-empty "
+                                   "string.")
+            try:
+                return match.corpse_var_set(str(_eid(eid_t)), path, value)
+            except VTTError as ex:
+                raise FormulaError(f"corpse_var_set: {ex}")
+
+        def _corpse_var_del(eid_t: Any, path: Any) -> bool:
+            """corpse_var_del(eid, path): delete a var from the corpse of
+            `eid` (#268); False when it wasn't there. A vital var can't be
+            deleted."""
+            if not (isinstance(path, str) and path):
+                raise FormulaError("corpse_var_del: path must be a non-empty "
+                                   "string.")
+            try:
+                return match.corpse_var_del(str(_eid(eid_t)), path)
+            except VTTError as ex:
+                raise FormulaError(f"corpse_var_del: {ex}")
+
+        def _corpse_move(eid_t: Any, x: Any, y: Any = None,
+                         map: Any = None) -> Any:
+            """corpse_move(eid, x, y, map=None) / corpse_move(eid, coord):
+            drag the corpse of `eid` so its body's top-left cell is (x, y)
+            (#329), on map= (or a coordinate's map) else the map it lies on.
+            The whole body must be on the map and off void cells; units and
+            other corpses don't stop it, and no tile or zone hook fires.
+            Returns the cell ([x, y, map] on a map other than the
+            formula's)."""
+            eid = str(_eid(eid_t))
+            if y is None and (isinstance(x, (list, tuple)) or hasattr(x, "x")):
+                c = x
+                x, y = _coord_x(c), _coord_y(c)
+                if map is None:
+                    map = _coord_map(c)
+            cx = _cell_arg(x, "corpse_move", "x")
+            cy = _cell_arg(y, "corpse_move", "y")
+            dest = _map_arg(map, "corpse_move") if map is not None else None
+            try:
+                mp = match.corpse_move(eid, cx, cy,
+                                       dest.name if dest is not None else None)
+            except VTTError as ex:
+                raise FormulaError(f"corpse_move: {ex}")
+            if mp.name != _default_map_name():
+                return [cx, cy, mp.name]
+            return [cx, cy]
+
+        ns["corpse_var_set"] = _corpse_var_set
+        ns["corpse_var_del"] = _corpse_var_del
+        ns["corpse_move"]  = _corpse_move
         ns["all_corpses"]  = _all_corpses
         ns["corpse_has"]   = _corpse_has
         ns["corpse_var"]   = _corpse_var

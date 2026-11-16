@@ -2130,7 +2130,12 @@ hardcodes**.
   leading `!` negates, `|`
   alternatives (an alternative that doesn't parse reuses the previous kind and
   key); `show:<csv>` (incl. `status`), `sort:<var>[:desc]`, `count`, `ids`
-  (536-538, 631, 694-695); `sum:` / `avg:` / `min:` / `max:<var>` print
+  (536-538, 631, 694-695); a leading `dead` searches the corpses
+  (`_find_match_corpse` over the snapshot: vars through the reader,
+  statuses, tags, its `groups`, size category; `near:` / `within:` from
+  every cell of the body; `action:` refused), `all` the units then the
+  corpses, and `!foreach dead|all ; ...` sweeps them with `$id $x $y`
+  where a corpse lies (#454, 1198-1199); `sum:` / `avg:` / `min:` / `max:<var>` print
   the count and the total over the matches holding a finite number there,
   read through the query view and the var reader (#453, 1193).
 - **`!assert [--as eid] "<expr>" [msg]`**: read-only; a failure raises
@@ -2694,6 +2699,28 @@ hardcodes**.
   corpse_cell (None without a corpse), corpses_within(x, y, n, mode)
   (nearest body cell, #396, 1186), all_corpses, corpse_var / corpse_has,
   corpse_status_has / _get / _names; corpse / corpse_list action targets.
+- **Working with corpses** (#535, #268, #329, #454; user calls; 1195-1199):
+  `!ent info` / `info short` / `get` take a corpse's id
+  (`_query_unit_or_corpse`; a corpse the view can't see reads like a
+  missing unit, word for word): the description renders
+  `corpse_description_sections` (`CORPSE_DESCRIPTION_SECTIONS`, default
+  header, vitals, statuses, data, parts), the header from
+  `corpse_description_header_format`, the rest from the unit's section
+  formats over the snapshot (`_corpse_description`,
+  `_corpse_read_context`; vars through `corpse_reader_vars`). Writes
+  (`Match.corpse_var_set` / `corpse_var_del`; `!ent set_var` /
+  `delete_var`, `var_move` / `var_copy` with either end a corpse,
+  `corpse_var_set` / `corpse_var_del`): store checks only (whole-number
+  vitals that can't be deleted, text team, checked tags, no reserved or
+  derived size var, a footprint still on the map), no clamps, var hooks
+  or death check; each write lays a NEW record, so earlier states keep
+  theirs. Moves (`Match.corpse_move`, `!ent tp <corpse> x y [map]`,
+  `corpse_move(eid, x, y, map=)`): the body on the map and off voids,
+  units and corpses don't block, another map takes it along (not into a
+  map it holds as a wreck); no tile or zone hook fires (§8). The
+  non-host pre-check of `!ent` lets these subcommands
+  (`_ENT_CORPSE_SUBS`) name a visible corpse (`_typed_corpse` for the
+  writes: a host reaches any).
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
   `revert`; `!ent replace`, `replace_form`): swaps name, vars, passives,
   clamps and the part subtree; keeps id, position, facing, team, turn slot
@@ -4411,6 +4438,10 @@ rejected already. Update this section in the PR that resolves an item.
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
   only that pair. A layer-aware version of each is open (idea #563).
+
+- **Dragged corpses fire no hooks** (user: a known limitation; code it
+  when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross
+  tiles and zones without their enter / exit / stop hooks.
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose
