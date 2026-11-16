@@ -30,6 +30,7 @@ A forecast runs steps 1-2 and puts the match back as it was, RNG included.
 
 from __future__ import annotations
 
+from fractions import Fraction
 import contextvars
 import math
 from typing import Any, Dict, List, Optional, Tuple
@@ -517,7 +518,47 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
                trace: Optional[List[Dict[str, Any]]] = None
                ) -> Dict[str, Any]:
     """Take one packet to `target` (module docstring). Returns {raw,
-    taken, lost (per pool), components, dropped, notes, log, skipped}."""
+    taken, lost (per pool), components, dropped, notes, log, skipped}.
+
+    The target's death check is held from the first step through the
+    writes, the share and the hooks, then runs once (design §10.9):
+    on_damage_taken fires on a killing blow too, with the unit still in
+    the match at 0 hp, and a hook that heals it above 0 saves it. A step's
+    or a hook's own writes to the target wait for the same check (L54: a
+    step that wrote the defender's hp to 0 killed it at once, so the
+    packet found no hp to write, fired no hook and credited no killer)."""
+    from logic import PACKET_KILLER
+    held = (not forecast and isinstance(target, str)
+            and target in m.entities
+            and target not in m._death_check_deferred_ids)
+    if held:
+        m._death_check_deferred_ids.add(target)
+    try:
+        result = _packet(m, kind, target, damage, pool=pool, tags=tags,
+                         packet_tags=packet_tags, dealer=dealer,
+                         source=source, forecast=forecast, quiet=quiet,
+                         trace=trace)
+    finally:
+        if held:
+            m._death_check_deferred_ids.discard(target)
+    if held and target in m.entities:
+        token = PACKET_KILLER.set((m.id, target, result["dealer"]))
+        try:
+            result["log"].extend(m.check_death(target))
+        finally:
+            PACKET_KILLER.reset(token)
+    if result.get("wrote") and target in m.entities \
+            and m.entities[target].is_part:
+        _part_destroyed(m, kind, result)
+    return result
+
+
+def _packet(m: Any, kind: str, target: str, damage: Any, *,
+            pool: Any, tags: Any, packet_tags: Any,
+            dealer: Optional[str], source: Optional[str],
+            forecast: bool, quiet: bool,
+            trace: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """run_packet's work, inside its held death check."""
     info = kind_info(kind)
     if not isinstance(target, str) or target not in m.entities:
         raise NotFound(f"no unit `{target}` to take {info['noun']}.")
@@ -542,10 +583,25 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
     result["packet_tags"] = list(packet["tags"])
     notes: List[str] = result["notes"]
     pre = mark = rng = None
+    out_saved = sink_token = None
     if forecast:
         pre = m.to_dict(include_history=False)
         mark = m.history.mark()
         rng = m.rng_position()
+        # The lines the steps and the hooks they set off print go with the
+        # rollback (H1: a forecast printed a step's say() line and a status
+        # hook's line for a status it never applied); the step notes stay.
+        from logic import FORMULA_LOG_SINK
+        import copy as _copy
+        from action import _BufferCtx
+        out_saved = m._runtime_buffer
+        # The running action's buffer, with an output nobody shows (a
+        # cmd() line a step's nested action runs still has its identity).
+        throwaway = (_copy.copy(out_saved) if out_saved is not None
+                     else _BufferCtx("CLI"))
+        throwaway.out = []
+        m._runtime_buffer = throwaway
+        sink_token = FORMULA_LOG_SINK.set([])
     try:
         steps = ordered_steps(getattr(m, info["lib"]), kind)
         first = info["sides"][0]
@@ -565,8 +621,8 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
         e = m.entities.get(target)
         # A pool the target doesn't hold (stamina damage on a machine
         # with none): dropped.
-        for p in list(totals):
-            v = unit_var(e, p) if e is not None else None
+        for p in list(totals) if e is not None else ():
+            v = unit_var(e, p)
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 result["dropped"].append(p)
                 notes.append(f"ℹ️ `{target}` has no number at `{p}`: its "
@@ -576,12 +632,21 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
     finally:
         if forecast:
             from action import _rollback_match
+            from logic import FORMULA_LOG_SINK
             _rollback_match(m, None, pre)
             m.history.rewind(mark)
             m.set_rng(pos=rng)
+            m._runtime_buffer = out_saved
+            FORMULA_LOG_SINK.reset(sink_token)
     if forecast:
         _record_forecast(m, kind, target, result, rng)
-    if forecast or e is None or target not in m.entities:
+    if forecast:
+        return result
+    if e is None or target not in m.entities:
+        # A step removed its defender (remove_entity(self)).
+        result["skipped"] = "gone"
+        notes.append(f"ℹ️ `{target}` left the match during the "
+                     f"{info['noun']} steps: it takes nothing.")
         return result
     # A body part's share is worked out before anything is written, so a
     # bad knob (to_main_cap, a percent) refuses the whole hit.
@@ -594,32 +659,13 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
         except VTTError as ex:
             raise VTTError(f"damage_part `{target}`: {ex}"
                            if kind == "damage" else f"`{target}`: {ex}")
-    # The target's death check is held through the writes, the share and
-    # the hooks, then runs once (design §10.9): on_damage_taken fires on a
-    # killing blow too, with the unit still in the match at 0 hp, and a
-    # hook that heals it above 0 saves it. A hook's own writes to the
-    # target wait for the same check.
-    from logic import PACKET_KILLER
-    held = target not in m._death_check_deferred_ids
-    if held:
-        m._death_check_deferred_ids.add(target)
-    try:
-        _write_pools(m, kind, e, result, quiet)
-        _record(m, kind, result)
-        if e.is_part and share:
-            _send_share(m, kind, result, share, quiet)
-        _fire_hooks(m, kind, result)
-    finally:
-        if held:
-            m._death_check_deferred_ids.discard(target)
-    if held and target in m.entities:
-        token = PACKET_KILLER.set((m.id, target, result["dealer"]))
-        try:
-            result["log"].extend(m.check_death(target))
-        finally:
-            PACKET_KILLER.reset(token)
-    if target in m.entities and m.entities[target].is_part:
-        _part_destroyed(m, kind, result)
+    # (run_packet holds the target's death check around all of this.)
+    _write_pools(m, kind, e, result, quiet)
+    _record(m, kind, result)
+    if e.is_part and share:
+        _send_share(m, kind, result, share, quiet)
+    _fire_hooks(m, kind, result)
+    result["wrote"] = True
     return result
 
 
@@ -683,6 +729,15 @@ def _share_percent(m: Any, kind: str, part: Any, comp: Dict[str, Any],
     return pct
 
 
+def _exact(v: Any) -> Fraction:
+    """A number as an exact fraction, a float read as its decimal text."""
+    if isinstance(v, Fraction):
+        return v
+    if isinstance(v, float):
+        return Fraction(repr(v))
+    return Fraction(v)
+
+
 def _plan_share(m: Any, kind: str, result: Dict[str, Any], pre_hp: Any,
                 pre_max: Any) -> List[Dict[str, Any]]:
     """A body part's share to its parent (design §10.5): each component it
@@ -694,28 +749,36 @@ def _plan_share(m: Any, kind: str, result: Dict[str, Any], pre_hp: Any,
     part = m.entities.get(result["target"])
     if part is None or not part.part_of or part.part_of not in m.entities:
         return []
-    comps = [c for c in result["components"] if c["amount"] > 0]
+    # A component in a pool the part holds no number in was dropped from
+    # its writes, so it isn't part of what the part took (H3: the body got
+    # its share, and it shrank a capped hp share).
+    dropped = set(result.get("dropped") or [])
+    comps = [c for c in result["components"]
+             if c["amount"] > 0 and c["pool"] not in dropped]
     if not comps:
         return []
     tags = list(result.get("packet_tags") or [])
-    factor = 1.0
+    factor = Fraction(1)
     if kind == "damage":
         cap = str(part.vars.get("to_main_cap",
                                 m.rules.get("part_to_main_cap_default",
                                             "max_hp")))
-        whole = sum(c["amount"] for c in comps)
+        # Exact arithmetic (H4: 22 * (15 / 22) is 14.999... in floats, and
+        # the floor rounding wrote 14 where the cap gives 15).
+        whole = sum(_exact(c["amount"]) for c in comps)
         base = m._part_transfer_base(whole, int(_num(pre_hp)),
                                      int(_num(pre_max)), cap)
-        factor = base / whole
+        factor = Fraction(base) / whole
     mode = str(m.rules.get(
         "part_damage_share_mode" if kind == "damage"
         else "part_heal_share_mode", "true"))
     share: List[Dict[str, Any]] = []
     for c in comps:
         pct = _share_percent(m, kind, part, c, tags)
-        amt = c["amount"] * factor * pct / 100
-        if amt == 0:
+        exact = _exact(c["amount"]) * factor * _exact(pct) / 100
+        if exact == 0:
             continue
+        amt = int(exact) if exact.denominator == 1 else float(exact)
         ctags = list(c["tags"])
         if mode == "true" and info["true_tag"] not in ctags:
             ctags.append(info["true_tag"])

@@ -3787,13 +3787,44 @@ _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "__mount_death_effect"})
 
 
-def _hide_formula_at(path: str, value: Any) -> Any:
-    """`value`, read at the dotted `path`, as _hide_formula_fields shows it
-    (the last key decides for a text value: `actions.hit.body`)."""
+def _hide_formula_at(path: str, value: Any, root: Any = None) -> Any:
+    """`value`, read at the dotted `path` of `root` (a unit's vars, a
+    team's data), as _hide_formula_fields shows it inside its parents: the
+    last key decides for a text value (`actions.hit.body`), the parent's
+    key for a hook (`gear.ring.hooks.on_equip`) and the parent record for
+    a modifier's `value` (V26: only the last key was read, so those two
+    read raw one key deeper than their parent)."""
     if not FORMULA_TEXT_HIDDEN.get():
         return value
-    key = str(path).split(".")[-1] if path else "_"
-    return _hide_formula_fields({key: value})[key]
+    segs = str(path).split(".") if path else ["_"]
+    parent = root
+    for seg in segs[:-1]:
+        if isinstance(parent, dict):
+            parent = parent.get(seg)
+        elif isinstance(parent, list) and seg.lstrip("-").isdigit() \
+                and -len(parent) <= int(seg) < len(parent):
+            parent = parent[int(seg)]
+        else:
+            parent = None
+    # The parent's `stat` / `op` mark a modifier record; nothing else of
+    # it decides.
+    tree: Dict[str, Any] = {k: parent[k] for k in ("stat", "op")
+                            if isinstance(parent, dict) and k in parent}
+    tree[segs[-1]] = value
+    for seg in reversed(segs[:-1]):
+        tree = {seg: tree}
+    out: Any = _hide_formula_fields(tree)
+    for seg in segs:
+        out = out[seg]
+    return out
+
+
+def _formula_hidden_at(path: str, value: Any, root: Any) -> bool:
+    """Whether the text `value` at `path` of `root` is formula text this
+    caller may not read: `!find`'s selectors, `sort:` and aggregates read
+    it as missing (V26: `=` and `<` / `>` tested guesses against it)."""
+    return (isinstance(value, str) and FORMULA_TEXT_HIDDEN.get()
+            and _hide_formula_at(path, value, root) != value)
 
 
 def _hide_formula_fields(value: Any) -> Any:
@@ -13124,13 +13155,24 @@ async def _ent_group_dispatch(ctx, args, mgr, m, sub: str):
         # formula substitutions (self_id = the iterated member). Per-entity
         # errors are surfaced but don't abort the rest of the iteration —
         # one bad apple shouldn't silently drop the others.
+        failed = 0
         for eid in targets:
             sub_args = list(args)
             sub_args[1] = eid
+            watch = _ErrorWatchCtx(ctx)
             try:
-                await ent_cmd(ctx, sub_args, mgr)
+                await ent_cmd(watch, sub_args, mgr)
             except VTTError as ex:
                 await ctx.send(f"⚠️ `{eid}`: {ex}")
+                failed += 1
+                continue
+            if watch.error_seen:
+                failed += 1
+        if failed == len(targets):
+            # Every member refused (L55: one ⚠️ per member read as a
+            # partial success, so a strict batch ran on past it).
+            return await ctx.send(
+                f"❌ every member of `{group_name}` refused `!ent {sub}`.")
         return
     return await ctx.send(
         f"❌ !ent {sub} either doesn't support group targets, or isn't a "
@@ -13508,13 +13550,16 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     break
                 val = val[seg]
         else:
-            found, val = _entity_path_value(m, e, path, _query_pov(ctx, m))
+            found, val = _entity_path_value(m, e, path, _query_pov(ctx, m),
+                                            formulas=True)
         if not found:
             raise NotFound(f"`{args[1]}` has no var at `{path}` that this "
                            f"channel can read.")
         if not host:
             val = _without_engine_keys(val)
-        val = _hide_formula_at(path, val)
+        val = _hide_formula_at(
+            path, val, (m.reader_vars(e, _query_pov(ctx, m)) if e is not None
+                        else ((cloc[2].get("entity") or {}).get("vars"))))
         shown = (m.entity_display_name(e, _query_pov(ctx, m)) if e is not None
                  else str(((cloc[2].get("entity") or {}).get("name"))
                           or eid) + " (corpse)")
@@ -14036,14 +14081,17 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Entity '{aid}' not found.")
         if bid not in m.entities:
             raise NotFound(f"Entity '{bid}' not found.")
+        if aid == bid:
+            # A refusal (L55: it answered "No swap", and a strict batch ran
+            # on past it).
+            return await ctx.send(f"❌ `{aid}` can't swap with itself.")
         try:
             swapped, hook_log = m.swap_entities(aid, bid)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
         if not swapped:
             return await ctx.send(
-                f"No swap: `{aid}` and `{bid}` are the same entity "
-                f"or already share a cell."
+                f"No swap: `{aid}` and `{bid}` already share a cell."
             )
         # Movement hooks fire during the swap and can remove either unit.
         def _at(i):
@@ -17418,7 +17466,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Coordinate rulers {'ON' if m.coords_on() else 'OFF'} for "
             f"**{m.name}** ({how}).")
     if args and args[0].lower() == "legend":
-        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        if len(args) >= 2 and args[1].lower() not in ("on", "off"):
+            # A refusal like its siblings' (L55: it read as the state, so a
+            # strict batch ran on past it).
+            return await ctx.send("❌ Usage: `!map legend on|off` (or "
+                                  "one-off `!map legend=on`).")
+        if len(args) < 2:
             state = "ON" if m.map_legend_enabled else "OFF"
             return await ctx.send(
                 f"Auto-legend is {state} for **{m.name}**. "
@@ -17763,7 +17816,8 @@ def _resolve_dotted_var(vars_dict: Dict[str, Any], path: str) -> Tuple[bool, Any
 
 
 def _entity_path_value(m: Match, e: Entity, path: str,
-                       pov: Optional[str] = None) -> Tuple[bool, Any]:
+                       pov: Optional[str] = None,
+                       formulas: bool = False) -> Tuple[bool, Any]:
     """`!find`'s read of `path` on `e`: the reserved var paths (x / y / name,
     logic.RESERVED_VAR_PATHS) come from the entity's own fields, matching
     `entity[X].path` in formulas; anything else walks the vars. `name` is
@@ -17780,9 +17834,14 @@ def _entity_path_value(m: Match, e: Entity, path: str,
         return True, getattr(e, seg0)
     # Private vars (#70) read as missing to a reader who may not see them:
     # a selector, `show:` or `sort:` can't answer what the listing hides.
-    found, val = _resolve_dotted_var(m.reader_vars(e, pov), path)
+    rv = m.reader_vars(e, pov)
+    found, val = _resolve_dotted_var(rv, path)
     if found and path == e._team_var_name() and val is not None:
         val = str(val)      # team 1 and team "1" are one team (Entity.team)
+    if found and not formulas and _formula_hidden_at(path, val, rv):
+        # Formula text read as missing (`formulas`: the caller hides it
+        # itself, as `!ent get` shows `(hidden)`).
+        return False, None
     return found, val
 
 
@@ -18018,7 +18077,7 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
 
 
 def _corpse_path_value(m: Match, loc: Tuple[Any, ...],
-                       path: str) -> Tuple[bool, Any]:
+                       path: str, formulas: bool = False) -> Tuple[bool, Any]:
     """`!find`'s read of `path` on a corpse (#454): x / y from where it
     lies, `name` / `map` from the snapshot and its map, anything else from
     its vars as the command's reader may read them."""
@@ -18034,10 +18093,13 @@ def _corpse_path_value(m: Match, loc: Tuple[Any, ...],
     reader = VAR_READER.get()
     cv = (m.corpse_reader_vars(corpse, reader) if reader is not None
           else (ent.get("vars") or {}))
-    found, val = _resolve_dotted_var(cv if isinstance(cv, dict) else {}, path)
+    cv = cv if isinstance(cv, dict) else {}
+    found, val = _resolve_dotted_var(cv, path)
     if found and path == str(m.rules.get("team_var", "team")) \
             and val is not None:
         val = str(val)
+    if found and not formulas and _formula_hidden_at(path, val, cv):
+        return False, None
     return found, val
 
 
@@ -18286,6 +18348,20 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
             return _entity_path_value(m, h[1], path, pov)
         return _corpse_path_value(m, h[1][1], path)
 
+    def shown_value(h, path: str) -> Tuple[bool, Any]:
+        """A `show:` column: formula text as `(hidden)`, judged in its
+        parents (V26)."""
+        if h[0] == "unit":
+            found, v = _entity_path_value(m, h[1], path, pov, formulas=True)
+            root = m.reader_vars(h[1], pov)
+        else:
+            found, v = _corpse_path_value(m, h[1][1], path, formulas=True)
+            ent = h[1][1][2].get("entity") or {}
+            reader = VAR_READER.get()
+            root = (m.corpse_reader_vars(h[1][1][2], reader)
+                    if reader is not None else ent.get("vars"))
+        return found, (_hide_formula_at(path, v, root) if found else v)
+
     if output == "count" or aggregates:
         head = f"**{len(hits)}** {'match' if len(hits) == 1 else 'matches'}."
         if not aggregates:
@@ -18362,8 +18438,7 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                             st, dict) else ""
                     cells.append(f"{col}={names or '—'}")
                     continue
-                found, v = hit_value(h, col)
-                v = _hide_formula_at(col, v) if found else v
+                found, v = shown_value(h, col)
                 cells.append(f"{col}={v if found else '—'}")
             row += "  [" + ", ".join(cells) + "]"
         lines.append(row)
@@ -28325,7 +28400,8 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if v is _sent:
             return await ctx.send(f"team `{args[1]}`.{args[2]} is unset.")
         return await ctx.send(
-            f"team `{args[1]}`.{args[2]} = {_hide_formula_at(args[2], v)!r}")
+            f"team `{args[1]}`.{args[2]} = "
+            f"{_hide_formula_at(args[2], v, m.team_data.get(args[1]))!r}")
 
     if sub == "list":
         if len(args) >= 2:

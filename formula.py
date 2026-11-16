@@ -4881,6 +4881,16 @@ class FormulaEngine:
                     f"formula_loop_limit rule if a higher cap is "
                     f"intentionally needed."
                 )
+
+        def _loop_charge(n: int, what: str) -> None:
+            """Charge `n` steps of a built-in's own loop to
+            formula_loop_limit (X26: chain_targets scanned every unit per
+            link, uncharged)."""
+            self._loop_iters += n
+            if self._loop_iters > loop_limit:
+                raise FormulaError(
+                    f"{what} went past the formula loop limit "
+                    f"({loop_limit} steps, the formula_loop_limit rule).")
         def _rule_int(key: str, default: int) -> int:
             try:
                 return int(self._match.rules.get(key, default)) \
@@ -5942,18 +5952,29 @@ class FormulaEngine:
                 if isinstance(max_jump, bool) or not isinstance(max_jump, (int, float)):
                     raise FormulaError("chain_targets(...): max_jump must be a number.")
                 cap = float(max_jump)
-            visited = {start}
             cur = start
             out: list = []
-            while len(out) < n:
-                # Eligibility (relation) is judged against the ORIGIN; the jump
-                # distance is measured from the PREVIOUS link (`cur`).
+            # Eligibility (relation) is judged against the ORIGIN, so the
+            # pool is gathered once; each link examines what is left of it,
+            # every candidate a step of formula_loop_limit (X26: a chain
+            # through every unit cost the square of the unit count, with no
+            # limit charged).
+            pool = {oid: oe for oid, oe, _ref in _candidates(start, relation)}
+            while len(out) < n and pool:
+                # The jump distance is measured from the PREVIOUS link; with
+                # a max_jump only the units the cell index finds near it are
+                # examined, so a chain costs its length times the units
+                # near each link.
                 cur_e = match.entities.get(cur)
+                if cap is not None:
+                    near = [(oid, pool[oid]) for oid, _oe, _r in
+                            _candidates(cur, "", within=cap) if oid in pool]
+                else:
+                    near = list(pool.items())
+                _loop_charge(len(near), "chain_targets")
                 best_id = ""
                 best_d = None
-                for oid, oe, _ref in _candidates(start, relation):
-                    if oid in visited:
-                        continue
+                for oid, oe in near:
                     d = _ent_dist(cur_e, oe, "square_radius_distance")
                     if cap is not None and d > cap:
                         continue
@@ -5963,7 +5984,7 @@ class FormulaEngine:
                 if not best_id:
                     break
                 out.append(best_id)
-                visited.add(best_id)
+                del pool[best_id]
                 cur = best_id
             return out
 

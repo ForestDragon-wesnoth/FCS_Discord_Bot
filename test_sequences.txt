@@ -27900,7 +27900,7 @@ SCENARIO 880 — `!action ... map=<map>` aims a location action at another map
 !ent set_var hero actions.blink.target location
 !ent set_var hero actions.blink.body "entity[self].got = [target.x, target.y, target.map]\nmove_entity(self, target)"
 !action hero blink 4 4 map=deck
-?? `hero` used action `blink` on `(4,4)`.
+?? `Hero` used action `blink` on `(4,4)`.
 !assert "entity[hero].got == [4, 4, 'deck'] and map_of('hero') == 'deck' and entity[hero].x == 4"
 !action hero blink 3 3 map=nowhere
 ?? Could not find a map named `nowhere`
@@ -29744,7 +29744,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag_unless blind "entity[self].blindsight == True"
 !ent set_var hunter blindsight true
 !action hunter shoot wolf
-?? `hunter` used action `shoot` on `wolf`.
+?? `Hunter` used action `shoot` on `Wolf`.
 !assert "entity[wolf].hp == 5"
 !action hunter aimed_shot wolf
 ?? forbids `aimed_shot`.
@@ -29763,7 +29763,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag blind -
 ?? Cleared `blind` forbids_actions_with_tag.
 !action hunter bash wolf
-?? `hunter` used action `bash` on `wolf`.
+?? `Hunter` used action `bash` on `Wolf`.
 
 Expected: An action's tags are its own `tags` plus the `action_tags` of every
 container above it, the vars root included, nearest first, and `!action
@@ -29826,12 +29826,12 @@ SCENARIO 917 — Action tags: immune statuses on single and list targets, body r
 !assert "entity[knight].swept == ['rat']"
 !status apply knight flying
 !action knight hack bird
-?? `knight` used action `hack` on `bird`.
+?? `Knight` used action `hack` on `Bird`.
 !assert "entity[bird].hp == 5"
 !status dispel knight flying
 !ent status bird set flying immune_to_actions_with_tag ranged
 !action knight hack bird
-?? `knight` used action `hack` on `bird`.
+?? `Knight` used action `hack` on `Bird`.
 !action archer arrow bird
 ?? flying on `bird` blocks `ranged` actions.
 !assert "entity[bird].hp == 2"
@@ -29906,10 +29906,10 @@ SCENARIO 918 — Action tags: mounts, the system library, lint, malformed tag fi
 ?! failed
 !assert "entity[ogre].hp == 30"
 !action gun horn
-?? `gun` used action `horn`.
+?? `Gunner` used action `horn`.
 !ent set_var tank crew 3
 !action gun cannon ogre
-?? `gun` used action `cannon` on `ogre`.
+?? `Gunner` used action `cannon` on `Ogre`.
 !assert "entity[ogre].hp == 25"
 !status apply gun blind
 !action gun cannon ogre
@@ -30120,7 +30120,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action info druid raise
 ?? Target must match: `humanoid and not undead`
 !action druid command horse
-?? `druid` used action `command` on `horse`.
+?? `Druid` used action `command` on `Horse`.
 !action druid command zed
 ?? ❌ action `command`: [target_tags] `zed` doesn't fit `command`: its tags (mindless) don't match `animal`.
 !assert "entity[horse].commanded == True and not var_has('zed', 'commanded')"
@@ -30139,7 +30139,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action druid raise horse
 ?? ❌ action `raise`: [target_tags] `horse` doesn't fit `raise`: its tags (animal, rideable, corpse) don't match `humanoid and not undead`.
 !action druid raise bandit
-?? `druid` used action `raise` on `bandit`.
+?? `Druid` used action `raise` on `Bandit`.
 !assert "'bandit' in all_entities() and has_corpse('horse')"
 !status def feared
 !status cannot_affect_units_with_tag feared "mindless or construct"
@@ -30282,7 +30282,7 @@ SCENARIO 923 — One filter rule: modifiers, shields, status tag: tokens, restri
 !action hero smash foe
 ?? heavy_load on `hero` forbids `melee and heavy` actions.
 !action hero jab foe
-?? `hero` used action `jab` on `foe`.
+?? `Hero` used action `jab` on `Foe`.
 !zone new lava
 !zone add lava 2 2
 !zone tags lava "fire, hazard"
@@ -36973,7 +36973,7 @@ SCENARIO 1052 — Extra turns in an action: a Bard's inspire gives an ally withi
 !assert "extra_turn_queue() == [] and entity_distance('bard', 'archer') == 3"
 !assert "entity_distance('bard', 'knight') == 2"
 !action bard inspire knight
-?? `bard` used action `inspire` on `knight`.
+?? `Bard` used action `inspire` on `Knight`.
 !turn forecast 3
 ?? 1. `knight` **Knight** (extra)
 ?? 2. `archer` **Archer**
@@ -38886,7 +38886,7 @@ SCENARIO 1093 — A block reaction lowers the damage its attacker's prepare fore
 ?? (before it resolves)
 !react hero block
 ?? Hero picks `block`
-?? `orc` used action `cleave`
+?? `Orc` used action `cleave`
 !assert "entity[hero].hp == 26"
 !action orc cleave hero
 !react hero pass
@@ -39095,7 +39095,7 @@ SCENARIO 1098 — Protect: a bystander redirects the attack onto itself and halv
 !action orc burn 4 4
 !react guard protect
 ?? Guard's `protect` failed: [redirect]
-?? `orc` used action `burn`
+?? `Orc` used action `burn`
 !assert "reactions_used('guard', 'ever') == 1"
 
 Expected: The guard isn't a target: `protect` is a bystander reaction.
@@ -39160,7 +39160,7 @@ SCENARIO 1100 — Auto mode: auto_when reads the forecast; a never unit isn't of
 !ent set_var ally __reaction_mode never
 !action orc hit hero n=10
 ?? Hero doesn't react
-?? `orc` used action `hit`
+?? `Orc` used action `hit`
 !assert "entity[hero].hp == 50"
 !action orc hit hero n=30
 ?? Hero reacts with `block`
@@ -39258,7 +39258,7 @@ SCENARIO 1102 — A window past reaction_window_expiry_seconds closes as skipped
 !as wait 31
 !list
 ?? The reaction window ran out (reaction_window_expiry_seconds); it closes as skipped
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 !assert "entity[hero].hp == 20"
 
 Expected: The rule counts from when the window opened (`!as wait`, the
@@ -39286,7 +39286,7 @@ SCENARIO 1103 — reactions_used counts uses since a point; a limit is a line in
 !react hero block
 !action orc slash hero
 ?! !react hero block
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 !assert "reactions_used('hero') == 1 and reactions_used('hero', 'ever') == 1"
 !assert "reactions_used('hero', 'turn') == 1 and reactions_used('hero', 'round') == 1"
 !assert "reactions_used('hero', 'action') == 0"
@@ -39366,7 +39366,7 @@ SCENARIO 1105 — A combo answers its holder's own attack, also inside another a
 !ent set_var orc actions.twice.target entity
 !ent set_var orc actions.twice.body "use_action(self, 'slash', target)"
 !action orc slash hero
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 ?? `!react orc combo`
 !react orc combo
 !assert "entity[hero].hp == 24"
@@ -39374,7 +39374,7 @@ SCENARIO 1105 — A combo answers its holder's own attack, also inside another a
 ?? (started by `twice`) has resolved
 !assert "entity[hero].hp == 24"
 !react orc combo
-?? `orc` used action `twice`
+?? `Orc` used action `twice`
 !assert "entity[hero].hp == 18"
 !ent set_var orc actions.combo.self_trigger false
 !action orc slash hero
@@ -39417,7 +39417,7 @@ SCENARIO 1106 — A gunner's seat reaction defends its vehicle (#36)
 !assert "entity[tank].hp == 40 and entity['gun'].fired == 1"
 !mount dismount gun
 !action orc shoot tank
-?? `orc` used action `shoot`
+?? `Orc` used action `shoot`
 !assert "entity[tank].hp == 31"
 
 Expected: The flak reaction lives in the tank's `gunner` seat: it is
@@ -39459,7 +39459,7 @@ SCENARIO 1107 — A multi-tile body: its parts and every covered cell bring its 
 !assert "entity[drake].hp == 49"
 !system set default reactions_cover_parts false
 !action orc shoot wing
-?? `orc` used action `shoot`
+?? `Orc` used action `shoot`
 !assert "entity[wing].hp == 7"
 
 Expected: The 2x2 drake's located wing is struck: with
@@ -39487,7 +39487,7 @@ SCENARIO 1108 — target_condition: checked when used and again at resolution (#
 !action orc zap hero
 !react hero vanish
 ?? Hero drops out of `zap`: Hero no longer meets `zap`'s target condition
-?? `orc` used action `zap`
+?? `Orc` used action `zap`
 !assert "entity[hero].hp == 30 and entity[orc].zaps == 1"
 !action orc zap hero
 ?? ❌ action `zap`: [target_condition] `hero` doesn't meet `zap`'s target condition.
@@ -39791,7 +39791,7 @@ SCENARIO 1117 — A reaction's own action is a react point: a riposte's stab is 
 !react
 ?? (started by `riposte`)
 !react orc dodge
-?? `hero` used action `stab`
+?? `Hero` used action `stab`
 !assert "entity[orc].hp == 30 and entity[orc].dodged == 1 and entity[hero].riposted == 1"
 !assert "reactions_used('hero', 'ever') == 1 and reactions_used('orc', 'ever') == 1"
 !react
@@ -39876,7 +39876,7 @@ SCENARIO 1119 — A passive's and an !eval's actions open their windows; use_act
 ?? = `None`
 !assert "entity[hero].hp == 30"
 !react hero parry
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 !assert "entity[hero].hp == 28"
 !passive add orc rage on_turn_start "entity[self].raged = use_action(self, 'slash', 'hero')"
 !turn next
@@ -39919,11 +39919,11 @@ SCENARIO 1120 — Actions started while a window is open wait in a queue (#36)
 !react
 ?? Reactions to Orc's `slash` on Hero
 !react hero pass
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 ?? Orc's `kick` on Hero: reactions are offered
 !assert "entity[hero].hp == 24"
 !react hero parry
-?? `orc` used action `kick`
+?? `Orc` used action `kick`
 !assert "entity[hero].hp == 24"
 !react
 ?? No reaction window is open
@@ -39959,7 +39959,7 @@ SCENARIO 1121 — A paused step survives a restart, a host's skip and an undo (#
 ?? (started by `twice`): reactions are offered
 !assert "var_has('orc', 'r1') == False and entity[hero].hp == 30"
 !react skip
-?? `orc` used action `twice`
+?? `Orc` used action `twice`
 !assert "entity[orc].done == 1 and entity[hero].hp == 24"
 !assert "var_has('orc', 'r1') and var_has('orc', 'r2')"
 !undo command confirm
@@ -41175,14 +41175,14 @@ SCENARIO 1148 — The action-used line names its target (action_used_message_for
 !ent set_var hunter actions.rest.body "x = 1"
 !ent set_var bird tags flying
 !action hunter shoot boss
-?? `hunter` used action `shoot` on `boss`.
+?? `Hunter` used action `shoot` on `Boss`.
 !action hunter volley boss bird
 ?? dropped a target
-?? `hunter` used action `volley` on `boss`.
+?? `Hunter` used action `volley` on `Boss`.
 !action hunter mark 3 7
-?? `hunter` used action `mark` on `(3,7)`.
+?? `Hunter` used action `mark` on `(3,7)`.
 !action hunter rest
-?? `hunter` used action `rest`.
+?? `Hunter` used action `rest`.
 ?! `rest` on
 !system set default action_used_message_format "{actor_name} uses {action}{?target?} on {target_name}{/?}!"
 !ent set_var boss team red
@@ -41208,9 +41208,10 @@ Expected: the line a successful action ends with names what it was used
 on: the 2x2 boss, the list as the checks left it (the flying bird
 dropped by target_refuses_tags, so only `boss`), a cell as (x,y), and
 nothing for an action without a target (`{?target?}...{/?}` leaves the
-" on ..." out). A custom format's {actor_name} / {target_name} print as
-the channel's view sees each unit: in a blue-view channel the red boss
-reads as its disguise (Rock), in an unbound channel the real names. An
+" on ..." out). The default and a custom format print {actor_name} /
+{target_name} as the channel's view sees each unit: in a blue-view
+channel the red boss reads as its disguise (Rock), in an unbound channel
+the real names (Hunter, Boss). An
 empty format prints no line. Boss took 3 damage from each of three
 shoots (40 → 31).
 
@@ -41494,10 +41495,10 @@ SCENARIO 1153 — A cell target in the action-used line and the event log while 
 !ent set_var mage actions.bolt.target location
 !ent set_var mage actions.bolt.body "x = 1"
 !action mage bolt 4 4
-?? `mage` used action `bolt` on `(4,4)`.
+?? `Mage` used action `bolt` on `(4,4)`.
 !ent set_var orc actions.thorns.after "x = 1"
 !action mage bolt 4 4
-?? `mage` used action `bolt` on `(4,4)`.
+?? `Mage` used action `bolt` on `(4,4)`.
 ?! main
 !log 2
 ?? used `bolt` → (4,4).
@@ -41858,7 +41859,7 @@ SCENARIO 1161 — An open reaction window holds a macro's lines, `!dry` and `!si
 ?? 1 run(s) had a ❌ / ❓ reply
 !assert "entity[hero].hp == 30 and turns_elapsed() == 1"
 !react hero sidestep
-?? `orc` used action `cleave`
+?? `Orc` used action `cleave`
 !assert "entity[hero].hp == 26 and entity[hero].x == 4"
 !macro run round
 ?? It is now **Hero**'s turn
@@ -41953,10 +41954,10 @@ SCENARIO 1163 — A pause stops the commands a host opened to players, and holds
 ?? `!action ogre wave` is held
 !assert "entity[ogre].waved == 0 and entity[ogre].y == 3"
 !match resume
-?? `ogre` used action `wave`.
+?? `Ogre` used action `wave`.
 !as player bob
 !action ogre wave
-?? `ogre` used action `wave`.
+?? `Ogre` used action `wave`.
 !as host
 !assert "entity[ogre].waved == 2"
 

@@ -627,7 +627,14 @@ def _refresh_done(m: Any, ex: Dict[str, Any]) -> None:
 def _action_line(m: Any, ex: Dict[str, Any]) -> str:
     targets = unit_targets(ex["target_type"], ex.get("target"))
     on = (" on " + ", ".join(_name(m, t) for t in targets)) if targets else ""
-    return f"{_name(m, ex['actor'])}'s `{ex['name']}`{on}"
+    return f"{_actor_name(m, ex)}'s `{ex['name']}`{on}"
+
+
+def _actor_name(m: Any, ex: Dict[str, Any]) -> str:
+    """The exchange's actor as the reply names it: a unit added under a
+    gone actor's id isn't its actor (H2)."""
+    return ("a departed unit" if ex.get("actor_gone")
+            else _name(m, ex["actor"]))
 
 
 def window_text(m: Any, ex: Dict[str, Any]) -> List[str]:
@@ -1192,9 +1199,9 @@ async def _advance(env: _Env, seq: int) -> str:
             env.start[seq] = (m.to_dict(include_history=False),
                               m.history.mark())
         if _incoming_action(m, ex) is None or ex["eff_actor"] not in \
-                m.entities:
+                m.entities or ex.get("actor_gone"):
             ex["outcome"], ex["phase"], ex["gone"] = "cancelled", "done", True
-            env.out.append(f"⚠️ {_name(m, ex['actor'])}'s `{ex['name']}` "
+            env.out.append(f"⚠️ {_actor_name(m, ex)}'s `{ex['name']}` "
                            f"doesn't resolve: the action or its unit is "
                            f"gone. Nothing runs.")
             env.finished[seq] = "cancelled"
@@ -1288,9 +1295,10 @@ async def _body_phase(env: _Env, seq: int) -> str:
     m = env.m
     ex = _ex(m, seq)
     act = _incoming_action(m, ex)
-    if act is None or ex["eff_actor"] not in m.entities:
+    if act is None or ex["eff_actor"] not in m.entities \
+            or ex.get("actor_gone"):
         ex["outcome"] = ex["ended"] = "cancelled"
-        env.out.append(f"⚠️ {_name(m, ex['actor'])}'s `{ex['name']}` doesn't "
+        env.out.append(f"⚠️ {_actor_name(m, ex)}'s `{ex['name']}` doesn't "
                        f"resolve: the action or its unit is gone.")
         return "ok"
     origin = (int(ex.get("depth", 0)), True)
@@ -1663,6 +1671,13 @@ async def begin(ctx: Any, mgr: Any, m: Any, action: Any, *,
                 extra_ctx: Optional[Dict[str, Any]],
                 via: Optional[str], rider_mode: bool) -> None:
     """A typed action that may open a reaction window (design §3)."""
+    refusal = _body_less(action)
+    if refusal is not None:
+        # Refused before an exchange takes a number (L54: the refusal
+        # changed reaction_seq, so it was an undo step and a journal
+        # entry while changing nothing a user sees).
+        return await ctx.send(f"❌ action `{action.name}`: [reaction] "
+                              f"{refusal}")
     with _Runtime(m, ctx, mgr):
         ok, why, pout, target, used = await _prepare(
             ctx, mgr, m, action, eff_actor_id, target, args, answers,
@@ -1692,6 +1707,16 @@ async def begin(ctx: Any, mgr: Any, m: Any, action: Any, *,
 # ----------------------------------------------------------------------
 # Actions a formula starts (#36: react points and the queue)
 # ----------------------------------------------------------------------
+
+def _body_less(action: Any) -> Optional[str]:
+    """Why `action` can't be used as an action (a reaction with no body
+    of its own runs only through !react), else None."""
+    if getattr(action, "reaction", None) is not None and \
+            not str(getattr(action, "body", "") or "").strip():
+        return (f"`{action.name}` is a reaction: it runs through `!react` "
+                f"while a reaction window offers it.")
+    return None
+
 
 def _sync(coro) -> Any:
     from action import _sync_dispatch_returning
@@ -1749,6 +1774,9 @@ def formula_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
     except (TypeError, ValueError):
         limit = 2
     step = REACT_STEP.get()
+    if _body_less(action) is not None:
+        # run_action refuses it without an exchange (L54).
+        return _plain_use(m, mgr, ctx, action, eid, target, args, "")
     if not has_holders(m):
         return _plain_use(m, mgr, ctx, action, eid, target, args, "")
     if not reactable:
@@ -1811,6 +1839,21 @@ def _queue_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
     watcher): its window opens now and the formula carries on (None), or
     it waits its turn in the queue while another window is open."""
     from action import _BufferCtx
+    if m.reaction_stack:
+        # A bounded queue (X25: each queued action's prepare copies the
+        # match, queue included, so a loop of use_action calls cost the
+        # square of its length, and nothing bounded what it saved).
+        try:
+            limit = int(m.rules.get("reaction_queue_limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        if len(m.reaction_queue) >= limit:
+            msg = (f"the reaction queue already holds "
+                   f"{len(m.reaction_queue)} action(s) (reaction_queue_limit "
+                   f"{limit}); `{action.name}` doesn't wait.")
+            m.surface_log([m.unit_tag(eid) + f"❌ action `{action.name}`: "
+                           f"{msg}"])
+            return False, ("", msg)
     buf = _BufferCtx.for_ctx(ctx)
     ok, why, pout, target, _used = _sync(_prepare(
         buf, mgr, m, action, eid, target, args, [], None))
@@ -1818,6 +1861,7 @@ def _queue_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
         m.surface_log(list(buf.out))
         buf.out.clear()
     if not ok:
+        _fail_line(m, action, why)
         return False, why
     notes: List[str] = []
     ex, refusal = _new_exchange(

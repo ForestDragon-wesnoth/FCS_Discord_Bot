@@ -5013,7 +5013,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "action_used_message_format": {
-        "default": "`{actor}` used action `{action}`{?target?} on `{target}`{/?}.",
+        # Names through the view's markers (V25: the ids named a hidden
+        # actor in a team-view channel that resolved its window).
+        "default": ("`{actor_name}` used action `{action}`{?target?} on "
+                    "`{target_name}`{/?}."),
         "schema": {"type": "str"},
         "desc": (
             "The line a successful `!action` (or `!ent action`) ends with. "
@@ -5156,6 +5159,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "program (an action's own `cancelled_action_cost` field "
             "overrides it). refund (default): it pays nothing. pay: its "
             "`cost` runs anyway (the mana of a countered spell is spent)."
+        ),
+    },
+    "reaction_queue_limit": {
+        "default": 50,
+        "schema": {"type": "int", "min": 0, "max": 1000, "ceiling": True},
+        "desc": (
+            "How many actions may wait in the reaction queue: an action a "
+            "formula outside any action starts (a passive, a watcher, "
+            "`!eval`) while a reaction window is open waits there for its "
+            "own window. Past this count such a use_action is refused with "
+            "a line (each queued action costs the next a copy of the match, "
+            "and the host closes the windows one at a time). 0 = none "
+            "wait: they are refused while a window is open."
         ),
     },
     "reaction_depth_limit": {
@@ -10327,6 +10343,14 @@ class Entity:
             m.round_acted = [x for x in m.round_acted if x != self.id]
         if (despawn or not (corpse_kept or self.part_of)):
             m.own_turn_counts.pop(self.id, None)
+            # An open or queued exchange whose actor leaves for good doesn't
+            # resolve (H2: it named its actor by id, so a unit added later
+            # under the id answered the window with its own action).
+            for ex in list(m.reaction_stack) + list(m.reaction_queue):
+                if isinstance(ex, dict) and self.id in (
+                        ex.get("actor"), ex.get("eff_actor"),
+                        ex.get("holder_unit")):
+                    ex["actor_gone"] = True
         m._scrub_entity_from_groups(self.id)
         # Drop any entity-attached scheduled effects bound to this entity
         # — a dead/despawned entity's pending turn-delayed effects don't
@@ -20959,7 +20983,10 @@ class Match:
             if self.extra_turn is None:
                 out.append({"eid": order[ptr], "round": rnd, "now": True,
                             "skip": []})
-            acted.add(order[ptr])
+            # A unit the round rests on (every unit skippable) holds the
+            # turn unmarked, so the next `!turn next` skips it again this
+            # round (L54: the forecast left that skip out); any other turn
+            # holder is in round_acted already.
         elif self.turn_vacated == "wrap":
             ptr = len(order) - 1
         elif not live and order[ptr] not in acted:
@@ -20984,7 +21011,18 @@ class Match:
                 acted.add(order[j])
         # Queued extra turns come right after the turn under way (before
         # the first turn, after it). Marked by the -1 round placeholder.
-        at = 0 if self.round_started else min(1, len(upcoming))
+        at = 0
+        if not self.round_started and upcoming:
+            # The first turn is the first unit no skips_turn status passes
+            # over (L54: a grant before the first turn was listed after a
+            # stunned unit's skip, while the engine runs it after the next
+            # unit's turn).
+            at = len(upcoming)
+            for i, (_r, eid) in enumerate(upcoming):
+                e = self.entities.get(eid)
+                if e is None or not self._skipping_statuses(e):
+                    at = i + 1
+                    break
         upcoming[at:at] = [(-1, eid) for eid in self.extra_turns]
         want = n
         if want is None:
@@ -30496,7 +30534,18 @@ class Match:
         if marks:
             mg = (mark_glyph or "*")[0]
             for (mx, my) in marks:
-                if mp.in_bounds(mx, my) and (mx, my) not in unit_shown:
+                # in_rect: a void a fogged view can't see is in the marks
+                # (the preview counts it like the fog around it) and is
+                # drawn like it too (V24+: it was left as fog, outlining
+                # the hole).
+                hidden_void = (
+                    (mx, my) in mp.voids and mp.in_rect(mx, my)
+                    and pov_team is not None and self.fog_on(mp)
+                    and "fog" not in hidden
+                    and self.rules.get("void_under_fog", "show") == "fog"
+                    and not self._fog_terrain_visible(pov_team, mx, my, mp))
+                if (mp.in_bounds(mx, my) or hidden_void) \
+                        and (mx, my) not in unit_shown:
                     grid[my][mx] = mg
                     colors[my][mx] = None
                     if meanings is not None:
