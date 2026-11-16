@@ -1265,6 +1265,21 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
 
     bot.add_listener(_load_owners, "on_ready")
 
+    async def _label_servers():
+        # Each server folder gets a file naming its server (the folder is
+        # the numeric id), refreshed at every start in case of a rename.
+        st = getattr(workspaces, "storage", None)
+        if st is None:
+            return
+        for guild in list(getattr(bot, "guilds", []) or []):
+            name = str(getattr(guild, "name", "") or guild.id)
+            st.label_server(str(guild.id), name, force=True)
+            w = workspaces.peek(str(guild.id))
+            if w is not None:
+                w.guild_name = name
+
+    bot.add_listener(_label_servers, "on_ready")
+
     async def _dispatch(ctx, bound_root: str):
         mgr = _workspace(ctx)
         if mgr is None:

@@ -43656,3 +43656,60 @@ their vars as the player may read them (the private gm_note is missing to
 a selector and to `show:`). `!ent info` on the hidden corpse answers like
 a missing unit. A host's sweep acts on the whole board, as a unit sweep
 does.
+
+SCENARIO 1200 — A server's data folder carries a file naming the server, replaced when the name changes; the owner listings read it for a server not in memory
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+!as server 726172087244292166
+!match new sol Sol 6 6
+!as servername Solis RP: main/test
+?? wrote `0 server - Solis RP_ main_test.txt` in its folder
+?file list
+?? 0 server - Solis RP_ main_test.txt
+?file show 0 server - Solis RP_ main_test.txt
+?? Discord server: Solis RP: main/test
+?? Server id: 726172087244292166
+!as servername Solis
+?? wrote `0 server - Solis.txt`
+?file list
+?? 0 server - Solis.txt
+?! Solis RP
+!as server local
+!as idle 13
+?? Unloaded: `726172087244292166`
+!owner servers
+?? **Solis** (`726172087244292166`): not loaded
+!owner storage
+?? **Solis** (`726172087244292166`)
+!as server 726172087244292166
+!match
+?? sol
+?file list
+?? 0 server - Solis.txt
+
+Expected: `!as servername` plays the bot's startup for this server: the
+workspace takes the name Discord gives it and the folder gets `0 server -
+<name>.txt` (sorted first; characters no file system takes become `_`),
+whose first lines name the server and its id. A new name replaces the file.
+Once the server leaves memory, `!owner servers` and `!owner storage` name
+it from the file; the server loads again as before (the file isn't data).
+
+SCENARIO 1201 — A new server's first save writes its name file; the local workspace has none
+---------------------------------------------------------------------------------------------
+!as servername Anything
+?? ❌ The local workspace has no server name
+!as server 1294368645421727806
+!as servername Fresh Server
+?? its folder doesn't exist yet
+?file list
+?? 0 server - Fresh Server.txt
+!as servername <>:*?
+?? wrote `0 server - _____.txt`
+!as servername
+?? ❌ Usage: !as servername <name ...>
+HARNESS-ALLOWS-ERRORS
+
+Expected: a server whose folder doesn't exist yet takes the name, and
+the save that ends the same command (its first, which makes the folder)
+writes the file: the commit after any command writes it when the name
+differs from the one last written. The local workspace (CLI / GUI) has no Discord
+name. A name made only of characters a file name can't hold leaves `_`s.

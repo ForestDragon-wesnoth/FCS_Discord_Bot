@@ -58,7 +58,7 @@ from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name, legacy_template_fixes,
                    LEGACY_IDS_OK, owner_limit, unreachable_id,
-                   check_role_perms, state_text)
+                   check_role_perms, state_text, LOCAL_WORKSPACE)
 from match_history import MatchHistory, HistoryError, _now_iso
 from journal import start_header
 
@@ -101,6 +101,33 @@ SERVER_LOGS: Dict[str, Tuple[str, str]] = {
     "syshist": ("system_history.json", "system_history"),
     "audit": ("audit.json", "audit_log"),
 }
+
+
+# A text file at the top of each Discord server's folder naming the server
+# (the folder is its numeric id): `0 server - <name>.txt`. Written at bot
+# startup for every server with a folder, and after a command whose server
+# name differs from the one last written (a new server's first save, a
+# rename); a rename replaces the file. The bot never loads it; `!owner
+# servers` / `!owner storage` read it for a server not in memory.
+SERVER_LABEL_PREFIX = "0 server - "
+SERVER_LABEL_SUFFIX = ".txt"
+SERVER_LABEL_NAME_MAX = 80
+_LABEL_BAD_CHARS = set('<>:"/\\|?*')
+
+
+def server_label_file(name: str, key: str) -> str:
+    """The label file's name for server `name`: characters no file system
+    takes become `_`, whitespace runs one space, cut at
+    SERVER_LABEL_NAME_MAX, the key when nothing is left."""
+    text = "".join("_" if (c in _LABEL_BAD_CHARS or ord(c) < 32) else c
+                   for c in str(name))
+    text = " ".join(text.split())[:SERVER_LABEL_NAME_MAX].rstrip(" .")
+    return f"{SERVER_LABEL_PREFIX}{text or key}{SERVER_LABEL_SUFFIX}"
+
+
+def _is_label_file(fname: str) -> bool:
+    return (fname.startswith(SERVER_LABEL_PREFIX)
+            and fname.endswith(SERVER_LABEL_SUFFIX))
 
 
 def _disk_state(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -193,6 +220,8 @@ class Storage:
         # The matches whose files the last commit of each server rewrote:
         # a journaled match changed from outside its channel shows up here.
         self.last_changed: Dict[str, set] = {}
+        # Server key -> the name its label file was last written with.
+        self._labels: Dict[str, str] = {}
         self._load_settings()
         # The owner's rule ceilings are process-wide (logic.RULE_CEILINGS).
         RULE_CEILINGS.clear()
@@ -516,6 +545,63 @@ class Storage:
             path = os.path.join(self.root, key)
             self._usage[key] = _dir_size(path) if os.path.isdir(path) else 0
         return self._usage[key]
+
+    # ---- server label file ---------------------------------------------
+    def label_server(self, key: str, name: str, force: bool = False) -> bool:
+        """Write server `key`'s label file (SERVER_LABEL_PREFIX) naming
+        `name`, replacing an older one, when its folder exists. Without
+        `force`, only when `name` differs from the name last written in this
+        process. Returns whether it wrote. The local workspace has none."""
+        if key == LOCAL_WORKSPACE or not self.has_server(key):
+            return False
+        name = str(name)
+        if not force and self._labels.get(key) == name:
+            return False
+        sdir = self.server_dir(key)
+        fname = server_label_file(name, key)
+        text = (f"Discord server: {name}\n"
+                f"Server id: {key}\n"
+                f"Written by the bot on "
+                f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}.\n\n"
+                f"This folder holds that server's data. The bot writes this "
+                f"file at startup and when the server's name changes; editing "
+                f"or deleting it changes nothing else.\n")
+        path = os.path.join(sdir, fname)
+        delta = -_file_size(path)
+        try:
+            _write_text(path, text)
+            delta += _file_size(path)
+            for other in os.listdir(sdir):
+                opath = os.path.join(sdir, other)
+                if (other != fname and _is_label_file(other)
+                        and os.path.isfile(opath)):
+                    delta -= _file_size(opath)
+                    os.remove(opath)
+        except OSError as ex:
+            print(f"⚠️ [{key}] couldn't write the server name file: {ex}")
+            return False
+        finally:
+            self._add_usage(key, delta)
+        self._labels[key] = name
+        return True
+
+    def label_on_disk(self, key: str) -> Optional[str]:
+        """The server name server `key`'s label file holds, if it has one."""
+        if not self.has_server(key):
+            return None
+        sdir = os.path.join(self.root, key)
+        for fname in sorted(os.listdir(sdir)):
+            if not _is_label_file(fname):
+                continue
+            try:
+                with open(os.path.join(sdir, fname), encoding="utf-8") as f:
+                    first = f.readline()
+            except (OSError, UnicodeDecodeError):
+                continue
+            head = "Discord server: "
+            if first.startswith(head):
+                return first[len(head):].rstrip("\n") or None
+        return None
 
     def server_breakdown(self, key: str) -> List[Tuple[str, int]]:
         """Server `key`'s disk use by part, largest first: each match (its

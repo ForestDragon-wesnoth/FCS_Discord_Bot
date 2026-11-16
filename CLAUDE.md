@@ -180,7 +180,8 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   storage layer's back (it rescans its usage), then `!as restart` shows
   what a load does with it (864-866). `?file set <path> <a.b.c> <json>` /
   `?file replace <path> "<old>" "<new>"` write a file in the shape an
-  older build left it (868, 874).
+  older build left it (868, 874); `?file list [dir]` / `?file show <path>`
+  read the folder (1200).
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
@@ -713,6 +714,18 @@ plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
   files' copies are for an operator to copy back by hand. A commit over the
   limit cuts the oldest copies after old template versions, keeping each
   file's newest unless this commit writes a new one.
+- **Server name file:** each Discord server's folder (named by its
+  numeric id) holds `0 server - <name>.txt` (`storage.server_label_file`:
+  characters no file system takes become `_`), whose first lines give the
+  server's name and id. `Storage.label_server` writes it at bot startup
+  for every server with a folder (`_label_servers`, an on_ready listener
+  in discord_commands.py) and after a commit whose `mgr.guild_name`
+  differs from the name last written (a new server's first save, a rename
+  seen since startup); a new name replaces the old file. Loads ignore it,
+  wipes leave it, `local` has none; `!owner servers` / `!owner storage`
+  read it (`label_on_disk`) for a server not in memory. `!as servername
+  <name>` (CLI / harness) plays the startup step; the harness's `?file
+  list [dir]` / `?file show <path>` read the folder (1200-1201).
 - **A replaced manager doesn't save:** `persist_workspace` skips a manager
   its workspace no longer holds (after `!as restart`, the old one's state
   would overwrite what was loaded).

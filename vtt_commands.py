@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any, Set, Tuple
 from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 from match_history import MatchHistory, Snapshot, HistoryError, _now_iso
-from storage import storage_of, valid_id, fmt_bytes
+from storage import storage_of, valid_id, fmt_bytes, server_label_file
 from prefab import capture_prefab, check_prefab, check_prefab_name, stamp_prefab, system_allows, Turn, PREFAB_KINDS
 
 #used for Gamesystem-related commands
@@ -1973,6 +1973,10 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
                   "command."]
     else:
         mgr._save_failure_ref = None
+        if mgr.guild_name != mgr.guild_key:
+            # The folder's name file (storage.SERVER_LABEL_PREFIX): a new
+            # server's first save, or a rename seen since startup.
+            st.label_server(mgr.guild_key, mgr.guild_name)
     if msgs and ctx is not None:
         await ctx.send("\n".join(msgs))
     if ws is not None:
@@ -5517,7 +5521,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -5533,6 +5537,9 @@ def _mention(user_id: Optional[str]) -> str:
         "test harness): `!as server <key>` moves you into another server's "
         "workspace — its own systems, matches and saves, as on Discord where "
         "each server is separate; `!as server local` (or bare) returns. "
+        "`!as servername <name>` gives this server the name Discord would, "
+        "as the bot's startup reads it: the workspace takes the name and "
+        "its data folder's name file (`0 server - <name>.txt`) is written. "
         "`!as restart` reloads every server from the data folder, as a bot "
         "restart would (unsaved runtime state — pending requests, `!again` — "
         "is gone). `!as idle <hours>` moves every loaded server's last "
@@ -5657,6 +5664,28 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Now in server `{key}`'s workspace (its own systems, matches "
             f"and saves).")
+    if role == "servername":
+        if not getattr(ctx, "workspace_switchable", False):
+            return await ctx.send(
+                "❌ This surface has a single workspace; `!as servername` "
+                "works in the CLI and the scenario harness.")
+        if mgr.guild_key == LOCAL_WORKSPACE:
+            return await ctx.send(
+                "❌ The local workspace has no server name; `!as server "
+                "<key>` first.")
+        name = " ".join(args[1:]).strip()
+        if not name:
+            return await ctx.send("❌ Usage: !as servername <name ...>")
+        mgr.guild_name = name
+        st = storage_of(mgr)
+        if st is not None and st.label_server(mgr.guild_key, name,
+                                              force=True):
+            return await ctx.send(
+                f"Server `{mgr.guild_key}` is named **{name}**; wrote "
+                f"`{server_label_file(name, mgr.guild_key)}` in its folder.")
+        return await ctx.send(
+            f"Server `{mgr.guild_key}` is named **{name}**; its folder "
+            f"doesn't exist yet, so its first save writes the name file.")
     if role == "view":
         target = args[1].lower() if len(args) >= 2 else "omniscient"
         if target == "clear":
@@ -5817,7 +5846,9 @@ async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for key in sorted(set(loaded) | set(on_disk)):
             w = loaded.get(key)
             if w is None:
-                lines.append(f"- `{key}`: not loaded (on disk, loads on its "
+                disk = st.label_on_disk(key) if st is not None else None
+                label = f"**{disk}** (`{key}`)" if disk else f"`{key}`"
+                lines.append(f"- {label}: not loaded (on disk, loads on its "
                              f"next command)")
                 continue
             here = " ← this one" if w is mgr else ""
@@ -6007,6 +6038,8 @@ async def _owner_storage(ctx, args: List[str], mgr: MatchManager):
     ws = getattr(mgr, "workspaces", None)
     names = {k: w.guild_name for k, w in (ws.items() if ws is not None else [])}
     for key in sorted(k for k in st._usage if k != TRASH_DIR):
+        if key not in names:
+            names[key] = st.label_on_disk(key) or key
         label = f"**{names[key]}** (`{key}`)" if key in names and names[key] != key \
             else f"`{key}`"
         lines.append(f"- {label}: {fmt_bytes(st.server_usage(key))} of "
