@@ -2593,6 +2593,54 @@ _FMT_NAME = re.compile(r"(\d+|[A-Za-z_]\w*)(?::(.*))?\Z", re.S)
 _FMT_SPEC = re.compile(r"[<>^]?[+-]?\d{0,3}(?:\.\d{1,2})?[dfeg%s]?\Z")
 
 
+def _plural(n: Any, word: Any, plural: Any = None) -> str:
+    """plural(n, word, plural=None): the count with the word in the form
+    it takes: plural(1, 'arrow') is '1 arrow', plural(3, 'arrow') '3
+    arrows'; an irregular form as the third argument (plural(2, 'wolf',
+    'wolves')). English rules: an s, or es after s / x / z / ch / sh."""
+    if isinstance(n, bool) or not _is_num(n):
+        raise FormulaError(f"plural(n, word): n must be a number, got "
+                           f"{_echo(n)}.")
+    if not isinstance(word, str) or (plural is not None
+                                     and not isinstance(plural, str)):
+        raise FormulaError("plural(n, word, plural=None): word and plural "
+                           "must be text.")
+    count = int(n) if n == int(n) else n
+    if count == 1:
+        return f"{count} {word}"
+    if plural is None:
+        low = word.lower()
+        plural = word + ("es" if low.endswith(("s", "x", "z", "ch", "sh"))
+                         else "s")
+    return f"{count} {plural}"
+
+
+def _ordinal(n: Any) -> str:
+    """ordinal(n): a whole number as an English ordinal: 1st, 2nd, 3rd,
+    4th, 11th, 12th, 13th, 21st, 102nd."""
+    if isinstance(n, bool) or not _is_num(n) or n != int(n):
+        raise FormulaError(f"ordinal(n): n must be a whole number, got "
+                           f"{_echo(n)}.")
+    k = int(n)
+    if abs(k) % 100 in (11, 12, 13):
+        suf = "th"
+    else:
+        suf = {1: "st", 2: "nd", 3: "rd"}.get(abs(k) % 10, "th")
+    return f"{k}{suf}"
+
+
+def _list_text(items: Any, word: Any = "and") -> str:
+    """list_text(items, word='and'): a list as English text: 'a', 'a and
+    b', 'a, b and c' ('or' as the second argument gives 'a, b or c'); an
+    empty list is ''."""
+    if not isinstance(word, str):
+        raise FormulaError("list_text(items, word='and'): word must be text.")
+    parts = [_text_of(v) for v in _list_arg(items, "list_text")]
+    if len(parts) <= 1:
+        return "".join(parts)
+    return f"{', '.join(parts[:-1])} {word} {parts[-1]}"
+
+
 def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
          **kwargs: Any) -> str:
     """fmt(template, a, b, ..., name=value, ...): the template with each
@@ -2736,6 +2784,9 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "replace": _replace,
     "join": _join,
     "fmt": _fmt,
+    "plural": _plural,
+    "ordinal": _ordinal,
+    "list_text": _list_text,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -3237,6 +3288,12 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # A unit by its id: in the match at all / living (#326); the cell past
     # a unit's body seen from a unit or a cell (#270).
     "exists", "is_alive", "cell_behind",
+    # The teams in play and the group names (#395); the units on a cell
+    # list (#457); a counter of a unit's own turns (#539); whether a body
+    # fits at a cell (#540) and every spot where it does (#522); a
+    # corpse's cell and the corpses near a cell (#396).
+    "teams", "group_names", "entities_in_cells", "own_turns", "fits_at",
+    "free_cells_near", "corpse_cell", "corpses_within",
 )
 
 # ----------------------------------------------------------------------------
@@ -3306,6 +3363,8 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "reactions_used",
+    "teams", "group_names", "entities_in_cells", "own_turns", "fits_at",
+    "free_cells_near", "corpse_cell", "corpses_within",
     "exists", "is_alive", "cell_behind",
     "last_damage", "last_healing", "status_source",
     "is_void", "void_cells", "zone_can_move",
@@ -3406,13 +3465,13 @@ _TUPLE_FREE_FUNCS = frozenset(_MATCH_FUNC_NAMES) | frozenset(_ALLOWED_FUNCS)
 _MAP_CELL_RESULT_FUNCS: "frozenset[str]" = frozenset({
     "first_opaque", "raycast", "free_cell_near", "clip_cells",
     "cells_in_burst", "cells_in_line", "cells_in_cone", "cells_in_rect",
-    "tiles_with_tag", "void_cells",
+    "tiles_with_tag", "void_cells", "free_cells_near",
 })
 # Unit searches taking `tag=` (a tag filter the units' tags must match).
 _TAG_ARG_FUNCS: "frozenset[str]" = frozenset({
     "entities_within", "entities_in_area", "entities_in_cone",
     "entities_in_rect", "entities_in_zone", "entities_at",
-    "visible_entities",
+    "visible_entities", "entities_in_cells",
 })
 
 # The changes after which a formula's zone grants settle (#136): a zone's
@@ -3437,6 +3496,7 @@ _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "team_sees_cell", "team_sees_cell_rangeonly", "team_sees_cell_losonly",
     "can_see", "can_see_rangeonly", "can_see_losonly", "has_los",
     "is_void", "void_add", "void_remove", "zone_place",
+    "entities_in_cells", "corpses_within", "fits_at",
 })
 assert _MAP_ARG_FUNCS <= _TUPLE_FREE_FUNCS, (
     _MAP_ARG_FUNCS - _TUPLE_FREE_FUNCS)
@@ -3572,6 +3632,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
     "prefab_names", "size_categories", "next_turns", "extra_turn_queue",
     "void_cells", "status_layers",
+    "teams", "group_names", "entities_in_cells", "free_cells_near",
+    "corpses_within",
     "range",
     "each",
     "keys",
@@ -5124,17 +5186,27 @@ class FormulaEngine:
             return roll_table_pick(_active_rng(), spec)
         ns["roll_table"] = _roll_table
 
-        def _table_roll(name: Any) -> str:
-            """table_roll("loot"): roll a NAMED table stored on the match
-            (Match.tables, authored via `!table def`). Returns the picked key.
-            Replay-safe via the match RNG."""
+        def _table_roll(name: Any, n: Any = None) -> Any:
+            """table_roll(name, n=None): roll a NAMED table stored on the
+            match (Match.tables, authored via `!table def`). Returns the
+            picked key; with n, a list of n picks (at most
+            roll_repeat_limit). Replay-safe via the match RNG."""
             if not isinstance(name, str) or not name.strip():
                 raise FormulaError("table_roll(name): name must be a string.")
             tables = getattr(match, "tables", {}) or {}
             spec = tables.get(name.strip())
             if spec is None:
                 raise FormulaError(f"table_roll: no table named '{name}'.")
-            return roll_table_pick(_active_rng(), spec)
+            if n is None:
+                return roll_table_pick(_active_rng(), spec)
+            cap = _rule_int("roll_repeat_limit", 20)
+            if isinstance(n, bool) or not isinstance(n, int) \
+                    or not 1 <= n <= cap:
+                raise FormulaError(
+                    f"table_roll(name, n): n must be a whole number from 1 "
+                    f"to {cap} (roll_repeat_limit), got {_echo(n)}.")
+            rng = _active_rng()
+            return [roll_table_pick(rng, spec) for _ in range(n)]
         ns["table_roll"] = _table_roll
 
         def _eid(token: Any) -> str:
@@ -8759,6 +8831,21 @@ class FormulaEngine:
         ns["revert"]       = _revert
         ns["has_corpse"]   = _has_corpse
         ns["corpse_at"]    = _corpse_at
+
+        def _corpse_cell(eid_t: Any) -> Any:
+            """corpse_cell(eid): the cell the corpse of `eid` lies on (its
+            body's top-left cell; [x, y, map] when it lies on a map other
+            than the formula's own), or None when there is no such corpse:
+            corpse_at without the error, for a range check before a
+            loot."""
+            eid = str(_eid(eid_t))
+            loc = match.find_corpse(eid)
+            if loc is None:
+                return None
+            if loc[3].name != _default_map_name():
+                return [loc[0], loc[1], loc[3].name]
+            return [loc[0], loc[1]]
+        ns["corpse_cell"]  = _corpse_cell
         ns["all_corpses"]  = _all_corpses
         ns["corpse_has"]   = _corpse_has
         ns["corpse_var"]   = _corpse_var
@@ -9698,6 +9785,21 @@ class FormulaEngine:
             return int(match.turns_elapsed)
         ns["turns_elapsed"] = _turns_elapsed
 
+        def _own_turns(eid_t: Any, acted: Any = False) -> int:
+            """own_turns(eid, acted=False): how many turns the unit has
+            begun in this match, extra turns included, under rounds and ATB
+            alike; a turn a skips_turn status passed over counts too, and
+            acted=True leaves those out. A cooldown in the owner's turns:
+            the action stores `ready_at = own_turns(self) + 3` and its
+            condition reads `own_turns(self) >= entity[self].ready_at`. A
+            unit that leaves for good (no corpse) starts again at 0."""
+            eid = str(_eid(eid_t))
+            if eid not in match.entities and match.find_corpse(eid) is None:
+                raise FormulaError(f"own_turns: no unit '{eid}'.")
+            c = match.own_turn_counts.get(eid) or [0, 0]
+            return int(c[1] if acted else c[0])
+        ns["own_turns"] = _own_turns
+
         def _next_turns(n=None) -> List[str]:
             """next_turns(n=None): the ids of the next n turns as the turn
             forecast predicts them (`!turn forecast`): the board as it
@@ -10409,6 +10511,81 @@ class FormulaEngine:
             return [eid for _, eid in scored]
         ns["entities_in_area"] = _entities_in_area
 
+        def _entities_in_cells(cells: Any, relation: Any = None,
+                               of: Any = None) -> list:
+            """entities_in_cells(cells, relation=None, tag=None, of=None):
+            the alive units covering any cell of a cell list (the reader for
+            shapes built with cells_union / cells_minus / cells_intersect),
+            each once, in the order of the first of its cells the list
+            names. A cell [x, y, map] is on that map, [x, y] on the
+            formula's (or map=). A large body counts if any covered cell is
+            listed; glued parts and riders hidden in a vehicle are left out,
+            as in the other area searches. `relation` (any / hostile / ally /
+            same_team / attackable) is judged against `of`, default self;
+            `tag=` keeps the units whose tags match a filter. Loopable."""
+            keys = [_cell_key(c, "entities_in_cells")
+                    for c in _list_arg(cells, "entities_in_cells")]
+            _cell_budget(len(keys), "entities_in_cells", cell_limit)
+            rel = "" if relation is None else relation
+            if not isinstance(rel, str):
+                raise FormulaError("entities_in_cells(...): relation must "
+                                   "be a string.")
+            ref = None
+            if rel not in ("", "any"):
+                if of is not None:
+                    ref, _ = _resolve_entity(of, "entities_in_cells")
+                elif ctx.target:
+                    ref = ctx.target
+                else:
+                    raise FormulaError(
+                        "entities_in_cells(...): a relation is judged "
+                        "against a unit: pass of=<unit> (self is unbound "
+                        "here).")
+            here = _cur_map().name
+            out: list = []
+            seen: set = set()
+            for k in keys:
+                mname = k[2] if len(k) == 3 else here
+                if mname not in match.maps:
+                    raise FormulaError(
+                        f"entities_in_cells(...): this match has no map "
+                        f"named `{mname}`.")
+                for eid in sorted(match._spatial.at(match, mname, k[0],
+                                                    k[1])):
+                    e = match.entities.get(eid)
+                    if eid in seen or e is None or not _on_board(e):
+                        continue
+                    if ref is not None and (eid == ref or not _relation_ok(
+                            rel, ref, eid)):
+                        continue
+                    seen.add(eid)
+                    out.append(eid)
+            return out
+        ns["entities_in_cells"] = _entities_in_cells
+
+        def _corpses_within(x: Any, y: Any, n: Any,
+                            mode: Any = "square_radius_distance") -> list:
+            """corpses_within(x, y, n, mode='square_radius_distance'): the
+            ids of the corpses on the formula's map (or map=) whose body
+            comes within distance n of the cell (x, y), nearest first (ties
+            by id): a corpse target range-checked, the bones a necromancer
+            reaches. Loopable."""
+            _distance(x, y, x, y, mode)
+            if isinstance(n, bool) or not isinstance(n, (int, float)):
+                raise FormulaError(
+                    f"corpses_within(...): n (the radius) must be a number, "
+                    f"got {type(n).__name__}.")
+            mp = _cur_map()
+            scored = []
+            for cx, cy, cid, corpse in match.all_corpses(mp):
+                d = min(_distance(x, y, fx, fy, mode)
+                        for fx, fy in match.corpse_cells(cx, cy, corpse, mp))
+                if d <= n:
+                    scored.append((d, cid))
+            scored.sort(key=lambda t: (t[0], t[1]))
+            return [cid for _, cid in scored]
+        ns["corpses_within"] = _corpses_within
+
         # Shape-rooted entity queries: the entity-returning twins of the
         # cells_in_* helpers. Each builds the shape's cells then collects
         # the alive entities standing on them.
@@ -10979,6 +11156,121 @@ class FormulaEngine:
         ns["cell_opaque"] = _cell_opaque
         ns["free_cell_near"] = _free_cell_near
         ns["team_members"] = _team_members
+
+        def _fits_at(eid_t: Any, x: Any, y: Any, mode: Any = "tp") -> bool:
+            """fits_at(eid, x, y, mode='tp'): whether the whole unit could
+            stand with its top-left cell at (x, y) (of map=, else its own
+            map): every cell of its body on the map and free of other units
+            (its own body, segments and riders don't count; on another map
+            its located parts at their offsets too, as a cross-map move
+            carries them), and no cell blocking a move of
+            `mode` (tp / walk / push / swap: the block_<mode> rule and the
+            block conditions; none = occupancy only). For a location
+            target's target_condition ("a cell where I fit"), so a
+            teleport refuses a bad cell before any cost is paid."""
+            _, e = _resolve_entity(eid_t, "fits_at")
+            cx = _cell_arg(x, "fits_at", "x")
+            cy = _cell_arg(y, "fits_at", "y")
+            if mode not in ("tp", "walk", "push", "swap", "none", None):
+                raise FormulaError(
+                    f"fits_at(...): mode must be tp, walk, push, swap or "
+                    f"none, got {mode!r}.")
+            w, h = match.entity_footprint(e)
+            _cell_budget(w * h, "fits_at", cell_limit)
+            return match.body_fits_at(
+                e, cx, cy, None if mode in ("none", None) else mode,
+                _explicit_map() or match.map_of(e))
+
+        def _free_cells_near(x: Any, y: Any, radius: Any, eid_t: Any = None,
+                             fit: Any = "body") -> list:
+            """free_cells_near(x, y, radius, eid=None, fit='body'): every
+            cell within `radius` (Chebyshev rings, nearest first, in
+            free_cell_near's order) where a unit could stand, as a list of
+            coordinates. With `eid` the unit's whole body must fit there
+            (clear of other units, not movement-blocked for it) and `fit`
+            says how the body relates to the searched square: body (all of
+            it inside), center (its centre cell), any (one cell) or anchor
+            (its top-left cell); without, the empty cells. For a choose()
+            of where a summon appears, or "is there room for three?".
+            Charged to formula_cell_limit. Loopable."""
+            cx = _cell_arg(x, "free_cells_near", "x")
+            cy = _cell_arg(y, "free_cells_near", "y")
+            if isinstance(radius, bool) or not isinstance(radius, int) \
+                    or radius < 0:
+                raise FormulaError(
+                    "free_cells_near(...): radius must be a whole number "
+                    ">= 0.")
+            e = None
+            if eid_t is not None:
+                _, e = _resolve_entity(eid_t, "free_cells_near")
+            mp = _explicit_map() or (match.map_of(e) if e is not None
+                                     else _cur_map())
+            area = set()
+            order = {}
+            for r in match._ring_radii(cx, cy, radius, mp):
+                for c in match._ring_cells(cx, cy, r, mp):
+                    order[c] = len(order)
+                    area.add(c)
+            w, h = match.entity_footprint(e) if e is not None else (1, 1)
+            _cell_budget(len(area) * w * h, "free_cells_near", cell_limit)
+            try:
+                found = match.free_anchors_in_area(area, e, str(fit),
+                                                   mp=mp)
+            except VTTError as ex:
+                raise FormulaError(f"free_cells_near(...): {ex}")
+            far = len(order)
+
+            def rank(c):
+                # An anchor outside the square (fit center / any) ranks by
+                # its ring distance from the search centre.
+                if c in order:
+                    return (order[c],)
+                return (far + max(abs(c[0] - cx), abs(c[1] - cy)),
+                        c[1], c[0])
+            return [[a, b] for a, b in sorted(found, key=rank)]
+
+        def _teams() -> list:
+            """teams(): the teams in play: those of living units (a body
+            part counts as its body's team), in the order they first act,
+            then teams known only from corpses or team data, by name. For
+            "each team" loops and scoring. Loopable."""
+            out: list = []
+            units = list(match.entities_in_turn_order())
+            ids = {e.id for e in units}
+            units += [e for _i, e in sorted(match.entities.items())
+                      if _i not in ids]
+            for e in units:
+                if not e.is_alive:
+                    continue
+                t = match._root_team(e)
+                if t not in (None, "") and str(t) not in out:
+                    out.append(str(t))
+            rest = set()
+            team_var = str(match.rules.get("team_var", "team"))
+            for _mp, _x, _y, _cid, corpse in match.every_corpse():
+                ent = corpse.get("entity") if isinstance(corpse, dict) \
+                    else None
+                cv = ent.get("vars") if isinstance(ent, dict) else None
+                t = cv.get(team_var) if isinstance(cv, dict) else None
+                if t not in (None, ""):
+                    rest.add(str(t))
+            for e in match.entities.values():
+                t = match._root_team(e)
+                if t not in (None, ""):
+                    rest.add(str(t))
+            rest.update(str(t) for t in match.team_data if t)
+            out.extend(sorted(rest - set(out)))
+            return out
+
+        def _group_names() -> list:
+            """group_names(): the names of the match's unit groups (`!ent
+            group`), sorted. Loopable."""
+            return sorted(match.groups)
+
+        ns["fits_at"] = _fits_at
+        ns["free_cells_near"] = _free_cells_near
+        ns["teams"] = _teams
+        ns["group_names"] = _group_names
 
         def _zone_distance(eid_t: Any, zone: Any,
                            mode: Any = "square_radius_distance") -> Any:

@@ -2918,6 +2918,11 @@ def _entity_template_context(e: Entity,
                 pv = e._match.presented_vars(e, pov_team)
                 ctx["size"] = pv.get(size_n, "")
                 ctx["size_class"] = pv.get(size_t, "")
+    # A destroyed body part says so (#587): `{state}` and the
+    # `{?destroyed?}...{/?}` conditional; a GM var of either name wins.
+    destroyed = bool(e.is_part and e.vars.get("__part_destroyed"))
+    ctx.setdefault("state", "destroyed" if destroyed else "")
+    ctx.setdefault("destroyed", destroyed)
     # The unit's full tag set (own, granted, engine), as the viewer's
     # disguise presents it; `tags_sourced` names where each came from.
     if e._match is not None:
@@ -7409,10 +7414,72 @@ def _fmt_age(seconds: float) -> str:
     return f"{s // 3600} h {s % 3600 // 60} min"
 
 
+def _template_has_path(tpl: Dict[str, Any], path: str, resolver: Match,
+                       trules: Dict[str, Any],
+                       reader: Optional[VarReader]) -> bool:
+    """`!template list has=<path>` (#456): whether the template, expanded
+    (its partial references resolved), holds the dotted var path, as the
+    reader may read it: an entity template's vars, a partial's data."""
+    try:
+        exp = _expanded_template(tpl, resolver)
+    except VTTError:
+        return False
+    partial = _is_partial(tpl)
+    view = reader_template({"kind": "partial", "data": exp} if partial
+                           else exp, trules, reader)
+    cur: Any = view.get("data" if partial else "vars")
+    for seg in path.split("."):
+        if not isinstance(cur, dict) or seg not in cur:
+            return False
+        cur = cur[seg]
+    return True
+
+
 def _expanded_template(tpl: Dict[str, Any], m: Match) -> Dict[str, Any]:
     """`tpl` with every partial reference resolved (markers dropped): what a
     spawn or a give gets (Match.expand_template)."""
     return m.expand_template(tpl)
+
+
+def _no_turn_order_text(ctx: ReplyContext, m: Match) -> str:
+    """`!turn next` with an empty turn order (#538): which units stand
+    outside it (no initiative var; those the channel's view shows) and the
+    ways in."""
+    pov = _query_pov(ctx, m)
+    init_var = str(m.rules.get("turnorder_var", "initiative"))
+    out = [e.id for _i, e in sorted(m.entities.items())
+           if e.is_alive and not e.is_part and e.id not in m.turn_order
+           and not _pov_hides(m, pov, e.id)]
+    if not out:
+        return "No turn order yet: the match has no units that take turns."
+    names = ", ".join(f"`{i}`" for i in out[:10]) + (
+        f" and {len(out) - 10} more" if len(out) > 10 else "")
+    return (f"No turn order yet: no unit has an `{init_var}`, so none "
+            f"takes turns ({names}). `!ent init <id> <n>` gives one unit "
+            f"its place, `!turn roll` rolls for every unit "
+            f"(initiative_roll_formula), and default_entity_vars (`!defvar "
+            f"add {init_var} <n>`) starts every new unit with one.")
+
+
+def _clone_spot(m: Match, src: Entity, mp: "Map",
+                near: Optional[int]) -> Optional[Tuple[int, int]]:
+    """Where `!ent clone` without coordinates puts a copy of `src` (#590):
+    the anchor nearest the source's body centre (rings outward, ties by y
+    then x, as a dismount) where its whole footprint is on map `mp`, clear
+    of every unit (the source's own body included) and not tp-blocked;
+    with `near`, within that many cells of the source's body."""
+    w, h = m.entity_footprint(src)
+    avoid = set(m.entity_cells(src)) if src.map == mp.name else set()
+    for p in m.entity_part_subtree(src.id):
+        if p.vars.get("__part_located") and p.map == mp.name:
+            avoid.update(m.entity_cells(p))
+    spot = m._nearest_fit_cell(src, src.x + (w - 1) / 2,
+                               src.y + (h - 1) / 2, mp, avoid=avoid)
+    if spot is None or near is None:
+        return spot
+    gap = m._rect_gap(spot[0], spot[1], w, h, src.x, src.y, w, h,
+                      "square_radius")
+    return spot if gap <= near else None
 
 
 def _spawn_many(m: Match, name: str, tpl: Dict[str, Any], x: int, y: int,
@@ -7507,9 +7574,12 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "list":
         usage = ("!template list [kind=<entity|partial>] [by=<user>] "
-                 "[tag=<filter>] [prefix]")
+                 "[tag=<filter>] [has=<var.path>] [prefix]")
         words, opts = _template_options(args, 1, usage,
-                                        allowed=("kind", "by", "tag"))
+                                        allowed=("kind", "by", "tag", "has"))
+        has_path = opts.get("has")
+        if has_path is not None:
+            check_store_path(str(has_path), "var path")
         if len(words) > 1:
             raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
                            f"`{usage}`.")
@@ -7542,6 +7612,11 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                      str(mgr.templates[n].get("saved_by") or "").lower()))
                  and (tag_filter is None
                       or tag_filter_matches(tags[n], tag_filter))]
+        if has_path is not None:
+            with private_templates_hidden(viewer):
+                names = [n for n in names if _template_has_path(
+                    mgr.templates[n], str(has_path), resolver, trules,
+                    reader)]
         if not names:
             return await ctx.send("\n".join(_template_read_note(reader) + [
                 "No template matches those filters."]))
@@ -8372,9 +8447,11 @@ for _subs, _usage, _desc in (
         (("give",), "!template give <partial> <unit> <path>",
          "Build a partial template into a unit's var path (replacing what is "
          "there); the unit's own changes to it are recorded from then on."),
-        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [prefix]",
+        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [has=<var.path>] [prefix]",
          "This server's saved templates; kind= keeps entity or partial "
-         "templates, by= those a user saved, tag= those whose tags match a "
+         "templates, by= those a user saved, has= those whose vars (a "
+         "partial's data), expanded, hold that dotted path "
+         "(`has=actions.bite`), tag= those whose tags match a "
          "tag filter (a list = any of them, or an expression such as "
          "`\"undead and not boss\"`), a prefix those whose name starts "
          "with it."),
@@ -12742,10 +12819,37 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # add
     if sub == "add":# and len(args) >= 6:
         args, mapspec = _pop_map_opt(args)
+        # `key=value` words are the unit's starting vars (#434): written
+        # before it spawns, as a template's values are (no var hooks), a
+        # dotted key nesting (`stats.str=3`).
+        extra_vars: Dict[str, Any] = {}
+        positional = [args[0]]
+        for tok in args[1:]:
+            key, sep, raw = tok.partition("=")
+            if not sep or len(positional) < 6:
+                positional.append(tok)
+                continue
+            if not key:
+                raise VTTError(f"`{tok}` isn't key=value.")
+            check_store_path(key, "var path")
+            if raw.startswith("$("):
+                raw = resolve_arg_token(raw, m)
+            node = extra_vars
+            segs = key.split(".")
+            for seg in segs[:-1]:
+                nxt = node.setdefault(seg, {})
+                if not isinstance(nxt, dict):
+                    raise VTTError(f"`{key}` nests under `{seg}`, which "
+                                   f"holds a value.")
+                node = nxt
+            if segs[-1] in node:
+                raise VTTError(f"`{key}` is given twice.")
+            node[segs[-1]] = _parse_scalar(raw)
+        args = positional
         if await return_help_if_not_enough_args(ctx, args, 6, "ent", "add"):
             return
         _check_tail(args, 7, ("map",), "!ent add <id> <name> <hp> <x> <y> [init] "
-                    "[map=<map>] (set other vars with !ent set_var)")
+                    "[map=<map>] [<var>=<value> ...]")
         # One placement: a match with several maps names it.
         amp = _one_map(ctx, m, mapspec, strict=True)
         eid, name = args[1], args[2]
@@ -12761,9 +12865,24 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         initial_vars = {hp_var: hp, max_hp_var: hp}
         if init is not None:
             initial_vars[init_var] = init
+        for key in (hp_var, init_var):
+            if key in extra_vars and key in initial_vars:
+                raise VTTError(f"`{key}` is given twice (as a number in its "
+                               f"place and as `{key}=`).")
+        initial_vars.update(extra_vars)
         e = Entity(id=eid, name=name, x=x, y=y, vars=initial_vars)
         _, spawn_log = e.spawn(m, x, y, map_name=amp.name)
         msg = f"Added `{name}` with id `{eid}` at ({x},{y}){_on_map(m, amp)}."
+        if extra_vars:
+            msg += " Vars: " + ", ".join(
+                f"{k}={_clip(repr(v), 30)}" for k, v in extra_vars.items()) \
+                + "."
+        # Outside the turn order until it has an initiative (#538).
+        if init_var not in e.vars and eid in m.entities \
+                and eid not in m.turn_order:
+            msg += (f"\nℹ️ `{eid}` has no `{init_var}`, so it stands outside "
+                    f"the turn order: `!ent init {eid} <n>` or `!turn roll` "
+                    f"puts it in.")
         if spawn_log:
             msg += "\n" + "\n".join(spawn_log)
         return await ctx.send(msg)
@@ -13489,11 +13608,49 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # dropping a squad of identical mooks without retyping !ent add.
         # All-or-nothing: every target cell and every generated id is
         # validated before any clone is created.
-        if await return_help_if_not_enough_args(ctx, args, 5, "ent", "clone"):
+        # Without coordinates (#590) the copies land as a dismount does: on
+        # the free cell nearest the source's body where the whole body fits
+        # (count=<n> copies, near=<r> bounding the search).
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "clone"):
             return
         src_id = _resolve_eid(m, args[1])
         new_id_base = args[2]
         coord_tokens, map_spec = _pop_map_opt(args[3:])
+        clone_count: Optional[int] = None
+        clone_near: Optional[int] = None
+        rest_tokens = []
+        for t in coord_tokens:
+            key, eq, val = t.partition("=")
+            if eq and key in ("count", "near"):
+                try:
+                    n = int(val)
+                except ValueError:
+                    return await ctx.send(
+                        f"❌ `{key}=` takes a whole number, got `{val}`.")
+                if n < (1 if key == "count" else 0):
+                    return await ctx.send(
+                        f"❌ `{key}=` must be at least "
+                        f"{1 if key == 'count' else 0}.")
+                if key == "count":
+                    clone_count = n
+                else:
+                    clone_near = n
+            else:
+                rest_tokens.append(t)
+        coord_tokens = rest_tokens
+        if coord_tokens and (clone_count is not None
+                             or clone_near is not None):
+            return await ctx.send(
+                "❌ `count=` and `near=` go with a clone placed by itself; "
+                "with coordinates, give one `x y` pair per copy.")
+        auto_place = not coord_tokens
+        if auto_place:
+            limit = int(m.rules.get("summon_event_limit", 50) or 50)
+            if (clone_count or 1) > max(1, limit):
+                return await ctx.send(
+                    f"❌ `count=` is at most {max(1, limit)} "
+                    f"(summon_event_limit).")
+            coord_tokens = ["0", "0"] * (clone_count or 1)
         if len(coord_tokens) % 2 != 0:
             return await ctx.send(
                 "❌ coordinates must come in `x y` pairs."
@@ -13525,6 +13682,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ entity id `{cid}` already exists (or is "
                     f"duplicated in this batch)."
                 )
+            if auto_place:
+                seen_ids.add(cid)
+                plan.append((cid, 0, 0))
+                continue
             if not cmap.in_bounds(x, y):
                 return await ctx.send(
                     f"❌ ({x},{y}) {cmap.off_text(x, y)}"
@@ -13552,8 +13713,19 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # so far stayed on the board beside the ❌.
         from action import _rollback_match
         pre_clone = m.to_dict(include_history=False)
+        placed_plan: List[Tuple[str, int, int]] = []
         try:
             for cid, x, y in plan:
+                if auto_place:
+                    spot = _clone_spot(m, src, cmap, clone_near)
+                    if spot is None:
+                        raise VTTError(
+                            f"no free cell fits `{src_id}`'s body"
+                            + (f" within {clone_near} of it"
+                               if clone_near is not None else "")
+                            + f" for `{cid}`")
+                    x, y = spot
+                placed_plan.append((cid, x, y))
                 # Clone the WHOLE part subtree (parents before children) so a
                 # multi-part creature keeps its limbs, remapping part_of / __follows
                 # onto the new ids and STRIPPING the mount link (a clone is never
@@ -13609,6 +13781,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except VTTError as ex:
             _rollback_match(m, mgr, pre_clone)
             return await ctx.send(f"❌ {ex} — nothing was cloned.")
+        plan = placed_plan
         if single:
             cid, x, y = plan[0]
             msg = f"Cloned `{src_id}` → `{cid}` at ({x},{y}){_on_map(m, cmap)}."
@@ -14060,9 +14233,13 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "add",
-    usage="!ent add <id> <name> <hp> <x> <y> [init] [map=<map>]",
+    usage="!ent add <id> <name> <hp> <x> <y> [init] [map=<map>] [key=value ...]",
     desc=("Create and place a new entity; optional initiative. On a match "
-          "with several maps name the map with `map=<name>`.")
+          "with several maps name the map with `map=<name>`. `key=value` "
+          "words give it starting vars (`team=red speed=2`, a dotted key "
+          "nesting: `stats.str=3`), set before it arrives like a "
+          "template's values. Without an initiative the unit stands "
+          "outside the turn order, and the reply says so.")
 )
 registry.annotate_sub(
     "ent", "remove", #"del", "rm",
@@ -14217,9 +14394,14 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "clone",
-    usage="!ent clone <id> <new_id> <x> <y> [<x> <y> ...] [map=<map>]",
+    usage="!ent clone <id> <new_id> [<x> <y> ...] [count=<n>] [near=<r>] [map=<map>]",
     desc=(
-        "Copy <id> to one or more cells. With a single x y pair, the copy "
+        "Copy <id> to one or more cells. Without coordinates the copy lands "
+        "on the free cell nearest <id>'s body where its whole body fits "
+        "(as a dismount: rings outward); `count=<n>` makes n copies that "
+        "way (ids <new_id>1, <new_id>2, ...), `near=<r>` keeps them within "
+        "r cells of the source, all or nothing. "
+        "With a single x y pair, the copy "
         "gets id <new_id> (the original behavior). With multiple pairs, "
         "one copy is made per cell with auto-numbered ids "
         "<new_id>1, <new_id>2, ... — e.g. `!ent clone goblin mob 5 5 6 6 "
@@ -14423,7 +14605,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         fire_log = list(fire_log) + _take_formula_log()
         if not eid:
             if not fire_log:
-                return await ctx.send("No turn order yet.")
+                return await ctx.send(_no_turn_order_text(ctx, m))
             # The transition ran (hooks fired, units may have died on their
             # turn start) and left no one to take the turn.
             return await ctx.send("No one is left to take a turn.\n"
@@ -17211,7 +17393,7 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
 
 @registry.command(
     "find", access="all",
-    usage="!find <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [count|ids]",
+    usage="!find <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [sum|avg|min|max:<var> ...] [count|ids]",
     desc=(
         "Query entities by AND-ed predicates. A leading `!` negates a "
         "predicate (`!status:stunned`; `!team=red` also matches units with no "
@@ -17245,7 +17427,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
         "3 cells of `boss`, showing each one's hp, lowest first. OUTPUT: a "
         "bare `count` prints only the number of matches; a bare `ids` prints "
         "the matching ids space-separated, ready to paste into another "
-        "command (`!find team=red ids`)."
+        "command (`!find team=red ids`). `sum:<var>`, `avg:<var>`, "
+        "`min:<var>` and `max:<var>` print the count and that total over "
+        "the matches' numbers instead (`!find team=red sum:hp`; text and "
+        "missing vars are left out)."
     ),
     snapshot=False,
 )
@@ -17266,9 +17451,15 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
     sort_desc = False
     output = "rows"          # rows | count | ids
     pred_tokens: List[str] = []
+    # sum: / avg: / min: / max: <var> (#453): totals over the matches.
+    aggregates: List[Tuple[str, str]] = []
     for t in args:
         low = t.lower()
-        if low in ("count", "ids"):
+        agg = re.fullmatch(r"(sum|avg|min|max):(.+)", t, re.IGNORECASE)
+        if agg:
+            check_store_path(agg.group(2), "var path")
+            aggregates.append((agg.group(1).lower(), agg.group(2)))
+        elif low in ("count", "ids"):
             # Bare words can't be predicates (those need an operator or a
             # `kind:` prefix), so these output forms can't collide with one.
             output = low
@@ -17294,9 +17485,36 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                     and _find_match_entity(m, e, predicates, pov)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
-    if output == "count":
-        return await ctx.send(
-            f"**{len(hits)}** {'match' if len(hits) == 1 else 'matches'}.")
+    if output == "count" or aggregates:
+        head = f"**{len(hits)}** {'match' if len(hits) == 1 else 'matches'}."
+        if not aggregates:
+            return await ctx.send(head)
+        lines = [head]
+        for kind, path in aggregates:
+            # The numbers the caller may read (private vars read as
+            # missing); text, bools and missing vars are left out.
+            nums = []
+            for e in hits:
+                found, v = _entity_path_value(m, e, path, pov)
+                if found and isinstance(v, (int, float)) \
+                        and not isinstance(v, bool) and math.isfinite(v):
+                    nums.append(v)
+            if not nums:
+                lines.append(f"{kind} `{path}`: — (no match holds a number "
+                             f"there)")
+                continue
+            val = {"sum": lambda: sum(nums),
+                   "avg": lambda: sum(nums) / len(nums),
+                   "min": lambda: min(nums),
+                   "max": lambda: max(nums)}[kind]()
+            if isinstance(val, float):
+                val = round(val, 4)
+                if val == int(val):
+                    val = int(val)
+            note = (f" ({len(nums)} of {len(hits)} hold a number)"
+                    if len(nums) < len(hits) else "")
+            lines.append(f"{kind} `{path}`: **{val}**{note}")
+        return await ctx.send("\n".join(lines))
     if not hits:
         return await ctx.send("No entities match.")
     if sort_var:
@@ -17341,6 +17559,19 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
 
 
 # ---- !roll --------------------------------------------------------------
+def _table_roll_reply(m: Match, name: str, reps: int) -> str:
+    """`!table roll <name> [n]` / `!roll [<n>x] <table>`: the picks of
+    named table `name`, rolled `reps` times on the match RNG."""
+    rng = m.formula_rng()
+    try:
+        picks = [roll_table_pick(rng, m.tables[name]) for _ in range(reps)]
+    except FormulaError as ex:
+        return f"❌ {ex}"
+    times = f"{reps}x " if reps > 1 else ""
+    return (f"🎲 {times}table `{name}` → "
+            + ", ".join(f"**{p}**" for p in picks))
+
+
 @registry.command(
     "roll", access="all",
     usage="!roll [<n>x] <dice_or_list ...> | !roll odds <dice> [<op> <n>]",
@@ -17357,7 +17588,9 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
         "`!roll odds` works out probabilities instead of rolling (see "
         "`!help roll odds`). A comma-separated list picks one item: "
         "`!roll none, none, minicrit, crit`, and `item:weight` weights an "
-        "item like a table (`none:3, crit`). A leading `<n>x` rolls n times "
+        "item like a table (`none:3, crit`). A word that isn't dice and "
+        "names a table of the match (`!table def`) rolls that table "
+        "(`!roll loot`). A leading `<n>x` rolls n times "
         "(`!roll 6x 4d6kh3`, `!roll 2x none, crit`; at most the "
         "roll_repeat_limit rule)."
     ),
@@ -17389,6 +17622,12 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not args:
             return await ctx.send("❌ `!roll <n>x` needs dice or a list to "
                                   "roll.")
+    # A named table of the channel's match (#610), when the word isn't
+    # dice: `!roll loot`, `!roll 3x loot`.
+    if (len(args) == 1 and rules and args[0] in m.tables
+            and not re.fullmatch(r"\d*d\d+.*|[+-]?\d+", args[0],
+                                 re.IGNORECASE)):
+        return await ctx.send(_table_roll_reply(m, args[0], reps))
     text = " ".join(args)
     if "," in text and args[0].lower() != "odds":
         # A list roll: one item per roll, `item:weight` weighted like a
@@ -21996,7 +22235,7 @@ registry.annotate_sub(
         "(`set`/`del`/`clear`/`info`) exactly like tile data, and is "
         "readable from formulas via zone_get/zone_has plus membership "
         "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
-        "new, drop, rename, add, remove, fill, shift, anchor, "
+        "new, drop, rename, copy, add, remove, fill, shift, anchor, "
         "unanchor, set, del, clear, glyph, sprite (a graphics sprite key, "
         "like glyph), color, legend, tags, setdef, grant / ungrant / "
         "grant_condition / grant_bodies (statuses the units inside "
@@ -22137,6 +22376,61 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         note = _mentions_note(m, args[1], "zone")
         return await ctx.send(f"Renamed zone `{args[1]}` to `{args[2]}`."
                               + (f"\n{note}" if note else ""))
+
+    # ---- copy <name> [<new_name>] [<dx> <dy>] (#605) ----
+    if sub == "copy":
+        if await return_help_if_not_enough_args(ctx, args, 2, "zone", "copy"):
+            return
+        src_name = args[1]
+        zmp = m.zone_map(src_name)
+        if zmp is None:
+            raise NotFound(f"No zone `{src_name}`.")
+        rest = args[2:]
+        new_name: Optional[str] = None
+        if rest and not re.fullmatch(r"[+-]?\d+", rest[0]):
+            new_name = rest[0]
+            rest = rest[1:]
+        if len(rest) not in (0, 2):
+            return await ctx.send(
+                "❌ Usage: `!zone copy <name> [<new_name>] [<dx> <dy>] "
+                "[map=<map>]`: the offset is two whole numbers.")
+        try:
+            dx, dy = (int(rest[0]), int(rest[1])) if rest else (0, 0)
+        except ValueError:
+            return await ctx.send("❌ expected integer dx and dy.")
+        dest = _one_map(ctx, m, mapspec) if mapspec is not None else zmp
+        if new_name is None:
+            new_name = m.mint_zone_name(src_name)
+        else:
+            check_zone_name(new_name)
+            if m.has_zone(new_name):
+                raise DuplicateId(f"A zone `{new_name}` already exists.")
+        z = zmp.zones[src_name]
+        cells = {(x + dx, y + dy) for x, y in z.get("cells") or ()}
+        kept = {c for c in cells if dest.in_bounds(*c)}
+        if cells and not kept:
+            return await ctx.send(
+                f"❌ No cell of the copy lands on map `{dest.name}` "
+                f"({dest.size_text()}); nothing was copied.")
+        # An aura's anchor stays with the original: the copy is a plain
+        # zone on the cells the aura covers now.
+        new = {k: copy.deepcopy(v) for k, v in z.items()
+               if k not in ("cells", "anchor", "anchor_radius",
+                            "anchor_metric")}
+        new["cells"] = kept
+        dest.zones[new_name] = new
+        dest.zone_touch(new_name)
+        lost = len(cells) - len(kept)
+        return await ctx.send(
+            f"Copied zone `{src_name}` to `{new_name}`"
+            + (f" by ({dx},{dy})" if (dx, dy) != (0, 0) else "")
+            + _on_map(m, dest) + f": {len(kept)} cell(s)"
+            + (f" ({lost} off the map dropped)" if lost else "")
+            + (f"; `{src_name}` is an aura of `{z['anchor']}`, the copy "
+               f"stays where it is." if z.get("anchor") else ".")
+            + ("" if (dx, dy) != (0, 0) or dest is not zmp else
+               " It lies on the same cells: move it with `!zone move "
+               f"{new_name} <dx> <dy>`."))
 
     # ---- drop <name> ----  (delete the whole zone)
     if sub == "drop":
@@ -24800,6 +25094,18 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "zone", "copy",
+    usage="!zone copy <name> [<new_name>] [<dx> <dy>] [map=<map>]",
+    desc=(
+        "Copy a zone with everything it holds: its cells (moved by "
+        "(dx, dy), cells off the map dropped), data, hooks, look, tags, "
+        "grants and its definition link. `map=` puts the copy on another "
+        "map. Without a new name one is minted (`lava` -> `lava2`). An "
+        "aura's copy is a plain zone on the cells it covers now: the "
+        "anchor stays with the original."
+    ),
+)
+registry.annotate_sub(
     "zone", "shift",
     usage="!zone shift <name> <dx> <dy>",
     desc=(
@@ -26693,7 +26999,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 for _subs, _usage in (
         (('def',), '!table def <name> <spec ...>'),
-        (('roll',), '!table roll <name>'),
+        (('roll',), '!table roll <name> [n]'),
         (('list',), '!table list'),
         (('show',), '!table show <name>'),
         (('remove',), '!table remove <name>')):
@@ -26822,12 +27128,20 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if name not in m.tables:
             return await ctx.send(f"❌ no table `{name}`.")
-        rng = m.formula_rng()
-        try:
-            pick = roll_table_pick(rng, m.tables[name])
-        except FormulaError as ex:
-            return await ctx.send(f"❌ {ex}")
-        return await ctx.send(f"🎲 table `{name}` → **{pick}**")
+        reps = 1
+        if len(args) > 2:
+            cap = int(m.rules.get(
+                "roll_repeat_limit",
+                RULES_REGISTRY["roll_repeat_limit"]["default"]))
+            try:
+                reps = int(args[2])
+            except ValueError:
+                return await ctx.send(
+                    f"❌ `{args[2]}`: the number of rolls is a whole number.")
+            if not 1 <= reps <= cap:
+                return await ctx.send(f"❌ `{args[2]}`: roll 1 to {cap} "
+                                      f"times (roll_repeat_limit).")
+        return await ctx.send(_table_roll_reply(m, name, reps))
 
     if sub == "list":
         if not m.tables:
@@ -27574,9 +27888,27 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     sub = args[0].lower()
 
+    if sub == "list" and len(args) == 1:
+        # Every vehicle and its riders (#600), one line each, through the
+        # channel's view: a vehicle or rider the view can't see stays out.
+        pov = _query_pov(ctx, m)
+        lines = []
+        for v in m.entities_in_turn_order():
+            slots = m.vehicle_slots(v.id)
+            if not slots or _pov_hides(m, pov, v.id):
+                continue
+            parts = []
+            for name in slots:
+                occ = [f"`{e.id}`" for e in m.slot_occupants(v.id, name)
+                       if not _pov_hides(m, pov, e.id)]
+                parts.append(f"{name}: {', '.join(occ) or '(empty)'}")
+            lines.append(f"- `{v.id}`{_on_map(m, m.map_of(v))}: "
+                         + "; ".join(parts))
+        if not lines:
+            return await ctx.send("No vehicles in this match.")
+        return await ctx.send("**Vehicles:**\n" + "\n".join(lines))
+
     if sub == "list":
-        if await return_help_if_not_enough_args(ctx, args, 2, "mount", "list"):
-            return
         vid = _query_eid(ctx, m, args[1])
         pov = _query_pov(ctx, m)
         slots = m.vehicle_slots(vid)
@@ -27697,8 +28029,10 @@ registry.annotate_sub("mount", "switch",
                       usage="!mount switch <rider> <slot>",
                       desc="Move a mounted rider to another slot of the same vehicle.")
 registry.annotate_sub("mount", "list",
-                      usage="!mount list <vehicle>",
-                      desc="Show a vehicle's slots, capacity, and occupants.")
+                      usage="!mount list [<vehicle>]",
+                      desc="Show a vehicle's slots, capacity, and occupants; "
+                           "with no vehicle, every vehicle of the match and "
+                           "who rides it, one line each.")
 registry.annotate_sub("mount", "info",
                       usage="!mount info <vehicle> [slot]",
                       desc="Detail one slot (or all) of a vehicle.")

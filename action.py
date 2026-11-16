@@ -2216,11 +2216,12 @@ def _restriction_refusal(action: Action, actor_id: str, target: Any,
     return None
 
 
-def target_condition_ok(action: Action, actor_id: str, tid: str,
+def target_condition_ok(action: Action, actor_id: str, tid: Any,
                         match: "Match") -> Tuple[bool, str]:
     """Whether target `tid` meets the action's target_condition (#36;
-    `self` = the actor, `target` = the target), and the error text when
-    the formula fails (a failing formula is not met)."""
+    `self` = the actor, `target` = the target: a unit id, or a location
+    target's cell), and the error text when the formula fails (a failing
+    formula is not met)."""
     if not action.target_condition:
         return True, ""
     from formula import FormulaEngine, EvalCtx
@@ -2242,13 +2243,17 @@ def _target_condition_refusal(action: Action, actor_id: str, target: Any,
     """Like _restriction_refusal, for the action's target_condition: a
     single target that fails refuses the action; a list drops the ones
     that fail, refused only when none is left."""
-    if action.target_type not in ("entity", "entity_list"):
+    # A location target is judged too (#540: `fits_at(self, target)` on a
+    # teleport), `target` bound to the cell.
+    if action.target_type not in ("entity", "entity_list", "location",
+                                  "location_list"):
         return None
 
-    def line(tid: str, err: str) -> str:
+    def line(tid: Any, err: str) -> str:
         return (f"`{tid}` doesn't meet `{action.name}`'s target condition"
                 + (f" (its formula failed: {err})" if err else "") + ".")
-    if action.target_type == "entity" and isinstance(target, str):
+    if action.target_type in ("entity", "location") \
+            and not isinstance(target, list):
         ok, err = target_condition_ok(action, actor_id, target, match)
         return None if ok else ("target_condition", line(target, err),
                                 target, [])
