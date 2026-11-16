@@ -175,11 +175,15 @@ _TAB_PREFIX = "?tab "
 # operator would, to test what a load does with it (`!as restart`).
 # `?file set <path> <a.b.c> <json>` writes a JSON value at a dotted path of
 # a JSON file and `?file replace <path> "<old>" "<new>"` replaces text in
-# it: data in the shape an older build wrote.
+# it: data in the shape an older build wrote. `?file list [<dir>]` names
+# the files of the folder (or a folder in it), `?file show <path>` prints a
+# text file's lines. `?file copy|move <path> <path>` copies a file (a new
+# modification time) or moves a file or folder, as an operator would.
 _FILE_PREFIX = "?file "
 _FILE_USAGE = ("💥 Usage: ?file corrupt|delete <path> | set <path> <a.b.c> "
-               "<json> | replace <path> \"<old>\" \"<new>\" (a path in the "
-               "server folder)")
+               "<json> | replace <path> \"<old>\" \"<new>\" | list [<dir>] | "
+               "show <path> | copy|move <path> <path> (paths in the server "
+               "folder)")
 
 
 def _file_action(line: str, workspaces, ctx) -> List[str]:
@@ -189,6 +193,34 @@ def _file_action(line: str, workspaces, ctx) -> List[str]:
         return [_FILE_USAGE]
     if words[0] in ("set", "replace"):
         return _file_edit(line, words, st, ctx)
+    if words[0] in ("copy", "move") and len(words) == 3:
+        import shutil
+        base = st.server_dir(ctx.guild_key)
+        src, dest = os.path.join(base, words[1]), os.path.join(base, words[2])
+        if not os.path.exists(src):
+            return [f"💥 ?file: no file or folder {words[1]}"]
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if words[0] == "copy":
+            shutil.copyfile(src, dest)
+        else:
+            shutil.move(src, dest)
+        st.rescan()
+        return [f"({words[0]} {words[1]} -> {words[2]})"]
+    if words[0] == "list" and len(words) <= 2:
+        path = os.path.join(st.server_dir(ctx.guild_key), *words[1:])
+        if not os.path.isdir(path):
+            return [f"💥 ?file: no folder {words[1] if len(words) > 1 else '.'}"]
+        names = sorted(n for n in os.listdir(path)
+                       if os.path.isfile(os.path.join(path, n)))
+        return ["files: " + (" | ".join(names) if names else "(none)")]
+    if words[0] == "show" and len(words) >= 2:
+        # The rest of the line, spaces included, is the path.
+        rel = line[len(_FILE_PREFIX):].split(maxsplit=1)[1].strip().strip('"')
+        path = os.path.join(st.server_dir(ctx.guild_key), rel)
+        if not os.path.isfile(path):
+            return [f"💥 ?file: no file {rel}"]
+        with open(path, encoding="utf-8") as f:
+            return [ln.rstrip("\n") for ln in f]
     if len(words) != 2 or words[0] not in ("corrupt", "delete"):
         return [_FILE_USAGE]
     path = os.path.join(st.server_dir(ctx.guild_key), words[1])

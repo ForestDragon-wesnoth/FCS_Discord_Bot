@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any, Set, Tuple
 from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 from match_history import MatchHistory, Snapshot, HistoryError, _now_iso
-from storage import storage_of, valid_id, fmt_bytes
+from storage import storage_of, valid_id, fmt_bytes, server_label_file
 from prefab import capture_prefab, check_prefab, check_prefab_name, stamp_prefab, system_allows, Turn, PREFAB_KINDS
 
 #used for Gamesystem-related commands
@@ -17,6 +17,8 @@ from logic import (
 
 # Passive system
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY
+from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
+                   folder_within)
 from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
@@ -184,7 +186,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "passive":    frozenset({"list", "info"}),
     # The prefab library is readable by anyone, as the templates are; save /
     # import / rename / delete check the saver, stamp changes the match.
-    "prefab":     frozenset({"list", "show", "trash"}),
+    "prefab":     frozenset({"list", "show", "trash", "folders"}),
     "remind":     frozenset({"list"}),
     "reveal_fog": frozenset({"list"}),
     "schedule":   frozenset({"list"}),
@@ -199,7 +201,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # delete check the saver themselves, spawn changes the match. `refs`
     # stays host-gated: it lists which of a unit's vars changed, and a
     # unit's vars are host-only (`!ent dump`).
-    "template":   frozenset({"list", "show", "trash", "diff"}),
+    "template":   frozenset({"list", "show", "trash", "diff", "folders"}),
     # team_data_visibility decides whose data a player may read.
     "team":       frozenset({"list", "get"}),
     "tile":       frozenset({"list", "info"}),
@@ -397,9 +399,10 @@ _LIBRARY_EDITS = {
     "match": ("host", frozenset({"new"})),
     "template": ("templates", frozenset({
         "save", "import", "set", "unset", "part", "rename", "copy",
-        "delete", "restore", "private", "tags"})),
+        "delete", "restore", "private", "tags", "move", "folder"})),
     "prefab": ("prefabs", frozenset({
-        "save", "import", "rename", "copy", "delete", "restore", "tags"})),
+        "save", "import", "rename", "copy", "delete", "restore", "tags",
+        "move", "folder"})),
 }
 
 
@@ -1973,6 +1976,10 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
                   "command."]
     else:
         mgr._save_failure_ref = None
+        if mgr.guild_name != mgr.guild_key:
+            # The folder's name file (storage.SERVER_LABEL_PREFIX): a new
+            # server's first save, or a rename seen since startup.
+            st.label_server(mgr.guild_key, mgr.guild_name)
     if msgs and ctx is not None:
         await ctx.send("\n".join(msgs))
     if ws is not None:
@@ -3036,7 +3043,7 @@ def _description_paths(text: Any) -> List[str]:
     return [w for w in _re.split(r"[\s,]+", str(text or "")) if w]
 
 
-def _description_vars(m: Match, e: Entity, vars_: Dict[str, Any],
+def _description_vars(m: Match, e: Any, vars_: Dict[str, Any],
                       engine_vars: bool) -> Dict[str, Any]:
     """The vars the description's data section shows: `vars_` without `__`
     keys, action dicts and what entity_description_hidden_vars hides, and
@@ -3485,6 +3492,106 @@ def _corpse_template_context(
             if hidden(str(var)):
                 ctx[alias] = text
     return ctx
+
+
+def _corpse_read_context(m: Match, x: int, y: int, cid: str,
+                         corpse: Dict[str, Any],
+                         mp: Optional["Map"] = None) -> Dict[str, Any]:
+    """The placeholders a read of a corpse fills (#535): the corpse row's,
+    plus its map, its `description` var as the reader may read it, and the
+    `{state}` / `destroyed` pair a body part's line uses."""
+    ctx = _corpse_template_context(m, x, y, cid, corpse)
+    ctx["map"] = mp.name if mp is not None else ""
+    ctx["map_shown"] = (mp.name if mp is not None and len(m.maps) > 1
+                        else "")
+    reader = VAR_READER.get()
+    cv = (m.corpse_reader_vars(corpse, reader) if reader is not None
+          else ((corpse.get("entity") or {}).get("vars") or {}))
+    desc = cv.get("description") if isinstance(cv, dict) else None
+    ctx["description"] = desc if isinstance(desc, str) else ""
+    destroyed = bool(isinstance(cv, dict) and cv.get("__part_destroyed"))
+    ctx.setdefault("state", "destroyed" if destroyed else "")
+    ctx.setdefault("destroyed", destroyed)
+    return ctx
+
+
+def _corpse_card(m: Match, x: int, y: int, cid: str,
+                 corpse: Dict[str, Any], mp: Optional["Map"] = None) -> str:
+    """`!ent info <corpse> short`: entity_info_format over the corpse's
+    snapshot (#535)."""
+    tmpl = m.rules.get("entity_info_format") or DEFAULT_SYSTEM_SETTINGS.get(
+        "entity_info_format", "")
+    return _render_template(tmpl, _corpse_read_context(m, x, y, cid, corpse,
+                                                       mp), _var_labels(m))
+
+
+def _corpse_description(m: Match, x: int, y: int, cid: str,
+                        corpse: Dict[str, Any],
+                        mp: Optional["Map"] = None) -> str:
+    """`!ent info <corpse>` (#535): the sections corpse_description_sections
+    lists, the header from corpse_description_header_format and the rest
+    from the unit's entity_description_<section>_format, over the corpse's
+    snapshot as the command's reader may read it."""
+    from types import SimpleNamespace
+    ent = corpse.get("entity") if isinstance(corpse, dict) else None
+    ent = ent if isinstance(ent, dict) else {}
+    ctx = _corpse_read_context(m, x, y, cid, corpse, mp)
+    reader = VAR_READER.get()
+    labels = _var_labels(m)
+    sections = _description_paths(m.rules.get("corpse_description_sections"))
+    out: List[str] = []
+
+    def fmt(sec: str) -> str:
+        if sec == "header":
+            return _description_rule(m, "corpse_description_header_format")
+        return _description_rule(m, f"entity_description_{sec}_format")
+
+    for sec in sections:
+        text = ""
+        if sec in ("header", "vitals"):
+            text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "size":
+            if m.sizes_on() and ctx.get("size") not in (None, ""):
+                text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "tags":
+            if ctx.get("tags"):
+                text = _render_template(fmt(sec), ctx, labels)
+        elif sec == "statuses":
+            status = ent.get("status")
+            items = _description_statuses(
+                m, status if isinstance(status, dict) else {})
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        elif sec == "data":
+            src = (m.corpse_reader_vars(corpse, reader)
+                   if reader is not None else (ent.get("vars") or {}))
+            shape = SimpleNamespace(var_names=ent.get("var_names") or {})
+            tree = _hide_formula_fields(_description_vars(
+                m, shape, src if isinstance(src, dict) else {}, True))
+            lines: List[str] = []
+            _description_tree(tree, 0, lines, labels)
+            if lines:
+                cap = int(m.rules.get("entity_description_line_limit", 60))
+                if len(lines) > cap:
+                    lines = lines[:cap] + [
+                        f"... ({len(lines) - cap} more lines)"]
+                text = _render_template(fmt(sec), {"items": "\n".join(lines)})
+        elif sec == "parts":
+            pfmt = _description_rule(m, "entity_description_part_format")
+            items = []
+            parts = corpse.get("parts") if isinstance(corpse, dict) else None
+            for pd in sorted((p for p in (parts or [])
+                              if isinstance(p, dict)
+                              and p.get("part_of") == cid),
+                             key=lambda p: str(p.get("id", ""))):
+                pid = str(pd.get("id", ""))
+                items.append(_render_template(pfmt, _corpse_read_context(
+                    m, x, y, pid, {"entity": pd}, mp)))
+            if items:
+                text = _render_template(fmt(sec), {"items": "\n".join(items)})
+        if text.strip():
+            out.append(text.rstrip("\n"))
+    return "\n".join(out) if out else f"`{cid}`"
 
 
 def _corpse_line(
@@ -5417,7 +5524,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -5433,6 +5540,9 @@ def _mention(user_id: Optional[str]) -> str:
         "test harness): `!as server <key>` moves you into another server's "
         "workspace — its own systems, matches and saves, as on Discord where "
         "each server is separate; `!as server local` (or bare) returns. "
+        "`!as servername <name>` gives this server the name Discord would, "
+        "as the bot's startup reads it: the workspace takes the name and "
+        "its data folder's name file (`0 server - <name>.txt`) is written. "
         "`!as restart` reloads every server from the data folder, as a bot "
         "restart would (unsaved runtime state — pending requests, `!again` — "
         "is gone). `!as idle <hours>` moves every loaded server's last "
@@ -5557,6 +5667,28 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Now in server `{key}`'s workspace (its own systems, matches "
             f"and saves).")
+    if role == "servername":
+        if not getattr(ctx, "workspace_switchable", False):
+            return await ctx.send(
+                "❌ This surface has a single workspace; `!as servername` "
+                "works in the CLI and the scenario harness.")
+        if mgr.guild_key == LOCAL_WORKSPACE:
+            return await ctx.send(
+                "❌ The local workspace has no server name; `!as server "
+                "<key>` first.")
+        name = " ".join(args[1:]).strip()
+        if not name:
+            return await ctx.send("❌ Usage: !as servername <name ...>")
+        mgr.guild_name = name
+        st = storage_of(mgr)
+        if st is not None and st.label_server(mgr.guild_key, name,
+                                              force=True):
+            return await ctx.send(
+                f"Server `{mgr.guild_key}` is named **{name}**; wrote "
+                f"`{server_label_file(name, mgr.guild_key)}` in its folder.")
+        return await ctx.send(
+            f"Server `{mgr.guild_key}` is named **{name}**; its folder "
+            f"doesn't exist yet, so its first save writes the name file.")
     if role == "view":
         target = args[1].lower() if len(args) >= 2 else "omniscient"
         if target == "clear":
@@ -5717,7 +5849,9 @@ async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for key in sorted(set(loaded) | set(on_disk)):
             w = loaded.get(key)
             if w is None:
-                lines.append(f"- `{key}`: not loaded (on disk, loads on its "
+                disk = st.label_on_disk(key) if st is not None else None
+                label = f"**{disk}** (`{key}`)" if disk else f"`{key}`"
+                lines.append(f"- {label}: not loaded (on disk, loads on its "
                              f"next command)")
                 continue
             here = " ← this one" if w is mgr else ""
@@ -5907,6 +6041,8 @@ async def _owner_storage(ctx, args: List[str], mgr: MatchManager):
     ws = getattr(mgr, "workspaces", None)
     names = {k: w.guild_name for k, w in (ws.items() if ws is not None else [])}
     for key in sorted(k for k in st._usage if k != TRASH_DIR):
+        if key not in names:
+            names[key] = st.label_on_disk(key) or key
         label = f"**{names[key]}** (`{key}`)" if key in names and names[key] != key \
             else f"`{key}`"
         lines.append(f"- {label}: {fmt_bytes(st.server_usage(key))} of "
@@ -6162,6 +6298,8 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             mgr.default_system_per_channel = {}
             mgr.templates = {}
             mgr.prefabs = {}
+            for lib in ("templates", "prefabs"):
+                mgr.lib_reset(lib)
         audit_note(f"wiped {scope}")
         tail = ("Changed your mind? `!server wipe undo` within 24 hours."
                 if st is not None else
@@ -6844,6 +6982,315 @@ def _creator_template_use(ctx: ReplyContext, mgr: MatchManager) -> str:
             if s is not None else "none")
 
 
+# ---- library folders (templates, prefabs) ----------------------------------
+# A folder only organizes a library: a name is unique across its folders
+# (user call), so everything that names a template or prefab ignores where
+# it lives. MatchManager.library_folders / library_dirs hold the layout,
+# storage.py mirrors it on disk.
+_LIB_WORDS = {"templates": ("template", "!template", "templates"),
+              "prefabs": ("prefab", "!prefab", "prefabs")}
+
+
+def _channel_rule(ctx: ReplyContext, mgr: MatchManager, rule: str,
+                  default: Any) -> Any:
+    """A rule as this channel reads it: its match's value, else its default
+    system's."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    if m is not None:
+        return m.rules.get(rule, default)
+    s = mgr.systems.get(mgr.effective_system_name(ctx.channel_key))
+    return mgr.system_value(s, rule) if s is not None else default
+
+
+def _lib_readable(ctx: ReplyContext, mgr: MatchManager, lib: str,
+                  name: str) -> bool:
+    """Whether the caller may know of library entry `name` (a private
+    template reads as missing to others)."""
+    if lib != "templates":
+        return True
+    return not template_hidden(mgr.templates.get(name),
+                               _template_viewer(ctx, mgr))
+
+
+def _folder_opt(opts: Dict[str, Any]) -> Optional[str]:
+    """A `folder=` option, checked; None when not given."""
+    return check_library_folder(opts["folder"]) if "folder" in opts else None
+
+
+def _lib_place(ctx: ReplyContext, mgr: MatchManager, lib: str, name: str,
+               folder: Optional[str]) -> None:
+    """Refuse writing `name` into `folder` when it lives in another folder:
+    a name is unique across a library's folders, and a write never moves
+    an entry (`move` does)."""
+    if folder is None or name not in mgr.lib_entries(lib):
+        return
+    cur = mgr.lib_folder(lib, name)
+    if cur == folder:
+        return
+    word, cmd, _ = _LIB_WORDS[lib]
+    if not _lib_readable(ctx, mgr, lib, name):
+        raise VTTError(f"The name `{name}` is taken; choose another.")
+    raise VTTError(
+        f"{word.capitalize()} `{name}` is in `{folder_label(cur)}`, and a "
+        f"name is unique across folders: `{cmd} move {name} "
+        f"{folder_label(folder)}` moves it, or choose another name.")
+
+
+def _lib_prune(ctx: Optional[ReplyContext], mgr: MatchManager, lib: str,
+               folder: str) -> None:
+    """After an entry left `folder`: delete it, and its parents, while
+    nothing is left in them, when delete_empty_library_folders is on."""
+    if not folder or ctx is None or not _channel_rule(
+            ctx, mgr, "delete_empty_library_folders", False):
+        return
+    st = storage_of(mgr)
+    entries = mgr.lib_entries(lib)
+    for f in reversed(folder_ancestors(folder)):
+        if any(folder_within(mgr.lib_folder(lib, n), f) for n in entries):
+            return
+        if any(d != f and folder_within(d, f) for d in mgr.lib_dirs(lib)):
+            return
+        if st is not None:
+            st.prune_folder(mgr.guild_key, lib, f)
+            if os.path.isdir(st.folder_dir(mgr.guild_key, lib, f)):
+                return          # it holds an operator's own file
+        mgr.lib_dirs(lib).discard(f)
+
+
+def _lib_renamed(mgr: MatchManager, lib: str, old: str, new: str) -> str:
+    """Record entry `old` renamed to `new` in the same folder; returns the
+    folder `new` was in before (its old entry, replaced), or ""."""
+    before = mgr.lib_folder(lib, new) if new in mgr.lib_entries(lib) else ""
+    folder = mgr.lib_folder(lib, old)
+    mgr.lib_forget(lib, old)
+    mgr.lib_set_folder(lib, new, folder)
+    return before
+
+
+def _lib_removed(ctx: Optional[ReplyContext], mgr: MatchManager, lib: str,
+                 name: str) -> None:
+    folder = mgr.lib_folder(lib, name)
+    mgr.lib_forget(lib, name)
+    _lib_prune(ctx, mgr, lib, folder)
+
+
+def _lib_grouped(mgr: MatchManager, lib: str, names: List[str],
+                 row) -> List[str]:
+    """List rows for `names`, under a heading per folder when they come
+    from more than one (the top level first, then by path)."""
+    names = sorted(names, key=lambda n: (mgr.lib_folder(lib, n), n))
+    folders = {mgr.lib_folder(lib, n) for n in names}
+    if len(folders) <= 1:
+        return [row(n) for n in names]
+    out: List[str] = []
+    last = None
+    for n in names:
+        f = mgr.lib_folder(lib, n)
+        if f != last:
+            out.append(f"__`{folder_label(f)}`__")
+            last = f
+        out.append(row(n))
+    return out
+
+
+def _lib_folder_known(ctx: ReplyContext, mgr: MatchManager, lib: str,
+                      folder: str) -> None:
+    """Refuse a folder that doesn't exist, or that holds only entries the
+    caller can't read (which `folders` leaves out)."""
+    _word, cmd, _ = _LIB_WORDS[lib]
+    inside = [n for n in mgr.lib_entries(lib)
+              if folder_within(mgr.lib_folder(lib, n), folder)]
+    if folder not in mgr.lib_dirs(lib) or (
+            inside and not any(_lib_readable(ctx, mgr, lib, n)
+                               for n in inside)):
+        raise VTTError(f"No folder `{folder_label(folder)}` (`{cmd} "
+                       f"folders`).")
+
+
+def _in_folder_note(mgr: MatchManager, lib: str, name: str) -> List[str]:
+    """`In `<folder>/`.` after a save into a folder; nothing at the top."""
+    f = mgr.lib_folder(lib, name)
+    return [f"📁 In `{folder_label(f)}`."] if f else []
+
+
+def _import_folder(rest: List[str], usage: str) -> Tuple[Optional[str], str]:
+    """An import's optional leading `folder=<folder>` and the JSON after
+    it."""
+    raw = " ".join(rest)
+    mt = re.match(r"\s*folder=(\S+)\s*(.*)\Z", raw, re.S | re.I)
+    if not mt:
+        return None, raw
+    if not mt.group(2).strip():
+        raise VTTError(f"The JSON is missing — usage: `{usage}`.")
+    return check_library_folder(mt.group(1)), mt.group(2)
+
+
+def _copy_folder(ctx: ReplyContext, mgr: MatchManager, lib: str, src: str,
+                 new: str, opts_args: List[str]) -> Optional[str]:
+    """Where a copy goes: `folder=`, else (a new name) the source's
+    folder; a copy over an existing entry stays where that one is."""
+    opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
+            for a in opts_args if "=" in a}
+    folder = _folder_opt(opts)
+    if folder is not None:
+        _lib_place(ctx, mgr, lib, new, folder)
+        return folder
+    if new in mgr.lib_entries(lib):
+        return None
+    return mgr.lib_folder(lib, src)
+
+
+_LIB_FOLDER_USAGE = {
+    "move": "<name> <folder>",
+    "folders": "[<folder>]",
+    "folder": "<new|delete|rename> <folder> [<new_folder>]",
+}
+
+
+async def _library_folder_sub(ctx: ReplyContext, args: List[str],
+                              mgr: MatchManager, lib: str):
+    """`move`, `folders` and `folder new|delete|rename` of `!template` /
+    `!prefab`."""
+    word, cmd, cap = _LIB_WORDS[lib]
+    sub = args[0].lower()
+    entries = mgr.lib_entries(lib)
+    st = storage_of(mgr)
+    key = mgr.guild_key
+
+    def may_edit(name: str, verb: str) -> None:
+        if lib == "templates":
+            _require_saver(ctx, name, entries[name], verb)
+        else:
+            _require_prefab_saver(ctx, name, entries[name], verb)
+
+    def visible(names: List[str]) -> List[str]:
+        return [n for n in names if _lib_readable(ctx, mgr, lib, n)]
+
+    if sub == "move":
+        usage = f"{cmd} move {_LIB_FOLDER_USAGE['move']}"
+        if len(args) < 3:
+            raise VTTError(f"Usage: `{usage}` (`/` = the top level).")
+        _check_tail(args, 3, (), usage)
+        name = (check_template_name(args[1]) if lib == "templates"
+                else check_prefab_name(args[1]))
+        if name not in entries or not _lib_readable(ctx, mgr, lib, name):
+            raise VTTError(f"No {word} `{name}` (`{cmd} list`).")
+        folder = check_library_folder(args[2])
+        cur = mgr.lib_folder(lib, name)
+        if folder == cur:
+            return await ctx.send(f"{word.capitalize()} `{name}` is already "
+                                  f"in `{folder_label(folder)}`.")
+        may_edit(name, "move")
+        if st is not None:
+            st.move_template_file(mgr, name, folder, lib)
+        mgr.lib_set_folder(lib, name, folder)
+        _lib_prune(ctx, mgr, lib, cur)
+        audit_note(f"{word} `{name}` moved to {folder_label(folder)}")
+        return await ctx.send(f"📁 Moved {word} `{name}` from "
+                              f"`{folder_label(cur)}` to "
+                              f"`{folder_label(folder)}`.")
+
+    if sub == "folders":
+        usage = f"{cmd} folders {_LIB_FOLDER_USAGE['folders']}"
+        _check_tail(args, min(len(args), 2), (), usage)
+        top = check_library_folder(args[1]) if len(args) > 1 else ""
+        shown = visible(sorted(entries))
+        rows = []
+        for f in [""] + sorted(mgr.lib_dirs(lib)):
+            if not folder_within(f, top):
+                continue
+            inside = [n for n in entries
+                      if folder_within(mgr.lib_folder(lib, n), f)]
+            seen = [n for n in shown
+                    if folder_within(mgr.lib_folder(lib, n), f)]
+            if inside and not seen:
+                continue        # only entries the caller can't read
+            here = sum(1 for n in seen if mgr.lib_folder(lib, n) == f)
+            rows.append(f"- `{folder_label(f)}` — {here} {word}(s)"
+                        + (f" ({len(seen)} with subfolders)"
+                           if len(seen) != here else ""))
+        if top and len(rows) == 0:
+            raise VTTError(f"No folder `{folder_label(top)}` (`{cmd} "
+                           f"folders`).")
+        return await ctx.send("\n".join(
+            [f"**{word.capitalize()} folders ({len(rows)}):**"] + rows))
+
+    # folder new|delete|rename
+    usage = f"{cmd} folder {_LIB_FOLDER_USAGE['folder']}"
+    act = args[1].lower() if len(args) > 1 else ""
+    if act not in ("new", "delete", "rename") or len(args) < 3:
+        raise VTTError(f"Usage: `{usage}`.")
+    _check_tail(args, 4 if act == "rename" else 3, (), usage)
+    _template_may_save(ctx, mgr, cap)
+    folder = check_library_folder(args[2])
+    if not folder:
+        raise VTTError("The top level (`/`) is always there.")
+    known = folder in mgr.lib_dirs(lib)
+    if act == "new":
+        if known:
+            return await ctx.send(f"Folder `{folder_label(folder)}` already "
+                                  f"exists.")
+        if st is not None:
+            st.make_folder(key, lib, folder)
+        mgr.lib_dirs(lib).update(folder_ancestors(folder))
+        audit_note(f"{word} folder {folder_label(folder)} made")
+        return await ctx.send(f"📁 Made {word} folder "
+                              f"`{folder_label(folder)}`.")
+    if not known:
+        raise VTTError(f"No folder `{folder_label(folder)}` (`{cmd} "
+                       f"folders`).")
+    inside = [n for n in entries
+              if folder_within(mgr.lib_folder(lib, n), folder)]
+    if act == "delete":
+        if inside:
+            raise VTTError(f"Folder `{folder_label(folder)}` isn't empty; "
+                           f"move or delete what is in it first.")
+        if st is not None:
+            st.remove_folder(key, lib, folder)
+        for d in [d for d in mgr.lib_dirs(lib) if folder_within(d, folder)]:
+            mgr.lib_dirs(lib).discard(d)
+        _lib_prune(ctx, mgr, lib, "/".join(folder.split("/")[:-1]))
+        audit_note(f"{word} folder {folder_label(folder)} deleted")
+        return await ctx.send(f"🗑️ Deleted {word} folder "
+                              f"`{folder_label(folder)}`.")
+    new = check_library_folder(args[3])
+    if not new:
+        raise VTTError("Renaming onto the top level would merge the folder "
+                       f"into it; `{cmd} move` its entries instead.")
+    if folder_within(new, folder):
+        raise VTTError(f"`{folder_label(new)}` is inside "
+                       f"`{folder_label(folder)}`.")
+    if new in mgr.lib_dirs(lib):
+        raise VTTError(f"Folder `{folder_label(new)}` already exists.")
+    if len(new.split("/")) + max(
+            [len(d.split("/")) - len(folder.split("/"))
+             for d in mgr.lib_dirs(lib) if folder_within(d, folder)] or [0]) \
+            > LIBRARY_FOLDER_DEPTH:
+        raise VTTError(f"Its subfolders would be more than "
+                       f"{LIBRARY_FOLDER_DEPTH} levels deep there.")
+    for n in inside:
+        may_edit(n, "move")
+    if st is not None:
+        st.rename_folder(key, lib, folder, new)
+
+    def moved(f: str) -> str:
+        return new + f[len(folder):]
+    for n in inside:
+        mgr.lib_set_folder(lib, n, moved(mgr.lib_folder(lib, n)))
+    for d in [d for d in mgr.lib_dirs(lib) if folder_within(d, folder)]:
+        mgr.lib_dirs(lib).discard(d)
+        mgr.lib_dirs(lib).update(folder_ancestors(moved(d)))
+    parent = "/".join(folder.split("/")[:-1])
+    _lib_prune(ctx, mgr, lib, parent)
+    audit_note(f"{word} folder {folder_label(folder)} renamed to "
+               f"{folder_label(new)}")
+    return await ctx.send(
+        f"📁 Renamed {word} folder `{folder_label(folder)}` to "
+        f"`{folder_label(new)}`" + (f" ({len(inside)} {word}(s) moved)."
+                                    if inside else "."))
+
+
 def _creator_hidden(ctx: ReplyContext, mgr: MatchManager, tpl: Any) -> bool:
     """`tpl` is a creator-level template the caller can't read."""
     return (template_private_level(tpl) == TEMPLATE_CREATOR_ONLY
@@ -6937,11 +7384,13 @@ def _template_read_note(reader: Optional[VarReader]) -> List[str]:
 
 def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
                     data: Dict[str, Any], saver: Optional[Tuple[Any, Any]] = None,
-                    check_saver: bool = True) -> Tuple[str, List[str]]:
+                    check_saver: bool = True,
+                    folder: Optional[str] = None) -> Tuple[str, List[str]]:
     """Write `data` as template `name` (memory + disk) and return (verb,
     notes): 'Saved' or 'Replaced'. Replacing needs the old version's saver
     or a server administrator, and the old version goes to the template
-    trash for 24 hours. `saver` = (id, name) to record; default the caller."""
+    trash for 24 hours. `saver` = (id, name) to record; default the caller.
+    `folder`: where it goes (default: where it is, else the top level)."""
     old = mgr.templates.get(name)
     if old is not None and check_saver:
         _require_saver(ctx, name, old, "replace")
@@ -6977,12 +7426,17 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
             data[k] = str(v)
     notes: List[str] = []
     st = storage_of(mgr)
+    was = mgr.lib_folder("templates", name) if old is not None else None
     if st is not None:
-        notes, trashed = st.write_template(mgr, name, data)
+        notes, trashed = st.write_template(mgr, name, data, folder=folder)
         if trashed:
             notes.append(f"The previous version is kept 24 hours "
                          f"(`!template restore {name}`).")
     mgr.templates[name] = data
+    mgr.lib_set_folder("templates", name,
+                       folder if folder is not None else (was or ""))
+    if was is not None and folder is not None and was != folder:
+        _lib_prune(ctx, mgr, "templates", was)
     invalidate_partial_cache()
     _template_changed(mgr, name, "replaced" if old is not None else "saved")
     return ("Replaced" if old is not None else "Saved"), notes
@@ -7545,7 +7999,7 @@ _TEMPLATE_DIFF_ROWS = 40
 
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|part|rename|copy|delete|trash|restore|resync|detach|refs> ...",
+    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
     desc=(
         "This server's library of saved templates, shared by all its matches "
         "and kept on disk (even when the CLI / GUI don't keep matches). An "
@@ -7560,7 +8014,9 @@ _TEMPLATE_DIFF_ROWS = 40
         "`show <name> [path] [compact] [expanded] [part=]`, `import <name> "
         "<json>`, `set` / `unset`, `tags`, `part remove`, `rename`, `copy`, `delete`, "
         "`trash` / `restore`, `resync <unit> [path]`, `detach <unit> [path]`, "
-        "`refs <unit>`. Only whoever saved a template, or a server "
+        "`refs <unit>`, `move`, `folders`, `folder new|delete|rename` "
+        "(folders organize the library; a name is unique across them). "
+        "Only whoever saved a template, or a server "
         "administrator, can change or delete it. Formulas: summon_template / "
         "summon_template_near / give_template / has_template / template_names "
         "/ template_of. " + _TEMPLATE_EDIT_NOTE
@@ -7574,9 +8030,14 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "list":
         usage = ("!template list [kind=<entity|partial>] [by=<user>] "
-                 "[tag=<filter>] [has=<var.path>] [prefix]")
+                 "[tag=<filter>] [has=<var.path>] [folder=<folder>] "
+                 "[prefix]")
         words, opts = _template_options(args, 1, usage,
-                                        allowed=("kind", "by", "tag", "has"))
+                                        allowed=("kind", "by", "tag", "has",
+                                                 "folder"))
+        top = _folder_opt(opts)
+        if top:
+            _lib_folder_known(ctx, mgr, "templates", top)
         has_path = opts.get("has")
         if has_path is not None:
             check_store_path(str(has_path), "var path")
@@ -7611,7 +8072,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                      str(mgr.templates[n].get("saved_by_name") or "").lower(),
                      str(mgr.templates[n].get("saved_by") or "").lower()))
                  and (tag_filter is None
-                      or tag_filter_matches(tags[n], tag_filter))]
+                      or tag_filter_matches(tags[n], tag_filter))
+                 and (not top or folder_within(
+                     mgr.lib_folder("templates", n), top))]
         if has_path is not None:
             with private_templates_hidden(viewer):
                 names = [n for n in names if _template_has_path(
@@ -7621,14 +8084,15 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("\n".join(_template_read_note(reader) + [
                 "No template matches those filters."]))
         filtered = len(names) != len(library)
-        rows = [f"- {_template_summary(n, _reader_view(mgr.templates[n], trules, reader, mgr, viewer), tags[n])}"
-                + _private_mark(mgr.templates[n])
-                for n in names]
+        rows = _lib_grouped(mgr, "templates", names, lambda n: (
+            f"- {_template_summary(n, _reader_view(mgr.templates[n], trules, reader, mgr, viewer), tags[n])}"
+            + _private_mark(mgr.templates[n])))
         # The note after the rows: it settles the reminder their
         # redaction noted.
         lines = _template_read_note(reader) + [
             f"**Templates ({len(names)}"
-            + (f" of {len(library)}" if filtered else "") + "):**"] + rows
+            + (f" of {len(library)}" if filtered else "")
+            + (f" in `{folder_label(top)}`" if top else "") + "):**"] + rows
         return await ctx.send("\n".join(lines))
 
     if sub == "diff":
@@ -7734,14 +8198,20 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             label += (f" ({_template_summary(name, {**views[0][1], **{k: tpl[k] for k in ('saved_by', 'saved_by_name') if k in tpl}})})"
                       + (_private_mark(tpl).replace(" 🔒", " 🔒 private")
                          if template_private_level(tpl) else ""))
+            where = mgr.lib_folder("templates", name)
+            if where:
+                label += f" in `{folder_label(where)}`"
         return await ctx.send("\n".join(_template_read_note(reader)
                                         + [label] + out))
 
     if sub == "save":
         if await return_help_if_not_enough_args(ctx, args, 2, "template", "save"):
             return
-        usage = "!template save <unit> [name] [path=<var.path>]"
-        words, opts = _template_options(args, 1, usage, allowed=("path",))
+        usage = ("!template save <unit> [name] [path=<var.path>] "
+                 "[folder=<folder>]")
+        words, opts = _template_options(args, 1, usage,
+                                        allowed=("path", "folder"))
+        folder = _folder_opt(opts)
         if not words:
             raise VTTError(f"Which unit? Usage: `{usage}`.")
         if len(words) > 2:
@@ -7774,6 +8244,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # A re-save keeps a private template private, at its level.
             data[TEMPLATE_PRIVATE_KEY] = old[TEMPLATE_PRIVATE_KEY]
         data, _ = check_template(data, name, mgr.templates)
+        _lib_place(ctx, mgr, "templates", name, folder)
         if m.rules.get("template_pinning", False):
             # The save diffed against this match's pins; say where the
             # library has moved on since.
@@ -7785,7 +8256,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     notes.append(f"`{r}` is pinned in this match and the "
                                  f"library's version differs; the saved "
                                  f"changes are against the pinned one.")
-        verb, more = _store_template(ctx, mgr, name, data)
+        verb, more = _store_template(ctx, mgr, name, data, folder=folder)
+        more = _in_folder_note(mgr, "templates", name) + more
         if _is_partial(data):
             src = (f"`{e.id}`'s vars" if path in ("", ".")
                    else f"`{e.id}` `{path}`")
@@ -7805,7 +8277,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         _template_may_save(ctx, mgr)
         name = check_template_name(args[1])
-        raw = " ".join(args[2:])
+        folder, raw = _import_folder(args[2:], "!template import <name> "
+                                     "[folder=<folder>] <json ...>")
         data = _parse_import_json(raw, strict=False)
         says_private = (isinstance(data, dict)
                         and TEMPLATE_PRIVATE_KEY in data)
@@ -7821,7 +8294,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # records the unit's, so a later var-name rename moves its vars
             # at spawn (S9).
             data["var_names"] = _channel_var_names(ctx, mgr)
-        verb, notes = _store_template(ctx, mgr, name, data)
+        _lib_place(ctx, mgr, "templates", name, folder)
+        verb, notes = _store_template(ctx, mgr, name, data, folder=folder)
+        notes = _in_folder_note(mgr, "templates", name) + notes
         msg = (f"💾 {verb} template `{name}` from JSON "
                f"({_template_summary(name, data)})"
                + (" 🔒 still private" if data.get(TEMPLATE_PRIVATE_KEY)
@@ -7981,16 +8456,20 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "copy":
         if await return_help_if_not_enough_args(ctx, args, 3, "template", sub):
             return
-        _check_tail(args, 3, (), "!template copy <name> <new_name>")
+        _check_tail(args, 3, ("folder",),
+                    "!template copy <name> <new_name> [folder=<folder>]")
         name, tpl = _usable_template(ctx, mgr, args[1], "copy")
         new_name = check_template_name(args[2])
         if new_name == name:
             raise VTTError(f"`{new_name}` is already this template's name.")
         _template_may_save(ctx, mgr)
+        folder = _copy_folder(ctx, mgr, "templates", name, new_name, args[3:])
         data = {k: copy.deepcopy(v) for k, v in tpl.items()
                 if k not in ("saved_by", "saved_by_name")}
         data, _ = check_template(data, new_name, mgr.templates)
-        verb, notes = _store_template(ctx, mgr, new_name, data)
+        verb, notes = _store_template(ctx, mgr, new_name, data,
+                                      folder=folder)
+        notes = _in_folder_note(mgr, "templates", new_name) + notes
         return await ctx.send("\n".join(
             [f"📄 {verb} template `{new_name}` as a copy of `{name}`."]
             + notes))
@@ -8048,7 +8527,11 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                              f"(`!template restore {new_name}`).")
         if st is not None:
             st.rename_template_file(mgr, name, new_name)
+        before = _lib_renamed(mgr, "templates", name, new_name)
         mgr.templates[new_name] = mgr.templates.pop(name)
+        if old is not None and before != mgr.lib_folder("templates",
+                                                        new_name):
+            _lib_prune(ctx, mgr, "templates", before)
         invalidate_partial_cache()
         _template_changed(mgr, name, f"renamed to `{new_name}`",
                           new_name=new_name)
@@ -8148,6 +8631,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         st = storage_of(mgr)
         kept = st is not None and st.trash_template(mgr, name)
         del mgr.templates[name]
+        _lib_removed(ctx, mgr, "templates", name)
         invalidate_partial_cache()
         _template_changed(mgr, name, "deleted")
         notes = []
@@ -8287,9 +8771,13 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         data, _ = check_template(raw, name, mgr.templates)
         if name not in mgr.templates:
             _require_saver(ctx, name, data, "restore")
+        # A version comes back where the template is now, else into the
+        # folder it was in.
         verb, notes = _store_template(
             ctx, mgr, name, data,
-            saver=(data.get("saved_by"), data.get("saved_by_name")))
+            saver=(data.get("saved_by"), data.get("saved_by_name")),
+            folder=(None if name in mgr.templates
+                    else st.trash_folder(mgr.guild_key, path)))
         st.drop_trashed_template(mgr.guild_key, path)
         return await ctx.send("\n".join(
             [f"♻️ Restored template `{name}` (version #{n}): "
@@ -8414,6 +8902,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                          + (": " + "; ".join(bits) if bits else " (unchanged)"))
         return await ctx.send("\n".join(lines))
 
+    if sub in ("move", "folders", "folder"):
+        return await _library_folder_sub(ctx, args, mgr, "templates")
+
     return await _help_fallback(ctx, ["template"], args[0])
 
 
@@ -8431,13 +8922,16 @@ def _outermost_marked(m: Match, e: Entity) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 for _subs, _usage, _desc in (
-        (("save",), "!template save <unit> [name] [path=<var.path>]",
+        (("save",), "!template save <unit> [name] [path=<var.path>] [folder=<folder>]",
          "Save a unit (and its body parts) as an entity template; the name "
          "defaults to the unit's id. With path=, save that container "
          "(`inventory.axe`, or `.` for all its vars) as a PARTIAL template, "
          "named after its last key by default. Needs a host of this channel's "
          "match. Saving over an existing template replaces it (its saver or "
-         "an administrator)."),
+         "an administrator), where it is. folder= saves it into a folder "
+         "(`monsters/undead`; made if new); a name is unique across "
+         "folders, so naming another folder than the one it is in is "
+         "refused (`!template move`)."),
         (("spawn",), "!template spawn <name> <x> <y> [near=<radius>] [count=<n>] [map=<map>]",
          "Spawn an entity template at a cell (near=: the nearest free cell "
          "within the radius). Its id is the template name, numbered when "
@@ -8447,7 +8941,7 @@ for _subs, _usage, _desc in (
         (("give",), "!template give <partial> <unit> <path>",
          "Build a partial template into a unit's var path (replacing what is "
          "there); the unit's own changes to it are recorded from then on."),
-        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [has=<var.path>] [prefix]",
+        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [has=<var.path>] [folder=<folder>] [prefix]",
          "This server's saved templates; kind= keeps entity or partial "
          "templates, by= those a user saved, has= those whose vars (a "
          "partial's data), expanded, hold that dotted path "
@@ -8484,7 +8978,7 @@ for _subs, _usage, _desc in (
          "To a non-host (and a host in a channel with a team view) the "
          "private vars of private_vars / team_private_vars and the "
          "template's own lists are left out, as from a unit (#70)."),
-        (("import",), "!template import <name> <json ...>",
+        (("import",), "!template import <name> [folder=<folder>] <json ...>",
          "Save pasted JSON as a template, or replace one with JSON edited "
          "anywhere (the rest of the line is the JSON; a ```json fence is "
          "fine). A partial is {\"kind\": \"partial\", \"data\": {...}}. It is "
@@ -8503,7 +8997,7 @@ for _subs, _usage, _desc in (
          "templates reference needs `force` (an administrator or a "
          "`templates` holder), which updates "
          "those references."),
-        (("copy",), "!template copy <name> <new_name>",
+        (("copy",), "!template copy <name> <new_name> [folder=<folder>]",
          "Save a copy under another name; you are the copy's saver."),
         (("delete",), "!template delete <name> [force]",
          "Delete a template (its saver or a server administrator); it is "
@@ -8525,7 +9019,20 @@ for _subs, _usage, _desc in (
          "from a partial: it stays as plain data."),
         (("refs",), "!template refs <unit>",
          "Which of a unit's containers are built from partial templates, and "
-         "what the unit changed in each.")):
+         "what the unit changed in each."),
+        (("move",), "!template move <name> <folder>",
+         "Move a template into another folder (`/` = the top level); its "
+         "saver or an administrator. A folder only organizes the library: "
+         "the name, and everything that names it, stays the same."),
+        (("folders",), "!template folders [<folder>]",
+         "The library's folders (or one and its subfolders) with how many "
+         "templates each holds. `!template list folder=<folder>` lists "
+         "them."),
+        (("folder",), "!template folder <new|delete|rename> <folder> [<new_folder>]",
+         "Make a folder, delete an empty one, or rename one (its templates "
+         "and subfolders go along; you need to be able to move each). A "
+         "folder is up to 4 levels of lower-case words joined by `/`. "
+         "Empty folders stay unless delete_empty_library_folders is on.")):
     registry.annotate_sub("template", *_subs, usage=_usage, desc=_desc)
 
 
@@ -8561,10 +9068,12 @@ def _require_prefab_saver(ctx: ReplyContext, name: str, pf: Dict[str, Any],
 def _store_prefab(ctx: ReplyContext, mgr: MatchManager, name: str,
                   data: Dict[str, Any],
                   saver: Optional[Tuple[Any, Any]] = None,
-                  check_saver: bool = True) -> Tuple[str, List[str]]:
+                  check_saver: bool = True,
+                  folder: Optional[str] = None) -> Tuple[str, List[str]]:
     """Write `data` as prefab `name` (memory + disk); 'Saved' or 'Replaced'
     and notes. Replacing needs the old one's saver or an administrator; the
-    old version is kept 24 hours."""
+    old version is kept 24 hours. `folder`: where it goes (default: where
+    it is, else the top level)."""
     old = mgr.prefabs.get(name)
     if old is not None and check_saver:
         _require_prefab_saver(ctx, name, old, "replace")
@@ -8578,12 +9087,18 @@ def _store_prefab(ctx: ReplyContext, mgr: MatchManager, name: str,
             data[k] = str(v)
     notes: List[str] = []
     st = storage_of(mgr)
+    was = mgr.lib_folder("prefabs", name) if old is not None else None
     if st is not None:
-        notes, trashed = st.write_template(mgr, name, data, lib="prefabs")
+        notes, trashed = st.write_template(mgr, name, data, lib="prefabs",
+                                           folder=folder)
         if trashed:
             notes.append(f"The previous version is kept 24 hours "
                          f"(`!prefab restore {name}`).")
     mgr.prefabs[name] = data
+    mgr.lib_set_folder("prefabs", name,
+                       folder if folder is not None else (was or ""))
+    if was is not None and folder is not None and was != folder:
+        _lib_prune(ctx, mgr, "prefabs", was)
     _prefab_changed(mgr, name, "replaced" if old is not None else "saved")
     return ("Replaced" if old is not None else "Saved"), notes
 
@@ -8629,25 +9144,28 @@ def _prefab_scratch(mgr: MatchManager, ctx: ReplyContext, name: str,
 
 _PREFAB_USAGE = {
     "save": ("!prefab save <name> <x1> <y1> <x2> <y2> [map=<map>] "
-             "[only=<kinds>] [definitions=all]"),
+             "[only=<kinds>] [definitions=all] [folder=<folder>]"),
     "stamp": ("!prefab stamp <name> <x> <y> [map=<map>] [mode=<mode>] "
               "[rotate=<deg>] [flip=<h|v>] [team=<team>] [confirm]"),
     "show": "!prefab show <name> [text|image]",
-    "list": "!prefab list [tag=<filter>] [prefix]",
+    "list": "!prefab list [tag=<filter>] [folder=<folder>] [prefix]",
     "tags": "!prefab tags <name> [<tag ...> | -]",
-    "import": "!prefab import <name> <json ...>",
+    "import": "!prefab import <name> [folder=<folder>] <json ...>",
     "rename": "!prefab rename <name> <new_name>",
-    "copy": "!prefab copy <name> <new_name>",
+    "copy": "!prefab copy <name> <new_name> [folder=<folder>]",
     "delete": "!prefab delete <name>",
     "trash": "!prefab trash [name]",
     "restore": "!prefab restore <name> [n]",
+    "move": "!prefab move <name> <folder>",
+    "folders": "!prefab folders [<folder>]",
+    "folder": "!prefab folder <new|delete|rename> <folder> [<new_folder>]",
 }
 
 
 @registry.command(
     "prefab",
     usage=("!prefab <save|stamp|show|list|tags|import|rename|copy|delete|"
-           "trash|restore> ..."),
+           "trash|restore|move|folders|folder> ..."),
     desc=(
         "Prefabs: a saved rectangle of one map (its units with their parts "
         "and riders, tile data, zones and corpses), stamped into any match "
@@ -8681,27 +9199,37 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             skips.append(f"`!prefab {sub} {' '.join(args[1:2])}`")
         return await ctx.send(f"(replay: `!prefab {sub}` skipped; the "
                               f"prefab library is left alone)")
+    if sub in ("move", "folders", "folder"):
+        return await _library_folder_sub(ctx, args, mgr, "prefabs")
 
     if sub == "list":
-        words, opts = _template_options(args, 1, usage, allowed=("tag",))
+        words, opts = _template_options(args, 1, usage,
+                                        allowed=("tag", "folder"))
         if len(words) > 1:
             raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
                            f"`{usage}`.")
+        top = _folder_opt(opts)
+        if top:
+            _lib_folder_known(ctx, mgr, "prefabs", top)
         prefix = words[0].lower() if words else ""
         tag_filter = (check_tag_filter(opts["tag"]) if "tag" in opts
                       else None)
         names = [n for n in sorted(mgr.prefabs) if n.startswith(prefix)
                  and (tag_filter is None or tag_filter_matches(
-                     list(mgr.prefabs[n].get("tags") or []), tag_filter))]
+                     list(mgr.prefabs[n].get("tags") or []), tag_filter))
+                 and (not top or folder_within(
+                     mgr.lib_folder("prefabs", n), top))]
         if not names:
-            if mgr.prefabs and (prefix or tag_filter is not None):
+            if mgr.prefabs and (prefix or tag_filter is not None or top):
                 return await ctx.send("No prefab matches those filters.")
             return await ctx.send(
                 "No prefabs on this server. `!prefab save <name> <x1> <y1> "
                 "<x2> <y2>` saves one.")
         return await ctx.send("\n".join(
-            [f"**Prefabs ({len(names)}):**"]
-            + [f"- {_prefab_summary(n, mgr.prefabs[n])}" for n in names]))
+            [f"**Prefabs ({len(names)}"
+             + (f" in `{folder_label(top)}`" if top else "") + "):**"]
+            + _lib_grouped(mgr, "prefabs", names, lambda n: (
+                f"- {_prefab_summary(n, mgr.prefabs[n])}"))))
 
     if sub == "tags":
         if await return_help_if_not_enough_args(ctx, args, 2, "prefab", "tags"):
@@ -8809,8 +9337,9 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "save":
         opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
                 for a in args[6:] if "=" in a}
-        _check_tail(args, 6, ("map", "only", "definitions"), usage)
+        _check_tail(args, 6, ("map", "only", "definitions", "folder"), usage)
         _template_may_save(ctx, mgr, "prefabs")
+        folder = _folder_opt(opts)
         m = active_match(mgr, ctx)
         smp = _one_map(ctx, m, opts.get("map"))
         name = check_prefab_name(args[1])
@@ -8839,10 +9368,11 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if isinstance(old, dict) and old.get("tags"):
             data["tags"] = list(old["tags"])     # a re-save keeps its tags
         data = check_prefab(data, name)
-        verb, more = _store_prefab(ctx, mgr, name, data)
+        _lib_place(ctx, mgr, "prefabs", name, folder)
+        verb, more = _store_prefab(ctx, mgr, name, data, folder=folder)
         return await ctx.send("\n".join(
             [f"💾 {verb} prefab {_prefab_summary(name, data)}."]
-            + notes + more))
+            + _in_folder_note(mgr, "prefabs", name) + notes + more))
 
     if sub == "stamp":
         opts = {}
@@ -8885,18 +9415,20 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "import":
         name = check_prefab_name(args[1])
-        raw = args[2]
+        folder, raw = _import_folder(args[2:], usage)
         if ctx_user(ctx) is None:
             raise VTTError("Prefabs can only be imported with an identity to "
                            "record as the saver.")
         parsed = _parse_import_json(raw)
         data = check_prefab(parsed, name)
-        verb, notes = _store_prefab(ctx, mgr, name, data)
+        _lib_place(ctx, mgr, "prefabs", name, folder)
+        verb, notes = _store_prefab(ctx, mgr, name, data, folder=folder)
         return await ctx.send("\n".join(
-            [f"📥 {verb} prefab {_prefab_summary(name, data)}."] + notes))
+            [f"📥 {verb} prefab {_prefab_summary(name, data)}."]
+            + _in_folder_note(mgr, "prefabs", name) + notes))
 
     if sub in ("rename", "copy"):
-        _check_tail(args, 3, (), usage)
+        _check_tail(args, 3, ("folder",) if sub == "copy" else (), usage)
         name, pf = _get_prefab(mgr, args[1])
         new = check_prefab_name(args[2])
         if new in mgr.prefabs:
@@ -8906,13 +9438,16 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if ctx_user(ctx) is None:
                 raise VTTError("Prefabs can only be copied with an identity "
                                "to record as the saver.")
-            _verb, notes = _store_prefab(ctx, mgr, new, copy.deepcopy(pf))
+            folder = _copy_folder(ctx, mgr, "prefabs", name, new, args[3:])
+            _verb, notes = _store_prefab(ctx, mgr, new, copy.deepcopy(pf),
+                                         folder=folder)
             return await ctx.send("\n".join(
                 [f"📄 Copied prefab `{name}` to `{new}`; you are its saver."]
-                + notes))
+                + _in_folder_note(mgr, "prefabs", new) + notes))
         _require_prefab_saver(ctx, name, pf, "rename")
         if st is not None:
             st.rename_template_file(mgr, name, new, lib="prefabs")
+        _lib_renamed(mgr, "prefabs", name, new)
         mgr.prefabs[new] = mgr.prefabs.pop(name)
         _prefab_changed(mgr, name, f"renamed to `{new}`")
         return await ctx.send(f"Renamed prefab `{name}` to `{new}`.")
@@ -8925,6 +9460,7 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if st is not None:
             st.delete_template(mgr, name, lib="prefabs")
         del mgr.prefabs[name]
+        _lib_removed(ctx, mgr, "prefabs", name)
         _prefab_changed(mgr, name, "deleted")
         return await ctx.send(
             f"🗑️ Deleted prefab `{name}`"
@@ -8963,7 +9499,9 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         _require_prefab_saver(ctx, name, data, "restore")
     _verb, notes = _store_prefab(
         ctx, mgr, name, data,
-        saver=(data.get("saved_by"), data.get("saved_by_name")))
+        saver=(data.get("saved_by"), data.get("saved_by_name")),
+        folder=(None if name in mgr.prefabs
+                else st.trash_folder(mgr.guild_key, path, "prefabs")))
     st.drop_trashed_template(mgr.guild_key, path)
     return await ctx.send("\n".join(
         [f"♻️ Restored prefab {_prefab_summary(name, data)} (version "
@@ -9016,6 +9554,13 @@ for _sub, _usage in _PREFAB_USAGE.items():
                   "limit)."),
         "restore": ("Bring back an old version (#1 = the newest); the "
                     "current one, if any, goes to the trash."),
+        "move": ("Move a prefab into another folder (`/` = the top level); "
+                 "its saver or an administrator."),
+        "folders": ("The prefab folders (or one and its subfolders) with "
+                    "how many prefabs each holds."),
+        "folder": ("Make a folder, delete an empty one, or rename one (its "
+                   "prefabs and subfolders go along). Empty folders stay "
+                   "unless delete_empty_library_folders is on."),
     }[_sub])
 
 
@@ -9331,12 +9876,14 @@ def _replay_template(mgr: MatchManager, e: Dict[str, Any]) -> None:
         if name in mgr.templates:
             if st is not None:
                 st.rename_template_file(mgr, name, new_name)
+            _lib_renamed(mgr, "templates", name, new_name)
             mgr.templates[new_name] = mgr.templates.pop(name)
     elif data is None:
         if name in mgr.templates:
             if st is not None:
                 st.delete_template(mgr, name)
             del mgr.templates[name]
+            mgr.lib_forget("templates", name)
     else:
         if st is not None:
             st.write_template(mgr, name, copy.deepcopy(data))
@@ -12793,6 +13340,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             and not _acts_as_host(ctx, m) and _query_pov(ctx, m) is not None):
         if sub == "revive":
             _query_corpse(ctx, m, args[1])
+        elif sub in _ENT_CORPSE_SUBS:
+            # These name a corpse too (#535, #268, #329): one the view
+            # shows passes, a hidden one reads like a missing unit.
+            _query_unit_or_corpse(ctx, m, args[1])
+            if sub in ("var_move", "var_copy") and len(args) >= 4:
+                _query_unit_or_corpse(ctx, m, args[3])
         else:
             _query_eid(ctx, m, args[1])
         # The second unit a subcommand names (a transform's form is a var
@@ -12896,7 +13449,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 or any(w not in ("short", "full") for w in words)):
             raise VTTError(f"Unexpected `{' '.join(args[2:])}` — usage: "
                            f"`!ent info <id> [short] [full]`.")
-        eid = _query_eid(ctx, m, args[1])
+        eid, cloc = _query_unit_or_corpse(ctx, m, args[1])
         if "full" in words:
             # A host shows the private vars on purpose (#70), even in a
             # channel players read.
@@ -12906,6 +13459,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             token = None
         try:
+            if cloc is not None:
+                cx, cy, corpse, cmp = cloc
+                if "short" in words:
+                    return await ctx.send(_corpse_card(m, cx, cy, eid,
+                                                       corpse, cmp))
+                return await ctx.send(_corpse_description(m, cx, cy, eid,
+                                                          corpse, cmp))
             if "short" in words:
                 return await ctx.send(_entity_card(m.entities[eid],
                                                    _query_pov(ctx, m)))
@@ -12920,8 +13480,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "get"):
             return
         _check_tail(args, 3, (), "!ent get <id> <path>")
-        eid = _query_eid(ctx, m, args[1])
-        e = m.entities[eid]
+        eid, cloc = _query_unit_or_corpse(ctx, m, args[1])
+        e = m.entities.get(eid) if cloc is None else None
         path = str(args[2])
         check_store_path(path, "var path")
         host = ctx_is_admin(ctx) or _acts_as_host(ctx, m)
@@ -12929,15 +13489,30 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # the host's to read (`!ent dump`); a player meets it as missing.
         hidden = not host and any(seg.startswith("__")
                                   for seg in path.split("."))
-        found, val = (False, None) if hidden else _entity_path_value(
-            m, e, path, _query_pov(ctx, m))
+        if hidden:
+            found, val = False, None
+        elif cloc is not None:
+            # A corpse's snapshot vars as the reader may read them (#535).
+            reader = VAR_READER.get()
+            cv = (m.corpse_reader_vars(cloc[2], reader) if reader is not None
+                  else ((cloc[2].get("entity") or {}).get("vars") or {}))
+            found, val = True, cv
+            for seg in path.split("."):
+                if not isinstance(val, dict) or seg not in val:
+                    found, val = False, None
+                    break
+                val = val[seg]
+        else:
+            found, val = _entity_path_value(m, e, path, _query_pov(ctx, m))
         if not found:
             raise NotFound(f"`{args[1]}` has no var at `{path}` that this "
                            f"channel can read.")
         if not host:
             val = _without_engine_keys(val)
         val = _hide_formula_at(path, val)
-        shown = m.entity_display_name(e, _query_pov(ctx, m))
+        shown = (m.entity_display_name(e, _query_pov(ctx, m)) if e is not None
+                 else str(((cloc[2].get("entity") or {}).get("name"))
+                          or eid) + " (corpse)")
         if isinstance(val, (dict, list)):
             return await ctx.send(
                 f"**{shown}** `{path}`:\n```json\n"
@@ -12978,10 +13553,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         _check_tail(args, 5, (), f"!ent {sub} <id> <path> <dest_id> "
                                  f"<dest_path>")
-        src_id = _resolve_eid(m, args[1])
-        dest_id = _resolve_eid(m, args[3])
-        for tok, rid in ((args[1], src_id), (args[3], dest_id)):
-            if rid not in m.entities:
+        # Either end may be a corpse (#268): looting a body.
+        src_cid = _typed_corpse(ctx, m, args[1])
+        dest_cid = _typed_corpse(ctx, m, args[3])
+        src_id = src_cid or _resolve_eid(m, args[1])
+        dest_id = dest_cid or _resolve_eid(m, args[3])
+        for tok, rid, cid_ in ((args[1], src_id, src_cid),
+                               (args[3], dest_id, dest_cid)):
+            if cid_ is None and rid not in m.entities:
                 raise NotFound(f"Entity '{tok}' not found.")
         src_path, dest_path = str(args[2]), str(args[4])
         for p_ in (src_path, dest_path):
@@ -12992,8 +13571,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                                  f"!ent {sub} (source)")
         if msg:
             raise VTTError(msg)
-        se, de = m.entities[src_id], m.entities[dest_id]
-        found, val = _resolve_dotted_var(se.vars, src_path)
+        se = m.entities.get(src_id) if src_cid is None else None
+        de = m.entities.get(dest_id) if dest_cid is None else None
+        found, val = _resolve_dotted_var(
+            se.vars if se is not None else (m.corpse_vars_of(src_id) or {}),
+            src_path)
         if not found:
             raise NotFound(f"`{src_id}` has no var at `{src_path}`.")
         if sub == "var_move" and src_id == dest_id:
@@ -13003,13 +13585,23 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if dest_path.startswith(src_path + "."):
                 raise VTTError(f"`{dest_path}` is inside `{src_path}`, which "
                                f"the move deletes.")
-        log = list(de.write_var(dest_path, copy.deepcopy(val)))
-        if sub == "var_move" and src_id in m.entities:
-            log.extend(m.entities[src_id].remove_var(src_path))
+        if de is not None:
+            log = list(de.write_var(dest_path, copy.deepcopy(val)))
+        else:
+            log = []
+            m.corpse_var_set(dest_id, dest_path, copy.deepcopy(val))
+        if sub == "var_move":
+            if src_cid is not None:
+                m.corpse_var_del(src_id, src_path)
+            elif src_id in m.entities:
+                log.extend(m.entities[src_id].remove_var(src_path))
         verb = "Moved" if sub == "var_move" else "Copied"
+
+        def who(rid: str, cid_: Optional[str]) -> str:
+            return f"corpse `{rid}`" if cid_ is not None else f"`{rid}`"
         return await ctx.send("\n".join(
-            [f"{verb} `{src_id}` vars.{src_path} to `{dest_id}` "
-             f"vars.{dest_path}."] + log))
+            [f"{verb} {who(src_id, src_cid)} vars.{src_path} to "
+             f"{who(dest_id, dest_cid)} vars.{dest_path}."] + log))
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -13272,13 +13864,25 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                "<map>` or `map=<map>`.")
             mapspec, args = args[4], args[:4]
         _check_tail(args, 4, (), "!ent tp <id> <x> <y> [<map>]")
-        eid = _resolve_eid(m, args[1]);
-        if eid not in m.entities:
-            raise NotFound(f"Entity '{eid}' not found.")
         try:
             x = int(args[2]); y = int(args[3])
         except ValueError:
             return await ctx.send("❌ x and y must be integers.")
+        cid = _typed_corpse(ctx, m, args[1])
+        if cid is not None:
+            # Dragging a corpse (#329): its body on the map, no hooks.
+            loc = m.find_corpse(cid)
+            tmp = (_one_map(ctx, m, mapspec) if mapspec is not None
+                   else loc[3])
+            before = loc[3].name
+            m.corpse_move(cid, x, y, tmp.name)
+            return await ctx.send(
+                f"Moved the corpse of `{cid}` to ({x},{y})"
+                + (f" on map `{tmp.name}` (from `{before}`)."
+                   if tmp.name != before else "."))
+        eid = _resolve_eid(m, args[1]);
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
         # The unit's own map unless one is named (tier 2 of the hierarchy).
         tmp = _one_map(ctx, m, mapspec, unit=m.entities[eid])
         before = m.entities[eid].map
@@ -13802,6 +14406,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "set_var"):
             return
 
+        cid = _typed_corpse(ctx, m, args[1])
+        if cid is not None:
+            # A corpse's var (#268): store checks only, no hooks or clamps.
+            _check_tail(args, 4, (), "!ent set_var <id> <path> <value>")
+            m.corpse_var_set(cid, args[2], _parse_scalar(args[3]))
+            stored = _var_at(m.corpse_vars_of(cid), args[2])
+            return await ctx.send(f"Corpse `{cid}` vars.{args[2]} = "
+                                  f"{stored!r}")
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -13927,6 +14539,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "delete_var":
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "delete_var"):
             return
+        cid = _typed_corpse(ctx, m, args[1])
+        if cid is not None:
+            if not m.corpse_var_del(cid, args[2]):
+                raise NotFound(f"Corpse `{cid}` has no var at `{args[2]}`.")
+            return await ctx.send(f"Deleted corpse `{cid}` vars.{args[2]}")
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -15209,6 +15826,39 @@ def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
                 f"exist, or this channel currently does not have permission "
                 f"to view it.")
         raise NotFound(f"Entity '{token}' not found.")
+    return eid
+
+
+def _query_unit_or_corpse(ctx: ReplyContext, m: "Match", token: str
+                          ) -> Tuple[str, Optional[Tuple[Any, ...]]]:
+    """A read naming a unit or a corpse (#535): (id, None) for a unit the
+    view may read, (id, (x, y, corpse, map)) for a corpse it may. A unit
+    or corpse the view can't see reads exactly like a missing unit."""
+    eid = _resolve_eid(m, token, view=False)
+    if eid not in m.entities:
+        loc = m.find_corpse(eid)
+        pov = _query_pov(ctx, m)
+        if loc is not None and (pov is None or m.corpse_visible_to(
+                eid, loc[2], loc[0], loc[1], pov, loc[3])):
+            return eid, loc
+    return _query_eid(ctx, m, token), None
+
+
+# The `!ent` subcommands whose first id may name a corpse.
+_ENT_CORPSE_SUBS = frozenset({"info", "get", "set_var", "delete_var", "tp",
+                              "var_move", "var_copy"})
+
+
+def _typed_corpse(ctx: ReplyContext, m: "Match", token: str
+                  ) -> Optional[str]:
+    """The corpse a typed write names (#268, #329), or None when `token`
+    names a living unit or nothing. A host reaches any corpse; anyone else
+    only one the channel's view shows (a hidden one reads as missing)."""
+    eid = _resolve_eid(m, token, view=False)
+    if eid in m.entities or m.find_corpse(eid) is None:
+        return None
+    if not (ctx_is_admin(ctx) or _acts_as_host(ctx, m)):
+        _query_corpse(ctx, m, eid)
     return eid
 
 
@@ -17357,43 +18007,162 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             return False
         # A team is text (Entity.team): `team=1` names team "1".
         rhs = val if key == e._team_var_name() else _coerce_for_compare(val)
-        # true / false aren't the numbers 1 / 0 here: `hp>=true` matched
-        # every unit and `flag<5` a flag set to true.
-        if (isinstance(lhs, (int, float)) and isinstance(rhs, (int, float))
-                and isinstance(lhs, bool) != isinstance(rhs, bool)):
-            if kind == "!=":
-                continue
+        if not _find_compare(kind, lhs, rhs):
             return False
-        # If lhs is numeric-ish and rhs coerced numeric, compare as numbers.
-        # Otherwise the relational ops still attempt the comparison and a
-        # TypeError is treated as "doesn't match".
-        try:
-            if kind == "=":
-                if lhs != rhs:
+    return True
+
+
+def _corpse_path_value(m: Match, loc: Tuple[Any, ...],
+                       path: str) -> Tuple[bool, Any]:
+    """`!find`'s read of `path` on a corpse (#454): x / y from where it
+    lies, `name` / `map` from the snapshot and its map, anything else from
+    its vars as the command's reader may read them."""
+    x, y, corpse, mp = loc
+    ent = corpse.get("entity") if isinstance(corpse, dict) else None
+    ent = ent if isinstance(ent, dict) else {}
+    seg0 = path.split(".", 1)[0]
+    if seg0 in RESERVED_VAR_PATHS:
+        if "." in path:
+            return False, None
+        return True, {"x": x, "y": y, "map": mp.name,
+                      "name": ent.get("name")}.get(seg0)
+    reader = VAR_READER.get()
+    cv = (m.corpse_reader_vars(corpse, reader) if reader is not None
+          else (ent.get("vars") or {}))
+    found, val = _resolve_dotted_var(cv if isinstance(cv, dict) else {}, path)
+    if found and path == str(m.rules.get("team_var", "team")) \
+            and val is not None:
+        val = str(val)
+    return found, val
+
+
+def _corpse_body_box(m: Match, loc: Tuple[Any, ...]) -> Tuple[int, int,
+                                                               int, int]:
+    x, y, corpse, mp = loc
+    w, h = m._corpse_footprint(corpse, mp)
+    return x, y, w, h
+
+
+def _find_match_corpse(m: Match, cid: str, loc: Tuple[Any, ...],
+                       selectors, pov: Optional[str] = None) -> bool:
+    """`!find dead` (#454): whether every selector word matches the corpse
+    of `cid` (`loc` = (x, y, record, map)), read off its snapshot: vars,
+    the statuses and tags it died with, the groups it was in, its map and
+    size category; `near:` / `within:` measure from every cell of its
+    body. `action:` names nothing a corpse can do."""
+    x, y, corpse, mp = loc
+    ent = corpse.get("entity") if isinstance(corpse, dict) else None
+    ent = ent if isinstance(ent, dict) else {}
+
+    def one(kind: str, key: str, val: Optional[str]) -> bool:
+        if kind == "status":
+            st = ent.get("status")
+            return isinstance(st, dict) and key in st
+        if kind == "group":
+            groups = corpse.get("groups") if isinstance(corpse, dict) else None
+            mine = groups.get(cid) if isinstance(groups, dict) else None
+            return isinstance(mine, list) and key in mine
+        if kind == "map":
+            return mp.name == key
+        if kind == "tag":
+            return tag_filter_matches(
+                [t for t, _s in m.corpse_tag_sources(corpse)], key)
+        if kind == "size":
+            if not m.sizes_on():
+                raise VTTError("`size:` needs sizes on (size_enabled is off "
+                               "on this match).")
+            want = m.size_rank_of(key)
+            if want is None:
+                raise VTTError(f"`size:{key}`: not a size category.")
+            _n, text_v, _t = m.size_names()
+            found, cat = _corpse_path_value(m, loc, text_v)
+            have = m.size_rank_of(str(cat)) if found else None
+            if have is None:
+                return False
+            return (have >= want if val == "+" else have <= want
+                    if val == "-" else have == want)
+        if kind == "action":
+            raise VTTError("`action:` doesn't apply to corpses: a corpse "
+                           "uses no actions.")
+        if kind in ("near", "within"):
+            radius = _coerce_for_compare(val)
+            if isinstance(radius, bool) or not isinstance(radius,
+                                                          (int, float)):
+                raise VTTError(f"`{kind}:` radius must be a number, got "
+                               f"`{val}`.")
+            if radius < 0:
+                raise VTTError(f"`{kind}:` radius can't be negative, got "
+                               f"`{val}`.")
+            bx, by, bw, bh = _corpse_body_box(m, loc)
+            if kind == "near":
+                ref = m.entities.get(_resolve_eid(m, key, view=False))
+                if ref is None or _pov_hides(m, pov, ref.id):
+                    raise VTTError(f"`near:` reference entity `{key}` not "
+                                   f"found.")
+                if ref.map != mp.name:
                     return False
-            elif kind == "!=":
-                if lhs == rhs:
-                    return False
-            elif kind == "<":
-                if not (lhs < rhs):
-                    return False
-            elif kind == "<=":
-                if not (lhs <= rhs):
-                    return False
-            elif kind == ">":
-                if not (lhs > rhs):
-                    return False
-            elif kind == ">=":
-                if not (lhs >= rhs):
-                    return False
-        except TypeError:
+                gap = min(m._rect_gap(rx, ry, rw, rh, bx, by, bw, bh)
+                          for rx, ry, rw, rh in m.body_rects(ref))
+                return gap <= radius
+            sx, sy, wmap = (key.split(":") + [""])[:3]
+            try:
+                cx, cy = int(sx), int(sy)
+            except ValueError:
+                raise VTTError("`within:` coordinates must be integers.")
+            if wmap and mp.name != wmap:
+                return False
+            return m._rect_gap(cx, cy, 1, 1, bx, by, bw, bh) <= radius
+        found, lhs = _corpse_path_value(m, loc, key)
+        if not found:
             return False
+        rhs = (val if key == str(m.rules.get("team_var", "team"))
+               else _coerce_for_compare(val))
+        return _find_compare(kind, lhs, rhs)
+
+    for neg, alts in selectors:
+        if any(one(k, key, v) for k, key, v in alts) == neg:
+            return False
+    return True
+
+
+def _find_compare(kind: str, lhs: Any, rhs: Any) -> bool:
+    """One `!find` comparison (`=`, `!=`, `<`, ...) of a value read with the
+    typed one (#454 shares it between units and corpses)."""
+    # true / false aren't the numbers 1 / 0 here: `hp>=true` matched
+    # every unit and `flag<5` a flag set to true.
+    if (isinstance(lhs, (int, float)) and isinstance(rhs, (int, float))
+            and isinstance(lhs, bool) != isinstance(rhs, bool)):
+        return kind == "!="
+    # If lhs is numeric-ish and rhs coerced numeric, compare as numbers.
+    # Otherwise the relational ops still attempt the comparison and a
+    # TypeError is treated as "doesn't match".
+    try:
+        if kind == "=":
+            if lhs != rhs:
+                return False
+        elif kind == "!=":
+            if lhs == rhs:
+                return False
+        elif kind == "<":
+            if not (lhs < rhs):
+                return False
+        elif kind == "<=":
+            if not (lhs <= rhs):
+                return False
+        elif kind == ">":
+            if not (lhs > rhs):
+                return False
+        elif kind == ">=":
+            if not (lhs >= rhs):
+                return False
+    except TypeError:
+        return False
     return True
 
 
 @registry.command(
     "find", access="all",
-    usage="!find <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [sum|avg|min|max:<var> ...] [count|ids]",
+    usage="!find [dead|all] <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [sum|avg|min|max:<var> ...] [count|ids]",
     desc=(
         "Query entities by AND-ed predicates. A leading `!` negates a "
         "predicate (`!status:stunned`; `!team=red` also matches units with no "
@@ -17427,7 +18196,10 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
         "3 cells of `boss`, showing each one's hp, lowest first. OUTPUT: a "
         "bare `count` prints only the number of matches; a bare `ids` prints "
         "the matching ids space-separated, ready to paste into another "
-        "command (`!find team=red ids`). `sum:<var>`, `avg:<var>`, "
+        "command (`!find team=red ids`). A leading `dead` searches the "
+        "corpses instead (their snapshot's vars, statuses, tags, groups; "
+        "`near:` / `within:` from every cell of the body; `action:` "
+        "refused), `all` the units then the corpses. `sum:<var>`, `avg:<var>`, "
         "`min:<var>` and `max:<var>` print the count and that total over "
         "the matches' numbers instead (`!find team=red sum:hp`; text and "
         "missing vars are left out)."
@@ -17444,6 +18216,10 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
         title, body = registry.help_for(["find"])
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
+    # `dead` searches the corpses, `all` the units and the corpses (#454).
+    scope = "units"
+    if args[0].lower() in ("dead", "all"):
+        scope, args = args[0].lower(), args[1:]
     # Split off the DISPLAY directives (show: / sort:) so they aren't parsed
     # as predicates. Everything else is a filter predicate.
     show_cols: List[str] = []
@@ -17475,16 +18251,36 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                 sort_var = spec
         else:
             pred_tokens.append(t)
+    # A hit is ("unit", Entity) or ("corpse", (id, (x, y, record, map))).
+    hits: List[Tuple[str, Any]] = []
     try:
         predicates = _bind_find_maps(
             ctx, m, [_parse_find_selector(t) for t in pred_tokens])
         pov = _query_pov(ctx, m)
         with m.vision_pass():
-            hits = [e for e in m.entities_in_turn_order()
-                    if not _pov_hides(m, pov, e.id)
-                    and _find_match_entity(m, e, predicates, pov)]
+            if scope in ("units", "all"):
+                hits += [("unit", e) for e in m.entities_in_turn_order()
+                         if not _pov_hides(m, pov, e.id)
+                         and _find_match_entity(m, e, predicates, pov)]
+            if scope in ("dead", "all"):
+                for mp_, cx, cy, cid, corpse in m.every_corpse():
+                    if pov is not None and not m.corpse_visible_to(
+                            cid, corpse, cx, cy, pov, mp_):
+                        continue
+                    loc = (cx, cy, corpse, mp_)
+                    if _find_match_corpse(m, cid, loc, predicates, pov):
+                        hits.append(("corpse", (cid, loc)))
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
+
+    def hit_id(h) -> str:
+        return h[1].id if h[0] == "unit" else h[1][0]
+
+    def hit_value(h, path: str) -> Tuple[bool, Any]:
+        if h[0] == "unit":
+            return _entity_path_value(m, h[1], path, pov)
+        return _corpse_path_value(m, h[1][1], path)
+
     if output == "count" or aggregates:
         head = f"**{len(hits)}** {'match' if len(hits) == 1 else 'matches'}."
         if not aggregates:
@@ -17494,8 +18290,8 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
             # The numbers the caller may read (private vars read as
             # missing); text, bools and missing vars are left out.
             nums = []
-            for e in hits:
-                found, v = _entity_path_value(m, e, path, pov)
+            for h in hits:
+                found, v = hit_value(h, path)
                 if found and isinstance(v, (int, float)) \
                         and not isinstance(v, bool) and math.isfinite(v):
                     nums.append(v)
@@ -17516,10 +18312,11 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
             lines.append(f"{kind} `{path}`: **{val}**{note}")
         return await ctx.send("\n".join(lines))
     if not hits:
-        return await ctx.send("No entities match.")
+        return await ctx.send("No corpses match." if scope == "dead"
+                              else "No entities match.")
     if sort_var:
-        def _sort_key(e):
-            found, v = _entity_path_value(m, e, sort_var, pov)
+        def _sort_key(h):
+            found, v = hit_value(h, sort_var)
             # Missing vars sort last: a (rank, number, string) tuple groups
             # present values together and compares numbers vs strings cleanly
             # within their own kind (a numeric string sorts as a number).
@@ -17536,11 +18333,15 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
         hits.sort(key=_sort_key, reverse=sort_desc)
     if output == "ids":
         # Plain space-separated ids, ready to paste into another command.
-        return await ctx.send(" ".join(e.id for e in hits))
+        return await ctx.send(" ".join(hit_id(h) for h in hits))
     word = "match" if len(hits) == 1 else "matches"
     lines = [f"**{len(hits)} {word}:**"]
-    for e in hits:
-        row = f"- {_entity_line(e, pov)}"
+    for h in hits:
+        if h[0] == "unit":
+            row = f"- {_entity_line(h[1], pov)}"
+        else:
+            cid, (cx, cy, corpse, mp_) = h[1]
+            row = f"- {_corpse_line(m, cx, cy, cid, corpse, mp_)}"
         if show_cols:
             cells = []
             for col in show_cols:
@@ -17548,9 +18349,15 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                     # Statuses live in e.status, NOT in vars, so a plain var
                     # lookup renders '—'. This pseudo-column reads the real
                     # status dict; a level > 1 is shown as name(level).
-                    cells.append(f"{col}={_fmt_status_names(e) or '—'}")
+                    if h[0] == "unit":
+                        names = _fmt_status_names(h[1])
+                    else:
+                        st = (h[1][1][2].get("entity") or {}).get("status")
+                        names = ", ".join(sorted(st)) if isinstance(
+                            st, dict) else ""
+                    cells.append(f"{col}={names or '—'}")
                     continue
-                found, v = _entity_path_value(m, e, col, pov)
+                found, v = hit_value(h, col)
                 v = _hide_formula_at(col, v) if found else v
                 cells.append(f"{col}={v if found else '—'}")
             row += "  [" + ", ".join(cells) + "]"
@@ -18059,12 +18866,14 @@ def _split_foreach_commands(cmd_tokens: List[str]) -> List[List[str]]:
 @registry.command(
     "foreach",
     raw_args=True,
-    usage="!foreach <predicate> [<predicate> ...] ; <command> [; <command> ...]",
+    usage="!foreach [dead|all] <predicate> [<predicate> ...] ; <command> [; <command> ...]",
     desc=(
         "Run one or more commands for every entity matching a `!find` selector. "
         "The selector (same predicates as `!find`: `var=value`, "
         "`status:NAME`, `group:NAME`, `action:NAME`, `near:<eid>:<radius>`, "
-        "`within:<x>:<y>:<radius>`) comes before the first bare `;`. After it, "
+        "`within:<x>:<y>:<radius>`) comes before the first bare `;`; a "
+        "leading `dead` sweeps the corpses (`$id` the corpse's id, `$x $y` "
+        "where it lies), `all` the units then the corpses. After it, "
         "one OR MORE commands (separated by further bare `;`) run once per "
         "matching entity, all commands for one entity before moving to the "
         "next. Per-entity tokens substituted in each command: `$id`, `$name`, "
@@ -18153,6 +18962,11 @@ async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not commands:
         return await ctx.send("❌ foreach command is empty (nothing after `;`).")
     m = active_match(mgr, ctx)
+    # `dead` sweeps the corpses, `all` the units then the corpses (#454).
+    scope = "units"
+    if sel_tokens[0].lower() in ("dead", "all"):
+        scope, sel_tokens = sel_tokens[0].lower(), sel_tokens[1:]
+    targets: List[Tuple[str, str, int, int, str, str]] = []
     try:
         predicates = _bind_find_maps(
             ctx, m, [_parse_find_selector(t) for t in sel_tokens])
@@ -18160,17 +18974,32 @@ async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # read-only) sees what `!find` would: $id/$x/$y would otherwise hand
         # out hidden units' positions. A host's sweep acts on the real board.
         pov = None if _acts_as_host(ctx, m) else _query_pov(ctx, m)
-        hits = [e for e in m.entities_in_turn_order()
-                if not _pov_hides(m, pov, e.id)
-                and _find_match_entity(m, e, predicates, pov)]
+        # Snapshot the substitution values up front so the target set is
+        # fixed even if the per-entity commands move / kill / spawn
+        # entities.
+        if scope in ("units", "all"):
+            targets += [(e.id, e.name, e.x, e.y, (e.team or ""), e.map or "")
+                        for e in m.entities_in_turn_order()
+                        if not _pov_hides(m, pov, e.id)
+                        and _find_match_entity(m, e, predicates, pov)]
+        if scope in ("dead", "all"):
+            team_var = str(m.rules.get("team_var", "team"))
+            for mp_, cx, cy, cid, corpse in m.every_corpse():
+                if pov is not None and not m.corpse_visible_to(
+                        cid, corpse, cx, cy, pov, mp_):
+                    continue
+                loc = (cx, cy, corpse, mp_)
+                if not _find_match_corpse(m, cid, loc, predicates, pov):
+                    continue
+                ent = corpse.get("entity") or {}
+                _f, team = _corpse_path_value(m, loc, team_var)
+                targets.append((cid, str(ent.get("name") or cid), cx, cy,
+                                "" if team is None else str(team), mp_.name))
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
-    if not hits:
-        return await ctx.send("No entities match; nothing to do.")
-    # Snapshot the substitution values up front so the target set is fixed
-    # even if the per-entity commands move / kill / spawn entities.
-    targets = [(e.id, e.name, e.x, e.y, (e.team or ""), e.map or "")
-               for e in hits]
+    if not targets:
+        return await ctx.send(("No corpses match" if scope == "dead"
+                               else "No entities match") + "; nothing to do.")
     total = len(targets)
     noun = "entity" if total == 1 else "entities"
     ncmd = f"{len(commands)} command(s) each" if len(commands) > 1 else "1 command"

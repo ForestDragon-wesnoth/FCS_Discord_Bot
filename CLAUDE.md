@@ -180,7 +180,10 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   storage layer's back (it rescans its usage), then `!as restart` shows
   what a load does with it (864-866). `?file set <path> <a.b.c> <json>` /
   `?file replace <path> "<old>" "<new>"` write a file in the shape an
-  older build left it (868, 874).
+  older build left it (868, 874); `?file list [dir]` / `?file show <path>`
+  read the folder (1200); `?file copy|move <path> <path>` copy a file
+  (a new modification time) or move a file or folder as an operator
+  would (1203-1204).
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
@@ -595,9 +598,10 @@ one folder per server (`local` for the CLI / GUI):
 `matches/<id>/journal/` (per segment `<n>.json` = its starting state and
 `<n>.jsonl` = its entries, appended to; `Storage.write_journals` after each
 commit, `_truncate_journal` on a rollback), `saves/`, `sprites/`, `templates/`
-(entity templates, outside commits; `templates/.trash/` = their replaced /
-edited / deleted versions, 24 h; `templates/prefabs/` the prefabs, with
-their own `.trash/`, §7.19), `backups/` (a dated copy of
+(entity and partial templates in folders, outside commits; `templates/.trash/`
+= their replaced / edited / deleted versions, 24 h, under the folder each
+was in; §7.17 "Folders"), `prefabs/` (the prefabs, the same way, with their
+own `.trash/`, §7.19), `backups/` (a dated copy of
 systems.json, workspace.json, system_history.json and audit.json, written
 by each commit that changes one, `<stem>.<unix ms>.json`; kept for the
 owner limits `server_backup_days` (7) and `server_backup_count` (200 per
@@ -713,6 +717,18 @@ plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
   files' copies are for an operator to copy back by hand. A commit over the
   limit cuts the oldest copies after old template versions, keeping each
   file's newest unless this commit writes a new one.
+- **Server name file:** each Discord server's folder (named by its
+  numeric id) holds `0 server - <name>.txt` (`storage.server_label_file`:
+  characters no file system takes become `_`), whose first lines give the
+  server's name and id. `Storage.label_server` writes it at bot startup
+  for every server with a folder (`_label_servers`, an on_ready listener
+  in discord_commands.py) and after a commit whose `mgr.guild_name`
+  differs from the name last written (a new server's first save, a rename
+  seen since startup); a new name replaces the old file. Loads ignore it,
+  wipes leave it, `local` has none; `!owner servers` / `!owner storage`
+  read it (`label_on_disk`) for a server not in memory. `!as servername
+  <name>` (CLI / harness) plays the startup step; the harness's `?file
+  list [dir]` / `?file show <path>` read the folder (1200-1201).
 - **A replaced manager doesn't save:** `persist_workspace` skips a manager
   its workspace no longer holds (after `!as restart`, the old one's state
   would overwrite what was loaded).
@@ -2130,7 +2146,12 @@ hardcodes**.
   leading `!` negates, `|`
   alternatives (an alternative that doesn't parse reuses the previous kind and
   key); `show:<csv>` (incl. `status`), `sort:<var>[:desc]`, `count`, `ids`
-  (536-538, 631, 694-695); `sum:` / `avg:` / `min:` / `max:<var>` print
+  (536-538, 631, 694-695); a leading `dead` searches the corpses
+  (`_find_match_corpse` over the snapshot: vars through the reader,
+  statuses, tags, its `groups`, size category; `near:` / `within:` from
+  every cell of the body; `action:` refused), `all` the units then the
+  corpses, and `!foreach dead|all ; ...` sweeps them with `$id $x $y`
+  where a corpse lies (#454, 1198-1199); `sum:` / `avg:` / `min:` / `max:<var>` print
   the count and the total over the matches holding a finite number there,
   read through the query view and the var reader (#453, 1193).
 - **`!assert [--as eid] "<expr>" [msg]`**: read-only; a failure raises
@@ -2694,6 +2715,28 @@ hardcodes**.
   corpse_cell (None without a corpse), corpses_within(x, y, n, mode)
   (nearest body cell, #396, 1186), all_corpses, corpse_var / corpse_has,
   corpse_status_has / _get / _names; corpse / corpse_list action targets.
+- **Working with corpses** (#535, #268, #329, #454; user calls; 1195-1199):
+  `!ent info` / `info short` / `get` take a corpse's id
+  (`_query_unit_or_corpse`; a corpse the view can't see reads like a
+  missing unit, word for word): the description renders
+  `corpse_description_sections` (`CORPSE_DESCRIPTION_SECTIONS`, default
+  header, vitals, statuses, data, parts), the header from
+  `corpse_description_header_format`, the rest from the unit's section
+  formats over the snapshot (`_corpse_description`,
+  `_corpse_read_context`; vars through `corpse_reader_vars`). Writes
+  (`Match.corpse_var_set` / `corpse_var_del`; `!ent set_var` /
+  `delete_var`, `var_move` / `var_copy` with either end a corpse,
+  `corpse_var_set` / `corpse_var_del`): store checks only (whole-number
+  vitals that can't be deleted, text team, checked tags, no reserved or
+  derived size var, a footprint still on the map), no clamps, var hooks
+  or death check; each write lays a NEW record, so earlier states keep
+  theirs. Moves (`Match.corpse_move`, `!ent tp <corpse> x y [map]`,
+  `corpse_move(eid, x, y, map=)`): the body on the map and off voids,
+  units and corpses don't block, another map takes it along (not into a
+  map it holds as a wreck); no tile or zone hook fires (§8). The
+  non-host pre-check of `!ent` lets these subcommands
+  (`_ENT_CORPSE_SUBS`) name a visible corpse (`_typed_corpse` for the
+  writes: a host reaches any).
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
   `revert`; `!ent replace`, `replace_form`): swaps name, vars, passives,
   clamps and the part subtree; keeps id, position, facing, team, turn slot
@@ -3625,7 +3668,46 @@ hardcodes**.
   BEFORE moving anything; a forced partial rename / delete that rewrites
   several dependents reserves room for all of them first,
   `_reserve_template_room`, so it is refused whole or done whole).
-  `!server wipe all` trashes templates.
+  `!server wipe all` trashes templates and prefabs.
+- **Folders** (user design, 1202-1204): both libraries (templates,
+  prefabs) keep their entries in folders, organization only: a name
+  is unique across a library's folders (user call), so references,
+  spawns, stamps, formulas and journals name an entry alone. A folder
+  is up to `LIBRARY_FOLDER_DEPTH` (4) lower-case id words joined by `/`
+  (`logic.check_library_folder`; `/` or `-` = the top level). The
+  layout is `MatchManager.library_folders` (lib -> name -> folder, top
+  level unrecorded) and `library_dirs` (every folder, empty ones
+  included), mirrored on disk by storage.py (`template_file(mgr, name,
+  lib, folder)`, `folder_dir`; its methods change the disk only and the
+  callers keep the records: `lib_set_folder`, `_lib_renamed`,
+  `_lib_removed`). `folder=` on save / import (a word before the JSON,
+  `_import_folder`) / copy (default the source's folder; a copy over
+  an existing entry stays where it is, `_copy_folder`); writing a name
+  into another folder than the one it lives in is refused
+  (`_lib_place`; "The name is taken" when the caller can't read it);
+  a save without `folder=` replaces it in place. `move <name>
+  <folder>` (its saver / the capability), `folders [<folder>]` (a
+  player read: counts with and without subfolders), `folder
+  new|delete|rename` (`_library_folder_sub`, shared by `!template` and
+  `!prefab`; delete only an empty folder, rename moves everything inside
+  and needs the right to move each). `list folder=<f>` keeps a folder and
+  its subfolders, rows grouped under folder headings (`_lib_grouped`).
+  A folder holding only templates the caller can't read is left out of
+  `folders`, refused by `list folder=` and Tab like a missing one
+  (`_lib_folder_known`). The trash mirrors the folders
+  (`.trash/<folder>/<stamp>-<name>.json`, `trash_folder`): a restore puts
+  a version back where the entry is, else where it was. Rule
+  `delete_empty_library_folders` (default off, user call): on, a folder
+  emptied by a delete, move, rename or a subfolder's delete goes with its
+  emptied parents (`_lib_prune`; a directory holding an operator's own
+  file stays). Load (`Storage._scan_library`) walks the folders: a
+  directory whose name the library can't use is skipped with a note (its
+  files stay on disk, unloaded); a name found in two folders loads from
+  the copy changed last and the others move to corrupt/ with a note and
+  an error-log entry (`_record_load_problem`, user call). Prefabs lived
+  in templates/prefabs/ before: a server without prefabs/ gets the files
+  there that read as prefabs moved over before the templates load
+  (`_migrate_prefabs`).
 - **Raw JSON tail:** `split_command_line` / `split_command_args` keep
   `template import <name> <rest>` whole (```json fence or single quotes
   dropped) on every surface; a multi-line import is one command on Discord,
@@ -3800,9 +3882,9 @@ design is `docs/zones_prefabs_design.md` §5-§9) (908-915).
 - **Journal:** journals carry no prefab library; a command reading it
   (a stamp, `!map new from=`, `prefab_names`, `prefab_size`) is a `cmd`
   entry carrying what it read (§7.16, 947).
-- **Library** (`MatchManager.prefabs`, `templates/prefabs/<name>.json`,
-  its own namespace and trash; `storage.library_dir`, the template file
-  helpers' `lib=`): `show <name> [text|image]` (rendered through a scratch
+- **Library** (`MatchManager.prefabs`, `prefabs/[<folder>/]<name>.json`,
+  its own namespace, folders (§7.17 "Folders") and trash;
+  `storage.library_dir`, the template file helpers' `lib=`): `show <name> [text|image]` (rendered through a scratch
   match, the channel match's render mode by default, plus a contents
   summary), `list`, `import <name> <json>`, `rename`, `copy`, `delete`,
   `trash`, `restore`; edits need the saver or an admin, reads are open.
@@ -4411,6 +4493,10 @@ rejected already. Update this section in the PR that resolves an item.
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
   only that pair. A layer-aware version of each is open (idea #563).
+
+- **Dragged corpses fire no hooks** (user: a known limitation; code it
+  when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross
+  tiles and zones without their enter / exit / stop hooks.
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose

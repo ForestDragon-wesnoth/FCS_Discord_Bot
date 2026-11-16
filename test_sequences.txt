@@ -43383,3 +43383,520 @@ dotted path once their partial references are resolved: the scout's
 scout. It combines with the other filters. A player reads through the
 private-var rules, so a private var's path finds nothing for them. A
 malformed path is refused.
+
+
+SCENARIO 1195 — Reading a corpse: `!ent info`, `short` and `!ent get` (#535)
+-----------------------------------------------------------------------------
+
+!match new rc RC 10 10
+!match use rc
+!ent add hero Hero 30 4 4 9 team=blue
+!ent add ogre Ogre 40 5 5 5 team=red footprint_w=2 footprint_h=2 description="A hulking brute." gold=12 gm_note="carried the key"
+!part add ogre arm Arm 5 5
+!status def burn
+!status apply ogre burn 2
+!ent kill ogre
+!ent info ogre
+?? **Ogre** (`ogre`), dead
+?? *A hulking brute.*
+?? HP: 0/40   Position: (5,5)
+?? - burn (level 2)
+?? - gold: 12
+?? - Arm (`arm`): HP 5/5
+!ent info ogre short
+?? HP: 0/40
+!ent get ogre gold
+?? **Ogre (corpse)** `gold` = 12
+!system set default corpse_description_sections "header, data"
+!system set default corpse_description_header_format "{name} lies here (fell in round {died_round})"
+!ent info ogre
+?? Ogre lies here (fell in round
+?! burn
+?! Arm
+!system set default private_vars gm_note
+!as player pleb
+!as view blue
+!ent info ogre
+?? - gold: 12
+?! carried the key
+!ent get ogre gm_note
+?? ❌ `ogre` has no var at `gm_note` that this channel can read.
+!as host
+!system set default corpse_visibility_condition "corpse_team == pov_team"
+!as player pleb
+!ent info ogre
+?? ❌ Could not find a unit named `ogre`. Either it does not exist, or this channel currently does not have permission to view it.
+!ent info nobody
+?? ❌ Could not find a unit named `nobody`. Either it does not exist, or this channel currently does not have permission to view it.
+!as host
+!as view red
+!ent info ogre
+?? Ogre lies here
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!ent info` on a dead unit's id reads its corpse through
+corpse_description_sections (default header, vitals, statuses, data,
+parts): the header from corpse_description_header_format marks it dead,
+the other sections use the unit's formats over the snapshot (hp 0, the
+burn it died with, its vars, its arm). `short` gives the card and `!ent
+get` one var. The two rules reshape it (`{died_round}` among the
+placeholders). A player reads private vars as missing, and a corpse the
+channel's view can't see (corpse_visibility_condition) answers like a
+missing unit, word for word (the ogre lies in the blue hero's sight;
+the visibility condition hides it).
+
+
+SCENARIO 1196 — Writing a corpse's vars and looting it (#268)
+-------------------------------------------------------------
+
+!match new cw2 CW 10 10
+!match use cw2
+!ent add thief Thief 20 3 3 9 gold=0
+!ent add ogre Ogre 40 5 5 5 footprint_w=2 footprint_h=2 gold=12 bag.gem=1
+!ent kill ogre
+!gpassive add spy on_var_written "match_var_set('hooked', 1)"
+!ent set_var ogre gold 15
+?? Corpse `ogre` vars.gold = 15
+!ent set_var ogre note "smells of sulphur"
+!assert "corpse_var('ogre', 'gold') == 15 and corpse_var('ogre', 'note') == 'smells of sulphur'"
+!assert "not match_var_has('hooked')"
+!ent set_var ogre hp lots
+?? ❌ corpse `ogre`: vital var 'hp' must be a finite whole number
+!ent set_var ogre size_total 9
+?? is derived by the engine
+!ent set_var ogre footprint_w 9
+?? ❌ corpse `ogre`: (11,5) outside 10x10 (its body would cover it).
+!ent set_var ogre gold.coins 3
+?? not a dict
+!ent delete_var ogre hp
+?? ❌ corpse `ogre`: `hp` is a vital var and can't be deleted.
+!ent delete_var ogre note
+?? Deleted corpse `ogre` vars.note
+!ent delete_var ogre note
+?? ❌ Corpse `ogre` has no var at `note`.
+!ent var_move ogre gold thief loot
+?? Moved corpse `ogre` vars.gold to `thief` vars.loot.
+!assert "entity[thief].loot == 15 and not corpse_has('ogre', 'gold')"
+!ent set_var thief actions.pilfer.target corpse
+!ent set_var thief actions.pilfer.body "for k in keys(corpse_var(target, 'bag', {})):\n    var_move(target, 'bag.' + k, self, 'pack.' + k)\ncorpse_var_set(target, 'looted', true)"
+!action thief pilfer ogre
+!assert "entity[thief].pack.gem == 1 and corpse_var('ogre', 'looted') == True"
+!eval "corpse_var_set('ogre', 'x', 1)"
+?? reserved
+!eval "corpse_var_set('nobody', 'gold', 1)"
+?? No corpse with id 'nobody'
+!ent set_var ogre gold 4 bypass_clamp=yes
+?? ❌ Unknown option `bypass_clamp=` for `!ent set_var`
+!undo command
+!assert "not corpse_has('ogre', 'looted') and corpse_var('ogre', 'bag.gem') == 1"
+!ent revive ogre
+!assert "entity[ogre].hp == 40 and entity[ogre].bag.gem == 1 and not var_has('ogre', 'gold')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a corpse's vars take writes through `!ent set_var` /
+`delete_var`, `var_move` (either end) and corpse_var_set / corpse_var_del,
+with the store checks only: a vital stays a whole number and can't be
+deleted, the engine's derived size vars and the reserved paths are
+refused, a value can't nest under one, and a footprint that would reach
+off the map is refused. No var hook fires (the global on_var_written spy
+never ran) and no clamp applies. The thief's pilfer action loots the
+ogre's bag item by item and marks the corpse, one undo step: undoing it
+puts the gem back, and the revived ogre comes back with what the corpse
+held then (the gem, no gold). A corpse write takes no `bypass_clamp`.
+
+
+SCENARIO 1197 — Dragging a corpse: `!ent tp` and corpse_move (#329)
+-------------------------------------------------------------------
+
+!match new cm CM 10 10
+!match use cm
+!ent add hero Hero 20 2 2 9
+!ent add ogre Ogre 40 5 5 5 footprint_w=2 footprint_h=2
+!ent add rat Rat 3 8 8 1
+!ent kill ogre
+!ent kill rat
+!zone fill pit 7 1 8 2
+!zone hook add pit on_enter "match_var_set('trap', 1)"
+!ent tp ogre 7 1
+?? Moved the corpse of `ogre` to (7,1).
+!assert "corpse_cell('ogre') == [7, 1] and not match_var_has('trap')"
+!ent tp ogre 2 2
+?? Moved the corpse of `ogre` to (2,2).
+!ent tp ogre 10 10
+?? ❌ corpse `ogre`: (11,10) outside 10x10 (its body would cover it).
+!map void add 5 9
+!ent tp ogre 4 8
+?? ❌ corpse `ogre`: (5,9) is a void cell (its body would cover it).
+!eval "corpse_move('rat', [8, 1])"
+?? = `[8, 1]`
+!map new crypt 4 4
+!ent tp ogre 1 1 crypt
+?? Moved the corpse of `ogre` to (1,1) on map `crypt` (from `main`).
+!eval "corpse_cell('ogre')"
+?? [1, 1, 'crypt']
+!eval "corpse_move('ogre', 4, 4, map='crypt')"
+?? ❌ corpse_move: corpse `ogre`: (5,4) outside 4x4
+!eval "corpse_move('ogre', 3, 3, map='crypt')"
+?? = `[3, 3, 'crypt']`
+!undo command
+!eval "corpse_cell('ogre')"
+?? [1, 1, 'crypt']
+!ent revive ogre
+!assert "entity[ogre].map == 'crypt' and entity[ogre].x == 1 and footprint_width('ogre') == 2"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!ent tp` on a corpse's id drags it (its whole 2x2 body must
+lie on the map and off void cells; the hero standing at (2,2) doesn't
+stop it, as a corpse occupies no cell). Dragging it over the pit fires no
+hook (a known limitation). corpse_move takes a coordinate and map=; a
+fifth word (or map=) moves the corpse to another map. An undo takes a
+move back, and a revive stands the unit up where the corpse lies.
+
+
+SCENARIO 1198 — Corpse sweeps: `!find dead`, `!find all`, `!foreach dead` (#454)
+---------------------------------------------------------------------------------
+
+!match new cs CS 12 12
+!match use cs
+!ent add priest Priest 20 2 2 9 team=blue
+!ent add ogre Ogre 40 5 5 5 team=red footprint_w=2 footprint_h=2 gold=12 size_num=200
+!ent add gob1 Goblin 5 9 9 3 team=red gold=3
+!ent add gob2 Goblin 5 10 2 2 team=red
+!ent add squire Squire 10 3 6 4 team=blue
+!status def burn
+!status apply gob1 burn 1
+!ent group add pack gob1 gob2
+!ent kill ogre
+!ent kill gob1
+!ent kill squire
+!find dead
+?? **3 matches:**
+?? Ogre (`ogre`): HP: 0/40 X,Y: 5,5 (corpse)
+!find dead team=red show:gold sort:gold:desc
+?? - Ogre (`ogre`): HP: 0/40 X,Y: 5,5 (corpse)  [gold=12]
+?? - Goblin (`gob1`): HP: 0/5 X,Y: 9,9 (corpse)  [gold=3]
+!find dead status:burn ids
+?? gob1
+!find dead group:pack ids
+?? gob1
+!find dead near:priest:3 ids
+?? ogre
+?! squire
+!find dead near:priest:4 ids
+?? squire ogre
+!find dead within:7:7:1 ids
+?? ogre
+!find dead team=red sum:gold count
+?? **2** matches.
+?? sum `gold`: **15**
+!find all team=red ids
+?? gob2 ogre gob1
+!find dead action:smite
+?? ❌ `action:` doesn't apply to corpses
+!find dead team=green
+?? No corpses match.
+!foreach dead team=blue ; !ent revive $id
+?? Revived corpse `squire` as `squire`.
+!assert "is_alive('squire') and not exists('ogre')"
+!foreach dead ; !ent set_var $id looted true
+!assert "corpse_var('ogre', 'looted') == True and corpse_var('gob1', 'looted') == True"
+!foreach dead size:large+ ; !ent revive $id
+!assert "is_alive('ogre') and not is_alive('gob1')"
+!undo command
+!assert "not exists('ogre') and has_corpse('ogre')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a leading `dead` turns `!find` / `!foreach` to the corpses: the
+same selectors read each snapshot (its vars, the burn the goblin died
+with, the group it was in, its size category), `near:` and `within:`
+measure from every cell of a corpse's body (the 2x2 ogre corpse is 3 from
+the priest, the squire's 4, and the ogre's 1 from (7,7)), and `show:` / `sort:` / `sum:` / `ids` work
+as for units. `all` lists the units then the corpses. `action:` names
+nothing a corpse can do and is refused. A sweep over the dead revives
+the fallen blue squire, marks every corpse looted, and revives the large
+one; each sweep is one undo step.
+
+
+SCENARIO 1199 — Corpse sweeps through the channel's view and private vars (#454, #535)
+----------------------------------------------------------------------------------------
+
+!match new cv CV 10 10
+!match use cv
+!ent add scout Scout 10 2 2 9 team=blue
+!ent add orc Orc 10 3 3 5 team=red gm_note=ambush
+!ent add wolf Wolf 10 8 8 3 team=red
+!ent kill orc
+!ent kill wolf
+!system set default corpse_visibility_condition "tile_x < 5"
+!system set default private_vars gm_note
+!as player pleb
+!as view blue
+!find dead ids
+?? orc
+?! wolf
+!find dead gm_note=ambush
+?? No corpses match.
+!find dead show:gm_note
+?? [gm_note=—]
+!ent info wolf
+?? ❌ Could not find a unit named `wolf`.
+!ent get orc gm_note
+?? has no var at `gm_note` that this channel can read
+!as host
+!as view omniscient
+!find dead gm_note=ambush ids
+?? orc
+!foreach dead ; !ent set_var $id seen yes
+!assert "corpse_var('orc', 'seen') == 'yes' and corpse_var('wolf', 'seen') == 'yes'"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a player's `!find dead` reads the corpses the channel's view
+shows (the wolf's lies where corpse_visibility_condition hides it) and
+their vars as the player may read them (the private gm_note is missing to
+a selector and to `show:`). `!ent info` on the hidden corpse answers like
+a missing unit. A host's sweep acts on the whole board, as a unit sweep
+does.
+
+SCENARIO 1200 — A server's data folder carries a file naming the server, replaced when the name changes; the owner listings read it for a server not in memory
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+!as server 726172087244292166
+!match new sol Sol 6 6
+!as servername Solis RP: main/test
+?? wrote `0 server - Solis RP_ main_test.txt` in its folder
+?file list
+?? 0 server - Solis RP_ main_test.txt
+?file show 0 server - Solis RP_ main_test.txt
+?? Discord server: Solis RP: main/test
+?? Server id: 726172087244292166
+!as servername Solis
+?? wrote `0 server - Solis.txt`
+?file list
+?? 0 server - Solis.txt
+?! Solis RP
+!as server local
+!as idle 13
+?? Unloaded: `726172087244292166`
+!owner servers
+?? **Solis** (`726172087244292166`): not loaded
+!owner storage
+?? **Solis** (`726172087244292166`)
+!as server 726172087244292166
+!match
+?? sol
+?file list
+?? 0 server - Solis.txt
+
+Expected: `!as servername` plays the bot's startup for this server: the
+workspace takes the name Discord gives it and the folder gets `0 server -
+<name>.txt` (sorted first; characters no file system takes become `_`),
+whose first lines name the server and its id. A new name replaces the file.
+Once the server leaves memory, `!owner servers` and `!owner storage` name
+it from the file; the server loads again as before (the file isn't data).
+
+SCENARIO 1201 — A new server's first save writes its name file; the local workspace has none
+---------------------------------------------------------------------------------------------
+!as servername Anything
+?? ❌ The local workspace has no server name
+!as server 1294368645421727806
+!as servername Fresh Server
+?? its folder doesn't exist yet
+?file list
+?? 0 server - Fresh Server.txt
+!as servername <>:*?
+?? wrote `0 server - _____.txt`
+!as servername
+?? ❌ Usage: !as servername <name ...>
+HARNESS-ALLOWS-ERRORS
+
+Expected: a server whose folder doesn't exist yet takes the name, and
+the save that ends the same command (its first, which makes the folder)
+writes the file: the commit after any command writes it when the name
+differs from the one last written. The local workspace (CLI / GUI) has no Discord
+name. A name made only of characters a file name can't hold leaves `_`s.
+
+SCENARIO 1202 — Template folders: save into a folder, a name stays unique across folders, move, copy, folder rename, restore, listing by folder, kept across a restart
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new tf TF 10 10
+!match use tf
+!ent add ogre Ogre 30 2 2 5 team=red footprint_w=2 footprint_h=2
+!template save ogre folder=Monsters/Giants
+?? 📁 In `monsters/giants/`.
+!template save ogre brute folder=monsters
+!template save ogre ogre folder=npcs
+?? ❌ Template `ogre` is in `monsters/giants/`, and a name is unique across folders: `!template move ogre npcs/` moves it
+!template save ogre
+?? 📁 In `monsters/giants/`.
+!template folder new npcs/town
+?? Made template folder `npcs/town/`
+!template move ogre npcs/town
+?? Moved template `ogre` from `monsters/giants/` to `npcs/town/`
+!template copy ogre ogre_guard
+?? 📁 In `npcs/town/`.
+!template copy ogre loose folder=/
+?! 📁 In
+!template list
+?? __`monsters/`__
+?? __`npcs/town/`__
+!template list folder=npcs
+?? Templates (2 of 4 in `npcs/`)
+?? ogre_guard
+?! brute
+!template folders
+?? `monsters/giants/` — 0 template(s)
+?? `npcs/` — 0 template(s) (2 with subfolders)
+!template folder rename npcs people
+?? Renamed template folder `npcs/` to `people/` (2 template(s) moved).
+?file list templates/people/town
+?? ogre.json | ogre_guard.json
+!template show ogre
+?? in `people/town/`
+!template delete ogre_guard
+!template restore ogre_guard
+!template list folder=people/town
+?? ogre_guard
+!template spawn ogre 6 6
+?? Spawned `ogre2` from template `ogre`
+!assert "footprint_width('ogre2') == 2"
+!as restart
+!template list folder=people
+?? ogre_guard
+!template folders
+?? `monsters/giants/` — 0 template(s)
+!template move ogre people/town
+?? already in `people/town/`
+?tab "!template move ogre pe"
+?? people/town
+
+Expected: `folder=` saves a template into a folder (lower-cased, made if
+new) and the reply names it. A name is unique across folders: saving
+`ogre` into `npcs/` while it lives in `monsters/giants/` is refused,
+pointing at `!template move`, and a save without `folder=` replaces it
+where it is. A copy goes into its source's folder unless `folder=` says
+otherwise (`/` = the top level). `list` groups the rows by folder and
+`folder=` keeps a folder and its subfolders; `folders` counts each
+folder's templates with and without subfolders, empty folders included.
+Renaming a folder moves its templates and subfolders on disk, `show` names
+the folder, an old version comes back into the folder it was in, and a
+spawn names the template by its name alone (the 2x2 ogre spawns whole).
+Everything is still there after a restart; Tab offers the folders.
+
+SCENARIO 1203 — Prefab folders; prefabs move out of templates/; delete_empty_library_folders; folder refusals
+-----------------------------------------------------------------------------------------------------------
+!match new pf PF 10 10
+!match use pf
+!ent add ogre Ogre 30 2 2 5 team=red footprint_w=2 footprint_h=2
+!prefab save cave 1 1 4 4 folder=dungeon/caves
+?? 📁 In `dungeon/caves/`.
+!prefab save hall 1 1 3 3
+?file list prefabs/dungeon/caves
+?? cave.json
+!prefab list
+?? __`/`__
+?? __`dungeon/caves/`__
+!prefab folders
+?? `dungeon/caves/` — 1 prefab(s)
+!prefab copy cave cave2
+?? 📁 In `dungeon/caves/`.
+!prefab delete cave2
+!prefab move cave /
+!prefab folders
+?? `dungeon/caves/` — 0 prefab(s)
+!prefab move cave dungeon/caves
+!system set default delete_empty_library_folders true
+!prefab move cave /
+!prefab folders
+?! dungeon
+!prefab stamp cave 5 5
+?? Stamped prefab `cave`
+?file move prefabs templates/prefabs
+!as restart
+?? moved 2 prefab(s) from templates/prefabs/ to prefabs/.
+!prefab list
+?? cave
+?? hall
+!template list
+?! cave
+!template save ogre a1 folder=a/b/c
+!template folder new a/x
+!template delete a1
+!template folders
+?? `a/x/` — 0 template(s)
+?! a/b/
+!template folder delete a/x
+!template folders
+?! `a/`
+?? Template folders (1)
+!template save ogre deep folder=a/b/c/d/e
+?? ❌ A folder is at most 4 levels deep
+!template save ogre bad folder=two words
+?? ❌ Unexpected
+!template folder new my.stuff
+?? ❌ A folder name uses letters, digits
+!template folder new grp
+!template save ogre in_grp folder=grp
+!template folder delete grp
+?? ❌ Folder `grp/` isn't empty
+!template folder rename grp grp/sub
+?? ❌ `grp/sub/` is inside `grp/`.
+!template folder new /
+?? ❌ The top level (`/`) is always there.
+HARNESS-ALLOWS-ERRORS
+
+Expected: prefabs take the same folders as templates (`folder=` on save,
+import and copy; `move`, `folders`, `folder new|delete|rename`) and now
+live in prefabs/, beside templates/. A server whose prefabs/ folder
+doesn't exist yet gets the prefab files it kept in templates/prefabs/
+moved over at load, so none of them reads as a template. Empty folders
+stay until deleted while delete_empty_library_folders is off; with it on,
+moving or deleting a folder's last entry deletes it and every parent it
+leaves empty (`a/b/c/` and `a/b/` went, `a/` stayed while `a/x/` was in
+it), and deleting `a/x/` then took `a/` too. Refused: a folder deeper
+than 4 levels, a name the library can't use
+as a folder, deleting a folder that still holds a template, renaming a
+folder into itself, and the top level.
+
+SCENARIO 1204 — The same name in two folders on disk: the newest copy loads and the other goes to corrupt/ with an error-log entry; a folder name the bot can't use is skipped; a folder of private templates is hidden from players
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new dp DP 8 8
+!match use dp
+!ent add ogre Ogre 30 2 2 5 team=red footprint_w=2 footprint_h=2
+!template save ogre goblin folder=monsters
+!template save ogre spare folder=extra
+?file copy templates/monsters/goblin.json templates/goblin.json
+?file set templates/goblin.json vars.hp 77
+?file move templates/extra templates/Extra_Stuff
+!as restart
+?? a second copy of `goblin`, which loads from
+?? templates/Extra_Stuff isn't a folder name the library uses
+!template list
+?? hp 77
+?! spare
+!template folders
+?? `monsters/` — 0 template(s)
+?file list corrupt
+?? goblin.json.
+!server errors
+?? a second copy of `goblin`
+!template save ogre plan folder=secret
+!template private plan on
+!template folders
+?? `secret/` — 1 template(s)
+!as player pip
+!template folders
+?! secret
+!template list folder=secret
+?? ❌ No folder `secret/`
+!as host
+!template folder new empty
+!as player pip
+!template folders
+?? `empty/` — 0 template(s)
+HARNESS-ALLOWS-ERRORS
+
+Expected: two files of one name in different folders (an operator copied
+one by hand) load once: the copy changed last wins (hp 77 here), the other
+moves to corrupt/ with a console note and an entry in `!server errors`. A
+folder whose name the library can't use (capitals) is skipped with a note
+and its files stay on disk unloaded. A folder holding only templates a
+player can't read is left out of their `folders` and refused by
+`list folder=` like a missing one; an empty folder shows to anyone.
