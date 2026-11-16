@@ -42723,3 +42723,663 @@ body (the nearest one, as distances to a unit do): radius 1 around the
 the imp two cells past its right side. The plain `<eid>` point reads the
 unit's aoe_origin cell (its centre, rounded down): a 3x3 square of 9
 cells. from= is for bursts; an unknown unit or metric is refused.
+
+
+SCENARIO 1180 — teams() and group_names() for "each team" loops (#395)
+-----------------------------------------------------------------------
+
+!match new tm TM 10 10
+!match use tm
+!ent add knight Knight 20 1 1 5
+!ent set_var knight team blue
+!ent add orc Orc 15 5 5 9
+!ent set_var orc team red
+!ent add imp Imp 5 8 8 2
+!ent set_var imp team red
+!part add orc orc_arm Arm 5 5
+!team set green gold 3
+!ent add ghost Ghost 4 9 1 1
+!ent set_var ghost team grey
+!ent kill ghost
+!eval "teams()"
+?? ['red', 'blue', 'green', 'grey']
+!ent group add vanguard knight orc
+!ent group add reserve imp
+!eval "group_names()"
+?? ['reserve', 'vanguard']
+!eval "score = {}\nfor t in teams():\n    total = 0\n    for e in team_members(t):\n        total = total + entity[e].hp\n    score = with_key(score, t, total)\nmatch_var_set('score', score)"
+!assert "match_var_get('score') == {'red': 20, 'blue': 20, 'green': 0, 'grey': 0}"
+!ent set_var knight scored "$(len(teams()))"
+!assert "entity[knight].scored == 4"
+
+Expected: teams() lists the teams of living units in the order they first
+act (the orc's red at initiative 9, then the knight's blue; the orc's
+arm counts as red, its body's team), then the teams known only from team
+data (green) or a corpse (grey), by name. group_names() lists the groups,
+sorted. A scoring loop over teams() and team_members() totals each
+team's hp; teams() also works inside a `$()` argument.
+
+
+SCENARIO 1181 — entities_in_cells reads the units on a built cell list (#457)
+-----------------------------------------------------------------------------
+
+!match new ec EC 10 10
+!match use ec
+!ent add mage Mage 20 2 5 5
+!ent set_var mage team blue
+!ent add ogre Ogre 40 5 4 4
+!ent set_vars ogre team=red footprint_w=2 footprint_h=2
+!ent add imp Imp 5 8 5 3
+!ent set_var imp team red
+!ent add ally Ally 10 4 7 2
+!ent set_var ally team blue
+!ent set_var imp tags flying
+!eval "entities_in_cells(cells_minus(cells_in_burst(5, 5, 3), cells_in_burst(5, 5, 0)))"
+?? ['mage', 'ally', 'ogre', 'imp']
+!eval "entities_in_cells([[6, 5], [8, 5], [2, 5]])"
+?? ['ogre', 'imp', 'mage']
+!eval --as mage "entities_in_cells(cells_in_rect(1, 1, 10, 10), 'hostile')"
+?? ['ogre', 'imp']
+!eval "entities_in_cells(cells_in_rect(1, 1, 10, 10), 'ally', of='ogre')"
+?? ['imp']
+!eval "entities_in_cells(cells_in_rect(1, 1, 10, 10), tag='flying')"
+?? ['imp']
+!eval "entities_in_cells(cells_in_rect(1, 1, 10, 10), 'hostile')"
+?? self is unbound here
+!eval "entities_in_cells([[1, 1], 'nope'])"
+?? every item must be a cell
+!ent set_var mage seen "$(len(entities_in_cells(cells_in_line(1, 5, 10, 5))))"
+!assert "entity[mage].seen == 3"
+HARNESS-ALLOWS-ERRORS
+
+Expected: entities_in_cells lists the units covering any cell of a list,
+in the order of the first cell of each the list names: the 2x2 ogre is
+found by any of its four cells (the ring around (5,5) and the single cell
+(6,5) both reach it). A relation is judged against `of`, default self
+(the mage is hostile to the ogre and the imp); `tag=` filters by tags.
+Without self or `of`, a relation is refused; a cell list holding a
+non-cell is refused. It is read-only, so `$()` takes it.
+
+
+SCENARIO 1182 — plural, ordinal and list_text in a say() line (#460)
+--------------------------------------------------------------------
+
+!match new tx TX 10 10
+!match use tx
+!ent add bard Bard 20 2 2 5
+!ent add a1 Rat 5 4 2 1
+!ent add a2 Bat 5 5 2 1
+!ent add a3 Toad 5 6 2 1
+!ent set_var bard actions.volley.target entity_list
+!ent set_var bard actions.volley.body "names = []\nfor t in target:\n    names = names + [entity[t].name]\nentity[self].volleys = entity[self].volleys + 1\nsay('The ' + ordinal(entity[self].volleys) + ' volley hits ' + list_text(names) + ' for ' + plural(len(names) * 2, 'point') + '.')"
+!ent set_var bard volleys 0
+!action bard volley a1 a2 a3
+?? The 1st volley hits Rat, Bat and Toad for 6 points.
+!action bard volley a2
+?? The 2nd volley hits Bat for 2 points.
+!eval "plural(1, 'arrow') + '|' + plural(2, 'box') + '|' + plural(3, 'wolf', 'wolves') + '|' + plural(0, 'coin') + '|' + plural(1.5, 'hour')"
+?? 1 arrow|2 boxes|3 wolves|0 coins|1.5 hours
+!eval "ordinal(11) + ' ' + ordinal(12) + ' ' + ordinal(13) + ' ' + ordinal(21) + ' ' + ordinal(102) + ' ' + ordinal(111) + ' ' + ordinal(0)"
+?? 11th 12th 13th 21st 102nd 111th 0th
+!eval "list_text([]) + '|' + list_text(['a']) + '|' + list_text(['a', 'b'], 'or') + '|' + list_text([1, 2, 3])"
+?? |a|a or b|1, 2 and 3
+!eval "ordinal(1.5)"
+?? ordinal(n): n must be a whole number
+!eval "plural('x', 'cat')"
+?? plural(n, word): n must be a number
+HARNESS-ALLOWS-ERRORS
+
+Expected: the action counts its volleys and says how many it hit and for
+how much: ordinal(1) is "1st", list_text joins the names with commas and
+"and", plural puts the count with the word in its form (an s, es after
+s / x / z / ch / sh, or the form given). list_text takes another joining
+word ('or'); ordinal refuses a fraction and plural a non-number.
+
+
+SCENARIO 1183 — own_turns: a cooldown in the owner's turns (#539)
+-----------------------------------------------------------------
+
+!match new ot OT 10 10
+!match use ot
+!ent add hero Hero 20 2 2 9
+!ent add orc Orc 20 5 5 5
+!ent set_var hero ready_at 0
+!ent set_var hero actions.smite.target entity
+!ent set_var hero actions.smite.body "if own_turns(self) < entity[self].ready_at:\n    fail('smite is ready on your ' + ordinal(entity[self].ready_at) + ' turn')\nentity[target].hp = entity[target].hp - 5\nentity[self].ready_at = own_turns(self) + 2"
+!turn next
+!eval "own_turns('hero')"
+?? = `1`
+!action hero smite orc
+!assert "entity[orc].hp == 15 and entity[hero].ready_at == 3"
+!turn next
+!turn next
+!action hero smite orc
+?? smite is ready on your 3rd turn
+!status def stun
+!status data stun skips_turn true
+!status apply hero stun
+!turn next
+!turn next
+?? `hero`'s turn skipped (stun)
+!ent status hero remove stun
+!eval "[own_turns('hero'), own_turns('hero', acted=True), own_turns('orc'), turns_elapsed()]"
+?? [3, 2, 3, 5]
+!action hero smite orc
+!assert "entity[orc].hp == 10"
+!turn grant hero
+!turn next
+!assert "own_turns('hero') == 4 and own_turns('hero', acted=True) == 3"
+!ent kill orc
+!assert "own_turns('orc') == 3"
+!ent revive orc
+!assert "own_turns('orc') == 3"
+!ent kill orc
+!ent remove orc
+!ent add orc Orc 20 5 5 5
+!assert "own_turns('orc') == 0"
+!eval "own_turns('nobody')"
+?? own_turns: no unit 'nobody'
+HARNESS-ALLOWS-ERRORS
+
+Expected: own_turns counts the turns each unit has begun. The smite sets
+ready_at two of the hero's own turns ahead, so it is refused on its 2nd
+turn. A turn a stun skips counts as begun (own_turns 3) but not acted
+(acted=True gives 2): the skipped turn wasn't a turn the hero played,
+while turns_elapsed counts every unit's turns (5). On its 3rd turn
+counted the smite works again. An extra turn counts too. The orc's count
+survives its death and its revive (a revive is the same unit) and starts
+again at 0 for a new unit made under the id once the corpse is gone.
+
+
+SCENARIO 1184 — fits_at: a teleport refuses a cell its body doesn't fit (#540)
+------------------------------------------------------------------------------
+
+!match new fa FA 10 10
+!match use fa
+!ent add golem Golem 40 2 2 5
+!ent set_vars golem footprint_w=2 footprint_h=2
+!ent add rock Rock 10 7 7 1
+!tile set 8 2 block true
+!ent set_var golem actions.blink.target location
+!ent set_var golem actions.blink.target_condition "fits_at(self, target)"
+!ent set_var golem actions.blink.body "move_entity(self, target)"
+!eval "[fits_at('golem', 5, 5), fits_at('golem', 6, 6), fits_at('golem', 9, 9), fits_at('golem', 10, 1)]"
+?? [True, False, True, False]
+!eval "[fits_at('golem', 7, 2), fits_at('golem', 7, 2, 'none'), fits_at('golem', 2, 2), fits_at('golem', 1, 1)]"
+?? [False, True, True, True]
+!action golem blink 6 6
+?? `(6,6)` doesn't meet `blink`'s target condition
+!assert "entity[golem].x == 2 and entity[golem].y == 2"
+!action golem blink 5 5
+!assert "entity[golem].x == 5 and entity[golem].y == 5"
+!eval "fits_at('golem', [4, 4])"
+?? = `True`
+!map new cave 4 4
+!part add golem golem_fist Fist 5 5
+!part locate golem_fist 7 5
+!eval "[fits_at('golem', 1, 1, map='cave'), fits_at('golem', 3, 3, map='cave'), fits_at('golem', 1, 1, 'none')]"
+?? [True, False, True]
+!eval "fits_at('golem', 2, 2, 'fly')"
+?? mode must be tp, walk, push, swap or none
+HARNESS-ALLOWS-ERRORS
+
+Expected: fits_at judges the golem's whole 2x2 body at a cell: every cell
+on the map and free (the rock at (7,7) refuses (6,6); (9,9) fits the
+10x10 map's corner, (10,1) would hang a column off it), none blocking the
+mode's move (at (7,2) the body would cover the blocking tile (8,2):
+refused for a teleport, fine with mode `none`), and its own cells never
+count against it ((1,1) overlaps where it stands). As the blink's
+target_condition (a location target's cell is `target`) it refuses (6,6)
+before the body runs; (5,5) works. A coordinate fills x and y. On another
+map its located fist counts too, at its offset two cells right, as a
+cross-map move carries it: on the 4x4 cave the body fits at (1,1) with
+the fist at (3,1), while at (3,3) the fist would land off the map. On
+its own map a move leaves the fist standing, so fits_at doesn't count
+it. An unknown mode is refused.
+
+
+SCENARIO 1185 — free_cells_near lists every spot a body fits, nearest first (#522)
+----------------------------------------------------------------------------------
+
+!match new fc FC 8 8
+!match use fc
+!ent add ogre Ogre 40 4 4 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add imp Imp 5 3 3 2
+!eval "free_cells_near(4, 4, 1)"
+?? = `[[4, 3], [5, 3], [3, 4], [3, 5]]`
+!eval "free_cells_near(4, 4, 1, 'ogre')"
+?? = `[[4, 4], [4, 3], [3, 4]]`
+!eval "len(free_cells_near(4, 4, 1, 'ogre', fit='any'))"
+?? = `12`
+!eval "free_cells_near(1, 1, 0)"
+?? [[1, 1]]
+!ent set_var imp actions.call.target none
+!ent set_var imp actions.call.body "spots = free_cells_near(entity[self].x, entity[self].y, 2)\nif len(spots) < 3:\n    fail('no room for three')\nfor i in range(3):\n    summon({'name': 'Rat', 'vars': {'hp': 1, 'max_hp': 1}}, get(spots, i))"
+!action imp call
+!assert "len(all_entities()) == 5"
+!eval "free_cells_near(4, 4, -1)"
+?? radius must be a whole number >= 0
+!eval "free_cells_near(4, 4, 1, 'ogre', fit='middle')"
+?? fit must be one of
+HARNESS-ALLOWS-ERRORS
+
+Expected: free_cells_near lists every cell within the radius where a unit
+could stand, nearest ring first in free_cell_near's order: around (4,4)
+the empty cells (the imp's (3,3) and the ogre's four cells left out).
+For the 2x2 ogre, the anchors keeping its whole body inside the 3x3
+square (fit body) and clear of the imp: its own spot first (its own body
+doesn't count against it), then (4,3) and (3,4); fit any takes the 12
+anchors with at least one body cell inside. The imp's action counts the
+spots before it summons three rats on them. A negative radius and an
+unknown fit are refused.
+
+
+SCENARIO 1186 — corpse_cell and corpses_within: looting in reach (#396)
+-----------------------------------------------------------------------
+
+!match new cw CW 10 10
+!match use cw
+!ent add thief Thief 20 2 2 5
+!ent add brute Brute 30 5 2 3
+!ent set_vars brute footprint_w=2 footprint_h=2 gold=7
+!ent add rat Rat 3 9 9 1
+!ent set_var rat gold 1
+!ent kill brute
+!ent kill rat
+!eval "corpse_cell('brute')"
+?? = `[5, 2]`
+!eval "corpse_cell('thief')"
+?? = `None`
+!eval "corpses_within(3, 2, 1)"
+?? = `[]`
+!eval "corpses_within(3, 2, 2)"
+?? = `['brute']`
+!eval "corpses_within(5, 5, 5)"
+?? = `['brute', 'rat']`
+!ent set_var thief actions.loot.target corpse
+!ent set_var thief actions.loot.body "if target not in corpses_within(entity[self].x, entity[self].y, 1):\n    fail('out of reach')\nentity[self].gold = entity[self].gold + corpse_var(target, 'gold')"
+!ent set_var thief gold 0
+!action thief loot brute
+?? out of reach
+!ent tp thief 4 3
+!action thief loot brute
+!assert "entity[thief].gold == 7"
+
+Expected: corpse_cell gives the cell a corpse lies on (the brute's body's
+top-left cell) and None for a unit that isn't a corpse. corpses_within
+measures to a corpse's nearest cell, so the 2x2 brute corpse at (5,2) is
+2 from (3,2) and in reach of a radius-2 search, nearest first. The loot
+action checks it and fails while the corpse is out of reach; one step
+closer the thief loots the brute's gold.
+HARNESS-ALLOWS-ERRORS
+
+
+SCENARIO 1187 — A destroyed body part says so where players read parts (#587)
+-----------------------------------------------------------------------------
+
+!match new dp DP 10 10
+!match use dp
+!ent add ogre Ogre 40 4 4 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre arm Arm 5 5
+!part add ogre head Head 8 8
+!system set default roster_glued_parts true
+!ent damage arm 5
+?? 💀 **Arm** (`arm`) died.
+!as player pleb
+!ent info ogre
+?? - Arm (`arm`): HP 0/5, destroyed
+?? - Head (`head`): HP 8/8
+?! Head (`head`): HP 8/8, destroyed
+!as host
+!list
+?? Arm (arm): HP: 0/5
+?? [part of ogre, destroyed]
+?? Head (head): HP: 8/8 X,Y: 4,4 facing down [part of ogre]
+!system set default entity_description_part_format "- {name}{?destroyed?} (gone){/?}: {state}"
+!ent info ogre
+?? - Arm (gone): destroyed
+!ent set_var head state "bruised"
+!ent info ogre
+?? - Head: bruised
+!ent heal arm 2
+!ent info ogre
+?! Arm (gone)
+
+Expected: once the arm's hp reaches 0 it is destroyed, and the player's
+description of the ogre marks it (", destroyed" from the `{?destroyed?}`
+conditional in the default entity_description_part_format); the roster's
+part suffix says so too. A custom format reads `{state}` (`destroyed`,
+else empty) and the conditional; a GM var named `state` wins over the
+placeholder. A heal above 0 lifts the latch and the mark goes.
+
+
+SCENARIO 1188 — `!ent clone` without coordinates lands beside the source (#590)
+-------------------------------------------------------------------------------
+
+!match new cl CL 10 10
+!match use cl
+!ent add ogre Ogre 40 4 4 5
+!ent set_vars ogre footprint_w=2 footprint_h=2 team=red
+!ent add rock Rock 9 6 4 1
+!ent clone ogre ogre2
+?? Cloned `ogre` → `ogre2` at (6,5).
+!assert "footprint_width('ogre2') == 2 and entity[ogre2].team == 'red'"
+!ent clone ogre pack count=2
+?? Cloned `ogre` → 2 copies: `pack1`@(4,6), `pack2`@(4,2).
+!ent clone ogre far count=4 near=1
+?? ❌ no free cell fits `ogre`'s body within 1 of it for `far4` — nothing was cloned.
+!assert "not exists('far1')"
+!ent clone ogre h2 count=2 7 7
+?? ❌ `count=` and `near=` go with a clone placed by itself
+!ent clone ogre x count=0
+?? ❌ `count=` must be at least 1.
+!ent clone ogre solo 8 8
+?? Cloned `ogre` → `solo` at (8,8).
+HARNESS-ALLOWS-ERRORS
+
+Expected: with no cell given the copy of the 2x2 ogre lands on the free
+anchor nearest the ogre's body centre where its whole body fits, clear of
+the source itself (the rock at (6,4) leaves (6,5), which ties with (4,6)
+and wins by row, as for a dismount). count=2 makes
+two the same way (ids pack1, pack2); near=1 bounds the search, and when a
+copy doesn't fit within it nothing is cloned. count= with coordinates and
+count=0 are refused; one coordinate pair still works as before.
+
+
+SCENARIO 1189 — `!zone copy` copies a zone with what it holds (#605)
+--------------------------------------------------------------------
+
+!match new zc ZC 10 10
+!match use zc
+!status def burn
+!ent add imp Imp 10 8 2 3
+!zone def new firepit
+!zone def tags firepit hazard
+!zone fill lava 1 1 2 2
+!zone setdef lava firepit
+!zone set lava dmg 3
+!zone glyph lava ~
+!zone hook add lava on_enter "entity[self].hp = entity[self].hp - zone_get(zone_name, 'dmg')"
+!zone grant lava burn level=2
+!zone copy lava pool 7 0
+?? Copied zone `lava` to `pool` by (7,0): 4 cell(s).
+!zone copy lava
+?? Copied zone `lava` to `lava2`: 4 cell(s). It lies on the same cells: move it with `!zone move lava2 <dx> <dy>`.
+!assert "zone_get('pool', 'dmg') == 3 and zone_def_of('pool') == 'firepit' and zone_has_tag('pool', 'hazard')"
+!assert "cell_in_zone(8, 2, 'pool') and cell_in_zone(9, 1, 'pool') and not cell_in_zone(1, 1, 'pool')"
+!assert "status_level('imp', 'burn') == 2"
+!ent tp imp 8 5
+!ent tp imp 9 1
+!assert "entity[imp].hp == 7"
+!zone set pool dmg 1
+!assert "zone_get('lava', 'dmg') == 3"
+!zone copy lava edge 9 9
+?? Copied zone `lava` to `edge` by (9,9): 1 cell(s) (3 off the map dropped).
+!zone copy lava gone 20 20
+?? ❌ No cell of the copy lands on map `main` (10x10); nothing was copied.
+!zone copy lava pool
+?? ❌ A zone `pool` already exists.
+!ent add knight Knight 20 5 5 4
+!zone fill halo 5 5 5 5
+!zone anchor halo knight 1
+!zone copy halo ring 0 0
+?? the copy stays where it is.
+!ent tp knight 2 8
+!assert "zone_size('ring') == 9 and cell_in_zone(4, 4, 'ring') and zone_anchor_of('ring') == ''"
+!map new cellar 6 6
+!zone copy lava cold map=cellar
+?? Copied zone `lava` to `cold` on `cellar`: 4 cell(s).
+!assert "zone_size('cold') == 4 and len(zone_cells('cold')) == 4"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!zone copy` makes a new zone with the source's cells (moved by
+the offset), data, hooks, look, tags, grants and definition link: the
+copy at +7 covers the imp's cell, so the imp gets the granted burn at
+once (the grants settle after the command), and walking into it runs the
+copied on_enter hook. The copy's data is its own (changing it leaves the
+source alone). Without a name one is minted (`lava2`) and the reply says
+it lies on the source's cells; cells off the map are dropped, and a copy
+with none left, or a taken name, is refused. An aura's copy is a plain
+zone on the cells the aura covers now: it doesn't follow the knight.
+`map=` puts the copy on another map.
+
+
+SCENARIO 1190 — Table rolls with a count, and `!roll <table>` (#610)
+---------------------------------------------------------------------
+
+!match new tr TR 8 8
+!match use tr
+!match rng set 42
+!table def loot sword, shield:2, gold
+!table roll loot 3
+?? 🎲 3x table `loot` →
+!table roll loot
+?? 🎲 table `loot` →
+!roll loot
+?? 🎲 table `loot` →
+!roll 4x loot
+?? 🎲 4x table `loot` →
+!table def d6 heads, tails
+!roll d6
+?? 🎲 `d6` →
+?! table `d6`
+!eval "len(table_roll('loot', 5))"
+?? = `5`
+!eval "table_roll('loot') in ['sword', 'shield', 'gold']"
+?? = `True`
+!ent add hero Hero 10 1 1 5
+!ent set_var hero actions.search.target none
+!ent set_var hero actions.search.body "found = table_roll('loot', 2)\nentity[self].found = found\nsay('Found ' + list_text(found) + '.')"
+!action hero search
+?? Found
+!assert "len(entity[hero].found) == 2"
+!table roll loot 99
+?? ❌ `99`: roll 1 to 20 times (roll_repeat_limit).
+!table roll loot two
+?? ❌ `two`: the number of rolls is a whole number.
+!eval "table_roll('loot', 0)"
+?? n must be a whole number from 1 to 20
+!roll 30x loot
+?? roll 1 to 20 times
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!table roll loot 3` rolls the named table three times, and
+`!roll` rolls a named table when the word isn't dice (`!roll loot`, with
+its `<n>x` repeat); a table named like dice (`d6`) leaves `!roll d6`
+rolling a die. table_roll(name, n) returns a list of n picks, which an
+action can list in a say() line. The count is bounded by
+roll_repeat_limit, and a count that isn't a whole number is refused.
+
+
+SCENARIO 1191 — `!mount list` with no vehicle lists every vehicle (#600)
+------------------------------------------------------------------------
+
+!match new ml ML 10 10
+!match use ml
+!ent add cart Cart 30 2 2 3
+!ent set_vars cart team=red footprint_w=2
+!ent set_var cart slots.driver.capacity 1
+!ent set_var cart slots.driver.region front
+!ent set_var cart slots.hold.capacity 2
+!ent add boat Boat 30 6 6 2
+!ent set_var boat team blue
+!ent set_var boat slots.deck.capacity 2
+!ent set_var boat slots.deck.region center
+!ent add drv Driver 10 1 1 5
+!ent set_var drv team red
+!ent add spy Spy 10 1 2 4
+!ent set_var spy team red
+!ent add sailor Sailor 10 8 8 1
+!ent set_var sailor team blue
+!mount drv cart driver
+!mount spy cart hold
+!mount sailor boat deck
+!mount list
+?? **Vehicles:**
+?? - `cart`: driver: `drv`; hold: `spy`
+?? - `boat`: deck: `sailor`
+!as player pleb
+!as view blue
+!mount list
+?? - `cart`: driver: `drv`; hold: (empty)
+?! spy
+!as view red
+!as host
+!mount list cart
+?? `hold` [hidden] 1/2: `spy`
+!ent remove boat
+!ent remove cart
+!mount list
+?? No vehicles in this match.
+
+Expected: with no vehicle named, `!mount list` lists every vehicle in turn
+order with each slot and its riders, one line per vehicle. Through a
+team view a rider hidden inside its vehicle (a slot without a region)
+stays out, as any unit the view can't see. Naming a vehicle still shows
+its slots in detail; with no vehicles left the list says so.
+
+
+SCENARIO 1192 — `!ent add` with starting vars; why there is no turn order (#434, #538)
+--------------------------------------------------------------------------------------
+
+!match new ea EA 10 10
+!match use ea
+!turn next
+?? No turn order yet: the match has no units that take turns.
+!gpassive add watch on_var_written target=speed "match_var_set('hooked', 1)"
+!ent add hero Hero 30 2 2 team=blue speed=2 stats.str=3 note="old soldier"
+?? Added `Hero` with id `hero` at (2,2). Vars: team='blue', speed=2, stats={'str': 3}, note='old soldier'.
+?? ℹ️ `hero` has no `initiative`, so it stands outside the turn order: `!ent init hero <n>` or `!turn roll` puts it in.
+!assert "entity[hero].team == 'blue' and entity[hero].speed == 2 and entity[hero].stats.str == 3 and entity[hero].note == 'old soldier'"
+!assert "not match_var_has('hooked')"
+!ent set_var hero speed 3
+!assert "match_var_get('hooked') == 1"
+!ent add ogre Ogre 40 5 5 team=red footprint_w=2 footprint_h=2
+!assert "occupies('ogre', 6, 6)"
+!turn next
+?? No turn order yet: no unit has an `initiative`, so none takes turns (`hero`, `ogre`).
+?? `!ent init <id> <n>`
+?? `!turn roll`
+?? `!defvar add initiative <n>`
+!ent add gob Goblin 5 8 8 4 team=red
+?! outside the turn order
+!turn next
+?? It is now **Goblin**'s turn
+!ent add bad Bad 5 1 1 hp=3
+?? ❌ `hp` is given twice
+!ent add bad2 Bad 5 1 1 3 initiative=9
+?? ❌ `initiative` is given twice
+!ent add bad3 Bad 5 1 1 x=4
+?? reserved
+!ent add bad4 Bad 5 9 9 footprint_w=3
+?? ❌
+!assert "not exists('bad') and not exists('bad3') and not exists('bad4')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `key=value` words after the position give the unit its starting
+vars (a dotted key nests, a quoted value keeps its spaces), set before it
+arrives like a template's values, so no var hook fires (a later write of
+the same var does). A unit without an
+initiative stands outside the turn order and `!ent add` says so; with an
+empty order `!turn next` names the units outside it and the ways in
+(`!ent init`, `!turn roll`, default_entity_vars through `!defvar add`).
+A vital given both in its place and as `key=` is refused, as are a
+reserved var and a body that doesn't fit the map.
+
+
+SCENARIO 1193 — Aggregates in `!find`: sum, avg, min, max (#453)
+----------------------------------------------------------------
+
+!match new fg FG 10 10
+!match use fg
+!ent add a Orc 10 1 1 3
+!ent set_vars a team=red gold=5
+!ent add b Orc 20 2 1 2
+!ent set_vars b team=red gold=7
+!ent add c Orc 30 3 1 1
+!ent set_vars c team=red gold="lots"
+!ent add d Elf 12 4 1 4
+!ent set_vars d team=blue gold=100
+!find team=red sum:hp avg:hp min:hp max:hp
+?? **3** matches.
+?? sum `hp`: **60**
+?? avg `hp`: **20**
+?? min `hp`: **10**
+?? max `hp`: **30**
+!find team=red sum:gold avg:gold
+?? sum `gold`: **12** (2 of 3 hold a number)
+?? avg `gold`: **6**
+!find team=red sum:mana
+?? sum `mana`: — (no match holds a number there)
+!find team=green sum:hp
+?? **0** matches.
+!system set default private_vars gold
+!as player pleb
+!find team=red sum:gold
+?? sum `gold`: — (no match holds a number there)
+!as host
+!find team=red sum:gold
+?? sum `gold`: **12**
+!find team=red sum:
+?? ❌
+
+HARNESS-ALLOWS-ERRORS
+Expected: `sum:` / `avg:` / `min:` / `max:` over a var print the number of
+matches and the total over the matches holding a number there (the text
+"lots" left out, with a note counting who held one). No match, or no
+number, prints a dash. A player reads the totals through the private-var
+rules, so a private var adds nothing for them while the host sees it. An
+empty path is refused.
+
+
+SCENARIO 1194 — `!template list has=<path>` (#456)
+---------------------------------------------------
+
+!match new th TH 10 10
+!match use th
+!ent add wolf Wolf 10 1 1 3
+!ent set_var wolf actions.bite.body "1"
+!ent set_var wolf fly false
+!ent add bat Bat 5 2 1 2
+!ent set_var bat fly true
+!ent set_var bat gm_note "vampire in disguise"
+!template save wolf
+!template save bat
+!ent add kit Kit 5 3 1 1
+!ent set_var kit pack.rope 1
+!template save kit kit_pack path=pack
+!ent add scout Scout 8 4 1 1
+!template give kit_pack scout gear
+!template save scout
+!template list has=actions.bite
+?? **Templates (1 of 4):**
+?? `wolf`
+!template list has=fly
+?? **Templates (2 of 4):**
+!template list has=rope
+?? `kit_pack`
+!template list has=gear.rope
+?? `scout`
+!template list has=fly kind=entity b
+?? `bat`
+!template list has=nothing
+?? No template matches those filters.
+!template list has=gm_note
+?? `bat`
+!system set default private_vars gm_note
+!as player pleb
+!template list has=gm_note
+?? No template matches those filters.
+!as host
+!template list has=..
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: has= keeps the templates whose vars (a partial's data) hold the
+dotted path once their partial references are resolved: the scout's
+`gear` comes from the kit_pack partial, so `has=gear.rope` finds the
+scout. It combines with the other filters. A player reads through the
+private-var rules, so a private var's path finds nothing for them. A
+malformed path is refused.

@@ -482,6 +482,11 @@ MOVE_HOOK_WARNED: "contextvars.ContextVar[Optional[Set[str]]]" = (
     contextvars.ContextVar("vtt_move_hook_warned", default=None))
 MOVE_HOOK_FIRED: "contextvars.ContextVar[Optional[List[int]]]" = (
     contextvars.ContextVar("vtt_move_hook_fired", default=None))
+# Set while a corpse is revived (Match.revive_corpse): the units it spawns
+# are the same units again, so they keep their own-turn counts (#539); any
+# other spawn under an id starts a new count.
+REVIVING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "REVIVING", default=False)
 
 
 def move_hook_limit(rules: Dict[str, Any]) -> int:
@@ -3126,14 +3131,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     ## Entity card formatting (shown in !ent info)
     "body_part_entity_line_suffix": {
-        "default": " [part of {parent}]",
+        "default": " [part of {parent}{?destroyed?}, destroyed{/?}]",
         "schema": {"type": "str"},
         "desc": (
             "Appended to the entity_line_format row (in !list / !state) for a "
             "SUB-ENTITY — an entity attached as a body part / segment of "
             "another (its `part_of` points at a live parent). Lets a roster "
             "show at a glance which body a part belongs to. Placeholders: "
-            "{parent} (parent id), {parent_name} (parent's name), plus every "
+            "{parent} (parent id), {parent_name} (parent's name), {state} "
+            "(`destroyed` for a destroyed part, else empty; also the "
+            "{?destroyed?}...{/?} conditional), plus every "
             "key entity_line_format exposes (resolved against the PART). Empty "
             "= no suffix. Only parts that appear on the roster ever show it "
             "(see the roster_glued_parts rule and the `__roster_show` var)."
@@ -3497,10 +3504,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "entity_description_part_format": {
-        "default": "- {name} (`{id}`): HP {hp}/{max_hp}",
+        "default": "- {name} (`{id}`): HP {hp}/{max_hp}"
+                   "{?destroyed?}, destroyed{/?}",
         "schema": {"type": "str"},
         "desc": "One body part in the description (the part's "
-                "entity_info_format placeholders).",
+                "entity_info_format placeholders, plus {state}: "
+                "`destroyed` for a destroyed part, else empty, and the "
+                "{?destroyed?}...{/?} conditional).",
     },
     ## Var-hook system rules
     "var_hook_recursion_limit": {
@@ -10109,6 +10119,9 @@ class Entity:
                 f"Entity id '{self.id}' already exists in this match "
                 f"(as a living unit or a corpse)."
             )
+        # A new unit under an id counts its own turns from 0 (#539).
+        if not REVIVING.get():
+            match.own_turn_counts.pop(self.id, None)
 
         # Fill missing vars from the system's default_entity_vars BEFORE
         # validating placement and vital vars — a default may legitimately
@@ -10259,6 +10272,8 @@ class Entity:
         if (despawn or not (corpse_kept or self.part_of)) \
                 and self.id in m.round_acted:
             m.round_acted = [x for x in m.round_acted if x != self.id]
+        if (despawn or not (corpse_kept or self.part_of)):
+            m.own_turn_counts.pop(self.id, None)
         m._scrub_entity_from_groups(self.id)
         # Drop any entity-attached scheduled effects bound to this entity
         # — a dead/despawned entity's pending turn-delayed effects don't
@@ -13075,6 +13090,10 @@ class Match:
     reaction_seq: int = 0
     reaction_log: List[Dict[str, Any]] = field(default_factory=list)
     own_turn_at: Dict[str, int] = field(default_factory=dict)
+    # Per unit, [turns begun, turns acted] in this match (#539, own_turns):
+    # a skipped turn counts as begun only. Serialized, undo state; a unit
+    # leaving for good leaves it, as round_acted.
+    own_turn_counts: Dict[str, List[int]] = field(default_factory=dict)
     _reaction_opened: Optional[float] = field(default=None, repr=False)
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
@@ -21275,6 +21294,7 @@ class Match:
                 matched = ", ".join(sorted(skipping))
                 log.append(self.unit_line(
                     eid, f"⏭️ `{eid}`'s extra turn skipped ({matched})."))
+                self._count_own_turn(eid, False)
                 stale = [n for n in sorted(skipping)
                          if self._has_turn_tick(e, n)
                          and not self._ticks_on_extra_turn(e.status.get(n), n)]
@@ -21522,11 +21542,23 @@ class Match:
         # The turn its own latest turn began on (reactions_used(..,
         # 'own_turn'), #36).
         self.own_turn_at[e.id] = self.turns_elapsed
+        # A turn ATB picked for a skipped unit elapses without an action.
+        self._count_own_turn(e.id, not (
+            self.extra_turn is None and self._atb_last_skipped
+            and bool(self.rules.get("atb_enabled"))))
         rec = [e.id, e.map]
         self.last_actors[""] = list(rec)
         team = self._root_team(e)
         if team is not None:
             self.last_actors[str(team)] = list(rec)
+
+    def _count_own_turn(self, eid: str, acted: bool) -> None:
+        """A turn of `eid` began (#539): one more begun, and acted unless a
+        skips_turn status passed it over."""
+        c = self.own_turn_counts.get(eid)
+        if not (isinstance(c, list) and len(c) == 2):
+            c = [0, 0]
+        self.own_turn_counts[eid] = [c[0] + 1, c[1] + (1 if acted else 0)]
 
     def _root_team(self, e: "Entity") -> Any:
         """The team of `e`'s root body (a part counts as its parent's)."""
@@ -22031,6 +22063,7 @@ class Match:
             matched = ", ".join(sorted(skipping))
             # A skipped turn is this round's turn.
             self._mark_acted(cur)
+            self._count_own_turn(cur, False)
             log.append(self.unit_line(
                 cur, f"⏭️ `{cur}`'s turn skipped ({matched})."))
             log.extend(self.fire_hook(
@@ -25593,6 +25626,41 @@ class Match:
                     return (cx, cy)
         return None
 
+    def body_fits_at(self, e: "Entity", x: int, y: int,
+                     mode: Optional[str], mp: Optional["Map"] = None) -> bool:
+        """Whether `e`'s whole body could stand with its anchor at (x, y)
+        of map `mp` (None: its own; #540, fits_at): every footprint cell on
+        the map, free of other units (its own body, segments and riders
+        don't count; a stackable unit skips occupancy) and, with `mode`
+        (tp / walk / push / swap), not blocking that kind of move. On
+        another map its located parts too, at their offsets from the
+        anchor, as a cross-map move carries them (Match.move_to_map); a
+        move on its own map leaves them standing. Reads only."""
+        mp = self._map_for(mp, e)
+        subtree = self.entity_part_subtree(e.id)
+        # Its own parts never count against it.
+        ignore = self._stand_ignore(e) + tuple(p.id for p in subtree)
+        body = [e] + ([p for p in subtree
+                       if p.vars.get("__part_located")
+                       and not p.vars.get("__segment") and not p.is_mounted]
+                      if mp.name != e.map else [])
+        for u in body:
+            ux, uy = x + u.x - e.x, y + u.y - e.y
+            if u is e and not self.footprint_in_bounds(e, ux, uy, mp):
+                return False
+            cells = self.entity_cells(u, ux, uy)
+            if any(not mp.in_bounds(cx, cy) for cx, cy in cells):
+                return False
+            if not u.is_cell_stackable and any(
+                    self.cell_occupant(cx, cy, ignore, mp) is not None
+                    for cx, cy in cells):
+                return False
+            if mode is not None and any(
+                    self._check_block(u.id, cx, cy, mode, mp)
+                    for cx, cy in cells):
+                return False
+        return True
+
     def _stand_ignore(self, e: Optional["Entity"]) -> Tuple[str, ...]:
         """Units that don't count as in the way of `e` standing somewhere:
         its own body, snake segments and riders."""
@@ -26618,9 +26686,11 @@ class Match:
         unit existed, so an id a later formula binding took still comes
         back (LEGACY_IDS_OK)."""
         token = LEGACY_IDS_OK.set(True)
+        rtoken = REVIVING.set(True)
         try:
             return self._revive_corpse(eid)
         finally:
+            REVIVING.reset(rtoken)
             LEGACY_IDS_OK.reset(token)
 
     def _revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
@@ -28489,6 +28559,8 @@ class Match:
             "reaction_seq": self.reaction_seq,
             "reaction_log": jcopy(self.reaction_log),
             "own_turn_at": dict(self.own_turn_at),
+            "own_turn_counts": {k: list(v) for k, v in
+                                self.own_turn_counts.items()},
             # Saved only while set: whether the current ATB turn is a
             # skipped one (its end fires no action surface, T7), and a
             # watcher chain waiting for a change (L28).
@@ -28719,6 +28791,13 @@ class Match:
         m.own_turn_at = ({str(k): v for k, v in ot.items()
                           if isinstance(v, int) and not isinstance(v, bool)}
                          if isinstance(ot, dict) else {})
+        oc = d.get("own_turn_counts")
+        m.own_turn_counts = ({str(k): [int(v[0]), int(v[1])]
+                              for k, v in oc.items()
+                              if isinstance(v, list) and len(v) == 2
+                              and all(isinstance(n, int)
+                                      and not isinstance(n, bool) for n in v)}
+                             if isinstance(oc, dict) else {})
         m._atb_last_skipped = d.get("atb_turn_skipped") is True
         m._turn_order_dirty = d.get("turn_order_dirty") is True
         m._watcher_backlog = d.get("watcher_backlog") is True

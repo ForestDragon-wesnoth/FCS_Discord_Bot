@@ -1279,6 +1279,12 @@ hardcodes**.
   kill / revive / clone / copy / transfer / transform / revert / status /
   group / action / store_entity_into_var. `!ent info <id>` is the
   player-facing description, `!ent info <id> short` the card (§7.22).
+  `!ent add ... [key=value ...]` gives the unit starting vars (a dotted
+  key nests), set before it spawns like a template's values (no var
+  hooks; a vital given in its place and as `key=` refused); a unit added
+  without an initiative is named in the reply as outside the turn order,
+  and `!turn next` on an empty order names the units outside it and the
+  ways in (`_no_turn_order_text`; #434, #538, 1192).
   `!ent hp` SETS by default (`5`, `=-3`, `max`, `$(...)`);
   a leading sign changes (`+5` heals, `-5` damages); one `write_var`, hook
   output and deaths reported (633-634, 647). `!ent set_vars <id> k=v ...` is
@@ -1311,6 +1317,11 @@ hardcodes**.
   inventory.potion 99` replaces the whole item dict.
 - **`!ent clone`** copies the whole part subtree, strips mount links, refuses
   a body part, and is all-or-nothing (`_rollback_match` on any refusal).
+  Without coordinates (#590) each copy lands on the anchor nearest the
+  source's body centre where its whole body fits, clear of the source
+  (`_clone_spot`: `_nearest_fit_cell`, the dismount search, ties by row);
+  `count=<n>` copies (at most summon_event_limit), `near=<r>` bounds the
+  search (1188).
 - **Summons** (`Match.summon_entity`): `summon(template, x, y)` /
   `summon_near(..., radius)` / `summon_from(path, ...)` turn an entity-shaped
   dict into a unit (id minted from its name, footprint placement, parts /
@@ -1730,6 +1741,13 @@ hardcodes**.
 - **`Match.turns_elapsed`**: serialized count of turn boundaries in both
   models (`_begin_turn`); `turns_elapsed()`; the clock for ATB-safe expiry
   (reveals record which clock they used) (566-567).
+- **Own turns** (#539, 1183): `Match.own_turn_counts` (unit -> [begun,
+  acted], saved, undo state; `_count_own_turn` from `_note_actor`, the
+  round-mode skip loop and a skipped extra turn); `own_turns(eid,
+  acted=False)`. A turn a skips_turn status passes over counts as begun
+  only; extra turns count. A revive keeps the count (`logic.REVIVING`
+  around `revive_corpse`); any other spawn under the id, or a unit
+  leaving for good, starts it again.
 - **Pause:** `!match pause [reason]` refuses players' state-changing
   commands; `pause_affects_hosts` holds hosts' commands until `!match
   resume` runs them (`resume drop` discards); held commands are saved with
@@ -2112,7 +2130,9 @@ hardcodes**.
   leading `!` negates, `|`
   alternatives (an alternative that doesn't parse reuses the previous kind and
   key); `show:<csv>` (incl. `status`), `sort:<var>[:desc]`, `count`, `ids`
-  (536-538, 631, 694-695).
+  (536-538, 631, 694-695); `sum:` / `avg:` / `min:` / `max:<var>` print
+  the count and the total over the matches holding a finite number there,
+  read through the query view and the var reader (#453, 1193).
 - **`!assert [--as eid] "<expr>" [msg]`**: read-only; a failure raises
   `AssertionStop`, and batch / run / foreach / macro stop on the `ASSERT_STOP`
   sentinel; in an action, `cmd('assert ...')` fails the action (601-603).
@@ -2461,7 +2481,15 @@ hardcodes**.
   `entities_in_area/cone/rect/zone`, `cells_in_*`, `chain_targets` (relation
   judged against the ORIGIN), `entity_distance`, `nearest_cell`,
   `free_cell_near`, `random_cell`, `random_free_cell(..., fit=body|center|any|
-  anchor)`, `entities_at`, `cell_entity`, `grid_width/height`, `in_bounds`.
+  anchor)`, `entities_at`, `cell_entity`, `grid_width/height`, `in_bounds`;
+  `entities_in_cells(cells, relation=None, tag=None, of=None)` (the units
+  on any cell of a cell list, relation judged against `of`, default self;
+  #457), `free_cells_near(x, y, radius, eid=None, fit='body')` (every
+  anchor a body fits, in free_cell_near's ring order; #522),
+  `fits_at(eid, x, y, mode='tp')` (`Match.body_fits_at`: the footprint on
+  the map, free and not blocking `mode`; on another map the located parts
+  at their offsets too, as `move_to_map` carries them; a same-map move
+  leaves them standing; #540) (1181, 1184-1185).
   Membership in an area = ANY covered cell. Every area search (burst,
   rect, cone, line, zone, `!find near:` / `within:`) leaves out glued
   parts and riders hidden in a vehicle (`formula._alive_at` /
@@ -2536,7 +2564,11 @@ hardcodes**.
   remaining_hp / absolute:<n ≥ 0> — a typo is refused), the share modes),
   `vital`, `indestructible`; a raw hp write never does. A destroyed part lingers dead, fires
   on_death once (`__part_destroyed` latch, cleared by any heal above 0) and
-  kills the parent if vital. Negative amounts are refused.
+  kills the parent if vital. The unit placeholders give `{state}`
+  (`destroyed`, else empty) and `destroyed` for `{?destroyed?}...{/?}`
+  (a GM var of either name wins), used by the default
+  entity_description_part_format and body_part_entity_line_suffix
+  (#587, 1187). Negative amounts are refused.
   `damage_spread(target, total[, mode, fragments, origin, radius])` divides
   a total across parts (`aoe_default_mode`: weighted by `aoe_weight` /
   hit_weights, uniform, fragment × `aoe_fragment_count`, main_only;
@@ -2601,7 +2633,9 @@ hardcodes**.
   unmounted; transform re-checks a mounted rider's slot (and a vehicle's
   riders) per `transform_rider_mismatch_mode`. Boarding legality is the GM's
   call through slot conditions — a built-in boarding range was REJECTED.
-  `!mount <rider> <vehicle> <slot> | dismount | switch | list | info`; prims
+  `!mount <rider> <vehicle> <slot> | dismount | switch | list | info`
+  (`!mount list` without a vehicle: every vehicle and its riders, through
+  the view, #600, 1191); prims
   mount / dismount / switch_slot / riders / slot_riders / can_mount / ...
   (458-461, 465-466, 503-506, 682).
 
@@ -2657,8 +2691,9 @@ hardcodes**.
   follow one death, then one ⚠️ names the units left at their death
   condition (they die at their next change). `kill()` inside on_death
   still kills at once, nested. Prims: has_corpse, corpse_at,
-  all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
-  corpse / corpse_list action targets.
+  corpse_cell (None without a corpse), corpses_within(x, y, n, mode)
+  (nearest body cell, #396, 1186), all_corpses, corpse_var / corpse_has,
+  corpse_status_has / _get / _names; corpse / corpse_list action targets.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
   `revert`; `!ent replace`, `replace_form`): swaps name, vars, passives,
   clamps and the part subtree; keeps id, position, facing, team, turn slot
@@ -2815,6 +2850,10 @@ hardcodes**.
   Every hook re-checks the zone and the unit (ghost firing). The moves
   count in the move-hook chain (`move_hook_level`, the recursion and
   event limits). `zone_shift` stays the clipping, hook-free translate.
+- **`!zone copy <name> [<new_name>] [<dx> <dy>] [map=]`** (#605, 1189): a
+  new zone with the source's cells moved (off-map ones dropped; none left
+  refused), data, hooks, look, tags, grants and `def`; an aura's anchor
+  stays with the original. No name mints one (`mint_zone_name`).
 - **Zone time hooks** read an index (`Map.zone_hook_names`: zone -> its
   own hook names, kept by `ZoneTable.also`, which `zone_changed` /
   `zone_touch` and every `!zone` command mark) plus the zones of a
@@ -3254,7 +3293,9 @@ hardcodes**.
   `match_var_del`; `default_match_vars` (MERGE rule, `!defvar match
   add|remove|list`, `logic.fill_default_vars`) fills a NEW match's missing
   vars (1177). **Groups:** `!ent group`, `group:<name>` selectors and
-  group moves.
+  group moves; `group_names()`. `teams()` lists the teams in play: living
+  units' root teams in the order they first act, then teams only corpses
+  or team data name, by name (#395, 1180).
 - **Attribution:** each command snapshot records who ran it
   (`Snapshot.by`) and each event-log entry its command's author
   (`logic.COMMAND_USER`, set in `_run_top`); `command_attribution` (words
@@ -3383,7 +3424,10 @@ hardcodes**.
   through `roll_table_pick`) and a leading `<n>x` repeating any roll, at
   most `roll_repeat_limit` (owner ceiling) (888); `roll_table`
   (finite weights, keyed entries), `band` (ranges may be negative; an
-  unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`;
+  unreadable or backwards band is refused), named tables (`!table`,
+  `table_roll(name, n=None)`: a list of n picks with n; `!table roll
+  <name> [n]`; `!roll [<n>x] <table>` rolls a table when the word isn't
+  dice, `_table_roll_reply`; #610, 1190); `pick` / `shuffle`;
   `roll_dice(spec, all=False)` (the kept dice as a list, every die rolled
   with `all=True`, flat modifiers left out; `roll_detail(dice_out=)`) and
   `chance(percent)` (1172). All use
@@ -3487,7 +3531,9 @@ hardcodes**.
   crash [text]` (CLI / harness) raises one on purpose (890).
 - **Other:** `!help find <words>` (commands, subcommands, rules and formula functions),
   `!whoami`, `!log` (event log rules), `!state`, `!list`, `!dist`, string
-  helpers (`upper` ... `fmt`, a safe field parser), list helpers (`sum`,
+  helpers (`upper` ... `fmt`, a safe field parser; `plural(n, word,
+  plural=None)`, `ordinal(n)`, `list_text(items, word='and')`, #460,
+  1182), list helpers (`sum`,
   `sorted`, `any`, `all`, `count`), `lowest_var` / `highest_var`.
 
 ### 7.17 Entity templates
@@ -3599,7 +3645,9 @@ hardcodes**.
   (read-only; the template resolved through `Match.expand_template`, the
   same expansion `show ... expanded` prints), via `CURRENT_WORKSPACE`
   (718-726, 764).
-- **Tooling:** `!template list [kind=] [by=] [prefix]`; `!template diff
+- **Tooling:** `!template list [kind=] [by=] [has=<path>] [prefix]` (has=:
+  the expanded vars, a partial's data, hold the path as the reader reads
+  them, `_template_has_path`, #456, 1194); `!template diff
   <name> <other | unit=<id>>` (leaf paths of the expanded forms, parts
   compared by their relative id; the unit form is host-only, as it shows
   all its vars); `!template spawn ... count=N` (N copies on the free cells
@@ -4089,7 +4137,8 @@ lists what isn't built; 1093-1122).
   body's starting locals, `eval_program(locals_in=)`), `cost` (program,
   run right before the body, in the same transaction), `affects`
   (expression, `target` a location's cell; default the unit targets),
-  `target_condition` (expression, self = actor, `target` one target),
+  `target_condition` (expression, self = actor, `target` one target: a
+  unit, or a location target's cell, #540),
   `cancelled_action_cost` (refund / pay). `run_action(steps=,
   preset_locals=, prepare_out=, body_out=, finish=, skip_checks=,
   extra_bindings=, fail_out=, target_out=)` runs any of the programs as
