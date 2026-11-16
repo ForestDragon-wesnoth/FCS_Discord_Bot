@@ -374,6 +374,19 @@ def _eval_ctx(m: Any, ex: Dict[str, Any], uid: str, writable: bool,
     return EvalCtx(this=m.current_entity_id(), target=uid, extras=extras)
 
 
+def _condition_bindings(m: Any, uid: str, act: Any,
+                        via: Optional[str]) -> Dict[str, Any]:
+    """`source` for a reaction's condition and auto_when: its container,
+    read-only (an expression can't assign), as its halves bind it (Y7: a
+    condition reading `source.<path>` failed on the attribute rule)."""
+    from action import SourceProxy
+    eff, _extra, ract = mount_routing(m, uid, act, via)
+    e = m.entities.get(eff)
+    if e is None:
+        return {}
+    return {"source": SourceProxy(e, ract.container_path)}
+
+
 def _formula_error(ex: BaseException) -> str:
     if FORMULA_TEXT_HIDDEN.get():
         return "its formula failed"
@@ -381,7 +394,8 @@ def _formula_error(ex: BaseException) -> str:
 
 
 def _reaction_open(m: Any, ex: Dict[str, Any], uid: str, act: Any,
-                   phase: str, notes: List[str]) -> bool:
+                   phase: str, notes: List[str],
+                   via: Optional[str] = None) -> bool:
     """Whether unit `uid` may pick reaction `act` in the `phase` window now
     (design §2, §3 step 2)."""
     from formula import FormulaEngine
@@ -417,7 +431,8 @@ def _reaction_open(m: Any, ex: Dict[str, Any], uid: str, act: Any,
     if spec.condition:
         try:
             ok = FormulaEngine(m).eval_expression(
-                spec.condition, _eval_ctx(m, ex, uid, False))
+                spec.condition, _eval_ctx(m, ex, uid, False),
+                attr_bindings=_condition_bindings(m, uid, act, via))
         except Exception as err:      # noqa: BLE001 - a note, not raised
             notes.append(m.unit_tag(uid) + f"⚠️ `{uid}`'s reaction "
                          f"`{act.name}` isn't offered: its condition "
@@ -453,7 +468,7 @@ def available(m: Any, ex: Dict[str, Any], uid: str, phase: str,
         return out
     return [(a, via) for a, via in unit_reactions(m, e)
             if a.full_path not in picked
-            and _reaction_open(m, ex, uid, a, phase, notes)]
+            and _reaction_open(m, ex, uid, a, phase, notes, via)]
 
 
 def effective_priority(m: Any, act: Any, half: str,
@@ -530,7 +545,8 @@ def _auto_picks(m: Any, ex: Dict[str, Any], uid: str, phase: str,
         if spec.auto_when:
             try:
                 ok = FormulaEngine(m).eval_expression(
-                    spec.auto_when, _eval_ctx(m, ex, uid, False))
+                    spec.auto_when, _eval_ctx(m, ex, uid, False),
+                    attr_bindings=_condition_bindings(m, uid, act, via))
             except Exception as err:      # noqa: BLE001
                 notes.append(m.unit_tag(uid) + f"⚠️ `{uid}`'s reaction "
                              f"`{act.name}`: its auto_when failed "
@@ -1212,7 +1228,8 @@ async def _advance(env: _Env, seq: int) -> str:
                                    f"action was cancelled.")
                     continue
             notes: List[str] = []
-            if not _reaction_open(m, ex, cur["unit"], r_act, "before", notes):
+            if not _reaction_open(m, ex, cur["unit"], r_act, "before", notes,
+                                  cur.get("via")):
                 env.out += notes
                 cur["skipped"] = True
                 env.out.append(m.unit_tag(cur["unit"]) + f"- "
@@ -1470,7 +1487,8 @@ async def _after_run(env: _Env, seq: int) -> str:
             r_act = _find_action(m, cur["unit"], cur["path"], cur.get("via"))
             notes: List[str] = []
             if r_act is None or not _reaction_open(
-                    m, ex, cur["unit"], r_act, "after", notes):
+                    m, ex, cur["unit"], r_act, "after", notes,
+                    cur.get("via")):
                 env.out += notes
                 cur["skipped"] = True
                 env.out.append(m.unit_tag(cur["unit"]) + f"- "
@@ -1680,6 +1698,25 @@ def _sync(coro) -> Any:
     return _sync_dispatch_returning(coro)
 
 
+# The refusals use_action reports itself ("↳ use_action ..."): the engine's,
+# worded by its rules (formula.py).
+_ENGINE_REFUSALS = ("forbidden", "immune", "target_tags", "target_condition",
+                    "reaction")
+
+
+def _fail_line(m: Any, action: Any, why: Any) -> None:
+    """A nested action's own fail() (its prepare's or its body's) prints
+    as a typed one's does, `❌ action <name>: ...` (Y6: a nested prepare's
+    message, and on the path without reactions a body's, went nowhere)."""
+    if not (isinstance(why, tuple) and len(why) == 2):
+        return
+    reason, message = why
+    if reason in _ENGINE_REFUSALS:
+        return
+    tag = f"[{reason}] " if reason else ""
+    m.surface_log([f"❌ action `{action.name}`: {tag}{message}"])
+
+
 def _plain_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
                target: Any, args: Dict[str, Any],
                why: str) -> Tuple[bool, Any]:
@@ -1692,6 +1729,8 @@ def _plain_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
                                  args=args, match=m, mgr=mgr, ctx=buf))
     if top and buf is not ctx and buf.out:
         m.surface_log(list(buf.out))
+    if not ok:
+        _fail_line(m, action, why_f)
     if ok and why:
         note = unoffered_note(m, action, eid, target, why)
         if note:
@@ -1740,6 +1779,7 @@ def _point_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
     ok, why, pout, target, _used = _sync(_prepare(
         buf, mgr, m, action, eid, target, args, [], None))
     if not ok:
+        _fail_line(m, action, why)
         return False, why
     parent = _ex(m, step["seq"]) or {}
     notes: List[str] = []

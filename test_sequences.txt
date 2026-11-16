@@ -11753,7 +11753,7 @@ SCENARIO 456 — Match outcome: manual victory + prims + a goal-zone win conditi
 
 Expected: no outcome at first (match_over False). `!match win red ...` declares
 a manual victory; match_winner() = 'red', match_over() True, `!match outcome`
-shows red. `!match win clear` resets it (match_over False again, play resumes).
+shows red. `!match win clear` resets it (match_over False again).
 Then a GOAL: a one-cell zone at (4,1) carries an on_enter hook that calls
 declare_winner. Teleporting the runner onto it fires the hook, so `!match
 outcome` now shows blue won. There is NO built-in objective evaluator — the win
@@ -42216,8 +42216,8 @@ SCENARIO 1169 — !simulate says when its runs stopped at a reaction window
 !action orc cleave hero
 ?? `!react hero block`
 !ent kill hero
-?? ⏭ Nobody is left to answer the reaction window (hero is gone); it closes.
-?? ⚠️ hero drops out of `cleave`: hero is gone.
+?? ⏭ Nobody is left to answer the reaction window (Hero is gone); it closes.
+?? ⚠️ Hero drops out of `cleave`: Hero is gone.
 ?? ❌ action `cleave`: no unit was given (the value is None)
 ?? `target` once its target dropped out
 !react
@@ -42279,8 +42279,8 @@ SCENARIO 1170 — A reaction window nobody is left to answer closes in the comma
 !ent tp ogre 5 5
 ?! Nobody is left
 !batch ent hp ogre -1 ; ent kill ogre ; turn next
-?? ⏭ Nobody is left to answer the reaction window (ogre is gone); it closes.
-?? ⚠️ ogre drops out of `cleave`: ogre is gone.
+?? ⏭ Nobody is left to answer the reaction window (Ogre is gone); it closes.
+?? ⚠️ Ogre drops out of `cleave`: Ogre is gone.
 ?? It is now **Orc**'s turn
 !assert "has_corpse('ogre') and len(all_entities()) == 1 and turns_elapsed() == 2"
 !undo command
@@ -42288,7 +42288,7 @@ SCENARIO 1170 — A reaction window nobody is left to answer closes in the comma
 ?? - Ogre can react: `!react ogre block`
 !watch add doom "entity[orc].hp < 30" "kill('ogre')"
 !ent hp orc -1
-?? ⏭ Nobody is left to answer the reaction window (ogre is gone); it closes.
+?? ⏭ Nobody is left to answer the reaction window (Ogre is gone); it closes.
 !react
 ?? No reaction window is open on this match.
 

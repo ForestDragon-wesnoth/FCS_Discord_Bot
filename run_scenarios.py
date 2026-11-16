@@ -65,7 +65,14 @@ SCENARIO_RE = re.compile(
 # Output substrings that ALWAYS mark a flagged failure. 💥 is the dispatcher's
 # unexpected-exception prefix; "Syntax error" is a formula parse failure
 # (see module docstring for why that's always a malformed scenario).
-_FAILURE_MARKERS = ("💥", "Syntax error")
+_FAILURE_MARKERS = ("Syntax error",)
+# A crash: the dispatcher's "💥 Unexpected error", a hook's "💥 ... CRASHED",
+# the harness's own "💥 Uncaught" / "💥 shlex parse error" / "💥 ?file"
+# lines. Game text may hold 💥 ("💥 Critical hit!"), so the emoji alone
+# isn't one (Y9).
+_CRASH_RE = re.compile(
+    r"💥 (?:Unexpected error|Uncaught|shlex parse error|\?file|Usage: \?file)"
+    r"|💥[^\n]*CRASHED")
 
 # Substrings that mark a top-level command error (a caught VTTError/FormulaError
 # surfaced as a ❌ reply). In a WELL-FORMED scenario these are bugs — a core
@@ -384,7 +391,7 @@ def _flagged(transcript: List[Tuple[str, List[str]]],
         for o in outs:
             if crash_hook and o.startswith("💥 Unexpected error (ref "):
                 continue
-            if any(marker in o for marker in markers):
+            if any(marker in o for marker in markers) or _CRASH_RE.search(o):
                 hits.append((cmd, o))
     return hits
 

@@ -17,6 +17,7 @@ import contextvars
 import time
 from contextlib import contextmanager
 import keyword
+import unicodedata
 
 # Lines a formula's changes produced while a command runs (see
 # Match.surface_log). A context variable, so each command — on Discord, each
@@ -6507,7 +6508,20 @@ def _check_filter_rule(key: str, raw: str) -> str:
     return v
 
 
+def _check_glyph_rule(key: str, raw: str) -> str:
+    """preview_glyph / fog_glyph / void_glyph: their first character is
+    drawn, so it must be one column wide (Y8); empty stays allowed."""
+    if raw:
+        why = glyph_problem(raw[0])
+        if why is not None:
+            raise VTTError(f"Setting '{key}': {why}.")
+    return raw
+
+
 _FORMAT_RULE_CHECKS = {
+    "preview_glyph": _check_glyph_rule,
+    "fog_glyph": _check_glyph_rule,
+    "void_glyph": _check_glyph_rule,
     "transform_keep_vars": _check_var_path_list,
     "private_vars": _check_private_paths,
     "team_private_vars": _check_private_paths,
@@ -8831,7 +8845,7 @@ def facing_look_entry(kind: str, facing: Any, value: Any) -> bool:
     if not isinstance(facing, str) or facing not in ALLOWED_DIRECTIONS:
         return False
     if kind == "glyphs":
-        return isinstance(value, str) and len(value) == 1
+        return glyph_ok(value)
     return isinstance(value, str) and bool(value)
 
 
@@ -8840,7 +8854,7 @@ def zone_look_value(key: str, value: Any) -> bool:
     glyph, a non-empty color / sprite text, a legend text or False, a
     direction, a {facing: glyph / sprite} dict with a usable entry)."""
     if key == "glyph":
-        return isinstance(value, str) and len(value) == 1
+        return glyph_ok(value)
     if key == "legend":
         return value is False or (isinstance(value, str) and bool(value))
     if key == "facing":
@@ -10749,6 +10763,9 @@ class Entity:
             value = checked_tag_vars(
                 path, value, str(self._match.rules.get("tags_var", "tags")),
                 f"Writing '{path}' on `{self.id}`")
+            checked_glyph_write(
+                path, value, f"Writing '{path}' on `{self.id}`",
+                ("", str(self._match.rules.get("disguise_var", "disguise"))))
         if self._match is not None:
             # A container whose marker was measured inside another
             # container (copied out of it) is re-measured on its own.
@@ -11173,8 +11190,11 @@ class Entity:
         return log
 
     # ---------- passive management (entity-scoped) ----------
-    def add_passive(self, p: "Passive") -> None:
-        """Attach a Passive to this entity. Validates that its formula parses."""
+    def add_passive(self, p: "Passive",
+                    known_funcs: "Optional[frozenset]" = None) -> None:
+        """Attach a Passive to this entity. Validates that its formula
+        parses; a call to one of `known_funcs` (default: the unit's match's
+        `!func`s) is allowed."""
         if p.id in self.passives:
             raise DuplicateId(
                 f"Passive id '{p.id}' already exists on entity '{self.id}'."
@@ -11182,7 +11202,11 @@ class Entity:
         # Early-fail on a malformed formula so the user sees the error now,
         # not later when the hook fires.
         from formula import validate_formula
-        validate_formula(p.formula, mode="exec")
+        if known_funcs is None:
+            m = self._match
+            known_funcs = frozenset(getattr(m, "formula_functions", None)
+                                    or ())
+        validate_formula(p.formula, mode="exec", known_funcs=known_funcs)
         self.passives[p.id] = p
         self.mark_changed()
 
@@ -11309,6 +11333,75 @@ def glyph_of(v: Any) -> Any:
     if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9:
         return str(v)
     return v
+
+
+def glyph_problem(v: Any) -> Optional[str]:
+    """Why `v` can't be a map glyph, None when it can: one character one
+    column wide in a monospaced map. An emoji or a CJK character is one
+    code point and two columns, and pushed the rest of its row one column
+    right (Y8); a combining mark or a zero-width character takes none."""
+    v = glyph_of(v)
+    if not isinstance(v, str) or len(v) != 1:
+        return "a glyph is exactly one character"
+    if unicodedata.east_asian_width(v) in ("W", "F"):
+        return (f"`{v}` is two columns wide in a monospaced map and would "
+                f"shift the rest of its row; a glyph is one column")
+    if unicodedata.combining(v) or unicodedata.category(v) in (
+            "Mn", "Me", "Cf", "Cc", "Zl", "Zp"):
+        return f"{v!r} takes no column of its own in a map"
+    return None
+
+
+def checked_glyph_write(path: str, value: Any, where: str,
+                        roots: Tuple[str, ...] = ("",)) -> None:
+    """Refuse a map glyph a write would store that glyph_problem rejects
+    (Y8): `glyph` / `glyphs.<facing>` under each of `roots` (a unit's vars
+    and its disguise; a tile's data), or a dict written above them. None
+    (no glyph) passes."""
+    segs = path.split(".") if path else []
+
+    def bad(v: Any, at: str) -> None:
+        if v is None:
+            return
+        why = glyph_problem(v)
+        if why is not None:
+            raise VTTError(f"{where}: `{at}` is a map glyph; {why}.")
+
+    def look(node: Any, at: str) -> None:
+        if not isinstance(node, dict):
+            return
+        if "glyph" in node:
+            bad(node["glyph"], f"{at}.glyph" if at else "glyph")
+        gl = node.get("glyphs")
+        if isinstance(gl, dict):
+            for k, v in gl.items():
+                bad(v, f"{at}.glyphs.{k}" if at else f"glyphs.{k}")
+
+    for root in roots:
+        rs = root.split(".") if root else []
+        if segs[:len(rs)] != rs:
+            if rs[:len(segs)] == segs and isinstance(value, dict):
+                # A dict written above the root (a whole disguise's parent).
+                node = value
+                for k in rs[len(segs):]:
+                    node = node.get(k) if isinstance(node, dict) else None
+                look(node, root)
+            continue
+        rel = segs[len(rs):]
+        if rel == ["glyph"]:
+            bad(value, path)
+        elif len(rel) == 2 and rel[0] == "glyphs":
+            bad(value, path)
+        elif rel == ["glyphs"] and isinstance(value, dict):
+            for k, v in value.items():
+                bad(v, f"{path}.{k}")
+        elif not rel:
+            look(value, path)
+
+
+def glyph_ok(v: Any) -> bool:
+    """Whether `v` (as stored, see glyph_of) is a usable map glyph."""
+    return glyph_problem(v) is None
 
 
 def _rename_map_coords(value: Any, old: str, new: str) -> int:
@@ -12109,6 +12202,7 @@ class Map:
             )
         check_store_path(path, "tile path")
         value = checked_facing_data(path, value)
+        checked_glyph_write(path, value, f"tile ({x},{y})")
         # Checked before any container on the path is made: a refused
         # value left an empty `{}` tile behind (L35).
         owned = _own_value(value)
@@ -28376,13 +28470,14 @@ class Match:
         every entity-creation path. Each entity gets its OWN Passive
         instance (built from the spec dict) so later per-entity edits
         don't mutate the shared rule. A malformed spec is skipped
-        silently (same convention as the from_dict loaders) — one bad
-        default shouldn't make every entity un-spawnable; the `!defpassive
-        add` command validates specs before they reach the rule, so a bad
-        entry here means hand-edited config."""
+        with a ⚠️ naming the passive and the unit (one bad default
+        shouldn't make every entity un-spawnable). The match's `!func`s
+        are known to the check, as `!defpassive add` knows them (Y1: a
+        default calling a function reached no new unit, silently)."""
         specs = self.rules.get("default_entity_passives") or []
         if not isinstance(specs, list):
             return
+        known = frozenset(self.formula_functions or ())
         for spec in specs:
             if not isinstance(spec, dict):
                 continue
@@ -28390,9 +28485,11 @@ class Match:
             if not isinstance(pid, str) or pid in entity.passives:
                 continue
             try:
-                entity.add_passive(Passive.from_dict(spec))
-            except (VTTError, KeyError, TypeError):
-                continue
+                entity.add_passive(Passive.from_dict(spec),
+                                   known_funcs=known)
+            except (VTTError, KeyError, TypeError) as ex:
+                self.surface_log([f"⚠️ default passive `{pid}` couldn't be "
+                                  f"put on `{entity.id}`: {ex}"])
 
     def sync_default_passives(self, old_specs: Any, new_specs: Any
                               ) -> List[str]:
@@ -29219,18 +29316,18 @@ class Match:
             dglyphs = dis.get("glyphs")
             if isinstance(dglyphs, dict):
                 dg = glyph_of(dglyphs.get(facing))
-                if isinstance(dg, str) and len(dg) == 1:
+                if glyph_ok(dg):
                     return dg
             dg = glyph_of(dis.get("glyph"))
-            if isinstance(dg, str) and len(dg) == 1:
+            if glyph_ok(dg):
                 return dg
         glyphs = e.vars.get("glyphs")
         if isinstance(glyphs, dict):
             g = glyph_of(glyphs.get(facing))
-            if isinstance(g, str) and len(g) == 1:
+            if glyph_ok(g):
                 return g
         g = glyph_of(e.vars.get("glyph"))
-        if isinstance(g, str) and len(g) == 1:
+        if glyph_ok(g):
             return g
         return DIRECTION_ARROWS.get(facing, "@")
 
@@ -29241,10 +29338,10 @@ class Match:
         gd = e.vars.get("glyphs")
         if isinstance(gd, dict):
             gg = glyph_of(gd.get(getattr(e, "facing", "")))
-            if isinstance(gg, str) and len(gg) == 1:
+            if glyph_ok(gg):
                 return True
         g = glyph_of(e.vars.get("glyph"))
-        return isinstance(g, str) and len(g) == 1
+        return glyph_ok(g)
 
     def entity_color(self, e: "Entity",
                      pov_team: Optional[str] = None) -> Optional[str]:
@@ -29784,10 +29881,10 @@ class Match:
             glyphs = src.get("glyphs")
             if isinstance(glyphs, dict):
                 g = glyph_of(glyphs.get(facing))
-                if isinstance(g, str) and len(g) == 1:
+                if glyph_ok(g):
                     return g
             g = glyph_of(src.get("glyph"))
-            if isinstance(g, str) and len(g) == 1:
+            if glyph_ok(g):
                 return g
         return None
 
@@ -30022,10 +30119,10 @@ class Match:
         glyphs = vars_.get("glyphs")
         if isinstance(glyphs, dict):
             g = glyph_of(glyphs.get(facing))
-            if isinstance(g, str) and len(g) == 1:
+            if glyph_ok(g):
                 return g
         g = glyph_of(vars_.get("glyph"))
-        if isinstance(g, str) and len(g) == 1:
+        if glyph_ok(g):
             return g
         return None if custom_only else DIRECTION_ARROWS.get(facing, "@")
 
@@ -31417,7 +31514,11 @@ class Match:
             loc = self.find_corpse(eid)
             if loc is None:
                 return eid
-            name = (loc[2] or {}).get("name", eid) if isinstance(loc[2], dict) else eid
+            # A corpse record keeps the unit under `entity` (Y9: its
+            # top-level `name` doesn't exist, so a dead unit read by id).
+            rec = loc[2] if isinstance(loc[2], dict) else {}
+            ent = rec.get("entity")
+            name = ent.get("name", eid) if isinstance(ent, dict) else eid
         name = str(name).replace(UNIT_LINE_TAG, "")
         return f"{UNIT_LINE_TAG}#{self.id}|{eid}|{name}{UNIT_LINE_TAG}"
 
@@ -31776,6 +31877,11 @@ def mask_private_refs(value: Any, private: "set[str]") -> Any:
     return value
 _TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
                            "mount_slot")
+# The top-level keys an entity template holds: the unit's fields, its body
+# and the library metadata. Any other key is dropped with a note (Y3: a
+# misspelled `statuses` stored, shown and ignored at spawn).
+_ENTITY_TEMPLATE_KEYS = ("name", "vars", "status", "passives", "clamps",
+                         "facing", "parts", "segments", "var_names")
 
 
 def check_template_name(name: Any, legacy: bool = False) -> str:
@@ -32109,6 +32215,16 @@ def check_template(data: Any, name: str,
         notes.append(f"Dropped {', '.join(f'`{k}`' for k in dropped)}: a "
                      f"template carries no identity or position (its name is "
                      f"the id).")
+    unknown = sorted(k for k in d if k not in _ENTITY_TEMPLATE_KEYS
+                     and k not in _TEMPLATE_META_KEYS
+                     and k != TEMPLATE_PRIVATE_KEY)
+    for k in unknown:
+        d.pop(k)
+    if unknown:
+        notes.append(f"Dropped {', '.join(f'`{k}`' for k in unknown)}: an "
+                     f"entity template is "
+                     f"{', '.join(f'`{k}`' for k in _ENTITY_TEMPLATE_KEYS)} "
+                     f"(a unit's statuses are `status`).")
     for k in _TEMPLATE_META_KEYS:
         if k in d and d[k] is not None and not isinstance(d[k], str):
             d[k] = str(d[k])

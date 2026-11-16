@@ -4115,8 +4115,12 @@ class _EntityAccessTransformer(ast.NodeTransformer):
     """
 
     def __init__(self, known_params: "frozenset[str]" = frozenset(),
-                 action_mode: bool = False, locals_ok: bool = False):
+                 action_mode: bool = False, locals_ok: bool = False,
+                 attr_roots: "frozenset[str]" = frozenset()):
         self.known_params = known_params
+        # Names whose attribute chains resolve at runtime outside action
+        # mode too (a reaction's condition reads `source.<path>`, Y7).
+        self.attr_roots = attr_roots
         # A program (passive, tick, `!func`, watcher effect, hook) binds
         # bare-name locals like an action: `dealt = base - armor`
         # (_collect_program_locals put every one in known_params).
@@ -4244,7 +4248,8 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             while isinstance(root, ast.Attribute):
                 root = root.value
             if not (isinstance(root, ast.Name)
-                    and root.id in _ANY_MODE_ATTR_ROOTS):
+                    and (root.id in _ANY_MODE_ATTR_ROOTS
+                         or root.id in self.attr_roots)):
                 return False
         cur = node
         while isinstance(cur, ast.Attribute):
@@ -12173,6 +12178,7 @@ class FormulaEngine:
         known_funcs: "frozenset[str]" = frozenset(),
         known_params: "frozenset[str]" = frozenset(),
         action_mode: bool = False,
+        attr_roots: "frozenset[str]" = frozenset(),
     ) -> ast.AST:
         try:
             tree = ast.parse(src, mode=mode)
@@ -12190,6 +12196,7 @@ class FormulaEngine:
                 tree, known_funcs, action_mode)
         tree = _EntityAccessTransformer(
             known_params, action_mode=action_mode, locals_ok=program,
+            attr_roots=attr_roots,
         ).visit(tree)
         ast.fix_missing_locations(tree)
         _validate_tree(
@@ -12206,7 +12213,12 @@ class FormulaEngine:
             return frozenset()
         return frozenset(funcs.keys())
 
-    def eval_expression(self, src: str, ctx: EvalCtx) -> Any:
+    def eval_expression(self, src: str, ctx: EvalCtx, *,
+                        attr_bindings: Optional[Dict[str, Any]] = None,
+                        ) -> Any:
+        """Evaluate an expression. `attr_bindings` binds names read by
+        attribute (`source.cooldown`): a reaction's condition reads its
+        container as its halves do (Y7)."""
         # Fresh per-evaluation accounting so the !eval / passive-runner
         # caller sees only what THIS formula touched. eval_expression /
         # eval_program are the two entry points, so resetting here (vs.
@@ -12215,10 +12227,15 @@ class FormulaEngine:
         if ctx.match is None:
             ctx.match = self._match  # enable `parent`-token resolution
         self._reset_affected()
-        tree = self._prepare(src, "eval", known_funcs=self._known_funcs())
+        roots = frozenset(attr_bindings or ())
+        tree = self._prepare(src, "eval", known_funcs=self._known_funcs(),
+                             known_params=roots, attr_roots=roots)
         code = compile(_guard_arith(tree), "<formula>", "eval")
+        ns = self._namespace(ctx)
+        if attr_bindings:
+            ns.update(attr_bindings)
         try:
-            return eval(code, self._namespace(ctx))
+            return eval(code, ns)
         except FormulaError:
             raise
         except Exception as e:

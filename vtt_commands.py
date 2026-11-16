@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY
+from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
 from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
@@ -1773,6 +1773,13 @@ def _engine_var_warning(path: str, value: Any) -> str:
 _FACING_CLEAR = ("-", "none", "clear")
 
 
+def _check_glyph_value(value: str) -> None:
+    """Refuse a glyph that isn't one character one column wide (Y8)."""
+    why = glyph_problem(value)
+    if why is not None:
+        raise VTTError(f"{why[0].upper()}{why[1:]} (or `-` to clear).")
+
+
 def _facing_look_set(target: Dict[str, Any], kind: str, value: str,
                      facing: Optional[str]) -> str:
     """Set (or with `-` clear) a zone's / zone definition's `glyph` or
@@ -1782,9 +1789,8 @@ def _facing_look_set(target: Dict[str, Any], kind: str, value: str,
         if value in _FACING_CLEAR:
             target.pop(kind, None)
             return f"cleared its {kind}"
-        if kind == "glyph" and len(value) != 1:
-            raise VTTError("glyph must be exactly one character (or `-` to "
-                           "clear).")
+        if kind == "glyph":
+            _check_glyph_value(value)
         target[kind] = value
         return f"{kind} `{value}`"
     canon = normalize_direction(facing)
@@ -1799,9 +1805,8 @@ def _facing_look_set(target: Dict[str, Any], kind: str, value: str,
             if not entries:
                 target.pop(many, None)
         return f"cleared its {kind} facing {canon}"
-    if kind == "glyph" and len(value) != 1:
-        raise VTTError("glyph must be exactly one character (or `-` to "
-                       "clear).")
+    if kind == "glyph":
+        _check_glyph_value(value)
     entries = target.get(many)
     if not isinstance(entries, dict):
         entries = target[many] = {}
@@ -4707,14 +4712,14 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # built-in objective evaluator — win conditions are composed from
     # watchers / actions / hooks calling the declare_winner primitive, which
     # works from any formula context. `!match win <winner> [reason]` is the
-    # manual declaration; `!match win clear` resumes play; `!match outcome`
+    # manual declaration; `!match win clear` clears it; `!match outcome`
     # (read-only) shows the current result.
     if sub == "win":
         m = active_match(mgr, ctx)
         if len(args) >= 2 and args[1].lower() == "clear":
             had = m.clear_outcome()
             return await ctx.send(
-                "Cleared the match outcome — play resumes." if had
+                "Cleared the match outcome." if had
                 else "No outcome was set.")
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "win"):
             return
@@ -24104,9 +24109,8 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         return f"Cleared zone definition `{name}`'s {sub}."
     if sub == "legend" and val.lower() == "false":
         val = False
-    elif sub == "glyph" and len(val) != 1:
-        raise VTTError("glyph must be exactly one character (or `-` to "
-                       "clear).")
+    elif sub == "glyph":
+        _check_glyph_value(val)
     d[sub] = val
     tail = ""
     if sub == "color":
