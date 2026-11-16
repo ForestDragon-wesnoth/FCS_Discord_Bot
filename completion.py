@@ -41,6 +41,7 @@ _FREE_SLOTS = {
     "anchor", "word", "type", "template_text", "winner", "stat", "pid",
     "passive_id", "path", "var.path", "key", "dest_path", "stash_path",
     "shape args", "cmd1", "cmd2", "file", "seed", "pos", "new_map", "ref",
+    "new_folder",
 }
 # Placeholders that name a unit.
 _ENTITY_SLOTS = {
@@ -492,6 +493,17 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         e = m.entities.get(holder or "") if holder in seen else None
         slots = e.vars.get("slots") if e is not None else None
         return sorted(str(s) for s in slots) if isinstance(slots, dict) else []
+    if slot == "folder" and root in ("template", "prefab"):
+        lib = "templates" if root == "template" else "prefabs"
+        readable = (set(_readable_template_names(mgr, ctx))
+                    if lib == "templates" else set(mgr.prefabs))
+        out = ["/"]
+        for f in sorted(mgr.lib_dirs(lib)):
+            inside = [n for n in mgr.lib_entries(lib)
+                      if logic.folder_within(mgr.lib_folder(lib, n), f)]
+            if not inside or any(n in readable for n in inside):
+                out.append(f)
+        return out
     if slot == "prefab" or (slot == "name" and root == "prefab"):
         return sorted(getattr(mgr, "prefabs", {}) or {})
     if slot == "name":
@@ -567,7 +579,7 @@ _KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
                "dest_match", "rule", "function", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
                "slot", "corpse_id", "key", "path", "sub", "definition",
-               "prefab", "tag", "filter", "facing", "step"}
+               "prefab", "tag", "filter", "facing", "step", "folder"}
 
 
 # ---- the entry point -------------------------------------------------------

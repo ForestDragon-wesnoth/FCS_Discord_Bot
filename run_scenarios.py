@@ -177,11 +177,13 @@ _TAB_PREFIX = "?tab "
 # a JSON file and `?file replace <path> "<old>" "<new>"` replaces text in
 # it: data in the shape an older build wrote. `?file list [<dir>]` names
 # the files of the folder (or a folder in it), `?file show <path>` prints a
-# text file's lines.
+# text file's lines. `?file copy|move <path> <path>` copies a file (a new
+# modification time) or moves a file or folder, as an operator would.
 _FILE_PREFIX = "?file "
 _FILE_USAGE = ("💥 Usage: ?file corrupt|delete <path> | set <path> <a.b.c> "
                "<json> | replace <path> \"<old>\" \"<new>\" | list [<dir>] | "
-               "show <path> (a path in the server folder)")
+               "show <path> | copy|move <path> <path> (paths in the server "
+               "folder)")
 
 
 def _file_action(line: str, workspaces, ctx) -> List[str]:
@@ -191,6 +193,19 @@ def _file_action(line: str, workspaces, ctx) -> List[str]:
         return [_FILE_USAGE]
     if words[0] in ("set", "replace"):
         return _file_edit(line, words, st, ctx)
+    if words[0] in ("copy", "move") and len(words) == 3:
+        import shutil
+        base = st.server_dir(ctx.guild_key)
+        src, dest = os.path.join(base, words[1]), os.path.join(base, words[2])
+        if not os.path.exists(src):
+            return [f"💥 ?file: no file or folder {words[1]}"]
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if words[0] == "copy":
+            shutil.copyfile(src, dest)
+        else:
+            shutil.move(src, dest)
+        st.rescan()
+        return [f"({words[0]} {words[1]} -> {words[2]})"]
     if words[0] == "list" and len(words) <= 2:
         path = os.path.join(st.server_dir(ctx.guild_key), *words[1:])
         if not os.path.isdir(path):

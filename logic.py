@@ -3519,6 +3519,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "default system."
         ),
     },
+    "delete_empty_library_folders": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a template or prefab folder is deleted once nothing is "
+            "left in it: when its last entry is deleted, moved or renamed "
+            "away (parent folders too, while they are left empty). Off: "
+            "folders stay until `!template folder delete` / `!prefab folder "
+            "delete`, so a GM can lay out folders before filling them. Read "
+            "from the channel's match, else the channel's default system."
+        ),
+    },
     "var_labels_enabled": {
         "default": False,
         "schema": {"type": "bool"},
@@ -31586,6 +31598,56 @@ def check_id(kind: str, name: Any) -> None:
 LOCAL_WORKSPACE = "local"
 
 
+# Folders of the server libraries (templates, prefabs): organization only.
+# A name is unique across a library's folders, so everything that names a
+# template or prefab (references, spawns, formulas, journals) ignores where
+# it lives. A folder is a `/`-separated path of id-shaped words, lower-
+# cased (one folder on Windows / macOS), at most LIBRARY_FOLDER_DEPTH deep;
+# "" is the library's top level, written `/`.
+LIBRARY_KINDS = ("templates", "prefabs")
+LIBRARY_FOLDER_DEPTH = 4
+ROOT_FOLDER_WORDS = ("/", "-")
+
+
+def check_library_folder(text: Any) -> str:
+    """A library folder path, normalized: lower-case words joined by `/`,
+    "" for the top level (`/` or `-`)."""
+    raw = str(text).strip()
+    if raw in ROOT_FOLDER_WORDS or raw == "":
+        return ""
+    words = [w for w in raw.strip("/").lower().split("/")]
+    if len(words) > LIBRARY_FOLDER_DEPTH:
+        raise VTTError(f"A folder is at most {LIBRARY_FOLDER_DEPTH} levels "
+                       f"deep; `{raw}` is {len(words)}.")
+    for w in words:
+        if not ID_RE.fullmatch(w):
+            raise VTTError(f"A folder name uses letters, digits, `_` and `-` "
+                           f"(1-40 characters per level, levels joined by "
+                           f"`/`); `{raw}` can't be one.")
+        if not is_file_id(w):
+            raise VTTError(f"`{w}` is a reserved device name on Windows "
+                           f"(where the bot may run), so it can't name a "
+                           f"folder.")
+    return "/".join(words)
+
+
+def folder_label(folder: str) -> str:
+    """How a folder is written in replies: `/` for the top level."""
+    return f"{folder}/" if folder else "/"
+
+
+def folder_ancestors(folder: str) -> List[str]:
+    """`a/b/c` -> [a, a/b, a/b/c]; [] for the top level."""
+    words = folder.split("/") if folder else []
+    return ["/".join(words[:i]) for i in range(1, len(words) + 1)]
+
+
+def folder_within(folder: str, top: str) -> bool:
+    """Whether `folder` is `top` or one of its subfolders (any folder is
+    within the top level "")."""
+    return not top or folder == top or folder.startswith(top + "/")
+
+
 # Saved entity templates. A template is a unit's JSON without its identity
 # (see Match.capture_template); its NAME is the id spawned units take.
 TEMPLATE_ROOT = "@root"
@@ -32888,8 +32950,16 @@ class MatchManager:
         # outside undo.
         self.templates: Dict[str, Dict[str, Any]] = {}
         # Saved prefabs (prefab.py), by name: the server's other library,
-        # written to templates/prefabs/<name>.json, outside undo.
+        # written to prefabs/<name>.json, outside undo.
         self.prefabs: Dict[str, Dict[str, Any]] = {}
+        # Where each library entry lives (LIBRARY_KINDS -> name -> folder,
+        # "" = the top level) and the folders each library holds, empty
+        # ones included (with every folder's parents). Mirrors the
+        # folders on disk (storage.py); organization only.
+        self.library_folders: Dict[str, Dict[str, str]] = {
+            k: {} for k in LIBRARY_KINDS}
+        self.library_dirs: Dict[str, Set[str]] = {
+            k: set() for k in LIBRARY_KINDS}
         # `!system undo`: the server-wide state (server_state) as it was
         # before each command that changed it, oldest first, with who ran
         # the command and when (record_system_step). Saved as
@@ -33254,6 +33324,43 @@ class MatchManager:
     def set_channel_default_system(self, channel_key: str, name: str):
         self.get_system(name)
         self.default_system_per_channel[channel_key] = name
+
+    # ---- library folders (templates, prefabs) ----------------------------
+    def lib_entries(self, lib: str) -> Dict[str, Dict[str, Any]]:
+        return self.prefabs if lib == "prefabs" else self.templates
+
+    def lib_folder(self, lib: str, name: str) -> str:
+        """The folder library `lib`'s entry `name` lives in ("" = top)."""
+        return self.library_folders.setdefault(lib, {}).get(name, "")
+
+    def lib_set_folder(self, lib: str, name: str, folder: str) -> None:
+        """Record `name` as living in `folder` (its parents become known
+        folders); a top-level entry has no record."""
+        where = self.library_folders.setdefault(lib, {})
+        if folder:
+            where[name] = folder
+            self.library_dirs.setdefault(lib, set()).update(
+                folder_ancestors(folder))
+        else:
+            where.pop(name, None)
+
+    def lib_forget(self, lib: str, name: str) -> None:
+        self.library_folders.setdefault(lib, {}).pop(name, None)
+
+    def lib_dirs(self, lib: str) -> Set[str]:
+        return self.library_dirs.setdefault(lib, set())
+
+    def lib_in_folder(self, lib: str, folder: str,
+                      deep: bool = True) -> List[str]:
+        """The entries of `folder` (with its subfolders' when deep), by
+        name."""
+        return sorted(n for n in self.lib_entries(lib)
+                      if (folder_within(self.lib_folder(lib, n), folder)
+                          if deep else self.lib_folder(lib, n) == folder))
+
+    def lib_reset(self, lib: str) -> None:
+        self.library_folders[lib] = {}
+        self.library_dirs[lib] = set()
 
     def effective_system_name(self, channel_key: str) -> str:
         return self.default_system_per_channel.get(

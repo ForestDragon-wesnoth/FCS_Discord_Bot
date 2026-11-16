@@ -43713,3 +43713,190 @@ the save that ends the same command (its first, which makes the folder)
 writes the file: the commit after any command writes it when the name
 differs from the one last written. The local workspace (CLI / GUI) has no Discord
 name. A name made only of characters a file name can't hold leaves `_`s.
+
+SCENARIO 1202 — Template folders: save into a folder, a name stays unique across folders, move, copy, folder rename, restore, listing by folder, kept across a restart
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new tf TF 10 10
+!match use tf
+!ent add ogre Ogre 30 2 2 5 team=red footprint_w=2 footprint_h=2
+!template save ogre folder=Monsters/Giants
+?? 📁 In `monsters/giants/`.
+!template save ogre brute folder=monsters
+!template save ogre ogre folder=npcs
+?? ❌ Template `ogre` is in `monsters/giants/`, and a name is unique across folders: `!template move ogre npcs/` moves it
+!template save ogre
+?? 📁 In `monsters/giants/`.
+!template folder new npcs/town
+?? Made template folder `npcs/town/`
+!template move ogre npcs/town
+?? Moved template `ogre` from `monsters/giants/` to `npcs/town/`
+!template copy ogre ogre_guard
+?? 📁 In `npcs/town/`.
+!template copy ogre loose folder=/
+?! 📁 In
+!template list
+?? __`monsters/`__
+?? __`npcs/town/`__
+!template list folder=npcs
+?? Templates (2 of 4 in `npcs/`)
+?? ogre_guard
+?! brute
+!template folders
+?? `monsters/giants/` — 0 template(s)
+?? `npcs/` — 0 template(s) (2 with subfolders)
+!template folder rename npcs people
+?? Renamed template folder `npcs/` to `people/` (2 template(s) moved).
+?file list templates/people/town
+?? ogre.json | ogre_guard.json
+!template show ogre
+?? in `people/town/`
+!template delete ogre_guard
+!template restore ogre_guard
+!template list folder=people/town
+?? ogre_guard
+!template spawn ogre 6 6
+?? Spawned `ogre2` from template `ogre`
+!assert "footprint_width('ogre2') == 2"
+!as restart
+!template list folder=people
+?? ogre_guard
+!template folders
+?? `monsters/giants/` — 0 template(s)
+!template move ogre people/town
+?? already in `people/town/`
+?tab "!template move ogre pe"
+?? people/town
+
+Expected: `folder=` saves a template into a folder (lower-cased, made if
+new) and the reply names it. A name is unique across folders: saving
+`ogre` into `npcs/` while it lives in `monsters/giants/` is refused,
+pointing at `!template move`, and a save without `folder=` replaces it
+where it is. A copy goes into its source's folder unless `folder=` says
+otherwise (`/` = the top level). `list` groups the rows by folder and
+`folder=` keeps a folder and its subfolders; `folders` counts each
+folder's templates with and without subfolders, empty folders included.
+Renaming a folder moves its templates and subfolders on disk, `show` names
+the folder, an old version comes back into the folder it was in, and a
+spawn names the template by its name alone (the 2x2 ogre spawns whole).
+Everything is still there after a restart; Tab offers the folders.
+
+SCENARIO 1203 — Prefab folders; prefabs move out of templates/; delete_empty_library_folders; folder refusals
+-----------------------------------------------------------------------------------------------------------
+!match new pf PF 10 10
+!match use pf
+!ent add ogre Ogre 30 2 2 5 team=red footprint_w=2 footprint_h=2
+!prefab save cave 1 1 4 4 folder=dungeon/caves
+?? 📁 In `dungeon/caves/`.
+!prefab save hall 1 1 3 3
+?file list prefabs/dungeon/caves
+?? cave.json
+!prefab list
+?? __`/`__
+?? __`dungeon/caves/`__
+!prefab folders
+?? `dungeon/caves/` — 1 prefab(s)
+!prefab copy cave cave2
+?? 📁 In `dungeon/caves/`.
+!prefab delete cave2
+!prefab move cave /
+!prefab folders
+?? `dungeon/caves/` — 0 prefab(s)
+!prefab move cave dungeon/caves
+!system set default delete_empty_library_folders true
+!prefab move cave /
+!prefab folders
+?! dungeon
+!prefab stamp cave 5 5
+?? Stamped prefab `cave`
+?file move prefabs templates/prefabs
+!as restart
+?? moved 2 prefab(s) from templates/prefabs/ to prefabs/.
+!prefab list
+?? cave
+?? hall
+!template list
+?! cave
+!template save ogre a1 folder=a/b/c
+!template folder new a/x
+!template delete a1
+!template folders
+?? `a/x/` — 0 template(s)
+?! a/b/
+!template folder delete a/x
+!template folders
+?! `a/`
+?? Template folders (1)
+!template save ogre deep folder=a/b/c/d/e
+?? ❌ A folder is at most 4 levels deep
+!template save ogre bad folder=two words
+?? ❌ Unexpected
+!template folder new my.stuff
+?? ❌ A folder name uses letters, digits
+!template folder new grp
+!template save ogre in_grp folder=grp
+!template folder delete grp
+?? ❌ Folder `grp/` isn't empty
+!template folder rename grp grp/sub
+?? ❌ `grp/sub/` is inside `grp/`.
+!template folder new /
+?? ❌ The top level (`/`) is always there.
+HARNESS-ALLOWS-ERRORS
+
+Expected: prefabs take the same folders as templates (`folder=` on save,
+import and copy; `move`, `folders`, `folder new|delete|rename`) and now
+live in prefabs/, beside templates/. A server whose prefabs/ folder
+doesn't exist yet gets the prefab files it kept in templates/prefabs/
+moved over at load, so none of them reads as a template. Empty folders
+stay until deleted while delete_empty_library_folders is off; with it on,
+moving or deleting a folder's last entry deletes it and every parent it
+leaves empty (`a/b/c/` and `a/b/` went, `a/` stayed while `a/x/` was in
+it), and deleting `a/x/` then took `a/` too. Refused: a folder deeper
+than 4 levels, a name the library can't use
+as a folder, deleting a folder that still holds a template, renaming a
+folder into itself, and the top level.
+
+SCENARIO 1204 — The same name in two folders on disk: the newest copy loads and the other goes to corrupt/ with an error-log entry; a folder name the bot can't use is skipped; a folder of private templates is hidden from players
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new dp DP 8 8
+!match use dp
+!ent add ogre Ogre 30 2 2 5 team=red footprint_w=2 footprint_h=2
+!template save ogre goblin folder=monsters
+!template save ogre spare folder=extra
+?file copy templates/monsters/goblin.json templates/goblin.json
+?file set templates/goblin.json vars.hp 77
+?file move templates/extra templates/Extra_Stuff
+!as restart
+?? a second copy of `goblin`, which loads from
+?? templates/Extra_Stuff isn't a folder name the library uses
+!template list
+?? hp 77
+?! spare
+!template folders
+?? `monsters/` — 0 template(s)
+?file list corrupt
+?? goblin.json.
+!server errors
+?? a second copy of `goblin`
+!template save ogre plan folder=secret
+!template private plan on
+!template folders
+?? `secret/` — 1 template(s)
+!as player pip
+!template folders
+?! secret
+!template list folder=secret
+?? ❌ No folder `secret/`
+!as host
+!template folder new empty
+!as player pip
+!template folders
+?? `empty/` — 0 template(s)
+HARNESS-ALLOWS-ERRORS
+
+Expected: two files of one name in different folders (an operator copied
+one by hand) load once: the copy changed last wins (hp 77 here), the other
+moves to corrupt/ with a console note and an entry in `!server errors`. A
+folder whose name the library can't use (capitals) is skipped with a note
+and its files stay on disk unloaded. A folder holding only templates a
+player can't read is left out of their `folders` and refused by
+`list folder=` like a missing one; an empty folder shows to anyone.

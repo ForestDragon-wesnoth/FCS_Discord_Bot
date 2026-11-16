@@ -21,12 +21,17 @@ Layout under the data root (default `data/` next to the code):
         saves/                  `!store save`, `!history export`, `!run` files
         sprites/                the server's own sprites (searched before the
                                 shared sprites/ folder)
-        templates/<name>.json   saved entity templates (`!template`): written
-                                when saved, loaded at start — even with
-                                match persistence off
+        templates/[<folder>/]<name>.json
+                                saved entity and partial templates
+                                (`!template`): written when saved, loaded at
+                                start — even with match persistence off;
+                                folders organize them, names are unique
         templates/.trash/       replaced / edited / deleted template versions,
                                 kept 24 h (`!template restore`), cut first
                                 when the server nears its limit
+        prefabs/[<folder>/]<name>.json
+                                saved prefabs (`!prefab`), with their own
+                                .trash/
         corrupt/                files that failed to load, moved aside
 
 The live state is in memory (logic.Workspaces); this module mirrors it. After
@@ -58,7 +63,9 @@ from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name, legacy_template_fixes,
                    LEGACY_IDS_OK, owner_limit, unreachable_id,
-                   check_role_perms, state_text, LOCAL_WORKSPACE)
+                   check_role_perms, state_text, LOCAL_WORKSPACE,
+                   check_library_folder, folder_ancestors,
+                   LIBRARY_FOLDER_DEPTH)
 from match_history import MatchHistory, HistoryError, _now_iso
 from journal import start_header
 
@@ -153,6 +160,13 @@ def _write_text(path: str, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
 
 
 def _file_size(path: str) -> int:
@@ -259,14 +273,25 @@ class Storage:
 
     def library_dir(self, key: str, lib: str = "templates") -> str:
         """The folder of server `key`'s library `lib`: templates/ for entity
-        and partial templates, templates/prefabs/ for prefabs (their own
-        namespace)."""
-        tdir = self.templates_dir(key)
-        return os.path.join(tdir, "prefabs") if lib == "prefabs" else tdir
+        and partial templates, prefabs/ for prefabs (their own namespace).
+        Each holds the library's folders as subfolders (organization only:
+        a name is unique across a library)."""
+        return os.path.join(self.server_dir(key),
+                            "prefabs" if lib == "prefabs" else "templates")
 
-    def template_file(self, key: str, name: str,
-                      lib: str = "templates") -> str:
-        return os.path.join(self.library_dir(key, lib), f"{name}.json")
+    def folder_dir(self, key: str, lib: str, folder: str) -> str:
+        base = self.library_dir(key, lib)
+        return os.path.join(base, *folder.split("/")) if folder else base
+
+    def template_file(self, mgr: MatchManager, name: str,
+                      lib: str = "templates",
+                      folder: Optional[str] = None) -> str:
+        """The file of library `lib`'s entry `name`: in `folder`, by default
+        the folder it lives in now."""
+        if folder is None:
+            folder = mgr.lib_folder(lib, name)
+        return os.path.join(self.folder_dir(mgr.guild_key, lib, folder),
+                            f"{name}.json")
 
     # ---- entity templates -------------------------------------------------
     # Templates are the server's library, outside the match state: each one
@@ -274,32 +299,46 @@ class Storage:
     # (never through commit / rollback), and they load at start whether or
     # not match persistence is on.
     # Old versions: a template that is replaced, edited or deleted keeps its
-    # previous file in templates/.trash/<stamp>-<name>.json for 24 hours
-    # (`!template trash` / `!template restore`). They count toward the
-    # server's limit and are the first thing cut when a write needs room.
+    # previous file in templates/.trash/[<folder>/]<stamp>-<name>.json for
+    # 24 hours (`!template trash` / `!template restore`), the folder it was
+    # in mirrored there. They count toward the server's limit and are the
+    # first thing cut when a write needs room.
+    # These methods change the disk only; the caller keeps the manager's
+    # folder records (MatchManager.lib_set_folder and friends).
     def template_trash_dir(self, key: str, lib: str = "templates") -> str:
-        return os.path.join(self.library_dir(key, lib), ".trash")
+        return os.path.join(self.library_dir(key, lib), TRASH_DIR)
+
+    def trash_folder(self, key: str, path: str, lib: str = "templates") -> str:
+        """The library folder an old version in the trash was in."""
+        rel = os.path.relpath(os.path.dirname(path),
+                              self.template_trash_dir(key, lib))
+        return "" if rel in (".", "") else rel.replace(os.sep, "/")
 
     def write_template(self, mgr: MatchManager, name: str,
                        data: Dict[str, Any], keep_old: bool = True,
-                       lib: str = "templates") -> Tuple[List[str], bool]:
-        """Write template `name` (a prefab with lib="prefabs"), first moving
-        the file it replaces into the library's trash (keep_old). Returns
-        (notes, whether an old version was kept). Room is made BEFORE
-        anything moves (old versions are cut oldest first), so a refused
-        write changes nothing on disk."""
+                       lib: str = "templates",
+                       folder: Optional[str] = None) -> Tuple[List[str], bool]:
+        """Write template `name` (a prefab with lib="prefabs") into `folder`
+        (default: the folder it is in now), first moving the file it
+        replaces into the library's trash (keep_old). Returns (notes,
+        whether an old version was kept). Room is made BEFORE anything
+        moves (old versions are cut oldest first), so a refused write
+        changes nothing on disk."""
         key = mgr.guild_key
-        path = self.template_file(key, name, lib)
+        old_path = self.template_file(mgr, name, lib)
+        path = self.template_file(mgr, name, lib, folder)
         # Keys in their order (a template's passives fire in it).
         text = json.dumps(data, indent=2) + "\n"
         size = len(text.encode("utf-8"))
-        old = _file_size(path)
-        kept = keep_old and os.path.isfile(path)
+        old = _file_size(old_path)
+        kept = keep_old and os.path.isfile(old_path)
         # A kept old version still counts, so the whole new file is growth.
         notes = self._room_for_template(key, size if kept else size - old)
         if kept:
             self.trash_template(mgr, name, lib)
             old = 0
+        elif old_path != path and os.path.isfile(old_path):
+            os.remove(old_path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         _write_text(path, text)
         self.note_written(key, path, old)
@@ -308,12 +347,16 @@ class Storage:
     def trash_template(self, mgr: MatchManager, name: str,
                        lib: str = "templates") -> bool:
         """Move template `name`'s file into the library's trash (no change
-        in size). False when there is no file."""
+        in size), under the folder it was in. False when there is no
+        file."""
         key = mgr.guild_key
-        path = self.template_file(key, name, lib)
+        path = self.template_file(mgr, name, lib)
         if not os.path.isfile(path):
             return False
+        folder = mgr.lib_folder(lib, name)
         tdir = self.template_trash_dir(key, lib)
+        if folder:
+            tdir = os.path.join(tdir, *folder.split("/"))
         os.makedirs(tdir, exist_ok=True)
         stamp = time.time()
         dest = os.path.join(tdir, f"{stamp:.6f}-{name}.json")
@@ -330,40 +373,94 @@ class Storage:
 
     def rename_template_file(self, mgr: MatchManager, old: str,
                              new: str, lib: str = "templates") -> None:
-        key = mgr.guild_key
-        src = self.template_file(key, old, lib)
-        dest = self.template_file(key, new, lib)
+        """Rename an entry's file in its folder (the new name takes the
+        old one's folder)."""
+        folder = mgr.lib_folder(lib, old)
+        src = self.template_file(mgr, old, lib, folder)
+        dest = self.template_file(mgr, new, lib, folder)
         if os.path.isfile(src):
             os.replace(src, dest)
+
+    def move_template_file(self, mgr: MatchManager, name: str, folder: str,
+                           lib: str = "templates") -> None:
+        """Move an entry's file into `folder` (no change in size)."""
+        src = self.template_file(mgr, name, lib)
+        dest = self.template_file(mgr, name, lib, folder)
+        if src != dest and os.path.isfile(src):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.replace(src, dest)
+
+    def make_folder(self, key: str, lib: str, folder: str) -> None:
+        if folder:
+            os.makedirs(self.folder_dir(key, lib, folder), exist_ok=True)
+
+    def remove_folder(self, key: str, lib: str, folder: str) -> None:
+        """Remove an empty folder (with its empty subfolders). Raises when
+        the folder holds a file on disk, which the caller didn't know of
+        (an operator's own file)."""
+        path = self.folder_dir(key, lib, folder)
+        if not folder or not os.path.isdir(path):
+            return
+        for base, _dirs, files in os.walk(path):
+            if files:
+                raise VTTError(
+                    f"Folder `{folder}/` holds a file the bot doesn't load "
+                    f"(`{os.path.relpath(os.path.join(base, files[0]), self.root)}`"
+                    f"); move it away first.")
+        shutil.rmtree(path)
+
+    def rename_folder(self, key: str, lib: str, old: str, new: str) -> None:
+        """Move folder `old` (with its entries and subfolders) to `new`,
+        which must not exist on disk."""
+        src = self.folder_dir(key, lib, old)
+        dest = self.folder_dir(key, lib, new)
+        if os.path.exists(dest):
+            raise VTTError(f"Folder `{new}/` already exists on disk.")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.isdir(src):
+            os.replace(src, dest)
+        else:
+            os.makedirs(dest, exist_ok=True)
+
+    def prune_folder(self, key: str, lib: str, folder: str) -> None:
+        """Remove `folder`'s directory when it is empty on disk."""
+        path = self.folder_dir(key, lib, folder)
+        if folder and os.path.isdir(path):
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
 
     def template_trash(self, key: str, name: Optional[str] = None,
                        lib: str = "templates"
                        ) -> List[Tuple[float, str, str]]:
         """(time, template name, path) of server `key`'s old versions in
-        library `lib` from the last 24 hours, newest first; older ones are
-        deleted on the way."""
+        library `lib` from the last 24 hours, newest first (any folder;
+        `trash_folder` names a version's); older ones are deleted on the
+        way."""
         tdir = self.template_trash_dir(key, lib)
         out: List[Tuple[float, str, str]] = []
         if not os.path.isdir(tdir):
             return out
         now = time.time()
-        for fname in os.listdir(tdir):
-            stamp_s, _, rest = fname.partition("-")
-            if not rest.endswith(".json"):
-                continue
-            try:
-                stamp = float(stamp_s)
-            except ValueError:
-                continue
-            path = os.path.join(tdir, fname)
-            if now - stamp > TRASH_SECONDS:
-                size = _file_size(path)
-                _remove_path(path)
-                self._add_usage(key, -size)
-                continue
-            tname = rest[:-5]
-            if name is None or tname == name:
-                out.append((stamp, tname, path))
+        for base, _dirs, files in os.walk(tdir):
+            for fname in files:
+                stamp_s, _, rest = fname.partition("-")
+                if not rest.endswith(".json"):
+                    continue
+                try:
+                    stamp = float(stamp_s)
+                except ValueError:
+                    continue
+                path = os.path.join(base, fname)
+                if now - stamp > TRASH_SECONDS:
+                    size = _file_size(path)
+                    _remove_path(path)
+                    self._add_usage(key, -size)
+                    continue
+                tname = rest[:-5]
+                if name is None or tname == name:
+                    out.append((stamp, tname, path))
         out.sort(reverse=True)
         return out
 
@@ -403,23 +500,87 @@ class Storage:
         return [f"🗄️ Storage limit: cut the {n} oldest old template / "
                 f"prefab version(s) to make room."] if n else []
 
-    def load_templates(self, mgr: MatchManager) -> List[str]:
-        """Read the server's templates/ folder into `mgr.templates`; a file
-        that doesn't load is moved to corrupt/."""
+    def _scan_library(self, mgr: MatchManager, lib: str, notes: List[str]
+                      ) -> List[Tuple[str, str, str]]:
+        """(name, path, folder) of every entry file of library `lib`, each
+        name once: records the library's folders on `mgr`, skips (with a
+        note) a folder whose name the bot can't use, and moves every copy
+        of a name found in two folders but the newest to corrupt/ (a note,
+        and an entry in the error log)."""
         key = mgr.guild_key
-        notes: List[str] = []
+        base = self.library_dir(key, lib)
+        mgr.lib_reset(lib)
+        found: Dict[str, List[Tuple[str, str]]] = {}
+        if not os.path.isdir(base):
+            return []
+        for here, dirs, files in os.walk(base):
+            rel = os.path.relpath(here, base)
+            folder = "" if rel == "." else rel.replace(os.sep, "/")
+            keep = []
+            for d in sorted(dirs):
+                if d.startswith("."):
+                    continue
+                sub = f"{folder}/{d}" if folder else d
+                try:
+                    ok = check_library_folder(sub) == sub
+                except VTTError:
+                    ok = False
+                if ok:
+                    keep.append(d)
+                    mgr.lib_dirs(lib).update(folder_ancestors(sub))
+                else:
+                    notes.append(
+                        f"⚠️ [{key}] {lib}/{sub} isn't a folder name the "
+                        f"library uses (lower-case letters, digits, `_` and "
+                        f"`-`, at most {LIBRARY_FOLDER_DEPTH} levels); the "
+                        f"files in it weren't loaded.")
+            dirs[:] = keep
+            for fname in sorted(files):
+                if fname.endswith(".json"):
+                    found.setdefault(fname[:-5], []).append(
+                        (os.path.join(here, fname), folder))
+        out: List[Tuple[str, str, str]] = []
+        for name in sorted(found):
+            cands = found[name]
+            if len(cands) > 1:
+                # The copy changed last wins (user call); the others go to
+                # corrupt/, kept for an operator.
+                cands.sort(key=lambda c: (-_mtime(c[0]), c[0]))
+                kept = os.path.relpath(cands[0][0], self.root)
+                for path, _folder in cands[1:]:
+                    why = f"a second copy of `{name}`, which loads from {kept}"
+                    note = self._quarantine(key, path, why)
+                    notes.append(note)
+                    self._record_load_problem(mgr, note)
+            out.append((name, cands[0][0], cands[0][1]))
+        return out
+
+    def _record_load_problem(self, mgr: MatchManager, text: str) -> None:
+        """An entry in the error log (`!server errors`) for a load problem
+        an operator should see."""
+        ws = getattr(mgr, "workspaces", None)
+        log = getattr(ws, "crashes", None)
+        if log is None:
+            return
+        try:
+            raise VTTError(text.removeprefix("⚠️ "))
+        except VTTError as ex:
+            log.record("loading the server's library", ex,
+                       server=mgr.guild_key)
+
+    def load_templates(self, mgr: MatchManager) -> List[str]:
+        """Read the server's templates/ folder (its subfolders too) into
+        `mgr.templates`; a file that doesn't load is moved to corrupt/."""
+        key = mgr.guild_key
+        # Old prefabs out of templates/ first, so they don't read as
+        # templates.
+        notes: List[str] = self._migrate_prefabs(key)
         mgr.templates = {}
         fixed: List[str] = []
-        tdir = self.templates_dir(key)
-        if not os.path.isdir(tdir):
-            return notes
-        for fname in sorted(os.listdir(tdir)):
-            if not fname.endswith(".json"):
-                continue
-            fpath = os.path.join(tdir, fname)
+        for stem, fpath, folder in self._scan_library(mgr, "templates", notes):
             try:
-                name = check_template_name(fname[:-5], legacy=True)
-                if name != fname[:-5]:
+                name = check_template_name(stem, legacy=True)
+                if name != stem:
                     raise ValueError("file name isn't a template name")
                 raw = self._read_json(fpath)
                 fixes = legacy_template_fixes(raw, name)
@@ -434,6 +595,7 @@ class Storage:
                 notes.append(self._quarantine(key, fpath, type(ex).__name__))
                 continue
             mgr.templates[name] = data
+            mgr.lib_set_folder("templates", name, folder)
             if fixes:
                 fixed.append(name)
         # A template the load changed is recorded in every match journal
@@ -448,29 +610,55 @@ class Storage:
                         "data": copy.deepcopy(mgr.templates[name])})
         return notes
 
+    def _migrate_prefabs(self, key: str) -> List[str]:
+        """Prefabs lived in templates/prefabs/ before they had folders; a
+        server whose prefabs/ folder doesn't exist yet gets them moved
+        there (the files that read as prefabs, and their old versions)."""
+        from prefab import check_prefab
+        old = os.path.join(self.templates_dir(key), "prefabs")
+        new = self.library_dir(key, "prefabs")
+        if not os.path.isdir(old) or os.path.exists(new):
+            return []
+        moved = 0
+        for fname in sorted(os.listdir(old)):
+            path = os.path.join(old, fname)
+            if not (fname.endswith(".json") and os.path.isfile(path)):
+                continue
+            try:
+                check_prefab(self._read_json(path), fname[:-5])
+            except Exception:  # noqa: BLE001 - not a prefab: a template folder's
+                continue
+            os.makedirs(new, exist_ok=True)
+            os.replace(path, os.path.join(new, fname))
+            moved += 1
+        otrash = os.path.join(old, TRASH_DIR)
+        if moved and os.path.isdir(otrash):
+            os.replace(otrash, os.path.join(new, TRASH_DIR))
+        try:
+            os.rmdir(old)
+        except OSError:
+            pass
+        return ([f"ℹ️ [{key}] moved {moved} prefab(s) from templates/prefabs/ "
+                 f"to prefabs/."] if moved else [])
+
     def load_prefabs(self, mgr: MatchManager) -> List[str]:
-        """Read the server's templates/prefabs/ folder into `mgr.prefabs`; a
-        file that doesn't load is moved to corrupt/."""
+        """Read the server's prefabs/ folder (its subfolders too) into
+        `mgr.prefabs`; a file that doesn't load is moved to corrupt/."""
         from prefab import check_prefab, check_prefab_name
         key = mgr.guild_key
         notes: List[str] = []
         mgr.prefabs = {}
-        pdir = self.library_dir(key, "prefabs")
-        if not os.path.isdir(pdir):
-            return notes
-        for fname in sorted(os.listdir(pdir)):
-            if not fname.endswith(".json"):
-                continue
-            fpath = os.path.join(pdir, fname)
+        for stem, fpath, folder in self._scan_library(mgr, "prefabs", notes):
             try:
-                name = check_prefab_name(fname[:-5])
-                if name != fname[:-5]:
+                name = check_prefab_name(stem)
+                if name != stem:
                     raise ValueError("file name isn't a prefab name")
                 data = check_prefab(self._read_json(fpath), name)
             except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
                 notes.append(self._quarantine(key, fpath, type(ex).__name__))
                 continue
             mgr.prefabs[name] = data
+            mgr.lib_set_folder("prefabs", name, folder)
         return notes
 
     # ---- error log --------------------------------------------------------
@@ -621,16 +809,12 @@ class Storage:
                     label = f"match {name} undo history"
                     out[label] = out.get(label, 0) + _dir_size(path) - jsize
                     out[f"match {name} journal"] = jsize
-        tdir = os.path.join(sdir, "templates")
-        if os.path.isdir(tdir):
-            trash = _dir_size(os.path.join(tdir, TRASH_DIR))
-            pdir = os.path.join(tdir, "prefabs")
-            ptrash = _dir_size(os.path.join(pdir, TRASH_DIR))
-            prefabs = _dir_size(pdir)
-            out["templates"] = _dir_size(tdir) - trash - prefabs
-            out["old template versions"] = trash
-            out["prefabs"] = prefabs - ptrash
-            out["old prefab versions"] = ptrash
+        for lib, label in (("templates", "template"), ("prefabs", "prefab")):
+            ldir = os.path.join(sdir, lib)
+            if os.path.isdir(ldir):
+                trash = _dir_size(os.path.join(ldir, TRASH_DIR))
+                out[f"{label}s"] = _dir_size(ldir) - trash
+                out[f"old {label} versions"] = trash
         for sub, label in (("saves", "saves"), ("sprites", "sprites"),
                            ("corrupt", "corrupt files"),
                            (BACKUP_DIR, "server file backups")):
@@ -716,10 +900,7 @@ class Storage:
         if self.persist:
             notes = self.load_server(mgr)
         else:
-            notes = []
-            if os.path.isdir(os.path.join(self.root, key, "templates")):
-                notes.extend(self.load_templates(mgr))
-                notes.extend(self.load_prefabs(mgr))
+            notes = self.load_templates(mgr) + self.load_prefabs(mgr)
         self._usage[key] = _dir_size(os.path.join(self.root, key))
         for n in notes:
             print(n)
@@ -737,6 +918,11 @@ class Storage:
         os.makedirs(dest_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         dest = os.path.join(dest_dir, f"{os.path.basename(path)}.{stamp}")
+        n = 2
+        while os.path.exists(dest):
+            dest = os.path.join(dest_dir,
+                                f"{os.path.basename(path)}.{stamp}-{n}")
+            n += 1
         try:
             shutil.move(path, dest)
         except OSError:
@@ -1702,12 +1888,10 @@ class Storage:
                     os.path.join(self.root, server, BACKUP_DIR)):
                 self.prune_backups(server)
         for server in os.listdir(self.root):
-            if valid_id(server) and os.path.isdir(
-                    os.path.join(self.root, server, "templates", ".trash")):
-                self.template_trash(server)
-            if valid_id(server) and os.path.isdir(os.path.join(
-                    self.root, server, "templates", "prefabs", ".trash")):
-                self.template_trash(server, lib="prefabs")
+            for lib in ("templates", "prefabs"):
+                if valid_id(server) and os.path.isdir(
+                        os.path.join(self.root, server, lib, TRASH_DIR)):
+                    self.template_trash(server, lib=lib)
 
     def trash_entries(self, key: str) -> List[Tuple[float, str, str]]:
         """(time, scope, path) of server `key`'s trash entries, newest first."""
@@ -1728,7 +1912,7 @@ class Storage:
     def move_to_trash(self, mgr: MatchManager, scope: str) -> str:
         """Move the files a `!server wipe <scope>` removes into the trash and
         return the trash entry's path. `matches`: the matches folder (with
-        their histories). `all`: also systems.json, saves/ and templates/.
+        their histories). `all`: also systems.json, saves/, templates/ and prefabs/.
         A copy of
         workspace.json goes along so an undo can restore the channel
         pointers."""
@@ -1740,7 +1924,8 @@ class Storage:
         self.commit_all_one(mgr)
         entry = os.path.join(self._trash_root(), key, f"{time.time():.3f}-{scope}")
         os.makedirs(entry, exist_ok=True)
-        moved = ["matches"] + (["systems.json", "saves", "templates"]
+        moved = ["matches"] + (["systems.json", "saves", "templates",
+                                "prefabs"]
                                if scope == "all" else [])
         for name in moved:
             src = os.path.join(sdir, name)
@@ -1777,7 +1962,8 @@ class Storage:
         key = mgr.guild_key
         sdir = self.server_dir(key)
         os.makedirs(sdir, exist_ok=True)
-        for name in ("matches", "systems.json", "saves", "templates"):
+        for name in ("matches", "systems.json", "saves", "templates",
+                     "prefabs"):
             src = os.path.join(entry, name)
             if not os.path.exists(src):
                 continue

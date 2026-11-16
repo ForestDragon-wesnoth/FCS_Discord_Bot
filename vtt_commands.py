@@ -17,6 +17,8 @@ from logic import (
 
 # Passive system
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY
+from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
+                   folder_within)
 from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
@@ -184,7 +186,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "passive":    frozenset({"list", "info"}),
     # The prefab library is readable by anyone, as the templates are; save /
     # import / rename / delete check the saver, stamp changes the match.
-    "prefab":     frozenset({"list", "show", "trash"}),
+    "prefab":     frozenset({"list", "show", "trash", "folders"}),
     "remind":     frozenset({"list"}),
     "reveal_fog": frozenset({"list"}),
     "schedule":   frozenset({"list"}),
@@ -199,7 +201,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # delete check the saver themselves, spawn changes the match. `refs`
     # stays host-gated: it lists which of a unit's vars changed, and a
     # unit's vars are host-only (`!ent dump`).
-    "template":   frozenset({"list", "show", "trash", "diff"}),
+    "template":   frozenset({"list", "show", "trash", "diff", "folders"}),
     # team_data_visibility decides whose data a player may read.
     "team":       frozenset({"list", "get"}),
     "tile":       frozenset({"list", "info"}),
@@ -397,9 +399,10 @@ _LIBRARY_EDITS = {
     "match": ("host", frozenset({"new"})),
     "template": ("templates", frozenset({
         "save", "import", "set", "unset", "part", "rename", "copy",
-        "delete", "restore", "private", "tags"})),
+        "delete", "restore", "private", "tags", "move", "folder"})),
     "prefab": ("prefabs", frozenset({
-        "save", "import", "rename", "copy", "delete", "restore", "tags"})),
+        "save", "import", "rename", "copy", "delete", "restore", "tags",
+        "move", "folder"})),
 }
 
 
@@ -6295,6 +6298,8 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             mgr.default_system_per_channel = {}
             mgr.templates = {}
             mgr.prefabs = {}
+            for lib in ("templates", "prefabs"):
+                mgr.lib_reset(lib)
         audit_note(f"wiped {scope}")
         tail = ("Changed your mind? `!server wipe undo` within 24 hours."
                 if st is not None else
@@ -6977,6 +6982,315 @@ def _creator_template_use(ctx: ReplyContext, mgr: MatchManager) -> str:
             if s is not None else "none")
 
 
+# ---- library folders (templates, prefabs) ----------------------------------
+# A folder only organizes a library: a name is unique across its folders
+# (user call), so everything that names a template or prefab ignores where
+# it lives. MatchManager.library_folders / library_dirs hold the layout,
+# storage.py mirrors it on disk.
+_LIB_WORDS = {"templates": ("template", "!template", "templates"),
+              "prefabs": ("prefab", "!prefab", "prefabs")}
+
+
+def _channel_rule(ctx: ReplyContext, mgr: MatchManager, rule: str,
+                  default: Any) -> Any:
+    """A rule as this channel reads it: its match's value, else its default
+    system's."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    if m is not None:
+        return m.rules.get(rule, default)
+    s = mgr.systems.get(mgr.effective_system_name(ctx.channel_key))
+    return mgr.system_value(s, rule) if s is not None else default
+
+
+def _lib_readable(ctx: ReplyContext, mgr: MatchManager, lib: str,
+                  name: str) -> bool:
+    """Whether the caller may know of library entry `name` (a private
+    template reads as missing to others)."""
+    if lib != "templates":
+        return True
+    return not template_hidden(mgr.templates.get(name),
+                               _template_viewer(ctx, mgr))
+
+
+def _folder_opt(opts: Dict[str, Any]) -> Optional[str]:
+    """A `folder=` option, checked; None when not given."""
+    return check_library_folder(opts["folder"]) if "folder" in opts else None
+
+
+def _lib_place(ctx: ReplyContext, mgr: MatchManager, lib: str, name: str,
+               folder: Optional[str]) -> None:
+    """Refuse writing `name` into `folder` when it lives in another folder:
+    a name is unique across a library's folders, and a write never moves
+    an entry (`move` does)."""
+    if folder is None or name not in mgr.lib_entries(lib):
+        return
+    cur = mgr.lib_folder(lib, name)
+    if cur == folder:
+        return
+    word, cmd, _ = _LIB_WORDS[lib]
+    if not _lib_readable(ctx, mgr, lib, name):
+        raise VTTError(f"The name `{name}` is taken; choose another.")
+    raise VTTError(
+        f"{word.capitalize()} `{name}` is in `{folder_label(cur)}`, and a "
+        f"name is unique across folders: `{cmd} move {name} "
+        f"{folder_label(folder)}` moves it, or choose another name.")
+
+
+def _lib_prune(ctx: Optional[ReplyContext], mgr: MatchManager, lib: str,
+               folder: str) -> None:
+    """After an entry left `folder`: delete it, and its parents, while
+    nothing is left in them, when delete_empty_library_folders is on."""
+    if not folder or ctx is None or not _channel_rule(
+            ctx, mgr, "delete_empty_library_folders", False):
+        return
+    st = storage_of(mgr)
+    entries = mgr.lib_entries(lib)
+    for f in reversed(folder_ancestors(folder)):
+        if any(folder_within(mgr.lib_folder(lib, n), f) for n in entries):
+            return
+        if any(d != f and folder_within(d, f) for d in mgr.lib_dirs(lib)):
+            return
+        if st is not None:
+            st.prune_folder(mgr.guild_key, lib, f)
+            if os.path.isdir(st.folder_dir(mgr.guild_key, lib, f)):
+                return          # it holds an operator's own file
+        mgr.lib_dirs(lib).discard(f)
+
+
+def _lib_renamed(mgr: MatchManager, lib: str, old: str, new: str) -> str:
+    """Record entry `old` renamed to `new` in the same folder; returns the
+    folder `new` was in before (its old entry, replaced), or ""."""
+    before = mgr.lib_folder(lib, new) if new in mgr.lib_entries(lib) else ""
+    folder = mgr.lib_folder(lib, old)
+    mgr.lib_forget(lib, old)
+    mgr.lib_set_folder(lib, new, folder)
+    return before
+
+
+def _lib_removed(ctx: Optional[ReplyContext], mgr: MatchManager, lib: str,
+                 name: str) -> None:
+    folder = mgr.lib_folder(lib, name)
+    mgr.lib_forget(lib, name)
+    _lib_prune(ctx, mgr, lib, folder)
+
+
+def _lib_grouped(mgr: MatchManager, lib: str, names: List[str],
+                 row) -> List[str]:
+    """List rows for `names`, under a heading per folder when they come
+    from more than one (the top level first, then by path)."""
+    names = sorted(names, key=lambda n: (mgr.lib_folder(lib, n), n))
+    folders = {mgr.lib_folder(lib, n) for n in names}
+    if len(folders) <= 1:
+        return [row(n) for n in names]
+    out: List[str] = []
+    last = None
+    for n in names:
+        f = mgr.lib_folder(lib, n)
+        if f != last:
+            out.append(f"__`{folder_label(f)}`__")
+            last = f
+        out.append(row(n))
+    return out
+
+
+def _lib_folder_known(ctx: ReplyContext, mgr: MatchManager, lib: str,
+                      folder: str) -> None:
+    """Refuse a folder that doesn't exist, or that holds only entries the
+    caller can't read (which `folders` leaves out)."""
+    _word, cmd, _ = _LIB_WORDS[lib]
+    inside = [n for n in mgr.lib_entries(lib)
+              if folder_within(mgr.lib_folder(lib, n), folder)]
+    if folder not in mgr.lib_dirs(lib) or (
+            inside and not any(_lib_readable(ctx, mgr, lib, n)
+                               for n in inside)):
+        raise VTTError(f"No folder `{folder_label(folder)}` (`{cmd} "
+                       f"folders`).")
+
+
+def _in_folder_note(mgr: MatchManager, lib: str, name: str) -> List[str]:
+    """`In `<folder>/`.` after a save into a folder; nothing at the top."""
+    f = mgr.lib_folder(lib, name)
+    return [f"📁 In `{folder_label(f)}`."] if f else []
+
+
+def _import_folder(rest: List[str], usage: str) -> Tuple[Optional[str], str]:
+    """An import's optional leading `folder=<folder>` and the JSON after
+    it."""
+    raw = " ".join(rest)
+    mt = re.match(r"\s*folder=(\S+)\s*(.*)\Z", raw, re.S | re.I)
+    if not mt:
+        return None, raw
+    if not mt.group(2).strip():
+        raise VTTError(f"The JSON is missing — usage: `{usage}`.")
+    return check_library_folder(mt.group(1)), mt.group(2)
+
+
+def _copy_folder(ctx: ReplyContext, mgr: MatchManager, lib: str, src: str,
+                 new: str, opts_args: List[str]) -> Optional[str]:
+    """Where a copy goes: `folder=`, else (a new name) the source's
+    folder; a copy over an existing entry stays where that one is."""
+    opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
+            for a in opts_args if "=" in a}
+    folder = _folder_opt(opts)
+    if folder is not None:
+        _lib_place(ctx, mgr, lib, new, folder)
+        return folder
+    if new in mgr.lib_entries(lib):
+        return None
+    return mgr.lib_folder(lib, src)
+
+
+_LIB_FOLDER_USAGE = {
+    "move": "<name> <folder>",
+    "folders": "[<folder>]",
+    "folder": "<new|delete|rename> <folder> [<new_folder>]",
+}
+
+
+async def _library_folder_sub(ctx: ReplyContext, args: List[str],
+                              mgr: MatchManager, lib: str):
+    """`move`, `folders` and `folder new|delete|rename` of `!template` /
+    `!prefab`."""
+    word, cmd, cap = _LIB_WORDS[lib]
+    sub = args[0].lower()
+    entries = mgr.lib_entries(lib)
+    st = storage_of(mgr)
+    key = mgr.guild_key
+
+    def may_edit(name: str, verb: str) -> None:
+        if lib == "templates":
+            _require_saver(ctx, name, entries[name], verb)
+        else:
+            _require_prefab_saver(ctx, name, entries[name], verb)
+
+    def visible(names: List[str]) -> List[str]:
+        return [n for n in names if _lib_readable(ctx, mgr, lib, n)]
+
+    if sub == "move":
+        usage = f"{cmd} move {_LIB_FOLDER_USAGE['move']}"
+        if len(args) < 3:
+            raise VTTError(f"Usage: `{usage}` (`/` = the top level).")
+        _check_tail(args, 3, (), usage)
+        name = (check_template_name(args[1]) if lib == "templates"
+                else check_prefab_name(args[1]))
+        if name not in entries or not _lib_readable(ctx, mgr, lib, name):
+            raise VTTError(f"No {word} `{name}` (`{cmd} list`).")
+        folder = check_library_folder(args[2])
+        cur = mgr.lib_folder(lib, name)
+        if folder == cur:
+            return await ctx.send(f"{word.capitalize()} `{name}` is already "
+                                  f"in `{folder_label(folder)}`.")
+        may_edit(name, "move")
+        if st is not None:
+            st.move_template_file(mgr, name, folder, lib)
+        mgr.lib_set_folder(lib, name, folder)
+        _lib_prune(ctx, mgr, lib, cur)
+        audit_note(f"{word} `{name}` moved to {folder_label(folder)}")
+        return await ctx.send(f"📁 Moved {word} `{name}` from "
+                              f"`{folder_label(cur)}` to "
+                              f"`{folder_label(folder)}`.")
+
+    if sub == "folders":
+        usage = f"{cmd} folders {_LIB_FOLDER_USAGE['folders']}"
+        _check_tail(args, min(len(args), 2), (), usage)
+        top = check_library_folder(args[1]) if len(args) > 1 else ""
+        shown = visible(sorted(entries))
+        rows = []
+        for f in [""] + sorted(mgr.lib_dirs(lib)):
+            if not folder_within(f, top):
+                continue
+            inside = [n for n in entries
+                      if folder_within(mgr.lib_folder(lib, n), f)]
+            seen = [n for n in shown
+                    if folder_within(mgr.lib_folder(lib, n), f)]
+            if inside and not seen:
+                continue        # only entries the caller can't read
+            here = sum(1 for n in seen if mgr.lib_folder(lib, n) == f)
+            rows.append(f"- `{folder_label(f)}` — {here} {word}(s)"
+                        + (f" ({len(seen)} with subfolders)"
+                           if len(seen) != here else ""))
+        if top and len(rows) == 0:
+            raise VTTError(f"No folder `{folder_label(top)}` (`{cmd} "
+                           f"folders`).")
+        return await ctx.send("\n".join(
+            [f"**{word.capitalize()} folders ({len(rows)}):**"] + rows))
+
+    # folder new|delete|rename
+    usage = f"{cmd} folder {_LIB_FOLDER_USAGE['folder']}"
+    act = args[1].lower() if len(args) > 1 else ""
+    if act not in ("new", "delete", "rename") or len(args) < 3:
+        raise VTTError(f"Usage: `{usage}`.")
+    _check_tail(args, 4 if act == "rename" else 3, (), usage)
+    _template_may_save(ctx, mgr, cap)
+    folder = check_library_folder(args[2])
+    if not folder:
+        raise VTTError("The top level (`/`) is always there.")
+    known = folder in mgr.lib_dirs(lib)
+    if act == "new":
+        if known:
+            return await ctx.send(f"Folder `{folder_label(folder)}` already "
+                                  f"exists.")
+        if st is not None:
+            st.make_folder(key, lib, folder)
+        mgr.lib_dirs(lib).update(folder_ancestors(folder))
+        audit_note(f"{word} folder {folder_label(folder)} made")
+        return await ctx.send(f"📁 Made {word} folder "
+                              f"`{folder_label(folder)}`.")
+    if not known:
+        raise VTTError(f"No folder `{folder_label(folder)}` (`{cmd} "
+                       f"folders`).")
+    inside = [n for n in entries
+              if folder_within(mgr.lib_folder(lib, n), folder)]
+    if act == "delete":
+        if inside:
+            raise VTTError(f"Folder `{folder_label(folder)}` isn't empty; "
+                           f"move or delete what is in it first.")
+        if st is not None:
+            st.remove_folder(key, lib, folder)
+        for d in [d for d in mgr.lib_dirs(lib) if folder_within(d, folder)]:
+            mgr.lib_dirs(lib).discard(d)
+        _lib_prune(ctx, mgr, lib, "/".join(folder.split("/")[:-1]))
+        audit_note(f"{word} folder {folder_label(folder)} deleted")
+        return await ctx.send(f"🗑️ Deleted {word} folder "
+                              f"`{folder_label(folder)}`.")
+    new = check_library_folder(args[3])
+    if not new:
+        raise VTTError("Renaming onto the top level would merge the folder "
+                       f"into it; `{cmd} move` its entries instead.")
+    if folder_within(new, folder):
+        raise VTTError(f"`{folder_label(new)}` is inside "
+                       f"`{folder_label(folder)}`.")
+    if new in mgr.lib_dirs(lib):
+        raise VTTError(f"Folder `{folder_label(new)}` already exists.")
+    if len(new.split("/")) + max(
+            [len(d.split("/")) - len(folder.split("/"))
+             for d in mgr.lib_dirs(lib) if folder_within(d, folder)] or [0]) \
+            > LIBRARY_FOLDER_DEPTH:
+        raise VTTError(f"Its subfolders would be more than "
+                       f"{LIBRARY_FOLDER_DEPTH} levels deep there.")
+    for n in inside:
+        may_edit(n, "move")
+    if st is not None:
+        st.rename_folder(key, lib, folder, new)
+
+    def moved(f: str) -> str:
+        return new + f[len(folder):]
+    for n in inside:
+        mgr.lib_set_folder(lib, n, moved(mgr.lib_folder(lib, n)))
+    for d in [d for d in mgr.lib_dirs(lib) if folder_within(d, folder)]:
+        mgr.lib_dirs(lib).discard(d)
+        mgr.lib_dirs(lib).update(folder_ancestors(moved(d)))
+    parent = "/".join(folder.split("/")[:-1])
+    _lib_prune(ctx, mgr, lib, parent)
+    audit_note(f"{word} folder {folder_label(folder)} renamed to "
+               f"{folder_label(new)}")
+    return await ctx.send(
+        f"📁 Renamed {word} folder `{folder_label(folder)}` to "
+        f"`{folder_label(new)}`" + (f" ({len(inside)} {word}(s) moved)."
+                                    if inside else "."))
+
+
 def _creator_hidden(ctx: ReplyContext, mgr: MatchManager, tpl: Any) -> bool:
     """`tpl` is a creator-level template the caller can't read."""
     return (template_private_level(tpl) == TEMPLATE_CREATOR_ONLY
@@ -7070,11 +7384,13 @@ def _template_read_note(reader: Optional[VarReader]) -> List[str]:
 
 def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
                     data: Dict[str, Any], saver: Optional[Tuple[Any, Any]] = None,
-                    check_saver: bool = True) -> Tuple[str, List[str]]:
+                    check_saver: bool = True,
+                    folder: Optional[str] = None) -> Tuple[str, List[str]]:
     """Write `data` as template `name` (memory + disk) and return (verb,
     notes): 'Saved' or 'Replaced'. Replacing needs the old version's saver
     or a server administrator, and the old version goes to the template
-    trash for 24 hours. `saver` = (id, name) to record; default the caller."""
+    trash for 24 hours. `saver` = (id, name) to record; default the caller.
+    `folder`: where it goes (default: where it is, else the top level)."""
     old = mgr.templates.get(name)
     if old is not None and check_saver:
         _require_saver(ctx, name, old, "replace")
@@ -7110,12 +7426,17 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
             data[k] = str(v)
     notes: List[str] = []
     st = storage_of(mgr)
+    was = mgr.lib_folder("templates", name) if old is not None else None
     if st is not None:
-        notes, trashed = st.write_template(mgr, name, data)
+        notes, trashed = st.write_template(mgr, name, data, folder=folder)
         if trashed:
             notes.append(f"The previous version is kept 24 hours "
                          f"(`!template restore {name}`).")
     mgr.templates[name] = data
+    mgr.lib_set_folder("templates", name,
+                       folder if folder is not None else (was or ""))
+    if was is not None and folder is not None and was != folder:
+        _lib_prune(ctx, mgr, "templates", was)
     invalidate_partial_cache()
     _template_changed(mgr, name, "replaced" if old is not None else "saved")
     return ("Replaced" if old is not None else "Saved"), notes
@@ -7678,7 +7999,7 @@ _TEMPLATE_DIFF_ROWS = 40
 
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|part|rename|copy|delete|trash|restore|resync|detach|refs> ...",
+    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
     desc=(
         "This server's library of saved templates, shared by all its matches "
         "and kept on disk (even when the CLI / GUI don't keep matches). An "
@@ -7693,7 +8014,9 @@ _TEMPLATE_DIFF_ROWS = 40
         "`show <name> [path] [compact] [expanded] [part=]`, `import <name> "
         "<json>`, `set` / `unset`, `tags`, `part remove`, `rename`, `copy`, `delete`, "
         "`trash` / `restore`, `resync <unit> [path]`, `detach <unit> [path]`, "
-        "`refs <unit>`. Only whoever saved a template, or a server "
+        "`refs <unit>`, `move`, `folders`, `folder new|delete|rename` "
+        "(folders organize the library; a name is unique across them). "
+        "Only whoever saved a template, or a server "
         "administrator, can change or delete it. Formulas: summon_template / "
         "summon_template_near / give_template / has_template / template_names "
         "/ template_of. " + _TEMPLATE_EDIT_NOTE
@@ -7707,9 +8030,14 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "list":
         usage = ("!template list [kind=<entity|partial>] [by=<user>] "
-                 "[tag=<filter>] [has=<var.path>] [prefix]")
+                 "[tag=<filter>] [has=<var.path>] [folder=<folder>] "
+                 "[prefix]")
         words, opts = _template_options(args, 1, usage,
-                                        allowed=("kind", "by", "tag", "has"))
+                                        allowed=("kind", "by", "tag", "has",
+                                                 "folder"))
+        top = _folder_opt(opts)
+        if top:
+            _lib_folder_known(ctx, mgr, "templates", top)
         has_path = opts.get("has")
         if has_path is not None:
             check_store_path(str(has_path), "var path")
@@ -7744,7 +8072,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                      str(mgr.templates[n].get("saved_by_name") or "").lower(),
                      str(mgr.templates[n].get("saved_by") or "").lower()))
                  and (tag_filter is None
-                      or tag_filter_matches(tags[n], tag_filter))]
+                      or tag_filter_matches(tags[n], tag_filter))
+                 and (not top or folder_within(
+                     mgr.lib_folder("templates", n), top))]
         if has_path is not None:
             with private_templates_hidden(viewer):
                 names = [n for n in names if _template_has_path(
@@ -7754,14 +8084,15 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("\n".join(_template_read_note(reader) + [
                 "No template matches those filters."]))
         filtered = len(names) != len(library)
-        rows = [f"- {_template_summary(n, _reader_view(mgr.templates[n], trules, reader, mgr, viewer), tags[n])}"
-                + _private_mark(mgr.templates[n])
-                for n in names]
+        rows = _lib_grouped(mgr, "templates", names, lambda n: (
+            f"- {_template_summary(n, _reader_view(mgr.templates[n], trules, reader, mgr, viewer), tags[n])}"
+            + _private_mark(mgr.templates[n])))
         # The note after the rows: it settles the reminder their
         # redaction noted.
         lines = _template_read_note(reader) + [
             f"**Templates ({len(names)}"
-            + (f" of {len(library)}" if filtered else "") + "):**"] + rows
+            + (f" of {len(library)}" if filtered else "")
+            + (f" in `{folder_label(top)}`" if top else "") + "):**"] + rows
         return await ctx.send("\n".join(lines))
 
     if sub == "diff":
@@ -7867,14 +8198,20 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             label += (f" ({_template_summary(name, {**views[0][1], **{k: tpl[k] for k in ('saved_by', 'saved_by_name') if k in tpl}})})"
                       + (_private_mark(tpl).replace(" 🔒", " 🔒 private")
                          if template_private_level(tpl) else ""))
+            where = mgr.lib_folder("templates", name)
+            if where:
+                label += f" in `{folder_label(where)}`"
         return await ctx.send("\n".join(_template_read_note(reader)
                                         + [label] + out))
 
     if sub == "save":
         if await return_help_if_not_enough_args(ctx, args, 2, "template", "save"):
             return
-        usage = "!template save <unit> [name] [path=<var.path>]"
-        words, opts = _template_options(args, 1, usage, allowed=("path",))
+        usage = ("!template save <unit> [name] [path=<var.path>] "
+                 "[folder=<folder>]")
+        words, opts = _template_options(args, 1, usage,
+                                        allowed=("path", "folder"))
+        folder = _folder_opt(opts)
         if not words:
             raise VTTError(f"Which unit? Usage: `{usage}`.")
         if len(words) > 2:
@@ -7907,6 +8244,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # A re-save keeps a private template private, at its level.
             data[TEMPLATE_PRIVATE_KEY] = old[TEMPLATE_PRIVATE_KEY]
         data, _ = check_template(data, name, mgr.templates)
+        _lib_place(ctx, mgr, "templates", name, folder)
         if m.rules.get("template_pinning", False):
             # The save diffed against this match's pins; say where the
             # library has moved on since.
@@ -7918,7 +8256,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     notes.append(f"`{r}` is pinned in this match and the "
                                  f"library's version differs; the saved "
                                  f"changes are against the pinned one.")
-        verb, more = _store_template(ctx, mgr, name, data)
+        verb, more = _store_template(ctx, mgr, name, data, folder=folder)
+        more = _in_folder_note(mgr, "templates", name) + more
         if _is_partial(data):
             src = (f"`{e.id}`'s vars" if path in ("", ".")
                    else f"`{e.id}` `{path}`")
@@ -7938,7 +8277,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         _template_may_save(ctx, mgr)
         name = check_template_name(args[1])
-        raw = " ".join(args[2:])
+        folder, raw = _import_folder(args[2:], "!template import <name> "
+                                     "[folder=<folder>] <json ...>")
         data = _parse_import_json(raw, strict=False)
         says_private = (isinstance(data, dict)
                         and TEMPLATE_PRIVATE_KEY in data)
@@ -7954,7 +8294,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # records the unit's, so a later var-name rename moves its vars
             # at spawn (S9).
             data["var_names"] = _channel_var_names(ctx, mgr)
-        verb, notes = _store_template(ctx, mgr, name, data)
+        _lib_place(ctx, mgr, "templates", name, folder)
+        verb, notes = _store_template(ctx, mgr, name, data, folder=folder)
+        notes = _in_folder_note(mgr, "templates", name) + notes
         msg = (f"💾 {verb} template `{name}` from JSON "
                f"({_template_summary(name, data)})"
                + (" 🔒 still private" if data.get(TEMPLATE_PRIVATE_KEY)
@@ -8114,16 +8456,20 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "copy":
         if await return_help_if_not_enough_args(ctx, args, 3, "template", sub):
             return
-        _check_tail(args, 3, (), "!template copy <name> <new_name>")
+        _check_tail(args, 3, ("folder",),
+                    "!template copy <name> <new_name> [folder=<folder>]")
         name, tpl = _usable_template(ctx, mgr, args[1], "copy")
         new_name = check_template_name(args[2])
         if new_name == name:
             raise VTTError(f"`{new_name}` is already this template's name.")
         _template_may_save(ctx, mgr)
+        folder = _copy_folder(ctx, mgr, "templates", name, new_name, args[3:])
         data = {k: copy.deepcopy(v) for k, v in tpl.items()
                 if k not in ("saved_by", "saved_by_name")}
         data, _ = check_template(data, new_name, mgr.templates)
-        verb, notes = _store_template(ctx, mgr, new_name, data)
+        verb, notes = _store_template(ctx, mgr, new_name, data,
+                                      folder=folder)
+        notes = _in_folder_note(mgr, "templates", new_name) + notes
         return await ctx.send("\n".join(
             [f"📄 {verb} template `{new_name}` as a copy of `{name}`."]
             + notes))
@@ -8181,7 +8527,11 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                              f"(`!template restore {new_name}`).")
         if st is not None:
             st.rename_template_file(mgr, name, new_name)
+        before = _lib_renamed(mgr, "templates", name, new_name)
         mgr.templates[new_name] = mgr.templates.pop(name)
+        if old is not None and before != mgr.lib_folder("templates",
+                                                        new_name):
+            _lib_prune(ctx, mgr, "templates", before)
         invalidate_partial_cache()
         _template_changed(mgr, name, f"renamed to `{new_name}`",
                           new_name=new_name)
@@ -8281,6 +8631,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         st = storage_of(mgr)
         kept = st is not None and st.trash_template(mgr, name)
         del mgr.templates[name]
+        _lib_removed(ctx, mgr, "templates", name)
         invalidate_partial_cache()
         _template_changed(mgr, name, "deleted")
         notes = []
@@ -8420,9 +8771,13 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         data, _ = check_template(raw, name, mgr.templates)
         if name not in mgr.templates:
             _require_saver(ctx, name, data, "restore")
+        # A version comes back where the template is now, else into the
+        # folder it was in.
         verb, notes = _store_template(
             ctx, mgr, name, data,
-            saver=(data.get("saved_by"), data.get("saved_by_name")))
+            saver=(data.get("saved_by"), data.get("saved_by_name")),
+            folder=(None if name in mgr.templates
+                    else st.trash_folder(mgr.guild_key, path)))
         st.drop_trashed_template(mgr.guild_key, path)
         return await ctx.send("\n".join(
             [f"♻️ Restored template `{name}` (version #{n}): "
@@ -8547,6 +8902,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                          + (": " + "; ".join(bits) if bits else " (unchanged)"))
         return await ctx.send("\n".join(lines))
 
+    if sub in ("move", "folders", "folder"):
+        return await _library_folder_sub(ctx, args, mgr, "templates")
+
     return await _help_fallback(ctx, ["template"], args[0])
 
 
@@ -8564,13 +8922,16 @@ def _outermost_marked(m: Match, e: Entity) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 for _subs, _usage, _desc in (
-        (("save",), "!template save <unit> [name] [path=<var.path>]",
+        (("save",), "!template save <unit> [name] [path=<var.path>] [folder=<folder>]",
          "Save a unit (and its body parts) as an entity template; the name "
          "defaults to the unit's id. With path=, save that container "
          "(`inventory.axe`, or `.` for all its vars) as a PARTIAL template, "
          "named after its last key by default. Needs a host of this channel's "
          "match. Saving over an existing template replaces it (its saver or "
-         "an administrator)."),
+         "an administrator), where it is. folder= saves it into a folder "
+         "(`monsters/undead`; made if new); a name is unique across "
+         "folders, so naming another folder than the one it is in is "
+         "refused (`!template move`)."),
         (("spawn",), "!template spawn <name> <x> <y> [near=<radius>] [count=<n>] [map=<map>]",
          "Spawn an entity template at a cell (near=: the nearest free cell "
          "within the radius). Its id is the template name, numbered when "
@@ -8580,7 +8941,7 @@ for _subs, _usage, _desc in (
         (("give",), "!template give <partial> <unit> <path>",
          "Build a partial template into a unit's var path (replacing what is "
          "there); the unit's own changes to it are recorded from then on."),
-        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [has=<var.path>] [prefix]",
+        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [has=<var.path>] [folder=<folder>] [prefix]",
          "This server's saved templates; kind= keeps entity or partial "
          "templates, by= those a user saved, has= those whose vars (a "
          "partial's data), expanded, hold that dotted path "
@@ -8617,7 +8978,7 @@ for _subs, _usage, _desc in (
          "To a non-host (and a host in a channel with a team view) the "
          "private vars of private_vars / team_private_vars and the "
          "template's own lists are left out, as from a unit (#70)."),
-        (("import",), "!template import <name> <json ...>",
+        (("import",), "!template import <name> [folder=<folder>] <json ...>",
          "Save pasted JSON as a template, or replace one with JSON edited "
          "anywhere (the rest of the line is the JSON; a ```json fence is "
          "fine). A partial is {\"kind\": \"partial\", \"data\": {...}}. It is "
@@ -8636,7 +8997,7 @@ for _subs, _usage, _desc in (
          "templates reference needs `force` (an administrator or a "
          "`templates` holder), which updates "
          "those references."),
-        (("copy",), "!template copy <name> <new_name>",
+        (("copy",), "!template copy <name> <new_name> [folder=<folder>]",
          "Save a copy under another name; you are the copy's saver."),
         (("delete",), "!template delete <name> [force]",
          "Delete a template (its saver or a server administrator); it is "
@@ -8658,7 +9019,20 @@ for _subs, _usage, _desc in (
          "from a partial: it stays as plain data."),
         (("refs",), "!template refs <unit>",
          "Which of a unit's containers are built from partial templates, and "
-         "what the unit changed in each.")):
+         "what the unit changed in each."),
+        (("move",), "!template move <name> <folder>",
+         "Move a template into another folder (`/` = the top level); its "
+         "saver or an administrator. A folder only organizes the library: "
+         "the name, and everything that names it, stays the same."),
+        (("folders",), "!template folders [<folder>]",
+         "The library's folders (or one and its subfolders) with how many "
+         "templates each holds. `!template list folder=<folder>` lists "
+         "them."),
+        (("folder",), "!template folder <new|delete|rename> <folder> [<new_folder>]",
+         "Make a folder, delete an empty one, or rename one (its templates "
+         "and subfolders go along; you need to be able to move each). A "
+         "folder is up to 4 levels of lower-case words joined by `/`. "
+         "Empty folders stay unless delete_empty_library_folders is on.")):
     registry.annotate_sub("template", *_subs, usage=_usage, desc=_desc)
 
 
@@ -8694,10 +9068,12 @@ def _require_prefab_saver(ctx: ReplyContext, name: str, pf: Dict[str, Any],
 def _store_prefab(ctx: ReplyContext, mgr: MatchManager, name: str,
                   data: Dict[str, Any],
                   saver: Optional[Tuple[Any, Any]] = None,
-                  check_saver: bool = True) -> Tuple[str, List[str]]:
+                  check_saver: bool = True,
+                  folder: Optional[str] = None) -> Tuple[str, List[str]]:
     """Write `data` as prefab `name` (memory + disk); 'Saved' or 'Replaced'
     and notes. Replacing needs the old one's saver or an administrator; the
-    old version is kept 24 hours."""
+    old version is kept 24 hours. `folder`: where it goes (default: where
+    it is, else the top level)."""
     old = mgr.prefabs.get(name)
     if old is not None and check_saver:
         _require_prefab_saver(ctx, name, old, "replace")
@@ -8711,12 +9087,18 @@ def _store_prefab(ctx: ReplyContext, mgr: MatchManager, name: str,
             data[k] = str(v)
     notes: List[str] = []
     st = storage_of(mgr)
+    was = mgr.lib_folder("prefabs", name) if old is not None else None
     if st is not None:
-        notes, trashed = st.write_template(mgr, name, data, lib="prefabs")
+        notes, trashed = st.write_template(mgr, name, data, lib="prefabs",
+                                           folder=folder)
         if trashed:
             notes.append(f"The previous version is kept 24 hours "
                          f"(`!prefab restore {name}`).")
     mgr.prefabs[name] = data
+    mgr.lib_set_folder("prefabs", name,
+                       folder if folder is not None else (was or ""))
+    if was is not None and folder is not None and was != folder:
+        _lib_prune(ctx, mgr, "prefabs", was)
     _prefab_changed(mgr, name, "replaced" if old is not None else "saved")
     return ("Replaced" if old is not None else "Saved"), notes
 
@@ -8762,25 +9144,28 @@ def _prefab_scratch(mgr: MatchManager, ctx: ReplyContext, name: str,
 
 _PREFAB_USAGE = {
     "save": ("!prefab save <name> <x1> <y1> <x2> <y2> [map=<map>] "
-             "[only=<kinds>] [definitions=all]"),
+             "[only=<kinds>] [definitions=all] [folder=<folder>]"),
     "stamp": ("!prefab stamp <name> <x> <y> [map=<map>] [mode=<mode>] "
               "[rotate=<deg>] [flip=<h|v>] [team=<team>] [confirm]"),
     "show": "!prefab show <name> [text|image]",
-    "list": "!prefab list [tag=<filter>] [prefix]",
+    "list": "!prefab list [tag=<filter>] [folder=<folder>] [prefix]",
     "tags": "!prefab tags <name> [<tag ...> | -]",
-    "import": "!prefab import <name> <json ...>",
+    "import": "!prefab import <name> [folder=<folder>] <json ...>",
     "rename": "!prefab rename <name> <new_name>",
-    "copy": "!prefab copy <name> <new_name>",
+    "copy": "!prefab copy <name> <new_name> [folder=<folder>]",
     "delete": "!prefab delete <name>",
     "trash": "!prefab trash [name]",
     "restore": "!prefab restore <name> [n]",
+    "move": "!prefab move <name> <folder>",
+    "folders": "!prefab folders [<folder>]",
+    "folder": "!prefab folder <new|delete|rename> <folder> [<new_folder>]",
 }
 
 
 @registry.command(
     "prefab",
     usage=("!prefab <save|stamp|show|list|tags|import|rename|copy|delete|"
-           "trash|restore> ..."),
+           "trash|restore|move|folders|folder> ..."),
     desc=(
         "Prefabs: a saved rectangle of one map (its units with their parts "
         "and riders, tile data, zones and corpses), stamped into any match "
@@ -8814,27 +9199,37 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             skips.append(f"`!prefab {sub} {' '.join(args[1:2])}`")
         return await ctx.send(f"(replay: `!prefab {sub}` skipped; the "
                               f"prefab library is left alone)")
+    if sub in ("move", "folders", "folder"):
+        return await _library_folder_sub(ctx, args, mgr, "prefabs")
 
     if sub == "list":
-        words, opts = _template_options(args, 1, usage, allowed=("tag",))
+        words, opts = _template_options(args, 1, usage,
+                                        allowed=("tag", "folder"))
         if len(words) > 1:
             raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
                            f"`{usage}`.")
+        top = _folder_opt(opts)
+        if top:
+            _lib_folder_known(ctx, mgr, "prefabs", top)
         prefix = words[0].lower() if words else ""
         tag_filter = (check_tag_filter(opts["tag"]) if "tag" in opts
                       else None)
         names = [n for n in sorted(mgr.prefabs) if n.startswith(prefix)
                  and (tag_filter is None or tag_filter_matches(
-                     list(mgr.prefabs[n].get("tags") or []), tag_filter))]
+                     list(mgr.prefabs[n].get("tags") or []), tag_filter))
+                 and (not top or folder_within(
+                     mgr.lib_folder("prefabs", n), top))]
         if not names:
-            if mgr.prefabs and (prefix or tag_filter is not None):
+            if mgr.prefabs and (prefix or tag_filter is not None or top):
                 return await ctx.send("No prefab matches those filters.")
             return await ctx.send(
                 "No prefabs on this server. `!prefab save <name> <x1> <y1> "
                 "<x2> <y2>` saves one.")
         return await ctx.send("\n".join(
-            [f"**Prefabs ({len(names)}):**"]
-            + [f"- {_prefab_summary(n, mgr.prefabs[n])}" for n in names]))
+            [f"**Prefabs ({len(names)}"
+             + (f" in `{folder_label(top)}`" if top else "") + "):**"]
+            + _lib_grouped(mgr, "prefabs", names, lambda n: (
+                f"- {_prefab_summary(n, mgr.prefabs[n])}"))))
 
     if sub == "tags":
         if await return_help_if_not_enough_args(ctx, args, 2, "prefab", "tags"):
@@ -8942,8 +9337,9 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "save":
         opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
                 for a in args[6:] if "=" in a}
-        _check_tail(args, 6, ("map", "only", "definitions"), usage)
+        _check_tail(args, 6, ("map", "only", "definitions", "folder"), usage)
         _template_may_save(ctx, mgr, "prefabs")
+        folder = _folder_opt(opts)
         m = active_match(mgr, ctx)
         smp = _one_map(ctx, m, opts.get("map"))
         name = check_prefab_name(args[1])
@@ -8972,10 +9368,11 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if isinstance(old, dict) and old.get("tags"):
             data["tags"] = list(old["tags"])     # a re-save keeps its tags
         data = check_prefab(data, name)
-        verb, more = _store_prefab(ctx, mgr, name, data)
+        _lib_place(ctx, mgr, "prefabs", name, folder)
+        verb, more = _store_prefab(ctx, mgr, name, data, folder=folder)
         return await ctx.send("\n".join(
             [f"💾 {verb} prefab {_prefab_summary(name, data)}."]
-            + notes + more))
+            + _in_folder_note(mgr, "prefabs", name) + notes + more))
 
     if sub == "stamp":
         opts = {}
@@ -9018,18 +9415,20 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "import":
         name = check_prefab_name(args[1])
-        raw = args[2]
+        folder, raw = _import_folder(args[2:], usage)
         if ctx_user(ctx) is None:
             raise VTTError("Prefabs can only be imported with an identity to "
                            "record as the saver.")
         parsed = _parse_import_json(raw)
         data = check_prefab(parsed, name)
-        verb, notes = _store_prefab(ctx, mgr, name, data)
+        _lib_place(ctx, mgr, "prefabs", name, folder)
+        verb, notes = _store_prefab(ctx, mgr, name, data, folder=folder)
         return await ctx.send("\n".join(
-            [f"📥 {verb} prefab {_prefab_summary(name, data)}."] + notes))
+            [f"📥 {verb} prefab {_prefab_summary(name, data)}."]
+            + _in_folder_note(mgr, "prefabs", name) + notes))
 
     if sub in ("rename", "copy"):
-        _check_tail(args, 3, (), usage)
+        _check_tail(args, 3, ("folder",) if sub == "copy" else (), usage)
         name, pf = _get_prefab(mgr, args[1])
         new = check_prefab_name(args[2])
         if new in mgr.prefabs:
@@ -9039,13 +9438,16 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if ctx_user(ctx) is None:
                 raise VTTError("Prefabs can only be copied with an identity "
                                "to record as the saver.")
-            _verb, notes = _store_prefab(ctx, mgr, new, copy.deepcopy(pf))
+            folder = _copy_folder(ctx, mgr, "prefabs", name, new, args[3:])
+            _verb, notes = _store_prefab(ctx, mgr, new, copy.deepcopy(pf),
+                                         folder=folder)
             return await ctx.send("\n".join(
                 [f"📄 Copied prefab `{name}` to `{new}`; you are its saver."]
-                + notes))
+                + _in_folder_note(mgr, "prefabs", new) + notes))
         _require_prefab_saver(ctx, name, pf, "rename")
         if st is not None:
             st.rename_template_file(mgr, name, new, lib="prefabs")
+        _lib_renamed(mgr, "prefabs", name, new)
         mgr.prefabs[new] = mgr.prefabs.pop(name)
         _prefab_changed(mgr, name, f"renamed to `{new}`")
         return await ctx.send(f"Renamed prefab `{name}` to `{new}`.")
@@ -9058,6 +9460,7 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if st is not None:
             st.delete_template(mgr, name, lib="prefabs")
         del mgr.prefabs[name]
+        _lib_removed(ctx, mgr, "prefabs", name)
         _prefab_changed(mgr, name, "deleted")
         return await ctx.send(
             f"🗑️ Deleted prefab `{name}`"
@@ -9096,7 +9499,9 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         _require_prefab_saver(ctx, name, data, "restore")
     _verb, notes = _store_prefab(
         ctx, mgr, name, data,
-        saver=(data.get("saved_by"), data.get("saved_by_name")))
+        saver=(data.get("saved_by"), data.get("saved_by_name")),
+        folder=(None if name in mgr.prefabs
+                else st.trash_folder(mgr.guild_key, path, "prefabs")))
     st.drop_trashed_template(mgr.guild_key, path)
     return await ctx.send("\n".join(
         [f"♻️ Restored prefab {_prefab_summary(name, data)} (version "
@@ -9149,6 +9554,13 @@ for _sub, _usage in _PREFAB_USAGE.items():
                   "limit)."),
         "restore": ("Bring back an old version (#1 = the newest); the "
                     "current one, if any, goes to the trash."),
+        "move": ("Move a prefab into another folder (`/` = the top level); "
+                 "its saver or an administrator."),
+        "folders": ("The prefab folders (or one and its subfolders) with "
+                    "how many prefabs each holds."),
+        "folder": ("Make a folder, delete an empty one, or rename one (its "
+                   "prefabs and subfolders go along). Empty folders stay "
+                   "unless delete_empty_library_folders is on."),
     }[_sub])
 
 
@@ -9464,12 +9876,14 @@ def _replay_template(mgr: MatchManager, e: Dict[str, Any]) -> None:
         if name in mgr.templates:
             if st is not None:
                 st.rename_template_file(mgr, name, new_name)
+            _lib_renamed(mgr, "templates", name, new_name)
             mgr.templates[new_name] = mgr.templates.pop(name)
     elif data is None:
         if name in mgr.templates:
             if st is not None:
                 st.delete_template(mgr, name)
             del mgr.templates[name]
+            mgr.lib_forget("templates", name)
     else:
         if st is not None:
             st.write_template(mgr, name, copy.deepcopy(data))
