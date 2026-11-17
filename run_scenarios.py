@@ -65,7 +65,14 @@ SCENARIO_RE = re.compile(
 # Output substrings that ALWAYS mark a flagged failure. 💥 is the dispatcher's
 # unexpected-exception prefix; "Syntax error" is a formula parse failure
 # (see module docstring for why that's always a malformed scenario).
-_FAILURE_MARKERS = ("💥", "Syntax error")
+_FAILURE_MARKERS = ("Syntax error",)
+# A crash: the dispatcher's "💥 Unexpected error", a hook's "💥 ... CRASHED",
+# the harness's own "💥 Uncaught" / "💥 shlex parse error" / "💥 ?file"
+# lines. Game text may hold 💥 ("💥 Critical hit!"), so the emoji alone
+# isn't one (Y9).
+_CRASH_RE = re.compile(
+    r"💥 (?:Unexpected error|Uncaught|shlex parse error|\?file|Usage: \?file)"
+    r"|💥[^\n]*CRASHED")
 
 # Substrings that mark a top-level command error (a caught VTTError/FormulaError
 # surfaced as a ❌ reply). In a WELL-FORMED scenario these are bugs — a core
@@ -182,8 +189,8 @@ _TAB_PREFIX = "?tab "
 _FILE_PREFIX = "?file "
 _FILE_USAGE = ("💥 Usage: ?file corrupt|delete <path> | set <path> <a.b.c> "
                "<json> | replace <path> \"<old>\" \"<new>\" | list [<dir>] | "
-               "show <path> | copy|move <path> <path> (paths in the server "
-               "folder)")
+               "show <path> | copy|move <path> <path> | write <path> <text> "
+               "(paths in the server folder)")
 
 
 def _file_action(line: str, workspaces, ctx) -> List[str]:
@@ -193,6 +200,17 @@ def _file_action(line: str, workspaces, ctx) -> List[str]:
         return [_FILE_USAGE]
     if words[0] in ("set", "replace"):
         return _file_edit(line, words, st, ctx)
+    if words[0] == "write" and len(words) >= 3:
+        # A file an operator (or a GM's editor) wrote: the rest of the line,
+        # `\n` a line break, as typed (a `!run` file, a hand-made system
+        # file).
+        rel, text = line[len(_FILE_PREFIX):].split(maxsplit=2)[1:]
+        path = os.path.join(st.server_dir(ctx.guild_key), rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(_interpret_escapes(text) + "\n")
+        st.rescan()
+        return [f"(wrote {rel})"]
     if words[0] in ("copy", "move") and len(words) == 3:
         import shutil
         base = st.server_dir(ctx.guild_key)
@@ -263,8 +281,12 @@ def _file_edit(line: str, words: List[str], st, ctx) -> List[str]:
         keys = words[2].split(".")
         node = data
         for k in keys[:-1]:
-            node = node.setdefault(k, {})
-        node[keys[-1]] = json.loads(words[3])
+            node = (node[int(k)] if isinstance(node, list)
+                    else node.setdefault(k, {}))
+        if isinstance(node, list):
+            node[int(keys[-1])] = json.loads(words[3])
+        else:
+            node[keys[-1]] = json.loads(words[3])
         text = json.dumps(data, indent=1, sort_keys=True)
         out = [f"(set {words[2]} in {words[1]})"]
     with open(path, "w", encoding="utf-8") as f:
@@ -384,7 +406,7 @@ def _flagged(transcript: List[Tuple[str, List[str]]],
         for o in outs:
             if crash_hook and o.startswith("💥 Unexpected error (ref "):
                 continue
-            if any(marker in o for marker in markers):
+            if any(marker in o for marker in markers) or _CRASH_RE.search(o):
                 hits.append((cmd, o))
     return hits
 

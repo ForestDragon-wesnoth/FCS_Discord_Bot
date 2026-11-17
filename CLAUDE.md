@@ -160,8 +160,11 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   mismatch or a duplicate number). Only lines ABOVE a scenario's first
   `Expected:` run: a staged scenario labels intermediate prose `Result:`
   (see 13, 26). Multi-line bodies use literal `\n` (`_interpret_escapes`).
-- **What it flags.** `💥` (except the `💥 Unexpected error (ref N)` reply of
-  `!as crash`, the error log's test hook) and "Syntax error" always; `❌ Runtime error:`,
+- **What it flags.** A crash line (`💥 Unexpected error`, a hook's `💥 ...
+  CRASHED`, the harness's own `💥 Uncaught` / `💥 shlex parse error` /
+  `💥 ?file`; game text may hold 💥; the `💥 Unexpected error (ref N)` reply
+  of `!as crash`, the error log's test hook, excepted) and "Syntax error"
+  always; `❌ Runtime error:`,
   `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command"),
   missing arguments ("is missing arguments"), a usage refusal (`❌ Usage:`)
   and stray words ("❌ Unexpected ... — usage:") unless the prose carries
@@ -183,7 +186,9 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   older build left it (868, 874); `?file list [dir]` / `?file show <path>`
   read the folder (1200); `?file copy|move <path> <path>` copy a file
   (a new modification time) or move a file or folder as an operator
-  would (1203-1204).
+  would (1203-1204); `?file write <path> <text>` writes a file (`\n` a
+  line break: a `!run` file, a hand-made system file, 1221, 1224), and
+  `?file set` reads a number as a list index.
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
@@ -841,7 +846,9 @@ unit's position / display name, and nothing can be written at or under them.
 **Loops.** `for v in <call>` iterates only a `_LOOPABLE_FUNCS` function
 (`entities_within`, `parts`, `range`, `each`, `keys`, `team_members`, ...);
 `range(...)` gives counted loops and `each(value)` iterates a list or a dict's
-keys. `break` / `continue` work inside a loop body. Iterations are bounded by
+keys. `break` / `continue` work inside a loop body. A loop over
+anything else is refused leading with the usual fix (`for x in
+each(...)`) and pointing at `!help functions loopable` (Y10). Iterations are bounded by
 `formula_loop_limit`, which the higher-order helpers charge per item
 (`map_with(items, f)`, `filter_with`, `sort_by(items, f, desc=False)`; `f` is
 a `!func` name or a lambda; banned in `$()`, since a `!func` may write).
@@ -1062,7 +1069,8 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   rules, system libraries, templates, prefabs, aliases); every root x
   read subcommand x an argument pool run as a player under
   `formula_text_visibility host`; any marker in a reply is a leak (alias
-  expansions excepted, by design).
+  expansions excepted, by design). Include paths one key below a formula
+  (a modifier record's `value`, a hook name) and `!find` selectors.
 - **Existence-oracle detector** (41): the same board; each command run twice
   as the player, once naming a hidden unit (as an arg, `near:<id>:60`,
   `for=<id>`, `to=<id>`, `<id>.hp`) and once naming a nonexistent id; any
@@ -1301,6 +1309,9 @@ hardcodes**.
   without an initiative is named in the reply as outside the turn order,
   and `!turn next` on an empty order names the units outside it and the
   ways in (`_no_turn_order_text`; #434, #538, 1192).
+  A `group:<name>` form runs per member, a member's refusal a ⚠️ line;
+  when every member refuses it ends with a ❌ line, so a strict batch
+  stops (L55).
   `!ent hp` SETS by default (`5`, `=-3`, `max`, `$(...)`);
   a leading sign changes (`+5` heals, `-5` damages); one `write_var`, hook
   output and deaths reported (633-634, 647). `!ent set_vars <id> k=v ...` is
@@ -1630,7 +1641,10 @@ hardcodes**.
   frozen order (pointer forward, then units `!turn set` jumped over),
   then each later round (`_sorted_turn_ids(round)` where the wrap would
   re-sort: a pending change, or `random_stable`, re-sorted per round).
-  Default length: to the end of the next round (round 1 before the first
+  Queued extra turns follow the turn under way, or before the first turn
+  the first unit no skips_turn status passes over; a unit the round rests
+  on (every unit skippable) is listed again in its round, as the next
+  `!turn next` skips it again (L54). Default length: to the end of the next round (round 1 before the first
   turn); at most the owner limit `turn_forecast_limit` (100). The rest of
   the round is read in one pass over the order and stops at n (X24: a
   scan from the top per turn cost the order's length squared). Under ATB
@@ -1730,7 +1744,11 @@ hardcodes**.
   parent's turn; a part with its own initiative has its own turn instead.
 - **Status ticks** (`fire_status_tick`): per status, the definition's `tick`
   at its `tick_when`, else the global `status_tick_formula` at
-  `status_tick_when` (default never); stops for a unit removed mid-tick.
+  `status_tick_when` (default never): a status without a definition, and
+  a defined one without a tick of its own while it has a duration (user
+  call, Y2: one defined for its data never counted down; a permanent one
+  stays untouched; `_own_tick`, `_timed_status`, 1215); stops for a unit
+  removed mid-tick.
   Order (`Match.status_tick_order`): highest `tick_priority` first
   (`status_field`, so an instance key or a level entry sets it; `!status
   tick_priority <name> <n|->`), ties in the order the unit gained them
@@ -2016,7 +2034,8 @@ hardcodes**.
   `action_used_message_format` line (`Match.action_used_line`: {actor},
   {action}, {target} as the checks left it, a cell as (x,y), lists joined;
   {actor_name} / {target_name} as say() markers, so a view reads names
-  as it sees each unit; the actor's own placeholders; empty = no line;
+  as it sees each unit (the default uses these, V25); the actor's own
+  placeholders; empty = no line;
   1148; an exchange stores a cell as [x, y, map, named] and reads it back
   with `target_from_json` for the line, 1153).
 - **`run_action`** is transactional: pre-state captured, body run,
@@ -2073,6 +2092,16 @@ hardcodes**.
   for are named in a ⚠️, user call). Per attempt the RNG, output
   buffer and summon budget are reset, so side effects before a choice apply
   once. `cancel` aborts; `action_choice_limit` (394-395).
+- **Dice line** (#520, 1231): `roll()` / `roll_dice()` take `label=`
+  and note (label, spec, total) in `formula.DICE_LOG`, which `run_action`
+  sets to a fresh list per attempt (a choose() replay or a failed attempt
+  drops its rolls; a nested action collects its own) and a damage
+  forecast sets to None. After success (and after a prepare-only run)
+  `Match.action_dice_line` builds the line per `action_dice_line` (off /
+  on / labelled), `action_dice_line_format` and `action_dice_roll_format`,
+  surfaced tagged as about the actor (`unit_tag`), so a view that can't
+  see it drops it; each reaction half is its own run_action, so its line
+  is about the reacting unit (user call).
 - **Rider actions:** a rider gets its slot's actions plus the vehicle's
   actions whose `allowed_slots` list its slot; `mount_action_actor` decides
   who is `source`; `vehicle` / `rider` / `slot` are always bound.
@@ -2100,7 +2129,10 @@ hardcodes**.
   816, 1167). A dispatched line may keep its `!` (`dispatch_no_snapshot`
   strips it): the line splitter drops it only for a typed batch / sweep
   with a `;`, so a one-line `!batch !ent ...` and a batch or sweep under
-  `!dry` / `!simulate` answered "Unknown command `!ent`" (1167). **`!run <file>`** reads a saves-folder file (admin). Both nest
+  `!dry` / `!simulate` answered "Unknown command `!ent`" (1167). **`!run <file>`** reads a saves-folder file (admin); a quote left open
+  continues on the next lines not starting with `!`, joined with `\n` as
+  the GUI and Discord join a body typed over lines (`quote_unclosed`; the
+  CLI's `...` prompt continues one the same way; Y10, 1221). Both nest
   within `macro_recursion_limit`.
 - **Lines of `!batch` / `!foreach` are gated** (`_GATE_LINES`, checked in
   `dispatch_no_snapshot`): each typed line passes the per-match gate as its
@@ -2211,7 +2243,10 @@ hardcodes**.
   resolve BEFORE the access gate; an alias can't take a command's name
   (refused at def / promote, ignored if saved). Command roots and aliases
   are case-insensitive (`!Ent`, on Discord too). `!func` defines formula functions
-  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula,
+  (`formula_function_recursion_limit`; the value is the trailing
+  expression, and a body ending on an if / elif / else returns the
+  trailing value of the branch that ran: `_branch_results` stores it in
+  `_FN_RESULT` after the checks, Y5, 1217). `!eval [--as eid]` runs a formula,
   all or nothing like an action (user call): refused part-way, its writes
   are taken back, other matches too (`_eval_all_or_nothing`, 247, 960;
   a program `formula.program_is_read_only` passes, the `$()` test over
@@ -2500,7 +2535,9 @@ hardcodes**.
   square_radius (Chebyshev, default) / manhattan / euclidean — an unknown
   metric is refused. `entities_within`, `nearest_entity` (relation SECOND),
   `entities_in_area/cone/rect/zone`, `cells_in_*`, `chain_targets` (relation
-  judged against the ORIGIN), `entity_distance`, `nearest_cell`,
+  judged against the ORIGIN; every candidate a link examines is a step of
+  formula_loop_limit, and with a max_jump each link reads only the units
+  the cell index finds near the last, X26), `entity_distance`, `nearest_cell`,
   `free_cell_near`, `random_cell`, `random_free_cell(..., fit=body|center|any|
   anchor)`, `entities_at`, `cell_entity`, `grid_width/height`, `in_bounds`;
   `entities_in_cells(cells, relation=None, tag=None, of=None)` (the units
@@ -3124,7 +3161,11 @@ hardcodes**.
   `diff`, a history diff, `rule_get` in `$()`), the raw reads (`!ent
   dump`, `!find ... show:`, `!team get`, `!defvar list`, `!map cell`,
   `!mount info`, match / map var lists; `_hide_formula_at` for one value,
-  a modifier record's `value` included), the history list (a formula
+  a modifier record's `value` included; a path is judged inside its
+  parents, so `modifiers.m1.value` and `gear.hooks.on_x` read hidden like
+  their parent, V26), `!find` selectors, `sort:` and aggregates (a
+  formula text hidden from the caller reads as missing; `show:` prints it
+  `(hidden)`), the history list (a formula
   command's label cut after its subcommand, `logic.formula_label`) and
   an action's or modifier's formula error. A `$()` argument still reads
   any stored value; `inline_args_access host` closes it. Alias
@@ -3139,7 +3180,9 @@ hardcodes**.
 
 - **ASCII** (`render_ascii` → `_render_ascii_impl`): layers zones and
   tiles by draw layer (§7.12; by default zones under tiles) < units < fog; glyphs (`glyphs.<facing>` > `glyph` > facing arrow; one
-  character), colours (`color` var — a palette name or a formula with
+  character one column wide, `logic.glyph_problem`: an emoji or a CJK
+  character is two columns and is refused where a glyph is stored, Y8),
+  colours (`color` var — a palette name or a formula with
   self = the unit, falling through when it fails or isn't a palette name,
   shared by both renderers via `entity_color` (772) — > `team_colors` /
   a palette-named team;
@@ -3317,6 +3360,43 @@ hardcodes**.
   disallowed construct is refused, a call to an unknown function is
   stored with a ⚠️ (a match may define it later; a promote counts only the
   system's library) (757-759, 896-899).
+- **System defaults by name** (Y10, 1220): `!system defpassive|defvar
+  [map|match]|clamp <action> <system> ...` run the handlers of
+  `!defpassive` / `!defvar` / `!gclamp` (`_defpassive_on`, `_defvar_on`,
+  `_gclamp_on`, routed by `_system_defaults`) on a named system, so a
+  setup needs no match; a default passive may call the system's own
+  `!func`s. Without a match the match forms refuse naming them
+  (`_defaults_match`).
+- **System files** (Y10, user design, 1223-1224): `!system export
+  <system> <file> [chain=require|include|flatten] [templates=...]
+  [prefabs=...] [full] [overwrite]` (`files` capability) writes
+  `{"format": "fcs-system", "version": 1, "system", "chain", "requires",
+  "systems": [root first], "templates": [{name, folder, data}],
+  "prefabs": [...]}`, each system's settings as values only. chain:
+  require (default; the file names the parent the import needs),
+  include (the ancestors too), flatten (`_flat_system_dict`, what
+  `!system parent <s> none` would leave). templates= / prefabs= none
+  (default) / all / used (`_library_pick`: quoted names and `!template
+  spawn|give` / `!prefab stamp` / `from=` words in the systems' strings,
+  prefabs saved under them, then every partial they and the prefabs'
+  units reference, `_with_partials`) / a name list; `full` = include +
+  used + used; templates the caller can't read stay out. `!system import
+  <file> [as=<name>] [mode=replace|merge]` (`systems` capability, plus
+  `files`, and `templates` / `prefabs` when it carries them) checks
+  every rule value as `!system set` would (`_checked_rule_value`; an
+  unknown rule dropped with a note), each parent present without a loop
+  or a chain past the owner limit, and every template / prefab
+  (`check_template` against the server's library plus the file's,
+  `check_prefab`, the saver checks) before changing anything; then the
+  systems go in through `_switch_systems` (all or nothing, every match
+  re-applies its rules: units take the var names they give; size rule
+  problems put it back), one `!system undo` step; then the templates
+  (partials first) and prefabs through `_store_template` /
+  `_store_prefab` (a name already here replaced in place, its old
+  version in the trash), noted in the audit. merge (`_merged_system`):
+  the file's rules and library entries win, the server's others stay, a
+  hide the file's own entry undoes goes; replace: the file's system.
+  `as=` renames the file's system only.
 - **System tooling:** `!system rename` (`MatchManager.rename_system`: the
   matches on it, children's parent links, server / channel defaults follow;
   `system_name` survives `_rollback_match` and `_restore_snapshot` keeps
@@ -3461,19 +3541,54 @@ hardcodes**.
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
   a `modifiers` bundle applies to every member.
-- **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
-  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `!roll
-  none, none, crit` (a comma list picks one item, `item:weight` weighted,
-  through `roll_table_pick`) and a leading `<n>x` repeating any roll, at
-  most `roll_repeat_limit` (owner ceiling) (888); `roll_table`
-  (finite weights, keyed entries), `band` (ranges may be negative; an
-  unreadable or backwards band is refused), named tables (`!table`,
-  `table_roll(name, n=None)`: a list of n picks with n; `!table roll
-  <name> [n]`; `!roll [<n>x] <table>` rolls a table when the word isn't
-  dice, `_table_roll_reply`; #610, 1190); `pick` / `shuffle`;
-  `roll_dice(spec, all=False)` (the kept dice as a list, every die rolled
-  with `all=True`, flat modifiers left out; `roll_detail(dice_out=)`) and
-  `chance(percent)` (1172). All use
+- **Dice and tables:** one parser (`formula._parse_dice`: `_dice_terms`
+  splits on + / - except after a comparison, `_DiceGroup` per group) behind
+  rolling (`roll_detail`) and odds (`dice_distribution`). A group is `NdM`
+  (`dF` Fate dice -1 / 0 / +1, `d%` a d100) with suffixes in any order:
+  explode `!`, keep `kh<n>` / `kl<n>` (n ≥ 1), reroll `r<n>` / `r<op><n>`
+  until it misses (several join; drawn straight from the faces left, so a
+  d1000000 costs one draw) or `ro...` once (not both kinds), a success
+  test `<op><n>` (the group is worth the dice meeting it, a flat modifier
+  adds to the count; under it each roll of an exploding chain is a die)
+  and after it `f<n>` failures taking one off each (#104, 1225). Refused:
+  keep with a success test, exploding Fate dice, a reroll of every face, a
+  repeated suffix. Only an exploding die's first face is rerolled. `!roll`,
+  `!roll odds` (exact distributions; the target is a word of its own, `2d6
+  >= 8` or `2d6 >=8`, a comparison joined to the dice counts successes,
+  1226); `!roll none, none, crit` (a comma list picks one item,
+  `item:weight` weighted, through `roll_table_pick`) and a leading `<n>x`
+  repeating any roll, at most `roll_repeat_limit` (owner ceiling) (888);
+  `roll_odds(spec, op, n, percent=False)` (a fraction) and
+  `roll_mean(spec)` (#361, pure, no RNG); `roll_table` (finite weights,
+  keyed entries), `band` (ranges may be negative; an unreadable or
+  backwards band is refused; success tiers compose from it, #105 struck,
+  1227), `pick` / `shuffle`; `roll_dice(spec, all=False, label=None)`
+  (the kept dice as a list, every die rolled with `all=True`, flat
+  modifiers left out; `roll_detail(dice_out=)`) and `chance(percent)`
+  (1172).
+- **Named tables** (`Match.tables`, name -> text; `!table def | roll |
+  odds | rank | list | show | remove | rename`, `!system table`): the text
+  is the spec, optionally ending ` rank=a,b` (the entries best first,
+  `split_table_rank` / `table_text`; entries left out follow in the order
+  written, the fallback when there is no rank, user call; `!table rank`
+  writes it). An entry `@<table>` rolls that table when picked and
+  `{<dice>}` in an entry's text is replaced by a roll (#459,
+  `roll_named_table`); a table naming itself and dice that don't parse are
+  refused at def (`check_table_text`, a missing sub-table a note), a
+  longer loop stops at `table_nesting_limit` (8, ceiling) with a ⚠️ and
+  keeps the picked entry. A roll's `remove=entry:n,...` / `add=` change
+  weights for that roll (unknown entries refused), `best=<n>` /
+  `worst=<n>` roll the top table n times and keep one by the rank (#253,
+  `table_adjustments`, `adjusted_entries`, which sum repeated keys; a
+  plain roll keeps the pairs as written, so seeded rolls stay as they
+  were). `table_roll(name, n=None, remove=None, add=None, best=None,
+  worst=None, path=False)` (path: the tables an `@` entry led to, then the
+  final text), `!table roll <name> [n] [...]`, `!roll [<n>x] <table>
+  [...]` (`_table_roll_opts`, `_table_roll_reply`; #610, 1190, 1228-1229).
+  `!table odds <name> [...]` (a player read, #362, `table_odds_rows`):
+  each entry's chance, a sub-table's entries under it with their overall
+  chance, best / worst from the rank (P(best = i) = W_i^n - W_(i+1)^n,
+  W_i the chance of i or worse; 1230). All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
   `random_seed` rule when set, else the match's own `rng_seed` (made at
   creation, fresh for a clone), counting the 32-bit words drawn
@@ -3661,6 +3776,13 @@ hardcodes**.
   player's `!template list` quadratic, 13 s at 4,000 templates). Writing
   onto the name of a template the caller can't read (import, copy, save,
   rename) answers "The name is taken" (V20).
+- **Notes** (Y10, 1222): `template_notes` (`logic.TEMPLATE_NOTES_KEY`,
+  text up to `TEMPLATE_NOTES_MAX`, `checked_template_notes`) on an entity
+  or partial template, library metadata in `_TEMPLATE_LIBRARY_KEYS` (never
+  copied into a unit), kept by a re-save and an import without the
+  field; `!template notes <name> [<text ...> | -]` (a library edit),
+  printed by `show` above the JSON and by `list` (first line, cut at
+  `_NOTE_LIST_CHARS`). Everyone reading the template reads its notes.
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
@@ -4220,7 +4342,14 @@ lists what isn't built; 1093-1122).
   run right before the body, in the same transaction), `affects`
   (expression, `target` a location's cell; default the unit targets),
   `target_condition` (expression, self = actor, `target` one target: a
-  unit, or a location target's cell, #540),
+  unit, or a location target's cell, #540), `condition` on an action
+  that isn't a reaction (a precondition, Y4: an expression judged in
+  `run_action` before prepare and the status checks, self = actor,
+  `source` / `args` by attribute, `target` as typed; refusal reason
+  `condition`, worded by the action's `condition_message` else
+  `action_condition_message_format`, `action_condition_text`; `!action
+  list` marks an unmet one through `action_condition_ok` with no target,
+  1216),
   `cancelled_action_cost` (refund / pay). `run_action(steps=,
   preset_locals=, prepare_out=, body_out=, finish=, skip_checks=,
   extra_bindings=, fail_out=, target_out=)` runs any of the programs as
@@ -4231,9 +4360,13 @@ lists what isn't built; 1093-1122).
   after_on, priority / before_priority / after_priority, self_trigger,
   reaction_on_cancel, auto_when, reactable; `cancels` detected from the before
   half's text, `detects_cancel`). A bool `condition` / `auto_when` (a
-  `set_var ... true`) reads as always / never. `reacts_on: any` without a
+  `set_var ... true`) reads as always / never; both read `source` (the
+  reaction's container, through `mount_routing`, as the halves do;
+  `eval_expression(attr_bindings=)`, Y7). `reacts_on: any` without a
   condition and an unparseable `reacts_to` are never offered (named in
-  `!action info`). A reaction without a body can't be used by `!action`.
+  `!action info`). A reaction without a body can't be used by `!action`
+  or use_action; it is refused before an exchange takes a number
+  (`reactions._body_less`), so the refusal changes nothing (L54).
   `UnitFlags.REACTIONS` indexes the units whose vars hold one; a rider is
   offered its seat's reactions (a vehicle isn't offered its seats').
 - **Exchanges** (dicts, JSON): `Match.reaction_stack` (the top is the
@@ -4277,12 +4410,27 @@ lists what isn't built; 1093-1122).
   its start with the RNG set back. A child window's options are those
   read when it opened (`units[uid].options`). Outside any action (a
   passive, a watcher, `!eval`) the action begins at once or waits in
-  the queue (`_queue_use`) and use_action gives None. `COMMAND_CTX`
-  (set in `_run_top`) gives such a formula its reply context.
+  the queue (`_queue_use`, at most `reaction_queue_limit` waiting, a
+  ceiling rule; past it use_action is refused with a line, X25) and
+  use_action gives None. `COMMAND_CTX` (set in `_run_top`) gives such a
+  formula its reply context. A nested action's own fail() in its
+  prepare or body prints `❌ action <name>: ...` once
+  (`reactions._fail_line`; the engine refusals use_action words itself
+  stay as they are, Y6). An exchange whose actor leaves for good
+  (`Entity.remove`, a transfer) is marked `actor_gone`: it doesn't
+  resolve, and the window names "a departed unit" (H2: a unit added
+  under the id answered with its own action).
 - **Windows:** `open_window` fixes the units (candidates in turn order,
   `__reaction_mode` / `reaction_mode` ask / auto / never; auto picks at
   once: a reaction with no target of its own, or one taking one unit,
-  which gets the incoming action's actor, user call); each option line is
+  which gets the incoming action's actor, user call). A unit the acting
+  unit's body team can't see (`entity_visible_to`; `_unseen_by_side`) is
+  offered per `__reactions_while_hidden` / `reactions_while_hidden`
+  (`hidden_mode`; user call, L54, 1219): all (default), affected (only
+  reactions to actions directly affecting it: no bystander reaction,
+  `_hidden_bystander`) or none. `!react set <eid> [mode=] [hidden=]`
+  (works with no window open; `default` drops the var) shows or sets
+  both; each option line is
   tagged with its unit (`m.unit_tag`) and names units with say() markers,
   so a team view drops the units it can't see. A unit is done when it
   passes, reaches `__reactions_per_window` / the rule, or has nothing
@@ -4317,7 +4465,8 @@ lists what isn't built; 1093-1122).
   (once: targets re-checked: immunity, target tags, target_condition;
   `affects` again; newcomers get a copy of `""`), the cancelled path
   (`_cancelled`: `cancelled_action_cost`, on_action_failed reason
-  `cancelled`) or the body (`_body_phase`: one affected unit's copy as
+  `cancelled`; also when every unit target the action named dropped
+  out, `cancel_reason`, user call, L54, 1108, 1218) or the body (`_body_phase`: one affected unit's copy as
   preset locals, else `""`; body locals merged into every copy;
   `fail(refund)` rolls back to the state at resolution start in this
   drive, `_Env.start`, and marks every pick refunded; after a pause it
@@ -4390,19 +4539,24 @@ in full: 1123-1139).
   then `on_damage_dealt` on the dealer (`on_healing_received` /
   `on_healing_given`), extras `hook_extras` (damage_taken / damage_lost
   per pool, components as dicts), firing on 0 too. The target's death
-  check is held (`_death_check_deferred_ids`, run_packet) through all of
-  it, the hooks' own writes to the target included, and runs ONCE after
+  check is held (`_death_check_deferred_ids`, run_packet around
+  `_packet`) from the first step through all of it, the steps' and the
+  hooks' own writes to the target included (L54: a step writing hp 0
+  killed at once), and runs ONCE after
   the hooks under `logic.PACKET_KILLER`, so on_death binds `killer`
   (`Match.packet_killer`: the target or its body); then a body part at 0
   hp is destroyed. So on a killing blow the hooks see the defender in
   the match at 0 hp, and one that heals it saves it (user call: on_damage
   passives often prevent a death); a hook that mustn't act on a lethal
-  hit tests the defender's hp (1139). Packets dealt from the hooks nest
+  hit tests the defender's hp (1139). A step that removes its defender
+  ends the packet (`skipped` "gone", a note). Packets dealt from the hooks nest
   `Match._damage_hook_depth` deep, past `damage_hook_recursion_limit`
   (16, ceiling) no hooks, one ⚠️ per chain.
 - **Body parts** (design §10.5): a packet on a part (also `damage_part`,
   `damage_spread`, which route through it) plans the share BEFORE writing
-  (`_plan_share`, so a bad knob refuses the hit): per component above 0,
+  (`_plan_share`, so a bad knob refuses the hit; worked in exact
+  fractions, H4): per component above 0 in a pool the part holds (a
+  dropped pool sends nothing and leaves the cap's base, H3),
   the part's `damage_to_main_percent` var (a number or a dict of tag
   filter -> percent with `default`) else
   `part_damage_to_main_percent_default`; healing: the part's
@@ -4427,7 +4581,8 @@ in full: 1123-1139).
   corpses strip it. A status tick's packet takes it as its default
   attacker.
 - **Forecast**: steps run, then `_rollback_match`, history rewind and the
-  RNG position put back; no writes, no records. In a `prepare`
+  RNG position put back; no writes, no records. The lines the steps and
+  their hooks print go to a throwaway buffer and log sink (H1). In a `prepare`
   (`reactions._prepare` sets `damage.PREPARE_FORECAST`) it records per
   target `damage_raw` / `damage_taken` (healing_raw / healing_received),
   summed, and the RNG position of the first one; `_new_exchange` puts them

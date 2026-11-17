@@ -283,8 +283,8 @@ SCENARIO 11 — Rejections still hold
 
 Expected: every line should print an error (most with an X-mark).
 A `for` over a non-loopable iterable (entity[hero].hp is not a
-loopable builtin call) is rejected ("for-loop iterable must be a
-direct call to one of {...}"); `while` loops, lambdas, list
+loopable builtin call) is rejected ("can't loop over ...: to loop
+over a list or a dict's keys, use `for x in each(...)`"); `while` loops, lambdas, list
 comprehensions, local-variable assignment, imports, and disallowed
 constructs nested inside an otherwise-valid if (the last line nests
 a `for x in [1]` — a List iterable, rejected) are all rejected
@@ -2388,9 +2388,10 @@ SCENARIO 121 — Loops are constrained, not blanket-disallowed
 !eval "for x in range(3): entity[hero].hp = 10 + x"
 !assert "entity[hero].hp == 12"
 !eval "for x in entity[hero].hp: entity[hero].hp = x"
-?? for-loop iterable must be a direct call to one of
+?? can't loop over that value: to loop over a list or a dict's keys, use `for x in each(...)`.
 !eval "for x in [1, 2]: entity[hero].hp = x"
-?? for-loop iterable must be a direct call to one of
+?? can't loop over `[1, 2]`: to loop over a list
+?? `!help functions loopable` lists them all.
 !eval "while True: entity[hero].hp = 0"
 ?? Disallowed syntax: While
 !assert "entity[hero].hp == 12"
@@ -2399,8 +2400,9 @@ Expected: `while` loops are fully disallowed ("Disallowed syntax:
 While"). `for` loops are allowed over a direct call to one of the
 loopable functions (`_LOOPABLE_FUNCS`): `range(3)` is one, so the
 first loop runs three times and leaves hp at 10 + 2 = 12. A loop
-over anything else is refused before it runs ("for-loop iterable
-must be a direct call to one of {...}"): a var read
+over anything else is refused before it runs, the refusal leading
+with the usual fix (`for x in each(...)` for a list or a dict's keys,
+Y10) and pointing at `!help functions loopable`: a var read
 (`entity[hero].hp`) and a list literal alike, and hp stays 12.
 Scenarios 246+ show the legal for-loop forms.
 
@@ -6032,7 +6034,7 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 !match use mfor2
 !ent add hero Hero 30 5 5 10
 !eval "for x in abs(5): entity[hero].hp = 0"
-?? for-loop iterable must be a direct call to one of
+?? can't loop over `abs(5)`
 !eval "for x in my_list: entity[x].hp = 0"
 ?? Unknown identifier 'my_list'
 !assert "entity[hero].hp == 30"
@@ -6047,8 +6049,8 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 Expected: For-loops are validated up front. The iterable MUST be
 a direct call to one of the loopable functions (`_LOOPABLE_FUNCS`:
 entities_within, range, each, cells_in_burst, ...). So `abs(5)`, a
-function that isn't loopable, errors with "iterable must be a
-direct call to one of {...}" and `my_list` errors as an unknown
+function that isn't loopable, errors with "can't loop over
+`abs(5)`: ..." and `my_list` errors as an unknown
 identifier; neither loop runs, so the hero keeps 30 hp. A loop target that's
 neither a single name nor a tuple of names ("for [a, b] in ..."
 uses a List, not Tuple) is also rejected.
@@ -11753,7 +11755,7 @@ SCENARIO 456 — Match outcome: manual victory + prims + a goal-zone win conditi
 
 Expected: no outcome at first (match_over False). `!match win red ...` declares
 a manual victory; match_winner() = 'red', match_over() True, `!match outcome`
-shows red. `!match win clear` resets it (match_over False again, play resumes).
+shows red. `!match win clear` resets it (match_over False again).
 Then a GOAL: a one-cell zone at (4,1) carries an on_enter hook that calls
 declare_winner. Teleporting the runner onto it fires the hook, so `!match
 outcome` now shows blue won. There is NO built-in objective evaluator — the win
@@ -27900,7 +27902,7 @@ SCENARIO 880 — `!action ... map=<map>` aims a location action at another map
 !ent set_var hero actions.blink.target location
 !ent set_var hero actions.blink.body "entity[self].got = [target.x, target.y, target.map]\nmove_entity(self, target)"
 !action hero blink 4 4 map=deck
-?? `hero` used action `blink` on `(4,4)`.
+?? `Hero` used action `blink` on `(4,4)`.
 !assert "entity[hero].got == [4, 4, 'deck'] and map_of('hero') == 'deck' and entity[hero].x == 4"
 !action hero blink 3 3 map=nowhere
 ?? Could not find a map named `nowhere`
@@ -29744,7 +29746,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag_unless blind "entity[self].blindsight == True"
 !ent set_var hunter blindsight true
 !action hunter shoot wolf
-?? `hunter` used action `shoot` on `wolf`.
+?? `Hunter` used action `shoot` on `Wolf`.
 !assert "entity[wolf].hp == 5"
 !action hunter aimed_shot wolf
 ?? forbids `aimed_shot`.
@@ -29763,7 +29765,7 @@ SCENARIO 916 — Action tags: inheritance, exclusion, forbids and the _unless li
 !status forbids_actions_with_tag blind -
 ?? Cleared `blind` forbids_actions_with_tag.
 !action hunter bash wolf
-?? `hunter` used action `bash` on `wolf`.
+?? `Hunter` used action `bash` on `Wolf`.
 
 Expected: An action's tags are its own `tags` plus the `action_tags` of every
 container above it, the vars root included, nearest first, and `!action
@@ -29826,12 +29828,12 @@ SCENARIO 917 — Action tags: immune statuses on single and list targets, body r
 !assert "entity[knight].swept == ['rat']"
 !status apply knight flying
 !action knight hack bird
-?? `knight` used action `hack` on `bird`.
+?? `Knight` used action `hack` on `Bird`.
 !assert "entity[bird].hp == 5"
 !status dispel knight flying
 !ent status bird set flying immune_to_actions_with_tag ranged
 !action knight hack bird
-?? `knight` used action `hack` on `bird`.
+?? `Knight` used action `hack` on `Bird`.
 !action archer arrow bird
 ?? flying on `bird` blocks `ranged` actions.
 !assert "entity[bird].hp == 2"
@@ -29906,10 +29908,10 @@ SCENARIO 918 — Action tags: mounts, the system library, lint, malformed tag fi
 ?! failed
 !assert "entity[ogre].hp == 30"
 !action gun horn
-?? `gun` used action `horn`.
+?? `Gunner` used action `horn`.
 !ent set_var tank crew 3
 !action gun cannon ogre
-?? `gun` used action `cannon` on `ogre`.
+?? `Gunner` used action `cannon` on `Ogre`.
 !assert "entity[ogre].hp == 25"
 !status apply gun blind
 !action gun cannon ogre
@@ -30120,7 +30122,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action info druid raise
 ?? Target must match: `humanoid and not undead`
 !action druid command horse
-?? `druid` used action `command` on `horse`.
+?? `Druid` used action `command` on `Horse`.
 !action druid command zed
 ?? ❌ action `command`: [target_tags] `zed` doesn't fit `command`: its tags (mindless) don't match `animal`.
 !assert "entity[horse].commanded == True and not var_has('zed', 'commanded')"
@@ -30139,7 +30141,7 @@ SCENARIO 921 — Unit tags in play: action target filters, corpses, statuses tha
 !action druid raise horse
 ?? ❌ action `raise`: [target_tags] `horse` doesn't fit `raise`: its tags (animal, rideable, corpse) don't match `humanoid and not undead`.
 !action druid raise bandit
-?? `druid` used action `raise` on `bandit`.
+?? `Druid` used action `raise` on `Bandit`.
 !assert "'bandit' in all_entities() and has_corpse('horse')"
 !status def feared
 !status cannot_affect_units_with_tag feared "mindless or construct"
@@ -30282,7 +30284,7 @@ SCENARIO 923 — One filter rule: modifiers, shields, status tag: tokens, restri
 !action hero smash foe
 ?? heavy_load on `hero` forbids `melee and heavy` actions.
 !action hero jab foe
-?? `hero` used action `jab` on `foe`.
+?? `Hero` used action `jab` on `Foe`.
 !zone new lava
 !zone add lava 2 2
 !zone tags lava "fire, hazard"
@@ -36973,7 +36975,7 @@ SCENARIO 1052 — Extra turns in an action: a Bard's inspire gives an ally withi
 !assert "extra_turn_queue() == [] and entity_distance('bard', 'archer') == 3"
 !assert "entity_distance('bard', 'knight') == 2"
 !action bard inspire knight
-?? `bard` used action `inspire` on `knight`.
+?? `Bard` used action `inspire` on `Knight`.
 !turn forecast 3
 ?? 1. `knight` **Knight** (extra)
 ?? 2. `archer` **Archer**
@@ -38886,7 +38888,7 @@ SCENARIO 1093 — A block reaction lowers the damage its attacker's prepare fore
 ?? (before it resolves)
 !react hero block
 ?? Hero picks `block`
-?? `orc` used action `cleave`
+?? `Orc` used action `cleave`
 !assert "entity[hero].hp == 26"
 !action orc cleave hero
 !react hero pass
@@ -39095,7 +39097,7 @@ SCENARIO 1098 — Protect: a bystander redirects the attack onto itself and halv
 !action orc burn 4 4
 !react guard protect
 ?? Guard's `protect` failed: [redirect]
-?? `orc` used action `burn`
+?? `Orc` used action `burn`
 !assert "reactions_used('guard', 'ever') == 1"
 
 Expected: The guard isn't a target: `protect` is a bystander reaction.
@@ -39160,7 +39162,7 @@ SCENARIO 1100 — Auto mode: auto_when reads the forecast; a never unit isn't of
 !ent set_var ally __reaction_mode never
 !action orc hit hero n=10
 ?? Hero doesn't react
-?? `orc` used action `hit`
+?? `Orc` used action `hit`
 !assert "entity[hero].hp == 50"
 !action orc hit hero n=30
 ?? Hero reacts with `block`
@@ -39258,7 +39260,7 @@ SCENARIO 1102 — A window past reaction_window_expiry_seconds closes as skipped
 !as wait 31
 !list
 ?? The reaction window ran out (reaction_window_expiry_seconds); it closes as skipped
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 !assert "entity[hero].hp == 20"
 
 Expected: The rule counts from when the window opened (`!as wait`, the
@@ -39286,7 +39288,7 @@ SCENARIO 1103 — reactions_used counts uses since a point; a limit is a line in
 !react hero block
 !action orc slash hero
 ?! !react hero block
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 !assert "reactions_used('hero') == 1 and reactions_used('hero', 'ever') == 1"
 !assert "reactions_used('hero', 'turn') == 1 and reactions_used('hero', 'round') == 1"
 !assert "reactions_used('hero', 'action') == 0"
@@ -39366,7 +39368,7 @@ SCENARIO 1105 — A combo answers its holder's own attack, also inside another a
 !ent set_var orc actions.twice.target entity
 !ent set_var orc actions.twice.body "use_action(self, 'slash', target)"
 !action orc slash hero
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 ?? `!react orc combo`
 !react orc combo
 !assert "entity[hero].hp == 24"
@@ -39374,7 +39376,7 @@ SCENARIO 1105 — A combo answers its holder's own attack, also inside another a
 ?? (started by `twice`) has resolved
 !assert "entity[hero].hp == 24"
 !react orc combo
-?? `orc` used action `twice`
+?? `Orc` used action `twice`
 !assert "entity[hero].hp == 18"
 !ent set_var orc actions.combo.self_trigger false
 !action orc slash hero
@@ -39417,7 +39419,7 @@ SCENARIO 1106 — A gunner's seat reaction defends its vehicle (#36)
 !assert "entity[tank].hp == 40 and entity['gun'].fired == 1"
 !mount dismount gun
 !action orc shoot tank
-?? `orc` used action `shoot`
+?? `Orc` used action `shoot`
 !assert "entity[tank].hp == 31"
 
 Expected: The flak reaction lives in the tank's `gunner` seat: it is
@@ -39459,7 +39461,7 @@ SCENARIO 1107 — A multi-tile body: its parts and every covered cell bring its 
 !assert "entity[drake].hp == 49"
 !system set default reactions_cover_parts false
 !action orc shoot wing
-?? `orc` used action `shoot`
+?? `Orc` used action `shoot`
 !assert "entity[wing].hp == 7"
 
 Expected: The 2x2 drake's located wing is struck: with
@@ -39480,23 +39482,27 @@ SCENARIO 1108 — target_condition: checked when used and again at resolution (#
 !ent add hero Hero 30 5 5 3
 !ent set_var orc actions.zap.target entity
 !ent set_var orc actions.zap.target_condition "not status_has(target, 'invisible')"
-!ent set_var orc actions.zap.body "if target != None:\n    entity[target].hp = entity[target].hp - 10\nentity[self].zaps = 1"
+!ent set_var orc actions.zap.body "entity[target].hp = entity[target].hp - 10\nentity[self].zaps = 1"
 !ent set_var hero actions.vanish.before "status_apply(self, 'invisible')"
+!passive add orc missed on_action_failed "say('missed: ' + fail_reason + ', ' + fail_message)"
 !action info orc zap
 ?? Target condition: `not status_has(target, 'invisible')`
 !action orc zap hero
 !react hero vanish
 ?? Hero drops out of `zap`: Hero no longer meets `zap`'s target condition
-?? `orc` used action `zap`
-!assert "entity[hero].hp == 30 and entity[orc].zaps == 1"
+?? 🚫 Orc's `zap` is cancelled: its target dropped out.
+?? missed: cancelled, its target dropped out
+?! used action `zap`
+!assert "entity[hero].hp == 30 and not var_has('orc', 'zaps')"
 !action orc zap hero
 ?? ❌ action `zap`: [target_condition] `hero` doesn't meet `zap`'s target condition.
 
 Expected: The hero's `vanish` makes it invisible before the zap
 resolves. The target is checked again at resolution: the hero no longer
-meets the target condition and drops out (as if it had dodged); the
-body still runs with no target (`target` is None), so its other effects
-happen. Used against an invisible hero, the zap is refused at once.
+meets the target condition and drops out (as if it had dodged). The zap
+named one target, so it is cancelled (user call, L54): the body doesn't
+run, and on_action_failed fires with reason `cancelled` and the cause.
+Used against an invisible hero, the zap is refused at once.
 HARNESS-ALLOWS-ERRORS
 
 
@@ -39791,7 +39797,7 @@ SCENARIO 1117 — A reaction's own action is a react point: a riposte's stab is 
 !react
 ?? (started by `riposte`)
 !react orc dodge
-?? `hero` used action `stab`
+?? `Hero` used action `stab`
 !assert "entity[orc].hp == 30 and entity[orc].dodged == 1 and entity[hero].riposted == 1"
 !assert "reactions_used('hero', 'ever') == 1 and reactions_used('orc', 'ever') == 1"
 !react
@@ -39876,7 +39882,7 @@ SCENARIO 1119 — A passive's and an !eval's actions open their windows; use_act
 ?? = `None`
 !assert "entity[hero].hp == 30"
 !react hero parry
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 !assert "entity[hero].hp == 28"
 !passive add orc rage on_turn_start "entity[self].raged = use_action(self, 'slash', 'hero')"
 !turn next
@@ -39919,11 +39925,11 @@ SCENARIO 1120 — Actions started while a window is open wait in a queue (#36)
 !react
 ?? Reactions to Orc's `slash` on Hero
 !react hero pass
-?? `orc` used action `slash`
+?? `Orc` used action `slash`
 ?? Orc's `kick` on Hero: reactions are offered
 !assert "entity[hero].hp == 24"
 !react hero parry
-?? `orc` used action `kick`
+?? `Orc` used action `kick`
 !assert "entity[hero].hp == 24"
 !react
 ?? No reaction window is open
@@ -39959,7 +39965,7 @@ SCENARIO 1121 — A paused step survives a restart, a host's skip and an undo (#
 ?? (started by `twice`): reactions are offered
 !assert "var_has('orc', 'r1') == False and entity[hero].hp == 30"
 !react skip
-?? `orc` used action `twice`
+?? `Orc` used action `twice`
 !assert "entity[orc].done == 1 and entity[hero].hp == 24"
 !assert "var_has('orc', 'r1') and var_has('orc', 'r2')"
 !undo command confirm
@@ -41175,14 +41181,14 @@ SCENARIO 1148 — The action-used line names its target (action_used_message_for
 !ent set_var hunter actions.rest.body "x = 1"
 !ent set_var bird tags flying
 !action hunter shoot boss
-?? `hunter` used action `shoot` on `boss`.
+?? `Hunter` used action `shoot` on `Boss`.
 !action hunter volley boss bird
 ?? dropped a target
-?? `hunter` used action `volley` on `boss`.
+?? `Hunter` used action `volley` on `Boss`.
 !action hunter mark 3 7
-?? `hunter` used action `mark` on `(3,7)`.
+?? `Hunter` used action `mark` on `(3,7)`.
 !action hunter rest
-?? `hunter` used action `rest`.
+?? `Hunter` used action `rest`.
 ?! `rest` on
 !system set default action_used_message_format "{actor_name} uses {action}{?target?} on {target_name}{/?}!"
 !ent set_var boss team red
@@ -41208,9 +41214,10 @@ Expected: the line a successful action ends with names what it was used
 on: the 2x2 boss, the list as the checks left it (the flying bird
 dropped by target_refuses_tags, so only `boss`), a cell as (x,y), and
 nothing for an action without a target (`{?target?}...{/?}` leaves the
-" on ..." out). A custom format's {actor_name} / {target_name} print as
-the channel's view sees each unit: in a blue-view channel the red boss
-reads as its disguise (Rock), in an unbound channel the real names. An
+" on ..." out). The default and a custom format print {actor_name} /
+{target_name} as the channel's view sees each unit: in a blue-view
+channel the red boss reads as its disguise (Rock), in an unbound channel
+the real names (Hunter, Boss). An
 empty format prints no line. Boss took 3 damage from each of three
 shoots (40 → 31).
 
@@ -41494,10 +41501,10 @@ SCENARIO 1153 — A cell target in the action-used line and the event log while 
 !ent set_var mage actions.bolt.target location
 !ent set_var mage actions.bolt.body "x = 1"
 !action mage bolt 4 4
-?? `mage` used action `bolt` on `(4,4)`.
+?? `Mage` used action `bolt` on `(4,4)`.
 !ent set_var orc actions.thorns.after "x = 1"
 !action mage bolt 4 4
-?? `mage` used action `bolt` on `(4,4)`.
+?? `Mage` used action `bolt` on `(4,4)`.
 ?! main
 !log 2
 ?? used `bolt` → (4,4).
@@ -41858,7 +41865,7 @@ SCENARIO 1161 — An open reaction window holds a macro's lines, `!dry` and `!si
 ?? 1 run(s) had a ❌ / ❓ reply
 !assert "entity[hero].hp == 30 and turns_elapsed() == 1"
 !react hero sidestep
-?? `orc` used action `cleave`
+?? `Orc` used action `cleave`
 !assert "entity[hero].hp == 26 and entity[hero].x == 4"
 !macro run round
 ?? It is now **Hero**'s turn
@@ -41953,10 +41960,10 @@ SCENARIO 1163 — A pause stops the commands a host opened to players, and holds
 ?? `!action ogre wave` is held
 !assert "entity[ogre].waved == 0 and entity[ogre].y == 3"
 !match resume
-?? `ogre` used action `wave`.
+?? `Ogre` used action `wave`.
 !as player bob
 !action ogre wave
-?? `ogre` used action `wave`.
+?? `Ogre` used action `wave`.
 !as host
 !assert "entity[ogre].waved == 2"
 
@@ -42216,10 +42223,10 @@ SCENARIO 1169 — !simulate says when its runs stopped at a reaction window
 !action orc cleave hero
 ?? `!react hero block`
 !ent kill hero
-?? ⏭ Nobody is left to answer the reaction window (hero is gone); it closes.
-?? ⚠️ hero drops out of `cleave`: hero is gone.
-?? ❌ action `cleave`: no unit was given (the value is None)
-?? `target` once its target dropped out
+?? ⏭ Nobody is left to answer the reaction window (Hero is gone); it closes.
+?? ⚠️ Hero drops out of `cleave`: Hero is gone.
+?? 🚫 Orc's `cleave` is cancelled: its target dropped out.
+?! no unit was given
 !react
 ?? No reaction window is open on this match.
 !assert "not has_corpse('orc') and entity[orc].hp == 30"
@@ -42235,11 +42242,10 @@ simulated batch that answers the window itself reports the result (-4
 with the block, -10 with a pass), as does a hero whose `__reaction_mode`
 is `auto`. Then the real action: the host kills the hero while the window
 is open. Nobody is left to answer, so the window closes in that command
-(user call) and the action resolves: the hero drops out, the body
-still runs (design: an action with no target left resolves), and its
-`deal_damage(target, ...)` fails with a message naming a `target` that
-dropped out (it blamed an unbound 'self' / 'this' / 'current'). The
-failed body changes nothing and the exchange is over.
+(user call) and the action resolves: the hero drops out, and an action
+whose only target dropped out is cancelled (user call, L54: its body ran
+with `target` None, and its `deal_damage(target, ...)` failed). The
+exchange is over.
 
 
 SCENARIO 1170 — A reaction window nobody is left to answer closes in the command that left it so
@@ -42279,8 +42285,8 @@ SCENARIO 1170 — A reaction window nobody is left to answer closes in the comma
 !ent tp ogre 5 5
 ?! Nobody is left
 !batch ent hp ogre -1 ; ent kill ogre ; turn next
-?? ⏭ Nobody is left to answer the reaction window (ogre is gone); it closes.
-?? ⚠️ ogre drops out of `cleave`: ogre is gone.
+?? ⏭ Nobody is left to answer the reaction window (Ogre is gone); it closes.
+?? ⚠️ Ogre drops out of `cleave`: Ogre is gone.
 ?? It is now **Orc**'s turn
 !assert "has_corpse('ogre') and len(all_entities()) == 1 and turns_elapsed() == 2"
 !undo command
@@ -42288,7 +42294,7 @@ SCENARIO 1170 — A reaction window nobody is left to answer closes in the comma
 ?? - Ogre can react: `!react ogre block`
 !watch add doom "entity[orc].hp < 30" "kill('ogre')"
 !ent hp orc -1
-?? ⏭ Nobody is left to answer the reaction window (ogre is gone); it closes.
+?? ⏭ Nobody is left to answer the reaction window (Ogre is gone); it closes.
 !react
 ?? No reaction window is open on this match.
 
@@ -43900,3 +43906,1329 @@ folder whose name the library can't use (capitals) is skipped with a note
 and its files stay on disk unloaded. A folder holding only templates a
 player can't read is left out of their `folders` and refused by
 `list folder=` like a missing one; an empty folder shows to anyone.
+
+
+SCENARIO 1205 — A default passive calling a !func reaches units created after it; an entity template's unknown top-level key is dropped with a note (Y1, Y3)
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new dp DP 8 6
+!match use dp
+!func def dbl x "x * 2"
+!defpassive add regen on_turn_start "entity[self].hp = min(entity[self].hp + dbl(1), entity[self].max_hp)"
+!ent add ogre Ogre 30 1 1 10
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent hp ogre 20
+!turn next
+?? It is now **Ogre**'s turn
+!assert "entity[ogre].hp == 22"
+!passive list ogre
+?? regen
+!template import brute {"name": "Brute", "vars": {"hp": 9}, "statuses": {"stun": {"level": 1}}}
+?? Dropped `statuses`: an entity template is
+?? (a unit's statuses are `status`; notes for its users go in `template_notes`)
+!template show brute
+?! statuses
+!template spawn brute 5 5
+!assert "entity[brute].hp == 9 and not status_has('brute', 'stun')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a default passive whose formula calls the match's `!func dbl`
+lands on the 2x2 ogre added after it (it used to be checked against the
+built-in functions alone, refused, and dropped without a word): the
+ogre heals 2 at its turn start (20 → 22). An entity template keeps only
+the fields a unit has: `statuses` (a misspelling of `status`) is dropped
+with a note naming the fields, so the spawned brute carries no stun and
+the slip shows at import.
+
+
+SCENARIO 1206 — A nested action's own fail() prints its line from a prepare and a body; a reaction's condition and auto_when read `source` (a 2x2 shield bearer) (Y6, Y7)
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new nf NF 10 6
+!match use nf
+!ent add a A 20 1 1 5 team=red
+!ent add d D 40 3 1 3 team=blue
+!ent set_vars d footprint_w=2 footprint_h=2
+!ent set_var a kit.actions.reachb.target entity
+!ent set_var a kit.actions.reachb.body "fail('too far (body)')"
+!ent set_var a kit.actions.reachp.target entity
+!ent set_var a kit.actions.reachp.prepare "fail('too far (prepare)')"
+!ent set_var a kit.actions.reachp.body "say('hit')"
+!ent set_var a kit.actions.chargeb.target entity
+!ent set_var a kit.actions.chargeb.body "ok = use_action(self, 'reachb', target)\nsay('charge got ' + str(ok))"
+!ent set_var a kit.actions.chargep.target entity
+!ent set_var a kit.actions.chargep.body "ok = use_action(self, 'reachp', target)\nsay('charge got ' + str(ok))"
+!action a chargeb d
+?? ❌ action `reachb`: too far (body)
+?? charge got False
+!action a chargep d
+?? ❌ action `reachp`: too far (prepare)
+?? charge got False
+!ent set_var a kit.actions.hit.target entity
+!ent set_var a kit.actions.hit.tags attack
+!ent set_var a kit.actions.hit.body "entity[target].hp = entity[target].hp - 10"
+!ent set_var d shield.stats.pct 50
+!ent set_var d shield.actions.block.reacts_to attack
+!ent set_var d shield.actions.block.reacts_on target
+!ent set_var d shield.actions.block.condition "get(source.stats, 'pct', 0) > 0"
+!ent set_var d shield.actions.block.before "say('blocked at ' + str(get(source.stats, 'pct', 0)))"
+!action a hit d
+?? - D can react: `!react d block`
+!react d block
+?? blocked at 50
+!ent set_var d shield.stats.pct 0
+!action a hit d
+?! can react
+!assert "entity[d].hp == 20"
+!ent set_var d shield.stats.pct 5
+!ent set_var d __reaction_mode auto
+!ent set_var d shield.actions.block.auto_when "get(source.stats, 'pct', 0) > 3"
+!action a hit d
+?? blocked at 5
+!ent set_var d shield.actions.block.condition "cmd('ent kill a')"
+!action a hit d
+?? isn't offered: its condition failed
+?? Function 'cmd' is not allowed
+!assert "is_alive('a')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a use_action whose action fail()s in its own prepare or body
+prints that action's ❌ line once, as a typed one does (a prepare's
+message used to go nowhere, and with no reaction holder a body's too),
+and the caller reads False. The 2x2 shield bearer's block keeps its
+percent in its container: its condition and auto_when read `source`
+(the shield) as its before half does, so it is offered at 50, not at 0,
+and auto mode picks it at 5. A condition can't run commands: `cmd` stays
+refused there, the reaction isn't offered, and the attacker lives.
+
+
+SCENARIO 1207 — A two-column glyph is refused where it is stored; say() names a dead unit by name; `!match win clear`; game text may carry 💥 (Y8, Y9)
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new gl GL 8 4
+!match use gl
+!ent add a A 20 1 1 5
+!ent add b B 20 3 1 3
+!ent set_vars b footprint_w=2 footprint_h=2
+!ent set_var a glyph 🔥
+?? `glyph` is a map glyph; `🔥` is two columns wide
+!ent set_var a glyphs.down 火
+?? two columns wide
+!ent set_var b disguise.glyph 🐉
+?? `disguise.glyph` is a map glyph
+!tile set 2 3 glyph 🔥
+?? two columns wide
+!zone new pit
+!zone add pit 6 1
+!zone glyph pit 🔥
+?? ❌
+?? two columns wide
+!system set default fog_glyph 霧
+?? ❌
+!ent set_var a glyph *
+!map
+?? 1 * . v v . . . .
+!eval "entity[b].hp = 0"
+!eval "say('{u} avenges {t}! 💥 Critical hit', u='a', t='b')"
+?? A avenges B! 💥 Critical hit
+!match win red
+!match win clear
+?? Cleared the match outcome.
+?! play resumes
+HARNESS-ALLOWS-ERRORS
+
+Expected: a glyph is one character one column wide. An emoji or a CJK
+character is one code point but two columns, so it pushed the rest of
+its row right in a monospaced map; it is refused with the reason at
+every place a glyph is stored: a unit's glyph and glyphs, its disguise,
+tile data, a zone's glyph and the fog / void / preview glyph rules. The
+map lines up with a one-column glyph. say() names the dead 2x2 b by
+its name (B) from its corpse. Clearing a declared winner says only that
+(declaring one never stopped play). A say() line holding 💥 is game
+text: the harness counts only its own and the dispatcher's crash lines.
+
+
+SCENARIO 1208 — Under formula_text_visibility host, a formula reads hidden at any depth of its parents, and `!find` can't test or sort by it (V26)
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new ft FT 8 4
+!match use ft
+!system set default formula_text_visibility host
+!ent add hero Hero 20 1 1 5 team=red
+!ent set_vars hero footprint_w=2 footprint_h=2 lvl=2
+!eval "var_set('hero', 'modifiers', {'m1': {'stat': 'atk', 'op': 'add', 'value': 'entity[self].lvl * 2 + zqxsecret'}})"
+!ent set_var hero gear.ring.hooks.on_equip "deal_damage(self, zqxhook)"
+!ent set_var hero actions.hit.body "deal_damage(target, zqxbody)"
+!eval "team_set('red', 'mods2', {'m1': {'stat': 'atk', 'op': 'add', 'value': 'zqxteam*2'}})"
+!host access ent all
+!host access find all
+!host access team all
+!as player bob
+!ent get hero modifiers.m1.value
+?? = '(hidden)'
+!ent get hero gear.ring.hooks.on_equip
+?? = '(hidden)'
+!ent get hero actions.hit.body
+?? = '(hidden)'
+!team get red mods2.m1.value
+?? = '(hidden)'
+!find show:modifiers.m1.value
+?? [modifiers.m1.value=(hidden)]
+!find "actions.hit.body=deal_damage(target, zqxbody)"
+?? No entities match.
+!find "actions.hit.body>deal_damage(target, z"
+?? No entities match.
+!find sort:actions.hit.body
+?! zqx
+!as host
+!find "actions.hit.body=deal_damage(target, zqxbody)"
+?? **1 match:**
+!ent get hero modifiers.m1.value
+?? zqxsecret
+HARNESS-ALLOWS-ERRORS
+
+Expected: the rule hides the GM's formula text from players. A
+modifier record's `value` and a hook under `hooks` used to read raw one
+key deeper than their parent (`!ent get hero modifiers.m1.value`, `!team
+get red mods2.m1.value`); the path is now judged inside its parents, so
+each reads `(hidden)` like its parent does. `!find` reads a hidden
+formula as missing: an `=` guess and a `>` comparison match nothing (they
+let a player search the text a character at a time), and `show:` prints
+`(hidden)`. The host reads and matches the text.
+
+
+SCENARIO 1209 — chain_targets charges each candidate a link examines to formula_loop_limit; with a max_jump each link searches near the last (X26)
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new ch CH 20 4
+!match use ch
+!ent add n0 N0 10 1 1 5 team=red
+!ent add n1 N1 10 3 1 5 team=blue
+!ent add n2 N2 10 5 1 5 team=blue
+!ent add n3 N3 10 9 1 5 team=blue
+!ent add n4 N4 10 15 1 5 team=blue
+!ent set_vars n4 footprint_w=2 footprint_h=2
+!eval "chain_targets('n0', 10)"
+?? ['n1', 'n2', 'n3', 'n4']
+!eval "chain_targets('n0', 10, 2)"
+?? ['n1', 'n2']
+!eval "chain_targets('n0', 10, 6)"
+?? ['n1', 'n2', 'n3', 'n4']
+!system set default formula_loop_limit 6
+!eval "chain_targets('n0', 10)"
+?? ❌
+?? chain_targets went past the formula loop limit (6 steps
+!eval "chain_targets('n0', 10, 2)"
+?? ['n1', 'n2']
+!system set default formula_loop_limit 10000
+HARNESS-ALLOWS-ERRORS
+
+Expected: the chain goes n1, n2, n3, then the 2x2 n4 (its nearest cell
+is 5 from n3). Unlimited, the first link looks at 4 candidates, the next
+3, then 2 and 1: 10 steps of formula_loop_limit, so a limit of 6 refuses
+it (a chain through 4,000 units used to cost 35 s with nothing charged).
+With max_jump 2 each link reads only the units the cell index finds
+within 2 of the last one, so the same chain costs 3 steps and fits.
+
+
+SCENARIO 1210 — A body part's share: exact arithmetic under the cap, and no share for a component in a pool the part lacks (H4, H3)
+---------------------------------------------------------------------------------------------------------------------------------
+
+!match new sh SH 8 4
+!match use sh
+!ent add hero Hero 30 1 1 10
+!ent add ogre Ogre 60 3 1 5
+!ent set_vars ogre footprint_w=2 footprint_h=2 stamina=20
+!part add ogre arm arm 15 15 damage_to_main_percent=100
+!ent damage arm 22 from=hero
+?? 🩸 **Ogre** (`ogre`) takes 15 damage from Hero.
+!assert "entity[ogre].hp == 45"
+!ent hp arm 10
+!ent set_var arm damage_to_main_percent 50
+!ent damage arm 10 pool=stamina from=hero
+?? `arm` has no number at `stamina`
+?! stamina damage
+!assert "entity[ogre].stamina == 20"
+!ent set_var arm to_main_cap remaining_hp
+!ent hp arm 4
+!eval "deal_damage('arm', [{'amount': 4}, {'amount': 12, 'pool': 'stamina'}], attacker='hero')"
+?? 🩸 **Ogre** (`ogre`) takes 2 damage from Hero.
+!assert "entity[ogre].hp == 43 and entity[ogre].stamina == 20"
+HARNESS-ALLOWS-ERRORS
+
+Expected: the 15 max-hp arm caps a 22-point hit's share at 15; worked
+as 22 × 15/22 in floats it was 14.999…, and the floor rounding wrote 14.
+Now the share is exact: the ogre takes 15 (60 → 45). The arm holds no
+`stamina`, so a stamina hit is dropped from its writes and sends the
+ogre nothing (it used to send half). A mixed hit under `remaining_hp`
+with the arm at 4: the dropped stamina component leaves the cap's base,
+so the 4 hp send 2 (50%), as the same 4 hp alone do.
+
+
+SCENARIO 1211 — A full reaction queue refuses the next use_action; a forecast prints nothing for what it undoes (X25, H1)
+-----------------------------------------------------------------------------------------------------------------------
+
+!match new rq RQ 8 4
+!match use rq
+!ent add orc Orc 50 1 1 5
+!ent add hero Hero 40 2 1 3
+!ent set_vars hero footprint_w=2 footprint_h=2
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags attack
+!ent set_var orc actions.cleave.body "entity[target].hp = entity[target].hp - 1"
+!ent set_var hero actions.block.reacts_to attack
+!ent set_var hero actions.block.reacts_on target
+!ent set_var hero actions.block.before "say('blocked')"
+!system set default reaction_queue_limit 2
+!action orc cleave hero
+?? reactions are offered before it resolves
+!eval "for i in range(4):\n    use_action('orc', 'cleave', 'hero')"
+?? waits: another reaction window is open
+?? the reaction queue already holds 2 action(s) (reaction_queue_limit 2); `cleave` doesn't wait.
+!react skip
+!react skip
+!react skip
+!react
+?? No reaction window is open on this match.
+!assert "entity[hero].hp == 37"
+!system set default reaction_queue_limit 50
+!status def burn
+!status hook burn on_added "say('zqx-hook-added')"
+!damage step add loud side=defender "say('zqx-step-say')\nstatus_apply(defender, 'burn', 1)"
+!damage explain orc hero 5
+?? Damage forecast
+?! zqx-step-say
+?! zqx-hook-added
+!assert "not status_has('hero', 'burn')"
+!ent damage hero 5 from=orc
+?? zqx-step-say
+?? zqx-hook-added
+HARNESS-ALLOWS-ERRORS
+
+Expected: while a window is open, actions a formula starts wait in the
+queue, at most reaction_queue_limit (a ceiling rule) of them: the first
+two wait, the next two are refused with a line (each queued action
+copied the match, queue included, so 4,000 queued calls cost 55 s). The
+host's three skips resolve the open action and the two queued ones
+(40 → 37). A forecast (`!damage explain`) runs the steps and puts the
+match back; the lines the step and the status hook printed now go with
+it, and the real hit prints them once.
+
+
+SCENARIO 1212 — An exchange whose actor leaves doesn't resolve for a unit added under its id; a body-less reaction used as an action changes nothing (H2, L54)
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new ga GA 8 4
+!match use ga
+!ent add orc Orc 50 1 1 5
+!ent set_vars orc footprint_w=2 footprint_h=2
+!ent add hero Hero 30 4 1 3
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags attack
+!ent set_var orc actions.cleave.body "entity[target].hp = entity[target].hp - 10"
+!ent set_var hero actions.block.reacts_to attack
+!ent set_var hero actions.block.reacts_on target
+!ent set_var hero actions.block.before "say('blocked')"
+!action orc cleave hero
+?? Orc's `cleave` on Hero
+!ent remove orc
+!ent add orc Brute 50 1 1 5
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags attack
+!ent set_var orc actions.cleave.body "entity[target].hp = entity[target].hp - 25"
+!react
+?? Reactions to a departed unit's `cleave`
+?! Brute's
+!react hero pass
+?? a departed unit's `cleave` doesn't resolve
+!assert "entity[hero].hp == 30"
+!ent set_var hero actions.odd.reacts_to attack
+!ent set_var hero actions.odd.before "say('x')"
+!history list commands
+!action hero odd
+?? ❌ action `odd`: [reaction] `odd` is a reaction: it runs through `!react`
+!undo command 1
+?? Reverted past `!ent set_var hero actions.odd.before
+HARNESS-ALLOWS-ERRORS
+
+Expected: removing the 2x2 orc while its cleave waits on a window marks
+the exchange: the unit added later under the id `orc` (Brute) isn't its
+actor, so the window names "a departed unit" and the cleave doesn't
+resolve (it used to run Brute's own 25-point cleave). A reaction with no
+body used as an action is refused before an exchange takes a number,
+so the refusal changes nothing: it is no undo step, and `!undo command
+1` takes back the set_var before it.
+
+
+SCENARIO 1213 — A damage step that kills or removes its defender; the forecast after a rest and with a grant before the first turn (L54)
+---------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sk SK 8 4
+!match use sk
+!ent add a A 30 1 1 30
+!ent add b B 20 3 1 20
+!ent set_vars b footprint_w=2 footprint_h=2
+!ent add c C 20 6 1 10
+!damage step add zero side=defender "entity[defender].hp = 0"
+!gpassive add died on_death "say('died; killer ' + str(killer))"
+!gpassive add took on_damage_taken "say('took on ' + str(self))"
+!ent damage b 5 from=a
+?? took on b
+?? died; killer a
+!assert "has_corpse('b') and get(last_damage('a', 'dealt'), 'defender') == 'b'"
+!damage step remove zero
+!damage step add gone side=defender "remove_entity(self)"
+!ent damage c 5 from=a
+?? `c` left the match during the damage steps: it takes nothing.
+?! has no number
+!damage step remove gone
+!ent add c C 20 6 1 10
+!ent status a set stun skips_turn true
+!turn grant c 1
+!turn forecast 3
+?? 1. `a` **A** — skipped (stun)
+?? 2. `c` **C**
+?? 3. `c` **C** (extra)
+!turn next
+?? It is now **C**'s turn
+!turn next
+?? It is now **C**'s extra turn
+!ent status c set stun skips_turn true
+!turn next
+?? every entity is skippable
+!turn forecast 2
+?? 1. `a` **A** — skipped (stun)
+?? 2. `c` **C** — skipped (stun)
+HARNESS-ALLOWS-ERRORS
+
+Expected: a defender step writing the 2x2 b's hp to 0 no longer kills
+it on the spot: the death check waits through the packet, so
+on_damage_taken fires and on_death credits the attacker (it used to
+find no hp to write, fire no hook and read killer None). A step that
+removes its defender says so and writes nothing. A grant made before
+the first turn runs after the first turn a skip doesn't pass over (C's,
+past the stunned A), as the forecast now lists it. When every unit is
+skippable the round rests on a unit that stays unmarked, and the next
+`!turn next` skips it again in that round; the forecast lists that skip.
+
+
+SCENARIO 1214 — Refusals with their ❌: a group form every member refuses, `!map legend <junk>`, a unit swapped with itself; a strict batch stops at each (L55)
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rf RF 8 4
+!match use rf
+!ent add m1 M1 10 1 1 5
+!ent add m2 M2 10 2 1 5
+!ent set_vars m2 footprint_w=2 footprint_h=2
+!ent add gob Gob 10 6 1 5
+!ent group add mooks m1 m2
+!ent hp group:mooks zz9
+?? ⚠️ `m1`
+?? ❌ every member of `mooks` refused `!ent hp`.
+!batch strict ent hp group:mooks zz9 ; ent set_var gob ran10 1
+!assert "not var_has('gob', 'ran10')"
+!ent hp group:mooks 7
+?! every member
+!assert "entity[m1].hp == 7 and entity[m2].hp == 7"
+!map legend zz9
+?? ❌ Usage: `!map legend on|off`
+!map legend
+?? Auto-legend is
+!batch strict map legend zz9 ; ent set_var gob ran11 1
+!assert "not var_has('gob', 'ran11')"
+!ent swap gob gob
+?? ❌ `gob` can't swap with itself.
+!batch strict ent swap gob gob ; ent set_var gob ran12 1
+!assert "not var_has('gob', 'ran12')"
+HARNESS-ALLOWS-ERRORS
+
+Expected: a group form keeps one ⚠️ per member that refuses, and when
+every member refuses it ends with a ❌ line, so a strict batch stops
+there (it used to run the next line); a group where the members succeed
+prints no such line. `!map legend` with a word other than on / off is a
+usage refusal like its siblings', while a bare `!map legend` still reads
+the setting. Swapping a unit with itself is refused.
+
+
+SCENARIO 1215 — A defined status without a tick of its own counts down through status_tick_formula while it has a duration (Y2)
+-----------------------------------------------------------------------------------------------------------------------------
+
+!match new tk TK 8 4
+!match use tk
+!system set default status_tick_formula "status_counter_add(self, status_name, -1)"
+!system set default status_tick_when turn_end
+!ent add a A 20 1 1 10
+!ent set_vars a footprint_w=2 footprint_h=2
+!ent add b B 20 4 1 5
+!status def weak
+?? while it has a duration, the status_tick_formula rule ticks it
+!status data weak note "weakened: -2 attack"
+!status def ward
+!status def burn
+!status tick burn "status_counter_add(self, status_name, -2)"
+!status apply a weak 1 3
+!status apply a dazed 1 3
+!status apply a ward
+!status apply a burn 1 6
+!turn next
+!turn next
+!assert "status_duration('a', 'weak') == 2 and status_duration('a', 'dazed') == 2 and status_duration('a', 'burn') == 4"
+!assert "status_has('a', 'ward') and status_duration('a', 'ward') == None"
+!turn next
+!turn next
+!turn next
+!turn next
+!assert "not status_has('a', 'weak') and not status_has('a', 'dazed') and status_has('a', 'ward') and not status_has('a', 'burn')"
+!system set default status_tick_formula ""
+!system set default status_tick_when never
+
+Expected: the global formula counts a status down by one at the end of
+each of its bearer's turns. `weak` is defined for its data (a note
+here) with no tick of its own, so it used to drop out of the countdown
+and last forever; while it has a duration it now ticks through the global
+formula like the undefined `dazed` (3 → 2 after the 2x2 A's first turn
+ends, gone after its third). `ward`, defined and applied with no
+duration, is permanent and stays. `burn`'s own tick (-2) replaces the
+global formula (6 → 4, gone after A's third turn).
+
+
+SCENARIO 1216 — An action's `condition` is a precondition judged before its prepare and body (Y4)
+--------------------------------------------------------------------------------------------------
+!match new pc PC 10 8
+!match use pc
+!ent add a Ana 50 2 2 5
+!ent set_vars a footprint_width=2 footprint_height=2
+!ent add b Bo 8 6 2 3
+!eval "var_set('a', 'kit', {'charges': 0, 'actions': {'zap': {'target': 'entity', 'condition': 'source.charges > 0', 'prepare': 'say(\"zap prepared\")', 'body': '1'}, 'pow': {'target': 'none', 'condition': 'entity[self].hp > 100', 'condition_message': '{name} is too weak for {action} ({hp} hp).', 'body': 'say(\"pow\")'}, 'bad': {'target': 'none', 'condition': 'nope(1)', 'body': '1'}}})"
+!ent set_var a kit.actions.zap.body "deal_damage(target, 3)\nsource.charges = source.charges - 1"
+!ent set_var b actions.brace.before "incoming.braced = True"
+!action a zap b
+?? ❌ action `zap`: [condition] `a` can't use `zap` now.
+?! zap prepared
+!action a pow
+?? ❌ action `pow`: [condition] Ana is too weak for pow (50 hp).
+!action a bad
+?? (its condition formula failed: Function 'nope' is not allowed.)
+!action list a
+?? - `bad` (target: `none`, at `kit`) 🚫 its condition failed
+?? - `pow` (target: `none`, at `kit`) 🚫 condition not met
+?? - `zap` (target: `entity`, at `kit`) 🚫 condition not met
+!action info a zap
+?? Condition:   `source.charges > 0`
+!action info a pow
+?? Refusal:     {name} is too weak for {action} ({hp} hp).
+!eval "use_action('a', 'zap', 'b')"
+?? ↳ use_action `zap`: `a` can't use `zap` now.
+!system lint default
+?? ❌ match `pc` `a` action `kit.actions.bad` condition: Function 'nope' is not allowed.
+?! kit.actions.zap
+!ent set_var a kit.charges 1
+!action list a
+?? - `zap` (target: `entity`, at `kit`)
+?! - `zap` (target: `entity`, at `kit`) 🚫
+!action a zap b
+?? zap prepared
+?? `!react b brace`
+!react b pass
+?? 🩸 **Bo** (`b`) takes 3 damage from Ana.
+!action a zap b
+?? ❌ action `zap`: [condition] `a` can't use `zap` now.
+!system set default action_condition_message_format "{name} has no charges left."
+!action a zap b
+?? ❌ action `zap`: [condition] Ana has no charges left.
+!assert "entity[b].hp == 5 and entity[a].kit.charges == 0"
+
+Expected: HARNESS-ALLOWS-ERRORS. A `condition` on an action that isn't a
+reaction is judged before its prepare and body, self = the acting unit,
+`source` its container (user call, Y4: it was accepted and ignored). The
+2x2 Ana's zap has no charges, so it is refused before its prepare runs
+(no "zap prepared"); the refusal is worded by the
+action_condition_message_format rule, and pow's own `condition_message`
+replaces it with the unit's placeholders. A condition whose formula fails
+refuses too and says why. `!action list` marks each action whose
+condition is unmet now, `!action info` shows the condition and the
+refusal text, use_action reports the refusal, and `!system lint` checks
+the condition (reading `source.charges` as an action does). With a charge
+the zap prepares, Bo's reaction window opens, and the zap lands and spends
+the charge; the next try is refused again, in the rule's new wording.
+
+
+SCENARIO 1217 — A `!func` ending on an if / elif / else returns the branch's trailing value (Y5)
+------------------------------------------------------------------------------------------------
+!match new fr FR 10 8
+!match use fr
+!ent add a Ana 50 2 2 5
+!ent set_vars a footprint_width=2 footprint_height=2
+!ent add b Bo 8 6 2 3
+!func def ready eid "if entity[eid].hp > 10:\n    True\nelse:\n    False"
+!func def tier eid "h = entity[eid].hp\nif h > 40:\n    'high'\nelif h > 5:\n    if h > 7:\n        'mid'\n    else:\n        'lowmid'\nelse:\n    x = 1"
+!func def big eid "if entity[eid].hp > 10:\n    'big'"
+!eval "[ready('a'), ready('b'), tier('a'), tier('b'), big('a'), big('b')]"
+?? = `[True, False, 'high', 'mid', 'big', None]`
+!eval "if ready('a'):\n    say('Ana is ready')\nelse:\n    say('Ana is not ready')"
+?? Ana is ready
+!ent hp b 6
+!eval "tier('b')"
+?? = `'lowmid'`
+!ent hp b 2
+!eval "[tier('b')]"
+?? = `[None]`
+!func def sneaky eid "if True:\n    __fn_result = 3"
+?? `__fn_result` can't be a local's name
+
+Expected: HARNESS-ALLOWS-ERRORS. A function's value was its last
+statement's when that is an expression, so a body ending on an if / else
+returned None and every caller took its false branch (user call, Y5). The
+value of the branch that ran is returned now, through elif chains and an
+if nested at the end of a branch: Ana (50 hp, a 2x2) is ready and high,
+Bo (8) is not and mid, then lowmid at 6. A branch ending on a statement
+(the `else` assigning x) or no branch running (big at 8 hp) returns None.
+The name the engine keeps the value under can't be a local.
+
+
+SCENARIO 1218 — An action whose targets all dropped out is cancelled (L54)
+-------------------------------------------------------------------------
+!match new dc DC 12 8
+!match use dc
+!ent add orc Orc 30 1 1 5
+!ent add ogre Ogre 30 5 2 3
+!ent set_vars ogre footprint_width=2 footprint_height=2
+!ent add imp Imp 10 9 2 2
+!ent set_var orc actions.sweep.target entity_list
+!ent set_var orc actions.sweep.target_condition "not status_has(target, 'hidden')"
+!ent set_var orc actions.sweep.cost "entity[self].stamina = 1"
+!ent set_var orc actions.sweep.body "for t in target:\n    deal_damage(t, 5)"
+!ent set_var orc actions.sweep.cancelled_action_cost pay
+!ent set_var ogre actions.duck.before "status_apply(self, 'hidden')"
+!ent set_var imp actions.duck.before "status_apply(self, 'hidden')"
+!turn next
+!action orc sweep ogre imp
+!react ogre duck
+!react imp pass
+?? ⚠️ Ogre drops out of `sweep`: Ogre no longer meets `sweep`'s target condition
+?? 🩸 **Imp** (`imp`) takes 5 damage from Orc.
+!assert "entity[imp].hp == 5 and entity[ogre].hp == 30"
+!ent status ogre remove hidden
+!action orc sweep ogre imp
+!react ogre duck
+!react imp duck
+?? 🚫 Orc's `sweep` is cancelled: every target dropped out.
+?! takes 5 damage
+!assert "entity[imp].hp == 5 and entity[ogre].hp == 30 and entity[orc].stamina == 1"
+
+Expected: an entity_list action re-checks each target at resolution. When
+the 2x2 ogre ducks and the imp doesn't, the ogre drops out and the sweep
+hits the imp alone. When both duck, nothing is left, and the sweep is
+cancelled (user call, L54: the body ran with no targets) with its cost
+paid per its cancelled_action_cost, as for a reaction's cancel.
+
+
+SCENARIO 1219 — reactions_while_hidden: what a unit the acting side can't see is offered
+----------------------------------------------------------------------------------------
+!match new hr HR 12 6
+!match use hr
+!match fog on
+!ent add orc Orc 30 1 1 5
+!ent set_vars orc team=red fog_vision_radius=3
+!ent add knight Knight 30 2 1 3
+!ent set_vars knight team=blue footprint_width=2 footprint_height=2
+!ent add spy Spy 30 10 5 2
+!ent set_vars spy team=blue
+!ent set_var orc actions.hit.target entity
+!ent set_var orc actions.hit.body "deal_damage(target, 5)"
+!ent set_var spy actions.warn.reacts_on any
+!ent set_var spy actions.warn.condition "target == 'knight'"
+!ent set_var spy actions.warn.before "incoming.warned = True"
+!ent set_var spy actions.guard.before "incoming.guarded = True"
+!turn next
+!action orc hit knight
+?? - Spy can react: `!react spy warn`
+!react skip
+!react set spy hidden=affected
+?? hidden: `affected` (its own)
+!action orc hit knight
+?! Spy can react
+?? 🩸 **Knight** (`knight`) takes 5 damage from Orc.
+!action orc hit spy
+?? - Spy can react: `!react spy guard`
+!react skip
+!react set spy hidden=none
+!action orc hit spy
+?! Spy can react
+!ent tp spy 3 3
+!action orc hit knight
+?? - Spy can react: `!react spy warn`
+!react skip
+!react set spy hidden=default
+?? hidden: `all` (the rule reactions_while_hidden)
+!ent tp spy 10 5
+!system set default reactions_while_hidden none
+!action orc hit knight
+?! Spy can react
+!react set spy mode=auto hidden=all
+?? mode: `auto` (its own)
+?? hidden: `all` (its own)
+!react set spy hidden=sometimes
+?? ❌ `hidden=` takes all, affected, none or default, not `sometimes`.
+!react set spy color=red
+?? ❌ Unexpected `color=red`
+!react set nobody
+?? ❌ Entity 'nobody' not found.
+!system set default reactions_while_hidden all
+!assert "entity[knight].hp == 10 and entity[spy].hp == 20"
+
+Expected: HARNESS-ALLOWS-ERRORS. A reaction answers in the open, so
+reacting can give away a unit the acting side can't see (user call, L54).
+The spy (blue) sits in the fog, out of the red orc's sight. By default
+(all) it is offered its bystander warn when the orc hits the 2x2 knight.
+`!react set spy hidden=affected`: unseen, it is offered only reactions to
+actions that directly affect it (guard when it is hit itself, no warn on
+the knight's hit). hidden=none: nothing while unseen. Once it stands
+where the orc sees it, the setting doesn't apply and warn is offered
+again. `default` goes back to the rule, which a system can set (none
+here). `!react set` also sets the reaction mode (`__reaction_mode`) and
+refuses words it doesn't know.
+
+
+SCENARIO 1220 — !system defpassive / defvar / clamp edit a system by name, with no match (Y10)
+----------------------------------------------------------------------------------------------
+!system new solis
+!defpassive add regen on_turn_start "entity[self].hp = entity[self].hp + 1"
+?? ❌ No active match for this channel, so no system to edit. Edit a system by name: `!system defpassive add <system> ...` (`!system defpassive list <system>` reads it)
+!defvar match add day 1
+?? `!system defvar match <action> <system> ...` (`!system defvar match list <system>` reads it)
+!gclamp list
+?? Edit a system by name: `!system clamp list <system>`, or `!match use <id>`.
+!system func def solis bonus x "x + 2"
+!system defpassive add solis regen on_turn_start "entity[self].mana = entity[self].mana + bonus(1)"
+?? Added default passive `regen` (on_turn_start) to system `solis`
+!system defpassive list solis
+?? - `regen` (on_turn_start): `entity[self].mana = entity[self].mana + bonus(1)`
+!system defvar add solis mana 5
+!system defvar match add solis day 1
+!system defvar match list solis
+?? - `day` = 1
+!system clamp add solis mana max=10
+!system clamp list solis
+?? - `mana`: max=10, mode=soft
+!system clamp add nosuch mana max=10
+?? GameSystem 'nosuch' not found
+!match new s S 8 8 solis
+!match use s
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!assert "entity[ogre].mana == 5 and match_var_get('day') == 1"
+!turn next
+!assert "entity[ogre].mana == 8"
+!ent set_var ogre mana 50
+?? `ogre` vars.mana = 10 (typed 50)
+!system defpassive remove solis regen
+?? default passive `regen` taken off 1 unit(s)
+!system clamp remove solis mana
+!system defvar list solis
+?? - `mana` = 5
+!as player bob
+!system defvar add solis armor 1
+?? ❌ Only a server administrator or a role with the `systems` capability
+
+Expected: HARNESS-ALLOWS-ERRORS. `!defpassive`, `!defvar` and `!gclamp`
+edit the system of the channel's match; with no match they now say so and
+name the `!system` form (user call, Y10). `!system defpassive|defvar|clamp
+<action> <system> ...` edits a system by name in the grammar of the other
+system libraries (the action first), so a setup file needs no scratch
+match: a default passive may call the system's own `!func` (bonus), and
+the defaults reach a match made on the system later. The 2x2 ogre starts
+with mana 5 and the match with day 1; its turn adds bonus(1) = 3; the
+clamp holds mana at 10. Removing the default passive takes it off the
+ogre too (default_passives_existing_units). The edits need the `systems`
+capability like `!system set`.
+
+
+SCENARIO 1221 — A `!run` file's quoted body continues over lines (Y10)
+----------------------------------------------------------------------
+!match new r R 8 8
+!match use r
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+?file write saves/setup.txt !func def tier eid "if entity[eid].hp > 20:\n    'high'\nelse:\n    'low'"\n!passive add ogre warn on_turn_start "if tier(self) == 'low':\n    say('Ogre is hurt')"\n# a comment between commands\n!ent set_var ogre size_num 120
+!run setup.txt
+?? Running 3 command(s) from `saves/setup.txt`...
+!eval "tier('ogre')"
+?? = `'high'`
+!ent hp ogre 10
+!turn next
+?? Ogre is hurt
+!assert "entity[ogre].size_num == 120"
+?file write saves/stray.txt !ent set_var ogre a "open\n!ent set_var ogre b 2
+!run stray.txt
+?? ❌ parse error in `saves/stray.txt`: No closing quotation
+!assert "not var_has('ogre', 'b')"
+
+Expected: HARNESS-ALLOWS-ERRORS. In a `!run` file a quote left open
+continues on the next lines that don't start with `!` (user call, Y10:
+only a `!template import`'s JSON did), joined as a body's line breaks,
+indentation kept, as the GUI and Discord join a body typed over lines; a
+`#` comment line between commands is still skipped. The file defines a
+`!func` and a passive over several lines: three commands. The 2x2 ogre at
+10 hp is `low`, so its passive says so. A stray quote ends at the next
+line starting with `!`: the open line fails to parse, the whole file is
+refused and nothing runs.
+
+
+SCENARIO 1222 — template_notes: notes on a template for whoever uses it (Y10)
+----------------------------------------------------------------------------
+!match new tn TN 10 8
+!match use tn
+!ent add ogre Ogre 40 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2 axe.damage=8
+!template save ogre
+!template notes ogre "Spawn one per 3 players.\nGive it `axe_common` at `axe`."
+?? 📝 Template `ogre` notes saved (55 characters).
+!template show ogre
+?? 📝 Spawn one per 3 players.
+?? Give it `axe_common` at `axe`.
+?! "template_notes"
+!template list
+?? - `ogre` — Ogre, hp 40, saved by cli, 📝 Spawn one per 3 players.…
+!template save ogre
+!template notes ogre
+?? Spawn one per 3 players.
+!template import axe_common {"kind": "partial", "data": {"damage": 8}, "template_notes": "The standard axe."}
+?? 📝 The standard axe.
+!template import axe_common {"kind": "partial", "data": {"damage": 9}}
+!template show axe_common
+?? 📝 The standard axe.
+!template spawn ogre 6 2
+!ent dump ogre2
+?! notes
+!template give axe_common ogre2 offhand
+!assert "not var_has('ogre2', 'offhand.template_notes') and entity[ogre2].offhand.damage == 9"
+!template import bad {"name": "Bad", "vars": {"hp": 3}, "template_notes": 5}
+?? ❌ Template `bad`: `template_notes` is text, got int.
+!template notes ogre -
+?? 📝 Cleared the notes of template `ogre`.
+!template notes ogre
+?? Template `ogre` has no notes.
+!as player bob
+!template notes axe_common mine
+?? needs host approval
+?tab "!template notes a"
+?? → '!template notes axe_common '
+
+Expected: HARNESS-ALLOWS-ERRORS. A template (entity or partial) holds
+notes for whoever uses it in `template_notes` (user call, Y10): library
+metadata, written with `!template notes <name> <text>` (`\n` a new line,
+`-` clears, no text shows them) or in the JSON of an import, shown by
+`!template show` above the JSON and by `!template list` (its first line,
+cut). A re-save and an import without the field keep them; the 2x2 ogre
+spawned from the template and the axe given from the partial carry no
+notes. A value that isn't text is refused. Editing them is a library edit
+(its saver, an administrator or the `templates` capability; a player's
+goes to the approval queue).
+
+
+SCENARIO 1223 — !system export: the chain, the templates and prefabs it uses (Y10)
+--------------------------------------------------------------------------------
+!system new base
+!system set base hp_var life
+!system new solis parent=base
+!system set solis friendlyfire true
+!system func def solis spawn_orc x "summon_template('orc', x, 1)"
+!system macro set solis setup "!prefab stamp hut 1 1"
+!match new s S 10 10 solis
+!match use s
+!ent add orc Orc 30 2 2 5
+!ent set_vars orc footprint_w=2 footprint_h=2 axe.damage=8
+!template save orc axe_common path=axe
+!template import orc {"name": "Orc", "vars": {"life": 30, "footprint_w": 2, "footprint_h": 2, "axe": {"__template": "axe_common", "damage": 9}}}
+!prefab save hut 1 1 3 3
+!template import loner {"name": "Loner", "vars": {"life": 5}}
+!system export solis solis.json
+?? 📦 Exported system `solis` to `saves/solis.json`.
+?? Importing it needs a system `base` on the server
+!system export solis solis.json
+?? already exists; add `overwrite` to replace it.
+!system export solis full.json full
+?? with its ancestors `base`.
+?? 2 template(s): `axe_common`, `orc`.
+?? 1 prefab(s): `hut`.
+?! loner
+!system export solis flat.json chain=flatten templates=loner
+?? (flattened: the values it inherits are its own)
+?? 1 template(s): `loner`.
+!system export solis x.json templates=ghost
+?? ❌ No template `ghost` in this server's library.
+!system export solis x.json chain=sideways
+?? ❌ `chain=` takes require, include, flatten, not `sideways`.
+!system import full.json as=solis2
+?? replaced `base`, created `solis2` (`solis` in the file).
+!system diff solis solis2
+?? `solis` and `solis2` have the same rules and libraries.
+!system import flat.json as=flat
+?? created `flat` (`solis` in the file).
+!system diff solis flat
+?? `solis` and `flat` have the same rules and libraries.
+!system info flat
+?! Inherits from
+!system rename base mom
+!system import solis.json as=solis3
+?? ❌ Can't import `saves/solis.json`: `solis3` inherits from `base`, which isn't on this server (export it with `chain=include` or `chain=flatten`).
+!system list
+?! solis3
+!system import nosuch.json
+?? ❌ File not found: `saves/nosuch.json`.
+!match new s2 S2 10 10 solis2
+!match use s2
+!eval "spawn_orc(5)"
+!assert "entity[orc].life == 30 and entity[orc].axe.damage == 9 and footprint_width('orc') == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system export <system> <file>` writes
+a system file (user call, Y10). solis inherits from base: `chain=require`
+(default) writes solis alone and says the import needs a `base`;
+`include` (`full` sets it) writes base too; `flatten` writes solis as a
+root holding what it inherits. `templates=` / `prefabs=` choose what
+travels: `used` (`full`) takes the templates its formulas name (`orc` in
+spawn_orc), the partials they reference (`axe_common`) and the prefabs
+its macro names or that were saved under it (`hut`), not the unused
+`loner`; a list names them. Imports with `as=` show each form lands as the
+same system: the full file creates solis2 (replacing base with the
+file's), the flat one a root `flat`. With base renamed away the
+`require` file is refused, naming the missing parent, and nothing
+changes. A match on solis2 spawns the 2x2 orc its function names, with
+the partial's axe.
+
+
+SCENARIO 1224 — !system import: replace or merge, matches take the rules, all or nothing (Y10)
+--------------------------------------------------------------------------------------------
+!system new rpg
+!system set rpg friendlyfire true
+!system set rpg hp_var life
+!system func def rpg dbl x "x * 2"
+!system export rpg rpg.json
+!system set rpg hp_var hp
+!system set rpg turnorder_direction lowest_first
+!system func def rpg tpl x "x * 3"
+!match new m M 10 10 rpg
+!match use m
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!system import rpg.json mode=merge
+?? merged into `rpg`.
+?? Matches on it took its rules: `m`.
+!system info rpg
+?? `turnorder_direction` = 'lowest_first'
+?? `hp_var` = 'life'
+!assert "entity[ogre].life == 30 and not var_has('ogre', 'hp')"
+!system func list rpg
+?? tpl
+!system import rpg.json
+?? replaced `rpg`.
+!system info rpg
+?! `turnorder_direction` = 'lowest_first'
+!system func list rpg
+?! tpl
+!system undo
+?? ↩️ Undid 1 server-wide edit(s):
+!system func list rpg
+?? tpl
+!system export rpg bad.json
+?file set saves/bad.json systems.0.settings.friendlyfire.value "yes"
+!system import bad.json
+?? ❌ Can't import `saves/bad.json`: `rpg`: `friendlyfire` is true or false, got 'yes'.
+!system func list rpg
+?? tpl
+?file write saves/junk.json {"format": "something"}
+!system import junk.json
+?? isn't a system file
+!system import rpg.json mode=sideways
+?? ❌ `mode=` takes replace, merge, not `sideways`.
+!as player bob
+!system import rpg.json
+?? ❌ Only a server administrator or a role with the `systems` capability
+!system export rpg mine.json
+?? ❌ Only a server administrator or a role with the `files` capability
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system import <file>` installs a
+system file over a system of the same name (user call, Y10). `mode=merge`
+lays the file over it: the file's rules (hp_var `life`, friendlyfire) and
+functions win, the server's own others (turnorder_direction lowest_first,
+the `tpl` function) stay; the match on it takes the rules at once, so the
+2x2 ogre's `hp` moves to `life`. The default `replace` makes it the
+file's: lowest_first and `tpl` go. The import is one `!system undo` step. A
+file holding a rule value its rule refuses is refused whole, naming it,
+and changes nothing; a file that isn't a system file and an unknown mode
+are refused. Importing needs the `systems` capability (and `files` to
+read the file), exporting the `files` capability.
+
+
+SCENARIO 1225 — Dice pools: success counts, failures, rerolls, Fate dice and d% (#104)
+----------------------------------------------------------------------------------------
+
+!match new dp Dp 8 8
+!match use dp
+!system set default random_seed 11
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!assert "roll('5d1>=1') == 5"
+!assert "roll('5d1>=1+2') == 7"
+!assert "roll('5d1>=1f1') == 0"
+!assert "roll('-3d1>=1') == -3"
+!assert "roll('3d1=1+2d1=2') == 3"
+!assert "roll('6d10>=8') <= 6"
+!assert "min(roll_dice('30d6r1')) >= 2"
+!assert "min(roll_dice('30d6r<3')) >= 3"
+!assert "min(roll_dice('30d6r1r2')) >= 3"
+!assert "min(roll_dice('30dF')) == -1 and max(roll_dice('30dF')) == 1"
+!assert "roll('d%') >= 1 and roll('d%') <= 100"
+!assert "len(roll_dice('4d10!>=8', all=True)) >= 4"
+!ent set_var ogre pool $(5)
+!eval "entity[ogre].pool = roll('6d10>=8') + roll('4dF')"
+!assert "entity[ogre].pool >= -4 and entity[ogre].pool <= 10"
+!roll 6d10>=8f1
+?? 6d10>=8f1 [
+?? failures = 
+!roll 2d6r1
+?? 2d6r1 [
+!roll 4dF+1
+?? 4dF [
+!roll 2d6r1ro2
+?? mixes `r` (reroll until) and `ro` (reroll once)
+!roll 2d6f1
+?? comes after a success test
+!roll 1d6r<7
+?? rerolls every face
+!roll 4d6kh3>=4
+?? both keeps dice and counts successes
+!roll 2dF!
+?? Fate dice don't explode
+!roll 2d6>=7>=8
+?? gives a success test twice
+!roll 2d6r=-1
+?? 2d6r=-1 [
+
+Expected: HARNESS-ALLOWS-ERRORS. A comparison after a die group counts
+the dice meeting it, and a flat modifier adds to the count: five d1s
+`>=1` are 5 successes, 7 with `+2`. `f1` after it takes one off per die
+showing 1 (five d1s: 5 - 5 = 0); a `-` group subtracts its count. `r1`
+rerolls a 1 until the die shows something else, `r<3` anything under 3,
+`r1r2` both. `dF` dice are -1 / 0 / +1, `d%` a d100; an exploding pool
+counts every roll of the chain as a die. The replies show each die and
+the count. Refused: `r` and `ro` together, a failure term without a
+success test, a reroll matching every face, keeping dice while counting
+successes, exploding Fate dice and a second success test. A negative
+reroll number takes its op (`r=-1`).
+
+
+SCENARIO 1226 — Odds of pools and rerolls: !roll odds, roll_odds, roll_mean (#104, #361)
+---------------------------------------------------------------------------------------
+
+!match new od Od 8 8
+!match use od
+!roll odds 6d10>=8 >= 3
+?? P(`6d10>=8` ≥ 3) = **25.57%** (25569/100000)
+!roll odds 2d6 >= 8
+?? P(`2d6` ≥ 8) = **41.67%** (5/12)
+!roll odds 2d6 >=8
+?? P(`2d6` ≥ 8) = **41.67%** (5/12)
+!roll odds 1d6ro1 = 1
+?? (1/36)
+!roll odds 4dF = 0
+?? (19/81)
+!roll odds 2d6r1
+?? 4–12, average 8.00
+!roll odds 6d10>=8
+?? 0–6, average 1.80
+!assert "abs(roll_odds('2d6', '>=', 8) - 5 / 12) < 1e-12"
+!assert "abs(roll_odds('2d6', '>=', 8, percent=True) - 500 / 12) < 1e-9"
+!assert "abs(roll_mean('4d6kh3') - 12.2446) < 0.0001"
+!assert "abs(roll_mean('2d6ro1') - 7.8333) < 0.0001"
+!assert "abs(roll_mean('6d10!>=8') - 2) < 0.0001"
+!assert "chance(100 * roll_odds('1d6', '>=', 1))"
+!ent add scout Scout 10 1 1 5
+!ent set_var scout odds "$(roll_odds('1d20', '>=', 11))"
+!assert "entity[scout].odds == 0.5"
+!eval "roll_odds('2d6', '~', 3)"
+?? op is one of >= <= > < = == !=
+!eval "roll_odds('2d6', '>=', 8, percent=1)"
+?? percent= is True or False
+
+Expected: HARNESS-ALLOWS-ERRORS. `!roll odds` takes its target as a word
+of its own (`>= 8` or `>=8`); a comparison joined to the dice counts
+successes, so `!roll odds 6d10>=8 >= 3` is the chance of three or more
+successes. Rerolls and Fate dice are worked out exactly: rerolling a 1
+once leaves a 1 at 1/36, four Fate dice total 0 at 19/81, rerolling 1s
+on 2d6 averages 8. `roll_odds(spec, op, n)` gives the chance as a
+fraction (percent=True as a percentage), `roll_mean(spec)` the average;
+both draw nothing and are allowed in `$()`. A bad op or a percent= that
+isn't a bool is refused.
+
+
+SCENARIO 1227 — Success tiers composed from band(): PbtA and Call of Cthulhu (#105)
+----------------------------------------------------------------------------------
+
+!match new tr Tr 8 8
+!match use tr
+!system set default random_seed 4
+!ent add hero Hero 20 1 1 5
+!ent set_var hero skill 60
+!func def pbta roll_total "band(roll_total, '-6:miss,7-9:partial,10-:hit')"
+!func def coc pct,skill "band(pct, '1-' + str(skill // 5) + ':extreme,' + str(skill // 5 + 1) + '-' + str(skill // 2) + ':hard,' + str(skill // 2 + 1) + '-' + str(skill) + ':regular,' + str(skill + 1) + '-:fail')"
+!eval "[pbta(6), pbta(7), pbta(9), pbta(10)]"
+?? = `['miss', 'partial', 'partial', 'hit']`
+!eval "[coc(12, 60), coc(13, 60), coc(30, 60), coc(31, 60), coc(61, 60)]"
+?? = `['extreme', 'hard', 'hard', 'regular', 'fail']`
+!eval "entity[hero].tier = pbta(roll('2d6'))"
+!assert "entity[hero].tier in ['miss', 'partial', 'hit']"
+!eval "entity[hero].check = coc(roll('d%'), entity[hero].skill)"
+!assert "entity[hero].check in ['extreme', 'hard', 'regular', 'fail']"
+!assert "roll('2d6') - roll('2d6') <= 10"
+
+Expected: The tiers of #105 come from what ships (user call: struck as
+its own feature). A Powered by the Apocalypse move is `band()` over 2d6
+(6- miss, 7-9 partial, 10+ hit); Call of Cthulhu's tiers are a band with
+bounds worked out from the skill (a fifth: extreme, a half: hard, the
+skill: regular, above it: fail), here as two `!func`s. An opposed roll
+is one roll minus the other.
+
+
+SCENARIO 1228 — Table rolls with adjusted weights and a rank: remove=, add=, best=, worst= (#253)
+-----------------------------------------------------------------------------------------------
+
+!match new tb Tb 8 8
+!match use tb
+!system set default random_seed 3
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!table def crit none:3, minicrit, crit
+!table rank crit
+?? best first: `none`, `minicrit`, `crit` (the order written: no rank is set).
+!table rank crit crit,minicrit,none
+?? Ranked table `crit`, best first: `crit`, `minicrit`, `none`.
+!table show crit
+?? none:3, minicrit, crit rank=crit,minicrit,none
+!table roll crit remove=none:3
+?! **none**
+!table roll crit remove=none:3 remove=minicrit
+?? **crit**
+!table roll crit 3 remove=none:3,minicrit add=crit:2
+?? 3x table `crit` (none −3, minicrit −1, crit +2) → **crit**, **crit**, **crit**
+!table roll crit best=3 remove=none:3
+?! → **none**
+!table roll crit worst=2 remove=crit,minicrit
+?? none, none → **none**
+!assert "table_roll('crit', remove={'none': 3, 'minicrit': 1}) == 'crit'"
+!assert "table_roll('crit', remove='none:3,crit', best=2) == 'minicrit'"
+!assert "len(table_roll('crit', 4, best=2)) == 4"
+!eval "entity[ogre].loot = table_roll('crit', add={'crit': 100}, best=2)"
+!assert "entity[ogre].loot == 'crit'"
+!roll crit remove=none:3,minicrit
+?? **crit**
+!table roll crit remove=zzz
+?? remove= names `zzz`, which isn't an entry of the table.
+!table roll crit best=2 worst=2
+?? `best=` or `worst=`, once
+!table roll crit best=0
+?? best= is a whole number from 1 to
+!table rank crit gold
+?? the rank names `gold`, which isn't an entry of the table.
+!table def loot gold, gem rank=gem
+!table rank loot
+?? best first: `gem`, `gold`.
+!table rank crit -
+?? Cleared the rank of table `crit`
+!system table def default spoils junk:5, relic rank=relic
+!system table rank default spoils
+?? best first: `relic`, `junk`.
+!system table rank default spoils junk,relic
+?? Ranked table `spoils` on `default`, best first: `junk`, `relic`.
+!eval "table_roll('crit', best=True)"
+?? best= is a whole number
+
+Expected: HARNESS-ALLOWS-ERRORS. A table roll can change entries'
+weights for that roll: `remove=none:3` takes three off (never below 0),
+`add=crit:2` adds, a bare entry means 1, and repeated options add up.
+`!table rank` stores the entries best first (shown, set, cleared with
+`-`); without one the order written is the order (user call, option c).
+It can also end a `def` as ` rank=a,b`. `best=<n>` / `worst=<n>` roll n
+times and keep the best / worst by that rank: with no `none` left,
+`best=3` never keeps `none`, and with only `none` left `worst=2` keeps
+it. table_roll takes the same as dicts or text; `!roll <table>` takes
+the options too. Refused: an unknown entry, both best= and worst=, a
+count under 1, a rank naming no entry. `!system table rank` ranks a
+system's table.
+
+
+SCENARIO 1229 — Tables that roll tables and dice: @sub-tables, {2d6} in an entry, path=True (#459)
+--------------------------------------------------------------------------------------------------
+
+!match new ts Ts 8 8
+!match use ts
+!system set default random_seed 9
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_h 2
+!table def gems ruby, opal
+!table def coins {2d6} gold, {1d4+1} silver
+!table def loot @gems, @coins
+!table roll loot 4
+?? (via `
+!eval "entity[ogre].got = table_roll('loot')"
+!assert "entity[ogre].got in ['ruby', 'opal'] or ' gold' in entity[ogre].got or ' silver' in entity[ogre].got"
+!eval "entity[ogre].pick = table_roll('loot', path=True)"
+!assert "get(entity[ogre].pick, 0) in ['gems', 'coins'] and len(entity[ogre].pick) == 2"
+!assert "table_roll('gems', path=True) in [['ruby'], ['opal']]"
+!table def wages {3d1} gold
+!assert "table_roll('wages') == '3 gold'"
+!table def deep @gems
+!eval "entity[ogre].deep = table_roll('deep', 3, path=True)"
+!assert "len(entity[ogre].deep) == 3 and get(entity[ogre].deep, '0.0') == 'gems' and get(entity[ogre].deep, '2.1') in ['ruby', 'opal']"
+!table def self @self
+?? names the table itself; a table can't roll itself.
+!table def bad {2q6} gold
+?? malformed term
+!table def later @nowhere, gold:0
+?? names table `nowhere`, which isn't defined yet.
+!table roll later
+?? ❌ table `later`: entry `@nowhere` names table `nowhere`, which doesn't exist.
+!table def ping @pong
+!table def pong @ping
+!system set default table_nesting_limit 3
+!table roll ping
+?? ⚠️ table `ping` went 3 tables deep (table_nesting_limit) and stopped at `@pong`.
+!eval "table_roll('ping')"
+?? = `'@pong'`
+?? went 3 tables deep
+!system set default table_nesting_limit 0
+?? 0
+
+Expected: HARNESS-ALLOWS-ERRORS. An entry `@<table>` rolls that table
+when picked, and `{<dice>}` in an entry's text is replaced by a roll
+(`{3d1} gold` is always `3 gold`). The command names the tables a pick
+went through (`via`); `table_roll(name, path=True)` returns them, then
+the final text. A table naming itself and dice that don't parse are
+refused when defined; a sub-table not defined yet is stored with a
+note, and rolling into it is refused. A longer loop stops at the
+table_nesting_limit rule (default 8) with a ⚠️, keeping the entry it
+picked; the rule is at least 1.
+
+
+SCENARIO 1230 — !table odds: every entry's chance, sub-tables under their entry, with adjustments (#362)
+-------------------------------------------------------------------------------------------------------
+
+!match new to To 8 8
+!match use to
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!table def gems ruby, opal:3
+!table def loot gold:2, @gems, none rank=@gems,gold
+!table odds loot
+?? gold     50.00%
+?? @gems    25.00%
+??   ruby    6.25%
+??   opal   18.75%
+?? none     25.00%
+!table odds loot remove=gold:2
+?? (gold −2)
+?? @gems    50.00%
+!table odds loot best=2
+?? best of 2
+?? @gems    43.75%
+?? gold     50.00%
+?? none      6.25%
+!table odds loot worst=2
+?? none     43.75%
+?? @gems     6.25%
+!as player bob
+!table odds loot
+?? @gems    25.00%
+!table roll loot
+?? table `loot`
+!as host
+!table odds nothing
+?? ❌ no table `nothing`.
+
+Expected: HARNESS-ALLOWS-ERRORS. `!table odds <name>` lists each entry's
+chance and, under an `@` entry, the sub-table's entries with their
+overall chance (opal 3/4 of 25%). It takes the roll's adjustments
+(`remove=gold:2` leaves gems and none at 50% each) and best= / worst=,
+which work from the rank: best of 2 keeps gems unless both picks miss it
+(1 - 0.75² = 43.75%), gold when neither is gems and one is gold, none
+only when both are none (6.25%). Players read the odds as they roll the
+table.
+
+
+SCENARIO 1231 — The action dice line: on, labelled, reaction halves, failed attempts, a hidden actor (#520)
+----------------------------------------------------------------------------------------------------------
+
+!match new dl Dl 9 9
+!match use dl
+!system set default random_seed 2
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 3 1 3
+!ent set_var orc team red
+!ent set_var hero team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = roll('2d6', label='damage')"
+!ent set_var orc actions.cleave.body "hit = roll('1d20', label='attack')\nentity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.block.reacts_to melee
+!ent set_var hero actions.block.before "incoming.damage = max(0, incoming.damage - roll('1d4', label='block'))"
+!action orc cleave hero
+?! 🎲
+!react hero pass
+?! 🎲
+!system set default action_dice_line on
+!action orc cleave hero
+?? 🎲 damage 2d6 →
+!react hero block
+?? 🎲 block 1d4 →
+?? 🎲 attack 1d20 →
+!ent set_var orc actions.pick.target none
+!ent set_var orc actions.pick.body "a = roll('1d6')\nb = choose('which?', ['x', 'y'])\nc = roll('1d8', label='c')"
+!action orc pick answer=x
+?? 🎲 1d6 → 
+?? · c 1d8 →
+!ent set_var orc actions.boom.target none
+!ent set_var orc actions.boom.body "a = roll('1d6', label='a')\nfail('nope')"
+!action orc boom
+?! 🎲
+!system set default action_dice_line labelled
+!action orc pick answer=y
+?? 🎲 c 1d8 →
+?! 1d6
+!system set default action_dice_line_format "🎲 {actor_name} ({action}): {rolls}"
+!system set default action_dice_roll_format "{spec}={total}"
+!ent set_var orc actions.pool.target none
+!ent set_var orc actions.pool.body "a = roll_dice('6d10>=8', label='pool')"
+!action orc pool
+?? 🎲 Orc (pool): 6d10>=8=
+!eval "roll('1d6', label=3)"
+?? label must be text
+!defvar add fog_vision_radius 1
+!ent set_var hero fog_vision_radius 1
+!ent set_var orc fog_vision_radius 1
+!ent tp orc 8 8
+!ent set_var hero actions.pray.target none
+!ent set_var hero actions.pray.body "a = roll('1d6', label='prayer')"
+!match fog on
+!match bind pov=blue
+!eval "use_action('orc', 'pool')"
+?! 🎲
+!eval "use_action('hero', 'pray')"
+?? 🎲 Hero (pray): 1d6=
+!match bind pov=red
+!eval "use_action('orc', 'pool')"
+?? 🎲 Orc (pool)
+
+Expected: HARNESS-ALLOWS-ERRORS. With action_dice_line `off` (default)
+no line prints. `on`: after an action succeeds, one line lists its rolls
+(label, dice, total). The prepare prints its own line when the window
+opens; the reaction's half prints its own line about the reacting unit,
+and the body its line. A choose() replay counts each roll once; a failed
+action prints none. `labelled` shows only rolls given a label. The two
+format rules shape the line and each roll; `roll_dice` labels too, and
+a label must be text. The line is about the acting unit: with fog on, a
+channel seeing as blue doesn't get the line of the 2x1 orc out of its
+sight (an action a formula starts, here `!eval`), gets the hero's, and
+red's channel gets the orc's.

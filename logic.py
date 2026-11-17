@@ -17,6 +17,7 @@ import contextvars
 import time
 from contextlib import contextmanager
 import keyword
+import unicodedata
 
 # Lines a formula's changes produced while a command runs (see
 # Match.surface_log). A context variable, so each command — on Discord, each
@@ -2369,7 +2370,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula body run once per (entity, status) at the time "
-            "specified by status_tick_when. Empty (default) is a no-op "
+            "specified by status_tick_when, for each status without a "
+            "definition and each defined status without a `tick` of its "
+            "own that has a duration (a status defined for its data still "
+            "counts down; a permanent one doesn't). A definition's own "
+            "tick replaces it. Empty (default) is a no-op "
             "even if status_tick_when is set. Context bindings: "
             "entity[self] = the bearing entity, this = "
             "current_entity_id(), status_name = the status being "
@@ -3668,6 +3673,51 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "The most rolls one `!roll Nx ...` makes (`!roll 6x 4d6kh3`, "
             "`!roll 2x none, crit`): N past it is refused."
+        ),
+    },
+    "table_nesting_limit": {
+        "default": 8,
+        "schema": {"type": "int", "min": 1, "max": 100, "ceiling": True},
+        "desc": (
+            "How many tables deep one table roll goes: an entry `@<table>` "
+            "rolls that table when picked (`!table def loot gold, "
+            "@gems`), and a roll that reaches this depth stops at the "
+            "entry it picked, with a ⚠️. A table naming itself is refused "
+            "when it is defined; this stops a longer loop (loot -> gems -> "
+            "loot)."
+        ),
+    },
+    "action_dice_line": {
+        "default": "off",
+        "schema": {"type": "str", "choices": ["off", "on", "labelled"]},
+        "desc": (
+            "After an action succeeds, one line lists the dice its formulas "
+            "rolled with roll() and roll_dice() (action_dice_line_format): "
+            "`on` every roll, `labelled` only rolls given a label "
+            "(`roll('1d20+5', label='attack')`), `off` none. A reaction's "
+            "halves print their own line, about the reacting unit. Rolls of "
+            "an attempt that was rolled back (a choose() replay, a failed "
+            "action, a damage forecast) are left out. The line is about the "
+            "acting unit: a channel whose view can't see it doesn't show it."
+        ),
+    },
+    "action_dice_line_format": {
+        "default": "🎲 {rolls}",
+        "schema": {"type": "str"},
+        "desc": (
+            "The action dice line (action_dice_line). `{rolls}` is the "
+            "rolls, each as action_dice_roll_format, joined by ` · `; "
+            "`{actor}` / `{actor_name}` the acting unit (its name as the "
+            "channel's view sees it) and `{action}` the action."
+        ),
+    },
+    "action_dice_roll_format": {
+        "default": "{label} {spec} → {total}",
+        "schema": {"type": "str"},
+        "desc": (
+            "One roll on the action dice line: `{label}` (empty for a roll "
+            "without one), `{spec}` the dice as written and `{total}` the "
+            "result. Spaces left at either end are dropped."
         ),
     },
     "summon_event_limit": {
@@ -5012,7 +5062,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "action_used_message_format": {
-        "default": "`{actor}` used action `{action}`{?target?} on `{target}`{/?}.",
+        # Names through the view's markers (V25: the ids named a hidden
+        # actor in a team-view channel that resolved its window).
+        "default": ("`{actor_name}` used action `{action}`{?target?} on "
+                    "`{target_name}`{/?}."),
         "schema": {"type": "str"},
         "desc": (
             "The line a successful `!action` (or `!ent action`) ends with. "
@@ -5066,6 +5119,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`undead``). Empty = the default text."
         ),
     },
+    "action_condition_message_format": {
+        "default": "`{actor}` can't use `{action}` now.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The refusal of an action whose `condition` (its precondition, "
+            "an expression judged before its prepare and body, self = the "
+            "acting unit, `source` its container, `target` / `args` as "
+            "typed) reads false. An action's own `condition_message` "
+            "replaces it. Placeholders: {actor}, {action}, {target}, and "
+            "the acting unit's ({name}, {x}, {y}, {team}, its vars). "
+            "`!action list` marks an action whose condition is unmet now. "
+            "A reaction's `condition` decides when it is offered instead. "
+            "Empty = the default text."
+        ),
+    },
     "action_choice_limit": {
         "default": 20,
         "schema": {"type": "int", "min": 0, "max": 100, "ceiling": True},
@@ -5091,6 +5159,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "whose `auto_when` is true (a reaction without one whenever it "
             "is available), by priority, up to reactions_per_window. never: "
             "the unit is never offered a reaction."
+        ),
+    },
+    "reactions_while_hidden": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "affected", "none"]},
+        "desc": (
+            "What a unit is offered while the acting unit's side (its body "
+            "team) can't see it (fog, a visibility condition, a hidden "
+            "seat): a reaction answers in the open, so offering one can give "
+            "the unit away. all (default): every reaction it would be "
+            "offered in plain sight. affected: only reactions to actions "
+            "that directly affect it (its bystander, `reacts_on: any`, "
+            "reactions wait until it is seen). none: no reaction while "
+            "unseen. A unit's own `__reactions_while_hidden` var overrides "
+            "it (`!react set <unit> hidden=<mode>`). A teamless actor sees "
+            "every unit here."
         ),
     },
     "reactions_per_window": {
@@ -5155,6 +5239,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "program (an action's own `cancelled_action_cost` field "
             "overrides it). refund (default): it pays nothing. pay: its "
             "`cost` runs anyway (the mana of a countered spell is spent)."
+        ),
+    },
+    "reaction_queue_limit": {
+        "default": 50,
+        "schema": {"type": "int", "min": 0, "max": 1000, "ceiling": True},
+        "desc": (
+            "How many actions may wait in the reaction queue: an action a "
+            "formula outside any action starts (a passive, a watcher, "
+            "`!eval`) while a reaction window is open waits there for its "
+            "own window. Past this count such a use_action is refused with "
+            "a line (each queued action costs the next a copy of the match, "
+            "and the host closes the windows one at a time). 0 = none "
+            "wait: they are refused while a window is open."
         ),
     },
     "reaction_depth_limit": {
@@ -6507,7 +6604,20 @@ def _check_filter_rule(key: str, raw: str) -> str:
     return v
 
 
+def _check_glyph_rule(key: str, raw: str) -> str:
+    """preview_glyph / fog_glyph / void_glyph: their first character is
+    drawn, so it must be one column wide (Y8); empty stays allowed."""
+    if raw:
+        why = glyph_problem(raw[0])
+        if why is not None:
+            raise VTTError(f"Setting '{key}': {why}.")
+    return raw
+
+
 _FORMAT_RULE_CHECKS = {
+    "preview_glyph": _check_glyph_rule,
+    "fog_glyph": _check_glyph_rule,
+    "void_glyph": _check_glyph_rule,
     "transform_keep_vars": _check_var_path_list,
     "private_vars": _check_private_paths,
     "team_private_vars": _check_private_paths,
@@ -8831,7 +8941,7 @@ def facing_look_entry(kind: str, facing: Any, value: Any) -> bool:
     if not isinstance(facing, str) or facing not in ALLOWED_DIRECTIONS:
         return False
     if kind == "glyphs":
-        return isinstance(value, str) and len(value) == 1
+        return glyph_ok(value)
     return isinstance(value, str) and bool(value)
 
 
@@ -8840,7 +8950,7 @@ def zone_look_value(key: str, value: Any) -> bool:
     glyph, a non-empty color / sprite text, a legend text or False, a
     direction, a {facing: glyph / sprite} dict with a usable entry)."""
     if key == "glyph":
-        return isinstance(value, str) and len(value) == 1
+        return glyph_ok(value)
     if key == "legend":
         return value is False or (isinstance(value, str) and bool(value))
     if key == "facing":
@@ -10313,6 +10423,14 @@ class Entity:
             m.round_acted = [x for x in m.round_acted if x != self.id]
         if (despawn or not (corpse_kept or self.part_of)):
             m.own_turn_counts.pop(self.id, None)
+            # An open or queued exchange whose actor leaves for good doesn't
+            # resolve (H2: it named its actor by id, so a unit added later
+            # under the id answered the window with its own action).
+            for ex in list(m.reaction_stack) + list(m.reaction_queue):
+                if isinstance(ex, dict) and self.id in (
+                        ex.get("actor"), ex.get("eff_actor"),
+                        ex.get("holder_unit")):
+                    ex["actor_gone"] = True
         m._scrub_entity_from_groups(self.id)
         # Drop any entity-attached scheduled effects bound to this entity
         # — a dead/despawned entity's pending turn-delayed effects don't
@@ -10749,6 +10867,9 @@ class Entity:
             value = checked_tag_vars(
                 path, value, str(self._match.rules.get("tags_var", "tags")),
                 f"Writing '{path}' on `{self.id}`")
+            checked_glyph_write(
+                path, value, f"Writing '{path}' on `{self.id}`",
+                ("", str(self._match.rules.get("disguise_var", "disguise"))))
         if self._match is not None:
             # A container whose marker was measured inside another
             # container (copied out of it) is re-measured on its own.
@@ -11173,8 +11294,11 @@ class Entity:
         return log
 
     # ---------- passive management (entity-scoped) ----------
-    def add_passive(self, p: "Passive") -> None:
-        """Attach a Passive to this entity. Validates that its formula parses."""
+    def add_passive(self, p: "Passive",
+                    known_funcs: "Optional[frozenset]" = None) -> None:
+        """Attach a Passive to this entity. Validates that its formula
+        parses; a call to one of `known_funcs` (default: the unit's match's
+        `!func`s) is allowed."""
         if p.id in self.passives:
             raise DuplicateId(
                 f"Passive id '{p.id}' already exists on entity '{self.id}'."
@@ -11182,7 +11306,11 @@ class Entity:
         # Early-fail on a malformed formula so the user sees the error now,
         # not later when the hook fires.
         from formula import validate_formula
-        validate_formula(p.formula, mode="exec")
+        if known_funcs is None:
+            m = self._match
+            known_funcs = frozenset(getattr(m, "formula_functions", None)
+                                    or ())
+        validate_formula(p.formula, mode="exec", known_funcs=known_funcs)
         self.passives[p.id] = p
         self.mark_changed()
 
@@ -11309,6 +11437,75 @@ def glyph_of(v: Any) -> Any:
     if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9:
         return str(v)
     return v
+
+
+def glyph_problem(v: Any) -> Optional[str]:
+    """Why `v` can't be a map glyph, None when it can: one character one
+    column wide in a monospaced map. An emoji or a CJK character is one
+    code point and two columns, and pushed the rest of its row one column
+    right (Y8); a combining mark or a zero-width character takes none."""
+    v = glyph_of(v)
+    if not isinstance(v, str) or len(v) != 1:
+        return "a glyph is exactly one character"
+    if unicodedata.east_asian_width(v) in ("W", "F"):
+        return (f"`{v}` is two columns wide in a monospaced map and would "
+                f"shift the rest of its row; a glyph is one column")
+    if unicodedata.combining(v) or unicodedata.category(v) in (
+            "Mn", "Me", "Cf", "Cc", "Zl", "Zp"):
+        return f"{v!r} takes no column of its own in a map"
+    return None
+
+
+def checked_glyph_write(path: str, value: Any, where: str,
+                        roots: Tuple[str, ...] = ("",)) -> None:
+    """Refuse a map glyph a write would store that glyph_problem rejects
+    (Y8): `glyph` / `glyphs.<facing>` under each of `roots` (a unit's vars
+    and its disguise; a tile's data), or a dict written above them. None
+    (no glyph) passes."""
+    segs = path.split(".") if path else []
+
+    def bad(v: Any, at: str) -> None:
+        if v is None:
+            return
+        why = glyph_problem(v)
+        if why is not None:
+            raise VTTError(f"{where}: `{at}` is a map glyph; {why}.")
+
+    def look(node: Any, at: str) -> None:
+        if not isinstance(node, dict):
+            return
+        if "glyph" in node:
+            bad(node["glyph"], f"{at}.glyph" if at else "glyph")
+        gl = node.get("glyphs")
+        if isinstance(gl, dict):
+            for k, v in gl.items():
+                bad(v, f"{at}.glyphs.{k}" if at else f"glyphs.{k}")
+
+    for root in roots:
+        rs = root.split(".") if root else []
+        if segs[:len(rs)] != rs:
+            if rs[:len(segs)] == segs and isinstance(value, dict):
+                # A dict written above the root (a whole disguise's parent).
+                node = value
+                for k in rs[len(segs):]:
+                    node = node.get(k) if isinstance(node, dict) else None
+                look(node, root)
+            continue
+        rel = segs[len(rs):]
+        if rel == ["glyph"]:
+            bad(value, path)
+        elif len(rel) == 2 and rel[0] == "glyphs":
+            bad(value, path)
+        elif rel == ["glyphs"] and isinstance(value, dict):
+            for k, v in value.items():
+                bad(v, f"{path}.{k}")
+        elif not rel:
+            look(value, path)
+
+
+def glyph_ok(v: Any) -> bool:
+    """Whether `v` (as stored, see glyph_of) is a usable map glyph."""
+    return glyph_problem(v) is None
 
 
 def _rename_map_coords(value: Any, old: str, new: str) -> int:
@@ -12109,6 +12306,7 @@ class Map:
             )
         check_store_path(path, "tile path")
         value = checked_facing_data(path, value)
+        checked_glyph_write(path, value, f"tile ({x},{y})")
         # Checked before any container on the path is made: a refused
         # value left an empty `{}` tile behind (L35).
         owned = _own_value(value)
@@ -20865,7 +21063,10 @@ class Match:
             if self.extra_turn is None:
                 out.append({"eid": order[ptr], "round": rnd, "now": True,
                             "skip": []})
-            acted.add(order[ptr])
+            # A unit the round rests on (every unit skippable) holds the
+            # turn unmarked, so the next `!turn next` skips it again this
+            # round (L54: the forecast left that skip out); any other turn
+            # holder is in round_acted already.
         elif self.turn_vacated == "wrap":
             ptr = len(order) - 1
         elif not live and order[ptr] not in acted:
@@ -20890,7 +21091,18 @@ class Match:
                 acted.add(order[j])
         # Queued extra turns come right after the turn under way (before
         # the first turn, after it). Marked by the -1 round placeholder.
-        at = 0 if self.round_started else min(1, len(upcoming))
+        at = 0
+        if not self.round_started and upcoming:
+            # The first turn is the first unit no skips_turn status passes
+            # over (L54: a grant before the first turn was listed after a
+            # stunned unit's skip, while the engine runs it after the next
+            # unit's turn).
+            at = len(upcoming)
+            for i, (_r, eid) in enumerate(upcoming):
+                e = self.entities.get(eid)
+                if e is None or not self._skipping_statuses(e):
+                    at = i + 1
+                    break
         upcoming[at:at] = [(-1, eid) for eid in self.extra_turns]
         want = n
         if want is None:
@@ -23955,18 +24167,23 @@ class Match:
                 # tick_when (default turn_end); a def-less status falls back
                 # to the global status_tick_formula at the global when.
                 sdef = self.status_definitions.get(sname)
-                if sdef is not None:
+                if sdef is not None and self._own_tick(e, sname):
                     # The tick and its when as the instance's level reads
                     # them (#259).
                     sdef = self.status_def_view(
                         sname, self.status_level(e.status.get(sname)))
-                    body = sdef.get("tick")
-                    if not (isinstance(body, str) and body.strip()):
-                        continue
                     def_when = sdef.get("tick_when") or "turn_end"
                     if def_when != when:
                         continue
-                    src = body
+                    src = sdef.get("tick")
+                elif sdef is not None:
+                    # A definition without a tick of its own (one written
+                    # for its data) falls back to the global formula while
+                    # the instance has a duration (user call, Y2: such a
+                    # status never counted down).
+                    if not global_active or not self._timed_status(e, sname):
+                        continue
+                    src = global_src
                 else:
                     if not global_active:
                         continue
@@ -23998,15 +24215,31 @@ class Match:
         turn_end): its definition's tick at its level, else the global
         status_tick_formula at status_tick_when."""
         turn_whens = ("turn_start", "turn_end")
-        if sname in self.status_definitions:
+        if sname in self.status_definitions and self._own_tick(e, sname):
             view = self.status_def_view(
                 sname, self.status_level(e.status.get(sname)))
-            body = view.get("tick")
-            return (isinstance(body, str) and bool(body.strip())
-                    and (view.get("tick_when") or "turn_end") in turn_whens)
+            return (view.get("tick_when") or "turn_end") in turn_whens
+        if sname in self.status_definitions and \
+                not self._timed_status(e, sname):
+            return False
         src = self.rules.get("status_tick_formula", "")
         return (isinstance(src, str) and bool(src.strip())
                 and self.rules.get("status_tick_when", "never") in turn_whens)
+
+    def _own_tick(self, e: "Entity", sname: str) -> bool:
+        """Whether status `sname`'s definition gives it a tick of its own
+        at the instance's level."""
+        view = self.status_def_view(
+            sname, self.status_level(e.status.get(sname)))
+        body = view.get("tick")
+        return isinstance(body, str) and bool(body.strip())
+
+    def _timed_status(self, e: "Entity", sname: str) -> bool:
+        """Whether status `sname` on `e` has a duration (instance, then
+        definition and level entries): a defined status without a tick of
+        its own runs status_tick_formula only then (Y2)."""
+        dur = self.status_field(e.status.get(sname), sname, "duration")
+        return isinstance(dur, (int, float)) and not isinstance(dur, bool)
 
     def _ticks_on_extra_turn(self, inst: Any, sname: str) -> bool:
         """Whether status `sname` ticks during an extra turn: its
@@ -28376,13 +28609,14 @@ class Match:
         every entity-creation path. Each entity gets its OWN Passive
         instance (built from the spec dict) so later per-entity edits
         don't mutate the shared rule. A malformed spec is skipped
-        silently (same convention as the from_dict loaders) — one bad
-        default shouldn't make every entity un-spawnable; the `!defpassive
-        add` command validates specs before they reach the rule, so a bad
-        entry here means hand-edited config."""
+        with a ⚠️ naming the passive and the unit (one bad default
+        shouldn't make every entity un-spawnable). The match's `!func`s
+        are known to the check, as `!defpassive add` knows them (Y1: a
+        default calling a function reached no new unit, silently)."""
         specs = self.rules.get("default_entity_passives") or []
         if not isinstance(specs, list):
             return
+        known = frozenset(self.formula_functions or ())
         for spec in specs:
             if not isinstance(spec, dict):
                 continue
@@ -28390,9 +28624,11 @@ class Match:
             if not isinstance(pid, str) or pid in entity.passives:
                 continue
             try:
-                entity.add_passive(Passive.from_dict(spec))
-            except (VTTError, KeyError, TypeError):
-                continue
+                entity.add_passive(Passive.from_dict(spec),
+                                   known_funcs=known)
+            except (VTTError, KeyError, TypeError) as ex:
+                self.surface_log([f"⚠️ default passive `{pid}` couldn't be "
+                                  f"put on `{entity.id}`: {ex}"])
 
     def sync_default_passives(self, old_specs: Any, new_specs: Any
                               ) -> List[str]:
@@ -29219,18 +29455,18 @@ class Match:
             dglyphs = dis.get("glyphs")
             if isinstance(dglyphs, dict):
                 dg = glyph_of(dglyphs.get(facing))
-                if isinstance(dg, str) and len(dg) == 1:
+                if glyph_ok(dg):
                     return dg
             dg = glyph_of(dis.get("glyph"))
-            if isinstance(dg, str) and len(dg) == 1:
+            if glyph_ok(dg):
                 return dg
         glyphs = e.vars.get("glyphs")
         if isinstance(glyphs, dict):
             g = glyph_of(glyphs.get(facing))
-            if isinstance(g, str) and len(g) == 1:
+            if glyph_ok(g):
                 return g
         g = glyph_of(e.vars.get("glyph"))
-        if isinstance(g, str) and len(g) == 1:
+        if glyph_ok(g):
             return g
         return DIRECTION_ARROWS.get(facing, "@")
 
@@ -29241,10 +29477,10 @@ class Match:
         gd = e.vars.get("glyphs")
         if isinstance(gd, dict):
             gg = glyph_of(gd.get(getattr(e, "facing", "")))
-            if isinstance(gg, str) and len(gg) == 1:
+            if glyph_ok(gg):
                 return True
         g = glyph_of(e.vars.get("glyph"))
-        return isinstance(g, str) and len(g) == 1
+        return glyph_ok(g)
 
     def entity_color(self, e: "Entity",
                      pov_team: Optional[str] = None) -> Optional[str]:
@@ -29784,10 +30020,10 @@ class Match:
             glyphs = src.get("glyphs")
             if isinstance(glyphs, dict):
                 g = glyph_of(glyphs.get(facing))
-                if isinstance(g, str) and len(g) == 1:
+                if glyph_ok(g):
                     return g
             g = glyph_of(src.get("glyph"))
-            if isinstance(g, str) and len(g) == 1:
+            if glyph_ok(g):
                 return g
         return None
 
@@ -30022,10 +30258,10 @@ class Match:
         glyphs = vars_.get("glyphs")
         if isinstance(glyphs, dict):
             g = glyph_of(glyphs.get(facing))
-            if isinstance(g, str) and len(g) == 1:
+            if glyph_ok(g):
                 return g
         g = glyph_of(vars_.get("glyph"))
-        if isinstance(g, str) and len(g) == 1:
+        if glyph_ok(g):
             return g
         return None if custom_only else DIRECTION_ARROWS.get(facing, "@")
 
@@ -30399,7 +30635,18 @@ class Match:
         if marks:
             mg = (mark_glyph or "*")[0]
             for (mx, my) in marks:
-                if mp.in_bounds(mx, my) and (mx, my) not in unit_shown:
+                # in_rect: a void a fogged view can't see is in the marks
+                # (the preview counts it like the fog around it) and is
+                # drawn like it too (V24+: it was left as fog, outlining
+                # the hole).
+                hidden_void = (
+                    (mx, my) in mp.voids and mp.in_rect(mx, my)
+                    and pov_team is not None and self.fog_on(mp)
+                    and "fog" not in hidden
+                    and self.rules.get("void_under_fog", "show") == "fog"
+                    and not self._fog_terrain_visible(pov_team, mx, my, mp))
+                if (mp.in_bounds(mx, my) or hidden_void) \
+                        and (mx, my) not in unit_shown:
                     grid[my][mx] = mg
                     colors[my][mx] = None
                     if meanings is not None:
@@ -31417,7 +31664,11 @@ class Match:
             loc = self.find_corpse(eid)
             if loc is None:
                 return eid
-            name = (loc[2] or {}).get("name", eid) if isinstance(loc[2], dict) else eid
+            # A corpse record keeps the unit under `entity` (Y9: its
+            # top-level `name` doesn't exist, so a dead unit read by id).
+            rec = loc[2] if isinstance(loc[2], dict) else {}
+            ent = rec.get("entity")
+            name = ent.get("name", eid) if isinstance(ent, dict) else eid
         name = str(name).replace(UNIT_LINE_TAG, "")
         return f"{UNIT_LINE_TAG}#{self.id}|{eid}|{name}{UNIT_LINE_TAG}"
 
@@ -31463,6 +31714,33 @@ class Match:
         return self.render_unit_message(fmt, actor_id, e.name, e.x, e.y,
                                         e.vars, part_of=e.part_of or "",
                                         extra=extra)
+
+    def action_dice_line(self, actor_id: str, action_name: str,
+                         rolls: List[Tuple[Any, Any, Any]]) -> str:
+        """The action dice line (#520) for the rolls an action made, each
+        (label, spec, total), as the action_dice_line rule picks them;
+        "" when it shows none."""
+        mode = str(self.rules.get("action_dice_line", "off"))
+        if mode == "off" or not rolls:
+            return ""
+        if mode == "labelled":
+            rolls = [r for r in rolls if r[0]]
+        if not rolls:
+            return ""
+        one = str(self.rules.get("action_dice_roll_format",
+                                 "{label} {spec} → {total}"))
+        shown = []
+        for label, spec, total in rolls:
+            shown.append(one.replace("{label}", str(label or ""))
+                         .replace("{spec}", str(spec))
+                         .replace("{total}", str(total)).strip())
+        fmt = str(self.rules.get("action_dice_line_format", "🎲 {rolls}"))
+        if not fmt.strip():
+            return ""
+        return (fmt.replace("{rolls}", " · ".join(shown))
+                .replace("{actor_name}", self.say_name(actor_id))
+                .replace("{actor}", actor_id)
+                .replace("{action}", action_name))
 
     def say_tag(self, about: Optional[str]) -> str:
         """The tag a say() line about unit or corpse `about` starts with
@@ -31659,7 +31937,12 @@ _TEMPLATE_META_KEYS = ("saved_by", "saved_by_name")
 # team view (user call).
 TEMPLATE_PRIVATE_KEY = "private"
 TEMPLATE_CREATOR_ONLY = "creator"
-_TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,)
+# Notes for whoever uses the template (Y10, `!template notes`): library
+# metadata on both kinds, never copied into a unit.
+TEMPLATE_NOTES_KEY = "template_notes"
+TEMPLATE_NOTES_MAX = 2000
+_TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,
+                                               TEMPLATE_NOTES_KEY)
 # What a reader who may not read a private template sees in place of a
 # reference to it (V19).
 PRIVATE_REF_TEXT = "(private)"
@@ -31776,6 +32059,11 @@ def mask_private_refs(value: Any, private: "set[str]") -> Any:
     return value
 _TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
                            "mount_slot")
+# The top-level keys an entity template holds: the unit's fields, its body
+# and the library metadata. Any other key is dropped with a note (Y3: a
+# misspelled `statuses` stored, shown and ignored at spawn).
+_ENTITY_TEMPLATE_KEYS = ("name", "vars", "status", "passives", "clamps",
+                         "facing", "parts", "segments", "var_names")
 
 
 def check_template_name(name: Any, legacy: bool = False) -> str:
@@ -31792,7 +32080,31 @@ def check_template_name(name: Any, legacy: bool = False) -> str:
 
 
 _PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags",
-                 "var_names", TEMPLATE_PRIVATE_KEY)
+                 "var_names", TEMPLATE_PRIVATE_KEY, TEMPLATE_NOTES_KEY)
+
+
+def checked_template_notes(v: Any, where: str) -> Optional[str]:
+    """A template's notes: text of at most TEMPLATE_NOTES_MAX characters,
+    trailing spaces cut; None when empty."""
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise VTTError(f"{where}: `{TEMPLATE_NOTES_KEY}` is text, got "
+                       f"{type(v).__name__}.")
+    v = v.strip()
+    if len(v) > TEMPLATE_NOTES_MAX:
+        raise VTTError(f"{where}: `{TEMPLATE_NOTES_KEY}` is "
+                       f"{len(v)} characters, past {TEMPLATE_NOTES_MAX}.")
+    return v or None
+
+
+def _check_template_notes(d: Dict[str, Any], where: str) -> None:
+    if TEMPLATE_NOTES_KEY in d:
+        v = checked_template_notes(d[TEMPLATE_NOTES_KEY], where)
+        if v is None:
+            del d[TEMPLATE_NOTES_KEY]
+        else:
+            d[TEMPLATE_NOTES_KEY] = v
 
 
 def _check_template_private(d: Dict[str, Any], where: str) -> None:
@@ -32072,7 +32384,8 @@ def check_template(data: Any, name: str,
         d = {k: copy.deepcopy(v) for k, v in data.items() if k in _PARTIAL_KEYS}
         extra = sorted(k for k in data if k not in _PARTIAL_KEYS)
         notes = [f"Dropped {', '.join(f'`{k}`' for k in extra)}: a partial "
-                 f"template is `kind`, `data`, `tags`, `var_names`."] if extra else []
+                 f"template is `kind`, `data`, `tags`, `var_names`, "
+                 f"`{TEMPLATE_NOTES_KEY}`."] if extra else []
         if not isinstance(d.get("data"), dict):
             raise VTTError(f"Partial template `{name}` needs `data`: an object "
                            f"(the container it describes).")
@@ -32093,6 +32406,7 @@ def check_template(data: Any, name: str,
             if k in d and d[k] is not None and not isinstance(d[k], str):
                 d[k] = str(d[k])
         _check_template_private(d, f"Partial template `{name}`")
+        _check_template_notes(d, f"Partial template `{name}`")
         if library is not None:
             check_template_refs(name, d, library)
         json_text(d)
@@ -32109,10 +32423,21 @@ def check_template(data: Any, name: str,
         notes.append(f"Dropped {', '.join(f'`{k}`' for k in dropped)}: a "
                      f"template carries no identity or position (its name is "
                      f"the id).")
+    unknown = sorted(k for k in d if k not in _ENTITY_TEMPLATE_KEYS
+                     and k not in _TEMPLATE_LIBRARY_KEYS)
+    for k in unknown:
+        d.pop(k)
+    if unknown:
+        notes.append(f"Dropped {', '.join(f'`{k}`' for k in unknown)}: an "
+                     f"entity template is "
+                     f"{', '.join(f'`{k}`' for k in _ENTITY_TEMPLATE_KEYS)} "
+                     f"(a unit's statuses are `status`; notes for its users "
+                     f"go in `{TEMPLATE_NOTES_KEY}`).")
     for k in _TEMPLATE_META_KEYS:
         if k in d and d[k] is not None and not isinstance(d[k], str):
             d[k] = str(d[k])
     _check_template_private(d, f"Template `{name}`")
+    _check_template_notes(d, f"Template `{name}`")
 
     def probe(spec: Dict[str, Any], what: str) -> None:
         check_unit_form(spec, what)

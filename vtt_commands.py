@@ -16,19 +16,19 @@ from logic import (
 )
 
 # Passive system
-from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY
+from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
-from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
-from logic import reserved_var_path_error
+from logic import reserved_var_path_error, file_refs
 from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows
 
 import os
 import difflib
@@ -196,7 +196,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # `!table roll <name>` only rolls a stored table (advances the RNG, no
     # board mutation), so players may roll a GM-defined table. def/remove stay
     # host-gated.
-    "table":      frozenset({"list", "roll"}),
+    "table":      frozenset({"list", "roll", "odds"}),
     # The server's template library is readable by anyone; save / import /
     # delete check the saver themselves, spawn changes the match. `refs`
     # stays host-gated: it lists which of a unit's vars changed, and a
@@ -377,6 +377,9 @@ def _capability_needed(name: str, args: List[str]) -> Optional[str]:
             return ("admin" if len(args) > 1 and args[1].lower()
                     in ("grant", "revoke") else None)
         return None
+    if name == "system" and sub == "export":
+        # Writes a saves file; reading the systems is open (Y10).
+        return "files"
     cap = _systems_capability(name, sub, args)
     if cap:
         return "systems"
@@ -399,7 +402,8 @@ _LIBRARY_EDITS = {
     "match": ("host", frozenset({"new"})),
     "template": ("templates", frozenset({
         "save", "import", "set", "unset", "part", "rename", "copy",
-        "delete", "restore", "private", "tags", "move", "folder"})),
+        "delete", "restore", "private", "tags", "notes", "move",
+        "folder"})),
     "prefab": ("prefabs", frozenset({
         "save", "import", "rename", "copy", "delete", "restore", "tags",
         "move", "folder"})),
@@ -428,8 +432,12 @@ def _systems_capability(name: str, sub: str, args: List[str]) -> bool:
             return False
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
+        if sub == "defvar" and len(args) >= 2 \
+                and args[1].lower() in ("map", "match"):
+            return len(args) < 3 or args[2].lower() != "list"
         if sub in ("alias", "tile", "func", "status", "table", "macro",
-                   "zone", "tags", "labels"):
+                   "zone", "tags", "labels", "defpassive", "defvar",
+                   "clamp"):
             # !system alias <action> <sys> ...
             return len(args) < 2 or args[1].lower() not in ("list", "info",
                                                             "show")
@@ -1773,6 +1781,13 @@ def _engine_var_warning(path: str, value: Any) -> str:
 _FACING_CLEAR = ("-", "none", "clear")
 
 
+def _check_glyph_value(value: str) -> None:
+    """Refuse a glyph that isn't one character one column wide (Y8)."""
+    why = glyph_problem(value)
+    if why is not None:
+        raise VTTError(f"{why[0].upper()}{why[1:]} (or `-` to clear).")
+
+
 def _facing_look_set(target: Dict[str, Any], kind: str, value: str,
                      facing: Optional[str]) -> str:
     """Set (or with `-` clear) a zone's / zone definition's `glyph` or
@@ -1782,9 +1797,8 @@ def _facing_look_set(target: Dict[str, Any], kind: str, value: str,
         if value in _FACING_CLEAR:
             target.pop(kind, None)
             return f"cleared its {kind}"
-        if kind == "glyph" and len(value) != 1:
-            raise VTTError("glyph must be exactly one character (or `-` to "
-                           "clear).")
+        if kind == "glyph":
+            _check_glyph_value(value)
         target[kind] = value
         return f"{kind} `{value}`"
     canon = normalize_direction(facing)
@@ -1799,9 +1813,8 @@ def _facing_look_set(target: Dict[str, Any], kind: str, value: str,
             if not entries:
                 target.pop(many, None)
         return f"cleared its {kind} facing {canon}"
-    if kind == "glyph" and len(value) != 1:
-        raise VTTError("glyph must be exactly one character (or `-` to "
-                       "clear).")
+    if kind == "glyph":
+        _check_glyph_value(value)
     entries = target.get(many)
     if not isinstance(entries, dict):
         entries = target[many] = {}
@@ -3782,13 +3795,44 @@ _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "__mount_death_effect"})
 
 
-def _hide_formula_at(path: str, value: Any) -> Any:
-    """`value`, read at the dotted `path`, as _hide_formula_fields shows it
-    (the last key decides for a text value: `actions.hit.body`)."""
+def _hide_formula_at(path: str, value: Any, root: Any = None) -> Any:
+    """`value`, read at the dotted `path` of `root` (a unit's vars, a
+    team's data), as _hide_formula_fields shows it inside its parents: the
+    last key decides for a text value (`actions.hit.body`), the parent's
+    key for a hook (`gear.ring.hooks.on_equip`) and the parent record for
+    a modifier's `value` (V26: only the last key was read, so those two
+    read raw one key deeper than their parent)."""
     if not FORMULA_TEXT_HIDDEN.get():
         return value
-    key = str(path).split(".")[-1] if path else "_"
-    return _hide_formula_fields({key: value})[key]
+    segs = str(path).split(".") if path else ["_"]
+    parent = root
+    for seg in segs[:-1]:
+        if isinstance(parent, dict):
+            parent = parent.get(seg)
+        elif isinstance(parent, list) and seg.lstrip("-").isdigit() \
+                and -len(parent) <= int(seg) < len(parent):
+            parent = parent[int(seg)]
+        else:
+            parent = None
+    # The parent's `stat` / `op` mark a modifier record; nothing else of
+    # it decides.
+    tree: Dict[str, Any] = {k: parent[k] for k in ("stat", "op")
+                            if isinstance(parent, dict) and k in parent}
+    tree[segs[-1]] = value
+    for seg in reversed(segs[:-1]):
+        tree = {seg: tree}
+    out: Any = _hide_formula_fields(tree)
+    for seg in segs:
+        out = out[seg]
+    return out
+
+
+def _formula_hidden_at(path: str, value: Any, root: Any) -> bool:
+    """Whether the text `value` at `path` of `root` is formula text this
+    caller may not read: `!find`'s selectors, `sort:` and aggregates read
+    it as missing (V26: `=` and `<` / `>` tested guesses against it)."""
+    return (isinstance(value, str) and FORMULA_TEXT_HIDDEN.get()
+            and _hide_formula_at(path, value, root) != value)
 
 
 def _hide_formula_fields(value: Any) -> Any:
@@ -4707,14 +4751,14 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # built-in objective evaluator — win conditions are composed from
     # watchers / actions / hooks calling the declare_winner primitive, which
     # works from any formula context. `!match win <winner> [reason]` is the
-    # manual declaration; `!match win clear` resumes play; `!match outcome`
+    # manual declaration; `!match win clear` clears it; `!match outcome`
     # (read-only) shows the current result.
     if sub == "win":
         m = active_match(mgr, ctx)
         if len(args) >= 2 and args[1].lower() == "clear":
             had = m.clear_outcome()
             return await ctx.send(
-                "Cleared the match outcome — play resumes." if had
+                "Cleared the match outcome." if had
                 else "No outcome was set.")
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "win"):
             return
@@ -7772,7 +7816,17 @@ def _template_summary(name: str, tpl: Dict[str, Any],
         bits.append("tags " + ", ".join(tags))
     if by:
         bits.append(f"saved by {by}")
+    notes = tpl.get(TEMPLATE_NOTES_KEY)
+    if isinstance(notes, str) and notes.strip():
+        first = notes.strip().splitlines()[0]
+        cut = len(first) > _NOTE_LIST_CHARS or "\n" in notes.strip()
+        bits.append("📝 " + first[:_NOTE_LIST_CHARS] + ("…" if cut else ""))
     return ", ".join(bits)
+
+
+# How much of a template's notes `!template list` shows: their first line,
+# cut at this many characters.
+_NOTE_LIST_CHARS = 60
 
 
 def _template_tags_var(tpl: Dict[str, Any], resolver: Match) -> str:
@@ -7999,7 +8053,7 @@ _TEMPLATE_DIFF_ROWS = 40
 
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
+    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|notes|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
     desc=(
         "This server's library of saved templates, shared by all its matches "
         "and kept on disk (even when the CLI / GUI don't keep matches). An "
@@ -8161,7 +8215,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         viewer = _template_viewer(ctx, mgr)
         trules = _template_rules(ctx, mgr)
         raw = {k: v for k, v in tpl.items()
-               if k not in ("saved_by", "saved_by_name")}
+               if k not in ("saved_by", "saved_by_name", TEMPLATE_NOTES_KEY)}
         views = [("", _reader_view(raw, trules, reader, mgr, viewer))]
         if "expanded" in flags:
             with private_templates_hidden(viewer):
@@ -8201,6 +8255,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             where = mgr.lib_folder("templates", name)
             if where:
                 label += f" in `{folder_label(where)}`"
+            if tpl.get(TEMPLATE_NOTES_KEY):
+                label += "\n📝 " + str(tpl[TEMPLATE_NOTES_KEY]).replace(
+                    "\n", "\n   ")
         return await ctx.send("\n".join(_template_read_note(reader)
                                         + [label] + out))
 
@@ -8243,6 +8300,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if isinstance(old, dict) and old.get(TEMPLATE_PRIVATE_KEY):
             # A re-save keeps a private template private, at its level.
             data[TEMPLATE_PRIVATE_KEY] = old[TEMPLATE_PRIVATE_KEY]
+        if isinstance(old, dict) and old.get(TEMPLATE_NOTES_KEY):
+            # And its notes.
+            data[TEMPLATE_NOTES_KEY] = old[TEMPLATE_NOTES_KEY]
         data, _ = check_template(data, name, mgr.templates)
         _lib_place(ctx, mgr, "templates", name, folder)
         if m.rules.get("template_pinning", False):
@@ -8282,8 +8342,12 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         data = _parse_import_json(raw, strict=False)
         says_private = (isinstance(data, dict)
                         and TEMPLATE_PRIVATE_KEY in data)
+        says_notes = isinstance(data, dict) and TEMPLATE_NOTES_KEY in data
         data, checks = check_template(data, name, mgr.templates)
         old = mgr.templates.get(name)
+        if not says_notes and isinstance(old, dict) \
+                and old.get(TEMPLATE_NOTES_KEY):
+            data[TEMPLATE_NOTES_KEY] = old[TEMPLATE_NOTES_KEY]
         if not says_private and isinstance(old, dict) \
                 and old.get(TEMPLATE_PRIVATE_KEY):
             # Replacing a private template keeps it private unless the
@@ -8344,6 +8408,41 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg = f"✏️ Template {where}: `{path}` = `{shown}`."
         else:
             msg = f"✏️ Template {where}: removed `{path}`."
+        return await ctx.send("\n".join([msg] + notes))
+
+    if sub == "notes":
+        if await return_help_if_not_enough_args(ctx, args, 2, "template",
+                                                "notes"):
+            return
+        name, tpl = _readable_template(ctx, mgr, args[1])
+        text = " ".join(args[2:]).strip()
+        have = tpl.get(TEMPLATE_NOTES_KEY)
+        if not text:
+            return await ctx.send(
+                "\n".join(_template_read_note(_template_reader(ctx, mgr)) + [
+                    f"📝 Template `{name}` notes:\n{have}" if have else
+                    f"Template `{name}` has no notes. "
+                    f"`!template notes {name} <text>` writes them."]))
+        _require_saver(ctx, name, tpl, "edit")
+        new = copy.deepcopy(tpl)
+        if text == "-":
+            if not have:
+                return await ctx.send(f"Template `{name}` has no notes.")
+            new.pop(TEMPLATE_NOTES_KEY, None)
+        else:
+            from formula import normalize_body_source
+            new[TEMPLATE_NOTES_KEY] = checked_template_notes(
+                normalize_body_source(text), f"Template `{name}`")
+            if new[TEMPLATE_NOTES_KEY] == have:
+                return await ctx.send(f"Template `{name}` already has "
+                                      f"those notes.")
+        new, _ = check_template(new, name, mgr.templates)
+        _verb, notes = _store_template(
+            ctx, mgr, name, new,
+            saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
+        msg = (f"📝 Cleared the notes of template `{name}`." if text == "-"
+               else f"📝 Template `{name}` notes saved "
+                    f"({len(new[TEMPLATE_NOTES_KEY])} characters).")
         return await ctx.send("\n".join([msg] + notes))
 
     if sub == "private":
@@ -8966,6 +9065,16 @@ for _subs, _usage, _desc in (
          "(work in progress, a surprise for the other GMs). In a channel "
          "with a team view everyone reads as a player. No word shows the "
          "level. Its saver or an administrator; a re-save keeps it."),
+        (("notes",), "!template notes <name> [<text ...> | -]",
+         "Notes for whoever uses the template (what it is for, how to "
+         "spawn or give it): library metadata on an entity or a partial "
+         "template, the `template_notes` field of its JSON, never copied "
+         "into a unit. `!template show` prints them, `!template list` "
+         "their first line. No text shows them, `-` clears them; `\\n` "
+         "starts a new line. Everyone who reads the template reads its "
+         "notes (make it private to keep them from players). Its saver "
+         "or an administrator; a re-save and an import without the field "
+         "keep them."),
         (("diff",), "!template diff <name> <other | unit=<id>>",
          "The paths where two templates differ, or a template and a unit of "
          "this channel's match (host only, it shows the unit's vars), with "
@@ -11186,6 +11295,12 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_watch(ctx, args, mgr)
     if sub in ("damage", "healing"):
         return await _system_steps(ctx, args, mgr, sub)
+    if sub in ("defpassive", "defvar", "clamp"):
+        return await _system_defaults(ctx, args, mgr, sub)
+    if sub == "export":
+        return await _system_export(ctx, args, mgr)
+    if sub == "import":
+        return await _system_import(ctx, args, mgr)
 
     # ---- system alias <subcommand> -----------------------------------
     # System-level alias library. These don't affect any currently live
@@ -11435,6 +11550,11 @@ def _action_slots(where: str, act: Any):
     for key in ("affects", "target_condition"):
         yield (f"{where} {key}", getattr(act, key), "eval", frozenset(),
                False)
+    # A precondition and a reaction's condition read `source` / `args`
+    # by attribute (Y4, Y7).
+    if act.condition:
+        yield (f"{where} condition", act.condition, "eval", frozenset(),
+               True)
     spec = act.reaction
     if spec is not None:
         for key in ("before", "after"):
@@ -11442,7 +11562,7 @@ def _action_slots(where: str, act: Any):
                    frozenset(), True)
         for key in ("condition", "auto_when"):
             yield (f"{where} {key}", getattr(spec, key), "eval",
-                   frozenset(), False)
+                   frozenset(), True)
 
 
 def _match_formula_slots(m: Match):
@@ -12604,7 +12724,8 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
     kind, what, write = (("tables", "table", "def") if sub == "table"
                          else ("macros", "macro", "set"))
     need = {"list": 3, "info": 4, "show": 4, "promote": 4, write: 5,
-            "rename": 5, "copy": 5, **{d: 4 for d in _SYSTEM_LIB_DELETES}}
+            "rename": 5, "copy": 5, **{d: 4 for d in _SYSTEM_LIB_DELETES},
+            **({"rank": 4} if sub == "table" else {})}
     if action not in need:
         return await _help_fallback(ctx, ["system", sub], args[1])
     if await return_help_if_not_enough_args(ctx, args, need[action],
@@ -12649,6 +12770,26 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
         return await ctx.send(_promoted_line(what, f"`{name}`", m.id,
                                              sys_name, prior is not None,
                                              prior == entry))
+    if action == "rank":
+        entry = _system_lib_entry(mgr, s, kind, name, sys_name, what)
+        spec, _rank = split_table_rank(entry)
+        if len(args) == 4:
+            return await ctx.send(
+                f"Table `{name}` on `{sys_name}`, best first: "
+                + ", ".join(f"`{k}`" for k in table_order(entry))
+                + ("." if _rank else " (the order written: no rank is set)."))
+        words = " ".join(args[4:]).strip()
+        text = table_text(spec, None if words == "-" else [
+            w.strip() for w in words.split(",") if w.strip()])
+        try:
+            check_table_text(name, text, lib)
+        except FormulaError as ex:
+            raise VTTError(str(ex))
+        lib[name] = text
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(
+            f"Ranked table `{name}` on `{sys_name}`, best first: "
+            + ", ".join(f"`{k}`" for k in table_order(text)) + ".")
     if action in ("info", "show"):
         _check_tail(args, 4, (), f"!system {sub} {action} <system> <name>")
         entry = _system_lib_entry(mgr, s, kind, name, sys_name, what)
@@ -12683,10 +12824,11 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
             else normalize_body_source(" ".join(args[4:]).strip()))
     if sub == "table":
         try:
-            roll_table_pick(random, body)
+            notes = check_table_text(name, body, lib)
         except FormulaError as ex:
             raise VTTError(f"invalid table spec: {ex}")
-        reply = f"Defined table `{name}` = `{body}` on `{sys_name}`."
+        reply = (f"Defined table `{name}` = `{body}` on `{sys_name}`."
+                 + "".join(f"\n⚠️ {n}" for n in notes))
     else:
         if not body:
             raise VTTError("macro body is empty.")
@@ -12972,7 +13114,8 @@ for _sub, _write, _what, _gram in (
             f"drop <system> <name> | delete <system> <name> | "
             f"remove <system> <name> | rm <system> <name> | "
             f"promote <system> <name>" + (" [trust]" if _sub == "macro"
-                                          else "") + ">"),
+                                          else " | rank <system> <name> "
+                                               "[<entries> | -]") + ">"),
         desc=(
             f"Manage a GameSystem's {_what} with the grammar of {_gram} (the "
             f"system name after the action). Copied into every NEW match on "
@@ -13002,6 +13145,75 @@ registry.annotate_sub(
         "(`!system unset <sys> tag_vocabulary:<tag>` brings it back). "
         "Engine tags (corpse, part, segment, rider, vehicle, map_carrier) "
         "are declared by the engine."),
+)
+registry.annotate_sub(
+    "system", "export",
+    usage=("!system export <system> <file> [chain=require|include|flatten] "
+           "[templates=none|used|all|<a,b>] [prefabs=none|used|all|<a,b>] "
+           "[full] [overwrite]"),
+    desc=(
+        "Write a system to a saves file `!system import` reads back, on this "
+        "server or another. A system with a parent: `chain=require` "
+        "(default) writes it alone and the import needs a system of the "
+        "parent's name, `include` writes its ancestors too, `flatten` "
+        "writes it as a root holding every value it inherits. "
+        "`templates=` / `prefabs=`: none (default), all, used (those its "
+        "formulas, macros and aliases name, prefabs saved under it, and "
+        "every partial they reference) or a list of names. `full` = "
+        "chain=include templates=used prefabs=used. A server "
+        "administrator or the `files` capability."
+    ),
+)
+registry.annotate_sub(
+    "system", "import",
+    usage="!system import <file> [as=<name>] [mode=replace|merge]",
+    desc=(
+        "Install the system file `!system export` wrote: each system in it "
+        "is created, or one of the same name `replace`d (default: it "
+        "becomes the file's) or `merge`d (the file's rules and library "
+        "entries win, the server's others stay). `as=` names the file's "
+        "system on this server (its ancestors keep their names). Matches "
+        "on it take its rules at once; its libraries reach new matches "
+        "(`!match sync all` brings them to a live one). Templates and "
+        "prefabs in the file are saved, one of the same name replaced "
+        "(the old version kept 24 hours). One `!system undo` step for the "
+        "systems. Needs the `systems` and `files` capabilities (and "
+        "`templates` / `prefabs` when the file carries them)."
+    ),
+)
+registry.annotate_sub(
+    "system", "defpassive",
+    usage=("!system defpassive <add <system> <id> <when> [target=PATH] "
+           "[scope=exact|children|deep] [priority=<n>] "
+           "[extra_turns=on|off] <formula ...> | remove <system> <id> | "
+           "extra_turns <system> <id> <on|off|default> | "
+           "priority <system> <id> <n> | list <system> | hooks <system>>"),
+    desc=(
+        "A system's default passives (default_entity_passives) by name, "
+        "with the grammar of `!defpassive` and no match needed: a setup "
+        "file edits a system before any match uses it. A formula may call "
+        "the system's own `!func`s."
+    ),
+)
+registry.annotate_sub(
+    "system", "defvar",
+    usage=("!system defvar [map|match] <add <system> <path> <value> | "
+           "remove <system> <path> | list <system>>"),
+    desc=(
+        "A system's default unit vars (default_entity_vars), or with "
+        "`map` / `match` its default map / match vars, by name, with the "
+        "grammar of `!defvar` and no match needed."
+    ),
+)
+registry.annotate_sub(
+    "system", "clamp",
+    usage=("!system clamp <add <system> <path> [max=N|varpath] "
+           "[min=N|varpath] [mode=soft|hard] | remove <system> <path> | "
+           "list <system>>"),
+    desc=(
+        "A system's default clamps (default_clamps) by name, with the "
+        "grammar of `!gclamp` and no match needed."
+    ),
 )
 registry.annotate_sub(
     "system", "labels",
@@ -13119,13 +13331,24 @@ async def _ent_group_dispatch(ctx, args, mgr, m, sub: str):
         # formula substitutions (self_id = the iterated member). Per-entity
         # errors are surfaced but don't abort the rest of the iteration —
         # one bad apple shouldn't silently drop the others.
+        failed = 0
         for eid in targets:
             sub_args = list(args)
             sub_args[1] = eid
+            watch = _ErrorWatchCtx(ctx)
             try:
-                await ent_cmd(ctx, sub_args, mgr)
+                await ent_cmd(watch, sub_args, mgr)
             except VTTError as ex:
                 await ctx.send(f"⚠️ `{eid}`: {ex}")
+                failed += 1
+                continue
+            if watch.error_seen:
+                failed += 1
+        if failed == len(targets):
+            # Every member refused (L55: one ⚠️ per member read as a
+            # partial success, so a strict batch ran on past it).
+            return await ctx.send(
+                f"❌ every member of `{group_name}` refused `!ent {sub}`.")
         return
     return await ctx.send(
         f"❌ !ent {sub} either doesn't support group targets, or isn't a "
@@ -13503,13 +13726,16 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     break
                 val = val[seg]
         else:
-            found, val = _entity_path_value(m, e, path, _query_pov(ctx, m))
+            found, val = _entity_path_value(m, e, path, _query_pov(ctx, m),
+                                            formulas=True)
         if not found:
             raise NotFound(f"`{args[1]}` has no var at `{path}` that this "
                            f"channel can read.")
         if not host:
             val = _without_engine_keys(val)
-        val = _hide_formula_at(path, val)
+        val = _hide_formula_at(
+            path, val, (m.reader_vars(e, _query_pov(ctx, m)) if e is not None
+                        else ((cloc[2].get("entity") or {}).get("vars"))))
         shown = (m.entity_display_name(e, _query_pov(ctx, m)) if e is not None
                  else str(((cloc[2].get("entity") or {}).get("name"))
                           or eid) + " (corpse)")
@@ -14031,14 +14257,17 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Entity '{aid}' not found.")
         if bid not in m.entities:
             raise NotFound(f"Entity '{bid}' not found.")
+        if aid == bid:
+            # A refusal (L55: it answered "No swap", and a strict batch ran
+            # on past it).
+            return await ctx.send(f"❌ `{aid}` can't swap with itself.")
         try:
             swapped, hook_log = m.swap_entities(aid, bid)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
         if not swapped:
             return await ctx.send(
-                f"No swap: `{aid}` and `{bid}` are the same entity "
-                f"or already share a cell."
+                f"No swap: `{aid}` and `{bid}` already share a cell."
             )
         # Movement hooks fire during the swap and can remove either unit.
         def _at(i):
@@ -17413,7 +17642,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Coordinate rulers {'ON' if m.coords_on() else 'OFF'} for "
             f"**{m.name}** ({how}).")
     if args and args[0].lower() == "legend":
-        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        if len(args) >= 2 and args[1].lower() not in ("on", "off"):
+            # A refusal like its siblings' (L55: it read as the state, so a
+            # strict batch ran on past it).
+            return await ctx.send("❌ Usage: `!map legend on|off` (or "
+                                  "one-off `!map legend=on`).")
+        if len(args) < 2:
             state = "ON" if m.map_legend_enabled else "OFF"
             return await ctx.send(
                 f"Auto-legend is {state} for **{m.name}**. "
@@ -17758,7 +17992,8 @@ def _resolve_dotted_var(vars_dict: Dict[str, Any], path: str) -> Tuple[bool, Any
 
 
 def _entity_path_value(m: Match, e: Entity, path: str,
-                       pov: Optional[str] = None) -> Tuple[bool, Any]:
+                       pov: Optional[str] = None,
+                       formulas: bool = False) -> Tuple[bool, Any]:
     """`!find`'s read of `path` on `e`: the reserved var paths (x / y / name,
     logic.RESERVED_VAR_PATHS) come from the entity's own fields, matching
     `entity[X].path` in formulas; anything else walks the vars. `name` is
@@ -17775,9 +18010,14 @@ def _entity_path_value(m: Match, e: Entity, path: str,
         return True, getattr(e, seg0)
     # Private vars (#70) read as missing to a reader who may not see them:
     # a selector, `show:` or `sort:` can't answer what the listing hides.
-    found, val = _resolve_dotted_var(m.reader_vars(e, pov), path)
+    rv = m.reader_vars(e, pov)
+    found, val = _resolve_dotted_var(rv, path)
     if found and path == e._team_var_name() and val is not None:
         val = str(val)      # team 1 and team "1" are one team (Entity.team)
+    if found and not formulas and _formula_hidden_at(path, val, rv):
+        # Formula text read as missing (`formulas`: the caller hides it
+        # itself, as `!ent get` shows `(hidden)`).
+        return False, None
     return found, val
 
 
@@ -18013,7 +18253,7 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
 
 
 def _corpse_path_value(m: Match, loc: Tuple[Any, ...],
-                       path: str) -> Tuple[bool, Any]:
+                       path: str, formulas: bool = False) -> Tuple[bool, Any]:
     """`!find`'s read of `path` on a corpse (#454): x / y from where it
     lies, `name` / `map` from the snapshot and its map, anything else from
     its vars as the command's reader may read them."""
@@ -18029,10 +18269,13 @@ def _corpse_path_value(m: Match, loc: Tuple[Any, ...],
     reader = VAR_READER.get()
     cv = (m.corpse_reader_vars(corpse, reader) if reader is not None
           else (ent.get("vars") or {}))
-    found, val = _resolve_dotted_var(cv if isinstance(cv, dict) else {}, path)
+    cv = cv if isinstance(cv, dict) else {}
+    found, val = _resolve_dotted_var(cv, path)
     if found and path == str(m.rules.get("team_var", "team")) \
             and val is not None:
         val = str(val)
+    if found and not formulas and _formula_hidden_at(path, val, cv):
+        return False, None
     return found, val
 
 
@@ -18281,6 +18524,20 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
             return _entity_path_value(m, h[1], path, pov)
         return _corpse_path_value(m, h[1][1], path)
 
+    def shown_value(h, path: str) -> Tuple[bool, Any]:
+        """A `show:` column: formula text as `(hidden)`, judged in its
+        parents (V26)."""
+        if h[0] == "unit":
+            found, v = _entity_path_value(m, h[1], path, pov, formulas=True)
+            root = m.reader_vars(h[1], pov)
+        else:
+            found, v = _corpse_path_value(m, h[1][1], path, formulas=True)
+            ent = h[1][1][2].get("entity") or {}
+            reader = VAR_READER.get()
+            root = (m.corpse_reader_vars(h[1][1][2], reader)
+                    if reader is not None else ent.get("vars"))
+        return found, (_hide_formula_at(path, v, root) if found else v)
+
     if output == "count" or aggregates:
         head = f"**{len(hits)}** {'match' if len(hits) == 1 else 'matches'}."
         if not aggregates:
@@ -18357,8 +18614,7 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                             st, dict) else ""
                     cells.append(f"{col}={names or '—'}")
                     continue
-                found, v = hit_value(h, col)
-                v = _hide_formula_at(col, v) if found else v
+                found, v = shown_value(h, col)
                 cells.append(f"{col}={v if found else '—'}")
             row += "  [" + ", ".join(cells) + "]"
         lines.append(row)
@@ -18366,17 +18622,78 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
 
 
 # ---- !roll --------------------------------------------------------------
-def _table_roll_reply(m: Match, name: str, reps: int) -> str:
-    """`!table roll <name> [n]` / `!roll [<n>x] <table>`: the picks of
-    named table `name`, rolled `reps` times on the match RNG."""
-    rng = m.formula_rng()
+def _table_roll_opts(m: Match, name: str, words: List[str], usage: str
+                     ) -> Tuple[Dict[str, float], Optional[Tuple[str, int]]]:
+    """The `remove=` / `add=` / `best=` / `worst=` words of a table roll
+    or `!table odds` (#253)."""
+    cap = int(m.rules.get("roll_repeat_limit",
+                          RULES_REGISTRY["roll_repeat_limit"]["default"]))
+    remove = add = None
+    keep = None
+    for w in words:
+        key, sep, val = w.partition("=")
+        key = key.lower()
+        if not sep or key not in ("remove", "add", "best", "worst"):
+            raise VTTError(f"`{w}` — usage: `{usage}`.")
+        if key == "remove":
+            remove = val if remove is None else f"{remove},{val}"
+        elif key == "add":
+            add = val if add is None else f"{add},{val}"
+        else:
+            if keep is not None:
+                raise VTTError("A table roll takes `best=` or `worst=`, "
+                               "once.")
+            try:
+                k = int(val)
+            except ValueError:
+                k = 0
+            if not 1 <= k <= cap:
+                raise VTTError(f"`{w}`: {key}= is a whole number from 1 to "
+                               f"{cap} (roll_repeat_limit).")
+            keep = (key, k)
+    keys = [k for k, _w in table_entries(m.tables[name])]
     try:
-        picks = [roll_table_pick(rng, m.tables[name]) for _ in range(reps)]
+        adjust = table_adjustments(remove, add, keys, f"table `{name}`")
+    except FormulaError as ex:
+        raise VTTError(str(ex))
+    return adjust, keep
+
+
+def _table_roll_reply(m: Match, name: str, reps: int,
+                      adjust: Optional[Dict[str, float]] = None,
+                      keep: Optional[Tuple[str, int]] = None) -> str:
+    """`!table roll <name> [n] [...]` / `!roll [<n>x] <table> [...]`: the
+    results of named table `name`, rolled `reps` times on the match RNG."""
+    rng = m.formula_rng()
+    limit = int(m.rules.get("table_nesting_limit",
+                            RULES_REGISTRY["table_nesting_limit"]["default"]))
+    notes: List[str] = []
+    results = []
+    try:
+        for _ in range(reps):
+            results.append(roll_named_table(
+                rng, m.tables, name, adjust=adjust, keep=keep, limit=limit,
+                warn=notes.append))
     except FormulaError as ex:
         return f"❌ {ex}"
+
+    def _shown(final: str, trail: List[str], picks: List[str]) -> str:
+        text = f"**{final}**"
+        if len(trail) > 1:
+            text += " (via " + " → ".join(f"`{t}`" for t in trail[:-1]) + ")"
+        if keep is not None and reps == 1:
+            text = f"{', '.join(picks)} → " + text
+        return text
     times = f"{reps}x " if reps > 1 else ""
-    return (f"🎲 {times}table `{name}` → "
-            + ", ".join(f"**{p}**" for p in picks))
+    kept = f" {keep[0]} of {keep[1]}" if keep else ""
+    adj = ""
+    if adjust:
+        adj = " (" + ", ".join(
+            f"{k} {'+' if d > 0 else '−'}{abs(d):g}" for k, d in
+            adjust.items() if d) + ")"
+    return (f"🎲 {times}table `{name}`{kept}{adj} → "
+            + ", ".join(_shown(*r) for r in results)
+            + "".join(f"\n{n}" for n in dict.fromkeys(notes)))
 
 
 @registry.command(
@@ -18385,11 +18702,17 @@ def _table_roll_reply(m: Match, name: str, reps: int) -> str:
     snapshot=False,
     desc=(
         "Roll dice and show the total plus the individual dice. Uses the same "
-        "notation as the roll() formula primitive: `NdM` (N optional), with "
-        "optional `+`/`-` modifiers, `!` to explode (a max-face die rerolls "
-        "and adds), and `kh<n>`/`kl<n>` to keep the highest/lowest n "
-        "(`2d20kh1` = advantage, `2d20kl1` = disadvantage). Examples: "
-        "`!roll 2d6+3`, `!roll d20`, `!roll 4d6kh3`, `!roll 10d6!`. Replay-"
+        "notation as the roll() formula primitive: `NdM` (N optional; `dF` "
+        "Fate dice worth -1 / 0 / +1, `d%` a d100), with optional `+`/`-` "
+        "modifiers, `!` to explode (a max-face die rerolls and adds), "
+        "`kh<n>`/`kl<n>` to keep the highest/lowest n (`2d20kh1` = "
+        "advantage, `2d20kl1` = disadvantage), `r<n>` to reroll a die "
+        "showing n until it shows something else (`r<3`, `r1r2`; `ro1` "
+        "rerolls once), a comparison to count successes (`6d10>=8` is the "
+        "number of dice showing 8 or more; a flat modifier adds to the "
+        "count) and after it `f<n>` for failures that take one off each "
+        "(`6d10>=8f1`). Examples: `!roll 2d6+3`, `!roll d20`, `!roll "
+        "4d6kh3`, `!roll 10d6!`, `!roll 4dF+1`, `!roll 2d6r1`. Replay-"
         "safe via the match's random_seed rule (a seeded match rolls "
         "reproducibly). Read-only — rolling never mutates the match. "
         "`!roll odds` works out probabilities instead of rolling (see "
@@ -18397,7 +18720,8 @@ def _table_roll_reply(m: Match, name: str, reps: int) -> str:
         "`!roll none, none, minicrit, crit`, and `item:weight` weights an "
         "item like a table (`none:3, crit`). A word that isn't dice and "
         "names a table of the match (`!table def`) rolls that table "
-        "(`!roll loot`). A leading `<n>x` rolls n times "
+        "(`!roll loot`, with `!table roll`'s `remove=` / `add=` / `best=` / "
+        "`worst=`). A leading `<n>x` rolls n times "
         "(`!roll 6x 4d6kh3`, `!roll 2x none, crit`; at most the "
         "roll_repeat_limit rule)."
     ),
@@ -18431,10 +18755,19 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                   "roll.")
     # A named table of the channel's match (#610), when the word isn't
     # dice: `!roll loot`, `!roll 3x loot`.
-    if (len(args) == 1 and rules and args[0] in m.tables
-            and not re.fullmatch(r"\d*d\d+.*|[+-]?\d+", args[0],
+    if (rules and args[0] in m.tables
+            and all("=" in w for w in args[1:])
+            and not re.fullmatch(r"\d*d(\d+|f|%).*|[+-]?\d+", args[0],
                                  re.IGNORECASE)):
-        return await ctx.send(_table_roll_reply(m, args[0], reps))
+        try:
+            adjust, keep = _table_roll_opts(
+                m, args[0], args[1:],
+                "!roll [<n>x] <table> [remove=<entry:n,...>] "
+                "[add=<entry:n,...>] [best=<n> | worst=<n>]")
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(_table_roll_reply(m, args[0], reps, adjust,
+                                                keep))
     text = " ".join(args)
     if "," in text and args[0].lower() != "odds":
         # A list roll: one item per roll, `item:weight` weighted like a
@@ -18466,7 +18799,7 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"❌ `{left} {right}`: put `+` or `-` between dice terms "
                 f"(`{left}+{right}`).")
     if args[0].lower() == "odds":
-        return await _roll_odds(ctx, "".join(args[1:]))
+        return await _roll_odds(ctx, args[1:])
     spec = "".join(args)
     lines = []
     for i in range(reps):
@@ -18508,19 +18841,27 @@ def _fmt_pct(p: float) -> str:
     return f"{p * 100:.2f}%"
 
 
-async def _roll_odds(ctx: ReplyContext, text: str):
+async def _roll_odds(ctx: ReplyContext, words: List[str]):
     """`!roll odds <dice> [<op> <n>]`: the chance a roll meets a target, or
-    the whole distribution when no comparison is given. Read-only."""
-    if not text:
+    the whole distribution when no comparison is given. Read-only. The
+    target is a word of its own (`2d6 >= 8`, `2d6 >=8`); a comparison
+    joined to the dice counts successes (`6d10>=8`, #104)."""
+    if not words:
         return await ctx.send(
             "❌ `!roll odds` is missing arguments. Usage: "
             "`!roll odds <dice> [<op> <n>]`, e.g. `!roll odds 2d6 >= 8`.")
-    mt = re.match(r"^(.*?)(>=|<=|==|!=|=|>|<)(-?\d+)$", text)
-    spec, op, target = (mt.group(1), mt.group(2), int(mt.group(3))) if mt \
-        else (text, None, None)
-    if not spec:
+    op = target = None
+    cmp_re = r"(>=|<=|==|!=|=|>|<)"
+    mt = re.fullmatch(cmp_re + r"(-?\d+)", words[-1])
+    if mt and len(words) > 1:
+        op, target, words = mt.group(1), int(mt.group(2)), words[:-1]
+    elif (len(words) > 2 and re.fullmatch(cmp_re, words[-2])
+          and re.fullmatch(r"-?\d+", words[-1])):
+        op, target, words = words[-2], int(words[-1]), words[:-2]
+    elif mt or (len(words) >= 2 and re.fullmatch(cmp_re, words[0])):
         return await ctx.send("❌ `!roll odds` needs a dice expression before "
                               "the comparison.")
+    spec = "".join(words)
     try:
         dist, total, exact = dice_distribution(spec)
     except FormulaError as ex:
@@ -18566,7 +18907,10 @@ registry.annotate_sub(
     usage="!roll odds <dice> [<op> <n>]",
     desc=(
         "The exact chance of a roll: `!roll odds 2d6 >= 8` → 41.67% (5/12). "
-        "Operators: >= <= > < = !=. Without a comparison it shows the range, "
+        "Operators: >= <= > < = !=, written apart from the dice (a "
+        "comparison joined to them counts successes: `!roll odds 6d10>=8 "
+        ">= 3` is the chance of 3 or more successes). Without a comparison "
+        "it shows the range, "
         "the average and (up to 40 possible totals) the whole distribution. "
         "Same dice notation as `!roll`; exploding dice give a near-exact "
         "figure (≈), and a group that both explodes and keeps dice isn't "
@@ -21062,16 +21406,39 @@ async def gclamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["gclamp"])
         return await ctx.send(f"**{title}**\n{body}")
-    m = active_match(mgr, ctx)
-    sub = args[0].lower()
+    m = _defaults_match(ctx, mgr, "clamp", args[0])
+    return await _gclamp_on(ctx, mgr, args, m.system_name)
 
-    # Resolve the game system bound to the active match. Edits live on the
-    # GameSystem so they persist across saves and apply to other matches
-    # using the same system. We also refresh the active match's rules dict
-    # so the change takes effect immediately on the current match (other
-    # matches will pick it up next time their rules are refreshed; see
-    # MatchManager.refresh_match_rules used by !system set).
-    sys_name = m.system_name
+
+def _defaults_match(ctx: ReplyContext, mgr: MatchManager, form: str,
+                    sub: str) -> Match:
+    """The channel's match, whose system `!defpassive` / `!defvar` /
+    `!gclamp` edit; without one, the refusal names the `!system` form that
+    edits a system by name (Y10)."""
+    try:
+        return active_match(mgr, ctx)
+    except NotFound:
+        action = sub.lower() if sub.lower() in (
+            "add", "remove", "list", "map", "match") else "<action>"
+        lead = f"!system {form} {action}"
+        if action in ("map", "match"):
+            lead += " <action>"
+        said = (f"`{lead} <system>`" if action == "list" else
+                f"`{lead} <system> ...` (`!system {form} "
+                + (f"{action} " if action in ("map", "match") else "")
+                + "list <system>` reads it)")
+        raise NotFound(
+            f"No active match for this channel, so no system to edit. "
+            f"Edit a system by name: {said}, or `!match use <id>`.")
+
+
+async def _gclamp_on(ctx: ReplyContext, mgr: MatchManager, args: List[str],
+                     sys_name: str):
+    """`!gclamp` / `!system clamp` on system `sys_name`."""
+    sub = args[0].lower()
+    # Edits live on the GameSystem so they persist across saves and apply
+    # to other matches using the same system; refresh_match_rules gives the
+    # live matches the change at once.
     sysobj = mgr.get_system(sys_name)
 
     def _read_clamps() -> List[Dict[str, Any]]:
@@ -21192,14 +21559,23 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["defpassive"])
         return await ctx.send(f"**{title}**\n{body}")
-    m = active_match(mgr, ctx)
+    m = _defaults_match(ctx, mgr, "defpassive", args[0])
+    return await _defpassive_on(ctx, mgr, args, m.system_name, m)
+
+
+async def _defpassive_on(ctx: ReplyContext, mgr: MatchManager,
+                         args: List[str], sys_name: str,
+                         m: Optional[Match] = None):
+    """`!defpassive` / `!system defpassive` on system `sys_name` (`m`: the
+    channel's match, whose `!func`s a formula may call too)."""
     sub = args[0].lower()
 
     # Edits live on the GameSystem (persist across saves, apply to every
     # match on this system); we refresh live matches so the change takes
     # effect immediately. Same pattern as !gclamp.
-    sys_name = m.system_name
     sysobj = mgr.get_system(sys_name)
+    known = frozenset(mgr.system_library(sysobj, "formula_functions")) | (
+        frozenset(m.formula_functions) if m is not None else frozenset())
 
     def _read_specs() -> List[Dict[str, Any]]:
         return list(mgr.system_value(sysobj, "default_entity_passives") or [])
@@ -21213,7 +21589,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     def _reach() -> str:
         """Where the change went (#221): the units already here too, per
         default_passives_existing_units, else new ones only."""
-        if not m.rules.get("default_passives_existing_units", True):
+        if not mgr.system_value(sysobj, "default_passives_existing_units"):
             return (" Reaches entities created from now on "
                     "(default_passives_existing_units is off).")
         shown = sync_notes
@@ -21239,7 +21615,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
         try:
-            validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
+            validate_program(formula, known_funcs=known)
         except FormulaError as ex:
             raise VTTError(f"Invalid passive formula: {ex}")
         # Construct the Passive to validate id / when / scope up front
@@ -21431,7 +21807,13 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["defvar"])
         return await ctx.send(f"**{title}**\n{body}")
-    m = active_match(mgr, ctx)
+    m = _defaults_match(ctx, mgr, "defvar", args[0])
+    return await _defvar_on(ctx, mgr, args, m.system_name)
+
+
+async def _defvar_on(ctx: ReplyContext, mgr: MatchManager, args: List[str],
+                     sys_name: str):
+    """`!defvar` / `!system defvar` on system `sys_name`."""
     sub = args[0].lower()
     # `!defvar map <add|remove|list> ...` edits default_map_vars, the vars
     # every new map starts with, the same way.
@@ -21446,7 +21828,6 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     # Edits live on the GameSystem (persist across saves, apply to every
     # match on this system); refresh live matches so it takes effect now.
-    sys_name = m.system_name
     sysobj = mgr.get_system(sys_name)
 
     def _read_vars() -> Dict[str, Any]:
@@ -21479,8 +21860,8 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"❌ `{path.split('.', 1)[0]}` is a reserved var path (read from "
                 f"the entity itself: x / y / name); it can't have a default.")
         value = _parse_scalar(args[2])  # same coercion as !ent set_var
-        vitals = {m.rules.get("hp_var", "hp"), m.rules.get("max_hp_var", "max_hp"),
-                  m.rules.get("turnorder_var", "initiative")}
+        vitals = {str(mgr.system_value(sysobj, k))
+                  for k in ("hp_var", "max_hp_var", "turnorder_var")}
         seg0 = path.split(".", 1)[0]
         if seg0 in vitals:
             if "." in path or _coerce_vital_value(value) is None:
@@ -24104,9 +24485,8 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         return f"Cleared zone definition `{name}`'s {sub}."
     if sub == "legend" and val.lower() == "false":
         val = False
-    elif sub == "glyph" and len(val) != 1:
-        raise VTTError("glyph must be exactly one character (or `-` to "
-                       "clear).")
+    elif sub == "glyph":
+        _check_glyph_value(val)
     d[sub] = val
     tail = ""
     if sub == "color":
@@ -24582,8 +24962,10 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         except (VTTError, DuplicateId) as ex:
             return (f"❌ {ex}")
         return (
-            f"Defined status `{name}` (tick_when=turn_end, no tick yet). "
-            f"Set its effect with `{prefix.format(sub='tick')} {name} \"<formula>\"`."
+            f"Defined status `{name}` (tick_when=turn_end, no tick yet: "
+            f"while it has a duration, the status_tick_formula rule ticks "
+            f"it). Set its effect with "
+            f"`{prefix.format(sub='tick')} {name} \"<formula>\"`."
         )
 
     if sub == "rename":
@@ -26162,7 +26544,8 @@ registry.annotate_sub(
         "`raw,armor`), or one of `-` / `none` / empty-string for no "
         "parameters. `<body>` is the rest of the line — a formula "
         "program whose trailing expression (if any) is the return "
-        "value. Example: "
+        "value; a body ending on an if / elif / else returns the "
+        "trailing value of the branch that ran. Example: "
         "`!func def mitigated raw,armor \"max(raw - armor, 0)\"` then "
         "call it from any formula as `mitigated(entity[self].atk, 3)`. "
         "The body is validated at definition time; parameters and the "
@@ -27283,7 +27666,9 @@ async def _batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     usage="!run <path>",
     desc=(
         "Read a file of commands (one per line, leading `!` optional, "
-        "blank lines and `#`-prefixed comment lines ignored) and run "
+        "blank lines and `#`-prefixed comment lines ignored; a quote left "
+        "open continues on the next lines that don't start with `!`, "
+        "joined as a body's line breaks) and run "
         "them as a single batch — same one-snapshot undo semantics as "
         "`!batch`. Useful for replaying a saved sequence of setup "
         "commands at the start of a match."
@@ -27311,6 +27696,15 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # A `template import`'s JSON spans lines until it closes.
             if stripped:
                 lines[-1] += "\n" + stripped
+            continue
+        if lines and not stripped.startswith("!") \
+                and quote_unclosed(lines[-1]):
+            # A quoted body over several lines (Y10): one command, its line
+            # breaks the `\n` a body reads, indentation kept, as the GUI
+            # and Discord join a body typed over lines. A line starting
+            # with `!` starts the next command, so a stray quote fails its
+            # own line.
+            lines[-1] += "\\n" + ln.rstrip()
             continue
         if not stripped or stripped.startswith("#"):
             continue
@@ -27828,7 +28222,11 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 for _subs, _usage in (
         (('def',), '!table def <name> <spec ...>'),
-        (('roll',), '!table roll <name> [n]'),
+        (('roll',), '!table roll <name> [n] [remove=<entry:n,...>] '
+                    '[add=<entry:n,...>] [best=<n> | worst=<n>]'),
+        (('odds',), '!table odds <name> [remove=<entry:n,...>] '
+                    '[add=<entry:n,...>] [best=<n> | worst=<n>]'),
+        (('rank',), '!table rank <name> [<entries> | -]'),
         (('list',), '!table list'),
         (('show',), '!table show <name>'),
         (('remove',), '!table remove <name>')):
@@ -27911,15 +28309,26 @@ async def remind_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "table",
-    usage="!table <def|roll|list|show|remove|rename> ...",
+    usage="!table <def|roll|odds|rank|list|show|remove|rename> ...",
     desc=(
-        "Named random tables (Match.tables) — store a weighted table once and "
+        "Named random tables (Match.tables): store a weighted table once and "
         "roll it by name. `def <name> <key:weight,...>` defines a table (the "
         "spec is the same `key:weight` CSV as roll_table; weight optional, "
-        "default 1). `roll <name>` rolls it (replay-safe via the match RNG) "
-        "and returns the picked key. `list` / `show <name>` / `remove <name>`. "
-        "Also usable from formulas via `table_roll(name)`. The named companion "
-        "to inline `roll_table(...)`; per-match, serialized."
+        "default 1). An entry `@<table>` rolls that table when picked, and "
+        "`{2d6}` inside an entry's text becomes a roll of the dice (`{2d6} "
+        "gold`); a table can't name itself, and a longer loop stops at "
+        "table_nesting_limit. `roll <name> [n]` rolls it n times on the "
+        "match RNG; `remove=none:2` / `add=crit:1` change entries' weights "
+        "for that roll, and `best=<n>` / `worst=<n>` roll n times and keep "
+        "the best / worst by the table's rank. `rank <name> <a,b,...>` "
+        "stores that order, best first (entries it leaves out follow in "
+        "the order written; `-` clears it; with no rank the order written "
+        "is the order), also written as ` rank=a,b` at the end of a `def`. "
+        "`odds <name> [...]` lists each entry's chance, a sub-table's "
+        "entries under it with their overall chance. `list` / `show "
+        "<name>` / `remove <name>` / `rename`. Formulas: `table_roll(name, "
+        "...)`. The named companion to inline `roll_table(...)`; per-match, "
+        "serialized."
     ),
 )
 async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -27943,34 +28352,94 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         spec = " ".join(args[2:]).strip()
-        # Validate the spec by attempting a pick (catches bad weights / empty).
         try:
-            roll_table_pick(random, spec)
+            notes = check_table_text(name, spec, m.tables)
         except FormulaError as ex:
             return await ctx.send(f"❌ invalid table spec: {ex}")
         m.tables[name] = spec
-        return await ctx.send(f"Defined table `{name}` = `{spec}`.")
+        return await ctx.send(f"Defined table `{name}` = `{spec}`."
+                              + "".join(f"\n⚠️ {n}" for n in notes))
 
-    if sub == "roll":
-        if await return_help_if_not_enough_args(ctx, args, 2, "table", "roll"):
+    if sub in ("roll", "odds"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "table", sub):
             return
         name = args[1]
         if name not in m.tables:
             return await ctx.send(f"❌ no table `{name}`.")
+        words = args[2:]
         reps = 1
-        if len(args) > 2:
+        if sub == "roll" and words and "=" not in words[0]:
             cap = int(m.rules.get(
                 "roll_repeat_limit",
                 RULES_REGISTRY["roll_repeat_limit"]["default"]))
             try:
-                reps = int(args[2])
+                reps = int(words[0])
             except ValueError:
                 return await ctx.send(
-                    f"❌ `{args[2]}`: the number of rolls is a whole number.")
+                    f"❌ `{words[0]}`: the number of rolls is a whole number.")
             if not 1 <= reps <= cap:
-                return await ctx.send(f"❌ `{args[2]}`: roll 1 to {cap} "
+                return await ctx.send(f"❌ `{words[0]}`: roll 1 to {cap} "
                                       f"times (roll_repeat_limit).")
-        return await ctx.send(_table_roll_reply(m, name, reps))
+            words = words[1:]
+        usage = (f"!table {sub} <name>" + (" [n]" if sub == "roll" else "")
+                 + " [remove=<entry:n,...>] [add=<entry:n,...>] "
+                   "[best=<n> | worst=<n>]")
+        try:
+            adjust, keep = _table_roll_opts(m, name, words, usage)
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        if sub == "roll":
+            return await ctx.send(_table_roll_reply(m, name, reps, adjust,
+                                                    keep))
+        limit = int(m.rules.get(
+            "table_nesting_limit",
+            RULES_REGISTRY["table_nesting_limit"]["default"]))
+        try:
+            rows = table_odds_rows(m.tables, name, adjust=adjust, keep=keep,
+                                   limit=limit)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        head = f"🎲 table `{name}`"
+        if keep:
+            head += f", {keep[0]} of {keep[1]}"
+        if adjust:
+            head += " (" + ", ".join(
+                f"{k} {'+' if d > 0 else '−'}{abs(d):g}"
+                for k, d in adjust.items() if d) + ")"
+        width = max(len("  " * d + k) for d, k, _p in rows) if rows else 0
+        lines = [f"{'  ' * d + k:<{width}}  {_fmt_pct(p):>7}"
+                 for d, k, p in rows]
+        return await ctx.send(head + ":\n```\n" + "\n".join(lines)
+                              + "\n```")
+
+    if sub == "rank":
+        if await return_help_if_not_enough_args(ctx, args, 2, "table", "rank"):
+            return
+        name = args[1]
+        if name not in m.tables:
+            return await ctx.send(f"❌ no table `{name}`.")
+        spec, rank = split_table_rank(m.tables[name])
+        if len(args) == 2:
+            order = table_order(m.tables[name])
+            return await ctx.send(
+                f"Table `{name}`, best first: "
+                + ", ".join(f"`{k}`" for k in order)
+                + ("." if rank else " (the order written: no rank is set)."))
+        words = " ".join(args[2:]).strip()
+        new_rank = (None if words == "-" else
+                    [w.strip() for w in words.split(",") if w.strip()])
+        text = table_text(spec, new_rank)
+        try:
+            check_table_text(name, text, m.tables)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        m.tables[name] = text
+        if new_rank is None:
+            return await ctx.send(f"Cleared the rank of table `{name}`: "
+                                  f"best first is the order written.")
+        return await ctx.send(f"Ranked table `{name}`, best first: "
+                              + ", ".join(f"`{k}`" for k in
+                                          table_order(text)) + ".")
 
     if sub == "list":
         if not m.tables:
@@ -28321,7 +28790,8 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if v is _sent:
             return await ctx.send(f"team `{args[1]}`.{args[2]} is unset.")
         return await ctx.send(
-            f"team `{args[1]}`.{args[2]} = {_hide_formula_at(args[2], v)!r}")
+            f"team `{args[1]}`.{args[2]} = "
+            f"{_hide_formula_at(args[2], v, m.team_data.get(args[1]))!r}")
 
     if sub == "list":
         if len(args) >= 2:
@@ -28940,7 +29410,8 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command(
     "react",
     usage=("!react | !react <eid> <reaction> [target...] [k=v ...] "
-           "| !react <eid> pass | !react skip"),
+           "| !react <eid> pass | !react skip "
+           "| !react set <eid> [mode=<mode>] [hidden=<mode>]"),
     desc=(
         "Answer the open reaction window (#36): an action someone can react "
         "to waits until every unit offered a reaction picks or passes. "
@@ -28952,13 +29423,19 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "reactions_per_window. `pass` ends a unit's answers; `skip` (a "
         "host) closes the window for everyone, keeping what was picked. "
         "The command that closes a window runs it: the before halves, the "
-        "action, then the after window. See `!help action` and "
-        "docs/damage_reactions_design.md."
+        "action, then the after window. `!react set <eid>` shows or sets "
+        "how a unit answers windows (`mode=` ask / auto / never, the "
+        "reaction_mode rule) and what it is offered while the acting side "
+        "can't see it (`hidden=` all / affected / none, the "
+        "reactions_while_hidden rule); `default` goes back to the rule. "
+        "See `!help action` and docs/damage_reactions_design.md."
     ),
 )
 async def react_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     import reactions
     m = active_match(mgr, ctx)
+    if args and args[0].lower() == "set":
+        return await _react_set(ctx, m, args[1:])
     ex = m.reaction_exchange
     if ex is None:
         if args:
@@ -28994,6 +29471,70 @@ async def react_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                map_of=map_of)
 
 
+# `!react set` options: option -> (the unit's var, the rule, its words).
+_REACT_SETTINGS = {
+    "mode": ("__reaction_mode", "reaction_mode", ("ask", "auto", "never")),
+    "hidden": ("__reactions_while_hidden", "reactions_while_hidden",
+               ("all", "affected", "none")),
+}
+
+
+async def _react_set(ctx: ReplyContext, m: Match, args: List[str]) -> None:
+    """!react set <eid> [mode=] [hidden=]: a unit's reaction settings
+    (its `__reaction_mode` / `__reactions_while_hidden` vars); without
+    options, what they are and where each comes from."""
+    import reactions
+    if not args:
+        raise VTTError("Usage: `!react set <eid> [mode=<ask|auto|never|"
+                       "default>] [hidden=<all|affected|none|default>]`.")
+    eid = _resolve_eid(m, args[0])
+    if eid not in m.entities:
+        _query_eid(ctx, m, args[0])
+        raise NotFound(f"Entity '{eid}' not found.")
+    e = m.entities[eid]
+    changes: Dict[str, Optional[str]] = {}
+    for tok in args[1:]:
+        key, eq, val = tok.partition("=")
+        key, val = key.strip().lower(), val.strip().lower()
+        if not eq or key not in _REACT_SETTINGS:
+            raise VTTError(f"Unexpected `{tok}` — usage: `!react set <eid> "
+                           f"[mode=<mode>] [hidden=<mode>]`.")
+        words = _REACT_SETTINGS[key][2]
+        if val != "default" and val not in words:
+            raise VTTError(f"`{key}=` takes {', '.join(words)} or default, "
+                           f"not `{val}`.")
+        changes[key] = None if val == "default" else val
+    log: List[str] = []
+    for key, val in changes.items():
+        var = _REACT_SETTINGS[key][0]
+        if val is None:
+            if var in e.vars:
+                log += e.remove_var(var)
+        elif e.vars.get(var) != val:
+            log += e.write_var(var, val)
+    e = m.entities.get(eid)
+    if e is None:
+        return await ctx.send("\n".join(log + [f"`{eid}` is gone."]))
+    now = {"mode": reactions._mode(m, e),
+           "hidden": reactions.hidden_mode(m, e)}
+    lines = []
+    for key, (var, rule, _w) in _REACT_SETTINGS.items():
+        own = e.vars.get(var)
+        src = ("its own" if isinstance(own, str) and own.strip().lower()
+               == now[key] else f"the rule {rule}")
+        lines.append(f"{key}: `{now[key]}` ({src})")
+    head = (f"Set `{eid}`'s reaction settings:" if changes
+            else f"`{eid}`'s reaction settings:")
+    await ctx.send("\n".join(log + [head] + lines))
+
+
+registry.annotate_sub("react", "set",
+                      usage="!react set <eid> [mode=<mode>] [hidden=<mode>]",
+                      desc="Show or set how a unit answers reaction windows "
+                           "(mode= ask / auto / never) and what it is "
+                           "offered while the acting side can't see it "
+                           "(hidden= all / affected / none); default = the "
+                           "rule.")
 registry.annotate_sub("react", "skip", usage="!react skip",
                       desc="(A host) close the open reaction window for "
                            "every unit still to answer; what was picked "
@@ -29657,6 +30198,9 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
             tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
             forbid = "" if disguised else _action_forbid_note(m, actor_id,
                                                               act)
+            if not disguised:
+                forbid = "; ".join(x for x in (forbid, _action_condition_note(
+                    m, actor_id, act)) if x)
             lines.append(
                 f"- `{act.name}` (target: `{act.target_type}`, at "
                 f"`{container}`{tags}){desc}"
@@ -29669,8 +30213,10 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
             for act in mount_actions[name]:
                 desc = f" — {act.description}" if act.description else ""
                 tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
-                forbid = _action_forbid_note(m, actor_id, act,
-                                             actor.mounted_on)
+                forbid = "; ".join(x for x in (
+                    _action_forbid_note(m, actor_id, act, actor.mounted_on),
+                    _action_condition_note(m, actor_id, act,
+                                           actor.mounted_on)) if x)
                 where = (_private_text(m) if _path_private(
                     m, m.entities.get(actor.mounted_on or ""),
                     act.full_path) else act.full_path)
@@ -29730,6 +30276,526 @@ def _action_forbid_note(m: Match, actor_id: str, act: Any,
         f"{h['status']} on `{h['unit']}`"
         + (" (its _unless formula failed)" if h["error"] else "")
         for h in hits))
+
+
+# ---------------------------------------------------------------------------
+# System files (Y10): `!system export` writes a system (with its ancestors,
+# flattened, or naming the parent it needs) and, on request, the templates
+# and prefabs it uses to a saves file; `!system import` installs one in
+# place, replacing or merging a system of the same name.
+# ---------------------------------------------------------------------------
+
+SYSTEM_FILE_FORMAT = "fcs-system"
+SYSTEM_FILE_VERSION = 1
+_SYSTEM_CHAIN_MODES = ("require", "include", "flatten")
+_SYSTEM_IMPORT_MODES = ("replace", "merge")
+# Words naming an entry in command text: `!template spawn orc ...`,
+# `!prefab stamp hut ...`, `!map new x from=hut`.
+_TEMPLATE_WORD_RE = re.compile(
+    r"\btemplate\s+(?:spawn|give)\s+([A-Za-z0-9_\-]+)", re.I)
+_PREFAB_WORD_RE = re.compile(
+    r"\bprefab\s+stamp\s+([A-Za-z0-9_\-]+)|\bfrom=([A-Za-z0-9_\-]+)", re.I)
+_QUOTED_WORD_RE = re.compile(r"['\"]([A-Za-z0-9_\-]+)['\"]")
+
+
+def _flat_system_dict(mgr: MatchManager, s: GameSystem) -> Dict[str, Any]:
+    """System `s` as a root holding every value it inherits (what `!system
+    parent <s> none` would leave), without changing it."""
+    flat = GameSystem(s.name, {})
+    for key in RULES_REGISTRY:
+        if mgr.system_value_source(s, key) is not None:
+            flat.set(key, mgr.system_value(s, key))
+    for kind in SYSTEM_LIBRARIES:
+        setattr(flat, kind, mgr.system_library(s, kind))
+    flat.description = s.description
+    return flat.to_dict()
+
+
+def _strings_of(v: Any, out: List[str]) -> List[str]:
+    if isinstance(v, str):
+        out.append(v)
+    elif isinstance(v, dict):
+        for x in v.values():
+            _strings_of(x, out)
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            _strings_of(x, out)
+    return out
+
+
+def _named_in(texts: List[str], names: set, word_re: Any) -> set:
+    """The names of `names` the texts use: quoted (`summon_template('orc',
+    ...)`) or after a command word (`!template spawn orc`)."""
+    found = set()
+    for t in texts:
+        for w in _QUOTED_WORD_RE.findall(t):
+            if w.lower() in names:
+                found.add(w.lower())
+        for mo in word_re.finditer(t):
+            for w in mo.groups():
+                if w and w.lower() in names:
+                    found.add(w.lower())
+    return found
+
+
+def _library_pick(ctx: ReplyContext, mgr: MatchManager, lib: str, spec: str,
+                  texts: List[str], systems: set,
+                  extra_refs: Optional[set] = None) -> List[str]:
+    """The `lib` entries an export carries per `spec`: none, all, used (the
+    ones the exported systems' texts name, prefabs saved under them, and
+    the partials those reference, through every level) or a comma list."""
+    entries = (mgr.templates if lib == "templates" else mgr.prefabs)
+    readable = {n for n in entries if _lib_readable(ctx, mgr, lib, n)}
+    spec = spec.strip().lower()
+    if spec in ("", "none"):
+        return []
+    if spec == "all":
+        return sorted(readable)
+    if spec == "used":
+        word_re = _TEMPLATE_WORD_RE if lib == "templates" else _PREFAB_WORD_RE
+        picked = _named_in(texts, readable, word_re) | (extra_refs or set())
+        if lib == "prefabs":
+            picked |= {n for n in readable
+                       if (entries[n] or {}).get("system") in systems}
+        return sorted(n for n in picked if n in readable)
+    names = [w.strip().lower() for w in spec.split(",") if w.strip()]
+    missing = [n for n in names if n not in readable]
+    if missing:
+        what = "template" if lib == "templates" else "prefab"
+        raise NotFound(f"No {what} " + ", ".join(f"`{n}`" for n in missing)
+                       + " in this server's library.")
+    return sorted(set(names))
+
+
+def _with_partials(mgr: MatchManager, names: List[str],
+                   ctx: ReplyContext) -> List[str]:
+    """`names` plus every partial they reference, through every level."""
+    out, todo = set(names), list(names)
+    while todo:
+        tpl = mgr.templates.get(todo.pop())
+        if not isinstance(tpl, dict):
+            continue
+        for r in template_refs_of(tpl):
+            if r not in out and r in mgr.templates \
+                    and _lib_readable(ctx, mgr, "templates", r):
+                out.add(r)
+                todo.append(r)
+    return sorted(out)
+
+
+def _prefab_refs(pf: Dict[str, Any]) -> set:
+    """The partial templates a prefab's units reference."""
+    return set(file_refs(pf.get("units")))
+
+
+def _library_entry(mgr: MatchManager, lib: str, name: str) -> Dict[str, Any]:
+    data = copy.deepcopy((mgr.templates if lib == "templates"
+                          else mgr.prefabs)[name])
+    for k in ("saved_by", "saved_by_name"):
+        data.pop(k, None)
+    return {"name": name, "folder": mgr.lib_folder(lib, name), "data": data}
+
+
+async def _system_export(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager):
+    usage = ("!system export <system> <file> [chain=require|include|flatten] "
+             "[templates=none|used|all|<a,b>] [prefabs=none|used|all|<a,b>] "
+             "[full] [overwrite]")
+    if len(args) < 3:
+        raise VTTError(f"Usage: `{usage}`.")
+    s = mgr.get_system(args[1])
+    opts: Dict[str, str] = {}
+    full_ = overwrite = False
+    for tok in args[3:]:
+        key, eq, val = tok.partition("=")
+        if not eq and key.lower() == "full":
+            full_ = True
+        elif not eq and key.lower() == "overwrite":
+            overwrite = True
+        elif eq and key.lower() in ("chain", "templates", "prefabs"):
+            opts[key.lower()] = val
+        else:
+            raise VTTError(f"Unexpected `{tok}` — usage: `{usage}`.")
+    if full_:
+        for k, v in (("chain", "include"), ("templates", "used"),
+                     ("prefabs", "used")):
+            opts.setdefault(k, v)
+    chain = opts.get("chain", "require").lower()
+    if chain not in _SYSTEM_CHAIN_MODES:
+        raise VTTError(f"`chain=` takes {', '.join(_SYSTEM_CHAIN_MODES)}, "
+                       f"not `{chain}`.")
+    full, path = saves_path(args[2], mgr, write=True)
+    _check_overwrite(full, path, overwrite)
+    if s.parent is None or chain == "flatten":
+        systems = [_flat_system_dict(mgr, s) if s.parent else s.to_dict()]
+        requires = None
+    elif chain == "include":
+        systems = [x.to_dict() for x in mgr.system_chain(s)]
+        requires = None
+    else:
+        systems = [s.to_dict()]
+        requires = s.parent
+    for d in systems:
+        # A rule's value is all a file needs: its schema and description
+        # come from the registry of the build that imports it.
+        d["settings"] = {k: {"value": r.get("value")}
+                         for k, r in (d.get("settings") or {}).items()}
+    texts = _strings_of(systems, [])
+    names = {x["name"] for x in systems}
+    prefabs = _library_pick(ctx, mgr, "prefabs", opts.get("prefabs", "none"),
+                            texts, names)
+    pf_refs: set = set()
+    for n in prefabs:
+        pf_refs |= _prefab_refs(mgr.prefabs[n])
+    templates = _library_pick(ctx, mgr, "templates",
+                              opts.get("templates", "none"), texts, names,
+                              pf_refs)
+    if opts.get("templates", "none").lower() not in ("none", ""):
+        templates = _with_partials(mgr, templates, ctx)
+    bundle = {
+        "format": SYSTEM_FILE_FORMAT, "version": SYSTEM_FILE_VERSION,
+        "system": s.name, "chain": chain, "requires": requires,
+        "systems": systems,
+        "templates": [_library_entry(mgr, "templates", n) for n in templates],
+        "prefabs": [_library_entry(mgr, "prefabs", n) for n in prefabs],
+    }
+    _write_save_file(mgr, full, path, bundle)
+    audit_note(f"exported system `{s.name}` to `{path}`")
+    lines = [f"📦 Exported system `{s.name}` to `{path}`"
+             + (f" with its ancestors "
+                + ", ".join(f"`{x['name']}`" for x in systems[:-1])
+                if len(systems) > 1 else "")
+             + (" (flattened: the values it inherits are its own)"
+                if chain == "flatten" and s.parent else "") + "."]
+    if requires:
+        lines.append(f"Importing it needs a system `{requires}` on the "
+                     f"server (`chain=include` carries it, `chain=flatten` "
+                     f"folds it in).")
+    for what, got in (("template", templates), ("prefab", prefabs)):
+        if got:
+            lines.append(f"{len(got)} {what}(s): "
+                         + ", ".join(f"`{n}`" for n in got) + ".")
+    return await ctx.send("\n".join(lines))
+
+
+def _checked_rule_value(key: str, v: Any) -> Any:
+    """A rule value from a system file, checked as `!system set` checks a
+    typed one (structured rules: a JSON value)."""
+    spec = RULES_REGISTRY[key]["schema"]
+    t = spec.get("type")
+    if t == "bool":
+        if not isinstance(v, bool):
+            raise VTTError(f"`{key}` is true or false, got {v!r}.")
+        return v
+    if t in ("int", "number"):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise VTTError(f"`{key}` is a number, got {v!r}.")
+        text = (str(int(v)) if t == "int" and float(v).is_integer()
+                else repr(v))
+        return _coerce_rule_value(key, text)
+    if t in ("enum", "str"):
+        if not isinstance(v, str):
+            raise VTTError(f"`{key}` is text, got {v!r}.")
+        return _coerce_rule_value(key, v)
+    json_text(v)
+    return v
+
+
+def _imported_system(mgr: MatchManager, raw: Any,
+                     notes: List[str]) -> Dict[str, Any]:
+    """One system of a file as GameSystem.to_dict gives it, its rule values
+    checked (an unknown rule is dropped with a note, as a load does)."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("name"), str):
+        raise VTTError("a system in it has no name.")
+    check_id("system name", raw["name"])
+    settings = raw.get("settings") or {}
+    if not isinstance(settings, dict):
+        raise VTTError(f"`{raw['name']}`: `settings` isn't an object.")
+    kept: Dict[str, Any] = {}
+    for key, rec in settings.items():
+        if key not in RULES_REGISTRY:
+            notes.append(f"`{raw['name']}`: dropped the rule `{key}`, which "
+                         f"this build doesn't have.")
+            continue
+        value = rec.get("value") if isinstance(rec, dict) else rec
+        try:
+            value = _checked_rule_value(key, value)
+        except VTTError as ex:
+            raise VTTError(f"`{raw['name']}`: {ex}")
+        kept[key] = {"value": value}
+    d = dict(raw)
+    d["settings"] = kept
+    for lib in SYSTEM_LIBRARIES:
+        if lib in d and not isinstance(d[lib], dict):
+            raise VTTError(f"`{raw['name']}`: `{lib}` isn't an object.")
+    if d.get("parent") is not None and not isinstance(d["parent"], str):
+        raise VTTError(f"`{raw['name']}`: `parent` isn't a system name.")
+    return GameSystem.from_dict(copy.deepcopy(d)).to_dict()
+
+
+def _merged_system(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """`old` with `new` laid over it: the file's rules and library entries
+    win, the server's other ones stay; a hide the file's own entry undoes
+    goes."""
+    out = copy.deepcopy(old)
+    out["settings"] = {**(old.get("settings") or {}),
+                       **copy.deepcopy(new.get("settings") or {})}
+    for lib in SYSTEM_LIBRARIES:
+        out[lib] = {**(old.get(lib) or {}), **copy.deepcopy(new.get(lib) or {})}
+    removed: Dict[str, List[str]] = {}
+    for key in set(old.get("removed") or {}) | set(new.get("removed") or {}):
+        names = set((old.get("removed") or {}).get(key) or []) | set(
+            (new.get("removed") or {}).get(key) or [])
+        names -= set((new.get(key) or {}) if key in SYSTEM_LIBRARIES else ())
+        if names:
+            removed[key] = sorted(names)
+    out["removed"] = removed
+    out["parent"] = new.get("parent")
+    if new.get("description"):
+        out["description"] = new["description"]
+    return out
+
+
+async def _system_import(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager):
+    usage = "!system import <file> [as=<name>] [mode=replace|merge]"
+    if len(args) < 2:
+        raise VTTError(f"Usage: `{usage}`.")
+    as_name: Optional[str] = None
+    mode = "replace"
+    for tok in args[2:]:
+        key, eq, val = tok.partition("=")
+        if eq and key.lower() == "as":
+            check_id("system name", val)
+            as_name = val
+        elif eq and key.lower() == "mode":
+            mode = val.lower()
+            if mode not in _SYSTEM_IMPORT_MODES:
+                raise VTTError(f"`mode=` takes "
+                               f"{', '.join(_SYSTEM_IMPORT_MODES)}, not "
+                               f"`{val}`.")
+        else:
+            raise VTTError(f"Unexpected `{tok}` — usage: `{usage}`.")
+    if not ctx_can(ctx, "files"):
+        raise VTTError("Reading a saves file needs a server administrator "
+                       "or the `files` capability (`!server perms`).")
+    full, path = saves_path(args[1], mgr)
+    try:
+        with open(full, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+    except FileNotFoundError:
+        raise VTTError(f"File not found: `{path}`.")
+    except (OSError, ValueError) as ex:
+        raise VTTError(f"Failed to read `{path}`: {ex}")
+    if not isinstance(bundle, dict) or bundle.get("format") != \
+            SYSTEM_FILE_FORMAT:
+        raise VTTError(f"`{path}` isn't a system file (`!system export` "
+                       f"writes one).")
+    if bundle.get("version") != SYSTEM_FILE_VERSION:
+        raise VTTError(f"`{path}` is a system file of version "
+                       f"{bundle.get('version')!r}; this build reads "
+                       f"version {SYSTEM_FILE_VERSION}.")
+    raw_systems = bundle.get("systems")
+    if not isinstance(raw_systems, list) or not raw_systems:
+        raise VTTError(f"`{path}` holds no system.")
+    notes: List[str] = []
+    try:
+        systems = [_imported_system(mgr, r, notes) for r in raw_systems]
+    except VTTError as ex:
+        raise VTTError(f"Can't import `{path}`: {ex}")
+    top = systems[-1]
+    old_top = top["name"]
+    if as_name:
+        top["name"] = as_name
+    # The target server state: the file's systems in place, merged or
+    # replaced, the rest as they are.
+    target = copy.deepcopy(mgr.server_state())
+    done: List[str] = []
+    for d in systems:
+        have = target["systems"].get(d["name"])
+        if have is None:
+            target["systems"][d["name"]] = d
+            done.append(f"created `{d['name']}`")
+        elif mode == "merge":
+            target["systems"][d["name"]] = _merged_system(have, d)
+            done.append(f"merged into `{d['name']}`")
+        else:
+            target["systems"][d["name"]] = d
+            done.append(f"replaced `{d['name']}`")
+    # Every parent named must exist, without a loop or a chain past the
+    # owner's limit.
+    for d in systems:
+        seen, cur, depth = {d["name"]}, target["systems"][d["name"]], 1
+        while cur.get("parent"):
+            p = cur["parent"]
+            if p not in target["systems"]:
+                raise VTTError(
+                    f"Can't import `{path}`: `{d['name']}` inherits from "
+                    f"`{p}`, which isn't on this server (export it with "
+                    f"`chain=include` or `chain=flatten`).")
+            if p in seen:
+                raise VTTError(f"Can't import `{path}`: `{d['name']}`'s "
+                               f"parents make a loop through `{p}`.")
+            seen.add(p)
+            depth += 1
+            cur = target["systems"][p]
+        if depth > owner_limit("system_chain_depth"):
+            raise VTTError(
+                f"Can't import `{path}`: `{d['name']}` heads a chain of "
+                f"{depth} systems; the bot owner's limit is "
+                f"{owner_limit('system_chain_depth')} (system_chain_depth).")
+    # The library entries, all checked before anything changes.
+    entries: Dict[str, List[Tuple[str, str, Dict[str, Any]]]] = {}
+    for lib in ("templates", "prefabs"):
+        got = bundle.get(lib) or []
+        if not isinstance(got, list):
+            raise VTTError(f"Can't import `{path}`: `{lib}` isn't a list.")
+        if got and not ctx_can(ctx, lib):
+            raise VTTError(f"`{path}` carries {lib}; writing them needs a "
+                           f"server administrator or the `{lib}` "
+                           f"capability.")
+        rows = []
+        for e in got:
+            if not isinstance(e, dict) or not isinstance(e.get("data"), dict):
+                raise VTTError(f"Can't import `{path}`: an entry of `{lib}` "
+                               f"has no `data`.")
+            folder = e.get("folder") or ""
+            try:
+                folder = check_library_folder(folder) if folder else ""
+                if lib == "templates":
+                    name = check_template_name(e.get("name"))
+                else:
+                    name = check_prefab_name(e.get("name"))
+            except VTTError as ex:
+                raise VTTError(f"Can't import `{path}`: {ex}")
+            rows.append((name, folder, e["data"]))
+        entries[lib] = rows
+    library = dict(mgr.templates)
+    library.update({n: d for n, _f, d in entries["templates"]})
+    checked: Dict[str, List[Tuple[str, str, Dict[str, Any]]]] = {
+        "templates": [], "prefabs": []}
+    for name, folder, data in entries["templates"]:
+        if name in mgr.templates:
+            if not _lib_readable(ctx, mgr, "templates", name):
+                raise VTTError(f"Can't import `{path}`: the template name "
+                               f"`{name}` is taken.")
+            _require_saver(ctx, name, mgr.templates[name], "replace")
+        try:
+            data, _checks = check_template(data, name, library)
+        except VTTError as ex:
+            raise VTTError(f"Can't import `{path}`: {ex}")
+        checked["templates"].append((name, folder, data))
+    for name, folder, data in entries["prefabs"]:
+        if name in mgr.prefabs:
+            _require_prefab_saver(ctx, name, mgr.prefabs[name], "replace")
+        try:
+            data = check_prefab(data, name)
+        except VTTError as ex:
+            raise VTTError(f"Can't import `{path}`: {ex}")
+        checked["prefabs"].append((name, folder, data))
+    # The systems, all or nothing (_switch_systems re-applies every match's
+    # rules; a var in the way under var_name_collision refuse refuses it).
+    pre_state = mgr.server_state()
+    after = {mid: m.system_name for mid, m in mgr.matches.items()}
+    sizes = {d["name"]: _size_rule_effective(mgr, d["name"])
+             for d in systems if d["name"] in mgr.systems}
+    rule_notes = _switch_systems(mgr, target, after, f"import `{path}`")
+    problems = [p for d in systems for p in _size_rule_problems(mgr, d["name"])]
+    if problems:
+        _switch_systems(mgr, pre_state, after, "undo the import")
+        raise VTTError(f"Can't import `{path}`: " + " ".join(problems))
+    for name, before in sizes.items():
+        rule_notes += _size_rule_notes(mgr, before)
+    # Then the library entries, partials before what references them.
+    stored: Dict[str, List[str]] = {"templates": [], "prefabs": []}
+    pending = list(checked["templates"])
+    while pending:
+        ready = [r for r in pending
+                 if all(x in mgr.templates or x not in {p[0] for p in pending}
+                        for x in template_refs_of(r[2]))]
+        if not ready:
+            ready = pending[:1]
+        for name, folder, data in ready:
+            pending.remove((name, folder, data))
+            where = None if name in mgr.templates else (folder or None)
+            verb, _n = _store_template(ctx, mgr, name, data, folder=where)
+            stored["templates"].append(
+                f"`{name}`" + (" (replaced)" if verb == "Replaced" else ""))
+    for name, folder, data in checked["prefabs"]:
+        where = None if name in mgr.prefabs else (folder or None)
+        verb, _n = _store_prefab(ctx, mgr, name, data, folder=where)
+        stored["prefabs"].append(
+            f"`{name}`" + (" (replaced)" if verb == "Replaced" else ""))
+    audit_note(f"imported system `{top['name']}` from `{path}` ("
+               + ", ".join(done) + ")"
+               + "".join(f"; {lib}: " + ", ".join(v)
+                         for lib, v in stored.items() if v))
+    lines = [f"📥 Imported `{path}`: " + ", ".join(done)
+             + (f" (`{old_top}` in the file)" if as_name else "") + "."]
+    for lib, v in stored.items():
+        if v:
+            lines.append(f"{lib.capitalize()}: " + ", ".join(v) + ".")
+    users = sorted(mid for mid, m in mgr.matches.items()
+                   if m.system_name in {d["name"] for d in systems})
+    if users:
+        lines.append(
+            "Matches on it took its rules: " + ", ".join(f"`{u}`" for u in users)
+            + ". Its libraries reach new matches; `!match sync all` brings "
+              "them to a live one.")
+    lines += [f"⚠️ {n}" for n in notes + rule_notes]
+    return await ctx.send("\n".join(lines))
+
+
+async def _system_defaults(ctx: ReplyContext, args: List[str],
+                           mgr: MatchManager, sub: str):
+    """`!system defpassive|defvar|clamp <action> <system> ...` (Y10): the
+    system's default passives, vars and clamps by name, with the grammar of
+    `!defpassive` / `!defvar` / `!gclamp` (the action first, like the
+    other system libraries), so a setup needs no match on the system."""
+    rest = list(args[1:])
+    lead: List[str] = []
+    if sub == "defvar" and rest and rest[0].lower() in ("map", "match"):
+        lead, rest = [rest[0]], rest[1:]
+    usage = (f"!system {sub} " + ("[map|match] " if sub == "defvar" else "")
+             + "<action> <system> ...")
+    if len(rest) < 2:
+        raise VTTError(f"Usage: `{usage}`.")
+    action, sys_name = rest[0], rest[1]
+    mgr.get_system(sys_name)
+    inner = lead + [action] + rest[2:]
+    if sub == "defpassive":
+        return await _defpassive_on(ctx, mgr, inner, sys_name)
+    if sub == "defvar":
+        return await _defvar_on(ctx, mgr, inner, sys_name)
+    return await _gclamp_on(ctx, mgr, inner, sys_name)
+
+
+def _action_condition_note(m: Match, actor_id: str, act: Any,
+                           vehicle: Optional[str] = None) -> str:
+    """"condition not met" when the action's precondition (Y4) reads false
+    for `actor_id` now (no target, no args), "its condition failed" when
+    the formula fails; "" otherwise. A seat action is judged as `!action`
+    runs it (mount_action_actor)."""
+    if not getattr(act, "condition", ""):
+        return ""
+    from action import action_condition_ok
+    eff, extra = actor_id, None
+    if vehicle:
+        import dataclasses
+        veh = m.entities.get(vehicle)
+        mode = (veh.vars.get("mount_action_actor") if veh is not None
+                else None) or m.rules.get("mount_action_actor", "rider")
+        rider = m.entities.get(actor_id)
+        extra = {"vehicle": vehicle, "rider": actor_id,
+                 "slot": rider.mount_slot if rider is not None else None}
+        if str(mode) == "vehicle":
+            eff = vehicle
+        else:
+            act = dataclasses.replace(act, container_path="")
+    ok, err = action_condition_ok(act, eff, m, extra=extra)
+    if ok:
+        return ""
+    return "its condition failed" if err else "condition not met"
 
 
 async def _action_info(
@@ -29838,6 +30904,10 @@ def _reaction_info_lines(m: Match, act: Any, private: bool) -> List[str]:
         return _private_text(m) if private else formula_text(src)
     if act.affects:
         out.append(f"Affects:     `{ftext(act.affects)}`")
+    if act.condition:
+        out.append(f"Condition:   `{ftext(act.condition)}`")
+    if act.condition_message:
+        out.append(f"Refusal:     {act.condition_message}")
     if act.target_condition:
         out.append(f"Target condition: `{ftext(act.target_condition)}`")
     if act.cancelled_action_cost:
