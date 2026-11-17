@@ -3413,6 +3413,19 @@ def _description_statuses(m: Match, status: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _description_cut(m: "Match", lines: List[str], eid: str) -> List[str]:
+    """The data section's lines cut at entity_description_line_limit (-1 =
+    none). The count is a bullet of the list: as a plain line after it,
+    Discord ran it and the next section's header together ("... (27 more
+    lines) Actions")."""
+    cap = int(m.rules.get("entity_description_line_limit", -1))
+    if cap < 0 or len(lines) <= cap:
+        return lines
+    return lines[:cap] + [
+        f"- … {len(lines) - cap} more lines (`!ent get {eid} <var>` reads "
+        f"one; the rule entity_description_line_limit)"]
+
+
 def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
     """The description of `e` (`!ent info <id>`) as a viewer on `pov_team`
     sees it (None = every unit's whole truth): the sections
@@ -3473,10 +3486,7 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
             lines: List[str] = []
             _description_tree(tree, 0, lines, labels)
             if lines:
-                cap = int(m.rules.get("entity_description_line_limit", 60))
-                if len(lines) > cap:
-                    lines = lines[:cap] + [
-                        f"... ({len(lines) - cap} more lines)"]
+                lines = _description_cut(m, lines, e.id)
                 text = _render_template(fmt(sec),
                                         {"items": "\n".join(lines)})
         elif sec == "actions":
@@ -3679,10 +3689,7 @@ def _corpse_description(m: Match, x: int, y: int, cid: str,
             lines: List[str] = []
             _description_tree(tree, 0, lines, labels)
             if lines:
-                cap = int(m.rules.get("entity_description_line_limit", 60))
-                if len(lines) > cap:
-                    lines = lines[:cap] + [
-                        f"... ({len(lines) - cap} more lines)"]
+                lines = _description_cut(m, lines, cid)
                 text = _render_template(fmt(sec), {"items": "\n".join(lines)})
         elif sec == "parts":
             pfmt = _description_rule(m, "entity_description_part_format")
@@ -10068,6 +10075,7 @@ class _ReplayCtx:
         self.user_name = user_name or user_id
         self.prompt_choice = None
         self.offer_resume = None
+        self.offer_confirm = None
         self.replies: List[str] = []
 
     def __getattr__(self, name):
@@ -15547,7 +15555,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             e = m.entities.get(eid)
             if e and not _pov_hides(m, pov, eid):
                 order_lines.append(
-                    f"{mark} `{eid[:8]}` **{m.entity_display_name(e, pov)}** "
+                    f"{mark} `{eid}` **{m.entity_display_name(e, pov)}** "
                     f"({init_label} {e.initiative})")
         out = "Turn order:\n" + ("\n".join(order_lines) or "(empty)")
         extra = _extra_turn_lines(m, pov)
@@ -15651,7 +15659,7 @@ def _extra_turn_lines(m: Match, pov: Optional[str]) -> List[str]:
         e = m.entities.get(eid)
         if e is None or _pov_hides(m, pov, eid):
             return None
-        return f"`{eid[:8]}` **{m.entity_display_name(e, pov)}**"
+        return f"`{eid}` **{m.entity_display_name(e, pov)}**"
     if m.extra_turn:
         shown = name(m.extra_turn)
         if shown:
@@ -20186,13 +20194,17 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 ))
             if _undo_changes_nothing(ctx, m, snap):
                 # T13: back to the start of this turn, and nothing has
-                # changed since it began.
-                return await ctx.send(
+                # changed since it began: offer the turn before.
+                more = await _offer_further(
+                    ctx, m, "turn", n,
                     f"Nothing has changed since "
                     f"{snap.active_entity_id or 'no-active'}'s turn began "
                     f"(round {snap.round_at_snapshot}): `!undo turn {n}` "
-                    f"lands where the board is now."
-                    + _undo_further(m, "turn", n))
+                    f"lands where the board is now.")
+                if more is None:
+                    return
+                n = more
+                snap = m.history.get_turn_nth_back(n)
             bmode = await _resolve_bindings_mode(ctx, m, snap, args)
             if bmode is None:
                 return
@@ -20226,11 +20238,15 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"round {n}", erased,
                 ))
             if _undo_changes_nothing(ctx, m, snap):
-                return await ctx.send(
+                more = await _offer_further(
+                    ctx, m, "round", n,
                     f"Nothing has changed since round "
                     f"{snap.round_at_snapshot} began: `!undo round {n}` "
-                    f"lands where the board is now."
-                    + _undo_further(m, "round", n))
+                    f"lands where the board is now.")
+                if more is None:
+                    return
+                n = more
+                snap = m.history.get_round_nth_back(n)
             bmode = await _resolve_bindings_mode(ctx, m, snap, args)
             if bmode is None:
                 return
@@ -20455,20 +20471,38 @@ def _undo_changes_nothing(ctx, m: Match, snap: Snapshot) -> bool:
     return "(no differences)" in lines
 
 
-def _undo_further(m: Match, kind: str, n: int) -> str:
-    """The step past an undo that would change nothing: `!undo turn N+1`
-    and where it lands, when there is one."""
+async def _offer_further(ctx, m: Match, kind: str, n: int,
+                         nothing: str) -> Optional[int]:
+    """An undo that would change nothing (`nothing` says so) offers the step
+    past it, yes / no: Discord asks with buttons (`offer_confirm`, Yes
+    runs `!undo <kind> <n+1> confirm` as the clicker), the CLI and GUI ask
+    inline (`prompt_choice`; returns n + 1 on yes, so the caller restores
+    that one), elsewhere the reply names the command. None when the
+    command is done."""
     try:
         snap = (m.history.get_turn_nth_back(n + 1) if kind == "turn"
                 else m.history.get_round_nth_back(n + 1))
     except (VTTError, IndexError, KeyError):
-        return " There is no earlier one to go back to."
-    if kind == "turn":
-        return (f" `!undo turn {n + 1}` goes back to the start of "
-                f"{snap.active_entity_id or 'no-active'}'s turn (round "
-                f"{snap.round_at_snapshot}).")
-    return (f" `!undo round {n + 1}` goes back to the start of round "
-            f"{snap.round_at_snapshot}.")
+        await ctx.send(nothing + " There is no earlier one to go back to.")
+        return None
+    where = (f"{snap.active_entity_id or 'no-active'}'s turn (round "
+             f"{snap.round_at_snapshot})" if kind == "turn"
+             else f"round {snap.round_at_snapshot}")
+    question = f"{nothing} Undo to the start of {where} instead?"
+    args = [kind, str(n + 1), "confirm"]
+    offer = getattr(ctx, "offer_confirm", None)
+    if offer is not None:
+        await offer(m, question, "undo", args)
+        return None
+    prompt = getattr(ctx, "prompt_choice", None)
+    if prompt is not None:
+        ans = await prompt(question, ["yes", "no"], None, None)
+        if str(ans or "").strip().lower() in ("yes", "y"):
+            return n + 1
+        await ctx.send("Left as it is.")
+        return None
+    await ctx.send(f"{question} `!undo {kind} {n + 1}` does it.")
+    return None
 
 
 async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
@@ -27358,7 +27392,8 @@ class _SimCtx:
     def __init__(self, inner: ReplyContext):
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "replies", [])
-        for k in ("prompt_choice", "offer_resume", "post_scene_image",
+        for k in ("prompt_choice", "offer_resume", "offer_confirm",
+                  "post_scene_image",
                   "show_scene_view", "set_autoupdate", "set_roster_autoupdate",
                   "retire_server_boards"):
             object.__setattr__(self, k, None)

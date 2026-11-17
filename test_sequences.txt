@@ -34351,7 +34351,7 @@ SCENARIO 1009 — The description's readable vars: whitelist, blacklist paths, `
 ?? - max_hp: 12
 !system set default entity_description_line_limit 3
 !ent info mage
-?? more lines)
+?? more lines (`!ent get mage <var>` reads one; the rule entity_description_line_limit)
 !assert "len(rule_get('entity_description_hidden_vars')) > 0"
 !system unset default entity_description_hidden_vars
 !system unset default entity_description_shown_vars
@@ -34367,8 +34367,10 @@ values is joined, a bool reads yes / no, a 0 still shows. A blacklist path
 spell's and the cloak's). The whitelist entity_description_shown_vars
 (`stats, gear.cloak`) shows only those paths, the blacklist still applying
 inside them. Dropping `@engine` from the blacklist puts hp / max_hp in
-Details; entity_description_line_limit 3 cuts the section with a count of
-the lines left out.
+Details; entity_description_line_limit 3 cuts the section with a bullet
+counting the lines left out and naming `!ent get` (a bullet: as a plain
+line after the list, Discord ran it and the next header together). The
+rule's default is no limit.
 
 SCENARIO 1010 — Action visibility: all, allies, used; `!action list` / `info`, `!find action:`, Tab; what a use records
 ---------------------------------------------------------------------------------------------------------------------
@@ -45338,8 +45340,8 @@ its arm clear of the earlier copies. Forty copies within one cell don't
 fit, and nothing is cloned.
 
 
-SCENARIO 1235 — An undo that would change nothing says so; turn lines name units by their whole id (T13, L56)
-------------------------------------------------------------------------------------------------------------
+SCENARIO 1235 — An undo that would change nothing offers the step before; a round's autosave comes with its first turn (T13, T12, L56)
+---------------------------------------------------------------------------------------------------------------------------------
 
 !match new un Un 10 10
 !match use un
@@ -45353,7 +45355,7 @@ SCENARIO 1235 — An undo that would change nothing says so; turn lines name uni
 ?? `rare_frost_bear` **Bear**
 !turn next
 !undo turn 1
-?? Nothing has changed since a's turn began (round 2): `!undo turn 1` lands where the board is now. `!undo turn 2` goes back to the start of rare_frost_bear's turn (round 1).
+?? Nothing has changed since a's turn began (round 2): `!undo turn 1` lands where the board is now. Undo to the start of rare_frost_bear's turn (round 1) instead? `!undo turn 2` does it.
 !ent hp a 15
 !undo turn 1
 ?? Undid 1 turn(s). Now at start of a's turn (round 2).
@@ -45364,14 +45366,33 @@ SCENARIO 1235 — An undo that would change nothing says so; turn lines name uni
 ?? Undid 2 turn(s). Now at start of rare_frost_bear's turn (round 1).
 !undo round 1 confirm
 ?? Undid 1 round(s). Now at start of round 1.
+!turn
+?? ➡️ `a` **A**
+?? `rare_frost_bear` **Bear**
 !undo round 1 confirm
 ?? Nothing has changed since round 1 began: `!undo round 1` lands where the board is now. There is no earlier one to go back to.
+!turn next
+?? It is now **Bear**'s turn (id `rare_frost_bear`)
+!turn next
+!turn next
+!ent hp rare_frost_bear 5
+!undo round 1 confirm
+?? Undid 1 round(s). Now at start of round 2.
+!turn next
+?? It is now **Bear**'s turn (id `rare_frost_bear`)
+!assert "entity[rare_frost_bear].hp == 20"
 
 Expected: `!undo turn 1` goes back to the start of the turn under way;
-when nothing has changed since it began, the reply says so and names the
-step that goes further (T13) and changes nothing; after a change it
-undoes it. The same for `!undo round`. The turn line and the forecast
-name units by their whole id (L56: `rare_fro` named nothing).
+when nothing has changed since it began, the reply says so and offers
+the turn before ("Undo to the start of rare_frost_bear's turn (round 1)
+instead?"): Discord asks with Yes / No buttons, the CLI and GUI ask
+inline, here the reply names `!undo turn 2`; after a change it undoes
+it. The same for `!undo round`. A round's autosave is taken as its first
+turn begins (T12), so `!undo round 1` lands on A's turn under way and the
+next `!turn next` goes to the Bear (A's turn isn't given twice), in
+round 1 and again in round 2. The turn line and the forecast name units
+by their whole id, as does the bare `!turn` order (L56: `rare_fro` named
+nothing).
 
 
 SCENARIO 1236 — Tab offers corpses to the `!ent` forms that take them; an action's positional word names what it takes (L56)

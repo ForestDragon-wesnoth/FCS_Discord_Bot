@@ -3327,11 +3327,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "entity_description_line_limit": {
-        "default": 60,
-        "schema": {"type": "int", "min": 1, "max": 1000},
+        "default": -1,
+        "schema": {"type": "int", "min": 1, "max": 1000, "unlimited": True},
         "desc": (
             "The most lines the description's data section prints; the "
-            "rest are counted in a last line."
+            "rest are counted in a last bullet naming `!ent get`, which "
+            "reads one var. -1 (default) = no limit: a long description "
+            "takes several messages, and on Discord what passes "
+            "reply_message_cap goes in an attached file "
+            "(cut_output_attachment)."
         ),
     },
     "entity_description_actions_format": {
@@ -4921,6 +4925,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "how many. Each reply is also capped by reply_message_cap."
         ),
     },
+    "cut_output_attachment": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Discord: when reply_message_cap cuts a reply, its cut note "
+            "carries the whole reply as `reply.txt`; when "
+            "command_message_cap leaves messages out, the note at the end "
+            "carries the command's whole output as `output.txt`. The file "
+            "lives on Discord only (the bot keeps no copy); it is counted "
+            "against the server's storage limit when posted and must fit "
+            "the upload size Discord allows in the server, else the note "
+            "says why it isn't attached. Off: the note alone."
+        ),
+    },
     "autoupdate_reserved_messages": {
         "default": 5,
         "schema": {"type": "int", "min": 1, "max": 20, "ceiling": True},
@@ -5502,7 +5520,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     # ---- Match history / autosave / undo --------------------------------
     # The MatchHistory module (see match_history.py) takes three kinds of
-    # autosave: round-start (after on_round_start hooks), turn-start
+    # autosave: round-start (as the round's first turn begins), turn-start
     # (after on_turn_start hooks), and pre-command (before each mutating
     # command). The three rules below cap how much of each is kept; the
     # three thresholds below them gate the "are you sure?" prompt for
@@ -5537,9 +5555,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Cap on retained round-start autosaves. -1 = unlimited (default; "
             "the original spec is 'every start of round, for the entirety of "
             "the match'). 0 = disable round autosaves. N>0 = keep the most "
-            "recent N round-start snapshots. Round-start snapshots are taken "
-            "AFTER on_round_start hooks fire, so restoring one puts the "
-            "match at the state players would have seen as the round began."
+            "recent N round-start snapshots. A round's snapshot is taken as "
+            "its first turn begins (after the on_round_start hooks and that "
+            "unit's turn-start effects), so restoring one shows that unit's "
+            "turn under way, as the turn autosave of the same moment does."
         ),
     },
     "autosave_round_snapshot_mode": {
@@ -13303,6 +13322,11 @@ class Match:
     # what turn-based durations key on. Never decremented (a history restore
     # rolls it back with the rest of the state).
     turns_elapsed: int = 0
+    # The round whose round-start autosave was taken (T12): the snapshot is
+    # taken as the round's first turn begins (_begin_turn), so restoring
+    # it shows that unit's turn under way. Undo state, so a restore into a
+    # round doesn't take the round's autosave again.
+    round_saved: int = 0
     # The match's own RNG seed (made at creation; the random_seed rule, when
     # set, overrides it) and the position its RNG had reached, in 32-bit
     # words drawn (CountingRandom), so every match's rolls can be replayed
@@ -21384,11 +21408,8 @@ class Match:
             log.extend(self.fire_tile_time_hooks("on_round_start"))
             log.extend(self.fire_zone_time_hooks("on_round_start"))
             log.extend(self.fire_scheduled_round())
-            # Autosave: round start happens after on_round_start hooks
-            # so that restoring the snapshot gives the players the
-            # state they would have seen as the round began (with any
-            # hook side-effects already applied).
-            self.history.record_round(self)
+            # The round-start autosave is taken as the round's first turn
+            # begins (_begin_turn, T12).
             # An opening round_start hook/tick may have removed every
             # entity — nothing to start.
             if not self.turn_order:
@@ -21784,7 +21805,15 @@ class Match:
         self.turns_elapsed += 1
         self._note_actor()
         self._fire_reminders()
-        self.history.record_turn(self)
+        # The round's autosave comes with its first turn (T12): restoring it
+        # shows that unit's turn under way, its turn-start effects run, as
+        # the turn autosave of the same moment does. Taken before the turn
+        # autosave, so undoing to that turn keeps it.
+        with_round = (self.round_started and self.round_saved < self.round_number
+                      and not self.rules.get("atb_enabled"))
+        if with_round:
+            self.round_saved = self.round_number
+        self.history.record_turn(self, with_round=with_round)
 
     def reminder_line(self, r: Dict[str, Any]) -> str:
         """A reminder's line (reminder_message_format; a secret one marked)."""
@@ -22199,7 +22228,8 @@ class Match:
             log.extend(self.fire_tile_time_hooks("on_round_start"))
             log.extend(self.fire_zone_time_hooks("on_round_start"))
             log.extend(self.fire_scheduled_round())
-            self.history.record_round(self)
+            # The round-start autosave is taken as the round's first turn
+            # begins (_begin_turn, T12).
 
     _ROUND_FMT_RE = re.compile(r"\{(round|match)(?:\.([\w.]+))?\}")
 
@@ -29041,6 +29071,7 @@ class Match:
             "rules": copy.deepcopy(self.rules),
             "round_number": self.round_number,
             "turns_elapsed": self.turns_elapsed,
+            "round_saved": self.round_saved,
             "rng_seed": self.rng_seed,
             "schedule_seq": self.schedule_seq,
             "rng_pos": self.rng_position(),
@@ -29251,6 +29282,9 @@ class Match:
         # m.rules already set above
         m.round_number = int(d.get("round_number", 1))
         m.turns_elapsed = int(d.get("turns_elapsed", 0))
+        # A file from before T12 has no marker: its round's autosave, if
+        # any, was taken at the wrap.
+        m.round_saved = int(d.get("round_saved", m.round_number))
         try:
             m.schedule_seq = max(0, int(d.get("schedule_seq", 0)))
         except (TypeError, ValueError):

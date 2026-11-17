@@ -448,7 +448,7 @@ back, load the schema with `ToolSearch` before calling
   `getattr`, so the engine stays surface-agnostic and the harness exercises
   the fallback: `supports_color`, `viewport_capable`, `message_limit`,
   `auto_approve`, `post_scene_image`, `show_scene_view`, `set_autoupdate`,
-  `set_roster_autoupdate`, `offer_resume`, `prompt_choice`,
+  `set_roster_autoupdate`, `offer_resume`, `offer_confirm`, `prompt_choice`,
   `retire_server_boards`. The Discord adapter also routes `!<alias>`
   through `on_command_error`, never pings (`AllowedMentions.none()`),
   splits long replies fence-aware (`vtt_commands.split_message`, at
@@ -3231,8 +3231,14 @@ hardcodes**.
   rulers, then colour, then legend; one reply takes at most
   `reply_message_cap` messages, then a cut note, and one command at most
   `command_message_cap` (20, owner ceiling 1000, W14) in all (a sweep,
-  batch or macro posts a reply
-  per line), then one note counting the rest (`flush_dropped`). Commands run from the
+  batch or macro posts a reply per line), then one note counting the rest
+  (`flush_dropped`). Under `cut_output_attachment` (default on, W14, user
+  call) the reply's cut note carries the whole reply as `reply.txt` and
+  the command's note its whole output as `output.txt`
+  (`DiscordCtxWrapper._cut_file`, ANSI codes stripped): kept on Discord
+  only, counted against the server's storage limit when posted and held
+  to the server's upload size (`guild.filesize_limit`), else the note
+  says why it isn't attached. Commands run from the
   Approve / Resume buttons use the same adapter (`_InteractionCtx` is a
   `DiscordCtxWrapper`); a pan click is acknowledged before it waits for
   the command lock.
@@ -3588,8 +3594,19 @@ hardcodes**.
   saved in the history index, one line of at most `HISTORY_NOTE_MAX`);
   `!history list` and the undo previews show it (1177). An `!undo turn
   N` / `round N` whose restore point equals the board now (the start of
-  the turn under way, nothing changed since) says so, names the step that
-  goes further and restores nothing (`_undo_changes_nothing`, T13, 1235).
+  the turn under way, nothing changed since) says so and offers the step
+  before, yes / no (`_undo_changes_nothing`, `_offer_further`; user
+  design, T13, 1235): Discord asks with Yes / No buttons
+  (`offer_confirm`, `_ConfirmView`: only the asker answers, Yes runs
+  `!undo <kind> <N+1> confirm` as a typed command), the CLI and GUI ask
+  inline (`prompt_choice`; yes restores N+1 in the same command), other
+  surfaces name the command. A round's autosave is taken as its first
+  turn begins (T12, user call): `_begin_turn` records it with the turn
+  autosave of that moment (`record_turn(with_round=)`, the round's
+  sequence first, so undoing to that turn keeps it), once per round per
+  `Match.round_saved` (saved, undo state; a file without it reads its
+  round number), so a restore shows that unit's turn under way and
+  `!turn next` goes on to the next unit.
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -4288,7 +4305,9 @@ dump` is the raw data for the GM.
 - **Data:** the unit's vars as an indented list (`_description_vars` /
   `_description_tree`: a dict of plain values on one line, a dict's
   `description` after its key, plain lists joined, bools yes / no), cut at
-  `entity_description_line_limit`. `__` keys and `actions` dicts never
+  `entity_description_line_limit` (default -1, none; a cut ends with a
+  bullet naming `!ent get`, `_description_cut`: as a plain line Discord
+  ran it into the next header). `__` keys and `actions` dicts never
   show; `entity_description_shown_vars` (paths, empty = all) is the
   whitelist, `entity_description_hidden_vars` the blacklist (paths,
   `*.<key>` at any depth, `@engine` = every var a VAR_NAME_RULES rule names
@@ -4701,13 +4720,6 @@ rejected already. Update this section in the PR that resolves an item.
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
   only that pair. A layer-aware version of each is open (idea #563).
-
-- **`!undo round` lands before the round's first turn** (T12, asked):
-  the round snapshot is taken at the wrap, before the first unit's turn
-  begins, so after the restore that unit shows as current with its
-  turn-start effects not run, and the next `!turn next` gives it its turn
-  again. Options: take the snapshot after the turn begins, have the
-  restore begin it, or show no current unit and say `!turn next` starts it.
 
 - **Dragged corpses fire no hooks** (user: a known limitation; code it
   when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross

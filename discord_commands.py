@@ -200,6 +200,8 @@ class DiscordCtxWrapper:
         self._guild = getattr(ctx, "guild", None)
         self._sent = 0
         self._dropped = 0
+        # Every reply of the command, whole (W14: a cut one is attached).
+        self._output: List[str] = []
 
     def resolve_role(self, text: str) -> tuple:
         """A role a command names (`!server perms`, `!host access ...
@@ -264,22 +266,53 @@ class DiscordCtxWrapper:
                 return _role_text(r)
         return None
 
-    def _reply_cap(self, rule: str = "reply_message_cap",
-                   default: int = 8) -> int:
-        """A message-cap rule of this channel's match (else of the server's
-        default system)."""
+    def _rule_value(self, rule: str, default: Any) -> Any:
+        """A rule of this channel's match (else of the server's default
+        system)."""
         mgr = self._mgr
         try:
             mid = mgr.get_active_for_channel(self.channel_key) if mgr else None
             m = mgr.matches.get(mid) if mid else None
             if m is not None:
-                return max(1, int(m.rules.get(rule, default)))
+                return m.rules.get(rule, default)
             s = mgr.systems.get(mgr.default_system_name) if mgr else None
             if s is not None:
-                return max(1, int(mgr.system_value(s, rule)))
+                return mgr.system_value(s, rule)
         except Exception:
             pass
         return default
+
+    def _reply_cap(self, rule: str = "reply_message_cap",
+                   default: int = 8) -> int:
+        """A message-cap rule of this channel's match (else of the server's
+        default system)."""
+        try:
+            return max(1, int(self._rule_value(rule, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _cut_file(self, text: str, name: str):
+        """(a discord.File of `text`, "") for a cut reply or command
+        (cut_output_attachment, W14), else (None, why not: "" when the
+        rule is off). The file lives on Discord only; it is counted against
+        the server's storage limit when posted, and must fit the upload
+        size Discord allows in this server."""
+        if not bool(self._rule_value("cut_output_attachment", True)):
+            return None, ""
+        import io
+        from storage import storage_of, fmt_bytes
+        data = re.sub(r"\x1b\[[0-9;]*m", "", text).encode("utf-8")
+        cap = getattr(self._guild, "filesize_limit", None) or 10 * 1024 * 1024
+        if len(data) > cap:
+            return None, (f" The whole output ({fmt_bytes(len(data))}) is "
+                          f"past the {fmt_bytes(cap)} Discord takes here, "
+                          f"so it isn't attached.")
+        st = storage_of(self._mgr)
+        key = getattr(self._mgr, "guild_key", None)
+        if st is not None and key and st._over_limit(key, len(data)):
+            return None, (" The whole output isn't attached: this server's "
+                          "storage limit is reached (`!server storage`).")
+        return discord.File(io.BytesIO(data), filename=name), ""
 
     async def _post(self, *args, **kwargs):
         """Post one message (D11). A channel where the bot can't post
@@ -307,33 +340,51 @@ class DiscordCtxWrapper:
         # handler whose output happened to be empty must not crash the send.
         # One reply takes at most reply_message_cap messages: the server's
         # command lock is held while they go out.
+        message = "" if message is None else str(message)
+        self._output.append(message)
         chunks = [c for c in split_message(message) if c.strip()]
         cap = self._reply_cap()
+        cut_file = None
         if len(chunks) > cap:
             cut = sum(len(c) for c in chunks[cap:])
+            cut_file, why = self._cut_file(message, "reply.txt")
             chunks = chunks[:cap] + [
                 f"✂️ … {cut} more characters left out (reply_message_cap "
-                f"{cap}): narrow the command (a viewport, a page, fewer "
-                f"dice; for rules and help, `!help rule <rule>` or "
-                f"`!help find <words>`)."]
+                f"{cap})" + (": the whole reply is attached." if cut_file
+                             else ": narrow the command (a viewport, a page, "
+                                  "fewer dice; for rules and help, `!help "
+                                  "rule <rule>` or `!help find <words>`)."
+                             + why)]
         # And one command at most command_message_cap messages in all (a
         # sweep, batch or macro posts one reply per line): the rest are
         # counted and named in one note, sent once the command ends.
         total = self._reply_cap("command_message_cap", 20)
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             if self._sent >= total:
                 self._dropped += 1
                 continue
             self._sent += 1
-            await self._post(chunk)
+            if cut_file is not None and i == len(chunks) - 1:
+                await self._post(chunk, file=cut_file)
+            else:
+                await self._post(chunk)
 
     async def flush_dropped(self) -> None:
-        """The note for the messages command_message_cap left out."""
+        """The note for the messages command_message_cap left out, with
+        the command's whole output attached (cut_output_attachment, W14)."""
+        output, self._output = self._output, []
         if self._dropped:
             n, self._dropped = self._dropped, 0
-            await self._post(
-                f"✂️ … {n} more message(s) of this command left out "
-                f"(command_message_cap {self._reply_cap('command_message_cap', 20)}).")
+            cap = self._reply_cap("command_message_cap", 20)
+            file, why = self._cut_file("\n\n".join(output), "output.txt")
+            note = (f"✂️ … {n} more message(s) of this command left out "
+                    f"(command_message_cap {cap})"
+                    + (": its whole output is attached." if file
+                       else "." + why))
+            if file is not None:
+                await self._post(note, file=file)
+            else:
+                await self._post(note)
 
     async def set_autoupdate(self, m, on: bool) -> str:
         """Turn this channel's self-refreshing map board on/off. Posts the
@@ -495,6 +546,18 @@ class DiscordCtxWrapper:
             )
 
 
+    async def offer_confirm(self, m, question: str, name: str,
+                            args: list) -> None:
+        """A yes / no question a command asks (an `!undo` that would change
+        nothing offers the step past it): the question with Yes / No
+        buttons; Yes runs `!<name> <args>` as the clicker."""
+        try:
+            view = _ConfirmView(m.id, self.user_id, name, args, self._mgr)
+            view.message = await self._ctx.send(question, view=view)
+        except Exception:
+            await self._post(question + f" Type `{_shown_cmd(name, args)}` "
+                                        f"to do it.")
+
     async def offer_resume(self, m, entry: dict):
         """A host's command held on a paused match (pause_affects_hosts):
         ask to unpause, with Resume & run / Cancel buttons. Called by the
@@ -551,6 +614,8 @@ class _InteractionCtx(DiscordCtxWrapper):
         self.cli_mutable = False
         self._sent = 0
         self._dropped = 0
+        # Every reply of the command, whole (W14: a cut one is attached).
+        self._output: List[str] = []
 
 
 async def _ack_click(interaction, what: str) -> bool:
@@ -854,6 +919,82 @@ class _ResumeView(discord.ui.View):
         except Exception:
             pass
         self.stop()
+
+class _ConfirmView(discord.ui.View):
+    """Yes / No under a question a command asked (`offer_confirm`): Yes
+    runs the command the question offers as the clicker (only the person
+    who asked may answer), through the same gate as a typed command; No
+    leaves things as they are. Both disable the buttons."""
+
+    def __init__(self, match_id: str, asker: str, name: str, args: list,
+                 mgr, timeout: float = 600.0):
+        super().__init__(timeout=timeout)
+        self._mid = match_id
+        self._asker = asker
+        self._name = name
+        self._args = list(args)
+        self._mgr = mgr
+        self.message = None
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(self.message.content or "")
+                + f"\n⌛ Buttons expired — type `{_shown_cmd(self._name, self._args)}` "
+                  f"to do it.", view=self)
+        except Exception:
+            pass
+
+    async def _mine(self, interaction) -> bool:
+        if str(getattr(interaction.user, "id", "")) != self._asker:
+            await _click_reply(interaction, "❌ This question is for the "
+                               "person who asked it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, interaction, button):
+        if not await _ack_click(interaction, "Yes"):
+            return
+        if not await self._mine(interaction):
+            return
+        await self._disable(interaction)
+        ictx = _InteractionCtx(interaction, self._mgr)
+        depth = vtt_commands._RUN_DEPTH.set(1)
+        try:
+            async with vtt_commands.holding_command_lock(self._mgr, ictx):
+                with vtt_commands._channel_pointed_at(
+                        self._mgr, ictx.channel_key, self._mid):
+                    await registry.run(self._name, self._args, ictx,
+                                       self._mgr)
+        finally:
+            vtt_commands._RUN_DEPTH.reset(depth)
+            await ictx.flush_dropped()
+        if _boards or _roster_boards:
+            await _refresh_boards_for_match(self._mgr, self._mid)
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction, button):
+        if not await _ack_click(interaction, "No"):
+            return
+        if not await self._mine(interaction):
+            return
+        await _click_reply(interaction, "Left as it is.", ephemeral=True)
+        await self._disable(interaction)
+
+    async def _disable(self, interaction):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        self.stop()
+
 
 #now supports-multiple commands in one message - one command per line
 # ----------------------------------------------------------------------
