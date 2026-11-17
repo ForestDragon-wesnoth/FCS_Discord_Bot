@@ -3675,6 +3675,51 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`!roll 2x none, crit`): N past it is refused."
         ),
     },
+    "table_nesting_limit": {
+        "default": 8,
+        "schema": {"type": "int", "min": 1, "max": 100, "ceiling": True},
+        "desc": (
+            "How many tables deep one table roll goes: an entry `@<table>` "
+            "rolls that table when picked (`!table def loot gold, "
+            "@gems`), and a roll that reaches this depth stops at the "
+            "entry it picked, with a ⚠️. A table naming itself is refused "
+            "when it is defined; this stops a longer loop (loot -> gems -> "
+            "loot)."
+        ),
+    },
+    "action_dice_line": {
+        "default": "off",
+        "schema": {"type": "str", "choices": ["off", "on", "labelled"]},
+        "desc": (
+            "After an action succeeds, one line lists the dice its formulas "
+            "rolled with roll() and roll_dice() (action_dice_line_format): "
+            "`on` every roll, `labelled` only rolls given a label "
+            "(`roll('1d20+5', label='attack')`), `off` none. A reaction's "
+            "halves print their own line, about the reacting unit. Rolls of "
+            "an attempt that was rolled back (a choose() replay, a failed "
+            "action, a damage forecast) are left out. The line is about the "
+            "acting unit: a channel whose view can't see it doesn't show it."
+        ),
+    },
+    "action_dice_line_format": {
+        "default": "🎲 {rolls}",
+        "schema": {"type": "str"},
+        "desc": (
+            "The action dice line (action_dice_line). `{rolls}` is the "
+            "rolls, each as action_dice_roll_format, joined by ` · `; "
+            "`{actor}` / `{actor_name}` the acting unit (its name as the "
+            "channel's view sees it) and `{action}` the action."
+        ),
+    },
+    "action_dice_roll_format": {
+        "default": "{label} {spec} → {total}",
+        "schema": {"type": "str"},
+        "desc": (
+            "One roll on the action dice line: `{label}` (empty for a roll "
+            "without one), `{spec}` the dice as written and `{total}` the "
+            "result. Spaces left at either end are dropped."
+        ),
+    },
     "summon_event_limit": {
         "default": 50,
         "schema": {"type": "int", "min": 0, "max": 500, "ceiling": True},
@@ -31669,6 +31714,33 @@ class Match:
         return self.render_unit_message(fmt, actor_id, e.name, e.x, e.y,
                                         e.vars, part_of=e.part_of or "",
                                         extra=extra)
+
+    def action_dice_line(self, actor_id: str, action_name: str,
+                         rolls: List[Tuple[Any, Any, Any]]) -> str:
+        """The action dice line (#520) for the rolls an action made, each
+        (label, spec, total), as the action_dice_line rule picks them;
+        "" when it shows none."""
+        mode = str(self.rules.get("action_dice_line", "off"))
+        if mode == "off" or not rolls:
+            return ""
+        if mode == "labelled":
+            rolls = [r for r in rolls if r[0]]
+        if not rolls:
+            return ""
+        one = str(self.rules.get("action_dice_roll_format",
+                                 "{label} {spec} → {total}"))
+        shown = []
+        for label, spec, total in rolls:
+            shown.append(one.replace("{label}", str(label or ""))
+                         .replace("{spec}", str(spec))
+                         .replace("{total}", str(total)).strip())
+        fmt = str(self.rules.get("action_dice_line_format", "🎲 {rolls}"))
+        if not fmt.strip():
+            return ""
+        return (fmt.replace("{rolls}", " · ".join(shown))
+                .replace("{actor_name}", self.say_name(actor_id))
+                .replace("{actor}", actor_id)
+                .replace("{action}", action_name))
 
     def say_tag(self, about: Optional[str]) -> str:
         """The tag a say() line about unit or corpse `about` starts with

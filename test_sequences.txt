@@ -44859,3 +44859,376 @@ file holding a rule value its rule refuses is refused whole, naming it,
 and changes nothing; a file that isn't a system file and an unknown mode
 are refused. Importing needs the `systems` capability (and `files` to
 read the file), exporting the `files` capability.
+
+
+SCENARIO 1225 — Dice pools: success counts, failures, rerolls, Fate dice and d% (#104)
+----------------------------------------------------------------------------------------
+
+!match new dp Dp 8 8
+!match use dp
+!system set default random_seed 11
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!assert "roll('5d1>=1') == 5"
+!assert "roll('5d1>=1+2') == 7"
+!assert "roll('5d1>=1f1') == 0"
+!assert "roll('-3d1>=1') == -3"
+!assert "roll('3d1=1+2d1=2') == 3"
+!assert "roll('6d10>=8') <= 6"
+!assert "min(roll_dice('30d6r1')) >= 2"
+!assert "min(roll_dice('30d6r<3')) >= 3"
+!assert "min(roll_dice('30d6r1r2')) >= 3"
+!assert "min(roll_dice('30dF')) == -1 and max(roll_dice('30dF')) == 1"
+!assert "roll('d%') >= 1 and roll('d%') <= 100"
+!assert "len(roll_dice('4d10!>=8', all=True)) >= 4"
+!ent set_var ogre pool $(5)
+!eval "entity[ogre].pool = roll('6d10>=8') + roll('4dF')"
+!assert "entity[ogre].pool >= -4 and entity[ogre].pool <= 10"
+!roll 6d10>=8f1
+?? 6d10>=8f1 [
+?? failures = 
+!roll 2d6r1
+?? 2d6r1 [
+!roll 4dF+1
+?? 4dF [
+!roll 2d6r1ro2
+?? mixes `r` (reroll until) and `ro` (reroll once)
+!roll 2d6f1
+?? comes after a success test
+!roll 1d6r<7
+?? rerolls every face
+!roll 4d6kh3>=4
+?? both keeps dice and counts successes
+!roll 2dF!
+?? Fate dice don't explode
+!roll 2d6>=7>=8
+?? gives a success test twice
+!roll 2d6r=-1
+?? 2d6r=-1 [
+
+Expected: HARNESS-ALLOWS-ERRORS. A comparison after a die group counts
+the dice meeting it, and a flat modifier adds to the count: five d1s
+`>=1` are 5 successes, 7 with `+2`. `f1` after it takes one off per die
+showing 1 (five d1s: 5 - 5 = 0); a `-` group subtracts its count. `r1`
+rerolls a 1 until the die shows something else, `r<3` anything under 3,
+`r1r2` both. `dF` dice are -1 / 0 / +1, `d%` a d100; an exploding pool
+counts every roll of the chain as a die. The replies show each die and
+the count. Refused: `r` and `ro` together, a failure term without a
+success test, a reroll matching every face, keeping dice while counting
+successes, exploding Fate dice and a second success test. A negative
+reroll number takes its op (`r=-1`).
+
+
+SCENARIO 1226 — Odds of pools and rerolls: !roll odds, roll_odds, roll_mean (#104, #361)
+---------------------------------------------------------------------------------------
+
+!match new od Od 8 8
+!match use od
+!roll odds 6d10>=8 >= 3
+?? P(`6d10>=8` ≥ 3) = **25.57%** (25569/100000)
+!roll odds 2d6 >= 8
+?? P(`2d6` ≥ 8) = **41.67%** (5/12)
+!roll odds 2d6 >=8
+?? P(`2d6` ≥ 8) = **41.67%** (5/12)
+!roll odds 1d6ro1 = 1
+?? (1/36)
+!roll odds 4dF = 0
+?? (19/81)
+!roll odds 2d6r1
+?? 4–12, average 8.00
+!roll odds 6d10>=8
+?? 0–6, average 1.80
+!assert "abs(roll_odds('2d6', '>=', 8) - 5 / 12) < 1e-12"
+!assert "abs(roll_odds('2d6', '>=', 8, percent=True) - 500 / 12) < 1e-9"
+!assert "abs(roll_mean('4d6kh3') - 12.2446) < 0.0001"
+!assert "abs(roll_mean('2d6ro1') - 7.8333) < 0.0001"
+!assert "abs(roll_mean('6d10!>=8') - 2) < 0.0001"
+!assert "chance(100 * roll_odds('1d6', '>=', 1))"
+!ent add scout Scout 10 1 1 5
+!ent set_var scout odds "$(roll_odds('1d20', '>=', 11))"
+!assert "entity[scout].odds == 0.5"
+!eval "roll_odds('2d6', '~', 3)"
+?? op is one of >= <= > < = == !=
+!eval "roll_odds('2d6', '>=', 8, percent=1)"
+?? percent= is True or False
+
+Expected: HARNESS-ALLOWS-ERRORS. `!roll odds` takes its target as a word
+of its own (`>= 8` or `>=8`); a comparison joined to the dice counts
+successes, so `!roll odds 6d10>=8 >= 3` is the chance of three or more
+successes. Rerolls and Fate dice are worked out exactly: rerolling a 1
+once leaves a 1 at 1/36, four Fate dice total 0 at 19/81, rerolling 1s
+on 2d6 averages 8. `roll_odds(spec, op, n)` gives the chance as a
+fraction (percent=True as a percentage), `roll_mean(spec)` the average;
+both draw nothing and are allowed in `$()`. A bad op or a percent= that
+isn't a bool is refused.
+
+
+SCENARIO 1227 — Success tiers composed from band(): PbtA and Call of Cthulhu (#105)
+----------------------------------------------------------------------------------
+
+!match new tr Tr 8 8
+!match use tr
+!system set default random_seed 4
+!ent add hero Hero 20 1 1 5
+!ent set_var hero skill 60
+!func def pbta roll_total "band(roll_total, '-6:miss,7-9:partial,10-:hit')"
+!func def coc pct,skill "band(pct, '1-' + str(skill // 5) + ':extreme,' + str(skill // 5 + 1) + '-' + str(skill // 2) + ':hard,' + str(skill // 2 + 1) + '-' + str(skill) + ':regular,' + str(skill + 1) + '-:fail')"
+!eval "[pbta(6), pbta(7), pbta(9), pbta(10)]"
+?? = `['miss', 'partial', 'partial', 'hit']`
+!eval "[coc(12, 60), coc(13, 60), coc(30, 60), coc(31, 60), coc(61, 60)]"
+?? = `['extreme', 'hard', 'hard', 'regular', 'fail']`
+!eval "entity[hero].tier = pbta(roll('2d6'))"
+!assert "entity[hero].tier in ['miss', 'partial', 'hit']"
+!eval "entity[hero].check = coc(roll('d%'), entity[hero].skill)"
+!assert "entity[hero].check in ['extreme', 'hard', 'regular', 'fail']"
+!assert "roll('2d6') - roll('2d6') <= 10"
+
+Expected: The tiers of #105 come from what ships (user call: struck as
+its own feature). A Powered by the Apocalypse move is `band()` over 2d6
+(6- miss, 7-9 partial, 10+ hit); Call of Cthulhu's tiers are a band with
+bounds worked out from the skill (a fifth: extreme, a half: hard, the
+skill: regular, above it: fail), here as two `!func`s. An opposed roll
+is one roll minus the other.
+
+
+SCENARIO 1228 — Table rolls with adjusted weights and a rank: remove=, add=, best=, worst= (#253)
+-----------------------------------------------------------------------------------------------
+
+!match new tb Tb 8 8
+!match use tb
+!system set default random_seed 3
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!table def crit none:3, minicrit, crit
+!table rank crit
+?? best first: `none`, `minicrit`, `crit` (the order written: no rank is set).
+!table rank crit crit,minicrit,none
+?? Ranked table `crit`, best first: `crit`, `minicrit`, `none`.
+!table show crit
+?? none:3, minicrit, crit rank=crit,minicrit,none
+!table roll crit remove=none:3
+?! **none**
+!table roll crit remove=none:3 remove=minicrit
+?? **crit**
+!table roll crit 3 remove=none:3,minicrit add=crit:2
+?? 3x table `crit` (none −3, minicrit −1, crit +2) → **crit**, **crit**, **crit**
+!table roll crit best=3 remove=none:3
+?! → **none**
+!table roll crit worst=2 remove=crit,minicrit
+?? none, none → **none**
+!assert "table_roll('crit', remove={'none': 3, 'minicrit': 1}) == 'crit'"
+!assert "table_roll('crit', remove='none:3,crit', best=2) == 'minicrit'"
+!assert "len(table_roll('crit', 4, best=2)) == 4"
+!eval "entity[ogre].loot = table_roll('crit', add={'crit': 100}, best=2)"
+!assert "entity[ogre].loot == 'crit'"
+!roll crit remove=none:3,minicrit
+?? **crit**
+!table roll crit remove=zzz
+?? remove= names `zzz`, which isn't an entry of the table.
+!table roll crit best=2 worst=2
+?? `best=` or `worst=`, once
+!table roll crit best=0
+?? best= is a whole number from 1 to
+!table rank crit gold
+?? the rank names `gold`, which isn't an entry of the table.
+!table def loot gold, gem rank=gem
+!table rank loot
+?? best first: `gem`, `gold`.
+!table rank crit -
+?? Cleared the rank of table `crit`
+!system table def default spoils junk:5, relic rank=relic
+!system table rank default spoils
+?? best first: `relic`, `junk`.
+!system table rank default spoils junk,relic
+?? Ranked table `spoils` on `default`, best first: `junk`, `relic`.
+!eval "table_roll('crit', best=True)"
+?? best= is a whole number
+
+Expected: HARNESS-ALLOWS-ERRORS. A table roll can change entries'
+weights for that roll: `remove=none:3` takes three off (never below 0),
+`add=crit:2` adds, a bare entry means 1, and repeated options add up.
+`!table rank` stores the entries best first (shown, set, cleared with
+`-`); without one the order written is the order (user call, option c).
+It can also end a `def` as ` rank=a,b`. `best=<n>` / `worst=<n>` roll n
+times and keep the best / worst by that rank: with no `none` left,
+`best=3` never keeps `none`, and with only `none` left `worst=2` keeps
+it. table_roll takes the same as dicts or text; `!roll <table>` takes
+the options too. Refused: an unknown entry, both best= and worst=, a
+count under 1, a rank naming no entry. `!system table rank` ranks a
+system's table.
+
+
+SCENARIO 1229 — Tables that roll tables and dice: @sub-tables, {2d6} in an entry, path=True (#459)
+--------------------------------------------------------------------------------------------------
+
+!match new ts Ts 8 8
+!match use ts
+!system set default random_seed 9
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_h 2
+!table def gems ruby, opal
+!table def coins {2d6} gold, {1d4+1} silver
+!table def loot @gems, @coins
+!table roll loot 4
+?? (via `
+!eval "entity[ogre].got = table_roll('loot')"
+!assert "entity[ogre].got in ['ruby', 'opal'] or ' gold' in entity[ogre].got or ' silver' in entity[ogre].got"
+!eval "entity[ogre].pick = table_roll('loot', path=True)"
+!assert "get(entity[ogre].pick, 0) in ['gems', 'coins'] and len(entity[ogre].pick) == 2"
+!assert "table_roll('gems', path=True) in [['ruby'], ['opal']]"
+!table def wages {3d1} gold
+!assert "table_roll('wages') == '3 gold'"
+!table def deep @gems
+!eval "entity[ogre].deep = table_roll('deep', 3, path=True)"
+!assert "len(entity[ogre].deep) == 3 and get(entity[ogre].deep, '0.0') == 'gems' and get(entity[ogre].deep, '2.1') in ['ruby', 'opal']"
+!table def self @self
+?? names the table itself; a table can't roll itself.
+!table def bad {2q6} gold
+?? malformed term
+!table def later @nowhere, gold:0
+?? names table `nowhere`, which isn't defined yet.
+!table roll later
+?? ❌ table `later`: entry `@nowhere` names table `nowhere`, which doesn't exist.
+!table def ping @pong
+!table def pong @ping
+!system set default table_nesting_limit 3
+!table roll ping
+?? ⚠️ table `ping` went 3 tables deep (table_nesting_limit) and stopped at `@pong`.
+!eval "table_roll('ping')"
+?? = `'@pong'`
+?? went 3 tables deep
+!system set default table_nesting_limit 0
+?? 0
+
+Expected: HARNESS-ALLOWS-ERRORS. An entry `@<table>` rolls that table
+when picked, and `{<dice>}` in an entry's text is replaced by a roll
+(`{3d1} gold` is always `3 gold`). The command names the tables a pick
+went through (`via`); `table_roll(name, path=True)` returns them, then
+the final text. A table naming itself and dice that don't parse are
+refused when defined; a sub-table not defined yet is stored with a
+note, and rolling into it is refused. A longer loop stops at the
+table_nesting_limit rule (default 8) with a ⚠️, keeping the entry it
+picked; the rule is at least 1.
+
+
+SCENARIO 1230 — !table odds: every entry's chance, sub-tables under their entry, with adjustments (#362)
+-------------------------------------------------------------------------------------------------------
+
+!match new to To 8 8
+!match use to
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!table def gems ruby, opal:3
+!table def loot gold:2, @gems, none rank=@gems,gold
+!table odds loot
+?? gold     50.00%
+?? @gems    25.00%
+??   ruby    6.25%
+??   opal   18.75%
+?? none     25.00%
+!table odds loot remove=gold:2
+?? (gold −2)
+?? @gems    50.00%
+!table odds loot best=2
+?? best of 2
+?? @gems    43.75%
+?? gold     50.00%
+?? none      6.25%
+!table odds loot worst=2
+?? none     43.75%
+?? @gems     6.25%
+!as player bob
+!table odds loot
+?? @gems    25.00%
+!table roll loot
+?? table `loot`
+!as host
+!table odds nothing
+?? ❌ no table `nothing`.
+
+Expected: HARNESS-ALLOWS-ERRORS. `!table odds <name>` lists each entry's
+chance and, under an `@` entry, the sub-table's entries with their
+overall chance (opal 3/4 of 25%). It takes the roll's adjustments
+(`remove=gold:2` leaves gems and none at 50% each) and best= / worst=,
+which work from the rank: best of 2 keeps gems unless both picks miss it
+(1 - 0.75² = 43.75%), gold when neither is gems and one is gold, none
+only when both are none (6.25%). Players read the odds as they roll the
+table.
+
+
+SCENARIO 1231 — The action dice line: on, labelled, reaction halves, failed attempts, a hidden actor (#520)
+----------------------------------------------------------------------------------------------------------
+
+!match new dl Dl 9 9
+!match use dl
+!system set default random_seed 2
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 3 1 3
+!ent set_var orc team red
+!ent set_var hero team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = roll('2d6', label='damage')"
+!ent set_var orc actions.cleave.body "hit = roll('1d20', label='attack')\nentity[target].hp = entity[target].hp - damage"
+!ent set_var hero actions.block.reacts_to melee
+!ent set_var hero actions.block.before "incoming.damage = max(0, incoming.damage - roll('1d4', label='block'))"
+!action orc cleave hero
+?! 🎲
+!react hero pass
+?! 🎲
+!system set default action_dice_line on
+!action orc cleave hero
+?? 🎲 damage 2d6 →
+!react hero block
+?? 🎲 block 1d4 →
+?? 🎲 attack 1d20 →
+!ent set_var orc actions.pick.target none
+!ent set_var orc actions.pick.body "a = roll('1d6')\nb = choose('which?', ['x', 'y'])\nc = roll('1d8', label='c')"
+!action orc pick answer=x
+?? 🎲 1d6 → 
+?? · c 1d8 →
+!ent set_var orc actions.boom.target none
+!ent set_var orc actions.boom.body "a = roll('1d6', label='a')\nfail('nope')"
+!action orc boom
+?! 🎲
+!system set default action_dice_line labelled
+!action orc pick answer=y
+?? 🎲 c 1d8 →
+?! 1d6
+!system set default action_dice_line_format "🎲 {actor_name} ({action}): {rolls}"
+!system set default action_dice_roll_format "{spec}={total}"
+!ent set_var orc actions.pool.target none
+!ent set_var orc actions.pool.body "a = roll_dice('6d10>=8', label='pool')"
+!action orc pool
+?? 🎲 Orc (pool): 6d10>=8=
+!eval "roll('1d6', label=3)"
+?? label must be text
+!defvar add fog_vision_radius 1
+!ent set_var hero fog_vision_radius 1
+!ent set_var orc fog_vision_radius 1
+!ent tp orc 8 8
+!ent set_var hero actions.pray.target none
+!ent set_var hero actions.pray.body "a = roll('1d6', label='prayer')"
+!match fog on
+!match bind pov=blue
+!eval "use_action('orc', 'pool')"
+?! 🎲
+!eval "use_action('hero', 'pray')"
+?? 🎲 Hero (pray): 1d6=
+!match bind pov=red
+!eval "use_action('orc', 'pool')"
+?? 🎲 Orc (pool)
+
+Expected: HARNESS-ALLOWS-ERRORS. With action_dice_line `off` (default)
+no line prints. `on`: after an action succeeds, one line lists its rolls
+(label, dice, total). The prepare prints its own line when the window
+opens; the reaction's half prints its own line about the reacting unit,
+and the body its line. A choose() replay counts each roll once; a failed
+action prints none. `labelled` shows only rolls given a label. The two
+format rules shape the line and each roll; `roll_dice` labels too, and
+a label must be text. The line is about the acting unit: with fog on, a
+channel seeing as blue doesn't get the line of the 2x1 orc out of its
+sight (an action a formula starts, here `!eval`), gets the hero's, and
+red's channel gets the orc's.

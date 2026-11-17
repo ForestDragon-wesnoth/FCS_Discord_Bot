@@ -602,6 +602,10 @@ def _packet(m: Any, kind: str, target: str, damage: Any, *,
         throwaway.out = []
         m._runtime_buffer = throwaway
         sink_token = FORMULA_LOG_SINK.set([])
+        # The steps' rolls go with the rollback: no action dice line
+        # names them (#520).
+        from formula import DICE_LOG
+        dice_token = DICE_LOG.set(None)
     try:
         steps = ordered_steps(getattr(m, info["lib"]), kind)
         first = info["sides"][0]
@@ -638,6 +642,7 @@ def _packet(m: Any, kind: str, target: str, damage: Any, *,
             m.set_rng(pos=rng)
             m._runtime_buffer = out_saved
             FORMULA_LOG_SINK.reset(sink_token)
+            DICE_LOG.reset(dice_token)
     if forecast:
         _record_forecast(m, kind, target, result, rng)
     if forecast:

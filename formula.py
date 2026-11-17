@@ -520,128 +520,360 @@ def _shuffle(v: Any) -> list:
 _ROLL_MAX_DICE = 1000
 _ROLL_MAX_SIDES = 1_000_000
 _ROLL_EXPLODE_CAP = 1000   # max extra rolls a single exploding die can chain
-# A die group: optional sign, optional count, `d`, sides, optional `!`
-# (explode), optional keep-highest/lowest `kh<n>` / `kl<n>`. Or a flat int.
-_ROLL_DIE_RE = re.compile(r"^([+-]?)(\d*)d(\d+)(!?)(?:(kh|kl)(\d+))?$")
 _ROLL_FLAT_RE = re.compile(r"^([+-]?)(\d+)$")
+# A die group: optional sign, optional count, `d`, sides (a number, `f` for
+# Fate dice or `%` for a d100), then its suffixes (_DiceGroup).
+_ROLL_GROUP_RE = re.compile(r"^([+-]?)(\d*)d(\d+|f|%)(.*)$")
+_DICE_CMP = r"(<=|>=|<|>|=)"
+_DICE_SUFFIX_RES = (
+    ("explode", re.compile(r"!")),
+    ("reroll", re.compile(r"(ro|r)(?:" + _DICE_CMP + r"(-?\d+)|(\d+))")),
+    ("keep", re.compile(r"(kh|kl)(\d+)")),
+    ("fail", re.compile(r"f(?:" + _DICE_CMP + r"(-?\d+)|(\d+))")),
+    ("success", re.compile(_DICE_CMP + r"(-?\d+)")),
+)
+_DICE_GRAMMAR = ("NdM (N optional; M a number, F for Fate dice or % for a "
+                 "d100) with optional ! (explode), r<n> / ro<n> (reroll), "
+                 "kh<n> / kl<n> (keep), >=<n> (count successes) and f<n> "
+                 "(failures), or a flat integer")
+
+# The dice a formula rolled while an action runs (#520): a list of
+# (label, spec, total) the action's dice line prints, or None outside one.
+DICE_LOG: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
+    "DICE_LOG", default=None)
 
 
-def _roll_impl(rng, spec: Any) -> int:
-    """roll("2d6+3"): evaluate dice notation and return the integer total.
-    Thin wrapper over roll_detail (which also returns the per-term breakdown);
-    the formula binding only needs the total."""
-    return roll_detail(rng, spec)[0]
+def _note_roll(label: Any, spec: Any, total: Any) -> None:
+    log = DICE_LOG.get()
+    if log is not None:
+        log.append((label, spec, total))
+
+
+def _dice_test(op: str, n: int):
+    return {"<=": lambda v: v <= n, ">=": lambda v: v >= n,
+            "<": lambda v: v < n, ">": lambda v: v > n,
+            "=": lambda v: v == n}[op]
+
+
+def _dice_terms(spec: Any, where: str) -> list:
+    """Split a dice expression into its terms: a `+` / `-` starts a new term
+    unless it follows a comparison (`r=-1`, `>=-2`)."""
+    if not isinstance(spec, str):
+        raise FormulaError(
+            f"{where}: spec must be a dice string like '2d6+3', got "
+            f"{type(spec).__name__} ({_echo(spec)!r}).")
+    s = spec.replace(" ", "").lower()
+    if not s:
+        raise FormulaError(f"{where}: empty dice expression.")
+    terms: list = []
+    cur = ""
+    for i, ch in enumerate(s):
+        if ch in "+-" and cur and s[i - 1] not in "<>=":
+            terms.append(cur)
+            cur = ""
+        cur += ch
+    terms.append(cur)
+    if any(t in ("+", "-") for t in terms):
+        raise FormulaError(f"{where}: malformed dice expression "
+                           f"'{_echo(spec)}'.")
+    return terms
+
+
+class _DiceGroup:
+    """One die group of a dice expression, parsed once and used by both
+    the roller (roll_detail) and the odds (dice_distribution).
+
+    Suffixes, in any order:
+      `!`               explode: a die showing its highest face rolls again
+                        and adds (under success counting each roll of the
+                        chain is a die of its own).
+      `r<n>` / `r<op><n>`  reroll a die matching it until it doesn't (drawn
+                        straight from the faces left); several `r` terms
+                        join (`r1r2`). `ro...` rerolls once and keeps the
+                        second roll. Only the first face of an exploding
+                        die is rerolled.
+      `kh<n>` / `kl<n>` keep the highest / lowest n dice.
+      `<op><n>`         count successes: the group is worth the number of
+                        dice matching (op one of >= > <= < =).
+      `f<n>` / `f<op><n>`  after a success test: dice matching it subtract
+                        one each (World of Darkness botches).
+    A bare number after r / f means `=`; a negative number needs the op
+    (`r=-1`)."""
+
+    def __init__(self, term: str, spec: str, where: str):
+        gm = _ROLL_GROUP_RE.match(term)
+        if gm is None:
+            raise ValueError(term)
+        self.term = re.sub(r"d(f)", "dF", term.lstrip("+"))
+        self.sign = -1 if gm.group(1) == "-" else 1
+        self.count = int(gm.group(2)) if gm.group(2) else 1
+        sides = gm.group(3)
+        self.fate = sides == "f"
+        if self.fate:
+            self.lo, self.hi = -1, 1
+        else:
+            n = 100 if sides == "%" else int(sides)
+            if n < 1 or n > _ROLL_MAX_SIDES:
+                raise FormulaError(
+                    f"{where}: die sides {n} out of range "
+                    f"(1..{_ROLL_MAX_SIDES}) in '{_echo(spec)}'.")
+            self.lo, self.hi = 1, n
+        if self.count < 1 or self.count > _ROLL_MAX_DICE:
+            raise FormulaError(
+                f"{where}: die count {self.count} out of range "
+                f"(1..{_ROLL_MAX_DICE}) in '{_echo(spec)}'.")
+        self.explode = False
+        self.rerolls: list = []        # (op, n)
+        self.reroll_once: Optional[bool] = None
+        self.keep: Optional[Tuple[str, int]] = None
+        self.success: Optional[Tuple[str, int]] = None
+        self.fail: Optional[Tuple[str, int]] = None
+        rest = gm.group(4)
+        pos = 0
+        while pos < len(rest):
+            for kind, rx in _DICE_SUFFIX_RES:
+                mm = rx.match(rest, pos)
+                if mm is not None:
+                    break
+            else:
+                raise FormulaError(
+                    f"{where}: malformed term '{_echo(self.term)}' in "
+                    f"'{_echo(spec)}' — expected {_DICE_GRAMMAR}.")
+            pos = mm.end()
+            dup = f"{where}: '{_echo(self.term)}' gives {{}} twice."
+            if kind == "explode":
+                if self.explode:
+                    raise FormulaError(dup.format("`!`"))
+                self.explode = True
+            elif kind == "reroll":
+                once = mm.group(1) == "ro"
+                if self.reroll_once is not None and self.reroll_once != once:
+                    raise FormulaError(
+                        f"{where}: '{_echo(self.term)}' mixes `r` (reroll "
+                        f"until) and `ro` (reroll once); use one kind.")
+                self.reroll_once = once
+                op = mm.group(2) or "="
+                n = int(mm.group(3) if mm.group(2) else mm.group(4))
+                self.rerolls.append((op, n))
+            elif kind == "keep":
+                if self.keep is not None:
+                    raise FormulaError(dup.format("a keep"))
+                self.keep = (mm.group(1), int(mm.group(2)))
+                if self.keep[1] < 1:
+                    raise FormulaError(
+                        f"{where}: keeping {self.keep[1]} dice keeps nothing "
+                        f"in '{_echo(self.term)}' (kh / kl need at least 1).")
+            elif kind == "fail":
+                if self.success is None:
+                    raise FormulaError(
+                        f"{where}: the failure term in '{_echo(self.term)}' "
+                        f"comes after a success test (`6d10>=8f1`).")
+                if self.fail is not None:
+                    raise FormulaError(dup.format("a failure term"))
+                op = mm.group(1) or "="
+                self.fail = (op, int(mm.group(2) if mm.group(1)
+                                     else mm.group(3)))
+            else:
+                if self.success is not None:
+                    raise FormulaError(dup.format("a success test"))
+                self.success = (mm.group(1), int(mm.group(2)))
+        if self.explode and self.fate:
+            raise FormulaError(
+                f"{where}: Fate dice don't explode ('{_echo(self.term)}').")
+        if self.explode and self.hi <= 1:
+            self.explode = False         # a d1 would explode forever
+        if self.keep is not None and self.success is not None:
+            raise FormulaError(
+                f"{where}: '{_echo(self.term)}' both keeps dice and counts "
+                f"successes; a group does one of the two.")
+        self._tests = [_dice_test(op, n) for op, n in self.rerolls]
+        # The faces a reroll-until may land on, as (from, to) runs.
+        self.allowed: list = []
+        if self.rerolls and not self.reroll_once:
+            start = None
+            for v in self._face_points():
+                ok = not self.rerolled(v)
+                if ok and start is None:
+                    start = v
+                if not ok and start is not None:
+                    self.allowed.append((start, v - 1))
+                    start = None
+            if start is not None:
+                self.allowed.append((start, self.hi))
+            if not self.allowed:
+                raise FormulaError(
+                    f"{where}: '{_echo(self.term)}' rerolls every face.")
+        self.n_allowed = sum(b - a + 1 for a, b in self.allowed)
+        self._succ = (_dice_test(*self.success) if self.success else None)
+        self._fail = (_dice_test(*self.fail) if self.fail else None)
+
+    def _face_points(self):
+        """The faces where a reroll test can change, plus the ends: a test
+        is a range, so the faces between two points answer alike. Walked in
+        order, so the runs of allowed faces come out without visiting all
+        of a d1000000's faces."""
+        pts = {self.lo, self.hi}
+        for _op, n in self.rerolls:
+            for v in (n - 1, n, n + 1):
+                if self.lo <= v <= self.hi:
+                    pts.add(v)
+        last = None
+        for v in sorted(pts):
+            if last is not None and v > last + 1:
+                yield v - 1
+            yield v
+            last = v
+
+    def rerolled(self, v: int) -> bool:
+        return any(t(v) for t in self._tests)
+
+    def score(self, v: int) -> int:
+        """A die's worth under success counting."""
+        return (1 if self._succ(v) else 0) - (
+            1 if self._fail is not None and self._fail(v) else 0)
+
+    # -- rolling ----------------------------------------------------------
+    def _first_face(self, rng) -> Tuple[int, Optional[int]]:
+        """The first face of a die after its rerolls: (face, the face it
+        was rerolled from or None)."""
+        v = rng.randint(self.lo, self.hi)
+        if not self.rerolls or not self.rerolled(v):
+            return v, None
+        if self.reroll_once:
+            return rng.randint(self.lo, self.hi), v
+        k = rng.randint(0, self.n_allowed - 1)
+        for a, b in self.allowed:
+            if k <= b - a:
+                return a + k, v
+            k -= b - a + 1
+        return self.allowed[-1][1], v     # unreachable
+
+    def roll(self, rng) -> Tuple[int, str, list, list]:
+        """Roll the group: (value, detail text, kept dice, every die)."""
+        shown: list = []
+        dice: list = []          # one value per die (a chain's total)
+        faces: list = []         # under success counting: every roll
+        for _ in range(self.count):
+            v, was = self._first_face(rng)
+            chain = [v]
+            if self.explode:
+                last, steps = v, 0
+                while last == self.hi and steps < _ROLL_EXPLODE_CAP:
+                    last = rng.randint(self.lo, self.hi)
+                    chain.append(last)
+                    steps += 1
+            text = (f"{was}→" if was is not None else "")
+            if self.success is not None:
+                faces.extend(chain)
+                text += ", ".join(f"{c}!" if self.explode and c == self.hi
+                                  and j < len(chain) - 1 else str(c)
+                                  for j, c in enumerate(chain))
+            else:
+                text += str(sum(chain))
+            shown.append(text)
+            dice.append(sum(chain))
+        if self.success is not None:
+            succ = sum(1 for f in faces if self._succ(f))
+            bad = sum(1 for f in faces if self._fail is not None
+                      and self._fail(f))
+            value = succ - bad
+            word = "success" if succ == 1 else "successes"
+            tail = (f"→ {succ} {word}" if self.fail is None else
+                    f"→ {succ} {word} − {bad} "
+                    f"{'failure' if bad == 1 else 'failures'} = {value}")
+            return (value, f"{self.term} [{', '.join(shown)}] {tail}",
+                    faces, faces)
+        if self.keep is not None:
+            mode, k = self.keep
+            k = min(k, len(dice))
+            ordered = sorted(dice)
+            kept_sorted = ordered[-k:] if mode == "kh" else ordered[:k]
+            left = list(kept_sorted)
+            kept = []
+            for v in dice:
+                if v in left:
+                    left.remove(v)
+                    kept.append(v)
+            detail = (f"{self.term} [{', '.join(shown)}]→keep "
+                      f"{sorted(kept_sorted, reverse=(mode == 'kh'))}")
+            return sum(kept), detail, kept, dice
+        return sum(dice), f"{self.term} [{', '.join(shown)}]", dice, dice
+
+    # -- odds -------------------------------------------------------------
+    def face_weights(self) -> Dict[int, int]:
+        """The first face's distribution after rerolls, as whole weights."""
+        faces = range(self.lo, self.hi + 1)
+        if not self.rerolls:
+            return {v: 1 for v in faces}
+        if self.reroll_once:
+            m = sum(1 for v in faces if self.rerolled(v))
+            size = self.hi - self.lo + 1
+            return {v: (0 if self.rerolled(v) else size) + m for v in faces}
+        return {v: 1 for v in faces if not self.rerolled(v)}
+
+
+def _parse_dice(spec: Any, where: str) -> list:
+    """The terms of a dice expression: each an int (a flat modifier) or a
+    _DiceGroup."""
+    out: list = []
+    for term in _dice_terms(spec, where):
+        fm = _ROLL_FLAT_RE.match(term)
+        if fm is not None:
+            out.append((-1 if fm.group(1) == "-" else 1) * int(fm.group(2)))
+            continue
+        try:
+            out.append(_DiceGroup(term, spec, where))
+        except ValueError:
+            raise FormulaError(
+                f"{where}: malformed term '{_echo(term)}' in "
+                f"'{_echo(spec)}' — expected {_DICE_GRAMMAR}.")
+    return out
+
+
+def _roll_impl(rng, spec: Any, label: Any = None) -> int:
+    """roll("2d6+3", label=None): evaluate dice notation and return the
+    integer total. Thin wrapper over roll_detail (which also returns the
+    per-term breakdown); the label names the roll on an action's dice
+    line (#520)."""
+    if label is not None and not isinstance(label, str):
+        raise FormulaError("roll(spec, label=None): label must be text.")
+    total = roll_detail(rng, spec)[0]
+    _note_roll(label, spec, total)
+    return total
 
 
 def roll_detail(rng, spec: Any, dice_out: "Optional[list]" = None,
                 all_dice: bool = False) -> "Tuple[int, list]":
     """Evaluate dice notation; return (total, parts) where parts is a list of
     human-readable per-term strings (e.g. "2d6 [4, 5]", "4d6kh3 [6,5,4,2]→keep
-    [6,5,4]", "+3"). Shared by the formula roll() binding and the `!roll`
-    command, so the command can show the individual dice. The RNG is injected
-    so the match's random_seed rule makes rolls reproducible.
+    [6,5,4]", "6d10>=8 [9, 3, 10, 8, 1, 2]→3 successes", "+3"). Shared by the
+    formula roll() binding and the `!roll` command, so the command can show
+    the individual dice. The RNG is injected so the match's random_seed rule
+    makes rolls reproducible.
 
     Grammar: one or more terms joined by + / -, each term either a flat
-    integer modifier or a die group `NdM` (N optional, defaults to 1) with
-    optional suffixes:
-      `!`        explode — a die showing its max face rolls again and adds,
-                 repeating (so a d6 reading 6 keeps going); capped per die.
-      `kh<n>`    keep the highest n of the rolled dice (drop the rest).
-      `kl<n>`    keep the lowest n. `2d20kh1` = advantage, `2d20kl1` =
-                 disadvantage.
-    Examples: "d20", "2d6+3", "1d8-1", "3d6+2d4+1", "4d6kh3", "2d20kl1",
-    "10d6!". Whitespace and case are ignored. Each die is an independent
-    randint(1, M). With `dice_out` a list, each group's kept dice (every die
-    rolled with `all_dice`) are appended to it in the order they were
-    rolled, an exploded die as its chain's total (roll_dice)."""
-    if not isinstance(spec, str):
-        raise FormulaError(
-            f"roll(spec): spec must be a dice string like '2d6+3', got "
-            f"{type(spec).__name__} ({spec!r})."
-        )
-    s = spec.replace(" ", "").lower()
-    if not s:
-        raise FormulaError("roll(spec): empty dice expression.")
-    terms = re.findall(r"[+-]?[^+-]+", s)
-    if not terms or "".join(terms) != s:
-        raise FormulaError(f"roll(spec): malformed dice expression '{spec}'.")
+    integer modifier or a die group `NdM` (N optional, defaults to 1; M a
+    number, `F` for Fate dice worth -1 / 0 / +1, `%` for a d100) with the
+    suffixes of _DiceGroup: `!` explode, `r<n>` / `ro<n>` reroll, `kh<n>` /
+    `kl<n>` keep, `>=<n>` count successes, `f<n>` failures. Examples: "d20",
+    "2d6+3", "4d6kh3", "2d20kl1", "10d6!", "6d10>=8", "6d10>=8f1",
+    "2d6r1", "4dF+1", "d%". Whitespace and case are ignored. With
+    `dice_out` a list, each group's kept dice (every die rolled with
+    `all_dice`) are appended to it in the order they were rolled: an
+    exploded die as its chain's total, under success counting each roll of
+    the chain (roll_dice)."""
     total = 0
     parts: list = []
-    for term in terms:
-        dm = _ROLL_DIE_RE.match(term)
-        if dm is not None:
-            sgn = -1 if dm.group(1) == "-" else 1
-            count = int(dm.group(2)) if dm.group(2) else 1
-            sides = int(dm.group(3))
-            explode = dm.group(4) == "!"
-            keep_mode = dm.group(5)            # 'kh' / 'kl' / None
-            keep_n = int(dm.group(6)) if dm.group(6) else None
-            if count < 1 or count > _ROLL_MAX_DICE:
-                raise FormulaError(
-                    f"roll(spec): die count {count} out of range "
-                    f"(1..{_ROLL_MAX_DICE}) in '{spec}'."
-                )
-            if sides < 1 or sides > _ROLL_MAX_SIDES:
-                raise FormulaError(
-                    f"roll(spec): die sides {sides} out of range "
-                    f"(1..{_ROLL_MAX_SIDES}) in '{spec}'."
-                )
-            if keep_n is not None and keep_n < 1:
-                raise FormulaError(
-                    f"roll(spec): keeping {keep_n} dice keeps nothing in "
-                    f"'{term}' (kh / kl need at least 1).")
-            dice = []
-            for _ in range(count):
-                v = rng.randint(1, sides)
-                die_total = v
-                # Explode only when there's a non-trivial max face (a d1
-                # would explode forever); cap the chain regardless.
-                if explode and sides > 1:
-                    chain = 0
-                    while v == sides and chain < _ROLL_EXPLODE_CAP:
-                        v = rng.randint(1, sides)
-                        die_total += v
-                        chain += 1
-                dice.append(die_total)
-            rolled = list(dice)  # preserve the as-rolled order for display
-            if keep_mode is not None:
-                k = max(0, min(keep_n, len(dice)))
-                dice.sort()
-                # k==0 must keep NOTHING; dice[-0:] is the WHOLE list (Python
-                # negative-zero slice quirk), so guard it explicitly — only the
-                # kl branch (dice[:0]) is naturally correct at k==0.
-                if k == 0:
-                    kept = []
-                else:
-                    kept = dice[-k:] if keep_mode == "kh" else dice[:k]
-                detail = (f"{term.lstrip('+')} {rolled}→keep "
-                          f"{sorted(kept, reverse=(keep_mode == 'kh'))}")
-            else:
-                kept = dice
-                detail = f"{term.lstrip('+')} {rolled}"
-            total += sgn * sum(kept)
-            parts.append(detail)
-            if dice_out is not None:
-                if all_dice or keep_mode is None:
-                    dice_out.extend(rolled)
-                else:
-                    left = list(kept)
-                    for v in rolled:
-                        if v in left:
-                            left.remove(v)
-                            dice_out.append(v)
+    for t in _parse_dice(spec, "roll(spec)"):
+        if isinstance(t, int):
+            total += t
+            parts.append(f"{'+' if t >= 0 else '-'}{abs(t)}")
             continue
-        fm = _ROLL_FLAT_RE.match(term)
-        if fm is not None:
-            sgn = -1 if fm.group(1) == "-" else 1
-            total += sgn * int(fm.group(2))
-            parts.append(f"{'+' if sgn > 0 else '-'}{int(fm.group(2))}")
-            continue
-        raise FormulaError(
-            f"roll(spec): malformed term '{_echo(term)}' in '{_echo(spec)}' "
-            f"— expected NdM (with optional !, kh<n>, kl<n>) or a flat "
-            f"integer."
-        )
+        value, detail, kept, every = t.roll(rng)
+        total += t.sign * value
+        parts.append(detail)
+        if dice_out is not None:
+            dice_out.extend(every if all_dice else kept)
     return total, parts
 
 
@@ -670,12 +902,7 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
     equally likely outcomes (exact=True); an exploding group makes them floats
     with its improbable long chains cut off (exact=False). Raises FormulaError
     on bad notation or when the expression is too large to work out."""
-    if not isinstance(spec, str):
-        raise FormulaError("dice odds need a dice string like '2d6+3'.")
-    s = spec.replace(" ", "").lower()
-    terms = re.findall(r"[+-]?[^+-]+", s) if s else []
-    if not terms or "".join(terms) != s:
-        raise FormulaError(f"malformed dice expression '{spec}'.")
+    where = "dice odds"
     steps = 0
 
     def _spend(n: int) -> None:
@@ -683,7 +910,8 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
         steps += n
         if steps > _ODDS_MAX_STEPS:
             raise FormulaError(
-                f"'{spec}' has too many outcomes to work out exact odds.")
+                f"'{_echo(spec)}' has too many outcomes to work out exact "
+                f"odds.")
 
     def _conv(a: Dict[int, Any], b: Dict[int, Any]) -> Dict[int, Any]:
         _spend(len(a) * len(b))
@@ -693,70 +921,79 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
                 out[va + vb] = out.get(va + vb, 0) + wa * wb
         return out
 
+    def _chain(g: "_DiceGroup", worth, reach: float) -> Dict[int, float]:
+        """What an exploding die's rolls after its top first face add, as
+        probabilities (`reach` the chance of that first face): each roll
+        adds worth(face) and a top face rolls again, cut off once a chain
+        gets rarer than _ODDS_EXPLODE_EPS."""
+        p = 1.0 / (g.hi - g.lo + 1)
+        out: Dict[int, float] = {}
+        base, depth = 0, 0
+        while True:
+            for f in range(g.lo, g.hi):
+                v = base + worth(f)
+                out[v] = out.get(v, 0.0) + reach * p
+            reach *= p
+            base += worth(g.hi)
+            depth += 1
+            if reach < _ODDS_EXPLODE_EPS or depth >= _ROLL_EXPLODE_CAP:
+                out[base] = out.get(base, 0.0) + reach
+                return out
+
     dist: Dict[int, Any] = {0: 1}
     exact = True
-    for term in terms:
-        fm = _ROLL_FLAT_RE.match(term)
-        if fm is not None:
-            k = int(fm.group(2)) * (-1 if fm.group(1) == "-" else 1)
-            dist = {v + k: w for v, w in dist.items()}
+    for g in _parse_dice(spec, where):
+        if isinstance(g, int):
+            dist = {v + g: w for v, w in dist.items()}
             continue
-        dm = _ROLL_DIE_RE.match(term)
-        if dm is None:
-            raise FormulaError(
-                f"malformed term '{_echo(term)}' in '{_echo(spec)}' — "
-                f"expected NdM (with optional !, kh<n>, kl<n>) or a flat "
-                f"integer.")
-        sgn = -1 if dm.group(1) == "-" else 1
-        count = int(dm.group(2)) if dm.group(2) else 1
-        sides = int(dm.group(3))
-        explode = dm.group(4) == "!" and sides > 1
-        keep_mode, keep_n = dm.group(5), dm.group(6)
-        if not 1 <= count <= _ROLL_MAX_DICE or not 1 <= sides <= _ROLL_MAX_SIDES:
-            raise FormulaError(f"die count or sides out of range in '{term}'.")
-        if keep_n is not None and int(keep_n) < 1:
-            raise FormulaError(
-                f"keeping {keep_n} dice keeps nothing in '{term}' (kh / kl "
-                f"need at least 1).")
-        if keep_mode is not None:
-            if explode:
+        fw = g.face_weights()
+        worth = g.score if g.success is not None else (lambda f: f)
+        if g.keep is not None:
+            if g.explode:
                 raise FormulaError(
                     f"odds for a group that both explodes and keeps dice "
-                    f"('{term}') aren't supported.")
-            combos = sides ** count if count * math.log10(sides) < 9 else None
+                    f"('{_echo(g.term)}') aren't supported.")
+            n_faces = len(fw)
+            combos = (n_faces ** g.count
+                      if g.count * math.log10(max(n_faces, 2)) < 9 else None)
             if combos is None or combos > _ODDS_MAX_KEEP_COMBOS:
                 raise FormulaError(
-                    f"'{term}' has too many dice combinations to work out "
-                    f"exact odds (limit {_ODDS_MAX_KEEP_COMBOS}).")
+                    f"'{_echo(g.term)}' has too many dice combinations to "
+                    f"work out exact odds (limit {_ODDS_MAX_KEEP_COMBOS}).")
             _spend(combos)
-            k = max(0, min(int(keep_n), count))
+            mode, k = g.keep
+            k = min(k, g.count)
             group: Dict[int, Any] = {}
-            for faces in itertools.product(range(1, sides + 1), repeat=count):
-                ordered = sorted(faces)
-                kept = (ordered[-k:] if k else []) if keep_mode == "kh" \
-                    else ordered[:k]
+            items = list(fw.items())
+            for combo in itertools.product(items, repeat=g.count):
+                w = 1
+                for _f, fwt in combo:
+                    w *= fwt
+                ordered = sorted(f for f, _w in combo)
+                kept = ordered[-k:] if mode == "kh" else ordered[:k]
                 t = sum(kept)
-                group[t] = group.get(t, 0) + 1
+                group[t] = group.get(t, 0) + w
         else:
-            if explode:
+            die: Dict[int, Any]
+            if g.explode:
                 exact = False
-                die: Dict[int, Any] = {}
-                p, depth = 1.0 / sides, 0
-                while True:
-                    reach = p ** depth            # chance of `depth` max faces
-                    for r in range(1, sides):
-                        v = sides * depth + r
-                        die[v] = die.get(v, 0.0) + reach * p
-                    depth += 1
-                    if reach * p < _ODDS_EXPLODE_EPS or depth >= _ROLL_EXPLODE_CAP:
-                        die[sides * depth] = die.get(sides * depth, 0.0) + reach * p
-                        break
+                ftot = sum(fw.values())
+                die = {}
+                for f, wt in fw.items():
+                    if f == g.hi:
+                        for v, pv in _chain(g, worth, wt / ftot).items():
+                            key = worth(f) + v
+                            die[key] = die.get(key, 0.0) + pv
+                    else:
+                        die[worth(f)] = die.get(worth(f), 0.0) + wt / ftot
             else:
-                die = {v: 1 for v in range(1, sides + 1)}
+                die = {}
+                for f, wt in fw.items():
+                    die[worth(f)] = die.get(worth(f), 0) + wt
             group = {0: 1}
-            for _ in range(count):
+            for _ in range(g.count):
                 group = _conv(group, die)
-        if sgn < 0:
+        if g.sign < 0:
             group = {-v: w for v, w in group.items()}
         if not exact:
             dist = {v: float(w) for v, w in dist.items()}
@@ -767,12 +1004,45 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
     return dist, total, exact
 
 
-def roll_table_pick(rng, spec: Any) -> str:
-    """Weighted random pick from a table spec: a `key:weight,...` CSV (weight
-    optional, default 1) or a dict {key: weight}. Returns a key with
-    probability proportional to its weight; 0-weight entries never chosen.
-    Shared by the roll_table() formula primitive, the named-table table_roll()
-    primitive, and the `!table roll` command."""
+_ODDS_TESTS = {">=": lambda v, n: v >= n, "<=": lambda v, n: v <= n,
+               ">": lambda v, n: v > n, "<": lambda v, n: v < n,
+               "=": lambda v, n: v == n, "==": lambda v, n: v == n,
+               "!=": lambda v, n: v != n}
+
+
+def _roll_odds(spec: Any, op: Any, n: Any, percent: Any = False) -> float:
+    """roll_odds(spec, op, n, percent=False): the chance a roll of `spec`
+    meets `op n` (op one of >= <= > < = == !=), as a fraction from 0 to 1
+    (percent=True: 0 to 100). Works it out exactly from the dice (the same
+    code as `!roll odds`), drawing nothing from the RNG; exploding dice give
+    a near-exact figure. `chance(100 * roll_odds('2d6', '>=', 8))` rolls
+    with those odds."""
+    if op not in _ODDS_TESTS:
+        raise FormulaError(
+            f"roll_odds(spec, op, n): op is one of >= <= > < = == !=, got "
+            f"{_echo(op)!r}.")
+    if not _is_num(n) or not math.isfinite(n):
+        raise FormulaError("roll_odds(spec, op, n): n must be a number.")
+    if not isinstance(percent, bool):
+        raise FormulaError("roll_odds(...): percent= is True or False.")
+    dist, total, _exact = dice_distribution(spec)
+    test = _ODDS_TESTS[op]
+    p = sum(w for v, w in dist.items() if test(v, n)) / total
+    return p * 100 if percent else p
+
+
+def _roll_mean(spec: Any) -> float:
+    """roll_mean(spec): the average total of a roll of `spec`, worked out
+    from the dice without rolling (exploding dice: near-exact)."""
+    dist, total, _exact = dice_distribution(spec)
+    return sum(v * w for v, w in dist.items()) / total
+
+
+def _table_pairs(spec: Any) -> list:
+    """The (key, weight) entries of a table spec, in the order written: a
+    `key:weight,...` CSV (weight optional, default 1) or a dict {key:
+    weight}. Entries of weight 0 stay listed (an adjustment may raise
+    them)."""
     def _w(x: Any, key: str) -> float:
         if isinstance(x, bool) or not isinstance(x, (int, float)):
             try:
@@ -801,7 +1071,7 @@ def roll_table_pick(rng, spec: Any) -> str:
             if not part:
                 continue
             if ":" in part:
-                k, _, ws = part.partition(":")
+                k, _, ws = part.rpartition(":")
                 pairs.append((k.strip(), _w(ws.strip(), k.strip())))
             else:
                 pairs.append((part, 1.0))
@@ -809,6 +1079,10 @@ def roll_table_pick(rng, spec: Any) -> str:
         raise FormulaError(
             "roll_table(spec): spec must be a 'key:weight,...' string or a "
             "dict {key: weight}.")
+    return pairs
+
+
+def _pick_pairs(rng, pairs: list) -> str:
     pairs = [(k, w) for k, w in pairs if w > 0]
     total = sum(w for _, w in pairs)
     if not math.isfinite(total):
@@ -825,39 +1099,285 @@ def roll_table_pick(rng, spec: Any) -> str:
         if r < upto:
             return k
     return pairs[-1][0]
-    return total
 
 
-def _roll(spec: Any) -> int:
-    """roll("2d6+3"): roll standard dice notation, returning the integer
-    total. By default rolls are independent (unseeded global RNG); when
-    the match sets the random_seed rule the engine shadows this with a
-    match-bound seeded RNG so a session's rolls become reproducible —
-    see the random_seed rule docs (same mechanism as random_int)."""
-    return _roll_impl(random, spec)
+def roll_table_pick(rng, spec: Any) -> str:
+    """Weighted random pick from a table spec: a `key:weight,...` CSV (weight
+    optional, default 1) or a dict {key: weight}. Returns a key with
+    probability proportional to its weight; 0-weight entries never chosen.
+    Shared by the roll_table() formula primitive and the list rolls of
+    `!roll`; named tables go through roll_named_table."""
+    return _pick_pairs(rng, _table_pairs(spec))
 
 
-def _roll_dice_impl(rng, spec: Any, all: Any = False) -> list:
-    if not isinstance(all, bool):
-        raise FormulaError("roll_dice(spec, all=False): all= must be True or "
-                           "False.")
-    out: list = []
-    try:
-        roll_detail(rng, spec, dice_out=out, all_dice=all)
-    except FormulaError as ex:
-        raise FormulaError(str(ex).replace("roll(spec)", "roll_dice(spec)",
-                                           1))
+# ---- named tables (#253, #459, #362) -----------------------------------
+# A named table's stored text is its spec, optionally ended by
+# ` rank=a,b,c`: the entries best first, for best= / worst= (#253; the
+# entries it leaves out follow in the order written). An entry `@<table>`
+# rolls that table when picked, and `{<dice>}` inside an entry's text is
+# replaced by a roll of the dice (#459).
+_TABLE_RANK_RE = re.compile(r"(?:^|\s)rank=(\S*)\s*$")
+_TABLE_DICE_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def split_table_rank(text: str) -> Tuple[str, Optional[List[str]]]:
+    """(spec, rank or None) of a named table's stored text."""
+    mm = _TABLE_RANK_RE.search(text)
+    if mm is None:
+        return text, None
+    rank = [w.strip() for w in mm.group(1).split(",") if w.strip()]
+    return text[:mm.start()].rstrip(), rank
+
+
+def table_text(spec: str, rank: Optional[List[str]]) -> str:
+    return spec + (f" rank={','.join(rank)}" if rank else "")
+
+
+def table_entries(text: str) -> list:
+    """A named table's entries, one per key (repeats summed) in the order
+    written: [(key, weight)]."""
+    spec, _rank = split_table_rank(text)
+    out: Dict[str, float] = {}
+    for k, w in _table_pairs(spec):
+        out[k] = out.get(k, 0.0) + w
+    return list(out.items())
+
+
+def table_order(text: str) -> List[str]:
+    """A named table's entries best first: its rank, then the entries the
+    rank leaves out, in the order written."""
+    _spec, rank = split_table_rank(text)
+    keys = [k for k, _w in table_entries(text)]
+    first = [k for k in (rank or []) if k in keys]
+    return first + [k for k in keys if k not in first]
+
+
+def table_sub(key: str) -> Optional[str]:
+    """The table an entry rolls (`@treasure_b`), or None."""
+    return key[1:].strip() if key.startswith("@") and key[1:].strip() \
+        else None
+
+
+def check_table_text(name: str, text: str, tables: Dict[str, str]
+                     ) -> List[str]:
+    """Check a named table's stored text before it is stored; raise
+    FormulaError on a bad spec, a rank naming no entry, dice that don't
+    parse or a table naming itself. Returns notes (a sub-table the match
+    doesn't hold yet)."""
+    spec, rank = split_table_rank(text)
+    pairs = _table_pairs(spec)
+    _pick_pairs(random.Random(0), pairs)
+    keys = [k for k, _w in pairs]
+    for r in rank or []:
+        if r not in keys:
+            raise FormulaError(f"the rank names `{r}`, which isn't an entry "
+                               f"of the table.")
+    if rank is not None and len(set(rank)) != len(rank):
+        raise FormulaError("the rank names an entry twice.")
+    notes: List[str] = []
+    for k in dict.fromkeys(keys):
+        sub = table_sub(k)
+        if sub is not None:
+            if sub == name:
+                raise FormulaError(
+                    f"entry `{k}` names the table itself; a table can't "
+                    f"roll itself.")
+            if sub not in tables:
+                notes.append(f"entry `{k}` names table `{sub}`, which "
+                             f"isn't defined yet.")
+            continue
+        for d in _TABLE_DICE_RE.findall(k):
+            _parse_dice(d, f"entry `{k}`")
+    return notes
+
+
+def table_adjustments(remove: Any, add: Any, keys: List[str],
+                      where: str) -> Dict[str, float]:
+    """remove= / add= of a table roll as key -> weight change. Each is a
+    dict {entry: n} or the text `entry:n,entry` (n default 1)."""
+    out: Dict[str, float] = {}
+    for sign, arg, word in ((-1, remove, "remove"), (1, add, "add")):
+        if arg is None:
+            continue
+        if isinstance(arg, str):
+            items = []
+            for part in arg.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                k, sep, n = part.rpartition(":")
+                if not sep:
+                    k, n = part, "1"
+                try:
+                    num = float(n)
+                except ValueError:
+                    raise FormulaError(
+                        f"{where}: {word}= `{_echo(part)}`: the amount "
+                        f"after `:` is a number.")
+                items.append((k.strip(), num))
+        elif isinstance(arg, dict):
+            items = []
+            for k, n in _data_items(arg):
+                if not _is_num(n):
+                    raise FormulaError(f"{where}: {word}= amounts are "
+                                       f"numbers.")
+                items.append((str(k), float(n)))
+        else:
+            raise FormulaError(f"{where}: {word}= is a dict {{entry: n}} or "
+                               f"text like 'none:2'.")
+        for k, n in items:
+            if k not in keys:
+                raise FormulaError(f"{where}: {word}= names `{_echo(k)}`, "
+                                   f"which isn't an entry of the table.")
+            if not math.isfinite(n) or n < 0:
+                raise FormulaError(f"{where}: {word}= amounts are numbers of "
+                                   f"0 or more.")
+            out[k] = out.get(k, 0.0) + sign * n
     return out
 
 
-def _roll_dice(spec: Any, all: Any = False) -> list:
-    """roll_dice(spec, all=False): roll dice as roll() does and return the
-    dice instead of the total: the kept dice of every group, in the order
-    they were rolled (flat modifiers left out). all=True returns every die,
-    the ones a kh / kl keep dropped included. An exploding die is one entry,
-    its chain's total. For doubles, "count the sixes" (count) and "the
-    highest die" (max). Honors random_seed like roll()."""
-    return _roll_dice_impl(random, spec, all)
+def adjusted_entries(text: str, adjust: Dict[str, float]) -> list:
+    return [(k, max(0.0, w + adjust.get(k, 0.0)))
+            for k, w in table_entries(text)]
+
+
+def _keep_rank(picks: List[str], order: List[str], best: bool) -> str:
+    pos = {k: i for i, k in enumerate(order)}
+    return (min if best else max)(picks, key=lambda k: pos.get(k, len(pos)))
+
+
+def roll_named_table(rng, tables: Dict[str, str], name: str, *,
+                     adjust: Optional[Dict[str, float]] = None,
+                     keep: Optional[Tuple[str, int]] = None,
+                     limit: int = 8, warn=None
+                     ) -> Tuple[str, List[str], List[str]]:
+    """Roll named table `name`: (final text, path, picks). Adjustments and
+    best / worst (`keep` = ("best"|"worst", n)) apply to this table; an
+    `@<table>` entry rolls that table plainly, at most `limit` tables
+    deep (past it the entry's text stays, and `warn` gets a note).
+    `picks` are the top table's picks a best / worst chose from; `path`
+    the tables an `@` entry led to, then the final text."""
+    text = tables[name]
+    if adjust or keep:
+        pairs = adjusted_entries(text, adjust or {})
+    else:
+        pairs = _table_pairs(split_table_rank(text)[0])
+    picks = [_pick_pairs(rng, pairs)
+             for _ in range(keep[1] if keep else 1)]
+    key = (_keep_rank(picks, table_order(text), keep[0] == "best")
+           if keep else picks[0])
+    path: List[str] = []
+    depth = 1
+    while True:
+        sub = table_sub(key)
+        if sub is None:
+            break
+        if sub not in tables:
+            raise FormulaError(f"table `{name}`: entry `{key}` names table "
+                               f"`{sub}`, which doesn't exist.")
+        if depth >= limit:
+            if warn is not None:
+                warn(f"⚠️ table `{name}` went {limit} tables deep "
+                     f"(table_nesting_limit) and stopped at `{key}`.")
+            break
+        path.append(sub)
+        key = _pick_pairs(rng, _table_pairs(split_table_rank(
+            tables[sub])[0]))
+        depth += 1
+
+    def _dice(mm: "re.Match") -> str:
+        return str(roll_detail(rng, mm.group(1))[0])
+    final = _TABLE_DICE_RE.sub(_dice, key)
+    return final, path + [final], picks
+
+
+def table_odds_rows(tables: Dict[str, str], name: str, *,
+                    adjust: Optional[Dict[str, float]] = None,
+                    keep: Optional[Tuple[str, int]] = None,
+                    limit: int = 8) -> List[Tuple[int, str, float]]:
+    """The chances of a named table as rows (depth, entry, chance): each
+    entry's overall chance, an `@` entry's sub-table rows under it, one
+    level deeper. best / worst change the top table's chances."""
+    def _probs(text: str, adj: Optional[Dict[str, float]]) -> list:
+        pairs = adjusted_entries(text, adj or {})
+        total = sum(w for _k, w in pairs)
+        if not math.isfinite(total) or total <= 0:
+            raise FormulaError(
+                "roll_table(spec): needs at least one entry with positive "
+                "weight.")
+        return [(k, w / total) for k, w in pairs]
+    top = _probs(tables[name], adjust)
+    if keep is not None:
+        mode, n = keep
+        order = table_order(tables[name])
+        p = dict(top)
+        ranked = [k for k in order if k in p]
+        if mode == "worst":
+            ranked.reverse()
+        out = {}
+        worse = 1.0              # chance of this entry or one ranked lower
+        for k in ranked:
+            out[k] = worse ** n - max(0.0, worse - p[k]) ** n
+            worse = max(0.0, worse - p[k])
+        top = [(k, out[k]) for k, _p in top]
+    rows: List[Tuple[int, str, float]] = []
+
+    def _walk(entries: list, chance: float, depth: int, seen: int) -> None:
+        for k, pk in entries:
+            if pk <= 0:
+                continue
+            rows.append((depth, k, chance * pk))
+            sub = table_sub(k)
+            if sub is not None and sub in tables and seen < limit:
+                _walk(_probs(tables[sub], None), chance * pk, depth + 1,
+                      seen + 1)
+    _walk(top, 1.0, 0, 1)
+    return rows
+
+
+def _roll(spec: Any, label: Any = None) -> int:
+    """roll(spec, label=None): roll dice notation and return the total.
+    The grammar: `NdM` (N optional; M a number, `F` for Fate dice worth
+    -1 / 0 / +1, `%` for a d100), groups and flat numbers joined by + / -,
+    each group taking `!` (explode), `r<n>` / `r<op><n>` (reroll until it
+    misses, several join: `r1r2`), `ro<n>` (reroll once), `kh<n>` /
+    `kl<n>` (keep highest / lowest), `<op><n>` (count the dice meeting it:
+    `6d10>=8` is the number of 8+, a flat modifier adds to the count) and
+    after it `f<n>` / `f<op><n>` (each die meeting it takes one off:
+    `6d10>=8f1`). op is one of >= > <= < =; a bare number means =, a
+    negative one needs the op (`r=-1`). `label` names the roll on the
+    action's dice line (the action_dice_line rule). Honors random_seed."""
+    return _roll_impl(random, spec, label)
+
+
+def _roll_dice_impl(rng, spec: Any, all: Any = False,
+                    label: Any = None) -> list:
+    if not isinstance(all, bool):
+        raise FormulaError("roll_dice(spec, all=False): all= must be True or "
+                           "False.")
+    if label is not None and not isinstance(label, str):
+        raise FormulaError("roll_dice(spec, all=False, label=None): label "
+                           "must be text.")
+    out: list = []
+    try:
+        total, _parts = roll_detail(rng, spec, dice_out=out, all_dice=all)
+    except FormulaError as ex:
+        raise FormulaError(str(ex).replace("roll(spec)", "roll_dice(spec)",
+                                           1))
+    _note_roll(label, spec, total)
+    return out
+
+
+def _roll_dice(spec: Any, all: Any = False, label: Any = None) -> list:
+    """roll_dice(spec, all=False, label=None): roll dice as roll() does and
+    return the dice instead of the total: the kept dice of every group, in
+    the order they were rolled (flat modifiers left out). all=True returns
+    every die, the ones a kh / kl keep dropped included. An exploding die is
+    one entry, its chain's total; under success counting (`6d10>=8`) every
+    roll of the chain is its own entry. For doubles, "count the sixes"
+    (count) and "the highest die" (max). `label` as roll(). Honors
+    random_seed like roll()."""
+    return _roll_dice_impl(random, spec, all, label)
 
 
 def _chance_impl(rng, percent: Any) -> bool:
@@ -2732,6 +3252,8 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "pick": _pick,
     "shuffle": _shuffle,
     "roll": _roll,
+    "roll_odds": _roll_odds,
+    "roll_mean": _roll_mean,
     "distance": _distance,
     "angle": _angle,
     "direction_to": _direction_to,
@@ -5197,14 +5719,15 @@ class FormulaEngine:
             def shuffle(v):
                 return _shuffle_impl(rng, v)
 
-            def roll(spec):
-                return _roll_impl(rng, spec)
+            def roll(spec, label=None):
+                return _roll_impl(rng, spec, label)
 
             def chance(percent):
                 return _chance_impl(rng, percent)
 
-            def roll_dice(spec, all=False):
-                return _charge(_roll_dice_impl(rng, spec, all), "roll_dice")
+            def roll_dice(spec, all=False, label=None):
+                return _charge(_roll_dice_impl(rng, spec, all, label),
+                               "roll_dice")
             for fn in (random_int, random_string, pick, shuffle, roll,
                        chance, roll_dice):
                 fn.__wrapped__ = _ALLOWED_FUNCS[fn.__name__]
@@ -5232,27 +5755,66 @@ class FormulaEngine:
             return roll_table_pick(_active_rng(), spec)
         ns["roll_table"] = _roll_table
 
-        def _table_roll(name: Any, n: Any = None) -> Any:
-            """table_roll(name, n=None): roll a NAMED table stored on the
-            match (Match.tables, authored via `!table def`). Returns the
-            picked key; with n, a list of n picks (at most
-            roll_repeat_limit). Replay-safe via the match RNG."""
+        def _table_roll(name: Any, n: Any = None, remove: Any = None,
+                        add: Any = None, best: Any = None, worst: Any = None,
+                        path: Any = False) -> Any:
+            """table_roll(name, n=None, remove=None, add=None, best=None,
+            worst=None, path=False): roll a NAMED table stored on the match
+            (`!table def`). Returns the picked entry: an `@<table>` entry
+            rolls that table, `{2d6}` in an entry's text becomes a roll of
+            the dice. With n, a list of n results (at most
+            roll_repeat_limit). remove= / add= change entries' weights for
+            this roll (a dict {entry: n} or text 'none:2'); best=k / worst=k
+            roll k times and keep the best / worst by the table's rank
+            (`!table rank`, else the order written). path=True returns the
+            tables an `@` entry led to, then the final text (['gems',
+            'ruby']; just ['gold'] for a plain entry). Replay-safe via the
+            match RNG."""
             if not isinstance(name, str) or not name.strip():
                 raise FormulaError("table_roll(name): name must be a string.")
             tables = getattr(match, "tables", {}) or {}
-            spec = tables.get(name.strip())
-            if spec is None:
+            name = name.strip()
+            if name not in tables:
                 raise FormulaError(f"table_roll: no table named '{name}'.")
-            if n is None:
-                return roll_table_pick(_active_rng(), spec)
+            if not isinstance(path, bool):
+                raise FormulaError("table_roll(...): path= is True or False.")
             cap = _rule_int("roll_repeat_limit", 20)
-            if isinstance(n, bool) or not isinstance(n, int) \
-                    or not 1 <= n <= cap:
-                raise FormulaError(
-                    f"table_roll(name, n): n must be a whole number from 1 "
-                    f"to {cap} (roll_repeat_limit), got {_echo(n)}.")
-            rng = _active_rng()
-            return [roll_table_pick(rng, spec) for _ in range(n)]
+            keep = None
+            for word, k in (("best", best), ("worst", worst)):
+                if k is None:
+                    continue
+                if keep is not None:
+                    raise FormulaError("table_roll(...): best= or worst=, "
+                                       "not both.")
+                if isinstance(k, bool) or not isinstance(k, int) \
+                        or not 1 <= k <= cap:
+                    raise FormulaError(
+                        f"table_roll(...): {word}= is a whole number from 1 "
+                        f"to {cap} (roll_repeat_limit), got {_echo(k)}.")
+                keep = (word, k)
+            keys = [key for key, _w in table_entries(tables[name])]
+            adjust = table_adjustments(remove, add, keys, "table_roll")
+            limit = _rule_int("table_nesting_limit", 8)
+            notes: list = []
+
+            def _one():
+                final, trail, _picks = roll_named_table(
+                    _active_rng(), tables, name, adjust=adjust, keep=keep,
+                    limit=limit, warn=notes.append)
+                return trail if path else final
+            if n is None:
+                out = _one()
+            else:
+                if isinstance(n, bool) or not isinstance(n, int) \
+                        or not 1 <= n <= cap:
+                    raise FormulaError(
+                        f"table_roll(name, n): n must be a whole number "
+                        f"from 1 to {cap} (roll_repeat_limit), got "
+                        f"{_echo(n)}.")
+                out = [_one() for _ in range(n)]
+            if notes and match is not None:
+                match.surface_log(list(dict.fromkeys(notes)))
+            return out
         ns["table_roll"] = _table_roll
 
         def _eid(token: Any) -> str:

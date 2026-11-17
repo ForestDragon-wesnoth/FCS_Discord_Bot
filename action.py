@@ -1500,7 +1500,7 @@ async def run_action(
     action_recursion_limit at the top of every nested call.
     """
     from logic import Match  # for type hint, no runtime impact
-    from formula import FormulaEngine, EvalCtx
+    from formula import FormulaEngine, EvalCtx, DICE_LOG
 
     # Enforce recursion limit BEFORE allocating any state for this
     # call. The check uses the CURRENT depth — _action_depth gets
@@ -1893,6 +1893,10 @@ async def run_action(
                 reader_token = VAR_READER.set(None)
                 origin_token = ACTION_ORIGIN.set((actor_id,
                                                   action.full_path))
+                # The dice this attempt rolls (#520); a replayed or failed
+                # attempt's go with it.
+                dice_rolls = []
+                dice_token = DICE_LOG.set(dice_rolls)
                 try:
                     carried: Dict[str, Any] = dict(preset_locals or {})
                     for kind, src in programs:
@@ -1917,6 +1921,7 @@ async def run_action(
                                 body_out.clear()
                                 body_out.update(out_locals)
                 finally:
+                    DICE_LOG.reset(dice_token)
                     ACTION_ORIGIN.reset(origin_token)
                     VAR_READER.reset(reader_token)
                     _CROSS_LEVELS.reset(levels_token)
@@ -2002,7 +2007,12 @@ async def run_action(
     if target_out is not None:
         target_out["target"] = target
     if not finish:
-        # A prepare-only run (#36): its output goes out, nothing else.
+        # A prepare-only run (#36): its output and dice line go out,
+        # nothing else.
+        dice_line = match.action_dice_line(actor_id, action.name, dice_rolls)
+        if dice_line:
+            match.surface_log(match.tag_lines(match.unit_tag(actor_id),
+                                              [dice_line]))
         if is_top_level:
             flush = match._runtime_buffer
             match._runtime_buffer = None
@@ -2015,6 +2025,11 @@ async def run_action(
                                   dict(args), body_locals),
                   about=actor_id if (actor_id in match.entities or
                                      match.find_corpse(actor_id)) else "")
+    # The dice line (#520), about the actor.
+    dice_line = match.action_dice_line(actor_id, action.name, dice_rolls)
+    if dice_line:
+        match.surface_log(match.tag_lines(match.unit_tag(actor_id),
+                                          [dice_line]))
     # Successful completion: the holder has now used this action
     # (entity_description_action_visibility `used`). Recorded before the
     # hooks, so a hook that kills or removes the holder can't skip it; an

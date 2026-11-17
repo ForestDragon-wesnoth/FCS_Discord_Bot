@@ -2092,6 +2092,16 @@ hardcodes**.
   for are named in a ⚠️, user call). Per attempt the RNG, output
   buffer and summon budget are reset, so side effects before a choice apply
   once. `cancel` aborts; `action_choice_limit` (394-395).
+- **Dice line** (#520, 1231): `roll()` / `roll_dice()` take `label=`
+  and note (label, spec, total) in `formula.DICE_LOG`, which `run_action`
+  sets to a fresh list per attempt (a choose() replay or a failed attempt
+  drops its rolls; a nested action collects its own) and a damage
+  forecast sets to None. After success (and after a prepare-only run)
+  `Match.action_dice_line` builds the line per `action_dice_line` (off /
+  on / labelled), `action_dice_line_format` and `action_dice_roll_format`,
+  surfaced tagged as about the actor (`unit_tag`), so a view that can't
+  see it drops it; each reaction half is its own run_action, so its line
+  is about the reacting unit (user call).
 - **Rider actions:** a rider gets its slot's actions plus the vehicle's
   actions whose `allowed_slots` list its slot; `mount_action_actor` decides
   who is `source`; `vehicle` / `rider` / `slot` are always bound.
@@ -3531,19 +3541,54 @@ hardcodes**.
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
   a `modifiers` bundle applies to every member.
-- **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
-  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `!roll
-  none, none, crit` (a comma list picks one item, `item:weight` weighted,
-  through `roll_table_pick`) and a leading `<n>x` repeating any roll, at
-  most `roll_repeat_limit` (owner ceiling) (888); `roll_table`
-  (finite weights, keyed entries), `band` (ranges may be negative; an
-  unreadable or backwards band is refused), named tables (`!table`,
-  `table_roll(name, n=None)`: a list of n picks with n; `!table roll
-  <name> [n]`; `!roll [<n>x] <table>` rolls a table when the word isn't
-  dice, `_table_roll_reply`; #610, 1190); `pick` / `shuffle`;
-  `roll_dice(spec, all=False)` (the kept dice as a list, every die rolled
-  with `all=True`, flat modifiers left out; `roll_detail(dice_out=)`) and
-  `chance(percent)` (1172). All use
+- **Dice and tables:** one parser (`formula._parse_dice`: `_dice_terms`
+  splits on + / - except after a comparison, `_DiceGroup` per group) behind
+  rolling (`roll_detail`) and odds (`dice_distribution`). A group is `NdM`
+  (`dF` Fate dice -1 / 0 / +1, `d%` a d100) with suffixes in any order:
+  explode `!`, keep `kh<n>` / `kl<n>` (n ≥ 1), reroll `r<n>` / `r<op><n>`
+  until it misses (several join; drawn straight from the faces left, so a
+  d1000000 costs one draw) or `ro...` once (not both kinds), a success
+  test `<op><n>` (the group is worth the dice meeting it, a flat modifier
+  adds to the count; under it each roll of an exploding chain is a die)
+  and after it `f<n>` failures taking one off each (#104, 1225). Refused:
+  keep with a success test, exploding Fate dice, a reroll of every face, a
+  repeated suffix. Only an exploding die's first face is rerolled. `!roll`,
+  `!roll odds` (exact distributions; the target is a word of its own, `2d6
+  >= 8` or `2d6 >=8`, a comparison joined to the dice counts successes,
+  1226); `!roll none, none, crit` (a comma list picks one item,
+  `item:weight` weighted, through `roll_table_pick`) and a leading `<n>x`
+  repeating any roll, at most `roll_repeat_limit` (owner ceiling) (888);
+  `roll_odds(spec, op, n, percent=False)` (a fraction) and
+  `roll_mean(spec)` (#361, pure, no RNG); `roll_table` (finite weights,
+  keyed entries), `band` (ranges may be negative; an unreadable or
+  backwards band is refused; success tiers compose from it, #105 struck,
+  1227), `pick` / `shuffle`; `roll_dice(spec, all=False, label=None)`
+  (the kept dice as a list, every die rolled with `all=True`, flat
+  modifiers left out; `roll_detail(dice_out=)`) and `chance(percent)`
+  (1172).
+- **Named tables** (`Match.tables`, name -> text; `!table def | roll |
+  odds | rank | list | show | remove | rename`, `!system table`): the text
+  is the spec, optionally ending ` rank=a,b` (the entries best first,
+  `split_table_rank` / `table_text`; entries left out follow in the order
+  written, the fallback when there is no rank, user call; `!table rank`
+  writes it). An entry `@<table>` rolls that table when picked and
+  `{<dice>}` in an entry's text is replaced by a roll (#459,
+  `roll_named_table`); a table naming itself and dice that don't parse are
+  refused at def (`check_table_text`, a missing sub-table a note), a
+  longer loop stops at `table_nesting_limit` (8, ceiling) with a ⚠️ and
+  keeps the picked entry. A roll's `remove=entry:n,...` / `add=` change
+  weights for that roll (unknown entries refused), `best=<n>` /
+  `worst=<n>` roll the top table n times and keep one by the rank (#253,
+  `table_adjustments`, `adjusted_entries`, which sum repeated keys; a
+  plain roll keeps the pairs as written, so seeded rolls stay as they
+  were). `table_roll(name, n=None, remove=None, add=None, best=None,
+  worst=None, path=False)` (path: the tables an `@` entry led to, then the
+  final text), `!table roll <name> [n] [...]`, `!roll [<n>x] <table>
+  [...]` (`_table_roll_opts`, `_table_roll_reply`; #610, 1190, 1228-1229).
+  `!table odds <name> [...]` (a player read, #362, `table_odds_rows`):
+  each entry's chance, a sub-table's entries under it with their overall
+  chance, best / worst from the rank (P(best = i) = W_i^n - W_(i+1)^n,
+  W_i the chance of i or worse; 1230). All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
   `random_seed` rule when set, else the match's own `rng_seed` (made at
   creation, fresh for a clone), counting the 32-bit words drawn

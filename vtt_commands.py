@@ -28,7 +28,7 @@ from logic import reserved_var_path_error, file_refs
 from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows
 
 import os
 import difflib
@@ -196,7 +196,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # `!table roll <name>` only rolls a stored table (advances the RNG, no
     # board mutation), so players may roll a GM-defined table. def/remove stay
     # host-gated.
-    "table":      frozenset({"list", "roll"}),
+    "table":      frozenset({"list", "roll", "odds"}),
     # The server's template library is readable by anyone; save / import /
     # delete check the saver themselves, spawn changes the match. `refs`
     # stays host-gated: it lists which of a unit's vars changed, and a
@@ -12724,7 +12724,8 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
     kind, what, write = (("tables", "table", "def") if sub == "table"
                          else ("macros", "macro", "set"))
     need = {"list": 3, "info": 4, "show": 4, "promote": 4, write: 5,
-            "rename": 5, "copy": 5, **{d: 4 for d in _SYSTEM_LIB_DELETES}}
+            "rename": 5, "copy": 5, **{d: 4 for d in _SYSTEM_LIB_DELETES},
+            **({"rank": 4} if sub == "table" else {})}
     if action not in need:
         return await _help_fallback(ctx, ["system", sub], args[1])
     if await return_help_if_not_enough_args(ctx, args, need[action],
@@ -12769,6 +12770,26 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
         return await ctx.send(_promoted_line(what, f"`{name}`", m.id,
                                              sys_name, prior is not None,
                                              prior == entry))
+    if action == "rank":
+        entry = _system_lib_entry(mgr, s, kind, name, sys_name, what)
+        spec, _rank = split_table_rank(entry)
+        if len(args) == 4:
+            return await ctx.send(
+                f"Table `{name}` on `{sys_name}`, best first: "
+                + ", ".join(f"`{k}`" for k in table_order(entry))
+                + ("." if _rank else " (the order written: no rank is set)."))
+        words = " ".join(args[4:]).strip()
+        text = table_text(spec, None if words == "-" else [
+            w.strip() for w in words.split(",") if w.strip()])
+        try:
+            check_table_text(name, text, lib)
+        except FormulaError as ex:
+            raise VTTError(str(ex))
+        lib[name] = text
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(
+            f"Ranked table `{name}` on `{sys_name}`, best first: "
+            + ", ".join(f"`{k}`" for k in table_order(text)) + ".")
     if action in ("info", "show"):
         _check_tail(args, 4, (), f"!system {sub} {action} <system> <name>")
         entry = _system_lib_entry(mgr, s, kind, name, sys_name, what)
@@ -12803,10 +12824,11 @@ async def _system_text_lib(ctx: ReplyContext, args: List[str],
             else normalize_body_source(" ".join(args[4:]).strip()))
     if sub == "table":
         try:
-            roll_table_pick(random, body)
+            notes = check_table_text(name, body, lib)
         except FormulaError as ex:
             raise VTTError(f"invalid table spec: {ex}")
-        reply = f"Defined table `{name}` = `{body}` on `{sys_name}`."
+        reply = (f"Defined table `{name}` = `{body}` on `{sys_name}`."
+                 + "".join(f"\n⚠️ {n}" for n in notes))
     else:
         if not body:
             raise VTTError("macro body is empty.")
@@ -13092,7 +13114,8 @@ for _sub, _write, _what, _gram in (
             f"drop <system> <name> | delete <system> <name> | "
             f"remove <system> <name> | rm <system> <name> | "
             f"promote <system> <name>" + (" [trust]" if _sub == "macro"
-                                          else "") + ">"),
+                                          else " | rank <system> <name> "
+                                               "[<entries> | -]") + ">"),
         desc=(
             f"Manage a GameSystem's {_what} with the grammar of {_gram} (the "
             f"system name after the action). Copied into every NEW match on "
@@ -18599,17 +18622,78 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
 
 
 # ---- !roll --------------------------------------------------------------
-def _table_roll_reply(m: Match, name: str, reps: int) -> str:
-    """`!table roll <name> [n]` / `!roll [<n>x] <table>`: the picks of
-    named table `name`, rolled `reps` times on the match RNG."""
-    rng = m.formula_rng()
+def _table_roll_opts(m: Match, name: str, words: List[str], usage: str
+                     ) -> Tuple[Dict[str, float], Optional[Tuple[str, int]]]:
+    """The `remove=` / `add=` / `best=` / `worst=` words of a table roll
+    or `!table odds` (#253)."""
+    cap = int(m.rules.get("roll_repeat_limit",
+                          RULES_REGISTRY["roll_repeat_limit"]["default"]))
+    remove = add = None
+    keep = None
+    for w in words:
+        key, sep, val = w.partition("=")
+        key = key.lower()
+        if not sep or key not in ("remove", "add", "best", "worst"):
+            raise VTTError(f"`{w}` — usage: `{usage}`.")
+        if key == "remove":
+            remove = val if remove is None else f"{remove},{val}"
+        elif key == "add":
+            add = val if add is None else f"{add},{val}"
+        else:
+            if keep is not None:
+                raise VTTError("A table roll takes `best=` or `worst=`, "
+                               "once.")
+            try:
+                k = int(val)
+            except ValueError:
+                k = 0
+            if not 1 <= k <= cap:
+                raise VTTError(f"`{w}`: {key}= is a whole number from 1 to "
+                               f"{cap} (roll_repeat_limit).")
+            keep = (key, k)
+    keys = [k for k, _w in table_entries(m.tables[name])]
     try:
-        picks = [roll_table_pick(rng, m.tables[name]) for _ in range(reps)]
+        adjust = table_adjustments(remove, add, keys, f"table `{name}`")
+    except FormulaError as ex:
+        raise VTTError(str(ex))
+    return adjust, keep
+
+
+def _table_roll_reply(m: Match, name: str, reps: int,
+                      adjust: Optional[Dict[str, float]] = None,
+                      keep: Optional[Tuple[str, int]] = None) -> str:
+    """`!table roll <name> [n] [...]` / `!roll [<n>x] <table> [...]`: the
+    results of named table `name`, rolled `reps` times on the match RNG."""
+    rng = m.formula_rng()
+    limit = int(m.rules.get("table_nesting_limit",
+                            RULES_REGISTRY["table_nesting_limit"]["default"]))
+    notes: List[str] = []
+    results = []
+    try:
+        for _ in range(reps):
+            results.append(roll_named_table(
+                rng, m.tables, name, adjust=adjust, keep=keep, limit=limit,
+                warn=notes.append))
     except FormulaError as ex:
         return f"❌ {ex}"
+
+    def _shown(final: str, trail: List[str], picks: List[str]) -> str:
+        text = f"**{final}**"
+        if len(trail) > 1:
+            text += " (via " + " → ".join(f"`{t}`" for t in trail[:-1]) + ")"
+        if keep is not None and reps == 1:
+            text = f"{', '.join(picks)} → " + text
+        return text
     times = f"{reps}x " if reps > 1 else ""
-    return (f"🎲 {times}table `{name}` → "
-            + ", ".join(f"**{p}**" for p in picks))
+    kept = f" {keep[0]} of {keep[1]}" if keep else ""
+    adj = ""
+    if adjust:
+        adj = " (" + ", ".join(
+            f"{k} {'+' if d > 0 else '−'}{abs(d):g}" for k, d in
+            adjust.items() if d) + ")"
+    return (f"🎲 {times}table `{name}`{kept}{adj} → "
+            + ", ".join(_shown(*r) for r in results)
+            + "".join(f"\n{n}" for n in dict.fromkeys(notes)))
 
 
 @registry.command(
@@ -18618,11 +18702,17 @@ def _table_roll_reply(m: Match, name: str, reps: int) -> str:
     snapshot=False,
     desc=(
         "Roll dice and show the total plus the individual dice. Uses the same "
-        "notation as the roll() formula primitive: `NdM` (N optional), with "
-        "optional `+`/`-` modifiers, `!` to explode (a max-face die rerolls "
-        "and adds), and `kh<n>`/`kl<n>` to keep the highest/lowest n "
-        "(`2d20kh1` = advantage, `2d20kl1` = disadvantage). Examples: "
-        "`!roll 2d6+3`, `!roll d20`, `!roll 4d6kh3`, `!roll 10d6!`. Replay-"
+        "notation as the roll() formula primitive: `NdM` (N optional; `dF` "
+        "Fate dice worth -1 / 0 / +1, `d%` a d100), with optional `+`/`-` "
+        "modifiers, `!` to explode (a max-face die rerolls and adds), "
+        "`kh<n>`/`kl<n>` to keep the highest/lowest n (`2d20kh1` = "
+        "advantage, `2d20kl1` = disadvantage), `r<n>` to reroll a die "
+        "showing n until it shows something else (`r<3`, `r1r2`; `ro1` "
+        "rerolls once), a comparison to count successes (`6d10>=8` is the "
+        "number of dice showing 8 or more; a flat modifier adds to the "
+        "count) and after it `f<n>` for failures that take one off each "
+        "(`6d10>=8f1`). Examples: `!roll 2d6+3`, `!roll d20`, `!roll "
+        "4d6kh3`, `!roll 10d6!`, `!roll 4dF+1`, `!roll 2d6r1`. Replay-"
         "safe via the match's random_seed rule (a seeded match rolls "
         "reproducibly). Read-only — rolling never mutates the match. "
         "`!roll odds` works out probabilities instead of rolling (see "
@@ -18630,7 +18720,8 @@ def _table_roll_reply(m: Match, name: str, reps: int) -> str:
         "`!roll none, none, minicrit, crit`, and `item:weight` weights an "
         "item like a table (`none:3, crit`). A word that isn't dice and "
         "names a table of the match (`!table def`) rolls that table "
-        "(`!roll loot`). A leading `<n>x` rolls n times "
+        "(`!roll loot`, with `!table roll`'s `remove=` / `add=` / `best=` / "
+        "`worst=`). A leading `<n>x` rolls n times "
         "(`!roll 6x 4d6kh3`, `!roll 2x none, crit`; at most the "
         "roll_repeat_limit rule)."
     ),
@@ -18664,10 +18755,19 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                   "roll.")
     # A named table of the channel's match (#610), when the word isn't
     # dice: `!roll loot`, `!roll 3x loot`.
-    if (len(args) == 1 and rules and args[0] in m.tables
-            and not re.fullmatch(r"\d*d\d+.*|[+-]?\d+", args[0],
+    if (rules and args[0] in m.tables
+            and all("=" in w for w in args[1:])
+            and not re.fullmatch(r"\d*d(\d+|f|%).*|[+-]?\d+", args[0],
                                  re.IGNORECASE)):
-        return await ctx.send(_table_roll_reply(m, args[0], reps))
+        try:
+            adjust, keep = _table_roll_opts(
+                m, args[0], args[1:],
+                "!roll [<n>x] <table> [remove=<entry:n,...>] "
+                "[add=<entry:n,...>] [best=<n> | worst=<n>]")
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(_table_roll_reply(m, args[0], reps, adjust,
+                                                keep))
     text = " ".join(args)
     if "," in text and args[0].lower() != "odds":
         # A list roll: one item per roll, `item:weight` weighted like a
@@ -18699,7 +18799,7 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"❌ `{left} {right}`: put `+` or `-` between dice terms "
                 f"(`{left}+{right}`).")
     if args[0].lower() == "odds":
-        return await _roll_odds(ctx, "".join(args[1:]))
+        return await _roll_odds(ctx, args[1:])
     spec = "".join(args)
     lines = []
     for i in range(reps):
@@ -18741,19 +18841,27 @@ def _fmt_pct(p: float) -> str:
     return f"{p * 100:.2f}%"
 
 
-async def _roll_odds(ctx: ReplyContext, text: str):
+async def _roll_odds(ctx: ReplyContext, words: List[str]):
     """`!roll odds <dice> [<op> <n>]`: the chance a roll meets a target, or
-    the whole distribution when no comparison is given. Read-only."""
-    if not text:
+    the whole distribution when no comparison is given. Read-only. The
+    target is a word of its own (`2d6 >= 8`, `2d6 >=8`); a comparison
+    joined to the dice counts successes (`6d10>=8`, #104)."""
+    if not words:
         return await ctx.send(
             "❌ `!roll odds` is missing arguments. Usage: "
             "`!roll odds <dice> [<op> <n>]`, e.g. `!roll odds 2d6 >= 8`.")
-    mt = re.match(r"^(.*?)(>=|<=|==|!=|=|>|<)(-?\d+)$", text)
-    spec, op, target = (mt.group(1), mt.group(2), int(mt.group(3))) if mt \
-        else (text, None, None)
-    if not spec:
+    op = target = None
+    cmp_re = r"(>=|<=|==|!=|=|>|<)"
+    mt = re.fullmatch(cmp_re + r"(-?\d+)", words[-1])
+    if mt and len(words) > 1:
+        op, target, words = mt.group(1), int(mt.group(2)), words[:-1]
+    elif (len(words) > 2 and re.fullmatch(cmp_re, words[-2])
+          and re.fullmatch(r"-?\d+", words[-1])):
+        op, target, words = words[-2], int(words[-1]), words[:-2]
+    elif mt or (len(words) >= 2 and re.fullmatch(cmp_re, words[0])):
         return await ctx.send("❌ `!roll odds` needs a dice expression before "
                               "the comparison.")
+    spec = "".join(words)
     try:
         dist, total, exact = dice_distribution(spec)
     except FormulaError as ex:
@@ -18799,7 +18907,10 @@ registry.annotate_sub(
     usage="!roll odds <dice> [<op> <n>]",
     desc=(
         "The exact chance of a roll: `!roll odds 2d6 >= 8` → 41.67% (5/12). "
-        "Operators: >= <= > < = !=. Without a comparison it shows the range, "
+        "Operators: >= <= > < = !=, written apart from the dice (a "
+        "comparison joined to them counts successes: `!roll odds 6d10>=8 "
+        ">= 3` is the chance of 3 or more successes). Without a comparison "
+        "it shows the range, "
         "the average and (up to 40 possible totals) the whole distribution. "
         "Same dice notation as `!roll`; exploding dice give a near-exact "
         "figure (≈), and a group that both explodes and keeps dice isn't "
@@ -28111,7 +28222,11 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 for _subs, _usage in (
         (('def',), '!table def <name> <spec ...>'),
-        (('roll',), '!table roll <name> [n]'),
+        (('roll',), '!table roll <name> [n] [remove=<entry:n,...>] '
+                    '[add=<entry:n,...>] [best=<n> | worst=<n>]'),
+        (('odds',), '!table odds <name> [remove=<entry:n,...>] '
+                    '[add=<entry:n,...>] [best=<n> | worst=<n>]'),
+        (('rank',), '!table rank <name> [<entries> | -]'),
         (('list',), '!table list'),
         (('show',), '!table show <name>'),
         (('remove',), '!table remove <name>')):
@@ -28194,15 +28309,26 @@ async def remind_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "table",
-    usage="!table <def|roll|list|show|remove|rename> ...",
+    usage="!table <def|roll|odds|rank|list|show|remove|rename> ...",
     desc=(
-        "Named random tables (Match.tables) — store a weighted table once and "
+        "Named random tables (Match.tables): store a weighted table once and "
         "roll it by name. `def <name> <key:weight,...>` defines a table (the "
         "spec is the same `key:weight` CSV as roll_table; weight optional, "
-        "default 1). `roll <name>` rolls it (replay-safe via the match RNG) "
-        "and returns the picked key. `list` / `show <name>` / `remove <name>`. "
-        "Also usable from formulas via `table_roll(name)`. The named companion "
-        "to inline `roll_table(...)`; per-match, serialized."
+        "default 1). An entry `@<table>` rolls that table when picked, and "
+        "`{2d6}` inside an entry's text becomes a roll of the dice (`{2d6} "
+        "gold`); a table can't name itself, and a longer loop stops at "
+        "table_nesting_limit. `roll <name> [n]` rolls it n times on the "
+        "match RNG; `remove=none:2` / `add=crit:1` change entries' weights "
+        "for that roll, and `best=<n>` / `worst=<n>` roll n times and keep "
+        "the best / worst by the table's rank. `rank <name> <a,b,...>` "
+        "stores that order, best first (entries it leaves out follow in "
+        "the order written; `-` clears it; with no rank the order written "
+        "is the order), also written as ` rank=a,b` at the end of a `def`. "
+        "`odds <name> [...]` lists each entry's chance, a sub-table's "
+        "entries under it with their overall chance. `list` / `show "
+        "<name>` / `remove <name>` / `rename`. Formulas: `table_roll(name, "
+        "...)`. The named companion to inline `roll_table(...)`; per-match, "
+        "serialized."
     ),
 )
 async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -28226,34 +28352,94 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         spec = " ".join(args[2:]).strip()
-        # Validate the spec by attempting a pick (catches bad weights / empty).
         try:
-            roll_table_pick(random, spec)
+            notes = check_table_text(name, spec, m.tables)
         except FormulaError as ex:
             return await ctx.send(f"❌ invalid table spec: {ex}")
         m.tables[name] = spec
-        return await ctx.send(f"Defined table `{name}` = `{spec}`.")
+        return await ctx.send(f"Defined table `{name}` = `{spec}`."
+                              + "".join(f"\n⚠️ {n}" for n in notes))
 
-    if sub == "roll":
-        if await return_help_if_not_enough_args(ctx, args, 2, "table", "roll"):
+    if sub in ("roll", "odds"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "table", sub):
             return
         name = args[1]
         if name not in m.tables:
             return await ctx.send(f"❌ no table `{name}`.")
+        words = args[2:]
         reps = 1
-        if len(args) > 2:
+        if sub == "roll" and words and "=" not in words[0]:
             cap = int(m.rules.get(
                 "roll_repeat_limit",
                 RULES_REGISTRY["roll_repeat_limit"]["default"]))
             try:
-                reps = int(args[2])
+                reps = int(words[0])
             except ValueError:
                 return await ctx.send(
-                    f"❌ `{args[2]}`: the number of rolls is a whole number.")
+                    f"❌ `{words[0]}`: the number of rolls is a whole number.")
             if not 1 <= reps <= cap:
-                return await ctx.send(f"❌ `{args[2]}`: roll 1 to {cap} "
+                return await ctx.send(f"❌ `{words[0]}`: roll 1 to {cap} "
                                       f"times (roll_repeat_limit).")
-        return await ctx.send(_table_roll_reply(m, name, reps))
+            words = words[1:]
+        usage = (f"!table {sub} <name>" + (" [n]" if sub == "roll" else "")
+                 + " [remove=<entry:n,...>] [add=<entry:n,...>] "
+                   "[best=<n> | worst=<n>]")
+        try:
+            adjust, keep = _table_roll_opts(m, name, words, usage)
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        if sub == "roll":
+            return await ctx.send(_table_roll_reply(m, name, reps, adjust,
+                                                    keep))
+        limit = int(m.rules.get(
+            "table_nesting_limit",
+            RULES_REGISTRY["table_nesting_limit"]["default"]))
+        try:
+            rows = table_odds_rows(m.tables, name, adjust=adjust, keep=keep,
+                                   limit=limit)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        head = f"🎲 table `{name}`"
+        if keep:
+            head += f", {keep[0]} of {keep[1]}"
+        if adjust:
+            head += " (" + ", ".join(
+                f"{k} {'+' if d > 0 else '−'}{abs(d):g}"
+                for k, d in adjust.items() if d) + ")"
+        width = max(len("  " * d + k) for d, k, _p in rows) if rows else 0
+        lines = [f"{'  ' * d + k:<{width}}  {_fmt_pct(p):>7}"
+                 for d, k, p in rows]
+        return await ctx.send(head + ":\n```\n" + "\n".join(lines)
+                              + "\n```")
+
+    if sub == "rank":
+        if await return_help_if_not_enough_args(ctx, args, 2, "table", "rank"):
+            return
+        name = args[1]
+        if name not in m.tables:
+            return await ctx.send(f"❌ no table `{name}`.")
+        spec, rank = split_table_rank(m.tables[name])
+        if len(args) == 2:
+            order = table_order(m.tables[name])
+            return await ctx.send(
+                f"Table `{name}`, best first: "
+                + ", ".join(f"`{k}`" for k in order)
+                + ("." if rank else " (the order written: no rank is set)."))
+        words = " ".join(args[2:]).strip()
+        new_rank = (None if words == "-" else
+                    [w.strip() for w in words.split(",") if w.strip()])
+        text = table_text(spec, new_rank)
+        try:
+            check_table_text(name, text, m.tables)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        m.tables[name] = text
+        if new_rank is None:
+            return await ctx.send(f"Cleared the rank of table `{name}`: "
+                                  f"best first is the order written.")
+        return await ctx.send(f"Ranked table `{name}`, best first: "
+                              + ", ".join(f"`{k}`" for k in
+                                          table_order(text)) + ".")
 
     if sub == "list":
         if not m.tables:
