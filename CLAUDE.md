@@ -192,6 +192,10 @@ code. How the harness works (`run_scenarios.py`, scenarios in
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
+- **Roster boards** (Discord-only in play): `?board list|state
+  [reserve=<n>]` prints the messages a `!list` / `!state` autoupdate board
+  in the scenario's channel would show now, `[message i/n, <chars>]`
+  before each (1238-1240).
 - **Isolation.** Each scenario gets its own temp data folder (real storage
   commits) and a temp saves folder; `!as restart` reloads everything from
   disk as a bot restart would.
@@ -444,10 +448,11 @@ back, load the schema with `ToolSearch` before calling
   `getattr`, so the engine stays surface-agnostic and the harness exercises
   the fallback: `supports_color`, `viewport_capable`, `message_limit`,
   `auto_approve`, `post_scene_image`, `show_scene_view`, `set_autoupdate`,
-  `offer_resume`, `prompt_choice`, `retire_server_boards`. The Discord
-  adapter also routes `!<alias>` through `on_command_error`, never pings
-  (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
-  board whose channel was unbound. A button click is answered first
+  `set_roster_autoupdate`, `offer_resume`, `prompt_choice`,
+  `retire_server_boards`. The Discord adapter also routes `!<alias>`
+  through `on_command_error`, never pings (`AllowedMentions.none()`),
+  splits long replies fence-aware (`vtt_commands.split_message`, at
+  `MESSAGE_LIMIT`), and retires a board whose channel was unbound. A button click is answered first
   (`_ack_click`, D12: Discord refuses an answer after 3 s, and a click
   that waited behind another command used to drop its request); only then
   does it touch the queue, and a refused answer leaves everything as it
@@ -3256,13 +3261,34 @@ hardcodes**.
   `SpriteLoader` re-reads a sprite whose file appeared or changed (path +
   mtime) and keeps PNGs at most `_SPRITE_MAX_SIDE` px.
 - **Surfaces:** `!map image`, `!map mode text|image` (plain `!map` posts an
-  image), `!map autoupdate` boards (Discord, runtime-only), `!map scene
-  [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI;
+  image), `!map autoupdate` boards (Discord, runtime-only), roster
+  boards (below), `!map scene [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI;
   the map, the log and the input are panes of one vertical `PanedWindow`
   (`GuiApp._panes`): dragging the bar between two resizes them, and a
   window resize stretches only the map, so the log and the input keep the
   height they were dragged to; the Ctrl+R search bar opens inside the
   input's pane).
+- **Roster boards** (W15, user design, 1238-1240): `!list autoupdate
+  [on|off] [reserve=<n>]` and `!state autoupdate ...` (host-gated, as
+  `!map autoupdate`; Discord-only, runtime-only) post a set of messages
+  once and edit them after every command: `reserve=` else the rule
+  `autoupdate_reserved_messages` (5, ceiling 20; a state board needs 2),
+  since a board can't post more later. `vtt_commands.
+  autoupdate_board_text` builds the text as a PLAYER of the channel reads
+  `!list` (the channel's team view, `VarReader(host=False)`, formula text
+  hidden under `formula_text_visibility host`), whoever turned it on;
+  `autoupdate_board_messages` packs it from the top
+  (`split_message`), the unused messages showing
+  `autoupdate_reserved_text` (`{kind}`), text past the last one cut with
+  a note naming `reserve=` and the rule. A state board is the summary
+  (`_match_top_text`) and the roster, then the map in the message after
+  the text (`None` in the packing; drawn by `_apply_board(kind="state")`
+  with its own pan / browse buttons, `_BoardView.kind`), so the map moves
+  down as the roster grows. The adapter (`_roster_boards`, keyed by
+  channel and kind) edits only the messages whose text changed, retires
+  a board on unbind or `!server wipe` (first message noted, the rest
+  deleted), replaces an old board of the kind when turned on again, and
+  keeps the server loaded while one is up.
 - **Input editing** (gui.py and cli.py): Tab completes (`completion.py`;
   bash-style, a second Tab lists the choices), Up / Down recall this
   session's commands (GUI: only on the input's first / last line, so they

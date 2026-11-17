@@ -45428,3 +45428,155 @@ Expected: a label file's name is cut by its bytes (W12): sixty emoji
 (240 bytes) used to make a name too long for the file system, and the
 warning printed after every command; the name is now cut to fit, and
 the file's first line keeps the whole name.
+
+
+SCENARIO 1238 — A list board fills its reserved messages from the top (W15)
+---------------------------------------------------------------------------
+
+!match new lbd Lbd 8 8
+!match use lbd
+!ent add hero Hero 10 1 1 5 team=blue
+!ent add orc Orc 8 3 3 3 team=red
+?board list
+?? [message 1/5
+?? → Hero (hero): HP: 10/10
+?? [message 5/5, 38 characters]
+?? [reserved message for list autoupdate]
+!ent hp orc 2
+?board list reserve=2
+?? Orc (orc): HP: 2/8
+?? [message 2/2
+?! [message 3/
+!system set default autoupdate_reserved_text "(spare {kind} slot)"
+!system set default autoupdate_reserved_messages 3
+?board list
+?? [message 3/3, 17 characters]
+?? (spare list slot)
+!system set default autoupdate_reserved_text ""
+?board list reserve=2
+?? [message 2/2, 1 characters]
+!batch ent add a1 A1 1 5 5 1 ; ent add a2 A2 1 5 6 1 ; ent add a3 A3 1 5 7 1 ; ent add a4 A4 1 6 5 1
+!system set default entity_line_format "{name} zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+?board list reserve=2
+?? ✂️ … about
+?? this board holds 2 message(s). Turn it on again with more (`!list autoupdate on reserve=<n>`, or the rule `autoupdate_reserved_messages`).
+?! A4 zzz
+?board list reserve=4
+?! ✂️
+?? A4 zzz
+!list autoupdate on
+?? Auto-update boards are a Discord-only feature
+
+Expected: `?board list` shows the messages a `!list autoupdate` board
+posts in this channel. Five by default (autoupdate_reserved_messages):
+the roster in the first, the other four the reserved text. A change
+(Orc to 2 hp) shows on the next read, as a refresh would edit it.
+`reserve=` overrides the count, the rules give the count and the
+spare text (`{kind}` names the board; empty shows a dot). With long
+lines the roster takes several messages; past the last one it is cut
+with a note naming how much and how to make room, and four messages
+hold it whole. Outside Discord the command says boards are Discord-only.
+
+
+SCENARIO 1239 — A state board's map takes the message after the text (W15)
+--------------------------------------------------------------------------
+
+!match new sbd Sbd 8 8
+!match use sbd
+!ent add hero Hero 10 1 1 5 team=blue
+!ent add ogre Ogre 20 4 4 3 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add imp Imp 3 7 7 1 team=red
+?board state reserve=3
+?? [message 1/3
+?? **Sbd** `sbd`
+?? Current Round Number: **1**
+?? Ogre (ogre): HP: 20/20
+?? [message 2/3, 0 characters]
+?? (the map board)
+?? [message 3/3, 39 characters]
+?? [reserved message for state autoupdate]
+!system set default entity_line_format "{name} zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+?board state reserve=3
+?? [message 2/3
+?? Imp zzz
+?? [message 3/3, 0 characters]
+?! reserved message
+?board state reserve=2
+?? this board holds 2 message(s)
+?? [message 2/2, 0 characters]
+?board state reserve=1
+?? ❌ A `!state` board needs at least 2 messages (its map takes one), and `reserve=1` gives 1.
+!system set default autoupdate_reserved_messages 1
+?board state
+?? and the rule `autoupdate_reserved_messages` gives 1
+!state autoupdate on reserve=1
+?? A `!state` board needs at least 2 messages
+HARNESS-ALLOWS-ERRORS
+
+Expected: a state board shows the summary and the roster (the 2×2 Ogre
+listed like any unit), then the map in a message of its own (the map
+board, which the surface draws with its buttons), then the reserved
+messages. When long lines push the roster into a second message (the
+Imp's line) the map moves down to the third, and with two messages the
+roster is cut before the map with the note, which counts the map's
+message. A state board needs two messages: `reserve=1` and the rule at 1
+are refused.
+
+
+SCENARIO 1240 — A board reads as the channel's players do; who turns one on (W15)
+---------------------------------------------------------------------------------
+
+!match new vbd Vbd 8 8
+!match use vbd
+!ent add hero Hero 10 1 1 5 team=blue fog_vision_radius=1
+!ent add scout Scout 6 2 2 4 team=red fog_vision_radius=1
+!ent add spy Spy 5 8 8 3 team=blue
+!ent set_var scout secret 42
+!system set default private_vars secret
+!system set default entity_line_format "{name} ({id}) {hp}/{max_hp} s={secret}"
+!match fog on
+!match bind pov=red
+?board list
+?? Scout (scout) 6/6 s=?
+?? Hero (hero)
+?! Spy
+?! s=42
+!list
+?? Scout (scout) 6/6 s=?
+?! Spy
+!match bind pov=omniscient
+?board list
+?? Spy (spy)
+?? s=?
+!list autoupdate maybe
+?? ❌ Usage: `!list autoupdate [on|off] [reserve=<n>]`.
+!list autoupdate off reserve=2
+?? ❌ `reserve=` goes with `on`.
+!list autoupdate on reserve=x
+?? ❌ `reserve=x` isn't a whole number.
+!list autoupdate on reserve=21
+?? ❌ `reserve=` takes 1 to 20 messages.
+!list autoupdate on size=2
+?? Unknown option `size=`
+!system set default autoupdate_reserved_messages 21
+?? 20
+!as player bob
+!list autoupdate on
+?? needs host approval
+!state autoupdate on
+?? needs host approval
+!list
+?? Hero (hero)
+HARNESS-ALLOWS-ERRORS
+
+Expected: a board shows the roster as a player of its channel reads it,
+whoever turned it on: under red's fogged view the blue Spy far away
+isn't listed and the private `secret` shows `?`, as `!list` shows the
+channel; in a channel without a team view everyone is listed and the
+private var still reads `?` (a player reads the board, never a host).
+`!list autoupdate` refuses a stray word, `reserve=` with `off`, a
+count that isn't a whole number or past the rule's ceiling (20) and an
+unknown option; the rule refuses 21 the same way. A player's `!list
+autoupdate on` / `!state autoupdate on` waits for a host's approval (a
+board keeps posting in the channel), while `!list` stays open.

@@ -61,6 +61,99 @@ class ReplyContext(Protocol):
     async def send(self, message: str) -> None: ...
 
 
+# Discord rejects a message whose `content` exceeds a hard server-side
+# length cap (API error 50035). 2000 is the universally-safe bot limit
+# (works regardless of Nitro/boost/channel context). Long command output
+# (e.g. !help, !system rules, big maps) is split into multiple messages
+# at this boundary — see split_message.
+MESSAGE_LIMIT = 2000
+
+def split_message(message: str, limit: int = MESSAGE_LIMIT) -> List[str]:
+    """Split `message` into a list of chunks, each at most `limit`
+    characters, breaking ONLY at newline boundaries so a single logical
+    line is never cut across two messages. Consecutive lines are packed
+    into one chunk until the next line wouldn't fit.
+
+    Code-fence aware: a map arrives as one ```ansi block, and a plain line
+    split would leave the first chunk's fence unclosed and the next chunk's
+    rows unfenced (both render as garbage on Discord). When a chunk ends
+    INSIDE a fence it is closed, and the next chunk reopens it with the same
+    opener line (so `ansi` coloring carries over). Room for the closing
+    fence is reserved while packing a fenced chunk, and a chunk never ends
+    on a bare opener (that would post an empty block).
+
+    A single line longer than the space available (no newline to break on)
+    is the one case we can't honor cleanly — it's hard-split into
+    limit-sized pieces as a last resort. Returns at least one chunk (the
+    message unchanged when it already fits, including the empty string)."""
+    if len(message) <= limit:
+        return [message]
+    close = "\n```"
+    chunks: List[str] = []
+    # None = no chunk in progress. Distinct from "" so an EMPTY line at the
+    # start of a chunk is kept rather than silently swallowed.
+    cur: Optional[str] = None
+    opener: Optional[str] = None      # the ``` line of the fence we're inside
+
+    def _has_content(c: Optional[str]) -> bool:
+        # A chunk holding only the re-opened fence carries nothing to flush.
+        return c is not None and c != opener
+
+    def _flush(c: str) -> None:
+        if opener is not None and c.endswith("\n" + opener):
+            # Don't strand an empty block: the opener moves to the next
+            # chunk along with the content it introduces.
+            chunks.append(c[:-(len(opener) + 1)])
+        else:
+            chunks.append(c + (close if opener is not None else ""))
+
+    for line in message.split("\n"):
+        is_fence = line.lstrip().startswith("```")
+        if is_fence and opener is not None and cur == opener:
+            # Closing a block whose content all went out already (after a
+            # hard split): the re-opened fence would post an empty block.
+            cur, opener = None, None
+            continue
+        # Inside a fence, every content line must leave room for the close;
+        # the closing fence line itself IS the close, so it needs none.
+        reserve = len(close) if (opener is not None and not is_fence) else 0
+        # What a fresh chunk would start with before this line.
+        base = len(opener) + 1 if opener is not None else 0
+        if base + len(line) + reserve > limit:
+            # Oversized single line: flush whatever's buffered (closing an
+            # open fence), then hard-split the line itself.
+            if _has_content(cur):
+                _flush(cur)
+            if opener is not None and not is_fence:
+                # Inside a code block each piece keeps the block (opener
+                # + piece + close): a bare piece rendered as markdown (L30).
+                step = max(1, limit - len(opener) - 1 - len(close))
+                for i in range(0, len(line), step):
+                    chunks.append(opener + "\n" + line[i:i + step] + close)
+            else:
+                for i in range(0, len(line), limit):
+                    chunks.append(line[i:i + limit])
+            if is_fence:
+                opener = None if opener is not None else line.lstrip()
+            # Still inside a fence: the next chunk re-opens it.
+            cur = opener
+            continue
+        if _has_content(cur) and len(cur) + 1 + len(line) + reserve > limit:
+            _flush(cur)
+            if is_fence and opener is not None:
+                # This line WAS the close, and the flush already closed the
+                # block — don't re-open it just to post an empty one.
+                cur, opener = None, None
+                continue
+            cur = opener
+        cur = line if cur is None else cur + "\n" + line
+        if is_fence:
+            opener = None if opener is not None else line.lstrip()
+    if cur is not None:
+        chunks.append(cur)
+    return chunks
+
+
 def ctx_user(ctx: "ReplyContext") -> Optional[str]:
     """The sender's user id, or None when the surface doesn't carry one
     (which disables host gating for that surface)."""
@@ -239,7 +332,9 @@ _SELF_DISPATCHING_COMMANDS: frozenset = frozenset({
 # channel's POV for anyone, but `... full` forces the omniscient view and
 # so must be host-only (else a player could peek past fog of war).
 ELEVATED_ARGS: Dict[str, frozenset] = {
-    "state": frozenset({"full"}),
+    # `autoupdate` posts a board that keeps refreshing in the channel, as
+    # `!map autoupdate` does: a host's call.
+    "state": frozenset({"full", "autoupdate"}),
     # `map` renders for anyone from the channel POV, but `full` (omniscient),
     # `resize` (a grid mutation), and the `color`/`teamcolor`/`legend`
     # settings all elevate to host-gated. (pan/center/view are per-CHANNEL
@@ -248,7 +343,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
                       "legend", "autoupdate", "background", "border", "mode",
                       "coords", "new", "delete", "rename", "copy", "use",
                       "var", "unseen", "attach", "detach", "void", "shape"}),
-    "list": frozenset({"full"}),
+    "list": frozenset({"full", "autoupdate"}),
     # `!log` reads for anyone, but `clear` wipes the match's event log.
     "log": frozenset({"clear"}),
 }
@@ -15736,7 +15831,11 @@ registry.annotate_sub(
 #global info about the match that isn't the map or entities
 @registry.command("match_toplevel", access="all", usage="!match_toplevel", desc="Show active match summary (name/id/round number).")
 async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
-    m = active_match(mgr, ctx)
+    return await ctx.send(_match_top_text(active_match(mgr, ctx)))
+
+
+def _match_top_text(m: "Match") -> str:
+    """The match summary `!state` opens with (and its autoupdate board)."""
     parts = [
         f"**{m.name}** `{m.id}`",
         f"Game System: **{m.system_name}**",
@@ -15759,7 +15858,7 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         parts.append("**Global passives:**")
         for pid, p in m.global_passives.items():
             parts.append(f"- `{pid}` ({p.when}): `{formula_text(p.formula)}`")
-    return await ctx.send("\n".join(parts))
+    return "\n".join(parts)
 
 
 def _as_arg(args: List[str]) -> Any:
@@ -17806,7 +17905,42 @@ def _roster_groups(m: "Match", units: List["Entity"], pov: Optional[str],
 
 @registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if args and args[0].lower() == "autoupdate":
+        return await _autoupdate_cmd(ctx, args, mgr, "list")
     return await _in_vision_pass(ctx, mgr, _list_cmd_impl, args)
+
+
+registry.annotate_sub(
+    "list", "autoupdate", usage="!list autoupdate [on|off] [reserve=<n>]",
+    desc="Discord: a board of this roster that refreshes itself after "
+         "every change, read as the channel's players read `!list`. It "
+         "posts its messages once (`reserve=`, else the rule "
+         "autoupdate_reserved_messages) and fills them from the top.")
+
+
+async def _autoupdate_cmd(ctx: ReplyContext, args: List[str],
+                          mgr: MatchManager, kind: str):
+    """`!list|state autoupdate [on|off] [reserve=<n>]`: a roster board
+    (Discord-only, like `!map autoupdate`; the surface's
+    set_roster_autoupdate owns the messages)."""
+    m = active_match(mgr, ctx)
+    _check_options(args[1:], {"reserve"}, f"!{kind} autoupdate")
+    words = [a for a in args[1:] if "=" not in a]
+    usage = f"!{kind} autoupdate [on|off] [reserve=<n>]"
+    if len(words) > 1 or (words and words[0].lower() not in ("on", "off")):
+        raise VTTError(f"Usage: `{usage}`.")
+    on = not (words and words[0].lower() == "off")
+    given = next((a.split("=", 1)[1] for a in args[1:]
+                  if a.lower().startswith("reserve=")), None)
+    if not on and given is not None:
+        raise VTTError(f"`reserve=` goes with `on`. Usage: `{usage}`.")
+    slots = autoupdate_reserve(m, kind, given) if on else 0
+    hook = getattr(ctx, "set_roster_autoupdate", None)
+    if hook is None:
+        return await ctx.send(
+            "Auto-update boards are a Discord-only feature — here "
+            f"`!{kind}` prints the whole {kind} each time.")
+    return await ctx.send(await hook(m, kind, on, slots))
 
 
 async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
@@ -17817,6 +17951,15 @@ async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
         if "=" not in a and not (i == 0 and a.lower() == "full"):
             return await _help_fallback(ctx, ["list"], a)
     pov = _view_pov(ctx, m, args)
+    text = _list_text(m, pov)
+    if text is None:
+        return await ctx.send(_as_note(args) + "(no entities)")
+    return await ctx.send(_as_note(args) + text)
+
+
+def _list_text(m: "Match", pov: Optional[str]) -> Optional[str]:
+    """The `!list` roster as view `pov` reads it (None when it shows
+    nothing): living units in turn order, then the Dead: section."""
     es = m.entities_in_turn_order()
     active_id = m.current_entity_id()
     lines: List[str] = []
@@ -17856,9 +17999,104 @@ async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
                     lines.append(f"Map {m.map_label(cmp, pov)}:")
                     last_map = cmp
                 lines.append(f"   {_corpse_line(m, x, y, eid, corpse, cmp)}")
-    if not lines:
-        return await ctx.send(_as_note(args) + "(no entities)")
-    return await ctx.send(_as_note(args) + "\n".join(lines))
+    return "\n".join(lines) if lines else None
+
+
+# ---- `!list autoupdate` / `!state autoupdate` boards (W15) ----------------
+# A Discord board of the roster: a set of messages posted once and edited in
+# place after every change, as the map board is. The text and its packing
+# into the reserved messages are built here (surface-agnostic, read by the
+# harness's `?board`); the adapter owns the messages.
+AUTOUPDATE_KINDS = ("list", "state")
+
+
+def autoupdate_reserve(m: "Match", kind: str,
+                       given: Optional[str] = None) -> int:
+    """The message count of a new `kind` board: `reserve=<n>` when given,
+    else the autoupdate_reserved_messages rule. A state board needs two
+    (its map takes one)."""
+    hi = rule_max("autoupdate_reserved_messages") or 20
+    if given is None:
+        n = int(m.rules.get("autoupdate_reserved_messages", 5))
+        src = "the rule `autoupdate_reserved_messages`"
+    else:
+        try:
+            n = int(given)
+        except ValueError:
+            raise VTTError(f"`reserve={given}` isn't a whole number.")
+        src = f"`reserve={given}`"
+        if not 1 <= n <= hi:
+            raise VTTError(f"`reserve=` takes 1 to {hi} messages.")
+    if kind == "state" and n < 2:
+        raise VTTError(f"A `!state` board needs at least 2 messages (its "
+                       f"map takes one), and {src} gives {n}. Use "
+                       f"`!state autoupdate on reserve=<n>`.")
+    return n
+
+
+def autoupdate_board_text(mgr: MatchManager, m: "Match", channel_key: str,
+                          kind: str) -> str:
+    """The text of a `kind` board in `channel_key` (a `!state` board's map
+    is a message of its own, which the surface adds): the summary for a
+    state board, then the roster, as a player of the channel reads them,
+    whoever turned the board on: the channel's team view, private vars
+    hidden, formula text per formula_text_visibility for a player."""
+    pov = m.channel_pov(channel_key)
+    hidden = (str(m.rules.get("formula_text_visibility", "all")) == "host"
+              and getattr(m, "owner", None) is not None)
+    tokens = [(VAR_READER, VAR_READER.set(VarReader(team=pov, host=False))),
+              (FORMULA_TEXT_HIDDEN, FORMULA_TEXT_HIDDEN.set(hidden)),
+              (CURRENT_WORKSPACE, CURRENT_WORKSPACE.set(mgr)),
+              (PARTIAL_CACHE, PARTIAL_CACHE.set({})),
+              (PRIVATE_SCAN, PRIVATE_SCAN.set({})),
+              (COMMAND_POV, COMMAND_POV.set(lambda vm: pov))]
+    try:
+        with m.vision_pass():
+            roster = _list_text(m, pov) or "(no entities)"
+            if kind == "state":
+                return _match_top_text(m) + "\n\n" + roster
+            return roster
+    finally:
+        for var, tok in reversed(tokens):
+            var.reset(tok)
+
+
+def autoupdate_filler(m: "Match", kind: str,
+                      limit: int = MESSAGE_LIMIT) -> str:
+    """The text of a board message its content doesn't need
+    (autoupdate_reserved_text; a dot when empty: Discord refuses an empty
+    message)."""
+    filler = str(m.rules.get("autoupdate_reserved_text",
+                             "[reserved message for {kind} autoupdate]"))
+    return filler.replace("{kind}", kind).strip()[:limit] or "."
+
+
+def autoupdate_board_messages(m: "Match", text: str, slots: int, kind: str,
+                              limit: int = MESSAGE_LIMIT) -> List[Optional[str]]:
+    """`text` packed into `slots` messages from the top (split as a long
+    reply is), the messages it doesn't need showing the
+    autoupdate_reserved_text rule. Text past its last message is cut there
+    with a note saying how much and how to make room. A state board's map
+    takes the message after the text: None marks its place."""
+    with_map = kind == "state"
+    total = slots
+    if with_map:
+        slots -= 1
+    chunks = [c for c in split_message(text, limit) if c.strip()] or ["…"]
+    if len(chunks) > slots:
+        rest = "\n".join(chunks[slots - 1:])
+        note = (f"✂️ … about {{n}} more characters left out: this board "
+                f"holds {total} message(s). Turn it on again with more "
+                f"(`!{kind} autoupdate on reserve=<n>`, or the rule "
+                f"`autoupdate_reserved_messages`).")
+        room = limit - len(note) - 12
+        piece = split_message(rest, room)[0] if room > 0 else ""
+        last = (piece + "\n" if piece.strip() else "") + note.replace(
+            "{n}", str(max(1, len(rest) - len(piece))))
+        chunks = chunks[:slots - 1] + [last]
+    filler = autoupdate_filler(m, kind, limit)
+    return (chunks + ([None] if with_map else [])
+            + [filler] * (slots - len(chunks)))
 
 # ---- !find ----------------------------------------------------------
 # Token-based entity query. Each arg is one predicate; all predicates
@@ -19402,12 +19640,22 @@ async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command("state", access="all", usage="!state [full]", desc="Show match summary, entities, and map from this channel's POV. `!state full` (host-gated) forces the omniscient view.")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if args and args[0].lower() == "autoupdate":
+        return await _autoupdate_cmd(ctx, args, mgr, "state")
     # New behavior: show list (turn-order) then map. The `full` arg (when
     # present) flows through to list_cmd / map_cmd, which resolve it to
     # the omniscient POV; match_top_cmd ignores it.
     await match_top_cmd(ctx, args, mgr)
     await list_cmd(ctx, args, mgr)
     await map_cmd(ctx, args, mgr)
+
+registry.annotate_sub(
+    "state", "autoupdate", usage="!state autoupdate [on|off] [reserve=<n>]",
+    desc="Discord: a board of `!state` (summary, roster, map) that "
+         "refreshes itself after every change, read as the channel's "
+         "players read it. It posts its messages once (`reserve=`, else "
+         "the rule autoupdate_reserved_messages, at least 2: the map takes "
+         "one) and fills them from the top.")
 
 # ---- !history -----------------------------------------------------------
 # Per-match save history: manual saves, automatic round/turn/command
@@ -27111,7 +27359,7 @@ class _SimCtx:
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "replies", [])
         for k in ("prompt_choice", "offer_resume", "post_scene_image",
-                  "show_scene_view", "set_autoupdate",
+                  "show_scene_view", "set_autoupdate", "set_roster_autoupdate",
                   "retire_server_boards"):
             object.__setattr__(self, k, None)
 

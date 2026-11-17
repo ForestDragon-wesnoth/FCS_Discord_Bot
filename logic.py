@@ -4921,6 +4921,32 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "how many. Each reply is also capped by reply_message_cap."
         ),
     },
+    "autoupdate_reserved_messages": {
+        "default": 5,
+        "schema": {"type": "int", "min": 1, "max": 20, "ceiling": True},
+        "desc": (
+            "Discord: how many messages a new `!list autoupdate` or `!state "
+            "autoupdate` board posts and keeps (a board can't post more "
+            "later, so it reserves its room at the start). The text fills "
+            "them from the top; the ones it doesn't need show "
+            "autoupdate_reserved_text. Text past the last one is cut with a "
+            "note saying how much and how to make room. `reserve=<n>` on "
+            "the command overrides it for that board; a board keeps its "
+            "count until it is turned on again. A `!state` board's map "
+            "takes one message of its own. Each refresh edits every "
+            "message of the board."
+        ),
+    },
+    "autoupdate_reserved_text": {
+        "default": "[reserved message for {kind} autoupdate]",
+        "schema": {"type": "str"},
+        "desc": (
+            "Discord: the text of a `!list` / `!state` autoupdate board's "
+            "messages that its content doesn't need (see "
+            "autoupdate_reserved_messages). {kind} is `list` or `state`. "
+            "Empty shows a single dot, as Discord refuses an empty message."
+        ),
+    },
     # Auto-legend: a glyph->meaning key appended under the map. Seeds a new
     # match's per-match toggle (flip live with `!map legend on|off`); a
     # one-off `!map legend` / `!map nolegend` arg overrides per render.
