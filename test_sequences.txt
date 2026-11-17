@@ -283,8 +283,8 @@ SCENARIO 11 — Rejections still hold
 
 Expected: every line should print an error (most with an X-mark).
 A `for` over a non-loopable iterable (entity[hero].hp is not a
-loopable builtin call) is rejected ("for-loop iterable must be a
-direct call to one of {...}"); `while` loops, lambdas, list
+loopable builtin call) is rejected ("can't loop over ...: to loop
+over a list or a dict's keys, use `for x in each(...)`"); `while` loops, lambdas, list
 comprehensions, local-variable assignment, imports, and disallowed
 constructs nested inside an otherwise-valid if (the last line nests
 a `for x in [1]` — a List iterable, rejected) are all rejected
@@ -2388,9 +2388,10 @@ SCENARIO 121 — Loops are constrained, not blanket-disallowed
 !eval "for x in range(3): entity[hero].hp = 10 + x"
 !assert "entity[hero].hp == 12"
 !eval "for x in entity[hero].hp: entity[hero].hp = x"
-?? for-loop iterable must be a direct call to one of
+?? can't loop over that value: to loop over a list or a dict's keys, use `for x in each(...)`.
 !eval "for x in [1, 2]: entity[hero].hp = x"
-?? for-loop iterable must be a direct call to one of
+?? can't loop over `[1, 2]`: to loop over a list
+?? `!help functions loopable` lists them all.
 !eval "while True: entity[hero].hp = 0"
 ?? Disallowed syntax: While
 !assert "entity[hero].hp == 12"
@@ -2399,8 +2400,9 @@ Expected: `while` loops are fully disallowed ("Disallowed syntax:
 While"). `for` loops are allowed over a direct call to one of the
 loopable functions (`_LOOPABLE_FUNCS`): `range(3)` is one, so the
 first loop runs three times and leaves hp at 10 + 2 = 12. A loop
-over anything else is refused before it runs ("for-loop iterable
-must be a direct call to one of {...}"): a var read
+over anything else is refused before it runs, the refusal leading
+with the usual fix (`for x in each(...)` for a list or a dict's keys,
+Y10) and pointing at `!help functions loopable`: a var read
 (`entity[hero].hp`) and a list literal alike, and hp stays 12.
 Scenarios 246+ show the legal for-loop forms.
 
@@ -6032,7 +6034,7 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 !match use mfor2
 !ent add hero Hero 30 5 5 10
 !eval "for x in abs(5): entity[hero].hp = 0"
-?? for-loop iterable must be a direct call to one of
+?? can't loop over `abs(5)`
 !eval "for x in my_list: entity[x].hp = 0"
 ?? Unknown identifier 'my_list'
 !assert "entity[hero].hp == 30"
@@ -6047,8 +6049,8 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 Expected: For-loops are validated up front. The iterable MUST be
 a direct call to one of the loopable functions (`_LOOPABLE_FUNCS`:
 entities_within, range, each, cells_in_burst, ...). So `abs(5)`, a
-function that isn't loopable, errors with "iterable must be a
-direct call to one of {...}" and `my_list` errors as an unknown
+function that isn't loopable, errors with "can't loop over
+`abs(5)`: ..." and `my_list` errors as an unknown
 identifier; neither loop runs, so the hero keeps 30 hp. A loop target that's
 neither a single name nor a tuple of names ("for [a, b] in ..."
 uses a List, not Tuple) is also rejected.
@@ -43923,7 +43925,7 @@ SCENARIO 1205 — A default passive calling a !func reaches units created after 
 ?? regen
 !template import brute {"name": "Brute", "vars": {"hp": 9}, "statuses": {"stun": {"level": 1}}}
 ?? Dropped `statuses`: an entity template is
-?? (a unit's statuses are `status`)
+?? (a unit's statuses are `status`; notes for its users go in `template_notes`)
 !template show brute
 ?! statuses
 !template spawn brute 5 5
@@ -44586,3 +44588,274 @@ where the orc sees it, the setting doesn't apply and warn is offered
 again. `default` goes back to the rule, which a system can set (none
 here). `!react set` also sets the reaction mode (`__reaction_mode`) and
 refuses words it doesn't know.
+
+
+SCENARIO 1220 — !system defpassive / defvar / clamp edit a system by name, with no match (Y10)
+----------------------------------------------------------------------------------------------
+!system new solis
+!defpassive add regen on_turn_start "entity[self].hp = entity[self].hp + 1"
+?? ❌ No active match for this channel, so no system to edit. Edit a system by name: `!system defpassive add <system> ...` (`!system defpassive list <system>` reads it)
+!defvar match add day 1
+?? `!system defvar match <action> <system> ...` (`!system defvar match list <system>` reads it)
+!gclamp list
+?? Edit a system by name: `!system clamp list <system>`, or `!match use <id>`.
+!system func def solis bonus x "x + 2"
+!system defpassive add solis regen on_turn_start "entity[self].mana = entity[self].mana + bonus(1)"
+?? Added default passive `regen` (on_turn_start) to system `solis`
+!system defpassive list solis
+?? - `regen` (on_turn_start): `entity[self].mana = entity[self].mana + bonus(1)`
+!system defvar add solis mana 5
+!system defvar match add solis day 1
+!system defvar match list solis
+?? - `day` = 1
+!system clamp add solis mana max=10
+!system clamp list solis
+?? - `mana`: max=10, mode=soft
+!system clamp add nosuch mana max=10
+?? GameSystem 'nosuch' not found
+!match new s S 8 8 solis
+!match use s
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!assert "entity[ogre].mana == 5 and match_var_get('day') == 1"
+!turn next
+!assert "entity[ogre].mana == 8"
+!ent set_var ogre mana 50
+?? `ogre` vars.mana = 10 (typed 50)
+!system defpassive remove solis regen
+?? default passive `regen` taken off 1 unit(s)
+!system clamp remove solis mana
+!system defvar list solis
+?? - `mana` = 5
+!as player bob
+!system defvar add solis armor 1
+?? ❌ Only a server administrator or a role with the `systems` capability
+
+Expected: HARNESS-ALLOWS-ERRORS. `!defpassive`, `!defvar` and `!gclamp`
+edit the system of the channel's match; with no match they now say so and
+name the `!system` form (user call, Y10). `!system defpassive|defvar|clamp
+<action> <system> ...` edits a system by name in the grammar of the other
+system libraries (the action first), so a setup file needs no scratch
+match: a default passive may call the system's own `!func` (bonus), and
+the defaults reach a match made on the system later. The 2x2 ogre starts
+with mana 5 and the match with day 1; its turn adds bonus(1) = 3; the
+clamp holds mana at 10. Removing the default passive takes it off the
+ogre too (default_passives_existing_units). The edits need the `systems`
+capability like `!system set`.
+
+
+SCENARIO 1221 — A `!run` file's quoted body continues over lines (Y10)
+----------------------------------------------------------------------
+!match new r R 8 8
+!match use r
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+?file write saves/setup.txt !func def tier eid "if entity[eid].hp > 20:\n    'high'\nelse:\n    'low'"\n!passive add ogre warn on_turn_start "if tier(self) == 'low':\n    say('Ogre is hurt')"\n# a comment between commands\n!ent set_var ogre size_num 120
+!run setup.txt
+?? Running 3 command(s) from `saves/setup.txt`...
+!eval "tier('ogre')"
+?? = `'high'`
+!ent hp ogre 10
+!turn next
+?? Ogre is hurt
+!assert "entity[ogre].size_num == 120"
+?file write saves/stray.txt !ent set_var ogre a "open\n!ent set_var ogre b 2
+!run stray.txt
+?? ❌ parse error in `saves/stray.txt`: No closing quotation
+!assert "not var_has('ogre', 'b')"
+
+Expected: HARNESS-ALLOWS-ERRORS. In a `!run` file a quote left open
+continues on the next lines that don't start with `!` (user call, Y10:
+only a `!template import`'s JSON did), joined as a body's line breaks,
+indentation kept, as the GUI and Discord join a body typed over lines; a
+`#` comment line between commands is still skipped. The file defines a
+`!func` and a passive over several lines: three commands. The 2x2 ogre at
+10 hp is `low`, so its passive says so. A stray quote ends at the next
+line starting with `!`: the open line fails to parse, the whole file is
+refused and nothing runs.
+
+
+SCENARIO 1222 — template_notes: notes on a template for whoever uses it (Y10)
+----------------------------------------------------------------------------
+!match new tn TN 10 8
+!match use tn
+!ent add ogre Ogre 40 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2 axe.damage=8
+!template save ogre
+!template notes ogre "Spawn one per 3 players.\nGive it `axe_common` at `axe`."
+?? 📝 Template `ogre` notes saved (55 characters).
+!template show ogre
+?? 📝 Spawn one per 3 players.
+?? Give it `axe_common` at `axe`.
+?! "template_notes"
+!template list
+?? - `ogre` — Ogre, hp 40, saved by cli, 📝 Spawn one per 3 players.…
+!template save ogre
+!template notes ogre
+?? Spawn one per 3 players.
+!template import axe_common {"kind": "partial", "data": {"damage": 8}, "template_notes": "The standard axe."}
+?? 📝 The standard axe.
+!template import axe_common {"kind": "partial", "data": {"damage": 9}}
+!template show axe_common
+?? 📝 The standard axe.
+!template spawn ogre 6 2
+!ent dump ogre2
+?! notes
+!template give axe_common ogre2 offhand
+!assert "not var_has('ogre2', 'offhand.template_notes') and entity[ogre2].offhand.damage == 9"
+!template import bad {"name": "Bad", "vars": {"hp": 3}, "template_notes": 5}
+?? ❌ Template `bad`: `template_notes` is text, got int.
+!template notes ogre -
+?? 📝 Cleared the notes of template `ogre`.
+!template notes ogre
+?? Template `ogre` has no notes.
+!as player bob
+!template notes axe_common mine
+?? needs host approval
+?tab "!template notes a"
+?? → '!template notes axe_common '
+
+Expected: HARNESS-ALLOWS-ERRORS. A template (entity or partial) holds
+notes for whoever uses it in `template_notes` (user call, Y10): library
+metadata, written with `!template notes <name> <text>` (`\n` a new line,
+`-` clears, no text shows them) or in the JSON of an import, shown by
+`!template show` above the JSON and by `!template list` (its first line,
+cut). A re-save and an import without the field keep them; the 2x2 ogre
+spawned from the template and the axe given from the partial carry no
+notes. A value that isn't text is refused. Editing them is a library edit
+(its saver, an administrator or the `templates` capability; a player's
+goes to the approval queue).
+
+
+SCENARIO 1223 — !system export: the chain, the templates and prefabs it uses (Y10)
+--------------------------------------------------------------------------------
+!system new base
+!system set base hp_var life
+!system new solis parent=base
+!system set solis friendlyfire true
+!system func def solis spawn_orc x "summon_template('orc', x, 1)"
+!system macro set solis setup "!prefab stamp hut 1 1"
+!match new s S 10 10 solis
+!match use s
+!ent add orc Orc 30 2 2 5
+!ent set_vars orc footprint_w=2 footprint_h=2 axe.damage=8
+!template save orc axe_common path=axe
+!template import orc {"name": "Orc", "vars": {"life": 30, "footprint_w": 2, "footprint_h": 2, "axe": {"__template": "axe_common", "damage": 9}}}
+!prefab save hut 1 1 3 3
+!template import loner {"name": "Loner", "vars": {"life": 5}}
+!system export solis solis.json
+?? 📦 Exported system `solis` to `saves/solis.json`.
+?? Importing it needs a system `base` on the server
+!system export solis solis.json
+?? already exists; add `overwrite` to replace it.
+!system export solis full.json full
+?? with its ancestors `base`.
+?? 2 template(s): `axe_common`, `orc`.
+?? 1 prefab(s): `hut`.
+?! loner
+!system export solis flat.json chain=flatten templates=loner
+?? (flattened: the values it inherits are its own)
+?? 1 template(s): `loner`.
+!system export solis x.json templates=ghost
+?? ❌ No template `ghost` in this server's library.
+!system export solis x.json chain=sideways
+?? ❌ `chain=` takes require, include, flatten, not `sideways`.
+!system import full.json as=solis2
+?? replaced `base`, created `solis2` (`solis` in the file).
+!system diff solis solis2
+?? `solis` and `solis2` have the same rules and libraries.
+!system import flat.json as=flat
+?? created `flat` (`solis` in the file).
+!system diff solis flat
+?? `solis` and `flat` have the same rules and libraries.
+!system info flat
+?! Inherits from
+!system rename base mom
+!system import solis.json as=solis3
+?? ❌ Can't import `saves/solis.json`: `solis3` inherits from `base`, which isn't on this server (export it with `chain=include` or `chain=flatten`).
+!system list
+?! solis3
+!system import nosuch.json
+?? ❌ File not found: `saves/nosuch.json`.
+!match new s2 S2 10 10 solis2
+!match use s2
+!eval "spawn_orc(5)"
+!assert "entity[orc].life == 30 and entity[orc].axe.damage == 9 and footprint_width('orc') == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system export <system> <file>` writes
+a system file (user call, Y10). solis inherits from base: `chain=require`
+(default) writes solis alone and says the import needs a `base`;
+`include` (`full` sets it) writes base too; `flatten` writes solis as a
+root holding what it inherits. `templates=` / `prefabs=` choose what
+travels: `used` (`full`) takes the templates its formulas name (`orc` in
+spawn_orc), the partials they reference (`axe_common`) and the prefabs
+its macro names or that were saved under it (`hut`), not the unused
+`loner`; a list names them. Imports with `as=` show each form lands as the
+same system: the full file creates solis2 (replacing base with the
+file's), the flat one a root `flat`. With base renamed away the
+`require` file is refused, naming the missing parent, and nothing
+changes. A match on solis2 spawns the 2x2 orc its function names, with
+the partial's axe.
+
+
+SCENARIO 1224 — !system import: replace or merge, matches take the rules, all or nothing (Y10)
+--------------------------------------------------------------------------------------------
+!system new rpg
+!system set rpg friendlyfire true
+!system set rpg hp_var life
+!system func def rpg dbl x "x * 2"
+!system export rpg rpg.json
+!system set rpg hp_var hp
+!system set rpg turnorder_direction lowest_first
+!system func def rpg tpl x "x * 3"
+!match new m M 10 10 rpg
+!match use m
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!system import rpg.json mode=merge
+?? merged into `rpg`.
+?? Matches on it took its rules: `m`.
+!system info rpg
+?? `turnorder_direction` = 'lowest_first'
+?? `hp_var` = 'life'
+!assert "entity[ogre].life == 30 and not var_has('ogre', 'hp')"
+!system func list rpg
+?? tpl
+!system import rpg.json
+?? replaced `rpg`.
+!system info rpg
+?! `turnorder_direction` = 'lowest_first'
+!system func list rpg
+?! tpl
+!system undo
+?? ↩️ Undid 1 server-wide edit(s):
+!system func list rpg
+?? tpl
+!system export rpg bad.json
+?file set saves/bad.json systems.0.settings.friendlyfire.value "yes"
+!system import bad.json
+?? ❌ Can't import `saves/bad.json`: `rpg`: `friendlyfire` is true or false, got 'yes'.
+!system func list rpg
+?? tpl
+?file write saves/junk.json {"format": "something"}
+!system import junk.json
+?? isn't a system file
+!system import rpg.json mode=sideways
+?? ❌ `mode=` takes replace, merge, not `sideways`.
+!as player bob
+!system import rpg.json
+?? ❌ Only a server administrator or a role with the `systems` capability
+!system export rpg mine.json
+?? ❌ Only a server administrator or a role with the `files` capability
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system import <file>` installs a
+system file over a system of the same name (user call, Y10). `mode=merge`
+lays the file over it: the file's rules (hp_var `life`, friendlyfire) and
+functions win, the server's own others (turnorder_direction lowest_first,
+the `tpl` function) stay; the match on it takes the rules at once, so the
+2x2 ogre's `hp` moves to `life`. The default `replace` makes it the
+file's: lowest_first and `tpl` go. The import is one `!system undo` step. A
+file holding a rule value its rule refuses is refused whole, naming it,
+and changes nothing; a file that isn't a system file and an unknown mode
+are refused. Importing needs the `systems` capability (and `files` to
+read the file), exporting the `files` capability.

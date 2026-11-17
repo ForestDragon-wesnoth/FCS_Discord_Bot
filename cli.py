@@ -5,7 +5,8 @@ import asyncio, os, sys
 from typing import List
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
-from vtt_commands import registry, split_command_line, import_unfinished
+from vtt_commands import (registry, split_command_line, import_unfinished,
+                          quote_unclosed)
 
 
 def _enable_terminal_color() -> bool:
@@ -152,18 +153,26 @@ def _forget_lines(n: int) -> None:
 
 def _read_continuation(line: str) -> str:
     """A `!template import` line plus the lines of its pasted JSON (prompt
-    `...`), up to where the JSON closes, a blank line or end of input. The
-    block is one command and one history entry."""
+    `...`), up to where the JSON closes, a blank line or end of input; a
+    line leaving a quote open continues the same way until the quote
+    closes (a body typed over lines). The block is one command and one
+    history entry."""
     extra = 0
-    while import_unfinished(line):
+    while True:
+        body = not import_unfinished(line) and quote_unclosed(line)
+        if not body and not import_unfinished(line):
+            break
         try:
             more = input("... ")
         except (EOFError, KeyboardInterrupt):
             break
         if not more.strip():
+            # A blank line ends it: a stray quote then fails its line.
             break
         extra += 1
-        line += "\n" + more
+        # A quoted body's line breaks are the `\n` a body reads (Y10), as
+        # in a `!run` file and the GUI.
+        line += ("\\n" if body else "\n") + more
     if extra:
         _forget_lines(extra + 1)
         try:

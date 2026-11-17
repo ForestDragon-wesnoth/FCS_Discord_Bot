@@ -31865,7 +31865,12 @@ _TEMPLATE_META_KEYS = ("saved_by", "saved_by_name")
 # team view (user call).
 TEMPLATE_PRIVATE_KEY = "private"
 TEMPLATE_CREATOR_ONLY = "creator"
-_TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,)
+# Notes for whoever uses the template (Y10, `!template notes`): library
+# metadata on both kinds, never copied into a unit.
+TEMPLATE_NOTES_KEY = "template_notes"
+TEMPLATE_NOTES_MAX = 2000
+_TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,
+                                               TEMPLATE_NOTES_KEY)
 # What a reader who may not read a private template sees in place of a
 # reference to it (V19).
 PRIVATE_REF_TEXT = "(private)"
@@ -32003,7 +32008,31 @@ def check_template_name(name: Any, legacy: bool = False) -> str:
 
 
 _PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags",
-                 "var_names", TEMPLATE_PRIVATE_KEY)
+                 "var_names", TEMPLATE_PRIVATE_KEY, TEMPLATE_NOTES_KEY)
+
+
+def checked_template_notes(v: Any, where: str) -> Optional[str]:
+    """A template's notes: text of at most TEMPLATE_NOTES_MAX characters,
+    trailing spaces cut; None when empty."""
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise VTTError(f"{where}: `{TEMPLATE_NOTES_KEY}` is text, got "
+                       f"{type(v).__name__}.")
+    v = v.strip()
+    if len(v) > TEMPLATE_NOTES_MAX:
+        raise VTTError(f"{where}: `{TEMPLATE_NOTES_KEY}` is "
+                       f"{len(v)} characters, past {TEMPLATE_NOTES_MAX}.")
+    return v or None
+
+
+def _check_template_notes(d: Dict[str, Any], where: str) -> None:
+    if TEMPLATE_NOTES_KEY in d:
+        v = checked_template_notes(d[TEMPLATE_NOTES_KEY], where)
+        if v is None:
+            del d[TEMPLATE_NOTES_KEY]
+        else:
+            d[TEMPLATE_NOTES_KEY] = v
 
 
 def _check_template_private(d: Dict[str, Any], where: str) -> None:
@@ -32283,7 +32312,8 @@ def check_template(data: Any, name: str,
         d = {k: copy.deepcopy(v) for k, v in data.items() if k in _PARTIAL_KEYS}
         extra = sorted(k for k in data if k not in _PARTIAL_KEYS)
         notes = [f"Dropped {', '.join(f'`{k}`' for k in extra)}: a partial "
-                 f"template is `kind`, `data`, `tags`, `var_names`."] if extra else []
+                 f"template is `kind`, `data`, `tags`, `var_names`, "
+                 f"`{TEMPLATE_NOTES_KEY}`."] if extra else []
         if not isinstance(d.get("data"), dict):
             raise VTTError(f"Partial template `{name}` needs `data`: an object "
                            f"(the container it describes).")
@@ -32304,6 +32334,7 @@ def check_template(data: Any, name: str,
             if k in d and d[k] is not None and not isinstance(d[k], str):
                 d[k] = str(d[k])
         _check_template_private(d, f"Partial template `{name}`")
+        _check_template_notes(d, f"Partial template `{name}`")
         if library is not None:
             check_template_refs(name, d, library)
         json_text(d)
@@ -32321,19 +32352,20 @@ def check_template(data: Any, name: str,
                      f"template carries no identity or position (its name is "
                      f"the id).")
     unknown = sorted(k for k in d if k not in _ENTITY_TEMPLATE_KEYS
-                     and k not in _TEMPLATE_META_KEYS
-                     and k != TEMPLATE_PRIVATE_KEY)
+                     and k not in _TEMPLATE_LIBRARY_KEYS)
     for k in unknown:
         d.pop(k)
     if unknown:
         notes.append(f"Dropped {', '.join(f'`{k}`' for k in unknown)}: an "
                      f"entity template is "
                      f"{', '.join(f'`{k}`' for k in _ENTITY_TEMPLATE_KEYS)} "
-                     f"(a unit's statuses are `status`).")
+                     f"(a unit's statuses are `status`; notes for its users "
+                     f"go in `{TEMPLATE_NOTES_KEY}`).")
     for k in _TEMPLATE_META_KEYS:
         if k in d and d[k] is not None and not isinstance(d[k], str):
             d[k] = str(d[k])
     _check_template_private(d, f"Template `{name}`")
+    _check_template_notes(d, f"Template `{name}`")
 
     def probe(spec: Dict[str, Any], what: str) -> None:
         check_unit_form(spec, what)

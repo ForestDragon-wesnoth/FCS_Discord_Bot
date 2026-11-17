@@ -4507,16 +4507,23 @@ def _validate_for(
         and it.id in _ACTION_LOOPABLE_NAMES
     )
     if not (is_loopable_call or is_action_loopable_name):
-        allowed = ", ".join(sorted(_LOOPABLE_FUNCS))
+        # The common fix first (Y10: the whole function list buried it).
         if action_mode:
-            extras = ", ".join(sorted(_ACTION_LOOPABLE_NAMES))
-            extra_msg = f" (or, in action mode, one of {{{extras}}})"
+            extras = ", ".join(f"`{n}`" for n in
+                               sorted(_ACTION_LOOPABLE_NAMES))
+            extra_msg = f", or {extras} in an action"
         else:
             extra_msg = ""
+        # A var read is rewritten by now (`__read(...)`): name no engine
+        # helper.
+        shown = ast.unparse(it)
+        what = "that value" if "__" in shown else f"`{shown}`"
         raise FormulaError(
-            f"for-loop iterable must be a direct call to one of "
-            f"{{{allowed}}}{extra_msg} — got "
-            f"`{ast.unparse(it) if hasattr(ast, 'unparse') else type(it).__name__}`."
+            f"can't loop over {what}: to loop over a list "
+            f"or a dict's keys, use `for x in each(...)`. A loop takes a "
+            f"direct call to a loopable function (`range(n)`, "
+            f"`each(...)`, `entities_within(...)`, ...{extra_msg}); "
+            f"`!help functions loopable` lists them all."
         )
     names = _for_target_names(node.target)
     return names, frozenset(names)
