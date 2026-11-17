@@ -186,7 +186,9 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   older build left it (868, 874); `?file list [dir]` / `?file show <path>`
   read the folder (1200); `?file copy|move <path> <path>` copy a file
   (a new modification time) or move a file or folder as an operator
-  would (1203-1204).
+  would (1203-1204); `?file write <path> <text>` writes a file (`\n` a
+  line break: a `!run` file, a hand-made system file, 1221, 1224), and
+  `?file set` reads a number as a list index.
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
@@ -844,7 +846,9 @@ unit's position / display name, and nothing can be written at or under them.
 **Loops.** `for v in <call>` iterates only a `_LOOPABLE_FUNCS` function
 (`entities_within`, `parts`, `range`, `each`, `keys`, `team_members`, ...);
 `range(...)` gives counted loops and `each(value)` iterates a list or a dict's
-keys. `break` / `continue` work inside a loop body. Iterations are bounded by
+keys. `break` / `continue` work inside a loop body. A loop over
+anything else is refused leading with the usual fix (`for x in
+each(...)`) and pointing at `!help functions loopable` (Y10). Iterations are bounded by
 `formula_loop_limit`, which the higher-order helpers charge per item
 (`map_with(items, f)`, `filter_with`, `sort_by(items, f, desc=False)`; `f` is
 a `!func` name or a lambda; banned in `$()`, since a `!func` may write).
@@ -2115,7 +2119,10 @@ hardcodes**.
   816, 1167). A dispatched line may keep its `!` (`dispatch_no_snapshot`
   strips it): the line splitter drops it only for a typed batch / sweep
   with a `;`, so a one-line `!batch !ent ...` and a batch or sweep under
-  `!dry` / `!simulate` answered "Unknown command `!ent`" (1167). **`!run <file>`** reads a saves-folder file (admin). Both nest
+  `!dry` / `!simulate` answered "Unknown command `!ent`" (1167). **`!run <file>`** reads a saves-folder file (admin); a quote left open
+  continues on the next lines not starting with `!`, joined with `\n` as
+  the GUI and Discord join a body typed over lines (`quote_unclosed`; the
+  CLI's `...` prompt continues one the same way; Y10, 1221). Both nest
   within `macro_recursion_limit`.
 - **Lines of `!batch` / `!foreach` are gated** (`_GATE_LINES`, checked in
   `dispatch_no_snapshot`): each typed line passes the per-match gate as its
@@ -3343,6 +3350,43 @@ hardcodes**.
   disallowed construct is refused, a call to an unknown function is
   stored with a ⚠️ (a match may define it later; a promote counts only the
   system's library) (757-759, 896-899).
+- **System defaults by name** (Y10, 1220): `!system defpassive|defvar
+  [map|match]|clamp <action> <system> ...` run the handlers of
+  `!defpassive` / `!defvar` / `!gclamp` (`_defpassive_on`, `_defvar_on`,
+  `_gclamp_on`, routed by `_system_defaults`) on a named system, so a
+  setup needs no match; a default passive may call the system's own
+  `!func`s. Without a match the match forms refuse naming them
+  (`_defaults_match`).
+- **System files** (Y10, user design, 1223-1224): `!system export
+  <system> <file> [chain=require|include|flatten] [templates=...]
+  [prefabs=...] [full] [overwrite]` (`files` capability) writes
+  `{"format": "fcs-system", "version": 1, "system", "chain", "requires",
+  "systems": [root first], "templates": [{name, folder, data}],
+  "prefabs": [...]}`, each system's settings as values only. chain:
+  require (default; the file names the parent the import needs),
+  include (the ancestors too), flatten (`_flat_system_dict`, what
+  `!system parent <s> none` would leave). templates= / prefabs= none
+  (default) / all / used (`_library_pick`: quoted names and `!template
+  spawn|give` / `!prefab stamp` / `from=` words in the systems' strings,
+  prefabs saved under them, then every partial they and the prefabs'
+  units reference, `_with_partials`) / a name list; `full` = include +
+  used + used; templates the caller can't read stay out. `!system import
+  <file> [as=<name>] [mode=replace|merge]` (`systems` capability, plus
+  `files`, and `templates` / `prefabs` when it carries them) checks
+  every rule value as `!system set` would (`_checked_rule_value`; an
+  unknown rule dropped with a note), each parent present without a loop
+  or a chain past the owner limit, and every template / prefab
+  (`check_template` against the server's library plus the file's,
+  `check_prefab`, the saver checks) before changing anything; then the
+  systems go in through `_switch_systems` (all or nothing, every match
+  re-applies its rules: units take the var names they give; size rule
+  problems put it back), one `!system undo` step; then the templates
+  (partials first) and prefabs through `_store_template` /
+  `_store_prefab` (a name already here replaced in place, its old
+  version in the trash), noted in the audit. merge (`_merged_system`):
+  the file's rules and library entries win, the server's others stay, a
+  hide the file's own entry undoes goes; replace: the file's system.
+  `as=` renames the file's system only.
 - **System tooling:** `!system rename` (`MatchManager.rename_system`: the
   matches on it, children's parent links, server / channel defaults follow;
   `system_name` survives `_rollback_match` and `_restore_snapshot` keeps
@@ -3687,6 +3731,13 @@ hardcodes**.
   player's `!template list` quadratic, 13 s at 4,000 templates). Writing
   onto the name of a template the caller can't read (import, copy, save,
   rename) answers "The name is taken" (V20).
+- **Notes** (Y10, 1222): `template_notes` (`logic.TEMPLATE_NOTES_KEY`,
+  text up to `TEMPLATE_NOTES_MAX`, `checked_template_notes`) on an entity
+  or partial template, library metadata in `_TEMPLATE_LIBRARY_KEYS` (never
+  copied into a unit), kept by a re-save and an import without the
+  field; `!template notes <name> [<text ...> | -]` (a library edit),
+  printed by `show` above the JSON and by `list` (first line, cut at
+  `_NOTE_LIST_CHARS`). Everyone reading the template reads its notes.
 - **Storage:** written when saved, outside commit / rollback / undo, loaded
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
