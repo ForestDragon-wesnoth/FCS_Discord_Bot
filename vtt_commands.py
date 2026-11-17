@@ -11471,6 +11471,11 @@ def _action_slots(where: str, act: Any):
     for key in ("affects", "target_condition"):
         yield (f"{where} {key}", getattr(act, key), "eval", frozenset(),
                False)
+    # A precondition and a reaction's condition read `source` / `args`
+    # by attribute (Y4, Y7).
+    if act.condition:
+        yield (f"{where} condition", act.condition, "eval", frozenset(),
+               True)
     spec = act.reaction
     if spec is not None:
         for key in ("before", "after"):
@@ -11478,7 +11483,7 @@ def _action_slots(where: str, act: Any):
                    frozenset(), True)
         for key in ("condition", "auto_when"):
             yield (f"{where} {key}", getattr(spec, key), "eval",
-                   frozenset(), False)
+                   frozenset(), True)
 
 
 def _match_formula_slots(m: Match):
@@ -26243,7 +26248,8 @@ registry.annotate_sub(
         "`raw,armor`), or one of `-` / `none` / empty-string for no "
         "parameters. `<body>` is the rest of the line — a formula "
         "program whose trailing expression (if any) is the return "
-        "value. Example: "
+        "value; a body ending on an if / elif / else returns the "
+        "trailing value of the branch that ran. Example: "
         "`!func def mitigated raw,armor \"max(raw - armor, 0)\"` then "
         "call it from any formula as `mitigated(entity[self].atk, 3)`. "
         "The body is validated at definition time; parameters and the "
@@ -29022,7 +29028,8 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command(
     "react",
     usage=("!react | !react <eid> <reaction> [target...] [k=v ...] "
-           "| !react <eid> pass | !react skip"),
+           "| !react <eid> pass | !react skip "
+           "| !react set <eid> [mode=<mode>] [hidden=<mode>]"),
     desc=(
         "Answer the open reaction window (#36): an action someone can react "
         "to waits until every unit offered a reaction picks or passes. "
@@ -29034,13 +29041,19 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "reactions_per_window. `pass` ends a unit's answers; `skip` (a "
         "host) closes the window for everyone, keeping what was picked. "
         "The command that closes a window runs it: the before halves, the "
-        "action, then the after window. See `!help action` and "
-        "docs/damage_reactions_design.md."
+        "action, then the after window. `!react set <eid>` shows or sets "
+        "how a unit answers windows (`mode=` ask / auto / never, the "
+        "reaction_mode rule) and what it is offered while the acting side "
+        "can't see it (`hidden=` all / affected / none, the "
+        "reactions_while_hidden rule); `default` goes back to the rule. "
+        "See `!help action` and docs/damage_reactions_design.md."
     ),
 )
 async def react_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     import reactions
     m = active_match(mgr, ctx)
+    if args and args[0].lower() == "set":
+        return await _react_set(ctx, m, args[1:])
     ex = m.reaction_exchange
     if ex is None:
         if args:
@@ -29076,6 +29089,70 @@ async def react_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                map_of=map_of)
 
 
+# `!react set` options: option -> (the unit's var, the rule, its words).
+_REACT_SETTINGS = {
+    "mode": ("__reaction_mode", "reaction_mode", ("ask", "auto", "never")),
+    "hidden": ("__reactions_while_hidden", "reactions_while_hidden",
+               ("all", "affected", "none")),
+}
+
+
+async def _react_set(ctx: ReplyContext, m: Match, args: List[str]) -> None:
+    """!react set <eid> [mode=] [hidden=]: a unit's reaction settings
+    (its `__reaction_mode` / `__reactions_while_hidden` vars); without
+    options, what they are and where each comes from."""
+    import reactions
+    if not args:
+        raise VTTError("Usage: `!react set <eid> [mode=<ask|auto|never|"
+                       "default>] [hidden=<all|affected|none|default>]`.")
+    eid = _resolve_eid(m, args[0])
+    if eid not in m.entities:
+        _query_eid(ctx, m, args[0])
+        raise NotFound(f"Entity '{eid}' not found.")
+    e = m.entities[eid]
+    changes: Dict[str, Optional[str]] = {}
+    for tok in args[1:]:
+        key, eq, val = tok.partition("=")
+        key, val = key.strip().lower(), val.strip().lower()
+        if not eq or key not in _REACT_SETTINGS:
+            raise VTTError(f"Unexpected `{tok}` — usage: `!react set <eid> "
+                           f"[mode=<mode>] [hidden=<mode>]`.")
+        words = _REACT_SETTINGS[key][2]
+        if val != "default" and val not in words:
+            raise VTTError(f"`{key}=` takes {', '.join(words)} or default, "
+                           f"not `{val}`.")
+        changes[key] = None if val == "default" else val
+    log: List[str] = []
+    for key, val in changes.items():
+        var = _REACT_SETTINGS[key][0]
+        if val is None:
+            if var in e.vars:
+                log += e.remove_var(var)
+        elif e.vars.get(var) != val:
+            log += e.write_var(var, val)
+    e = m.entities.get(eid)
+    if e is None:
+        return await ctx.send("\n".join(log + [f"`{eid}` is gone."]))
+    now = {"mode": reactions._mode(m, e),
+           "hidden": reactions.hidden_mode(m, e)}
+    lines = []
+    for key, (var, rule, _w) in _REACT_SETTINGS.items():
+        own = e.vars.get(var)
+        src = ("its own" if isinstance(own, str) and own.strip().lower()
+               == now[key] else f"the rule {rule}")
+        lines.append(f"{key}: `{now[key]}` ({src})")
+    head = (f"Set `{eid}`'s reaction settings:" if changes
+            else f"`{eid}`'s reaction settings:")
+    await ctx.send("\n".join(log + [head] + lines))
+
+
+registry.annotate_sub("react", "set",
+                      usage="!react set <eid> [mode=<mode>] [hidden=<mode>]",
+                      desc="Show or set how a unit answers reaction windows "
+                           "(mode= ask / auto / never) and what it is "
+                           "offered while the acting side can't see it "
+                           "(hidden= all / affected / none); default = the "
+                           "rule.")
 registry.annotate_sub("react", "skip", usage="!react skip",
                       desc="(A host) close the open reaction window for "
                            "every unit still to answer; what was picked "
@@ -29739,6 +29816,9 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
             tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
             forbid = "" if disguised else _action_forbid_note(m, actor_id,
                                                               act)
+            if not disguised:
+                forbid = "; ".join(x for x in (forbid, _action_condition_note(
+                    m, actor_id, act)) if x)
             lines.append(
                 f"- `{act.name}` (target: `{act.target_type}`, at "
                 f"`{container}`{tags}){desc}"
@@ -29751,8 +29831,10 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
             for act in mount_actions[name]:
                 desc = f" — {act.description}" if act.description else ""
                 tags = f", tags: {', '.join(act.tags)}" if act.tags else ""
-                forbid = _action_forbid_note(m, actor_id, act,
-                                             actor.mounted_on)
+                forbid = "; ".join(x for x in (
+                    _action_forbid_note(m, actor_id, act, actor.mounted_on),
+                    _action_condition_note(m, actor_id, act,
+                                           actor.mounted_on)) if x)
                 where = (_private_text(m) if _path_private(
                     m, m.entities.get(actor.mounted_on or ""),
                     act.full_path) else act.full_path)
@@ -29812,6 +29894,34 @@ def _action_forbid_note(m: Match, actor_id: str, act: Any,
         f"{h['status']} on `{h['unit']}`"
         + (" (its _unless formula failed)" if h["error"] else "")
         for h in hits))
+
+
+def _action_condition_note(m: Match, actor_id: str, act: Any,
+                           vehicle: Optional[str] = None) -> str:
+    """"condition not met" when the action's precondition (Y4) reads false
+    for `actor_id` now (no target, no args), "its condition failed" when
+    the formula fails; "" otherwise. A seat action is judged as `!action`
+    runs it (mount_action_actor)."""
+    if not getattr(act, "condition", ""):
+        return ""
+    from action import action_condition_ok
+    eff, extra = actor_id, None
+    if vehicle:
+        import dataclasses
+        veh = m.entities.get(vehicle)
+        mode = (veh.vars.get("mount_action_actor") if veh is not None
+                else None) or m.rules.get("mount_action_actor", "rider")
+        rider = m.entities.get(actor_id)
+        extra = {"vehicle": vehicle, "rider": actor_id,
+                 "slot": rider.mount_slot if rider is not None else None}
+        if str(mode) == "vehicle":
+            eff = vehicle
+        else:
+            act = dataclasses.replace(act, container_path="")
+    ok, err = action_condition_ok(act, eff, m, extra=extra)
+    if ok:
+        return ""
+    return "its condition failed" if err else "condition not met"
 
 
 async def _action_info(
@@ -29920,6 +30030,10 @@ def _reaction_info_lines(m: Match, act: Any, private: bool) -> List[str]:
         return _private_text(m) if private else formula_text(src)
     if act.affects:
         out.append(f"Affects:     `{ftext(act.affects)}`")
+    if act.condition:
+        out.append(f"Condition:   `{ftext(act.condition)}`")
+    if act.condition_message:
+        out.append(f"Refusal:     {act.condition_message}")
     if act.target_condition:
         out.append(f"Target condition: `{ftext(act.target_condition)}`")
     if act.cancelled_action_cost:

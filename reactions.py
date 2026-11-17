@@ -53,6 +53,10 @@ REACTION_LOG_MAX = 2000
 # reactions_used(since=...) words.
 SINCE_WORDS = ("own_turn", "round", "turn", "action", "ever")
 MODES = ("ask", "auto", "never")
+# What a unit the acting side can't see is offered (reactions_while_hidden,
+# per unit `__reactions_while_hidden`): everything, only reactions to
+# actions directly affecting it, or nothing.
+HIDDEN_MODES = ("all", "affected", "none")
 
 
 # ----------------------------------------------------------------------
@@ -226,6 +230,15 @@ def _mode(m: Any, e: Any) -> str:
         return own.strip().lower()
     rule = str(m.rules.get("reaction_mode", "ask")).lower()
     return rule if rule in MODES else "ask"
+
+
+def hidden_mode(m: Any, e: Any) -> str:
+    """What unit `e` is offered while the acting side can't see it."""
+    own = e.vars.get("__reactions_while_hidden")
+    if isinstance(own, str) and own.strip().lower() in HIDDEN_MODES:
+        return own.strip().lower()
+    rule = str(m.rules.get("reactions_while_hidden", "all")).lower()
+    return rule if rule in HIDDEN_MODES else "all"
 
 
 def _window_limit(m: Any, e: Any) -> int:
@@ -419,11 +432,16 @@ def _reaction_open(m: Any, ex: Dict[str, Any], uid: str, act: Any,
             return False
     if uid in (ex["actor"], ex["eff_actor"]) and not spec.self_trigger:
         return False
+    reached = (list(ex.get("affected") or []) if phase == "before"
+               else _reached(ex))
     if spec.reacts_on == "target":
-        reached = (list(ex.get("affected") or []) if phase == "before"
-                   else _reached(ex))
         if not _covered(m, ex, uid, reached):
             return False
+    elif _hidden_bystander(m, ex, uid, reached):
+        return False
+    if spec.reacts_on == "target" and hidden_mode(
+            m, m.entities[uid]) == "none" and _unseen_by_side(m, ex, uid):
+        return False
     if m.action_restrictions(ACTION_FORBID_FIELDS,
                              m.action_forbid_units(uid), act.name,
                              act.tags, uid):
@@ -442,6 +460,31 @@ def _reaction_open(m: Any, ex: Dict[str, Any], uid: str, act: Any,
             return False
         return bool(ok)
     return True
+
+
+def _unseen_by_side(m: Any, ex: Dict[str, Any], uid: str) -> bool:
+    """Whether the acting unit's side (its body team) can't see `uid`
+    now; a teamless or departed actor sees everything."""
+    actor = m.entities.get(ex.get("actor") or "")
+    if actor is None or ex.get("actor_gone"):
+        return False
+    side = m.body_team(actor)
+    return side is not None and not m.entity_visible_to(uid, side)
+
+
+def _hidden_bystander(m: Any, ex: Dict[str, Any], uid: str,
+                      reached: List[str]) -> bool:
+    """Whether a bystander reaction (`reacts_on: any`) of `uid` stays
+    unoffered: `uid` keeps out of sight of the acting side
+    (reactions_while_hidden `affected` / `none`) and the action doesn't
+    directly affect it (under `none`, whatever it affects)."""
+    e = m.entities.get(uid)
+    if e is None:
+        return False
+    hm = hidden_mode(m, e)
+    if hm == "all" or not _unseen_by_side(m, ex, uid):
+        return False
+    return hm == "none" or not _covered(m, ex, uid, reached)
 
 
 def available(m: Any, ex: Dict[str, Any], uid: str, phase: str,
@@ -1305,8 +1348,18 @@ async def _body_phase(env: _Env, seq: int) -> str:
     if ex.get("cancelled"):
         return await _cancelled(env, seq, act, origin)
     if not ex.get("reread"):
+        had = unit_targets(ex["target_type"], ex.get("target"))
         _reread(m, ex, act, ex.get("mount") or None, env.out)
         ex["reread"] = True
+        if had and not unit_targets(ex["target_type"], ex.get("target")):
+            # Every target it named dropped out (dodged, left, now
+            # immune): the action is cancelled (L54: a single-target body
+            # ran with `target` None).
+            ex["cancelled"] = True
+            ex["cancel_reason"] = ("its target dropped out"
+                                   if len(had) == 1
+                                   else "every target dropped out")
+            return await _cancelled(env, seq, act, origin)
     await env.flush()
     affected = list(ex.get("affected") or [])
     copies = ex.get("incoming") or {}
@@ -1411,11 +1464,14 @@ async def _cancelled(env: _Env, seq: int, act: Any,
     m = env.m
     ex = _ex(m, seq)
     by = ex.get("cancelled_by") or ["", ""]
+    reason = ex.get("cancel_reason")
     if not ex.get("cancel_noted"):
         who = f"{_name(m, by[0])}'s `{by[1]}`" if by[0] else "a reaction"
         env.out.append(f"🚫 {_name(m, ex['actor'])}'s `{ex['name']}` is "
-                       f"cancelled by {who}.")
+                       + (f"cancelled: {reason}." if reason
+                          else f"cancelled by {who}."))
         ex["cancel_noted"] = True
+    why = reason or f"cancelled by {by[0] or 'a reaction'}"
     pay = act.cancelled_action_cost or str(
         m.rules.get("cancelled_action_cost", "refund"))
     if pay == "pay" and act.cost:
@@ -1455,12 +1511,12 @@ async def _cancelled(env: _Env, seq: int, act: Any,
         action_name=act.name, action_path=act.full_path,
         target=target_from_json(ex["target_type"], jcopy(ex.get("target"))),
         args=dict(ex.get("args") or {}), fail_reason="cancelled",
-        fail_message=f"cancelled by {by[0] or 'a reaction'}")
+        fail_message=why)
     m.log_event("action_failed", actor=ex["eff_actor"],
                 actor_name=m._entity_name(ex["eff_actor"]),
                 action=act.name, action_path=act.full_path,
                 target=str(ex.get("target")), reason="cancelled",
-                message=f"cancelled by {by[0]}")
+                message=reason or f"cancelled by {by[0]}")
     return "ok"
 
 
@@ -1726,7 +1782,7 @@ def _sync(coro) -> Any:
 # The refusals use_action reports itself ("↳ use_action ..."): the engine's,
 # worded by its rules (formula.py).
 _ENGINE_REFUSALS = ("forbidden", "immune", "target_tags", "target_condition",
-                    "reaction")
+                    "reaction", "condition")
 
 
 def _fail_line(m: Any, action: Any, why: Any) -> None:

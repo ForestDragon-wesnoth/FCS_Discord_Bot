@@ -39480,23 +39480,27 @@ SCENARIO 1108 — target_condition: checked when used and again at resolution (#
 !ent add hero Hero 30 5 5 3
 !ent set_var orc actions.zap.target entity
 !ent set_var orc actions.zap.target_condition "not status_has(target, 'invisible')"
-!ent set_var orc actions.zap.body "if target != None:\n    entity[target].hp = entity[target].hp - 10\nentity[self].zaps = 1"
+!ent set_var orc actions.zap.body "entity[target].hp = entity[target].hp - 10\nentity[self].zaps = 1"
 !ent set_var hero actions.vanish.before "status_apply(self, 'invisible')"
+!passive add orc missed on_action_failed "say('missed: ' + fail_reason + ', ' + fail_message)"
 !action info orc zap
 ?? Target condition: `not status_has(target, 'invisible')`
 !action orc zap hero
 !react hero vanish
 ?? Hero drops out of `zap`: Hero no longer meets `zap`'s target condition
-?? `Orc` used action `zap`
-!assert "entity[hero].hp == 30 and entity[orc].zaps == 1"
+?? 🚫 Orc's `zap` is cancelled: its target dropped out.
+?? missed: cancelled, its target dropped out
+?! used action `zap`
+!assert "entity[hero].hp == 30 and not var_has('orc', 'zaps')"
 !action orc zap hero
 ?? ❌ action `zap`: [target_condition] `hero` doesn't meet `zap`'s target condition.
 
 Expected: The hero's `vanish` makes it invisible before the zap
 resolves. The target is checked again at resolution: the hero no longer
-meets the target condition and drops out (as if it had dodged); the
-body still runs with no target (`target` is None), so its other effects
-happen. Used against an invisible hero, the zap is refused at once.
+meets the target condition and drops out (as if it had dodged). The zap
+named one target, so it is cancelled (user call, L54): the body doesn't
+run, and on_action_failed fires with reason `cancelled` and the cause.
+Used against an invisible hero, the zap is refused at once.
 HARNESS-ALLOWS-ERRORS
 
 
@@ -42219,8 +42223,8 @@ SCENARIO 1169 — !simulate says when its runs stopped at a reaction window
 !ent kill hero
 ?? ⏭ Nobody is left to answer the reaction window (Hero is gone); it closes.
 ?? ⚠️ Hero drops out of `cleave`: Hero is gone.
-?? ❌ action `cleave`: no unit was given (the value is None)
-?? `target` once its target dropped out
+?? 🚫 Orc's `cleave` is cancelled: its target dropped out.
+?! no unit was given
 !react
 ?? No reaction window is open on this match.
 !assert "not has_corpse('orc') and entity[orc].hp == 30"
@@ -42236,11 +42240,10 @@ simulated batch that answers the window itself reports the result (-4
 with the block, -10 with a pass), as does a hero whose `__reaction_mode`
 is `auto`. Then the real action: the host kills the hero while the window
 is open. Nobody is left to answer, so the window closes in that command
-(user call) and the action resolves: the hero drops out, the body
-still runs (design: an action with no target left resolves), and its
-`deal_damage(target, ...)` fails with a message naming a `target` that
-dropped out (it blamed an unbound 'self' / 'this' / 'current'). The
-failed body changes nothing and the exchange is over.
+(user call) and the action resolves: the hero drops out, and an action
+whose only target dropped out is cancelled (user call, L54: its body ran
+with `target` None, and its `deal_damage(target, ...)` failed). The
+exchange is over.
 
 
 SCENARIO 1170 — A reaction window nobody is left to answer closes in the command that left it so
@@ -44385,3 +44388,201 @@ formula like the undefined `dazed` (3 → 2 after the 2x2 A's first turn
 ends, gone after its third). `ward`, defined and applied with no
 duration, is permanent and stays. `burn`'s own tick (-2) replaces the
 global formula (6 → 4, gone after A's third turn).
+
+
+SCENARIO 1216 — An action's `condition` is a precondition judged before its prepare and body (Y4)
+--------------------------------------------------------------------------------------------------
+!match new pc PC 10 8
+!match use pc
+!ent add a Ana 50 2 2 5
+!ent set_vars a footprint_width=2 footprint_height=2
+!ent add b Bo 8 6 2 3
+!eval "var_set('a', 'kit', {'charges': 0, 'actions': {'zap': {'target': 'entity', 'condition': 'source.charges > 0', 'prepare': 'say(\"zap prepared\")', 'body': '1'}, 'pow': {'target': 'none', 'condition': 'entity[self].hp > 100', 'condition_message': '{name} is too weak for {action} ({hp} hp).', 'body': 'say(\"pow\")'}, 'bad': {'target': 'none', 'condition': 'nope(1)', 'body': '1'}}})"
+!ent set_var a kit.actions.zap.body "deal_damage(target, 3)\nsource.charges = source.charges - 1"
+!ent set_var b actions.brace.before "incoming.braced = True"
+!action a zap b
+?? ❌ action `zap`: [condition] `a` can't use `zap` now.
+?! zap prepared
+!action a pow
+?? ❌ action `pow`: [condition] Ana is too weak for pow (50 hp).
+!action a bad
+?? (its condition formula failed: Function 'nope' is not allowed.)
+!action list a
+?? - `bad` (target: `none`, at `kit`) 🚫 its condition failed
+?? - `pow` (target: `none`, at `kit`) 🚫 condition not met
+?? - `zap` (target: `entity`, at `kit`) 🚫 condition not met
+!action info a zap
+?? Condition:   `source.charges > 0`
+!action info a pow
+?? Refusal:     {name} is too weak for {action} ({hp} hp).
+!eval "use_action('a', 'zap', 'b')"
+?? ↳ use_action `zap`: `a` can't use `zap` now.
+!system lint default
+?? ❌ match `pc` `a` action `kit.actions.bad` condition: Function 'nope' is not allowed.
+?! kit.actions.zap
+!ent set_var a kit.charges 1
+!action list a
+?? - `zap` (target: `entity`, at `kit`)
+?! - `zap` (target: `entity`, at `kit`) 🚫
+!action a zap b
+?? zap prepared
+?? `!react b brace`
+!react b pass
+?? 🩸 **Bo** (`b`) takes 3 damage from Ana.
+!action a zap b
+?? ❌ action `zap`: [condition] `a` can't use `zap` now.
+!system set default action_condition_message_format "{name} has no charges left."
+!action a zap b
+?? ❌ action `zap`: [condition] Ana has no charges left.
+!assert "entity[b].hp == 5 and entity[a].kit.charges == 0"
+
+Expected: HARNESS-ALLOWS-ERRORS. A `condition` on an action that isn't a
+reaction is judged before its prepare and body, self = the acting unit,
+`source` its container (user call, Y4: it was accepted and ignored). The
+2x2 Ana's zap has no charges, so it is refused before its prepare runs
+(no "zap prepared"); the refusal is worded by the
+action_condition_message_format rule, and pow's own `condition_message`
+replaces it with the unit's placeholders. A condition whose formula fails
+refuses too and says why. `!action list` marks each action whose
+condition is unmet now, `!action info` shows the condition and the
+refusal text, use_action reports the refusal, and `!system lint` checks
+the condition (reading `source.charges` as an action does). With a charge
+the zap prepares, Bo's reaction window opens, and the zap lands and spends
+the charge; the next try is refused again, in the rule's new wording.
+
+
+SCENARIO 1217 — A `!func` ending on an if / elif / else returns the branch's trailing value (Y5)
+------------------------------------------------------------------------------------------------
+!match new fr FR 10 8
+!match use fr
+!ent add a Ana 50 2 2 5
+!ent set_vars a footprint_width=2 footprint_height=2
+!ent add b Bo 8 6 2 3
+!func def ready eid "if entity[eid].hp > 10:\n    True\nelse:\n    False"
+!func def tier eid "h = entity[eid].hp\nif h > 40:\n    'high'\nelif h > 5:\n    if h > 7:\n        'mid'\n    else:\n        'lowmid'\nelse:\n    x = 1"
+!func def big eid "if entity[eid].hp > 10:\n    'big'"
+!eval "[ready('a'), ready('b'), tier('a'), tier('b'), big('a'), big('b')]"
+?? = `[True, False, 'high', 'mid', 'big', None]`
+!eval "if ready('a'):\n    say('Ana is ready')\nelse:\n    say('Ana is not ready')"
+?? Ana is ready
+!ent hp b 6
+!eval "tier('b')"
+?? = `'lowmid'`
+!ent hp b 2
+!eval "[tier('b')]"
+?? = `[None]`
+!func def sneaky eid "if True:\n    __fn_result = 3"
+?? `__fn_result` can't be a local's name
+
+Expected: HARNESS-ALLOWS-ERRORS. A function's value was its last
+statement's when that is an expression, so a body ending on an if / else
+returned None and every caller took its false branch (user call, Y5). The
+value of the branch that ran is returned now, through elif chains and an
+if nested at the end of a branch: Ana (50 hp, a 2x2) is ready and high,
+Bo (8) is not and mid, then lowmid at 6. A branch ending on a statement
+(the `else` assigning x) or no branch running (big at 8 hp) returns None.
+The name the engine keeps the value under can't be a local.
+
+
+SCENARIO 1218 — An action whose targets all dropped out is cancelled (L54)
+-------------------------------------------------------------------------
+!match new dc DC 12 8
+!match use dc
+!ent add orc Orc 30 1 1 5
+!ent add ogre Ogre 30 5 2 3
+!ent set_vars ogre footprint_width=2 footprint_height=2
+!ent add imp Imp 10 9 2 2
+!ent set_var orc actions.sweep.target entity_list
+!ent set_var orc actions.sweep.target_condition "not status_has(target, 'hidden')"
+!ent set_var orc actions.sweep.cost "entity[self].stamina = 1"
+!ent set_var orc actions.sweep.body "for t in target:\n    deal_damage(t, 5)"
+!ent set_var orc actions.sweep.cancelled_action_cost pay
+!ent set_var ogre actions.duck.before "status_apply(self, 'hidden')"
+!ent set_var imp actions.duck.before "status_apply(self, 'hidden')"
+!turn next
+!action orc sweep ogre imp
+!react ogre duck
+!react imp pass
+?? ⚠️ Ogre drops out of `sweep`: Ogre no longer meets `sweep`'s target condition
+?? 🩸 **Imp** (`imp`) takes 5 damage from Orc.
+!assert "entity[imp].hp == 5 and entity[ogre].hp == 30"
+!ent status ogre remove hidden
+!action orc sweep ogre imp
+!react ogre duck
+!react imp duck
+?? 🚫 Orc's `sweep` is cancelled: every target dropped out.
+?! takes 5 damage
+!assert "entity[imp].hp == 5 and entity[ogre].hp == 30 and entity[orc].stamina == 1"
+
+Expected: an entity_list action re-checks each target at resolution. When
+the 2x2 ogre ducks and the imp doesn't, the ogre drops out and the sweep
+hits the imp alone. When both duck, nothing is left, and the sweep is
+cancelled (user call, L54: the body ran with no targets) with its cost
+paid per its cancelled_action_cost, as for a reaction's cancel.
+
+
+SCENARIO 1219 — reactions_while_hidden: what a unit the acting side can't see is offered
+----------------------------------------------------------------------------------------
+!match new hr HR 12 6
+!match use hr
+!match fog on
+!ent add orc Orc 30 1 1 5
+!ent set_vars orc team=red fog_vision_radius=3
+!ent add knight Knight 30 2 1 3
+!ent set_vars knight team=blue footprint_width=2 footprint_height=2
+!ent add spy Spy 30 10 5 2
+!ent set_vars spy team=blue
+!ent set_var orc actions.hit.target entity
+!ent set_var orc actions.hit.body "deal_damage(target, 5)"
+!ent set_var spy actions.warn.reacts_on any
+!ent set_var spy actions.warn.condition "target == 'knight'"
+!ent set_var spy actions.warn.before "incoming.warned = True"
+!ent set_var spy actions.guard.before "incoming.guarded = True"
+!turn next
+!action orc hit knight
+?? - Spy can react: `!react spy warn`
+!react skip
+!react set spy hidden=affected
+?? hidden: `affected` (its own)
+!action orc hit knight
+?! Spy can react
+?? 🩸 **Knight** (`knight`) takes 5 damage from Orc.
+!action orc hit spy
+?? - Spy can react: `!react spy guard`
+!react skip
+!react set spy hidden=none
+!action orc hit spy
+?! Spy can react
+!ent tp spy 3 3
+!action orc hit knight
+?? - Spy can react: `!react spy warn`
+!react skip
+!react set spy hidden=default
+?? hidden: `all` (the rule reactions_while_hidden)
+!ent tp spy 10 5
+!system set default reactions_while_hidden none
+!action orc hit knight
+?! Spy can react
+!react set spy mode=auto hidden=all
+?? mode: `auto` (its own)
+?? hidden: `all` (its own)
+!react set spy hidden=sometimes
+?? ❌ `hidden=` takes all, affected, none or default, not `sometimes`.
+!react set spy color=red
+?? ❌ Unexpected `color=red`
+!react set nobody
+?? ❌ Entity 'nobody' not found.
+!system set default reactions_while_hidden all
+!assert "entity[knight].hp == 10 and entity[spy].hp == 20"
+
+Expected: HARNESS-ALLOWS-ERRORS. A reaction answers in the open, so
+reacting can give away a unit the acting side can't see (user call, L54).
+The spy (blue) sits in the fog, out of the red orc's sight. By default
+(all) it is offered its bystander warn when the orc hits the 2x2 knight.
+`!react set spy hidden=affected`: unseen, it is offered only reactions to
+actions that directly affect it (guard when it is hit itself, no warn on
+the knight's hit). hidden=none: nothing while unseen. Once it stands
+where the orc sees it, the setting doesn't apply and warn is offered
+again. `default` goes back to the rule, which a system can set (none
+here). `!react set` also sets the reaction mode (`__reaction_mode`) and
+refuses words it doesn't know.

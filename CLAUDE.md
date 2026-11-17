@@ -2226,7 +2226,10 @@ hardcodes**.
   resolve BEFORE the access gate; an alias can't take a command's name
   (refused at def / promote, ignored if saved). Command roots and aliases
   are case-insensitive (`!Ent`, on Discord too). `!func` defines formula functions
-  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula,
+  (`formula_function_recursion_limit`; the value is the trailing
+  expression, and a body ending on an if / elif / else returns the
+  trailing value of the branch that ran: `_branch_results` stores it in
+  `_FN_RESULT` after the checks, Y5, 1217). `!eval [--as eid]` runs a formula,
   all or nothing like an action (user call): refused part-way, its writes
   are taken back, other matches too (`_eval_all_or_nothing`, 247, 960;
   a program `formula.program_is_read_only` passes, the `$()` test over
@@ -4243,7 +4246,14 @@ lists what isn't built; 1093-1122).
   run right before the body, in the same transaction), `affects`
   (expression, `target` a location's cell; default the unit targets),
   `target_condition` (expression, self = actor, `target` one target: a
-  unit, or a location target's cell, #540),
+  unit, or a location target's cell, #540), `condition` on an action
+  that isn't a reaction (a precondition, Y4: an expression judged in
+  `run_action` before prepare and the status checks, self = actor,
+  `source` / `args` by attribute, `target` as typed; refusal reason
+  `condition`, worded by the action's `condition_message` else
+  `action_condition_message_format`, `action_condition_text`; `!action
+  list` marks an unmet one through `action_condition_ok` with no target,
+  1216),
   `cancelled_action_cost` (refund / pay). `run_action(steps=,
   preset_locals=, prepare_out=, body_out=, finish=, skip_checks=,
   extra_bindings=, fail_out=, target_out=)` runs any of the programs as
@@ -4317,7 +4327,14 @@ lists what isn't built; 1093-1122).
 - **Windows:** `open_window` fixes the units (candidates in turn order,
   `__reaction_mode` / `reaction_mode` ask / auto / never; auto picks at
   once: a reaction with no target of its own, or one taking one unit,
-  which gets the incoming action's actor, user call); each option line is
+  which gets the incoming action's actor, user call). A unit the acting
+  unit's body team can't see (`entity_visible_to`; `_unseen_by_side`) is
+  offered per `__reactions_while_hidden` / `reactions_while_hidden`
+  (`hidden_mode`; user call, L54, 1219): all (default), affected (only
+  reactions to actions directly affecting it: no bystander reaction,
+  `_hidden_bystander`) or none. `!react set <eid> [mode=] [hidden=]`
+  (works with no window open; `default` drops the var) shows or sets
+  both; each option line is
   tagged with its unit (`m.unit_tag`) and names units with say() markers,
   so a team view drops the units it can't see. A unit is done when it
   passes, reaches `__reactions_per_window` / the rule, or has nothing
@@ -4352,7 +4369,8 @@ lists what isn't built; 1093-1122).
   (once: targets re-checked: immunity, target tags, target_condition;
   `affects` again; newcomers get a copy of `""`), the cancelled path
   (`_cancelled`: `cancelled_action_cost`, on_action_failed reason
-  `cancelled`) or the body (`_body_phase`: one affected unit's copy as
+  `cancelled`; also when every unit target the action named dropped
+  out, `cancel_reason`, user call, L54, 1108, 1218) or the body (`_body_phase`: one affected unit's copy as
   preset locals, else `""`; body locals merged into every copy;
   `fail(refund)` rolls back to the state at resolution start in this
   drive, `_Env.start`, and marks every pick refunded; after a pause it

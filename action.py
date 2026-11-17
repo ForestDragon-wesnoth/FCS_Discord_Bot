@@ -578,6 +578,13 @@ class Action:
     affects: str = ""
     target_condition: str = ""
     cancelled_action_cost: Optional[str] = None
+    # A precondition (Y4): an expression judged before `prepare` (self =
+    # the actor), refusing the action while false; `condition_message`
+    # words the refusal (else action_condition_message_format). A
+    # reaction's `condition` decides when it is offered instead
+    # (ReactionSpec.condition).
+    condition: str = ""
+    condition_message: str = ""
     # Set when the action is a reaction (it holds a `before` and / or
     # `after` half).
     reaction: Optional["ReactionSpec"] = None
@@ -672,6 +679,16 @@ class Action:
         cancel_cost = _word_field(raw, "cancelled_action_cost", CANCEL_COST,
                                   None, full_path, problems)
         reaction = _parse_reaction(raw, full_path, problems)
+        condition = "" if reaction is not None else _expression_field(
+            raw, "condition", full_path, problems)
+        condition_message = raw.get("condition_message", "")
+        if condition_message is None:
+            condition_message = ""
+        if not isinstance(condition_message, str):
+            problems.append(f"`{full_path}.condition_message` isn't text "
+                            f"({type(condition_message).__name__}); the "
+                            f"rule's wording applies.")
+            condition_message = ""
         return Action(
             name=name, body=body, description=description,
             target_type=target_type,
@@ -684,6 +701,7 @@ class Action:
             prepare=prepare, cost=cost, affects=affects,
             target_condition=target_condition,
             cancelled_action_cost=cancel_cost, reaction=reaction,
+            condition=condition, condition_message=condition_message,
         )
 
 
@@ -1780,6 +1798,17 @@ async def run_action(
         )
         return False, (af.reason, af.message)
 
+    # The action's precondition (Y4), before its prepare and the status
+    # checks.
+    if not skip_checks and action.condition:
+        ok_c, err_c = action_condition_ok(action, actor_id, match,
+                                          target=target, args=args,
+                                          extra=extra_ctx)
+        if not ok_c:
+            return _finish_action_fail(ActionFail(
+                action_condition_text(action, actor_id, match, target,
+                                      err_c), reason="condition"))
+
     # Statuses that forbid the action, or make its targets immune (#234),
     # before the body runs; an immune unit in a list target is dropped.
     refusal = None if skip_checks else _restriction_refusal(
@@ -2214,6 +2243,63 @@ def _restriction_refusal(action: Action, actor_id: str, target: Any,
             return "", "", kept, [
                 f"⚠️ `{action.name}` dropped a target: {ln}" for ln in dropped]
     return None
+
+
+def action_condition_ok(action: Action, actor_id: str, match: "Match", *,
+                        target: Any = None,
+                        args: Optional[Dict[str, Any]] = None,
+                        extra: Optional[Dict[str, Any]] = None,
+                        ) -> Tuple[bool, str]:
+    """Whether `actor_id` meets the action's precondition (Y4; `self` =
+    the actor, `source` its container, `target` / `args` as typed, None /
+    empty when `!action list` asks), and the error text when the formula
+    fails (a failing formula is not met)."""
+    if not action.condition:
+        return True, ""
+    from formula import FormulaEngine, EvalCtx
+    actor = match.entities.get(actor_id)
+    if actor is None:
+        return False, f"`{actor_id}` isn't in the match"
+    extras: Dict[str, Any] = {k: v for k, v in (extra or {}).items()
+                              if k in ("vehicle", "rider", "slot")}
+    extras.update({"target": target, "actor": actor_id,
+                   "action_name": action.name,
+                   "action_tags": list(action.tags)})
+    try:
+        ok = FormulaEngine(match).eval_expression(
+            action.condition,
+            EvalCtx(this=match.current_entity_id(), target=actor_id,
+                    extras=extras),
+            attr_bindings={"source": SourceProxy(actor,
+                                                 action.container_path),
+                           "args": ArgsProxy(dict(args or {}))})
+        return bool(ok), ""
+    except Exception as ex:      # noqa: BLE001 - reported, not raised
+        return False, str(ex)
+
+
+def action_condition_text(action: Action, actor_id: str, match: "Match",
+                          target: Any = None, err: str = "") -> str:
+    """The refusal of an action whose precondition isn't met: its own
+    `condition_message`, else action_condition_message_format, filled
+    with the actor's placeholders plus {actor}, {action}, {target}."""
+    from logic import RULES_REGISTRY, formula_text
+    fmt = action.condition_message or str(
+        match.rules.get("action_condition_message_format") or "") \
+        or RULES_REGISTRY["action_condition_message_format"]["default"]
+    actor = match.entities.get(actor_id)
+    tgt = _log_target_str(target) if target is not None else ""
+    if actor is None:
+        text = fmt
+    else:
+        text = match.render_unit_message(
+            fmt, actor_id, actor.name, actor.x, actor.y, actor.vars,
+            actor.part_of or "",
+            extra={"actor": actor_id, "action": action.name,
+                   "target": tgt})
+    if err:
+        text += f" (its condition formula failed: {formula_text(err)})"
+    return text
 
 
 def target_condition_ok(action: Action, actor_id: str, tid: Any,

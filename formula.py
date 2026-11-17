@@ -207,8 +207,9 @@ substitution, !eval, tile hooks, and other functions). They are the
 A function has a name, an ordered parameter list, and a body. The body is
 a full formula program: it may have statements (including entity[X] writes
 that take effect as side effects) and an optional trailing expression whose
-value becomes the return value. A body with no trailing expression returns
-None.
+value becomes the return value. A body ending on an if / elif / else
+returns the trailing value of the branch that ran. A body with no trailing
+expression returns None.
 
 Inside the body:
   - parameter names are bound to the call's argument values, as plain
@@ -4063,6 +4064,26 @@ class _LowercaseConstants(ast.NodeTransformer):
         return node
 
 
+# Where a `!func` body ending on an if / else keeps the value of the
+# branch that ran (Y5).
+_FN_RESULT = "__fn_result"
+
+
+def _branch_results(node: ast.If) -> None:
+    """Rewrite each branch of `node` (elif chains and an if ending a
+    branch included) so a trailing expression is stored in _FN_RESULT."""
+    for branch in (node.body, node.orelse):
+        if not branch:
+            continue
+        last = branch[-1]
+        if isinstance(last, ast.Expr):
+            branch[-1] = ast.copy_location(ast.Assign(
+                targets=[ast.Name(id=_FN_RESULT, ctx=ast.Store())],
+                value=last.value), last)
+        elif isinstance(last, ast.If):
+            _branch_results(last)
+
+
 def _refuse_engine_names(tree: ast.AST) -> None:
     """Refuse a `__` name a formula's SOURCE reads. The entity-access
     transformer injects calls to the engine's own helpers (`__read`,
@@ -5236,8 +5257,7 @@ class FormulaEngine:
                 raise FormulaError(
                     "no unit was given (the value is None): 'self', "
                     "'this' or 'current' is unbound in this context, or "
-                    "a variable holds no unit (an action's `target` once "
-                    "its target dropped out)."
+                    "a variable holds no unit."
                 )
             if not isinstance(token, str):
                 raise FormulaError(
@@ -8008,7 +8028,8 @@ class FormulaEngine:
             # own fail() stays its own to report.
             if ok is False and isinstance(why, tuple) and len(why) == 2 \
                     and why[0] in ("forbidden", "immune", "target_tags",
-                                   "target_condition", "reaction"):
+                                   "target_condition", "reaction",
+                                   "condition"):
                 match.surface_log([f"↳ use_action `{name}`: {why[1]}"])
             # None: the action waits on a reaction window (#36).
             return ok
@@ -12174,9 +12195,23 @@ class FormulaEngine:
         _validate_tree(full, known_funcs=known_funcs,
                        known_params=known_params)
         body_code = None
+        expr_code = None
+        if trailing_expr is None and full.body \
+                and isinstance(full.body[-1], ast.If):
+            # A body ending on an if / elif / else returns the trailing
+            # value of the branch that ran (Y5: it returned None, and every
+            # caller took its false branch). The rewrite runs after the
+            # checks, so its engine name passes them.
+            _branch_results(full.body[-1])
+            full.body.insert(0, ast.Assign(
+                targets=[ast.Name(id=_FN_RESULT, ctx=ast.Store())],
+                value=ast.Constant(value=None)))
+            ast.fix_missing_locations(full)
+            expr_code = compile(ast.fix_missing_locations(ast.Expression(
+                body=ast.Name(id=_FN_RESULT, ctx=ast.Load()))),
+                "<formula-fn>", "eval")
         if full.body:
             body_code = compile(_guard_arith(full), "<formula-fn>", "exec")
-        expr_code = None
         if trailing_expr is not None:
             expr_tree = ast.Expression(body=trailing_expr)
             expr_tree = _EntityAccessTransformer(known_params).visit(expr_tree)

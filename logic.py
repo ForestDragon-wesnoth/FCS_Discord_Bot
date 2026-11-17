@@ -5074,6 +5074,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`undead``). Empty = the default text."
         ),
     },
+    "action_condition_message_format": {
+        "default": "`{actor}` can't use `{action}` now.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The refusal of an action whose `condition` (its precondition, "
+            "an expression judged before its prepare and body, self = the "
+            "acting unit, `source` its container, `target` / `args` as "
+            "typed) reads false. An action's own `condition_message` "
+            "replaces it. Placeholders: {actor}, {action}, {target}, and "
+            "the acting unit's ({name}, {x}, {y}, {team}, its vars). "
+            "`!action list` marks an action whose condition is unmet now. "
+            "A reaction's `condition` decides when it is offered instead. "
+            "Empty = the default text."
+        ),
+    },
     "action_choice_limit": {
         "default": 20,
         "schema": {"type": "int", "min": 0, "max": 100, "ceiling": True},
@@ -5099,6 +5114,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "whose `auto_when` is true (a reaction without one whenever it "
             "is available), by priority, up to reactions_per_window. never: "
             "the unit is never offered a reaction."
+        ),
+    },
+    "reactions_while_hidden": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "affected", "none"]},
+        "desc": (
+            "What a unit is offered while the acting unit's side (its body "
+            "team) can't see it (fog, a visibility condition, a hidden "
+            "seat): a reaction answers in the open, so offering one can give "
+            "the unit away. all (default): every reaction it would be "
+            "offered in plain sight. affected: only reactions to actions "
+            "that directly affect it (its bystander, `reacts_on: any`, "
+            "reactions wait until it is seen). none: no reaction while "
+            "unseen. A unit's own `__reactions_while_hidden` var overrides "
+            "it (`!react set <unit> hidden=<mode>`). A teamless actor sees "
+            "every unit here."
         ),
     },
     "reactions_per_window": {
