@@ -7978,11 +7978,27 @@ def _clone_spot(m: Match, src: Entity, mp: "Map",
     with `near`, within that many cells of the source's body."""
     w, h = m.entity_footprint(src)
     avoid = set(m.entity_cells(src)) if src.map == mp.name else set()
-    for p in m.entity_part_subtree(src.id):
-        if p.vars.get("__part_located") and p.map == mp.name:
+    located = [p for p in m.entity_part_subtree(src.id)
+               if p.id != src.id and p.vars.get("__part_located")]
+    for p in located:
+        if p.map == mp.name:
             avoid.update(m.entity_cells(p))
+
+    def parts_fit(gx: int, gy: int) -> bool:
+        """The copy's located parts, carried at their offsets from the
+        new anchor, land on the map, clear of every unit and of the
+        source (K4)."""
+        body = set(m.entity_cells(src, gx, gy))
+        for p in located:
+            px, py = p.x - src.x + gx, p.y - src.y + gy
+            for c in m.entity_cells(p, px, py):
+                if not mp.in_bounds(*c) or c in avoid or c in body \
+                        or m.cell_occupant(c[0], c[1], (), mp) is not None:
+                    return False
+        return True
     spot = m._nearest_fit_cell(src, src.x + (w - 1) / 2,
-                               src.y + (h - 1) / 2, mp, avoid=avoid)
+                               src.y + (h - 1) / 2, mp, avoid=avoid,
+                               fits=parts_fit if located else None)
     if spot is None or near is None:
         return spot
     gap = m._rect_gap(spot[0], spot[1], w, h, src.x, src.y, w, h,
@@ -15461,7 +15477,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if e is None:
             # Its own turn-start effects (a lethal DoT tick, an on_turn_start
             # hook) removed it before the reply was built.
-            out = (f"`{eid[:8]}`'s turn began, and it was removed by its "
+            out = (f"`{eid}`'s turn began, and it was removed by its "
                    f"turn-start effects.")
             if fire_log:
                 out += "\n" + "\n".join(fire_log)
@@ -15604,7 +15620,7 @@ def _turn_forecast_text(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
         notes = [x for x in notes if "turn_forecast_limit" not in x]
     hidden_text = str(m.rules.get("turn_forecast_hidden_text", "") or "")
     fmt = str(m.rules.get("turn_forecast_line_format", "") or "") \
-        or "`{short_id}` **{name}**"
+        or "`{id}` **{name}**"
     atb = bool(m.rules.get("atb_enabled"))
     lines: List[str] = []
     last_round = None
@@ -18696,6 +18712,30 @@ def _table_roll_reply(m: Match, name: str, reps: int,
             + "".join(f"\n{n}" for n in dict.fromkeys(notes)))
 
 
+def _action_args_hint(action: Any, actor_id: str,
+                      words: List[str]) -> str:
+    """What an action takes after its target (L56): a positional word
+    past the target names no argument, so the refusal lists the
+    `args.<key>` its programs read and points at `!action info`."""
+    if not words or "=" in words[0]:
+        return ""
+    keys: List[str] = []
+    for prog in (getattr(action, "prepare", ""), getattr(action, "cost", ""),
+                 getattr(action, "body", ""), getattr(action, "condition", "")):
+        for k in re.findall(r"\bargs\.([A-Za-z_]\w*)", str(prog or "")):
+            if k not in keys:
+                keys.append(k)
+    target = getattr(action, "target_type", "none")
+    takes = (f" `{action.name}` takes " + (
+        f"a {target} target, then " if target not in ("none", None, "")
+        else "") + "arguments as `key=value`")
+    if keys:
+        takes += " (its formulas read " + ", ".join(
+            f"`{k}=`" for k in keys) + ")"
+    return (f".{takes}; `!action info {actor_id} {action.name}` "
+            f"describes it.")
+
+
 @registry.command(
     "roll", access="all",
     usage="!roll [<n>x] <dice_or_list ...> | !roll odds <dice> [<op> <n>]",
@@ -19896,6 +19936,15 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Undoing turns", n, "turn(s)",
                     f"turn {n}", erased,
                 ))
+            if _undo_changes_nothing(ctx, m, snap):
+                # T13: back to the start of this turn, and nothing has
+                # changed since it began.
+                return await ctx.send(
+                    f"Nothing has changed since "
+                    f"{snap.active_entity_id or 'no-active'}'s turn began "
+                    f"(round {snap.round_at_snapshot}): `!undo turn {n}` "
+                    f"lands where the board is now."
+                    + _undo_further(m, "turn", n))
             bmode = await _resolve_bindings_mode(ctx, m, snap, args)
             if bmode is None:
                 return
@@ -19928,6 +19977,12 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Undoing rounds", n, "round(s)",
                     f"round {n}", erased,
                 ))
+            if _undo_changes_nothing(ctx, m, snap):
+                return await ctx.send(
+                    f"Nothing has changed since round "
+                    f"{snap.round_at_snapshot} began: `!undo round {n}` "
+                    f"lands where the board is now."
+                    + _undo_further(m, "round", n))
             bmode = await _resolve_bindings_mode(ctx, m, snap, args)
             if bmode is None:
                 return
@@ -20132,6 +20187,40 @@ def _authors_line(m: Match, lo: int, hi: Optional[int],
         return []
     verb = "Undoes changes by" if undone else "Changes by"
     return [f"{verb}: {', '.join(who)}"]
+
+
+def _undo_changes_nothing(ctx, m: Match, snap: Snapshot) -> bool:
+    """True when restoring `snap` would leave the board as it is (T13: an
+    `!undo turn 1` at the start of a turn restores the state already
+    there), judged with the undo preview's diff."""
+    from types import SimpleNamespace
+    try:
+        now = SimpleNamespace(state=m.to_dict(include_history=False))
+        after = Match.from_dict(copy.deepcopy(snap.state))
+        after.rules = dict(m.rules)
+        after.sync_all_var_names()
+        lines = _format_snapshot_diff(
+            now, SimpleNamespace(state=after.to_dict(include_history=False)),
+            "now", "undo", _diff_rule_text(ctx, m))
+    except Exception:
+        return False
+    return "(no differences)" in lines
+
+
+def _undo_further(m: Match, kind: str, n: int) -> str:
+    """The step past an undo that would change nothing: `!undo turn N+1`
+    and where it lands, when there is one."""
+    try:
+        snap = (m.history.get_turn_nth_back(n + 1) if kind == "turn"
+                else m.history.get_round_nth_back(n + 1))
+    except (VTTError, IndexError, KeyError):
+        return " There is no earlier one to go back to."
+    if kind == "turn":
+        return (f" `!undo turn {n + 1}` goes back to the start of "
+                f"{snap.active_entity_id or 'no-active'}'s turn (round "
+                f"{snap.round_at_snapshot}).")
+    return (f" `!undo round {n + 1}` goes back to the start of round "
+            f"{snap.round_at_snapshot}.")
 
 
 async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
@@ -29156,7 +29245,7 @@ async def assert_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     "mount",
     usage=(
         "!mount <rider> <vehicle> <slot> | !mount dismount <rider> [x y] | "
-        "!mount switch <rider> <slot> | !mount list <vehicle> | "
+        "!mount switch <rider> <slot> | !mount list [<vehicle>] | "
         "!mount info <vehicle> [slot]"
     ),
     desc=(
@@ -31048,7 +31137,11 @@ async def _run_action_dispatch(
             action.target_type, pruned, m, actor_id, missing=missing,
             missing_corpse=missing_corpse, map_of=map_of,
         )
-        args_dict = parse_args_tokens(remaining)
+        try:
+            args_dict = parse_args_tokens(remaining)
+        except VTTError as ex:
+            raise VTTError(str(ex).rstrip(".")
+                           + _action_args_hint(action, actor_id, remaining))
     except VTTError as ex:
         return await ctx.send(f"❌ action `{action.name}`: {ex}")
     from action import dedupe_targets

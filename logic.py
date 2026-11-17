@@ -4912,7 +4912,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "command_message_cap": {
         "default": 20,
-        "schema": {"type": "int", "min": 1, "max": 200, "ceiling": True},
+        "schema": {"type": "int", "min": 1, "max": 1000, "ceiling": True},
         "desc": (
             "Discord: the most messages one command may post in all (a "
             "`!foreach` over many units, a long `!batch` or macro, each "
@@ -5888,7 +5888,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "turn_start_message_format": {
-        "default": "It is now **{name}**'s turn (id `{short_id}`)",
+        "default": "It is now **{name}**'s turn (id `{id}`)",
         "schema": {"type": "str"},
         "desc": (
             "The line `!turn next` ends with, naming whose turn it is now. "
@@ -5980,7 +5980,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "turn_forecast_line_format": {
-        "default": "`{short_id}` **{name}**",
+        "default": "`{id}` **{name}**",
         "schema": {"type": "str"},
         "desc": (
             "How `!turn forecast` names each unit in its list (the unit "
@@ -6023,7 +6023,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "extra_turn_message_format": {
-        "default": "It is now **{name}**'s extra turn (id `{short_id}`).",
+        "default": "It is now **{name}**'s extra turn (id `{id}`).",
         "schema": {"type": "str"},
         "desc": (
             "The line `!turn next` ends with when the turn it starts is an "
@@ -17538,7 +17538,8 @@ class Match:
 
     def _nearest_fit_cell(self, e: "Entity", ox: float, oy: float,
                           mp: "Map", avoid: Optional[Set[Tuple[int, int]]] = None,
-                          block_mode: Optional[str] = "tp"
+                          block_mode: Optional[str] = "tp",
+                          fits: Optional[Callable[[int, int], bool]] = None
                           ) -> Optional[Tuple[int, int]]:
         """The anchor cell nearest the point (ox, oy) where `e`'s whole
         footprint is on map `mp`, covers no other unit (ties by y then x),
@@ -17559,7 +17560,8 @@ class Match:
                             c in avoid for c in self.entity_cells(rider, gx, gy))) \
                         and not (block_mode and any(
                             self._check_block(rider.id, cx, cy, block_mode, mp)
-                            for cx, cy in self.entity_cells(rider, gx, gy))):
+                            for cx, cy in self.entity_cells(rider, gx, gy))) \
+                        and (fits is None or fits(gx, gy)):
                     key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
                     if best is None or key < best:
                         best = key
@@ -27017,6 +27019,27 @@ class Match:
         cv = ent.get("vars") if isinstance(ent, dict) else None
         return cv if isinstance(cv, dict) else {}
 
+    def _track_corpse_write(self, corpse: Dict[str, Any],
+                            new_vars: Dict[str, Any], path: str,
+                            deleted: bool) -> None:
+        """A corpse write under a partial template's marker is recorded in
+        it, as write_var records a living unit's (S7), so the revived
+        unit's next save keeps it and a resync doesn't undo it."""
+        if TEMPLATE_MARKER not in json.dumps(new_vars, default=str):
+            return
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if not isinstance(ent, dict):
+            return
+        token = LEGACY_IDS_OK.set(True)
+        try:
+            tmp = Entity.from_dict(dict(ent, vars={}))
+        except Exception:
+            return
+        finally:
+            LEGACY_IDS_OK.reset(token)
+        tmp.__dict__["vars"] = new_vars
+        self.track_template_change(tmp, path, deleted)
+
     def corpse_var_set(self, cid: str, path: str, value: Any) -> Any:
         """Write `value` at dotted `path` in the corpse's vars (#268); the
         value before (None when absent). Store checks only (see above)."""
@@ -27033,6 +27056,7 @@ class Match:
             node = nxt
         old = node.get(keys[-1])
         node[keys[-1]] = _own_value(value)
+        self._track_corpse_write(corpse, cur, path, False)
         self._store_corpse_vars(cid, mp, corpse, cur)
         return old
 
@@ -27059,6 +27083,7 @@ class Match:
         if not isinstance(node, dict) or keys[-1] not in node:
             return False
         del node[keys[-1]]
+        self._track_corpse_write(corpse, cur, path, True)
         self._store_corpse_vars(cid, mp, corpse, cur)
         return True
 
@@ -27082,6 +27107,35 @@ class Match:
                     f"corpse `{cid}`: ({cx},{cy}) {dest.off_text(cx, cy)} "
                     f"(its body would cover it).")
         rec = dict(corpse)
+        # The body moves whole (R3): its located parts and snake segments
+        # keep their offset from the anchor, and a snake's trail moves
+        # with it, as a revive displaced to another cell shifts them.
+        dx, dy = int(x) - ox, int(y) - oy
+        if dx or dy:
+            parts = []
+            for pd in rec.get("parts") or []:
+                pd = jcopy(pd) if isinstance(pd, dict) else pd
+                if isinstance(pd, dict) and (pd.get("vars") or {}).get(
+                        "__part_located"):
+                    px = int(pd.get("x", ox)) + dx
+                    py = int(pd.get("y", oy)) + dy
+                    if not dest.in_bounds(px, py):
+                        raise OutOfBounds(
+                            f"corpse `{cid}`: its part `{pd.get('id')}` "
+                            f"would lie at ({px},{py}), "
+                            f"{dest.off_text(px, py)}.")
+                    pd["x"], pd["y"] = px, py
+                if isinstance(pd, dict) and isinstance(pd.get("vars"), dict):
+                    Match._shift_snake_path_vars(pd["vars"], dx, dy)
+                parts.append(pd)
+            if "parts" in rec:
+                rec["parts"] = parts
+            ent = rec.get("entity")
+            if isinstance(ent, dict) and isinstance(ent.get("vars"), dict):
+                ent = dict(ent)
+                ent["vars"] = jcopy(ent["vars"])
+                Match._shift_snake_path_vars(ent["vars"], dx, dy)
+                rec["entity"] = ent
         if dest is src:
             rec["x"], rec["y"] = int(x), int(y)
             src.corpses[cid] = rec
@@ -27185,6 +27239,9 @@ class Match:
                         if (pd.get("vars") or {}).get("__part_located"):
                             pd["x"] = int(pd.get("x", x)) + dx
                             pd["y"] = int(pd.get("y", y)) + dy
+                    # A snake's trail moves with it.
+                    Match._shift_snake_path_vars(e.vars, dx, dy)
+                    e.mark_changed()
                     x, y = near
             except VTTError:
                 # Nothing was revived: the corpse goes back where it lay

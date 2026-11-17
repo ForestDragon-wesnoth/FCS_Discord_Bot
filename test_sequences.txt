@@ -45232,3 +45232,199 @@ a label must be text. The line is about the acting unit: with fog on, a
 channel seeing as blue doesn't get the line of the 2x1 orc out of its
 sight (an action a formula starts, here `!eval`), gets the hero's, and
 red's channel gets the orc's.
+
+
+SCENARIO 1232 — A dragged corpse takes its located parts, its snake segments and its trail along (R3)
+----------------------------------------------------------------------------------------------------
+
+!match new dr Dr 14 10
+!match use dr
+!map new cave 12 12
+!ent add boss Boss 30 2 2 10 map=main footprint_w=2
+!part add boss boss_arm Arm 10 10
+!part locate boss_arm 5 2
+!ent kill boss
+!ent tp boss 8 5
+?? Moved the corpse of `boss` to (8,5)
+!ent revive boss
+!assert "entity[boss].x == 8 and entity[boss].y == 5 and entity[boss_arm].x == 11 and entity[boss_arm].y == 5"
+!ent kill boss
+!ent tp boss 9 6 cave
+!ent revive boss
+!assert "map_of('boss') == 'cave' and map_of('boss_arm') == 'cave' and entity[boss_arm].x == 12 and entity[boss_arm].y == 6"
+!ent kill boss
+!ent tp boss 11 6 cave
+?? ❌ corpse `boss`: its part `boss_arm` would lie at (14,6)
+!ent add snk Snake 20 6 3 5 map=main
+!part segment snk snk_s1 Seg 5 5
+!part segment snk snk_s2 Seg 5 5
+!eval "entity[snk].before = [entity[snk_s1].x - entity[snk].x, entity[snk_s1].y - entity[snk].y, entity[snk_s2].x - entity[snk].x, entity[snk_s2].y - entity[snk].y]"
+!ent kill snk
+!ent tp snk 10 7
+!ent revive snk
+!assert "entity[snk].x == 10 and entity[snk].y == 7"
+!assert "[entity[snk_s1].x - entity[snk].x, entity[snk_s1].y - entity[snk].y, entity[snk_s2].x - entity[snk].x, entity[snk_s2].y - entity[snk].y] == entity[snk].before"
+!ent move snk 1 left
+!assert "entity[snk].x == 9 and entity[snk_s1].x - entity[snk].x <= 2"
+HARNESS-ALLOWS-ERRORS
+
+Expected: dragging a corpse moves its whole body (R3): the 2x1 boss's
+located arm, three cells to its right, comes back three cells to the
+right of where the corpse was dragged, on the map it was dragged to. A
+drag that would put a located part off the map is refused, naming it. A
+snake's segments keep their offsets from the head, and its trail moves
+with it, so its first walk after the revive lays the body behind the head
+where the drag left it.
+
+
+SCENARIO 1233 — A write to a corpse under a partial template is recorded in its marker (S7)
+------------------------------------------------------------------------------------------
+
+!match new cp Cp 10 10
+!match use cp
+!ent add orc Orc 20 2 2 5 footprint_w=2 footprint_h=2
+!template import axe_p {"kind": "partial", "data": {"name": "Axe", "damage": 8, "edge": "keen"}}
+!template give axe_p orc gear.axe
+!ent kill orc
+!ent set_var orc gear.axe.damage 20
+!ent delete_var orc gear.axe.edge
+!ent revive orc
+!ent get orc gear.axe.__template
+?? "damage"
+?? "edge"
+!template save orc orc_t
+!template show orc_t vars.gear
+?? "damage": 20
+?? "edge"
+!template resync orc
+!assert "entity[orc].gear.axe.damage == 20 and var_get('orc', 'gear.axe.edge', 'gone') == 'gone'"
+!ent kill orc
+!ent set_var orc gear.axe.damage 8
+!ent revive orc
+!ent get orc gear.axe.__template
+?! "damage"
+
+Expected: a corpse write under a partial's marker is recorded there as
+a living unit's write is (S7): after the revive the marker lists the
+changed `damage` and the removed `edge`, so the save writes both and a
+resync keeps them. Writing the partial's own value back on the corpse
+takes `damage` off the list again.
+
+
+SCENARIO 1234 — `!ent clone` without coordinates finds a cell for the body and its located parts (K4)
+----------------------------------------------------------------------------------------------------
+
+!match new kc Kc 14 10
+!match use kc
+!ent add big Big 30 3 3 5 footprint_w=2 footprint_h=2
+!part add big big_arm Arm 10 10
+!part locate big_arm 5 3
+!ent add rock Rock 5 7 4 1
+!ent add rock2 Rock 5 7 6 1
+!ent clone big big2
+?? Cloned `big` → `big2`
+!assert "abs(entity[big2_big_arm].x - entity[big2].x) == 2 and entity[big2_big_arm].y == entity[big2].y"
+!ent clone big big4 count=2 near=6
+?? 2 copies
+!assert "exists('big41_big_arm') and exists('big42_big_arm')"
+!ent clone big big5 count=40 near=1
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: the search for a clone's cell also places the copy's located
+arm at its offset (K4): an anchor whose arm cell a rock takes is passed
+over for the next one, where both fit; `count=2` places each copy with
+its arm clear of the earlier copies. Forty copies within one cell don't
+fit, and nothing is cloned.
+
+
+SCENARIO 1235 — An undo that would change nothing says so; turn lines name units by their whole id (T13, L56)
+------------------------------------------------------------------------------------------------------------
+
+!match new un Un 10 10
+!match use un
+!ent add a A 20 1 1 30 footprint_w=2
+!ent add rare_frost_bear Bear 20 4 1 20
+!turn next
+?? It is now **A**'s turn (id `a`)
+!turn next
+?? (id `rare_frost_bear`)
+!turn forecast 2
+?? `rare_frost_bear` **Bear**
+!turn next
+!undo turn 1
+?? Nothing has changed since a's turn began (round 2): `!undo turn 1` lands where the board is now. `!undo turn 2` goes back to the start of rare_frost_bear's turn (round 1).
+!ent hp a 15
+!undo turn 1
+?? Undid 1 turn(s). Now at start of a's turn (round 2).
+!assert "entity[a].hp == 20"
+!undo turn 1
+?? Nothing has changed since a's turn began
+!undo turn 2
+?? Undid 2 turn(s). Now at start of rare_frost_bear's turn (round 1).
+!undo round 1 confirm
+?? Undid 1 round(s). Now at start of round 1.
+!undo round 1 confirm
+?? Nothing has changed since round 1 began: `!undo round 1` lands where the board is now. There is no earlier one to go back to.
+
+Expected: `!undo turn 1` goes back to the start of the turn under way;
+when nothing has changed since it began, the reply says so and names the
+step that goes further (T13) and changes nothing; after a change it
+undoes it. The same for `!undo round`. The turn line and the forecast
+name units by their whole id (L56: `rare_fro` named nothing).
+
+
+SCENARIO 1236 — Tab offers corpses to the `!ent` forms that take them; an action's positional word names what it takes (L56)
+--------------------------------------------------------------------------------------------------------------------------
+
+!match new tc Tc 10 10
+!match use tc
+!ent add hero Hero 20 1 1 5 team=red fog_vision_radius=2
+!ent add pal Pal 10 2 1 4 team=blue footprint_w=2
+!ent add far Far 10 9 9 3 team=blue
+!ent kill pal
+!ent kill far
+?tab "!ent get "
+?? far
+?? pal
+?tab "!ent get pal "
+?? hp
+?tab "!ent var_move hero hp "
+?? pal
+!match fog on
+!match bind pov=red
+?tab "!ent get "
+?? pal
+?! far
+?tab "!ent tp "
+?? pal
+!match bind pov=omniscient
+!ent set_var hero actions.sprint.target none
+!ent set_var hero actions.sprint.body "n = args.steps\nd = args.dir"
+!action hero sprint 2 right
+?? `sprint` takes arguments as `key=value` (its formulas read `steps=`, `dir=`); `!action info hero sprint` describes it.
+!help mount
+?? !mount list [<vehicle>]
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!ent get`, `tp`, `var_move` and the others that take a
+corpse's id offer corpses in Tab, and a corpse's vars after its id; under
+a team view only the corpses the view sees (Pal lies in red's sight, Far
+doesn't). A positional word after an action's name is refused naming the
+keys its formulas read and `!action info`. `!help mount` gives the list
+form's optional vehicle.
+
+
+SCENARIO 1237 — A server name of many emoji still gets its label file (W12)
+-------------------------------------------------------------------------
+
+!as server 1294368645421727999
+!as servername 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+!match new lb Lb 5 5
+?file list
+?? 0 server - 🔥🔥🔥
+
+Expected: a label file's name is cut by its bytes (W12): sixty emoji
+(240 bytes) used to make a name too long for the file system, and the
+warning printed after every command; the name is now cut to fit, and
+the file's first line keeps the whole name.

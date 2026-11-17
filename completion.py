@@ -25,6 +25,7 @@ import logic
 from vtt_commands import (registry, _usage_tokens, _split_top, _usage_tails,
                           _is_option_group, _is_variadic, _OPTION_WORD,
                           _SUB_ALIASES, _query_pov, _pov_hides, _MAP_LAYERS,
+                          _ENT_CORPSE_SUBS,
                           _view_pov)
 
 # Placeholder names whose words are free values (numbers, formulas, text,
@@ -231,15 +232,32 @@ def _entity_ids(mgr, ctx) -> List[str]:
 
 
 def _corpse_ids(mgr, ctx) -> List[str]:
+    """The corpses this channel's view sees, on every map (a team view
+    reads each through corpse_visible_to, as `!ent info` does)."""
     m = _match(mgr, ctx)
     if m is None:
         return []
     try:
-        if _query_pov(ctx, m) is not None:
-            return []          # corpses follow their own visibility rule
+        pov = _query_pov(ctx, m)
+        return sorted({eid for mp, x, y, eid, c in m.every_corpse()
+                       if pov is None or m.corpse_visible_to(
+                           eid, c, x, y, pov, mp)})
     except Exception:
         return []
-    return sorted({c[2] for c in m.all_corpses()})
+
+
+def _corpse_vars(mgr, ctx, eid: str):
+    """The vars of visible corpse `eid` as the caller may read them."""
+    m = _match(mgr, ctx)
+    if m is None or eid not in _corpse_ids(mgr, ctx):
+        return None
+    loc = m.find_corpse(eid)
+    if loc is None:
+        return None
+    from vtt_commands import _var_reader
+    reader = _var_reader(ctx, mgr, mgr.active_by_channel.get(
+        ctx.channel_key))
+    return m.corpse_reader_vars(loc[2], reader)
 
 
 def _teams(mgr, ctx) -> List[str]:
@@ -410,6 +428,11 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
             return sorted(logic.RULES_REGISTRY)
         if slot == "dest_path":
             ent = binds.get("dest_id")
+        if root == "ent" and sub in _ENT_CORPSE_SUBS and m is not None \
+                and ent not in _entity_ids(mgr, ctx):
+            cv = _corpse_vars(mgr, ctx, ent)
+            if cv is not None:
+                return _var_paths(cv, word)
         if m is not None and ent in _entity_ids(mgr, ctx):
             # Only the vars this caller may read (#70: private vars).
             from vtt_commands import _var_reader
@@ -435,6 +458,10 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
                 return sorted(str(p) for p in parts)
             return sorted(str(p.get("id", "")).replace(logic.TEMPLATE_ROOT + "_", "")
                           for p in parts or [] if isinstance(p, dict))
+        if root == "ent" and sub in _ENT_CORPSE_SUBS:
+            # These take a corpse's id too (L56).
+            return sorted(set(_entity_ids(mgr, ctx))
+                          | set(_corpse_ids(mgr, ctx)))
         return _entity_ids(mgr, ctx)
     if slot == "corpse_id":
         return _corpse_ids(mgr, ctx)

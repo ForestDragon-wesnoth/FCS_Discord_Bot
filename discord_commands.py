@@ -242,6 +242,10 @@ def _role_text(role) -> str:
     return f"**{name}**" if name.startswith("@") else f"**@{name}**"
 
 
+# Channels (and reasons) the console already named as unpostable (D11).
+_UNPOSTABLE_NOTED: set = set()
+
+
 class DiscordCtxWrapper:
     # Discord renders ANSI colors inside ```ansi code blocks, so the
     # colorized map renderer is enabled for this surface.
@@ -364,6 +368,25 @@ class DiscordCtxWrapper:
             pass
         return default
 
+    async def _post(self, *args, **kwargs):
+        """Post one message (D11). A channel where the bot can't post
+        (Missing Permissions) or a post Discord refuses is no crash: the
+        command keeps what it did, and the console names the channel and
+        the reason once per channel and reason."""
+        try:
+            return await self._ctx.send(*args, **kwargs)
+        except discord.HTTPException as ex:
+            key = (self.channel_key, type(ex).__name__,
+                   getattr(ex, "code", None))
+            if key not in _UNPOSTABLE_NOTED:
+                _UNPOSTABLE_NOTED.add(key)
+                what = ("the bot can't post there (it lacks Send Messages "
+                        "or View Channel)" if isinstance(ex, discord.Forbidden)
+                        else f"Discord refused the post ({ex})")
+                print(f"[discord] channel {self.channel_key}: {what}; "
+                      f"commands there still run, their replies are lost.")
+            return None
+
     async def send(self, message: str):
         # Split over-long output at line boundaries so we never trip
         # Discord's content-length cap (see _split_for_discord). Discord also
@@ -389,13 +412,13 @@ class DiscordCtxWrapper:
                 self._dropped += 1
                 continue
             self._sent += 1
-            await self._ctx.send(chunk)
+            await self._post(chunk)
 
     async def flush_dropped(self) -> None:
         """The note for the messages command_message_cap left out."""
         if self._dropped:
             n, self._dropped = self._dropped, 0
-            await self._ctx.send(
+            await self._post(
                 f"✂️ … {n} more message(s) of this command left out "
                 f"(command_message_cap {self._reply_cap('command_message_cap', 20)}).")
 
@@ -569,6 +592,39 @@ class _InteractionCtx(DiscordCtxWrapper):
         self._dropped = 0
 
 
+async def _ack_click(interaction, what: str) -> bool:
+    """Answer a button click at once (D12): Discord refuses an interaction
+    answered more than 3 seconds after the click, and a click that waited
+    (the bot busy with another server's command) used to take its request
+    out of the queue first, so an approved command never ran. On a refusal
+    nothing is changed: the request (or held command) stays, and one
+    console line says so in place of a traceback."""
+    try:
+        await interaction.response.defer()
+        return True
+    except discord.NotFound:
+        print(f"[discord] a `{what}` click reached the bot after Discord's "
+              f"3 seconds; nothing was done (click again, or use the "
+              f"command).")
+    except discord.HTTPException as ex:
+        print(f"[discord] a `{what}` click couldn't be answered ({ex}); "
+              f"nothing was done.")
+    return False
+
+
+async def _click_reply(interaction, text: str, ephemeral: bool = False):
+    """A reply to a click, after `_ack_click` answered it (a follow-up),
+    or before (the response)."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(text,
+                                                    ephemeral=ephemeral)
+    except discord.HTTPException as ex:
+        print(f"[discord] a click's reply couldn't be posted ({ex}).")
+
+
 class _ApprovalView(discord.ui.View):
     """Approve / Deny buttons for one pending request. Only a host of the
     request's match may resolve it; non-hosts get an ephemeral refusal.
@@ -644,7 +700,7 @@ class _ApprovalView(discord.ui.View):
                 or not m.request_expired(self._req):
             return False
         m.pop_pending_request(rid)
-        await interaction.response.send_message(
+        await _click_reply(interaction,
             vtt_commands._expired_refusal(m, self._req), ephemeral=True)
         await self._disable(interaction)
         return True
@@ -653,7 +709,7 @@ class _ApprovalView(discord.ui.View):
         m = self._match()
         ictx = _InteractionCtx(interaction, self._mgr)
         if m is None or not vtt_commands.caller_hosts(ictx, m):
-            await interaction.response.send_message(
+            await _click_reply(interaction,
                 "❌ Only a host can resolve this request.", ephemeral=True
             )
             return False
@@ -661,6 +717,8 @@ class _ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
+        if not await _ack_click(interaction, "Approve"):
+            return
         if not await self._require_host(interaction):
             return
         if await self._refuse_expired(interaction):
@@ -672,18 +730,17 @@ class _ApprovalView(discord.ui.View):
                 self._req.get("id")) is self._req:
             waits = vtt_commands.approval_waits(m, self._req)
             if waits:
-                await interaction.response.send_message(waits,
+                await _click_reply(interaction, waits,
                                                         ephemeral=True)
                 return
         req = self._pop_own(m)
         if req is None:
-            await interaction.response.send_message(
+            await _click_reply(interaction,
                 "This request is no longer pending: it was approved, "
                 "denied or cancelled, or a `!store load` / restore "
                 "dropped it.", ephemeral=True
             )
             return self._finish()
-        await interaction.response.defer()
         ictx = _InteractionCtx(interaction, self._mgr)
         cmd = _shown_cmd(req["name"], req["args"])
         await ictx.send(
@@ -705,6 +762,8 @@ class _ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny(self, interaction, button):
+        if not await _ack_click(interaction, "Deny"):
+            return
         if not await self._require_host(interaction):
             return
         if await self._refuse_expired(interaction):
@@ -712,14 +771,14 @@ class _ApprovalView(discord.ui.View):
         m = self._match()
         req = self._pop_own(m)
         if req is None:
-            await interaction.response.send_message(
+            await _click_reply(interaction,
                 "This request is no longer pending: it was approved, "
                 "denied or cancelled, or a `!store load` / restore "
                 "dropped it.", ephemeral=True
             )
             return self._finish()
         cmd = _shown_cmd(req["name"], req["args"])
-        await interaction.response.send_message(
+        await _click_reply(interaction,
             f"🚫 {interaction.user.display_name} denied `{cmd}` "
             f"(by {req['user_name']})."
         )
@@ -772,21 +831,22 @@ class _ResumeView(discord.ui.View):
         ictx = _InteractionCtx(interaction, self._mgr)
         if m is None or (m.owner is not None
                          and not vtt_commands.caller_hosts(ictx, m)):
-            await interaction.response.send_message(
+            await _click_reply(interaction,
                 "❌ Only a host can resume the match.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Resume & run", style=discord.ButtonStyle.success)
     async def resume(self, interaction, button):
+        if not await _ack_click(interaction, "Resume & run"):
+            return
         if not await self._require_host(interaction):
             return
         m = self._match()
         if m is None or not m.paused:
-            await interaction.response.send_message(
+            await _click_reply(interaction,
                 "The match isn't paused any more.", ephemeral=True)
             return await self._disable(interaction)
-        await interaction.response.defer()
         ictx = _InteractionCtx(interaction, self._mgr)
         # Point the run at this match even if the clicked channel shows
         # another one, then put the channel back (run_approved_request's rule).
@@ -807,6 +867,8 @@ class _ResumeView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, button):
+        if not await _ack_click(interaction, "Cancel"):
+            return
         if not await self._require_host(interaction):
             return
         m = self._match()
@@ -816,10 +878,10 @@ class _ResumeView(discord.ui.View):
             if h is self._entry:
                 del held[i]
                 cmd = _shown_cmd(h["name"], h["args"])
-                await interaction.response.send_message(
+                await _click_reply(interaction,
                     f"🚫 Dropped held `{cmd}`; the match stays paused.")
                 return await self._disable(interaction)
-        await interaction.response.send_message(
+        await _click_reply(interaction,
             "That command isn't held any more.", ephemeral=True)
         await self._disable(interaction)
 

@@ -447,7 +447,13 @@ back, load the schema with `ToolSearch` before calling
   `offer_resume`, `prompt_choice`, `retire_server_boards`. The Discord
   adapter also routes `!<alias>` through `on_command_error`, never pings
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
-  board whose channel was unbound.
+  board whose channel was unbound. A button click is answered first
+  (`_ack_click`, D12: Discord refuses an answer after 3 s, and a click
+  that waited behind another command used to drop its request); only then
+  does it touch the queue, and a refused answer leaves everything as it
+  was with one console line. A post the channel refuses (Missing
+  Permissions) is no crash (`DiscordCtxWrapper._post`, D11): the command
+  keeps its effect and the console names the channel once.
 - **`test_sequences.txt`**: the scenarios (§2).
 - **`docs/audit_history.md`**: the narratives of audit passes 2-54 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
@@ -725,7 +731,12 @@ plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
 - **Server name file:** each Discord server's folder (named by its
   numeric id) holds `0 server - <name>.txt` (`storage.server_label_file`:
   characters no file system takes become `_`), whose first lines give the
-  server's name and id. `Storage.label_server` writes it at bot startup
+  server's name and id (the name cut to `SERVER_LABEL_NAME_BYTES`
+  encoded bytes, W12, 1237; a name is recorded once tried, so a failing
+  write warns once). The server's trash folder (`data/.trash/<key>/`)
+  gets the same file (`_write_label`: at a wipe and with every label
+  write, W13; its readers skip names that aren't a stamp).
+  `Storage.label_server` writes it at bot startup
   for every server with a folder (`_label_servers`, an on_ready listener
   in discord_commands.py) and after a commit whose `mgr.guild_name`
   differs from the name last written (a new server's first save, a rename
@@ -1346,7 +1357,9 @@ hardcodes**.
   a body part, and is all-or-nothing (`_rollback_match` on any refusal).
   Without coordinates (#590) each copy lands on the anchor nearest the
   source's body centre where its whole body fits, clear of the source
-  (`_clone_spot`: `_nearest_fit_cell`, the dismount search, ties by row);
+  (`_clone_spot`: `_nearest_fit_cell`, the dismount search, ties by row,
+  its `fits` test placing the copy's located parts at their offsets, K4,
+  1234);
   `count=<n>` copies (at most summon_event_limit), `near=<r>` bounds the
   search (1188).
 - **Summons** (`Match.summon_entity`): `summon(template, x, y)` /
@@ -1724,7 +1737,9 @@ hardcodes**.
   `skip_all_round_limit`, stopping early once a round changes no status
   (permanent stuns) → `_start_current_turn`. The reply prints hook
   output first and the `turn_start_message_format` line last (unit
-  placeholders, `{short_id}`, `{round}`; `turn_start_hidden_message_format`
+  placeholders, `{id}` by default (L56: `{short_id}`, the first 8
+  characters, named nothing a command takes), `{round}`;
+  `turn_start_hidden_message_format`
   for a unit the channel's view can't see; empty = no line) (770).
 - **Removal and death mid-turn:** removing the current unit sets
   `turn_vacated`, so the next `!turn next` starts the successor without
@@ -2767,10 +2782,16 @@ hardcodes**.
   vitals that can't be deleted, text team, checked tags, no reserved or
   derived size var, a footprint still on the map), no clamps, var hooks
   or death check; each write lays a NEW record, so earlier states keep
-  theirs. Moves (`Match.corpse_move`, `!ent tp <corpse> x y [map]`,
+  theirs. A write under a partial template's marker is recorded in it
+  as a living unit's is (`_track_corpse_write`, S7, 1233). Moves
+  (`Match.corpse_move`, `!ent tp <corpse> x y [map]`,
   `corpse_move(eid, x, y, map=)`): the body on the map and off voids,
   units and corpses don't block, another map takes it along (not into a
-  map it holds as a wreck); no tile or zone hook fires (§8). The
+  map it holds as a wreck); the stored located parts and snake segments
+  keep their offsets and the trail vars move too, a part landing off the
+  map refusing the drag (R3, 1232; a revive displaced by
+  `revive_blocked_mode nearest` shifts the trail the same way); no tile
+  or zone hook fires (§8). The
   non-host pre-check of `!ent` lets these subcommands
   (`_ENT_CORPSE_SUBS`) name a visible corpse (`_typed_corpse` for the
   writes: a host reaches any).
@@ -3204,7 +3225,8 @@ hardcodes**.
   (`!map pan/center/view`). Discord fits a 2000-char message by dropping
   rulers, then colour, then legend; one reply takes at most
   `reply_message_cap` messages, then a cut note, and one command at most
-  `command_message_cap` (20) in all (a sweep, batch or macro posts a reply
+  `command_message_cap` (20, owner ceiling 1000, W14) in all (a sweep,
+  batch or macro posts a reply
   per line), then one note counting the rest (`flush_dropped`). Commands run from the
   Approve / Resume buttons use the same adapter (`_InteractionCtx` is a
   `DiscordCtxWrapper`); a pan click is acknowledged before it waits for
@@ -3256,7 +3278,9 @@ hardcodes**.
   body; `quote_unclosed`, Discord too), joined with `\n`. History is per session (user
   call); the CLI keeps answers to choose() prompts out of it. Completion
   under a team view offers only what that view's queries show: unit ids,
-  their teams, actions, statuses and mount slots of visible units.
+  their teams, actions, statuses and mount slots of visible units; the
+  `!ent` forms that take a corpse (`_ENT_CORPSE_SUBS`) offer the corpses
+  the view sees and their vars (L56, 1236).
   The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
@@ -3536,7 +3560,10 @@ hardcodes**.
   export's own number replaced the match's snapshot of that number).
   `!history note <text|->` labels the newest snapshot (`Snapshot.note`,
   saved in the history index, one line of at most `HISTORY_NOTE_MAX`);
-  `!history list` and the undo previews show it (1177).
+  `!history list` and the undo previews show it (1177). An `!undo turn
+  N` / `round N` whose restore point equals the board now (the start of
+  the turn under way, nothing changed since) says so, names the step that
+  goes further and restores nothing (`_undo_changes_nothing`, T13, 1235).
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -4648,6 +4675,13 @@ rejected already. Update this section in the PR that resolves an item.
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
   only that pair. A layer-aware version of each is open (idea #563).
+
+- **`!undo round` lands before the round's first turn** (T12, asked):
+  the round snapshot is taken at the wrap, before the first unit's turn
+  begins, so after the restore that unit shows as current with its
+  turn-start effects not run, and the next `!turn next` gives it its turn
+  again. Options: take the snapshot after the turn begins, have the
+  restore begin it, or show no current unit and say `!turn next` starts it.
 
 - **Dragged corpses fire no hooks** (user: a known limitation; code it
   when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross
