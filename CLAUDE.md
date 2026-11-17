@@ -1740,7 +1740,11 @@ hardcodes**.
   parent's turn; a part with its own initiative has its own turn instead.
 - **Status ticks** (`fire_status_tick`): per status, the definition's `tick`
   at its `tick_when`, else the global `status_tick_formula` at
-  `status_tick_when` (default never); stops for a unit removed mid-tick.
+  `status_tick_when` (default never): a status without a definition, and
+  a defined one without a tick of its own while it has a duration (user
+  call, Y2: one defined for its data never counted down; a permanent one
+  stays untouched; `_own_tick`, `_timed_status`, 1215); stops for a unit
+  removed mid-tick.
   Order (`Match.status_tick_order`): highest `tick_priority` first
   (`status_field`, so an instance key or a level entry sets it; `!status
   tick_priority <name> <n|->`), ties in the order the unit gained them

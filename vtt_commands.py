@@ -24661,8 +24661,10 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         except (VTTError, DuplicateId) as ex:
             return (f"❌ {ex}")
         return (
-            f"Defined status `{name}` (tick_when=turn_end, no tick yet). "
-            f"Set its effect with `{prefix.format(sub='tick')} {name} \"<formula>\"`."
+            f"Defined status `{name}` (tick_when=turn_end, no tick yet: "
+            f"while it has a duration, the status_tick_formula rule ticks "
+            f"it). Set its effect with "
+            f"`{prefix.format(sub='tick')} {name} \"<formula>\"`."
         )
 
     if sub == "rename":

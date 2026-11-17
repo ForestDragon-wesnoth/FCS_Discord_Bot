@@ -2370,7 +2370,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula body run once per (entity, status) at the time "
-            "specified by status_tick_when. Empty (default) is a no-op "
+            "specified by status_tick_when, for each status without a "
+            "definition and each defined status without a `tick` of its "
+            "own that has a duration (a status defined for its data still "
+            "counts down; a permanent one doesn't). A definition's own "
+            "tick replaces it. Empty (default) is a no-op "
             "even if status_tick_when is set. Context bindings: "
             "entity[self] = the bearing entity, this = "
             "current_entity_id(), status_name = the status being "
@@ -24087,18 +24091,23 @@ class Match:
                 # tick_when (default turn_end); a def-less status falls back
                 # to the global status_tick_formula at the global when.
                 sdef = self.status_definitions.get(sname)
-                if sdef is not None:
+                if sdef is not None and self._own_tick(e, sname):
                     # The tick and its when as the instance's level reads
                     # them (#259).
                     sdef = self.status_def_view(
                         sname, self.status_level(e.status.get(sname)))
-                    body = sdef.get("tick")
-                    if not (isinstance(body, str) and body.strip()):
-                        continue
                     def_when = sdef.get("tick_when") or "turn_end"
                     if def_when != when:
                         continue
-                    src = body
+                    src = sdef.get("tick")
+                elif sdef is not None:
+                    # A definition without a tick of its own (one written
+                    # for its data) falls back to the global formula while
+                    # the instance has a duration (user call, Y2: such a
+                    # status never counted down).
+                    if not global_active or not self._timed_status(e, sname):
+                        continue
+                    src = global_src
                 else:
                     if not global_active:
                         continue
@@ -24130,15 +24139,31 @@ class Match:
         turn_end): its definition's tick at its level, else the global
         status_tick_formula at status_tick_when."""
         turn_whens = ("turn_start", "turn_end")
-        if sname in self.status_definitions:
+        if sname in self.status_definitions and self._own_tick(e, sname):
             view = self.status_def_view(
                 sname, self.status_level(e.status.get(sname)))
-            body = view.get("tick")
-            return (isinstance(body, str) and bool(body.strip())
-                    and (view.get("tick_when") or "turn_end") in turn_whens)
+            return (view.get("tick_when") or "turn_end") in turn_whens
+        if sname in self.status_definitions and \
+                not self._timed_status(e, sname):
+            return False
         src = self.rules.get("status_tick_formula", "")
         return (isinstance(src, str) and bool(src.strip())
                 and self.rules.get("status_tick_when", "never") in turn_whens)
+
+    def _own_tick(self, e: "Entity", sname: str) -> bool:
+        """Whether status `sname`'s definition gives it a tick of its own
+        at the instance's level."""
+        view = self.status_def_view(
+            sname, self.status_level(e.status.get(sname)))
+        body = view.get("tick")
+        return isinstance(body, str) and bool(body.strip())
+
+    def _timed_status(self, e: "Entity", sname: str) -> bool:
+        """Whether status `sname` on `e` has a duration (instance, then
+        definition and level entries): a defined status without a tick of
+        its own runs status_tick_formula only then (Y2)."""
+        dur = self.status_field(e.status.get(sname), sname, "duration")
+        return isinstance(dur, (int, float)) and not isinstance(dur, bool)
 
     def _ticks_on_extra_turn(self, inst: Any, sname: str) -> bool:
         """Whether status `sname` ticks during an extra turn: its
