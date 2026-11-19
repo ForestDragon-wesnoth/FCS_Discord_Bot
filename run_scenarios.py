@@ -139,6 +139,11 @@ class _Ctx:
     async def send(self, message: str) -> None:
         self.out.append(message)
 
+    async def post_to_channel(self, channel_key: str, text: str) -> None:
+        """A post to another channel (R5: a reaction window shown to a
+        team's channel), printed in the transcript with its channel."""
+        self.out.append(f"📨 to `{channel_key}`:\n{text}")
+
 
 def _interpret_escapes(raw: str) -> str:
     """Convert the documentation escapes `\\n` and `\\t` into the real

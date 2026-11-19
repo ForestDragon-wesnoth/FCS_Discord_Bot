@@ -28120,7 +28120,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 !status apply u burn 2 3
 !ent status u add mark
 !ent info u short
-?? Status: burn ×2 (3), mark
+?? Status: burn ×2 (3 turns), mark
 !status def rot
 !status display rot "rot (-{lost} max hp)"
 ?? `rot` shows as `rot (-{lost} max hp)` in `{statuses}`.
@@ -28128,7 +28128,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 !ent status u set rot lost 30
 !system set default entity_line_format "{name}: {statuses}"
 !list
-?? U: burn ×2 (3), mark, rot (-30 max hp)
+?? U: burn ×2 (3 turns), mark, rot (-30 max hp)
 !system set default status_line_format "{?level?}{level}x {/?}{name}"
 !status display rot
 !list
@@ -28139,7 +28139,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 ?? U corpse: 2x burn, mark, 1x rot
 
 Expected: `!ent info` lists each status with its level and duration
-(`burn ×2 (3)`); a status with neither shows its name. A `{statuses}`
+(`burn ×2 (3 turns)`); a status with neither shows its name. A `{statuses}`
 placeholder gives entity_line_format / entity_info_format /
 corpse_line_format the same text, each status through the
 status_line_format rule (any instance field is a placeholder) or its
@@ -34264,7 +34264,7 @@ HARNESS-ALLOWS-ERRORS (a stray word after `!ent info <id>` is refused)
 ?! description:
 ?! hp:
 !ent info knight short
-?? Status: bleed ×2 (3)
+?? Status: bleed ×2 (3 turns)
 ?? Inventory: {sword, rations}
 ?! Details
 ?! A sworn sword
@@ -37264,7 +37264,7 @@ SCENARIO 1058 — Layered status stacking in real use: a burn DoT dealing its le
 !assert "status_layers('a', 'burn') == [[3, 2], [1, 5]] and status_layers('b', 'burn') == [[3, 2], [1, 5]]"
 !assert "status_level('a', 'burn') == 3 and status_duration('a', 'burn') == 5"
 !ent info a short
-?? Status: burn ×3 (5): ×3 for 2, then ×1 for 3 more
+?? Status: burn ×3 (5 turns): ×3 for 2, then ×1 for 3 more
 !turn next
 !turn next
 !assert "entity['a'].hp == 17 and status_layers('a', 'burn') == [[3, 1], [1, 4]]"
@@ -45794,3 +45794,261 @@ host moved to B's would end B's turn; the approval refuses it, naming
 the request, and B keeps the turn. One asked and approved on the same
 turn runs. The description's status line reads "1 turn left" and "3
 turns left" (`{turns_word}`).
+
+
+SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: status_visibility_condition and a status's own visibility condition
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sv Sv 9 9
+!match use sv
+!ent add orc Orc 30 2 2 5
+!ent add hero Hero 30 6 6 3
+!ent set_var orc team red
+!ent set_var hero team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc footprint_h 2
+!status def burn
+!status def cursed
+!status sprite cursed fx_curse
+!status apply orc burn 2 3
+!status apply orc cursed 1 1
+!list
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns), cursed ×1 (1 turn)
+?? Hero (hero): HP: 30/30 X,Y: 6,6 facing up
+?! Hero (hero): HP: 30/30 X,Y: 6,6 facing up |
+!status visibility cursed "is_part_of_team(self, pov_team)"
+?? `cursed` shows to a team view while
+!match bind pov=blue
+!list
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns)
+?! cursed
+!find status:cursed
+?! orc
+!find status:burn
+?? orc
+!ent info orc
+?? burn
+?! cursed
+!map scene list
+?! fx_curse
+!match bind pov=red
+!list
+?? burn ×2 (3 turns), cursed ×1 (1 turn)
+!map scene list
+?? overlay `orc` at (2,2) 2x2 stretch — sprite fx_curse
+!match bind pov=blue
+!system set default status_visibility_condition "status_name != 'burn'"
+!list
+?! burn
+?! cursed
+!status visibility cursed
+?? Cleared `cursed`'s visibility condition (it follows status_visibility_condition)
+!list
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | cursed ×1 (1 turn)
+!status visibility cursed "entity[zqxnobody].hp > 0"
+!list
+?? cursed ×1 (1 turn)
+!status level burn 3 visibility_condition "False"
+!status apply orc burn 3 3
+!system set default status_visibility_condition ""
+!list
+?! burn
+?? cursed
+!match bind pov=omniscient
+!list
+?? burn ×3 (3 turns), cursed ×1 (1 turn)
+!status visibility cursed "corpse_team == pov_team"
+!ent kill orc
+!match bind pov=blue
+!ent info orc
+?! cursed
+!match bind pov=red
+!ent info orc
+?? cursed
+!assert "corpse_status_has('orc', 'burn')"
+
+Expected: the default entity_line_format ends with the unit's statuses
+(`| burn ×2 (3 turns), cursed ×1 (1 turn)`), each through
+status_line_format, which says how many turns are left; a unit without
+statuses has no `|`. A status's own visibility condition (`!status
+visibility`, self = the bearer) hides `cursed` from blue's view in the
+line, `!find status:` and the description, while red, the bearer's team,
+sees it; the image overlay of `cursed` over the 2×2 orc goes the same
+way. The status_visibility_condition rule covers the statuses without
+a condition of their own (`burn` hidden from blue); clearing the
+status's condition puts it back under the rule. A condition that fails
+shows the status. A level entry's condition (burn level 3: `False`) hides
+the status at that level only; the omniscient view sees everything. A
+corpse's statuses follow the same conditions with corpse_team bound.
+Formulas see every status (`corpse_status_has` finds the hidden burn).
+
+
+SCENARIO 1247 — The action dice line leaves out the rolls of units the channel's view can't see (V27)
+------------------------------------------------------------------------------------------------------
+
+!match new dv Dv 9 9
+!match use dv
+!system set default random_seed 3
+!system set default action_dice_line on
+!ent add orc Orc 30 2 2 5
+!ent add zqxspy Spy 30 4 2 3
+!ent add elf Elf 30 2 4 2
+!ent set_var orc team red
+!ent set_var zqxspy team blue
+!ent set_var elf team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc footprint_h 2
+!gpassive add zqxdodge on_damage_taken "roll('1d20', label='zqxevade')"
+!ent set_var orc actions.swing.target none
+!ent set_var orc actions.swing.body "for u in entities_within(self, 1, 'square_radius', 'hostile'):\n    deal_damage(u, roll('1d6', label='hit'))"
+!action orc swing
+?? zqxevade 1d20
+?? 🎲 hit 1d6
+!defvar add fog_vision_radius 0
+!ent set_var orc fog_vision_radius 0
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or self != 'zqxspy'"
+!match bind pov=red
+!action orc swing
+?? 🎲 hit 1d6 →
+?? zqxevade 1d20 →
+?! zqxspy
+?! Spy
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team)"
+!action orc swing
+?? 🎲 hit 1d6 →
+?! zqxevade
+!match bind pov=omniscient
+!action orc swing
+?? 🎲 hit 1d6 →
+?? · zqxevade 1d20 →
+
+Expected: a 2×2 orc's swing hits the spy and the elf next to its body;
+each takes damage, and a global passive rolls `zqxevade` for the unit hit.
+The omniscient view's dice line lists every roll. Bound to red, with the
+spy hidden (entity_visibility_condition) and the elf seen, the line keeps
+the orc's own hit rolls and the elf's evade roll and leaves out the spy's
+(the damage line about the spy is dropped too). With both blue units
+hidden, only the orc's rolls stay. A roll is noted with the unit whose
+formula made it (`self`); the actor's own rolls follow the line's tag.
+
+
+SCENARIO 1248 — A host names a unit the channel's view hides, under pov_host_names_hidden (W16)
+------------------------------------------------------------------------------------------------
+
+!match new wh Wh 9 9
+!match use wh
+!ent add cat Cat 60 4 4 5
+!ent add hero Hero 30 6 4 3
+!ent set_var cat team red
+!ent set_var hero team blue
+!ent set_var cat footprint_w 2
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or not status_has(self, 'cloak')"
+!status def cloak
+!status apply cat cloak
+!ent set_var cat actions.claws.target entity
+!ent set_var cat actions.claws.body "entity[target].hp = entity[target].hp - 5"
+!match bind pov=blue
+!action cat claws hero
+?? Could not find a unit named `cat`
+!system set default pov_host_names_hidden on
+!action cat claws hero
+?? `someone` used action `claws` on `Hero`.
+?! Cat
+!list
+?? Hero (hero): HP: 25/30
+?! cat
+!assert "entity[hero].hp == 25"
+!as player bob
+!ent info cat
+?? Could not find a unit named `cat`
+!as host
+!match var set pov_host_names_hidden false
+!action cat claws hero
+?? Could not find a unit named `cat`
+!match var set pov_host_names_hidden true
+!system set default pov_host_names_hidden off
+!system set default host_reveal_warning on
+!ent info cat short
+?? HP: 60/60
+?? this command named `cat`, hidden from it
+!assert "entity[hero].hp == 25"
+HARNESS-ALLOWS-ERRORS
+
+Expected: the cat is invisible to blue. In the channel bound to blue a
+host's `!action cat claws hero` refuses the cat like a missing unit; with
+the pov_host_names_hidden rule on it runs (the hero drops to 25), and the
+reply names the cat as `someone`, the channel's view. A player there still
+can't name the cat. A match var of the rule's name overrides the rule
+either way (false refuses with the rule on, true takes the cat with the
+rule off). A host's read of the hidden unit ends with the
+host_reveal_warning note while that rule is on.
+
+
+SCENARIO 1249 — A reaction window goes to the channels of the teams that may react; a deferred action's log carries its author (R5, L57)
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rc Rc 9 9
+!match use rc
+!ent add cat Cat 60 4 4 5
+!ent add hero Hero 30 6 4 3
+!ent set_var cat team red
+!ent set_var hero team blue
+!ent set_var cat footprint_w 2
+!ent set_var cat footprint_h 2
+!ent set_var cat actions.claws.target entity
+!ent set_var cat actions.claws.tags melee
+!ent set_var cat actions.claws.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var hero actions.dodge.reacts_to melee
+!ent set_var hero actions.dodge.before "incoming.avoid = True"
+!as channel blue
+?? Now typing in channel `blue`.
+!match use rc
+!match bind pov=blue
+!as channel redc
+!match use rc
+!match bind pov=red
+!as channel CLI
+!action cat claws hero
+?? 📨 to `blue`:
+?? Hero can react: `!react hero dodge`
+?! 📨 to `redc`
+!as channel blue
+!as player bob
+!react hero pass
+?? needs host approval (request `r1`
+!as host
+!as channel CLI
+!approve r1
+?? ✅ Approved `r1`
+!assert "entity[hero].hp == 25"
+!host access set react all
+!action cat claws hero
+!as channel blue
+!as player bob
+!react hero pass
+?? 🤚 Hero passes.
+!as host
+!as channel CLI
+!assert "entity[hero].hp == 20"
+!log 5 by=cli
+?? used `claws`
+!log 5 by=bob
+?! claws
+!dry !action cat claws hero
+?! 📨
+!react skip
+!batch strict !action cat claws hero ; !ent tp zqxnobody 1 1
+?! 📨
+HARNESS-ALLOWS-ERRORS
+
+Expected: the GM types `!action cat claws hero` in an unbound channel. The
+window shows there, and its listing also goes to `blue`, the channel bound
+to the team of the unit that may react (the hero); `redc` (the cat's team)
+gets nothing. Bob answers in `blue`; his `!react` still needs a host's
+approval. Approved, the window closes and the claws land (hero 25). With
+`!host access set react all`, bob's own `!react hero pass` closes the
+next window and the claws land again (20); the event log's entries for
+both claws carry the GM, who started the action, though bob's answer
+closed the window. A `!dry` run and a `!batch strict`
+whose later line fails open a window that never stays, so nothing is
+posted.

@@ -19,13 +19,13 @@ from logic import (
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
-from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
 from logic import reserved_var_path_error, file_refs
-from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem
+from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem, STATUS_VISIBILITY_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows, ODDS_BUDGET
@@ -1228,6 +1228,8 @@ class CommandRegistry:
                                            pre_matches, _AUDIT_NOTES.get())
                     _journal_after(mgr)
             await _flush_formula_log(ctx)
+            if outer:
+                await _post_window_elsewhere(ctx, mgr)
             if tags_token is not None:
                 warn = _vocabulary_warning(mgr, ctx, STORED_TAGS.get() or {})
                 if warn:
@@ -2938,6 +2940,8 @@ def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
             sdef = defs.get(name)
             fmt = sdef.get("display") if isinstance(sdef, dict) else None
         ctx["name"] = name
+        ctx.setdefault("turns_word", "turn" if ctx.get("duration") == 1
+                       else "turns")
         ctx.pop(STATUS_LAYERS_KEY, None)
         if status_layers_of(inst) is not None:
             ctx["layers"] = status_layers_text(status_layers_of(inst))
@@ -3568,7 +3572,9 @@ def _corpse_template_context(
     reader = VAR_READER.get()
     ent_vars = (m.corpse_reader_vars(corpse, reader)
                 if reader is not None else raw_vars)
-    status = ent.get("status") or {}
+    # The statuses the command's view sees (status_visibility_condition).
+    status = m.visible_statuses(ent.get("status") or {}, m.command_pov(),
+                                corpse_id=eid)
     passives = ent.get("passives") or {}
     ctx: Dict[str, Any] = {
         "id": eid,
@@ -3685,9 +3691,9 @@ def _corpse_description(m: Match, x: int, y: int, cid: str,
             if ctx.get("tags"):
                 text = _render_template(fmt(sec), ctx, labels)
         elif sec == "statuses":
-            status = ent.get("status")
-            items = _description_statuses(
-                m, status if isinstance(status, dict) else {})
+            status = m.visible_statuses(ent.get("status"), m.command_pov(),
+                                        corpse_id=cid)
+            items = _description_statuses(m, status)
             if items:
                 text = _render_template(fmt(sec), {"items": "\n".join(items)})
         elif sec == "data":
@@ -3897,6 +3903,7 @@ def _typed_unit_view(ctx: ReplyContext, mgr: MatchManager,
 # `<field>_unless` restriction formulas.
 _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "condition", "effect", "cost",
+                                 "visibility_condition",
                                  # An action's other programs and a
                                  # reaction's (#36).
                                  "prepare", "affects", "target_condition",
@@ -5680,7 +5687,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as channel <key> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -5706,6 +5713,9 @@ def _mention(user_id: Optional[str]) -> str:
         "(server_idle_unload_hours): the servers it unloads load again on "
         "their next command. `!as wait <seconds>` makes every pending "
         "approval request that much older (pending_request_expiry_seconds). "
+        "`!as channel <key>` types into another channel (`CLI` is the "
+        "usual one), as on Discord: what a channel bound with `pov=` "
+        "receives. "
         "`!as crash [text]` raises an error no command expects "
         "(a test hook for the error log, `!owner errors`). Bare `!as` "
         "reports your identity and your effective POV."
@@ -5744,6 +5754,15 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             "🔄 Reloaded every server from the data folder, as after a "
             "restart." + ("\n" + "\n".join(notes) if notes else ""))
+    if role == "channel":
+        # A test hook (R5): type into another channel, as on Discord, to
+        # see what a channel bound to a team's view receives.
+        _check_tail(args, 2, (), "!as channel <key>")
+        if len(args) < 2:
+            raise VTTError("Usage: `!as channel <key>` (`CLI` is the "
+                           "usual one).")
+        ctx.channel_key = args[1]
+        return await ctx.send(f"Now typing in channel `{args[1]}`.")
     if role == "wait":
         # A test hook (#135): every pending approval request of this server
         # was queued <seconds> earlier, as if that much time had passed.
@@ -10086,6 +10105,7 @@ class _ReplayCtx:
         self.prompt_choice = None
         self.offer_resume = None
         self.offer_confirm = None
+        self.post_to_channel = None
         self.replies: List[str] = []
 
     def __getattr__(self, name):
@@ -13205,6 +13225,7 @@ registry.annotate_sub(
         "copy <system> <name> <new_name> | tick <system> <name> <formula ...> | "
         "hook <system> <name> <on_added|on_removed|on_changed> [<formula ...>] | "
         "display <system> <name> [<format ...>] | "
+        "visibility <system> <name> [<formula ...>] | "
         "when <system> <name> <turn_end|turn_start|round_start|round_end|never> | "
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
         "stack <system> <name> <layered|refresh|add_level|extend|replace|none> | "
@@ -16014,6 +16035,55 @@ def _say_name_text(m: Optional["Match"], pov: Optional[str], mid: str,
     return e.name
 
 
+class _ChannelCtx:
+    """`inner` as seen from another channel: the reply filter judges lines
+    by that channel's view (R5's posts)."""
+
+    def __init__(self, inner: Any, channel_key: str):
+        self._inner = inner
+        self.channel_key = channel_key
+        self.pov_override = _NO_POV
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def _post_window_elsewhere(ctx: ReplyContext, mgr: MatchManager
+                                 ) -> None:
+    """Post the reaction windows this command opened to the team channels
+    reactions._note_team_posts recorded (R5), each as its channel's view
+    reads it, through the surface's `post_to_channel`. A surface without it
+    (a replay, a simulation) posts nothing."""
+    posts = getattr(mgr, "_window_posts", None)
+    if not posts:
+        return
+    mgr._window_posts = []
+    poster = getattr(ctx, "post_to_channel", None)
+    if poster is None:
+        return
+    for chan, mid, text in posts:
+        if mgr.active_by_channel.get(chan) != mid:
+            continue
+        shown = _filter_unit_lines(text, _ChannelCtx(ctx, chan), mgr)
+        if shown.strip():
+            await poster(chan, shown)
+
+
+def _dice_roll_shown(m: Optional["Match"], pov: Optional[str], mid: str,
+                     eid: str) -> bool:
+    """Whether this channel's view reads a dice-line roll unit `eid`'s
+    formula made (V27): the unit, or its corpse, is in view."""
+    if m is None or m.id != mid or pov is None:
+        return True
+    if eid in m.entities:
+        return not _pov_hides(m, pov, eid)
+    loc = m.find_corpse(eid)
+    if loc is None:
+        return False
+    x, y, corpse, mp = loc
+    return m.corpse_visible_to(eid, corpse, x, y, pov, mp)
+
+
 def _say_team_shown(ctx: ReplyContext, m: Optional["Match"],
                     pov: Optional[str], team: str) -> bool:
     """Whether a say_to() line for `team` shows here: that team's view, or a
@@ -16049,6 +16119,12 @@ def _filter_unit_lines(text: str, ctx: ReplyContext, mgr: MatchManager) -> str:
                 continue
             line = SAY_TEAM_RE.sub("", line)
         line = line.replace(SAY_OPEN_MARK, "")
+        if DICE_ROLL_RE.search(line):
+            m, pov = seen()
+            line = join_dice_rolls(
+                line, lambda mid, eid: _dice_roll_shown(m, pov, mid, eid))
+            if line is None:
+                continue
         mo = UNIT_LINE_RE.search(line)
         if mo is None:
             out.append(line)
@@ -16210,12 +16286,31 @@ def _team_data_readable(ctx: ReplyContext, m: "Match", team: str) -> bool:
     return pov is None or str(pov) == str(team)
 
 
+def _host_names_hidden(ctx: ReplyContext, m: "Match") -> bool:
+    """Whether the caller, a host of `m`, may name units the channel's view
+    hides (W16): the match var pov_host_names_hidden when it is a bool,
+    else the rule of that name."""
+    v = m.vars.get("pov_host_names_hidden") if isinstance(m.vars, dict) \
+        else None
+    on = v if isinstance(v, bool) else bool(
+        m.rules.get("pov_host_names_hidden", False))
+    return on and _acts_as_host(ctx, m)
+
+
 def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
     """Resolve an entity id for a read-only query, treating an entity the
     channel's POV can't see exactly like a missing one (same message, which
-    echoes what was typed — never the resolved id)."""
+    echoes what was typed — never the resolved id). A host under
+    pov_host_names_hidden reaches a hidden unit (W16)."""
     eid = _resolve_eid(m, token, view=False)
     pov = _query_pov(ctx, m)
+    if eid in m.entities and pov is not None and _pov_hides(m, pov, eid) \
+            and _host_names_hidden(ctx, m):
+        reveals = _HOST_REVEALS.get()
+        if reveals is not None and eid not in reveals \
+                and m.rules.get("host_reveal_warning", False):
+            reveals.append(eid)
+        return eid
     if eid not in m.entities or _pov_hides(m, pov, eid):
         if pov is not None:
             # Under a team view a hidden unit and a missing one read alike,
@@ -16238,7 +16333,8 @@ def _query_unit_or_corpse(ctx: ReplyContext, m: "Match", token: str
         loc = m.find_corpse(eid)
         pov = _query_pov(ctx, m)
         if loc is not None and (pov is None or m.corpse_visible_to(
-                eid, loc[2], loc[0], loc[1], pov, loc[3])):
+                eid, loc[2], loc[0], loc[1], pov, loc[3])
+                or _host_names_hidden(ctx, m)):
             return eid, loc
     return _query_eid(ctx, m, token), None
 
@@ -18608,8 +18704,8 @@ def _find_match_corpse(m: Match, cid: str, loc: Tuple[Any, ...],
 
     def one(kind: str, key: str, val: Optional[str]) -> bool:
         if kind == "status":
-            st = ent.get("status")
-            return isinstance(st, dict) and key in st
+            return key in m.visible_statuses(ent.get("status"), pov,
+                                             corpse_id=cid)
         if kind == "group":
             groups = corpse.get("groups") if isinstance(corpse, dict) else None
             mine = groups.get(cid) if isinstance(groups, dict) else None
@@ -24998,6 +25094,7 @@ for _sub, _usage in (
         ("tick", "!status tick <name> <formula ...>"),
         ("hook", "!status hook <name> <on_added|on_removed|on_changed> [<formula ...>]"),
         ("display", "!status display <name> [<format ...>]"),
+        ("visibility", "!status visibility <name> [<formula ...>]"),
         ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
         ("stack", "!status stack <name> <layered|refresh|add_level|extend|replace|none>"),
         ("maxlevel", "!status maxlevel <name> <n>"),
@@ -25142,7 +25239,8 @@ _STACK_MODES = ("layered", "refresh", "add_level", "extend", "replace",
 # The `!status` subcommands that edit definitions, which `!system status`
 # runs on a system's library too: sub -> the words it needs.
 _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
-                    "hook": 3, "display": 2, "when": 3, "sprite": 3,
+                    "hook": 3, "display": 2, "visibility": 2,
+                    "when": 3, "sprite": 3,
                     "stack": 3, "maxlevel": 3, "data": 4, "tags": 2,
                     "removes": 2, "blockedby": 2,
                     **{f: 2 for f in ACTION_RESTRICTION_FIELDS},
@@ -25159,6 +25257,7 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
 # definition holding the entry, so it validates the same way).
 _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "display": "display", "sprite": "sprite",
+                     STATUS_VISIBILITY_FIELD: "visibility",
                      GRANTS_UNIT_TAGS: GRANTS_UNIT_TAGS,
                      STATUS_UNIT_TAG_BLOCK: STATUS_UNIT_TAG_BLOCK,
                      "resist_affects": "resist_affects",
@@ -25178,15 +25277,23 @@ _STATUS_LEVEL_USAGE = ("!status level <name> list | "
 
 
 def _status_level_formulas(sdef: Any) -> List[Tuple[str, str, str]]:
-    """(where, formula, mode) of every formula a status definition's level
-    entries hold (#259): ticks and `_unless` expressions."""
+    """(where, formula, mode) of the visibility condition of a status
+    definition and of every formula its level entries hold (#259): ticks,
+    visibility conditions and `_unless` expressions."""
     out: List[Tuple[str, str, str]] = []
+    vis = sdef.get(STATUS_VISIBILITY_FIELD) if isinstance(sdef, dict) else None
+    if isinstance(vis, str) and vis.strip():
+        out.append((STATUS_VISIBILITY_FIELD, vis, "eval"))
     levels = sdef.get(STATUS_LEVELS_FIELD) if isinstance(sdef, dict) else None
     for spec, ent in sorted((levels or {}).items()):
         if not isinstance(ent, dict):
             continue
         if isinstance(ent.get("tick"), str) and ent["tick"].strip():
             out.append((f"level `{spec}` tick", ent["tick"], "exec"))
+        src = ent.get(STATUS_VISIBILITY_FIELD)
+        if isinstance(src, str) and src.strip():
+            out.append((f"level `{spec}` {STATUS_VISIBILITY_FIELD}", src,
+                        "eval"))
         for fld in ACTION_RESTRICTION_FIELDS:
             src = ent.get(fld + UNLESS_SUFFIX)
             if isinstance(src, str) and src.strip():
@@ -25763,12 +25870,34 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                 f"{sub[:-len(UNLESS_SUFFIX)]} while true)."
                 + (f"\n{warn}" if warn else ""))
 
+    if sub == "visibility":
+        # The expression deciding which team views see the status
+        # (replacing status_visibility_condition for it); none clears it.
+        if await return_help_if_not_enough_args(ctx, args, 2, "status",
+                                                 "visibility"):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        body = normalize_body_source(" ".join(args[2:]).strip())
+        if not body:
+            if m.status_definitions[name].pop(STATUS_VISIBILITY_FIELD,
+                                              None) is None:
+                return (f"❌ `{name}` has no visibility condition.")
+            return (f"Cleared `{name}`'s visibility condition (it follows "
+                    f"status_visibility_condition).")
+        warn = check(body, STATUS_VISIBILITY_FIELD, "eval")
+        m.status_definitions[name][STATUS_VISIBILITY_FIELD] = body
+        return (f"`{name}` shows to a team view while `{body}` is true "
+                f"(self = the bearer, status_name, pov_team bound)."
+                + (f"\n{warn}" if warn else ""))
+
     return None
 
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|tick_priority|data|tags|"
+    usage=("!status <def|drop|rename|copy|tick|hook|display|visibility|when|stack|maxlevel|tick_priority|data|tags|"
            "removes|blockedby|forbids_actions_with_tag|forbids_actions_with_name|"
            "immune_to_actions_with_tag|immune_to_actions_with_name|"
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
@@ -25809,6 +25938,11 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         "`display <name> <format>` sets how the status shows in the "
         "`{statuses}` roster placeholder (its fields are placeholders, as in "
         "the status_line_format rule); no format clears it. "
+        "`visibility <name> <formula>` decides which team views see the "
+        "status (in the unit lines, the description, `!find status:` and "
+        "image overlays; self = the bearer, status_name and pov_team "
+        "bound), replacing the status_visibility_condition rule for it; no "
+        "formula clears it. "
         "`forbids_actions_with_tag|forbids_actions_with_name <name> <words>` "
         "forbid the bearer actions with those tags / names, "
         "`immune_to_actions_with_tag|immune_to_actions_with_name` keep "
@@ -27218,6 +27352,9 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any],
     `only` (a `!simulate` run, X16): the matches the run reached; the rest
     are left as they are unless deleted or replaced (comparing a big match
     nobody touched cost a serialization per run)."""
+    # A reaction window the undone lines opened isn't posted (R5).
+    if getattr(mgr, "_window_posts", None):
+        mgr._window_posts = []
     from action import _rollback_match
     pre = snap["matches"]
     for mid in [mid for mid in mgr.matches if mid not in pre]:
@@ -27442,7 +27579,7 @@ class _SimCtx:
         for k in ("prompt_choice", "offer_resume", "offer_confirm",
                   "post_scene_image",
                   "show_scene_view", "set_autoupdate", "set_roster_autoupdate",
-                  "retire_server_boards"):
+                  "retire_server_boards", "post_to_channel"):
             object.__setattr__(self, k, None)
 
     def __getattr__(self, name: str) -> Any:

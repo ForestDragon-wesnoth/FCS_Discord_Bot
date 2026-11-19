@@ -449,7 +449,8 @@ back, load the schema with `ToolSearch` before calling
   the fallback: `supports_color`, `viewport_capable`, `message_limit`,
   `auto_approve`, `post_scene_image`, `show_scene_view`, `set_autoupdate`,
   `set_roster_autoupdate`, `offer_resume`, `offer_confirm`, `prompt_choice`,
-  `retire_server_boards`. The Discord adapter also routes `!<alias>`
+  `retire_server_boards`, `post_to_channel` (a post to another channel of
+  the server: a reaction window, §7.23). The Discord adapter also routes `!<alias>`
   through `on_command_error`, never pings (`AllowedMentions.none()`),
   splits long replies fence-aware (`vtt_commands.split_message`, at
   `MESSAGE_LIMIT`), and retires a board whose channel was unbound. A button click is answered first
@@ -2003,9 +2004,24 @@ hardcodes**.
   (`prefab._check_status_definition`).
 - **Display:** status sprite overlays (§7.13); the `{statuses}` roster
   placeholder (`vtt_commands._statuses_text`, in the default
-  entity_info_format): each status through its definition's `display`
-  format (`!status display`) else the `status_line_format` rule, its
-  instance fields as placeholders (885).
+  entity_line_format after a ` | ` and in entity_info_format): each status
+  through its definition's `display` format (`!status display`) else the
+  `status_line_format` rule (`burn ×2 (3 turns)`), its instance fields as
+  placeholders plus `{turns_word}` (885, 1246).
+- **Visibility** (user request, 1246): which team views see a status is
+  its own `visibility_condition` (`logic.STATUS_VISIBILITY_FIELD`,
+  `status_field`: instance key, definition, level entries; `!status
+  visibility <name> [formula]`) else the `status_visibility_condition`
+  rule (expression; self = the bearer, status_name, pov_team; corpse_id /
+  corpse_team on a corpse; empty = shown, a failing formula shows it).
+  `Match.status_visible_to` / `visible_statuses`, applied in
+  `presented_statuses` (a disguise's decoys are shown as they are), so the
+  placeholders, the description, `!find status:`, `!simulate`'s report
+  and the image overlays (`entity_overlays`) follow it; corpse lines,
+  descriptions and `!find dead status:` use the command's view
+  (`command_pov`). Formulas see every status. Lint, promote and the
+  formula-text hiding read the conditions (`_status_level_formulas`,
+  `_FORMULA_FIELD_KEYS`).
 
 ### 7.5 Modifiers (derived stats)
 
@@ -2121,7 +2137,13 @@ hardcodes**.
   on / labelled), `action_dice_line_format` and `action_dice_roll_format`,
   surfaced tagged as about the actor (`unit_tag`), so a view that can't
   see it drops it; each reaction half is its own run_action, so its line
-  is about the reacting unit (user call).
+  is about the reacting unit (user call). Each roll also notes the unit
+  whose formula made it (its `self`, bound when the namespace is built,
+  V27, user call, 1247); a roll by another unit than the actor (a hook on
+  a target) is a `logic.DICE_ROLL_RE` marker in the line, and the reply
+  filter keeps the rolls of units (or corpses) the channel's view sees
+  (`join_dice_rolls`, `_dice_roll_shown`), dropping a line left with none.
+  The actor's own rolls stay, one per target its body hit.
 - **Rider actions:** a rider gets its slot's actions plus the vehicle's
   actions whose `allowed_slots` list its slot; `mount_action_actor` decides
   who is `source`; `vehicle` / `rider` / `slot` are always bound.
@@ -3166,7 +3188,14 @@ hardcodes**.
   words). A HOST's command still reaches a hidden unit (user call: a host
   may reveal on purpose; `!ent dump` / `diff` show everything); with the
   `host_reveal_warning` rule on (default off) it ends with a ⚠️ naming the
-  hidden units it named (`_HOST_REVEALS`). A glued part shows while the
+  hidden units it named (`_HOST_REVEALS`). The reads that answer a hidden
+  unit like a missing one (`_query_eid`, `_query_unit_or_corpse`: `!action`,
+  `!ent info`, ...) refuse it to a host too, unless
+  `pov_host_names_hidden` (rule, default off; a match var of that name, a
+  bool, overrides it, `_host_names_hidden`; W16, user call, 1248) lets a
+  host play a hidden unit from the players' channel; the replies still
+  pass through the channel's view (the action-used line names it
+  `someone`). A glued part shows while the
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`); a host's in a channel with a team view
@@ -3488,8 +3517,8 @@ hardcodes**.
   (`logic.COMMAND_USER`, set in `_run_top`); `command_attribution` (words
   history / log / diff) picks where it shows. `!log [n] type= who= round=
   by=` filters (n ≥ 1; an unknown type is refused) (771, 822).
-- **Roster text:** `entity_line_format`, `entity_info_format` (`{statuses}`,
-  §7.4),
+- **Roster text:** `entity_line_format` (ends with `{statuses}` by
+  default), `entity_info_format` (`{statuses}`, §7.4),
   `corpse_line_format`, `body_part_entity_line_suffix`,
   `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`
   templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.
@@ -4543,6 +4572,21 @@ lists what isn't built; 1093-1122).
   poll that fired, never for a read or inside an action body; 1170).
   Expiry (`settle_expiry`, at the start of the next command on the match
   but `!as`) journals the command as state; `!as wait` ages windows.
+  Posting (R5, user call: option b, 1249): when a window opens
+  (`_announce`), `_note_team_posts` records on the manager
+  (`mgr._window_posts`, runtime) the window's listing for every channel
+  bound with the team view of a unit still to answer, other than the
+  channel it opened in; the outermost command posts them at its end
+  (`_post_window_elsewhere`), each filtered by its channel's view
+  (`_ChannelCtx`), through the surface's `post_to_channel` (Discord: the
+  guild's channel, failures one console line; the CLI, GUI and harness
+  print `📨 to <channel>`; replays and `!simulate` have none). A rollback
+  (`_restore_all_matches`: `!dry`, `!batch strict`) drops the posts. A
+  player's `!react` still needs approval unless an access override opens
+  it. The exchange records its author (`ex["by"]`), and its body runs
+  under it (`COMMAND_USER`), so the action's log entries name who started
+  it whoever's answer closed the window (L57, 1249). `!as channel <key>`
+  (CLI / harness) types into another channel.
 - **Resolution** (`_advance`, phases before -> before_run -> body ->
   after_open -> after -> after_run -> done, so a paused step resumes
   where it stopped; `_drive` runs the stack, then the queue): picks

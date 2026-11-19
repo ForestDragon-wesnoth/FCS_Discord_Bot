@@ -543,10 +543,14 @@ DICE_LOG: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
     "DICE_LOG", default=None)
 
 
-def _note_roll(label: Any, spec: Any, total: Any) -> None:
+def _note_roll(label: Any, spec: Any, total: Any,
+               owner: Optional[str] = None) -> None:
+    """Note a roll for the action dice line (#520): its label, spec, total
+    and the unit whose formula made it (`self`, V27), so a view that can't
+    see that unit doesn't read the roll."""
     log = DICE_LOG.get()
     if log is not None:
-        log.append((label, spec, total))
+        log.append((label, spec, total, owner))
 
 
 def _dice_test(op: str, n: int):
@@ -830,7 +834,8 @@ def _parse_dice(spec: Any, where: str) -> list:
     return out
 
 
-def _roll_impl(rng, spec: Any, label: Any = None) -> int:
+def _roll_impl(rng, spec: Any, label: Any = None,
+               owner: Optional[str] = None) -> int:
     """roll("2d6+3", label=None): evaluate dice notation and return the
     integer total. Thin wrapper over roll_detail (which also returns the
     per-term breakdown); the label names the roll on an action's dice
@@ -838,7 +843,7 @@ def _roll_impl(rng, spec: Any, label: Any = None) -> int:
     if label is not None and not isinstance(label, str):
         raise FormulaError("roll(spec, label=None): label must be text.")
     total = roll_detail(rng, spec)[0]
-    _note_roll(label, spec, total)
+    _note_roll(label, spec, total, owner)
     return total
 
 
@@ -1404,7 +1409,7 @@ def _roll(spec: Any, label: Any = None) -> int:
 
 
 def _roll_dice_impl(rng, spec: Any, all: Any = False,
-                    label: Any = None) -> list:
+                    label: Any = None, owner: Optional[str] = None) -> list:
     if not isinstance(all, bool):
         raise FormulaError("roll_dice(spec, all=False): all= must be True or "
                            "False.")
@@ -1417,7 +1422,7 @@ def _roll_dice_impl(rng, spec: Any, all: Any = False,
     except FormulaError as ex:
         raise FormulaError(str(ex).replace("roll(spec)", "roll_dice(spec)",
                                            1))
-    _note_roll(label, spec, total)
+    _note_roll(label, spec, total, owner)
     return out
 
 
@@ -5759,6 +5764,9 @@ class FormulaEngine:
         # Closures over `rng` (no `_r=rng` default): an extra positional
         # argument used to land on the RNG parameter (a raw Python error).
         rng = self._match.formula_rng() if self._match else random
+        # Whose roll it is on an action's dice line (V27): this formula's
+        # `self`.
+        owner = ctx.target if isinstance(ctx.target, str) else None
         if rng is not random:
             def random_int(lo, hi):
                 return _random_int_impl(rng, lo, hi)
@@ -5773,14 +5781,14 @@ class FormulaEngine:
                 return _shuffle_impl(rng, v)
 
             def roll(spec, label=None):
-                return _roll_impl(rng, spec, label)
+                return _roll_impl(rng, spec, label, owner)
 
             def chance(percent):
                 return _chance_impl(rng, percent)
 
             def roll_dice(spec, all=False, label=None):
-                return _charge(_roll_dice_impl(rng, spec, all, label),
-                               "roll_dice")
+                return _charge(_roll_dice_impl(rng, spec, all, label,
+                                               owner), "roll_dice")
             for fn in (random_int, random_string, pick, shuffle, roll,
                        chance, roll_dice):
                 fn.__wrapped__ = _ALLOWED_FUNCS[fn.__name__]

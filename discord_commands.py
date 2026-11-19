@@ -314,6 +314,35 @@ class DiscordCtxWrapper:
                           "storage limit is reached (`!server storage`).")
         return discord.File(io.BytesIO(data), filename=name), ""
 
+    async def post_to_channel(self, channel_key: str, text: str):
+        """Post `text` to another channel of this server (R5: a reaction
+        window shown to the channels bound to a team that may react). A
+        channel the bot can't find or post in is skipped with one console
+        line, as a reply is (D11)."""
+        try:
+            gid, cid = str(channel_key).split(":", 1)
+            channel = (self._guild.get_channel(int(cid))
+                       if self._guild is not None
+                       and str(getattr(self._guild, "id", "")) == gid
+                       else None)
+        except (ValueError, AttributeError):
+            channel = None
+        if channel is None:
+            return None
+        for chunk in split_message(text):
+            if not chunk.strip():
+                continue
+            try:
+                await channel.send(chunk)
+            except discord.HTTPException as ex:
+                key = (channel_key, type(ex).__name__,
+                       getattr(ex, "code", None))
+                if key not in _UNPOSTABLE_NOTED:
+                    _UNPOSTABLE_NOTED.add(key)
+                    print(f"[discord] channel {channel_key}: a reaction "
+                          f"window couldn't be posted there ({ex}).")
+                return None
+
     async def _post(self, *args, **kwargs):
         """Post one message (D11). A channel where the bot can't post
         (Missing Permissions) or a post Discord refuses is no crash: the

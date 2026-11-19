@@ -400,6 +400,9 @@ def settle_status_layers(inst: Any, cap: Callable[[Any], Any]) -> None:
 
 
 STATUS_LEVELS_FIELD = "levels"
+# A status's own visibility condition (an expression replacing the
+# status_visibility_condition rule for it; status_field reads it).
+STATUS_VISIBILITY_FIELD = "visibility_condition"
 STATUS_LEVEL_EXCLUDED = ("stack", "max_level", "tags", "removes",
                          "blocked_by", "hooks", "data", STATUS_LEVELS_FIELD,
                          "level")
@@ -600,6 +603,12 @@ UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\
 SAY_NAME_RE = re.compile("\u2063#([^|\u2063]*)\\|([^|\u2063]*)\\|([^\u2063]*)\u2063")
 SAY_TEAM_RE = re.compile("\u2063@([^\u2063]*)\u2063")
 SAY_OPEN_MARK = "\u2063!\u2063"
+# One roll of an action's dice line made by a unit's formula (V27):
+#   UNIT_LINE_TAG "%<match>|<unit>|<text>" UNIT_LINE_TAG
+# The reply filter keeps the rolls of the units the channel's view sees,
+# joined with ` · `, and drops a line left with none.
+DICE_ROLL_RE = re.compile("\u2063%([^|\u2063]*)\\|([^|\u2063]*)\\|([^\u2063]*)\u2063")
+DICE_ROLL_SEP = " · "
 # How many say(private=True) lines a match keeps waiting for a host (the
 # oldest go first).
 HELD_SAY_MAX = 200
@@ -624,7 +633,23 @@ def say_plain_text(text: str) -> str:
     when the line was made (the event log's text)."""
     text = SAY_NAME_RE.sub(lambda mo: mo.group(3), text)
     text = SAY_TEAM_RE.sub("", text).replace(SAY_OPEN_MARK, "")
+    text = join_dice_rolls(text, lambda _m, _u: True)
     return UNIT_LINE_RE.sub("", text)
+
+
+def join_dice_rolls(line: str, shown: Any) -> Optional[str]:
+    """`line` with its marked dice rolls (DICE_ROLL_RE) replaced by the
+    texts of those `shown(match_id, unit)` keeps, joined with
+    DICE_ROLL_SEP; None when it had rolls and keeps none."""
+    found = list(DICE_ROLL_RE.finditer(line))
+    if not found:
+        return line
+    kept = [mo.group(3) for mo in found
+            if not mo.group(2) or shown(mo.group(1), mo.group(2))]
+    if not kept:
+        return None
+    return (line[:found[0].start()] + DICE_ROLL_SEP.join(kept)
+            + line[found[-1].end():])
 
 
 # While the engine runs something on behalf of one unit outside a command
@@ -3124,10 +3149,14 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # is present and truthy. Dotted paths supported. Scenarios 4-6
     # cover the templating behavior.
     "entity_line_format": {
-        "default": "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
+        "default": ("{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing "
+                    "{facing}{?statuses?} | {statuses}{/?}"),
         "schema": {"type": "str"},
         "desc": (
             "Single-line template for an entity row (used in !list, !state). "
+            "The default ends with the unit's statuses as the channel's view "
+            "sees them ({statuses}: status_line_format per status, "
+            "status_visibility_condition deciding which show). "
             "Placeholders: {key} substitutes a value; {?key?}...{/?} renders inner "
             "only if the key is present and truthy. Dotted paths supported: "
             "{inventory.sword.damage}. Built-in keys: id, name, x, y, facing, team, "
@@ -3156,15 +3185,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "status_line_format": {
-        "default": ("{name}{?level?} ×{level}{/?}{?duration?} ({duration})"
-                    "{/?}{?layers?}: {layers}{/?}"),
+        "default": ("{name}{?level?} ×{level}{/?}{?duration?} ({duration} "
+                    "{turns_word}){/?}{?layers?}: {layers}{/?}"),
         "schema": {"type": "str"},
         "desc": (
             "How one status shows in the `{statuses}` placeholder of "
             "entity_line_format / entity_info_format / corpse_line_format "
             "(statuses joined with `, `, by name). Placeholders: {name}, and "
             "every field of the status instance ({level}, {duration}, any "
-            "custom field such as {lost_max_hp}); {layers} for a status "
+            "custom field such as {lost_max_hp}); {turns_word} (`turn` for "
+            "a duration of 1, else `turns`); {layers} for a status "
             "holding layers of several levels (layered stacking: `×3 for 2, "
             "then ×1 for 3 more`); {?key?}...{/?} shows a part "
             "only when the field is set. A status definition's own `display` "
@@ -4036,6 +4066,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "access` instead). Omniscient channels are unaffected either way."
         ),
     },
+    "pov_host_names_hidden": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a host's command in a channel with a team POV (one "
+            "players read) may name units that view hides: `!action`, "
+            "`!ent info` and the other reads that answer a hidden unit like "
+            "a missing one take it, so a GM can play an invisible enemy's "
+            "turn from the players' channel. The replies still pass "
+            "through the channel's view: lines about a unit it hides are "
+            "dropped and a name in the action-used line reads as "
+            "say_hidden_unit_name. A match var of the same name (true / "
+            "false, `!match var set pov_host_names_hidden true`) overrides "
+            "the rule for that match. Off (default) = a host's reads refuse "
+            "a hidden unit there as a player's do (`!list full`, `!map "
+            "full` and an unbound channel show everything)."
+        ),
+    },
     "host_reveal_warning": {
         "default": False,
         "schema": {"type": "bool"},
@@ -4104,6 +4152,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Malformed formula = treated as visible. Example: "
             "\"is_part_of_team(self, pov_team) or not status_has(self, "
             "'hidden')\"."
+        ),
+    },
+    "status_visibility_condition": {
+        "default": "",
+        "schema": {"type": "str", "formula": "expression"},
+        "desc": (
+            "Formula expression deciding whether a team POV (a player "
+            "channel) sees a status on a unit or corpse. Truthy = shown, "
+            "falsy = left out. Bindings: self = the bearer (None for a "
+            "corpse, which binds corpse_id and corpse_team), status_name, "
+            "pov_team. A "
+            "status's own `visibility_condition` (`!status visibility "
+            "<name> <formula>`; instance key, definition, level entries) "
+            "replaces this rule for it. Empty (default) = every status "
+            "shows. Omniscient views bypass it; a malformed formula shows "
+            "the status. Applies to the reads players make: {statuses} / "
+            "{status_csv} in the unit, card and corpse lines, the "
+            "description's statuses, `!find status:` and the status "
+            "overlays of images; formulas see every status. Example: "
+            "\"is_part_of_team(self, pov_team) or status_name != "
+            "'cursed'\"."
         ),
     },
     # Fake-statblock / disguise (116): the entity var holding a display-only,
@@ -19508,7 +19577,8 @@ class Match:
 
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,
-                            extras: Optional[Dict[str, Any]] = None) -> bool:
+                            extras: Optional[Dict[str, Any]] = None,
+                            cond: Optional[str] = None) -> bool:
         """Shared evaluator behind the *_visibility_condition rules
         (entity / tile / zone / corpse). An omniscient viewer (pov_team
         is None) sees everything; an empty rule means visible; a
@@ -19519,7 +19589,9 @@ class Match:
         one; tiles/zones/corpses pass None)."""
         if pov_team is None:
             return True
-        cond = str(self.rules.get(rule_key, "")).strip()
+        # `cond` replaces the rule (a status's own visibility_condition).
+        cond = (cond if cond is not None
+                else str(self.rules.get(rule_key, ""))).strip()
         if not cond:
             return True
         ex = dict(extras or {})
@@ -29924,15 +29996,61 @@ class Match:
                     out.pop(total_v, None)
         return out
 
+    def status_visible_to(self, name: str, inst: Any,
+                          pov_team: Optional[str], *,
+                          eid: Optional[str] = None,
+                          corpse_id: Optional[str] = None) -> bool:
+        """Whether team `pov_team` sees status `name` (instance `inst`) on
+        unit `eid` (self) or on corpse `corpse_id`: the status's own
+        visibility_condition (status_field: instance, definition, level
+        entries) else the status_visibility_condition rule. Omniscient
+        (None) sees all; empty = shown; a formula that fails shows it."""
+        if pov_team is None:
+            return True
+        own = self.status_field(inst, name, STATUS_VISIBILITY_FIELD)
+        cond = own if isinstance(own, str) and own.strip() else None
+        if cond is None and not str(self.rules.get(
+                "status_visibility_condition", "")).strip():
+            return True
+        ex: Dict[str, Any] = {"status_name": name}
+        if corpse_id is not None:
+            ex["corpse_id"] = corpse_id
+            loc = self.find_corpse(corpse_id)
+            ent = loc[2].get("entity") if loc is not None \
+                and isinstance(loc[2], dict) else None
+            cv = ent.get("vars") if isinstance(ent, dict) else None
+            ex["corpse_team"] = team_text(cv.get(str(self.rules.get(
+                "team_var", "team")))) if isinstance(cv, dict) else None
+        return self._visibility_visible("status_visibility_condition",
+                                        pov_team, target=eid, extras=ex,
+                                        cond=cond)
+
+    def visible_statuses(self, status: Any, pov_team: Optional[str],
+                         eid: Optional[str] = None,
+                         corpse_id: Optional[str] = None) -> Dict[str, Any]:
+        """`status` (name -> instance) without the statuses pov_team
+        doesn't see (status_visible_to); the same dict when none hides."""
+        if not isinstance(status, dict):
+            return {}
+        if pov_team is None or not status:
+            return status
+        hidden = [n for n, inst in status.items()
+                  if not self.status_visible_to(str(n), inst, pov_team,
+                                                eid=eid, corpse_id=corpse_id)]
+        if not hidden:
+            return status
+        return {k: v for k, v in status.items() if k not in hidden}
+
     def presented_statuses(self, e: "Entity",
                            pov_team: Optional[str] = None) -> Dict[str, Any]:
         """The statuses `e` presents to `pov_team`: the real ones, or under a
         disguise its `status` dict (name -> instance data), none when it has
         no such key (the image hides status overlays under a disguise too).
-        Read-only."""
+        A real status status_visibility_condition hides from pov_team is
+        left out (a disguise's decoys are what it shows). Read-only."""
         dis = self._effective_disguise(e, pov_team)
         if dis is None:
-            return e.status
+            return self.visible_statuses(e.status, pov_team, e.id)
         st = dis.get("status")
         return {str(k): v for k, v in st.items()} \
             if isinstance(st, dict) else {}
@@ -30254,7 +30372,7 @@ class Match:
             return []
         out: List[Dict[str, Any]] = []
         default_layer = self._layer_rule("sprite_layer_overlay", 150)
-        statuses = e.status if isinstance(e.status, dict) else {}
+        statuses = self.visible_statuses(e.status, pov_team, e.id)
         for sname in sorted(statuses):
             inst = statuses.get(sname)
             inst = inst if isinstance(inst, dict) else {}
@@ -31862,14 +31980,31 @@ class Match:
         one = str(self.rules.get("action_dice_roll_format",
                                  "{label} {spec} → {total}"))
         shown = []
-        for label, spec, total in rolls:
-            shown.append(one.replace("{label}", str(label or ""))
-                         .replace("{spec}", str(spec))
-                         .replace("{total}", str(total)).strip())
+        marked = False
+        for r in rolls:
+            label, spec, total = r[0], r[1], r[2]
+            owner = r[3] if len(r) > 3 else None
+            text = (one.replace("{label}", str(label or ""))
+                    .replace("{spec}", str(spec))
+                    .replace("{total}", str(total)).strip())
+            text = text.replace(UNIT_LINE_TAG, "")
+            # A roll another unit's formula made (a hook on a target, V27)
+            # is marked with that unit, so a view that can't see it drops
+            # the roll; the actor's own rolls follow the line's own tag.
+            if owner and owner != actor_id:
+                marked = True
+            shown.append((owner if owner and owner != actor_id else "",
+                          text))
         fmt = str(self.rules.get("action_dice_line_format", "🎲 {rolls}"))
         if not fmt.strip():
             return ""
-        return (fmt.replace("{rolls}", " · ".join(shown))
+        if marked:
+            rolls_text = "".join(
+                f"{UNIT_LINE_TAG}%{self.id}|{o}|{t}"
+                f"{UNIT_LINE_TAG}" for o, t in shown)
+        else:
+            rolls_text = DICE_ROLL_SEP.join(t for _o, t in shown)
+        return (fmt.replace("{rolls}", rolls_text)
                 .replace("{actor_name}", self.say_name(actor_id))
                 .replace("{actor}", actor_id)
                 .replace("{action}", action_name))
