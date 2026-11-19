@@ -810,13 +810,56 @@ file-touching command, use `saves_path` AND list it in `_admin_required`.
 **Allowed AST nodes** (`_ALLOWED_NODES`): Module, Expression, Expr, Assign,
 If, Pass, For, Tuple, BinOp, UnaryOp, BoolOp, IfExp, Compare, Call, keyword,
 Attribute, Dict, List, Name, Constant, Load, Store, arithmetic and comparison
-operators (incl. In/NotIn), And, Or; Break / Continue only inside a `for`
+operators (incl. In/NotIn), And, Or, NamedExpr; Break / Continue only inside a `for`
 body; Lambda only as the function argument of `map_with` / `filter_with` /
 `sort_by` (`_HOF_FUNCS`: one plain parameter, an expression body validated
-like any formula, never assignable or storable). **Banned:** Subscript
-(except `entity[X]`), Lambda anywhere else, While, comprehensions, Import,
-Try, With, class/function defs, AugAssign, chained/tuple Assign. A Call's
-function must be a bare Name.
+like any formula, never assignable or storable). **Banned:** Lambda
+anywhere else, While, comprehensions, Import, Try, With, class/function
+defs, chained Assign (`a = b = 1`), assigning a subscript, slices. A
+Call's function must be a bare Name.
+
+**Sugar** (bundle A, user design; `formula._SugarTransformer`, run at the
+end of `_refuse_engine_names`, so every parse path and every check sees
+the core forms; the engine's helper names are `_ENGINE_HELPER_NAMES`):
+- `T op= V` (#349) becomes `T = T op V` for every assignable target (a
+  local, `entity[x].path`, `match.path`, an action binding's attribute);
+  an `entity[...]` index that isn't a name or a constant is bound once
+  to the engine temp `__aug` (`:=`), so `entity[pick(u)].hp -= 5` hits
+  one unit. A var the unit lacks is refused, as any read is (user call).
+- `x[i]` / `d['key']` (#351) becomes `__index(x, i)`: a list index
+  (negative from the end), a dict key, a character, a `Coord`'s x / y; a
+  miss is refused naming it (user call; `get(x, k, default)` is the soft
+  read); a slice or an assigned subscript is refused.
+- f"..." (#352) becomes `__fstr(...)` with `__fval(value, spec)` per
+  field: the spec is fmt()'s `_FMT_SPEC` (alignment, sign, width up to 3
+  digits, precision up to 2, a type; user call: number and alignment
+  only), checked at compile; `!r` / `!a` / `=` and a computed spec are
+  refused; the text is held to formula_size_limit.
+- `return [value]` (#324) becomes `__return(value)`, which raises
+  `_ReturnSignal` (a BaseException) to where the program runs:
+  `eval_program` (its result; the trailing expression is skipped,
+  `locals_out` still filled) and a `!func` call (its value). In action
+  mode (actions, reaction halves, damage steps) a bare `return` ends it
+  as a success, `return <value>` too with a ⚠️ that the value isn't used
+  (`FormulaEngine._returned`), and `return fail` is rewritten to
+  `fail()` (user call: the return-shaped fail, rolled back). In an
+  expression `return` can't parse; the refusal says it belongs in a
+  program (`_RETURN_IN_EXPRESSION`, also for `$()` and a watcher
+  condition).
+- Unpacking (#350): `a, b = value` binds plain locals in a program
+  (the entity transformer refuses any other unpacking target).
+- `name := value` (#431, user call: expressions and programs): a local
+  in a program; in an expression (a condition, `$()`) a name for that
+  evaluation only, collected like a local (`_collect_action_locals`, for
+  expressions too in `_prepare`), so it can't take a function's or a
+  binding's name and a `$()` stays read-only.
+- Type tests `is_number` (True isn't one), `is_text`, `is_list`,
+  `is_dict` (#353, pure).
+- **Line numbers** (#354): a runtime error of a multi-line program or
+  `!func` body ends with "(line n: <the line, quoted>)" ("(in <f>,
+  line n: ...)" for a function), the deepest line of that body in the traceback
+  (`_line_note`, `_noted`: added once, so the innermost body's line
+  wins); only `(line n)` while formula text is hidden from the caller.
 
 **One namespace dict.** A formula runs with its namespace as globals AND
 locals (`exec(code, ns)`, `ns["__builtins__"] = {}`), so a lambda body
