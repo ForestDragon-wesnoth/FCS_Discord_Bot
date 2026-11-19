@@ -619,6 +619,40 @@ def move_hook_level(rules: Dict[str, Any], log: List[str],
             MOVE_HOOK_FIRED.reset(fired_token)
 
 
+# The unit-side zone and tile hooks (#386): the zone / tile hook whose
+# firing fires them on the unit (after it), zone boundaries once per body
+# crossing, tiles per cell.
+UNIT_ZONE_HOOKS = {"on_enter": "on_zone_entered", "on_exit": "on_zone_exited",
+                   "on_stop": "on_zone_stopped"}
+UNIT_TILE_HOOKS = {"on_enter": "on_tile_entered", "on_exit": "on_tile_exited",
+                   "on_stop": "on_tile_stopped"}
+# How the unit whose movement hooks fire now got there (#390): walk, tp,
+# push, pull, swap, carried, zone or map, bound as `move_kind` in
+# on_entity_moved, on_entity_step, the tile and zone enter / exit / stop
+# hooks and the unit-side on_zone_* / on_tile_* hooks (#386). Set by each
+# moving verb for its own extent, so a push set off by a walk's hook
+# reads `push`.
+MOVE_KIND: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "vtt_move_kind", default=None)
+
+
+def _move_kind(kind: str):
+    """Decorator for a moving verb: MOVE_KIND = `kind` (or the call's
+    `move_kind=` keyword) while it runs."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *a, move_kind: Optional[str] = None, **k):
+            tok = MOVE_KIND.set(move_kind or kind)
+            try:
+                return fn(self, *a, **k)
+            finally:
+                MOVE_KIND.reset(tok)
+        return wrapper
+    return deco
+
+
 def _bounded_move_hooks(fn):
     """Decorator for the Match methods that fire movement hooks: past
     move_hook_recursion_limit nested levels they fire nothing (one ⚠️ per
@@ -7829,6 +7863,25 @@ HOOK_NAMES: Set[str] = {
     # equivalent of on_var_changed). For applied/removed lifecycle,
     # use on_status_added / on_status_removed — they cover the
     # whole-status appear/disappear distinction.
+    # Unit-side zone and tile hooks (#386), fired on the moving unit after
+    # the zone's / tile's own hook: on_zone_entered / exited / stopped once
+    # per body crossing (also when a moving zone passes over it), with
+    # zone_name, zone_map, tile_x / tile_y (the cell); on_tile_entered /
+    # exited / stopped per cell of the body, with tile_x / tile_y and
+    # tile_map. move_kind (#390) is bound in both.
+    "on_zone_entered", "on_zone_exited", "on_zone_stopped",
+    "on_tile_entered", "on_tile_exited", "on_tile_stopped",
+    # A unit's kill (#387), fired on the killer (own, team and global
+    # passives) after its victim's death has run: `victim` and `killer`
+    # bound. The killer is the dealer of the lethal damage packet, or the
+    # acting unit of an action whose programs kill(); none for a host's
+    # `!ent kill`, a killer gone by then or one that killed itself. A
+    # destroyed body part is no kill (on_part_destroyed).
+    "on_kill",
+    # A body part destroyed (#388), fired on its body's root (not when the
+    # whole creature dies): `destroyed_part`, `part_parent` (the part it
+    # hung from) and `killer` bound.
+    "on_part_destroyed",
     "on_status_added",
     "on_status_removed",
     "on_status_changed",
@@ -10737,6 +10790,7 @@ class Entity:
         return log
 
     # Teleport (absolute move)
+    @_move_kind("tp")
     def tp(self, x: int, y: int, *, fire_hooks: bool = True,
            map_name: Optional[str] = None) -> List[str]:
         """Teleport this entity to (x, y) (of map `map_name`, None = its
@@ -10762,7 +10816,8 @@ class Entity:
         # passenger. The vehicle carries everyone via _restamp_riders_for.
         mover = self._mount_move_redirect()
         if mover is not self:
-            return mover.tp(x, y, fire_hooks=fire_hooks, map_name=map_name)
+            return mover.tp(x, y, fire_hooks=fire_hooks, map_name=map_name,
+                            move_kind=MOVE_KIND.get())
         if map_name is not None and map_name != self.map:
             return m.move_to_map(self, x, y, map_name, fire_hooks=fire_hooks)
         # Validate the WHOLE destination footprint in one shot: every
@@ -10804,6 +10859,7 @@ class Entity:
         return log
 
     # Stepwise move (final cell must be free; rotate per step)
+    @_move_kind("walk")
     def move_dirs(self, moves: list[tuple[str, int]], *,
                   fire_hooks: bool = True,
                   block_mode: Optional[str] = "walk") -> List[str]:
@@ -10831,7 +10887,8 @@ class Entity:
         mover = self._mount_move_redirect()
         if mover is not self:
             return mover.move_dirs(moves, fire_hooks=fire_hooks,
-                                   block_mode=block_mode)
+                                   block_mode=block_mode,
+                                   move_kind=MOVE_KIND.get())
         allow_diag_move = bool(m.rules.get("allow_diagonal_movement", False))
         allow_diag_face = bool(m.rules.get("allow_diagonal_facing", False))
         mp = m.map_of(self)
@@ -14302,6 +14359,7 @@ class Match:
         return (name in mp.zones and eid in self.entities
                 and self.entities[eid].is_alive)
 
+    @_move_kind("zone")
     def _zone_step_once(self, name: str, dx: int, dy: int,
                         move_dir: Optional[str], hooks: bool,
                         face: Optional[str], log: List[str]) -> None:
@@ -17902,7 +17960,12 @@ class Match:
             return log
         ox, oy = rider.x, rider.y
         rider.move_to(*spot)
-        log.extend(self.fire_entity_moved(rider.id, ox, oy, spot[0], spot[1]))
+        tok = MOVE_KIND.set("carried")
+        try:
+            log.extend(self.fire_entity_moved(rider.id, ox, oy, spot[0],
+                                              spot[1]))
+        finally:
+            MOVE_KIND.reset(tok)
         return log
 
     _MOUNT_FATES = ("eject", "kill", "keep")
@@ -20688,6 +20751,7 @@ class Match:
             return False
         return self.cell_blocks(mover_id, x, y, mp, step)
 
+    @_move_kind("push")
     def push_entity(self, eid: str, direction: str, n: int = 1) -> Tuple[int, List[str]]:
         """Forced movement: step `eid` up to `n` cells in `direction`,
         stopping at the first blocked cell (off-grid, or — for a non-
@@ -20763,9 +20827,11 @@ class Match:
         # Delegate the actual commit to move_dirs (we've already proven
         # the path legal) so we inherit per-step hook firing for free.
         # block_mode=None: we already applied the push-mode block check.
-        log = e.move_dirs([(canon, steps)], block_mode=None)
+        log = e.move_dirs([(canon, steps)], block_mode=None,
+                          move_kind=MOVE_KIND.get())
         return steps, log
 
+    @_move_kind("pull")
     def pull_entity(self, eid: str, tx: int, ty: int, n: int = 1) -> Tuple[int, List[str]]:
         """Forced movement TOWARD a point: step `eid` up to `n` cells
         toward (tx, ty), stopping at the first blocked cell (off-grid,
@@ -20846,9 +20912,11 @@ class Match:
         if not moves:
             return 0, []
         # block_mode=None — push-mode block already applied per step above.
-        log = e.move_dirs(moves, block_mode=None)
+        log = e.move_dirs(moves, block_mode=None,
+                          move_kind=MOVE_KIND.get())
         return len(moves), log
 
+    @_move_kind("swap")
     def swap_entities(self, a: str, b: str) -> Tuple[bool, List[str]]:
         """Atomically exchange the positions of entities `a` and `b`.
         Both must exist; swapping an entity with itself (or two entities
@@ -22678,8 +22746,34 @@ class Match:
                     continue
         return None
 
-    def fire_tile_hook(self, when: str, entity_id: Optional[str], x: int, y: int,
-                       mp: Optional["Map"] = None) -> List[str]:
+    def fire_tile_hook(self, when: str, entity_id: Optional[str], x: int,
+                       y: int, mp: Optional["Map"] = None) -> List[str]:
+        """_fire_tile_hook, then for a movement hook the unit's own
+        on_tile_entered / on_tile_exited / on_tile_stopped passives (#386),
+        per cell, whether or not the tile holds a hook."""
+        log = self._fire_tile_hook(when, entity_id, x, y, mp)
+        side = UNIT_TILE_HOOKS.get(when)
+        if side and entity_id:
+            mp2 = self._map_for(mp, self.entities.get(entity_id))
+            if mp2.in_bounds(x, y):
+                log.extend(self._unit_side_hook(
+                    side, entity_id, {"tile_x": x, "tile_y": y,
+                                      "tile_map": mp2.name}))
+        return log
+
+    def _unit_side_hook(self, when: str, eid: str,
+                        extras: Dict[str, Any]) -> List[str]:
+        """The unit-side zone / tile hook `when` (#386) on unit `eid`, with
+        `extras` and move_kind bound; nothing when no passive of the unit,
+        its team or the match listens (the per-step common case)."""
+        if eid not in self.entities or not self._ordered_passives(
+                eid, lambda p: p.when == when):
+            return []
+        return self.fire_hook(when, target_ids=[eid], extras={
+            **extras, "hook_name": when, "move_kind": MOVE_KIND.get()})
+
+    def _fire_tile_hook(self, when: str, entity_id: Optional[str], x: int, y: int,
+                        mp: Optional["Map"] = None) -> List[str]:
         """Fire the tile hook at (x, y) of map `mp` (None: the bound
         entity's map, else the only map) of the given `when`.
 
@@ -22760,6 +22854,7 @@ class Match:
             "tile_y": y,
             "tile_map": mp.name,
             "hook_name": when,
+            "move_kind": MOVE_KIND.get(),
         }
         ctx = EvalCtx(
             this=self.current_entity_id(),
@@ -22818,6 +22913,25 @@ class Match:
                        entity_id: Optional[str], x: int, y: int,
                        mp: Optional["Map"] = None,
                        extra: Optional[Dict[str, Any]] = None) -> List[str]:
+        """_fire_zone_hook, then for a boundary hook (once per body
+        crossing) the unit's own on_zone_entered / on_zone_exited /
+        on_zone_stopped passives (#386), whether or not the zone holds a
+        hook."""
+        log = self._fire_zone_hook(when, name, entity_id, x, y, mp, extra)
+        side = UNIT_ZONE_HOOKS.get(when)
+        if side and entity_id:
+            mp2 = self._map_for(mp, self.entities.get(entity_id))
+            if name in mp2.zones:
+                log.extend(self._unit_side_hook(
+                    side, entity_id, {"zone_name": name, "tile_x": x,
+                                      "tile_y": y, "zone_map": mp2.name,
+                                      **(extra or {})}))
+        return log
+
+    def _fire_zone_hook(self, when: str, name: str,
+                        entity_id: Optional[str], x: int, y: int,
+                        mp: Optional["Map"] = None,
+                        extra: Optional[Dict[str, Any]] = None) -> List[str]:
         """Fire zone `name`'s hook of `when`. Bindings: self = the bound
         entity (or None -> unbound), this = current entity, zone_name =
         `name`, tile_x/tile_y = (x,y) (the crossed/stepped cell), and
@@ -22841,6 +22955,7 @@ class Match:
             "tile_y": y,
             "zone_map": mp.name,
             "hook_name": when,
+            "move_kind": MOVE_KIND.get(),
             **(extra or {}),
         }
         ctx = EvalCtx(
@@ -24939,6 +25054,7 @@ class Match:
             todo += self.vehicle_riders(u.id)
         return out
 
+    @_move_kind("map")
     def move_to_map(self, e: "Entity", x: int, y: int, map_name: str, *,
                     fire_hooks: bool = True) -> List[str]:
         """Move unit `e` to (x, y) of another map, with its whole body:
@@ -25087,6 +25203,7 @@ class Match:
             "to_x": to_x, "to_y": to_y,
             "from_map": from_map, "to_map": e.map,
             "hook_name": "on_entity_moved",
+            "move_kind": MOVE_KIND.get(),
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         if from_map != e.map:
@@ -25156,6 +25273,7 @@ class Match:
             "from_x": from_x, "from_y": from_y,
             "to_x": to_x, "to_y": to_y,
             "hook_name": "on_entity_step",
+            "move_kind": MOVE_KIND.get(),
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         with move_hook_level(self.rules, log, self.id) as fire:
@@ -26778,12 +26896,12 @@ class Match:
         # between the two (a stack overflow in the copy above) left the
         # guard up, and no unit of the match could die until a restart.
         lost_pairs: List[Tuple[str, str]] = []
+        killer = self.packet_killer(entity_id)
         self._death_processing += 1
         self._dying_ids.add(entity_id)
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id],
-                                 extras={"killer": self.packet_killer(
-                                     entity_id)})
+                                 extras={"killer": killer})
             # Re-check entity still exists — a paranoid on_death passive
             # could have already removed the entity, in which case the
             # corpse/delete step has nothing to do.
@@ -26848,6 +26966,14 @@ class Match:
                                           dead_map))
         # An aura it anchored went with it or froze (#136).
         log.extend(self.sync_zone_grants())
+        # The killer's on_kill (#387), once the death has run its course:
+        # not for a killer gone by now or one that killed itself.
+        if killer is not None and killer != entity_id \
+                and killer in self.entities \
+                and self.entities.get(entity_id) is not e:
+            log.extend(self.fire_hook(
+                "on_kill", target_ids=[killer],
+                extras={"victim": entity_id, "killer": killer}))
         return log
 
     _MSG_FMT_RE = re.compile(r"\{([\w.]+)\}")
@@ -26990,6 +27116,25 @@ class Match:
         # vehicle-death effect or hook runs after it) leaves another object
         # under the id, which isn't killed again.
         before = self.entities[eid]
+        # A kill an action's programs make (kill(), a `cmd('ent kill')`) is
+        # credited to the acting unit (#387): on_death's `killer` and the
+        # killer's on_kill, as a damage packet credits its dealer.
+        from action import ACTION_ORIGIN as _ORIGIN
+        credit_tok = None
+        held = PACKET_KILLER.get()
+        origin = _ORIGIN.get()
+        if (held is None or held[0] != self.id) and origin \
+                and origin[0] != eid and origin[0] in self.entities:
+            credit_tok = PACKET_KILLER.set((self.id, eid, origin[0]))
+        try:
+            return self._kill_entity(eid, before)
+        finally:
+            if credit_tok is not None:
+                PACKET_KILLER.reset(credit_tok)
+
+    def _kill_entity(self, eid: str, before: "Entity"
+                     ) -> Tuple[bool, List[str]]:
+        """kill_entity's two steps, run with the kill's credit set."""
         effects = str(self.rules.get("default_kill_function_effects", "")).strip()
         if effects:
             from formula import FormulaEngine, EvalCtx, FormulaError
@@ -27146,6 +27291,17 @@ class Match:
         if p.id in self.entities:
             log.extend(self.end_sourced_statuses(
                 self.statuses_sourced_by(p.id)))
+        # The body learns of it (#388): on_part_destroyed on its root,
+        # before a vital part takes the body with it. Not when the whole
+        # creature is dying (cascade).
+        if not cascade and p.id in self.entities:
+            root = self.body_root(p)
+            if root is not p and root.id in self.entities:
+                log.extend(self.fire_hook(
+                    "on_part_destroyed", target_ids=[root.id],
+                    extras={"destroyed_part": p.id,
+                            "part_parent": p.part_of,
+                            "killer": self.packet_killer(p.id)}))
         # A destroyed limb LINGERS attached (it doesn't route through
         # Entity.remove), so resolve its anchored auras here too — same
         # delete/freeze/suspend rule as any anchor loss. Idempotent if a
@@ -32118,6 +32274,7 @@ class Match:
     # Designed to play nicely with a future per-step collision system:
     # the validation walks each entity step-by-step so per-step hooks
     # could be added here later without restructuring.
+    @_move_kind("walk")
     def move_group_dirs(
         self, group_name: str, moves: List[Tuple[str, int]],
         *, fire_hooks: bool = True,

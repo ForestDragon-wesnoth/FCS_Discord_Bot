@@ -8717,20 +8717,20 @@ SCENARIO 344 — !ent kill / !ent revive: command equivalents of the formula pri
 
 !match new mck1 KillCmd 6 6
 !match use mck1
-!ent add victim Victim 20 2 2 7
-!ent kill victim
+!ent add dummy Victim 20 2 2 7
+!ent kill dummy
 !list
-!ent revive victim
-!ent dump victim
+!ent revive dummy
+!ent dump dummy
 
-Expected: `!ent kill victim` routes through the same
+Expected: `!ent kill dummy` routes through the same
 Match.kill_entity used by the kill() formula primitive: it runs
 default_kill_function_effects (hp -> 0), fires the death
-pipeline, and replies "Killed `victim`.". `!list` then shows
-victim in the Dead: section (a corpse at 2,2), gone from the
-live roster. `!ent revive victim` wraps Match.revive_corpse and
-replies "Revived corpse `victim` as `victim`."; the default
-revive effects restore hp to max, so `!ent dump victim` shows a
+pipeline, and replies "Killed `dummy`.". `!list` then shows
+dummy in the Dead: section (a corpse at 2,2), gone from the
+live roster. `!ent revive dummy` wraps Match.revive_corpse and
+replies "Revived corpse `dummy` as `dummy`."; the default
+revive effects restore hp to max, so `!ent dump dummy` shows a
 live entity back at (2,2) with hp 20/20.
 
 
@@ -46771,3 +46771,129 @@ a body part's own immunity. A status's blocked_message replaces the rule's
 line. `!status apply`'s own refusal says why, so it prints no blocked
 line (the hook still fires). A zone's grant blocked by immunity is tried at every settle, so it
 fires neither the hook nor the line (the 2x2 orc stepping into the pit).
+
+
+SCENARIO 1264 — on_kill fires on the killer: a lethal damage packet, an action's kill(), never a host's kill (#387)
+-------------------------------------------------------------------------------------------------------------------
+
+!match new ok Ok 10 10
+!match use ok
+!ent add hero Hero 30 2 2 9
+!ent set_vars hero footprint_w=2 footprint_h=2 kills=0
+!ent add orc Orc 5 5 2 3
+!ent add rat Rat 3 5 4 2
+!ent add imp Imp 3 7 4 1
+!passive add hero k1 on_kill "entity[self].kills += 1\nentity[self].last = victim"
+!gpassive add who on_death "if killer:\n    entity[killer].credit = self"
+!ent set_var hero actions.hit.target entity
+!ent set_var hero actions.hit.body "deal_damage(target, 10)"
+!ent set_var hero actions.slay.target entity
+!ent set_var hero actions.slay.body "kill(target)"
+!action hero hit orc
+!assert "entity[hero].kills == 1 and entity[hero].last == 'orc' and entity[hero].credit == 'orc'"
+!action hero slay rat
+!assert "entity[hero].kills == 2 and entity[hero].last == 'rat' and entity[hero].credit == 'rat'"
+!ent kill imp
+!assert "entity[hero].kills == 2"
+!ent set_var hero actions.doom.target none
+!ent set_var hero actions.doom.body "kill(self)"
+!action hero doom
+!assert "not exists('hero')"
+
+Expected: on_kill (#387) fires on the 2x2 hero after its victim's death:
+for the orc its lethal damage packet killed, and for the rat its action
+killed with kill() (on_death binds that `killer` too). A host's `!ent
+kill` names no killer, so the imp's death is no kill; neither is the hero
+killing itself.
+
+
+SCENARIO 1265 — on_part_destroyed fires on the body's root, with the part and its killer (#388)
+-------------------------------------------------------------------------------------------------
+
+!match new pd Pd 10 10
+!match use pd
+!ent add hero Hero 30 2 2 9
+!ent add ogre Ogre 40 5 5 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre oarm arm 10 10
+!part add oarm ohand hand 5 5
+!passive add ogre pd on_part_destroyed "entity[self].lost = [destroyed_part, part_parent, killer]"
+!ent set_var hero actions.hit.target entity
+!ent set_var hero actions.hit.body "deal_damage(target, 10)"
+!action hero hit ohand
+!assert "entity[ogre].lost == ['ohand', 'oarm', 'hero']"
+!ent damage oarm 10
+!assert "entity[ogre].lost == ['oarm', 'ogre', None]"
+!ent set_var ogre lost none
+!ent kill ogre
+!assert "not exists('ogre')"
+
+Expected: when a body part is destroyed (#388) the body's root hears of
+it through on_part_destroyed, with destroyed_part, part_parent (the hand
+hung from the arm) and killer (the hero's packet; none for a host's
+`!ent damage`). The whole creature dying fires none for its parts.
+
+
+SCENARIO 1266 — move_kind in movement hooks: walk, push, tp, swap, a moving zone (#390)
+-----------------------------------------------------------------------------------------
+
+!match new mk Mk 12 10
+!match use mk
+!ent add ogre Ogre 30 1 1 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add rat Rat 3 8 5 2
+!eval "entity[ogre].kinds = []"
+!passive add ogre m1 on_entity_moved "entity[self].kinds = entity[self].kinds + [move_kind]"
+!tile set 4 1 name trap
+!tile hook add 4 1 on_enter "if move_kind == 'walk':\n    entity[self].sprung = True"
+!ent move ogre 1 right
+!assert "not var_has('ogre', 'sprung')"
+!ent move ogre 1 right
+!assert "entity[ogre].sprung == True"
+!ent push ogre right 2
+!ent tp ogre 1 6
+!ent swap ogre rat
+!zone fill fog 1 1 2 2
+!zone hook add fog on_enter "entity[self].fogged = move_kind"
+!zone move fog 7 4
+!assert "entity[ogre].fogged == 'zone'"
+!assert "entity[ogre].kinds == ['walk', 'walk', 'push', 'tp', 'swap']"
+
+Expected: move_kind (#390) names how the moving unit got there, in every
+movement hook: the 2x2 ogre's on_entity_moved reads walk, walk, push, tp
+and swap; a trap tile springs only on a walk (the first step doesn't
+reach it; the second does); a zone moved over the ogre fires its
+on_enter with move_kind `zone`.
+
+
+SCENARIO 1267 — Unit-side zone and tile hooks: on_zone_entered / exited / stopped, on_tile_entered (#386)
+-----------------------------------------------------------------------------------------------------------
+
+!match new us Us 12 10
+!match use us
+!ent add vamp Vamp 30 1 1 5
+!ent set_vars vamp footprint_w=2 footprint_h=2
+!eval "entity[vamp].trail = []"
+!zone fill sun 4 1 5 2
+!zone tags sun daylight
+!passive add vamp z1 on_zone_entered "if zone_has_tag(zone_name, 'daylight'):\n    entity[self].hp -= 5\nentity[self].trail = entity[self].trail + ['in:' + zone_name + ':' + move_kind]"
+!passive add vamp z2 on_zone_exited "entity[self].trail = entity[self].trail + ['out:' + zone_name]"
+!passive add vamp z3 on_zone_stopped "entity[self].trail = entity[self].trail + ['stop:' + zone_name]"
+!passive add vamp t1 on_tile_entered "entity[self].trail = entity[self].trail + [str(tile_x) + ',' + str(tile_y)]"
+!ent move vamp 3 right
+!assert "entity[vamp].hp == 25"
+!assert "entity[vamp].trail == ['3,1', '3,2', '4,1', '4,2', 'in:sun:walk', '5,1', '5,2', 'stop:sun']"
+!eval "entity[vamp].trail = []"
+!ent push vamp right 3
+!assert "entity[vamp].trail == ['6,1', '6,2', 'out:sun', '7,1', '7,2', '8,1', '8,2']"
+!eval "entity[vamp].trail = []"
+!zone move sun 3 0
+!assert "entity[vamp].hp == 20 and entity[vamp].trail == ['in:sun:zone', 'stop:sun']"
+
+Expected: a unit's own on_zone_entered / exited / stopped passives (#386)
+fire once per body crossing, after the zone's hooks, with zone_name and
+move_kind bound, so the vampire's sunlight weakness lives in the vampire
+(a daylight-tagged zone costs it 5 hp on entering); on_tile_entered fires
+per cell the 2x2 body newly covers. A push carries the vampire out of the
+sun, and the sun moving onto it fires on_zone_entered with move_kind
+`zone`.

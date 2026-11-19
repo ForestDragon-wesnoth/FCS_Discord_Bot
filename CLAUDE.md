@@ -1539,8 +1539,25 @@ hardcodes**.
   each `transfer_entity` hop counts for depth) (875). Lifecycle: on_entity_spawned,
   on_entity_despawned (every non-death removal, fired BEFORE the unit
   leaves; `Entity.remove(despawn=)` returns its log), on_death / on_revive,
-  on_entity_moved, on_entity_changed_map, on_map_vehicle_moved / on_map_vehicle_death (§7.8), on_mounted / on_dismounted, on_turn_skipped (`skip_status`), on_status_*,
+  on_entity_moved, on_entity_changed_map, on_map_vehicle_moved / on_map_vehicle_death (§7.8), on_mounted / on_dismounted, on_turn_skipped (`skip_status`), on_kill, on_part_destroyed, on_zone_* / on_tile_* (below), on_status_*,
   on_action_used / on_action_failed / on_action_used_on_target.
+- **Movement context** (#390, #386, 1266-1267): `logic.MOVE_KIND`,
+  set by each moving verb for its own extent (`_move_kind` decorator:
+  `Entity.tp` tp, `move_dirs` / `move_group_dirs` walk, `push_entity` /
+  `pull_entity` push / pull (their inner walk passes `move_kind=`),
+  `swap_entities` swap, `move_to_map` map, `_zone_step_once` zone, a
+  rider ejected by its vehicle's fate carried; a redirected driver keeps
+  the kind), is bound as `move_kind` in on_entity_moved / on_entity_step,
+  the tile and zone hooks and the unit-side hooks. `fire_tile_hook` /
+  `fire_zone_hook` wrap `_fire_tile_hook` / `_fire_zone_hook`: after a
+  tile's on_enter / on_exit / on_stop (per cell) and a zone's boundary
+  on_enter / on_exit / on_stop (once per body crossing, a moving zone
+  too) they fire the unit's own `on_tile_entered|exited|stopped` /
+  `on_zone_entered|exited|stopped` passives (`UNIT_TILE_HOOKS` /
+  `UNIT_ZONE_HOOKS`, `_unit_side_hook`, which returns at once when no
+  passive listens), whether or not the tile or zone holds a hook;
+  bindings tile_x / tile_y / tile_map, zone_name / zone_map (tags are
+  read with `zone_tags()` / `tile_tags()`, functions of those names).
 - **Event bus:** `emit(name, payload, target)` / `!emit`. Global handlers
   fire ONCE (self = target, else the current unit); a directed event also
   fires the target's team + own handlers. Payload via `event_get` /
@@ -2904,7 +2921,17 @@ hardcodes**.
   packet's dealer. At most `death_chain_limit` (200, ceiling) deaths
   follow one death, then one ⚠️ names the units left at their death
   condition (they die at their next change). `kill()` inside on_death
-  still kills at once, nested. Prims: has_corpse, corpse_at,
+  still kills at once, nested. A kill an action's programs make (`kill()`,
+  `cmd('ent kill')`) is credited to the acting unit (`kill_entity` sets
+  PACKET_KILLER from `action.ACTION_ORIGIN` when no packet holds it), so
+  on_death binds `killer` for it too; a host's `!ent kill` has none.
+  **on_kill** (#387, 1264) fires on the killer (own, team, global
+  passives) at the end of `_process_death_one`, `victim` / `killer`
+  bound; not for a killer gone by then or killing itself.
+  **on_part_destroyed** (#388, 1265) fires on the body root from
+  `_process_part_death` (not in a cascade), before a vital part's kill,
+  with `destroyed_part`, `part_parent`, `killer` (`part` is a function,
+  so the binding has another name). Prims: has_corpse, corpse_at,
   corpse_cell (None without a corpse), corpses_within(x, y, n, mode)
   (nearest body cell, #396, 1186), all_corpses, corpse_var / corpse_has,
   corpse_status_has / _get / _names; corpse / corpse_list action targets.
