@@ -39,7 +39,7 @@ import dataclasses
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from logic import (VTTError, UnitFlags, jcopy, _own_value,
+from logic import (COMMAND_USER, VTTError, UnitFlags, jcopy, _own_value,
                    tag_filter_matches, ACTION_IMMUNE_FIELDS,
                    ACTION_FORBID_FIELDS, FORMULA_TEXT_HIDDEN,
                    JOURNAL_AS_STATE)
@@ -1299,7 +1299,14 @@ async def _advance(env: _Env, seq: int) -> str:
         ex = _ex(env.m, seq)
         ex["phase"] = "body"
     if ex["phase"] == "body":
-        r = await _body_phase(env, seq)
+        # The action's own log entries carry whoever started it (L57),
+        # whichever command's answer closed the window.
+        utoken = COMMAND_USER.set(ex["by"]) if ex.get("by") else None
+        try:
+            r = await _body_phase(env, seq)
+        finally:
+            if utoken is not None:
+                COMMAND_USER.reset(utoken)
         if r == "suspended":
             return "window"
         ex = _ex(env.m, seq)
@@ -1631,6 +1638,35 @@ async def _announce(env: _Env) -> None:
     env.window = []
     if lines:
         await env.ctx.send("\n".join(lines))
+    _note_team_posts(env.mgr, m, getattr(env.ctx, "channel_key", None))
+
+
+def _note_team_posts(mgr: Any, m: Any, here: Optional[str]) -> None:
+    """R5: the open window's listing goes to each channel bound with the
+    team view of a unit still to answer (other than the channel it opened
+    in), so its players see the chance to react. Recorded on the manager
+    (`_window_posts`, runtime); the command posts them when it ends, each
+    filtered by its channel's view."""
+    ex = m.reaction_exchange
+    if not ex or mgr is None:
+        return
+    teams = set()
+    for uid in waiting(ex):
+        e = m.entities.get(uid)
+        t = m.body_team(e) if e is not None else None
+        if t not in (None, ""):
+            teams.add(str(t))
+    if not teams:
+        return
+    text = "\n".join(window_text(m, ex))
+    posts = getattr(mgr, "_window_posts", None)
+    if posts is None:
+        posts = mgr._window_posts = []
+    for chan in sorted(m.bound_channels, key=str):
+        if chan == here or m.channel_pov(chan) not in teams:
+            continue
+        posts[:] = [p for p in posts if p[0] != chan or p[1] != m.id]
+        posts.append((chan, m.id, text))
 
 
 # ----------------------------------------------------------------------
@@ -1707,6 +1743,7 @@ def _new_exchange(m: Any, action: Any, *, actor_id: str, eff: str,
         "affected": list(affected), "first_affected": list(affected),
         "dropped": [], "incoming": {"": base},
         "picks": [], "pick_seq": 0, "channel": channel,
+        "by": COMMAND_USER.get() or "",
     }
     for u in affected:
         ex["incoming"][u] = jcopy(base)
@@ -1907,8 +1944,15 @@ def _queue_use(m: Any, mgr: Any, ctx: Any, action: Any, eid: str,
             msg = (f"the reaction queue already holds "
                    f"{len(m.reaction_queue)} action(s) (reaction_queue_limit "
                    f"{limit}); `{action.name}` doesn't wait.")
-            m.surface_log([m.unit_tag(eid) + f"❌ action `{action.name}`: "
-                           f"{msg}"])
+            line = m.unit_tag(eid) + f"❌ action `{action.name}`: {msg}"
+            # Once per command (L57: a loop of 4,000 calls printed 3,950
+            # of these lines).
+            from logic import FORMULA_LOG_SINK
+            buf = m._runtime_buffer
+            said = (buf.out if buf is not None
+                    else FORMULA_LOG_SINK.get() or [])
+            if line not in said:
+                m.surface_log([line])
             return False, ("", msg)
     buf = _BufferCtx.for_ctx(ctx)
     ok, why, pout, target, _used = _sync(_prepare(

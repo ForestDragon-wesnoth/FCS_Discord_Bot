@@ -19,16 +19,16 @@ from logic import (
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
-from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
 from logic import reserved_var_path_error, file_refs
-from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
+from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem, STATUS_VISIBILITY_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows, ODDS_BUDGET
 
 import os
 import difflib
@@ -59,6 +59,99 @@ class ReplyContext(Protocol):
     # False (no viewport unless the viewport_mode rule forces it on).
     viewport_capable: bool
     async def send(self, message: str) -> None: ...
+
+
+# Discord rejects a message whose `content` exceeds a hard server-side
+# length cap (API error 50035). 2000 is the universally-safe bot limit
+# (works regardless of Nitro/boost/channel context). Long command output
+# (e.g. !help, !system rules, big maps) is split into multiple messages
+# at this boundary — see split_message.
+MESSAGE_LIMIT = 2000
+
+def split_message(message: str, limit: int = MESSAGE_LIMIT) -> List[str]:
+    """Split `message` into a list of chunks, each at most `limit`
+    characters, breaking ONLY at newline boundaries so a single logical
+    line is never cut across two messages. Consecutive lines are packed
+    into one chunk until the next line wouldn't fit.
+
+    Code-fence aware: a map arrives as one ```ansi block, and a plain line
+    split would leave the first chunk's fence unclosed and the next chunk's
+    rows unfenced (both render as garbage on Discord). When a chunk ends
+    INSIDE a fence it is closed, and the next chunk reopens it with the same
+    opener line (so `ansi` coloring carries over). Room for the closing
+    fence is reserved while packing a fenced chunk, and a chunk never ends
+    on a bare opener (that would post an empty block).
+
+    A single line longer than the space available (no newline to break on)
+    is the one case we can't honor cleanly — it's hard-split into
+    limit-sized pieces as a last resort. Returns at least one chunk (the
+    message unchanged when it already fits, including the empty string)."""
+    if len(message) <= limit:
+        return [message]
+    close = "\n```"
+    chunks: List[str] = []
+    # None = no chunk in progress. Distinct from "" so an EMPTY line at the
+    # start of a chunk is kept rather than silently swallowed.
+    cur: Optional[str] = None
+    opener: Optional[str] = None      # the ``` line of the fence we're inside
+
+    def _has_content(c: Optional[str]) -> bool:
+        # A chunk holding only the re-opened fence carries nothing to flush.
+        return c is not None and c != opener
+
+    def _flush(c: str) -> None:
+        if opener is not None and c.endswith("\n" + opener):
+            # Don't strand an empty block: the opener moves to the next
+            # chunk along with the content it introduces.
+            chunks.append(c[:-(len(opener) + 1)])
+        else:
+            chunks.append(c + (close if opener is not None else ""))
+
+    for line in message.split("\n"):
+        is_fence = line.lstrip().startswith("```")
+        if is_fence and opener is not None and cur == opener:
+            # Closing a block whose content all went out already (after a
+            # hard split): the re-opened fence would post an empty block.
+            cur, opener = None, None
+            continue
+        # Inside a fence, every content line must leave room for the close;
+        # the closing fence line itself IS the close, so it needs none.
+        reserve = len(close) if (opener is not None and not is_fence) else 0
+        # What a fresh chunk would start with before this line.
+        base = len(opener) + 1 if opener is not None else 0
+        if base + len(line) + reserve > limit:
+            # Oversized single line: flush whatever's buffered (closing an
+            # open fence), then hard-split the line itself.
+            if _has_content(cur):
+                _flush(cur)
+            if opener is not None and not is_fence:
+                # Inside a code block each piece keeps the block (opener
+                # + piece + close): a bare piece rendered as markdown (L30).
+                step = max(1, limit - len(opener) - 1 - len(close))
+                for i in range(0, len(line), step):
+                    chunks.append(opener + "\n" + line[i:i + step] + close)
+            else:
+                for i in range(0, len(line), limit):
+                    chunks.append(line[i:i + limit])
+            if is_fence:
+                opener = None if opener is not None else line.lstrip()
+            # Still inside a fence: the next chunk re-opens it.
+            cur = opener
+            continue
+        if _has_content(cur) and len(cur) + 1 + len(line) + reserve > limit:
+            _flush(cur)
+            if is_fence and opener is not None:
+                # This line WAS the close, and the flush already closed the
+                # block — don't re-open it just to post an empty one.
+                cur, opener = None, None
+                continue
+            cur = opener
+        cur = line if cur is None else cur + "\n" + line
+        if is_fence:
+            opener = None if opener is not None else line.lstrip()
+    if cur is not None:
+        chunks.append(cur)
+    return chunks
 
 
 def ctx_user(ctx: "ReplyContext") -> Optional[str]:
@@ -239,7 +332,9 @@ _SELF_DISPATCHING_COMMANDS: frozenset = frozenset({
 # channel's POV for anyone, but `... full` forces the omniscient view and
 # so must be host-only (else a player could peek past fog of war).
 ELEVATED_ARGS: Dict[str, frozenset] = {
-    "state": frozenset({"full"}),
+    # `autoupdate` posts a board that keeps refreshing in the channel, as
+    # `!map autoupdate` does: a host's call.
+    "state": frozenset({"full", "autoupdate"}),
     # `map` renders for anyone from the channel POV, but `full` (omniscient),
     # `resize` (a grid mutation), and the `color`/`teamcolor`/`legend`
     # settings all elevate to host-gated. (pan/center/view are per-CHANNEL
@@ -248,7 +343,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
                       "legend", "autoupdate", "background", "border", "mode",
                       "coords", "new", "delete", "rename", "copy", "use",
                       "var", "unseen", "attach", "detach", "void", "shape"}),
-    "list": frozenset({"full"}),
+    "list": frozenset({"full", "autoupdate"}),
     # `!log` reads for anyone, but `clear` wipes the match's event log.
     "log": frozenset({"clear"}),
 }
@@ -1070,6 +1165,10 @@ class CommandRegistry:
         # Which units hold private vars, memoized for this command (X21).
         scan_token = (PRIVATE_SCAN.set({}) if PRIVATE_SCAN.get() is None
                       else None)
+        # The dice odds work this command may do in all (X28); a nested
+        # run shares the outer command's.
+        odds_token = (ODDS_BUDGET.set([0]) if ODDS_BUDGET.get() is None
+                      else None)
         # Lines about one unit (deaths, revives) carry a tag naming it; every
         # reply of this command drops those its channel's view can't see
         # and strips the tag from the rest.
@@ -1129,6 +1228,8 @@ class CommandRegistry:
                                            pre_matches, _AUDIT_NOTES.get())
                     _journal_after(mgr)
             await _flush_formula_log(ctx)
+            if outer:
+                await _post_window_elsewhere(ctx, mgr)
             if tags_token is not None:
                 warn = _vocabulary_warning(mgr, ctx, STORED_TAGS.get() or {})
                 if warn:
@@ -1148,6 +1249,8 @@ class CommandRegistry:
             PARTIAL_CACHE.reset(cache_token)
             if scan_token is not None:
                 PRIVATE_SCAN.reset(scan_token)
+            if odds_token is not None:
+                ODDS_BUDGET.reset(odds_token)
             CURRENT_WORKSPACE.reset(ws_token)
             COMMAND_CTX.reset(cctx_token)
             FORMULA_LOG_SINK.reset(sink_token)
@@ -2837,6 +2940,8 @@ def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
             sdef = defs.get(name)
             fmt = sdef.get("display") if isinstance(sdef, dict) else None
         ctx["name"] = name
+        ctx.setdefault("turns_word", "turn" if ctx.get("duration") == 1
+                       else "turns")
         ctx.pop(STATUS_LAYERS_KEY, None)
         if status_layers_of(inst) is not None:
             ctx["layers"] = status_layers_text(status_layers_of(inst))
@@ -3314,8 +3419,25 @@ def _description_statuses(m: Match, status: Dict[str, Any]) -> List[str]:
                                sctx)
         sctx = _hide_formula_fields(sctx)
         sctx["name"] = name
+        # "1 turn left", "3 turns left" (L57); a GM field of the name wins.
+        if "turns_word" not in sctx:
+            sctx["turns_word"] = ("turn" if sctx.get("duration") == 1
+                                  else "turns")
         lines.append(_render_template(fmt, sctx))
     return lines
+
+
+def _description_cut(m: "Match", lines: List[str], eid: str) -> List[str]:
+    """The data section's lines cut at entity_description_line_limit (-1 =
+    none). The count is a bullet of the list: as a plain line after it,
+    Discord ran it and the next section's header together ("... (27 more
+    lines) Actions")."""
+    cap = int(m.rules.get("entity_description_line_limit", -1))
+    if cap < 0 or len(lines) <= cap:
+        return lines
+    return lines[:cap] + [
+        f"- … {len(lines) - cap} more lines (`!ent get {eid} <var>` reads "
+        f"one; the rule entity_description_line_limit)"]
 
 
 def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
@@ -3378,10 +3500,7 @@ def _entity_description(e: Entity, pov_team: Optional[str] = None) -> str:
             lines: List[str] = []
             _description_tree(tree, 0, lines, labels)
             if lines:
-                cap = int(m.rules.get("entity_description_line_limit", 60))
-                if len(lines) > cap:
-                    lines = lines[:cap] + [
-                        f"... ({len(lines) - cap} more lines)"]
+                lines = _description_cut(m, lines, e.id)
                 text = _render_template(fmt(sec),
                                         {"items": "\n".join(lines)})
         elif sec == "actions":
@@ -3453,7 +3572,9 @@ def _corpse_template_context(
     reader = VAR_READER.get()
     ent_vars = (m.corpse_reader_vars(corpse, reader)
                 if reader is not None else raw_vars)
-    status = ent.get("status") or {}
+    # The statuses the command's view sees (status_visibility_condition).
+    status = m.visible_statuses(ent.get("status") or {}, m.command_pov(),
+                                corpse_id=eid)
     passives = ent.get("passives") or {}
     ctx: Dict[str, Any] = {
         "id": eid,
@@ -3570,9 +3691,9 @@ def _corpse_description(m: Match, x: int, y: int, cid: str,
             if ctx.get("tags"):
                 text = _render_template(fmt(sec), ctx, labels)
         elif sec == "statuses":
-            status = ent.get("status")
-            items = _description_statuses(
-                m, status if isinstance(status, dict) else {})
+            status = m.visible_statuses(ent.get("status"), m.command_pov(),
+                                        corpse_id=cid)
+            items = _description_statuses(m, status)
             if items:
                 text = _render_template(fmt(sec), {"items": "\n".join(items)})
         elif sec == "data":
@@ -3584,10 +3705,7 @@ def _corpse_description(m: Match, x: int, y: int, cid: str,
             lines: List[str] = []
             _description_tree(tree, 0, lines, labels)
             if lines:
-                cap = int(m.rules.get("entity_description_line_limit", 60))
-                if len(lines) > cap:
-                    lines = lines[:cap] + [
-                        f"... ({len(lines) - cap} more lines)"]
+                lines = _description_cut(m, lines, cid)
                 text = _render_template(fmt(sec), {"items": "\n".join(lines)})
         elif sec == "parts":
             pfmt = _description_rule(m, "entity_description_part_format")
@@ -3785,6 +3903,7 @@ def _typed_unit_view(ctx: ReplyContext, mgr: MatchManager,
 # `<field>_unless` restriction formulas.
 _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "condition", "effect", "cost",
+                                 "visibility_condition",
                                  # An action's other programs and a
                                  # reaction's (#36).
                                  "prepare", "affects", "target_condition",
@@ -5568,7 +5687,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as channel <key> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -5594,6 +5713,9 @@ def _mention(user_id: Optional[str]) -> str:
         "(server_idle_unload_hours): the servers it unloads load again on "
         "their next command. `!as wait <seconds>` makes every pending "
         "approval request that much older (pending_request_expiry_seconds). "
+        "`!as channel <key>` types into another channel (`CLI` is the "
+        "usual one), as on Discord: what a channel bound with `pov=` "
+        "receives. "
         "`!as crash [text]` raises an error no command expects "
         "(a test hook for the error log, `!owner errors`). Bare `!as` "
         "reports your identity and your effective POV."
@@ -5632,6 +5754,15 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             "🔄 Reloaded every server from the data folder, as after a "
             "restart." + ("\n" + "\n".join(notes) if notes else ""))
+    if role == "channel":
+        # A test hook (R5): type into another channel, as on Discord, to
+        # see what a channel bound to a team's view receives.
+        _check_tail(args, 2, (), "!as channel <key>")
+        if len(args) < 2:
+            raise VTTError("Usage: `!as channel <key>` (`CLI` is the "
+                           "usual one).")
+        ctx.channel_key = args[1]
+        return await ctx.send(f"Now typing in channel `{args[1]}`.")
     if role == "wait":
         # A test hook (#135): every pending approval request of this server
         # was queued <seconds> earlier, as if that much time had passed.
@@ -7978,11 +8109,27 @@ def _clone_spot(m: Match, src: Entity, mp: "Map",
     with `near`, within that many cells of the source's body."""
     w, h = m.entity_footprint(src)
     avoid = set(m.entity_cells(src)) if src.map == mp.name else set()
-    for p in m.entity_part_subtree(src.id):
-        if p.vars.get("__part_located") and p.map == mp.name:
+    located = [p for p in m.entity_part_subtree(src.id)
+               if p.id != src.id and p.vars.get("__part_located")]
+    for p in located:
+        if p.map == mp.name:
             avoid.update(m.entity_cells(p))
+
+    def parts_fit(gx: int, gy: int) -> bool:
+        """The copy's located parts, carried at their offsets from the
+        new anchor, land on the map, clear of every unit and of the
+        source (K4)."""
+        body = set(m.entity_cells(src, gx, gy))
+        for p in located:
+            px, py = p.x - src.x + gx, p.y - src.y + gy
+            for c in m.entity_cells(p, px, py):
+                if not mp.in_bounds(*c) or c in avoid or c in body \
+                        or m.cell_occupant(c[0], c[1], (), mp) is not None:
+                    return False
+        return True
     spot = m._nearest_fit_cell(src, src.x + (w - 1) / 2,
-                               src.y + (h - 1) / 2, mp, avoid=avoid)
+                               src.y + (h - 1) / 2, mp, avoid=avoid,
+                               fits=parts_fit if located else None)
     if spot is None or near is None:
         return spot
     gap = m._rect_gap(spot[0], spot[1], w, h, src.x, src.y, w, h,
@@ -9957,6 +10104,8 @@ class _ReplayCtx:
         self.user_name = user_name or user_id
         self.prompt_choice = None
         self.offer_resume = None
+        self.offer_confirm = None
+        self.post_to_channel = None
         self.replies: List[str] = []
 
     def __getattr__(self, name):
@@ -10352,6 +10501,17 @@ async def run_approved_request(req: dict, ctx: ReplyContext,
     request's match only for the run, then restored, unless the command
     itself changed it (an approved `!match use`)."""
     ch = req.get("channel_key") or ctx.channel_key
+    m = mgr.matches.get(req.get("match_id") or "")
+    if (m is not None and str(req.get("name", "")).lower() == "turn"
+            and [str(a).lower() for a in req.get("args") or []][:1]
+            == ["next"]
+            and req.get("turns_elapsed") is not None
+            and req["turns_elapsed"] != m.turns_elapsed):
+        # L57: approved on a later turn, it would end that one instead.
+        await ctx.send(f"❌ `!turn next` (request `{req.get('id')}`, by "
+                       f"{req.get('user_name')}) was asked during a turn "
+                       f"that is over, so it doesn't run.")
+        return
     run_ctx = ctx if ch == ctx.channel_key else _RequesterChannelCtx(ctx, ch)
     # Never the approver's `!again` command: a Discord button click runs this
     # at the top level, where run() would record it.
@@ -11706,6 +11866,101 @@ def _mentions_note(m: Match, name: str, what: str) -> Optional[str]:
             f"written: {shown}.")
 
 
+def _function_or_none(fdef: Any) -> "Optional[FormulaFunction]":
+    """A stored formula function, None when the entry isn't one (a file
+    brought `{}` or a number as its params: S8)."""
+    if not isinstance(fdef, dict):
+        return None
+    try:
+        fn = FormulaFunction.from_dict(fdef)
+        list(fn.params)
+    except Exception:          # noqa: BLE001 - any wrong shape
+        return None
+    if not isinstance(fn.body, str) or not all(isinstance(p, str)
+                                               for p in fn.params):
+        return None
+    return fn
+
+
+def _system_formula_slots(rule_value: Callable[[str], Any],
+                          library: Callable[[str], Dict[str, Any]]):
+    """(where, formula, mode, params, action_mode) of every formula a
+    system stores: formula rules, default passives, tile templates'
+    hooks / block / opaque, function bodies, damage and healing steps,
+    status ticks, hooks, `_unless` and level entries, watchers (the
+    library's and those statuses give), zone definitions' hooks / block /
+    opaque / grant_condition. Shared by `!system lint` and `!system
+    import` (S8), which read rules and libraries through the two
+    callables; an entry of the wrong shape gives no slots (the import
+    refuses it first)."""
+    def _dict(x: Any) -> Dict[str, Any]:
+        return x if isinstance(x, dict) else {}
+    for k in sorted(RULES_REGISTRY):
+        mode = (RULES_REGISTRY[k].get("schema") or {}).get("formula")
+        if mode:
+            yield (f"rule `{k}`", rule_value(k),
+                   "eval" if mode == "expression" else "exec", frozenset(),
+                   False)
+    for spec in rule_value("default_entity_passives") or []:
+        if isinstance(spec, dict):
+            yield (f"default passive `{spec.get('id')}`", spec.get("formula"),
+                   "exec", frozenset(), False)
+    for tname, tdef in sorted(_dict(library("tile_templates")).items()):
+        tdef = _dict(tdef)
+        for when, src in sorted(_dict(tdef.get("hooks")).items()):
+            yield (f"tile template `{tname}` hook `{when}`", src, "exec",
+                   frozenset(), False)
+        for key in ("block", "opaque"):
+            yield (f"tile template `{tname}` {key}",
+                   _dict(tdef.get("data")).get(key), "eval", frozenset(),
+                   False)
+    for fname, fdef in sorted(_dict(library("formula_functions")).items()):
+        fn = _function_or_none(fdef)
+        if fn is not None:
+            yield (f"function `{fname}`", fn.body, "exec",
+                   frozenset(fn.params), False)
+    for lib_name, noun in (("damage_steps", "damage"),
+                           ("healing_steps", "healing")):
+        for sname, step in sorted(_dict(library(lib_name)).items()):
+            yield (f"{noun} step `{sname}`", _dict(step).get("formula"),
+                   "exec", frozenset(), True)
+    statuses = sorted(_dict(library("status_definitions")).items())
+    for sname, sdef in statuses:
+        sdef = _dict(sdef)
+        hooks = _dict(sdef.get("hooks"))
+        for where, src in ([("tick", sdef.get("tick"))]
+                           + [(f"{h} hook", hooks[h]) for h in sorted(hooks)]):
+            yield (f"status `{sname}` {where}", src, "exec", frozenset(),
+                   False)
+        for fld in ACTION_RESTRICTION_FIELDS:
+            yield (f"status `{sname}` {fld}{UNLESS_SUFFIX}",
+                   sdef.get(fld + UNLESS_SUFFIX), "eval", frozenset(), False)
+        for where, src, mode in _status_level_formulas(sdef):
+            yield (f"status `{sname}` {where}", src, mode, frozenset(),
+                   False)
+    watch = [(f"watcher `{wname}`", w) for wname, w in sorted(
+        _dict(library("watchers")).items())]
+    for sname, sdef in statuses:
+        watch += [(f"status `{sname}` {where}", spec)
+                  for where, spec in _status_watchers(_dict(sdef))]
+    for where, spec in watch:
+        yield from _watcher_slots(where, spec)
+    for zname, zdef in sorted(_dict(library("zone_definitions")).items()):
+        try:
+            zdef = normalize_zone_def(zdef)
+        except VTTError:
+            continue
+        for when, src in sorted(zdef["hooks"].items()):
+            yield (f"zone definition `{zname}` hook `{when}`", src, "exec",
+                   frozenset(), False)
+        for key in ("block", "opaque"):
+            yield (f"zone definition `{zname}` {key}", zdef["data"].get(key),
+                   "eval", frozenset(), False)
+        if zdef.get("grant_condition"):
+            yield (f"zone definition `{zname}` grant_condition",
+                   zdef["grant_condition"], "eval", frozenset(), False)
+
+
 def _system_lint(mgr: MatchManager, s: Any) -> str:
     """`!system lint <name>`: every formula the system and its matches
     store, checked at once. Each is checked when stored, but a function
@@ -11731,30 +11986,6 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         else:
             bad.append(f"❌ {where}: {err}")
 
-    n = 0
-    for k in sorted(RULES_REGISTRY):
-        mode = (RULES_REGISTRY[k].get("schema") or {}).get("formula")
-        if mode:
-            n += 1
-            check(f"rule `{k}`", mgr.system_value(s, k),
-                  "eval" if mode == "expression" else "exec", sys_known,
-                  soft=True)
-    for spec in mgr.system_value(s, "default_entity_passives") or []:
-        if isinstance(spec, dict):
-            n += 1
-            check(f"default passive `{spec.get('id')}`", spec.get("formula"),
-                  "exec", sys_known, soft=True)
-    for tname, tdef in sorted(mgr.system_library(s, "tile_templates").items()):
-        tdef = tdef if isinstance(tdef, dict) else {}
-        for when, src in sorted((tdef.get("hooks") or {}).items()):
-            n += 1
-            check(f"tile template `{tname}` hook `{when}`", src, "exec",
-                  sys_known, soft=True)
-        for key in ("block", "opaque"):
-            n += 1
-            check(f"tile template `{tname}` {key}",
-                  (tdef.get("data") or {}).get(key), "eval", sys_known,
-                  soft=True)
     def check_name(where: str, fname: str, params: List[Any]) -> None:
         # A name stored before the reserved names were refused (an older
         # save) would shadow an engine helper or never be called.
@@ -11763,64 +11994,19 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         except VTTError as ex:
             bad.append(f"❌ {where}: {ex}")
 
+    n = 0
     for fname, fdef in sorted(mgr.system_library(s, "formula_functions").items()):
-        fn = FormulaFunction.from_dict(fdef)
-        n += 1
+        fn = _function_or_none(fdef)
+        if fn is None:
+            bad.append(f"❌ function `{fname}`: isn't a function (a name, "
+                       f"a list of parameters and a body)")
+            continue
         check_name(f"function `{fname}`", fname, fn.params)
-        check(f"function `{fname}`", fn.body, "exec", sys_known,
-              frozenset(fn.params), soft=True)
-    for lib_name, noun in (("damage_steps", "damage"),
-                           ("healing_steps", "healing")):
-        for sname, step in sorted(mgr.system_library(s, lib_name).items()):
-            n += 1
-            check(f"{noun} step `{sname}`", step.get("formula"), "exec",
-                  sys_known, action_mode=True, soft=True)
-    for sname, sdef in sorted(
-            mgr.system_library(s, "status_definitions").items()):
-        sdef = sdef if isinstance(sdef, dict) else {}
-        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
-        for where, src in ([("tick", sdef.get("tick"))]
-                           + [(f"{h} hook", hooks[h]) for h in sorted(hooks)]):
-            if isinstance(src, str) and src.strip():
-                n += 1
-                check(f"status `{sname}` {where}", src, "exec", sys_known,
-                      soft=True)
-        for fld in ACTION_RESTRICTION_FIELDS:
-            src = sdef.get(fld + UNLESS_SUFFIX)
-            if isinstance(src, str) and src.strip():
-                n += 1
-                check(f"status `{sname}` {fld}{UNLESS_SUFFIX}", src, "eval",
-                      sys_known, soft=True)
-        for where, src, mode in _status_level_formulas(sdef):
-            n += 1
-            check(f"status `{sname}` {where}", src, mode, sys_known,
-                  soft=True)
-    sys_watch = [(f"watcher `{wname}`", w) for wname, w in sorted(
-        mgr.system_library(s, "watchers").items())]
-    for sname, sdef in sorted(
-            mgr.system_library(s, "status_definitions").items()):
-        sys_watch += [(f"status `{sname}` {where}", spec)
-                      for where, spec in _status_watchers(sdef)]
-    for where, spec in sys_watch:
-        for slot, src, mode, _p, _a in _watcher_slots(where, spec):
-            if isinstance(src, str) and src.strip():
-                n += 1
-                check(slot, src, mode, sys_known, soft=True)
-    for zname, zdef in sorted(
-            mgr.system_library(s, "zone_definitions").items()):
-        zdef = normalize_zone_def(zdef)
-        for when, src in sorted(zdef["hooks"].items()):
-            n += 1
-            check(f"zone definition `{zname}` hook `{when}`", src, "exec",
-                  sys_known, soft=True)
-        for key in ("block", "opaque"):
-            n += 1
-            check(f"zone definition `{zname}` {key}", zdef["data"].get(key),
-                  "eval", sys_known, soft=True)
-        if zdef.get("grant_condition"):
-            n += 1
-            check(f"zone definition `{zname}` grant_condition",
-                  zdef["grant_condition"], "eval", sys_known, soft=True)
+    for where, src, mode, params, action_mode in _system_formula_slots(
+            lambda k: mgr.system_value(s, k),
+            lambda kind: mgr.system_library(s, kind)):
+        n += 1
+        check(where, src, mode, sys_known, params, action_mode, soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
@@ -13039,6 +13225,7 @@ registry.annotate_sub(
         "copy <system> <name> <new_name> | tick <system> <name> <formula ...> | "
         "hook <system> <name> <on_added|on_removed|on_changed> [<formula ...>] | "
         "display <system> <name> [<format ...>] | "
+        "visibility <system> <name> [<formula ...>] | "
         "when <system> <name> <turn_end|turn_start|round_start|round_end|never> | "
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
         "stack <system> <name> <layered|refresh|add_level|extend|replace|none> | "
@@ -15436,7 +15623,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             e = m.entities.get(eid)
             if e and not _pov_hides(m, pov, eid):
                 order_lines.append(
-                    f"{mark} `{eid[:8]}` **{m.entity_display_name(e, pov)}** "
+                    f"{mark} `{eid}` **{m.entity_display_name(e, pov)}** "
                     f"({init_label} {e.initiative})")
         out = "Turn order:\n" + ("\n".join(order_lines) or "(empty)")
         extra = _extra_turn_lines(m, pov)
@@ -15461,7 +15648,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if e is None:
             # Its own turn-start effects (a lethal DoT tick, an on_turn_start
             # hook) removed it before the reply was built.
-            out = (f"`{eid[:8]}`'s turn began, and it was removed by its "
+            out = (f"`{eid}`'s turn began, and it was removed by its "
                    f"turn-start effects.")
             if fire_log:
                 out += "\n" + "\n".join(fire_log)
@@ -15540,7 +15727,7 @@ def _extra_turn_lines(m: Match, pov: Optional[str]) -> List[str]:
         e = m.entities.get(eid)
         if e is None or _pov_hides(m, pov, eid):
             return None
-        return f"`{eid[:8]}` **{m.entity_display_name(e, pov)}**"
+        return f"`{eid}` **{m.entity_display_name(e, pov)}**"
     if m.extra_turn:
         shown = name(m.extra_turn)
         if shown:
@@ -15604,7 +15791,7 @@ def _turn_forecast_text(ctx: ReplyContext, m: Match, rest: List[str]) -> str:
         notes = [x for x in notes if "turn_forecast_limit" not in x]
     hidden_text = str(m.rules.get("turn_forecast_hidden_text", "") or "")
     fmt = str(m.rules.get("turn_forecast_line_format", "") or "") \
-        or "`{short_id}` **{name}**"
+        or "`{id}` **{name}**"
     atb = bool(m.rules.get("atb_enabled"))
     lines: List[str] = []
     last_round = None
@@ -15720,7 +15907,11 @@ registry.annotate_sub(
 #global info about the match that isn't the map or entities
 @registry.command("match_toplevel", access="all", usage="!match_toplevel", desc="Show active match summary (name/id/round number).")
 async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
-    m = active_match(mgr, ctx)
+    return await ctx.send(_match_top_text(active_match(mgr, ctx)))
+
+
+def _match_top_text(m: "Match") -> str:
+    """The match summary `!state` opens with (and its autoupdate board)."""
     parts = [
         f"**{m.name}** `{m.id}`",
         f"Game System: **{m.system_name}**",
@@ -15743,7 +15934,7 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         parts.append("**Global passives:**")
         for pid, p in m.global_passives.items():
             parts.append(f"- `{pid}` ({p.when}): `{formula_text(p.formula)}`")
-    return await ctx.send("\n".join(parts))
+    return "\n".join(parts)
 
 
 def _as_arg(args: List[str]) -> Any:
@@ -15844,6 +16035,55 @@ def _say_name_text(m: Optional["Match"], pov: Optional[str], mid: str,
     return e.name
 
 
+class _ChannelCtx:
+    """`inner` as seen from another channel: the reply filter judges lines
+    by that channel's view (R5's posts)."""
+
+    def __init__(self, inner: Any, channel_key: str):
+        self._inner = inner
+        self.channel_key = channel_key
+        self.pov_override = _NO_POV
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def _post_window_elsewhere(ctx: ReplyContext, mgr: MatchManager
+                                 ) -> None:
+    """Post the reaction windows this command opened to the team channels
+    reactions._note_team_posts recorded (R5), each as its channel's view
+    reads it, through the surface's `post_to_channel`. A surface without it
+    (a replay, a simulation) posts nothing."""
+    posts = getattr(mgr, "_window_posts", None)
+    if not posts:
+        return
+    mgr._window_posts = []
+    poster = getattr(ctx, "post_to_channel", None)
+    if poster is None:
+        return
+    for chan, mid, text in posts:
+        if mgr.active_by_channel.get(chan) != mid:
+            continue
+        shown = _filter_unit_lines(text, _ChannelCtx(ctx, chan), mgr)
+        if shown.strip():
+            await poster(chan, shown)
+
+
+def _dice_roll_shown(m: Optional["Match"], pov: Optional[str], mid: str,
+                     eid: str) -> bool:
+    """Whether this channel's view reads a dice-line roll unit `eid`'s
+    formula made (V27): the unit, or its corpse, is in view."""
+    if m is None or m.id != mid or pov is None:
+        return True
+    if eid in m.entities:
+        return not _pov_hides(m, pov, eid)
+    loc = m.find_corpse(eid)
+    if loc is None:
+        return False
+    x, y, corpse, mp = loc
+    return m.corpse_visible_to(eid, corpse, x, y, pov, mp)
+
+
 def _say_team_shown(ctx: ReplyContext, m: Optional["Match"],
                     pov: Optional[str], team: str) -> bool:
     """Whether a say_to() line for `team` shows here: that team's view, or a
@@ -15879,6 +16119,12 @@ def _filter_unit_lines(text: str, ctx: ReplyContext, mgr: MatchManager) -> str:
                 continue
             line = SAY_TEAM_RE.sub("", line)
         line = line.replace(SAY_OPEN_MARK, "")
+        if DICE_ROLL_RE.search(line):
+            m, pov = seen()
+            line = join_dice_rolls(
+                line, lambda mid, eid: _dice_roll_shown(m, pov, mid, eid))
+            if line is None:
+                continue
         mo = UNIT_LINE_RE.search(line)
         if mo is None:
             out.append(line)
@@ -16040,12 +16286,31 @@ def _team_data_readable(ctx: ReplyContext, m: "Match", team: str) -> bool:
     return pov is None or str(pov) == str(team)
 
 
+def _host_names_hidden(ctx: ReplyContext, m: "Match") -> bool:
+    """Whether the caller, a host of `m`, may name units the channel's view
+    hides (W16): the match var pov_host_names_hidden when it is a bool,
+    else the rule of that name."""
+    v = m.vars.get("pov_host_names_hidden") if isinstance(m.vars, dict) \
+        else None
+    on = v if isinstance(v, bool) else bool(
+        m.rules.get("pov_host_names_hidden", False))
+    return on and _acts_as_host(ctx, m)
+
+
 def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
     """Resolve an entity id for a read-only query, treating an entity the
     channel's POV can't see exactly like a missing one (same message, which
-    echoes what was typed — never the resolved id)."""
+    echoes what was typed — never the resolved id). A host under
+    pov_host_names_hidden reaches a hidden unit (W16)."""
     eid = _resolve_eid(m, token, view=False)
     pov = _query_pov(ctx, m)
+    if eid in m.entities and pov is not None and _pov_hides(m, pov, eid) \
+            and _host_names_hidden(ctx, m):
+        reveals = _HOST_REVEALS.get()
+        if reveals is not None and eid not in reveals \
+                and m.rules.get("host_reveal_warning", False):
+            reveals.append(eid)
+        return eid
     if eid not in m.entities or _pov_hides(m, pov, eid):
         if pov is not None:
             # Under a team view a hidden unit and a missing one read alike,
@@ -16068,7 +16333,8 @@ def _query_unit_or_corpse(ctx: ReplyContext, m: "Match", token: str
         loc = m.find_corpse(eid)
         pov = _query_pov(ctx, m)
         if loc is not None and (pov is None or m.corpse_visible_to(
-                eid, loc[2], loc[0], loc[1], pov, loc[3])):
+                eid, loc[2], loc[0], loc[1], pov, loc[3])
+                or _host_names_hidden(ctx, m)):
             return eid, loc
     return _query_eid(ctx, m, token), None
 
@@ -17790,7 +18056,42 @@ def _roster_groups(m: "Match", units: List["Entity"], pov: Optional[str],
 
 @registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if args and args[0].lower() == "autoupdate":
+        return await _autoupdate_cmd(ctx, args, mgr, "list")
     return await _in_vision_pass(ctx, mgr, _list_cmd_impl, args)
+
+
+registry.annotate_sub(
+    "list", "autoupdate", usage="!list autoupdate [on|off] [reserve=<n>]",
+    desc="Discord: a board of this roster that refreshes itself after "
+         "every change, read as the channel's players read `!list`. It "
+         "posts its messages once (`reserve=`, else the rule "
+         "autoupdate_reserved_messages) and fills them from the top.")
+
+
+async def _autoupdate_cmd(ctx: ReplyContext, args: List[str],
+                          mgr: MatchManager, kind: str):
+    """`!list|state autoupdate [on|off] [reserve=<n>]`: a roster board
+    (Discord-only, like `!map autoupdate`; the surface's
+    set_roster_autoupdate owns the messages)."""
+    m = active_match(mgr, ctx)
+    _check_options(args[1:], {"reserve"}, f"!{kind} autoupdate")
+    words = [a for a in args[1:] if "=" not in a]
+    usage = f"!{kind} autoupdate [on|off] [reserve=<n>]"
+    if len(words) > 1 or (words and words[0].lower() not in ("on", "off")):
+        raise VTTError(f"Usage: `{usage}`.")
+    on = not (words and words[0].lower() == "off")
+    given = next((a.split("=", 1)[1] for a in args[1:]
+                  if a.lower().startswith("reserve=")), None)
+    if not on and given is not None:
+        raise VTTError(f"`reserve=` goes with `on`. Usage: `{usage}`.")
+    slots = autoupdate_reserve(m, kind, given) if on else 0
+    hook = getattr(ctx, "set_roster_autoupdate", None)
+    if hook is None:
+        return await ctx.send(
+            "Auto-update boards are a Discord-only feature — here "
+            f"`!{kind}` prints the whole {kind} each time.")
+    return await ctx.send(await hook(m, kind, on, slots))
 
 
 async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
@@ -17801,6 +18102,15 @@ async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
         if "=" not in a and not (i == 0 and a.lower() == "full"):
             return await _help_fallback(ctx, ["list"], a)
     pov = _view_pov(ctx, m, args)
+    text = _list_text(m, pov)
+    if text is None:
+        return await ctx.send(_as_note(args) + "(no entities)")
+    return await ctx.send(_as_note(args) + text)
+
+
+def _list_text(m: "Match", pov: Optional[str]) -> Optional[str]:
+    """The `!list` roster as view `pov` reads it (None when it shows
+    nothing): living units in turn order, then the Dead: section."""
     es = m.entities_in_turn_order()
     active_id = m.current_entity_id()
     lines: List[str] = []
@@ -17840,9 +18150,104 @@ async def _list_cmd_impl(ctx: ReplyContext, args: List[str],
                     lines.append(f"Map {m.map_label(cmp, pov)}:")
                     last_map = cmp
                 lines.append(f"   {_corpse_line(m, x, y, eid, corpse, cmp)}")
-    if not lines:
-        return await ctx.send(_as_note(args) + "(no entities)")
-    return await ctx.send(_as_note(args) + "\n".join(lines))
+    return "\n".join(lines) if lines else None
+
+
+# ---- `!list autoupdate` / `!state autoupdate` boards (W15) ----------------
+# A Discord board of the roster: a set of messages posted once and edited in
+# place after every change, as the map board is. The text and its packing
+# into the reserved messages are built here (surface-agnostic, read by the
+# harness's `?board`); the adapter owns the messages.
+AUTOUPDATE_KINDS = ("list", "state")
+
+
+def autoupdate_reserve(m: "Match", kind: str,
+                       given: Optional[str] = None) -> int:
+    """The message count of a new `kind` board: `reserve=<n>` when given,
+    else the autoupdate_reserved_messages rule. A state board needs two
+    (its map takes one)."""
+    hi = rule_max("autoupdate_reserved_messages") or 20
+    if given is None:
+        n = int(m.rules.get("autoupdate_reserved_messages", 5))
+        src = "the rule `autoupdate_reserved_messages`"
+    else:
+        try:
+            n = int(given)
+        except ValueError:
+            raise VTTError(f"`reserve={given}` isn't a whole number.")
+        src = f"`reserve={given}`"
+        if not 1 <= n <= hi:
+            raise VTTError(f"`reserve=` takes 1 to {hi} messages.")
+    if kind == "state" and n < 2:
+        raise VTTError(f"A `!state` board needs at least 2 messages (its "
+                       f"map takes one), and {src} gives {n}. Use "
+                       f"`!state autoupdate on reserve=<n>`.")
+    return n
+
+
+def autoupdate_board_text(mgr: MatchManager, m: "Match", channel_key: str,
+                          kind: str) -> str:
+    """The text of a `kind` board in `channel_key` (a `!state` board's map
+    is a message of its own, which the surface adds): the summary for a
+    state board, then the roster, as a player of the channel reads them,
+    whoever turned the board on: the channel's team view, private vars
+    hidden, formula text per formula_text_visibility for a player."""
+    pov = m.channel_pov(channel_key)
+    hidden = (str(m.rules.get("formula_text_visibility", "all")) == "host"
+              and getattr(m, "owner", None) is not None)
+    tokens = [(VAR_READER, VAR_READER.set(VarReader(team=pov, host=False))),
+              (FORMULA_TEXT_HIDDEN, FORMULA_TEXT_HIDDEN.set(hidden)),
+              (CURRENT_WORKSPACE, CURRENT_WORKSPACE.set(mgr)),
+              (PARTIAL_CACHE, PARTIAL_CACHE.set({})),
+              (PRIVATE_SCAN, PRIVATE_SCAN.set({})),
+              (COMMAND_POV, COMMAND_POV.set(lambda vm: pov))]
+    try:
+        with m.vision_pass():
+            roster = _list_text(m, pov) or "(no entities)"
+            if kind == "state":
+                return _match_top_text(m) + "\n\n" + roster
+            return roster
+    finally:
+        for var, tok in reversed(tokens):
+            var.reset(tok)
+
+
+def autoupdate_filler(m: "Match", kind: str,
+                      limit: int = MESSAGE_LIMIT) -> str:
+    """The text of a board message its content doesn't need
+    (autoupdate_reserved_text; a dot when empty: Discord refuses an empty
+    message)."""
+    filler = str(m.rules.get("autoupdate_reserved_text",
+                             "[reserved message for {kind} autoupdate]"))
+    return filler.replace("{kind}", kind).strip()[:limit] or "."
+
+
+def autoupdate_board_messages(m: "Match", text: str, slots: int, kind: str,
+                              limit: int = MESSAGE_LIMIT) -> List[Optional[str]]:
+    """`text` packed into `slots` messages from the top (split as a long
+    reply is), the messages it doesn't need showing the
+    autoupdate_reserved_text rule. Text past its last message is cut there
+    with a note saying how much and how to make room. A state board's map
+    takes the message after the text: None marks its place."""
+    with_map = kind == "state"
+    total = slots
+    if with_map:
+        slots -= 1
+    chunks = [c for c in split_message(text, limit) if c.strip()] or ["…"]
+    if len(chunks) > slots:
+        rest = "\n".join(chunks[slots - 1:])
+        note = (f"✂️ … about {{n}} more characters left out: this board "
+                f"holds {total} message(s). Turn it on again with more "
+                f"(`!{kind} autoupdate on reserve=<n>`, or the rule "
+                f"`autoupdate_reserved_messages`).")
+        room = limit - len(note) - 12
+        piece = split_message(rest, room)[0] if room > 0 else ""
+        last = (piece + "\n" if piece.strip() else "") + note.replace(
+            "{n}", str(max(1, len(rest) - len(piece))))
+        chunks = chunks[:slots - 1] + [last]
+    filler = autoupdate_filler(m, kind, limit)
+    return (chunks + ([None] if with_map else [])
+            + [filler] * (slots - len(chunks)))
 
 # ---- !find ----------------------------------------------------------
 # Token-based entity query. Each arg is one predicate; all predicates
@@ -18299,8 +18704,8 @@ def _find_match_corpse(m: Match, cid: str, loc: Tuple[Any, ...],
 
     def one(kind: str, key: str, val: Optional[str]) -> bool:
         if kind == "status":
-            st = ent.get("status")
-            return isinstance(st, dict) and key in st
+            return key in m.visible_statuses(ent.get("status"), pov,
+                                             corpse_id=cid)
         if kind == "group":
             groups = corpse.get("groups") if isinstance(corpse, dict) else None
             mine = groups.get(cid) if isinstance(groups, dict) else None
@@ -18694,6 +19099,30 @@ def _table_roll_reply(m: Match, name: str, reps: int,
     return (f"🎲 {times}table `{name}`{kept}{adj} → "
             + ", ".join(_shown(*r) for r in results)
             + "".join(f"\n{n}" for n in dict.fromkeys(notes)))
+
+
+def _action_args_hint(action: Any, actor_id: str,
+                      words: List[str]) -> str:
+    """What an action takes after its target (L56): a positional word
+    past the target names no argument, so the refusal lists the
+    `args.<key>` its programs read and points at `!action info`."""
+    if not words or "=" in words[0]:
+        return ""
+    keys: List[str] = []
+    for prog in (getattr(action, "prepare", ""), getattr(action, "cost", ""),
+                 getattr(action, "body", ""), getattr(action, "condition", "")):
+        for k in re.findall(r"\bargs\.([A-Za-z_]\w*)", str(prog or "")):
+            if k not in keys:
+                keys.append(k)
+    target = getattr(action, "target_type", "none")
+    takes = (f" `{action.name}` takes " + (
+        f"a {target} target, then " if target not in ("none", None, "")
+        else "") + "arguments as `key=value`")
+    if keys:
+        takes += " (its formulas read " + ", ".join(
+            f"`{k}=`" for k in keys) + ")"
+    return (f".{takes}; `!action info {actor_id} {action.name}` "
+            f"describes it.")
 
 
 @registry.command(
@@ -19362,12 +19791,22 @@ async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command("state", access="all", usage="!state [full]", desc="Show match summary, entities, and map from this channel's POV. `!state full` (host-gated) forces the omniscient view.")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if args and args[0].lower() == "autoupdate":
+        return await _autoupdate_cmd(ctx, args, mgr, "state")
     # New behavior: show list (turn-order) then map. The `full` arg (when
     # present) flows through to list_cmd / map_cmd, which resolve it to
     # the omniscient POV; match_top_cmd ignores it.
     await match_top_cmd(ctx, args, mgr)
     await list_cmd(ctx, args, mgr)
     await map_cmd(ctx, args, mgr)
+
+registry.annotate_sub(
+    "state", "autoupdate", usage="!state autoupdate [on|off] [reserve=<n>]",
+    desc="Discord: a board of `!state` (summary, roster, map) that "
+         "refreshes itself after every change, read as the channel's "
+         "players read it. It posts its messages once (`reserve=`, else "
+         "the rule autoupdate_reserved_messages, at least 2: the map takes "
+         "one) and fills them from the top.")
 
 # ---- !history -----------------------------------------------------------
 # Per-match save history: manual saves, automatic round/turn/command
@@ -19896,6 +20335,19 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Undoing turns", n, "turn(s)",
                     f"turn {n}", erased,
                 ))
+            if _undo_changes_nothing(ctx, m, snap):
+                # T13: back to the start of this turn, and nothing has
+                # changed since it began: offer the turn before.
+                more = await _offer_further(
+                    ctx, m, "turn", n,
+                    f"Nothing has changed since "
+                    f"{snap.active_entity_id or 'no-active'}'s turn began "
+                    f"(round {snap.round_at_snapshot}): `!undo turn {n}` "
+                    f"lands where the board is now.")
+                if more is None:
+                    return
+                n = more
+                snap = m.history.get_turn_nth_back(n)
             bmode = await _resolve_bindings_mode(ctx, m, snap, args)
             if bmode is None:
                 return
@@ -19928,6 +20380,16 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Undoing rounds", n, "round(s)",
                     f"round {n}", erased,
                 ))
+            if _undo_changes_nothing(ctx, m, snap):
+                more = await _offer_further(
+                    ctx, m, "round", n,
+                    f"Nothing has changed since round "
+                    f"{snap.round_at_snapshot} began: `!undo round {n}` "
+                    f"lands where the board is now.")
+                if more is None:
+                    return
+                n = more
+                snap = m.history.get_round_nth_back(n)
             bmode = await _resolve_bindings_mode(ctx, m, snap, args)
             if bmode is None:
                 return
@@ -20132,6 +20594,58 @@ def _authors_line(m: Match, lo: int, hi: Optional[int],
         return []
     verb = "Undoes changes by" if undone else "Changes by"
     return [f"{verb}: {', '.join(who)}"]
+
+
+def _undo_changes_nothing(ctx, m: Match, snap: Snapshot) -> bool:
+    """True when restoring `snap` would leave the board as it is (T13: an
+    `!undo turn 1` at the start of a turn restores the state already
+    there), judged with the undo preview's diff."""
+    from types import SimpleNamespace
+    try:
+        now = SimpleNamespace(state=m.to_dict(include_history=False))
+        after = Match.from_dict(copy.deepcopy(snap.state))
+        after.rules = dict(m.rules)
+        after.sync_all_var_names()
+        lines = _format_snapshot_diff(
+            now, SimpleNamespace(state=after.to_dict(include_history=False)),
+            "now", "undo", _diff_rule_text(ctx, m))
+    except Exception:
+        return False
+    return "(no differences)" in lines
+
+
+async def _offer_further(ctx, m: Match, kind: str, n: int,
+                         nothing: str) -> Optional[int]:
+    """An undo that would change nothing (`nothing` says so) offers the step
+    past it, yes / no: Discord asks with buttons (`offer_confirm`, Yes
+    runs `!undo <kind> <n+1> confirm` as the clicker), the CLI and GUI ask
+    inline (`prompt_choice`; returns n + 1 on yes, so the caller restores
+    that one), elsewhere the reply names the command. None when the
+    command is done."""
+    try:
+        snap = (m.history.get_turn_nth_back(n + 1) if kind == "turn"
+                else m.history.get_round_nth_back(n + 1))
+    except (VTTError, IndexError, KeyError):
+        await ctx.send(nothing + " There is no earlier one to go back to.")
+        return None
+    where = (f"{snap.active_entity_id or 'no-active'}'s turn (round "
+             f"{snap.round_at_snapshot})" if kind == "turn"
+             else f"round {snap.round_at_snapshot}")
+    question = f"{nothing} Undo to the start of {where} instead?"
+    args = [kind, str(n + 1), "confirm"]
+    offer = getattr(ctx, "offer_confirm", None)
+    if offer is not None:
+        await offer(m, question, "undo", args)
+        return None
+    prompt = getattr(ctx, "prompt_choice", None)
+    if prompt is not None:
+        ans = await prompt(question, ["yes", "no"], None, None)
+        if str(ans or "").strip().lower() in ("yes", "y"):
+            return n + 1
+        await ctx.send("Left as it is.")
+        return None
+    await ctx.send(f"{question} `!undo {kind} {n + 1}` does it.")
+    return None
 
 
 async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
@@ -24580,6 +25094,7 @@ for _sub, _usage in (
         ("tick", "!status tick <name> <formula ...>"),
         ("hook", "!status hook <name> <on_added|on_removed|on_changed> [<formula ...>]"),
         ("display", "!status display <name> [<format ...>]"),
+        ("visibility", "!status visibility <name> [<formula ...>]"),
         ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
         ("stack", "!status stack <name> <layered|refresh|add_level|extend|replace|none>"),
         ("maxlevel", "!status maxlevel <name> <n>"),
@@ -24724,7 +25239,8 @@ _STACK_MODES = ("layered", "refresh", "add_level", "extend", "replace",
 # The `!status` subcommands that edit definitions, which `!system status`
 # runs on a system's library too: sub -> the words it needs.
 _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
-                    "hook": 3, "display": 2, "when": 3, "sprite": 3,
+                    "hook": 3, "display": 2, "visibility": 2,
+                    "when": 3, "sprite": 3,
                     "stack": 3, "maxlevel": 3, "data": 4, "tags": 2,
                     "removes": 2, "blockedby": 2,
                     **{f: 2 for f in ACTION_RESTRICTION_FIELDS},
@@ -24741,6 +25257,7 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
 # definition holding the entry, so it validates the same way).
 _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "display": "display", "sprite": "sprite",
+                     STATUS_VISIBILITY_FIELD: "visibility",
                      GRANTS_UNIT_TAGS: GRANTS_UNIT_TAGS,
                      STATUS_UNIT_TAG_BLOCK: STATUS_UNIT_TAG_BLOCK,
                      "resist_affects": "resist_affects",
@@ -24760,15 +25277,23 @@ _STATUS_LEVEL_USAGE = ("!status level <name> list | "
 
 
 def _status_level_formulas(sdef: Any) -> List[Tuple[str, str, str]]:
-    """(where, formula, mode) of every formula a status definition's level
-    entries hold (#259): ticks and `_unless` expressions."""
+    """(where, formula, mode) of the visibility condition of a status
+    definition and of every formula its level entries hold (#259): ticks,
+    visibility conditions and `_unless` expressions."""
     out: List[Tuple[str, str, str]] = []
+    vis = sdef.get(STATUS_VISIBILITY_FIELD) if isinstance(sdef, dict) else None
+    if isinstance(vis, str) and vis.strip():
+        out.append((STATUS_VISIBILITY_FIELD, vis, "eval"))
     levels = sdef.get(STATUS_LEVELS_FIELD) if isinstance(sdef, dict) else None
     for spec, ent in sorted((levels or {}).items()):
         if not isinstance(ent, dict):
             continue
         if isinstance(ent.get("tick"), str) and ent["tick"].strip():
             out.append((f"level `{spec}` tick", ent["tick"], "exec"))
+        src = ent.get(STATUS_VISIBILITY_FIELD)
+        if isinstance(src, str) and src.strip():
+            out.append((f"level `{spec}` {STATUS_VISIBILITY_FIELD}", src,
+                        "eval"))
         for fld in ACTION_RESTRICTION_FIELDS:
             src = ent.get(fld + UNLESS_SUFFIX)
             if isinstance(src, str) and src.strip():
@@ -25345,12 +25870,34 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                 f"{sub[:-len(UNLESS_SUFFIX)]} while true)."
                 + (f"\n{warn}" if warn else ""))
 
+    if sub == "visibility":
+        # The expression deciding which team views see the status
+        # (replacing status_visibility_condition for it); none clears it.
+        if await return_help_if_not_enough_args(ctx, args, 2, "status",
+                                                 "visibility"):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        body = normalize_body_source(" ".join(args[2:]).strip())
+        if not body:
+            if m.status_definitions[name].pop(STATUS_VISIBILITY_FIELD,
+                                              None) is None:
+                return (f"❌ `{name}` has no visibility condition.")
+            return (f"Cleared `{name}`'s visibility condition (it follows "
+                    f"status_visibility_condition).")
+        warn = check(body, STATUS_VISIBILITY_FIELD, "eval")
+        m.status_definitions[name][STATUS_VISIBILITY_FIELD] = body
+        return (f"`{name}` shows to a team view while `{body}` is true "
+                f"(self = the bearer, status_name, pov_team bound)."
+                + (f"\n{warn}" if warn else ""))
+
     return None
 
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|tick_priority|data|tags|"
+    usage=("!status <def|drop|rename|copy|tick|hook|display|visibility|when|stack|maxlevel|tick_priority|data|tags|"
            "removes|blockedby|forbids_actions_with_tag|forbids_actions_with_name|"
            "immune_to_actions_with_tag|immune_to_actions_with_name|"
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
@@ -25391,6 +25938,11 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         "`display <name> <format>` sets how the status shows in the "
         "`{statuses}` roster placeholder (its fields are placeholders, as in "
         "the status_line_format rule); no format clears it. "
+        "`visibility <name> <formula>` decides which team views see the "
+        "status (in the unit lines, the description, `!find status:` and "
+        "image overlays; self = the bearer, status_name and pov_team "
+        "bound), replacing the status_visibility_condition rule for it; no "
+        "formula clears it. "
         "`forbids_actions_with_tag|forbids_actions_with_name <name> <words>` "
         "forbid the bearer actions with those tags / names, "
         "`immune_to_actions_with_tag|immune_to_actions_with_name` keep "
@@ -26800,6 +27352,9 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any],
     `only` (a `!simulate` run, X16): the matches the run reached; the rest
     are left as they are unless deleted or replaced (comparing a big match
     nobody touched cost a serialization per run)."""
+    # A reaction window the undone lines opened isn't posted (R5).
+    if getattr(mgr, "_window_posts", None):
+        mgr._window_posts = []
     from action import _rollback_match
     pre = snap["matches"]
     for mid in [mid for mid in mgr.matches if mid not in pre]:
@@ -27021,9 +27576,10 @@ class _SimCtx:
     def __init__(self, inner: ReplyContext):
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "replies", [])
-        for k in ("prompt_choice", "offer_resume", "post_scene_image",
-                  "show_scene_view", "set_autoupdate",
-                  "retire_server_boards"):
+        for k in ("prompt_choice", "offer_resume", "offer_confirm",
+                  "post_scene_image",
+                  "show_scene_view", "set_autoupdate", "set_roster_autoupdate",
+                  "retire_server_boards", "post_to_channel"):
             object.__setattr__(self, k, None)
 
     def __getattr__(self, name: str) -> Any:
@@ -28394,9 +28950,13 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         limit = int(m.rules.get(
             "table_nesting_limit",
             RULES_REGISTRY["table_nesting_limit"]["default"]))
+        row_limit = int(m.rules.get(
+            "table_odds_row_limit",
+            RULES_REGISTRY["table_odds_row_limit"]["default"]))
         try:
-            rows = table_odds_rows(m.tables, name, adjust=adjust, keep=keep,
-                                   limit=limit)
+            rows, cut = table_odds_rows(m.tables, name, adjust=adjust,
+                                        keep=keep, limit=limit,
+                                        row_limit=row_limit)
         except FormulaError as ex:
             return await ctx.send(f"❌ {ex}")
         head = f"🎲 table `{name}`"
@@ -28409,8 +28969,10 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         width = max(len("  " * d + k) for d, k, _p in rows) if rows else 0
         lines = [f"{'  ' * d + k:<{width}}  {_fmt_pct(p):>7}"
                  for d, k, p in rows]
+        tail = (f"\n✂️ … the rows past {row_limit} are left out "
+                f"(table_odds_row_limit)." if cut else "")
         return await ctx.send(head + ":\n```\n" + "\n".join(lines)
-                              + "\n```")
+                              + "\n```" + tail)
 
     if sub == "rank":
         if await return_help_if_not_enough_args(ctx, args, 2, "table", "rank"):
@@ -29156,7 +29718,7 @@ async def assert_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     "mount",
     usage=(
         "!mount <rider> <vehicle> <slot> | !mount dismount <rider> [x y] | "
-        "!mount switch <rider> <slot> | !mount list <vehicle> | "
+        "!mount switch <rider> <slot> | !mount list [<vehicle>] | "
         "!mount info <vehicle> [slot]"
     ),
     desc=(
@@ -30530,7 +31092,100 @@ def _imported_system(mgr: MatchManager, raw: Any,
             raise VTTError(f"`{raw['name']}`: `{lib}` isn't an object.")
     if d.get("parent") is not None and not isinstance(d["parent"], str):
         raise VTTError(f"`{raw['name']}`: `parent` isn't a system name.")
+    _check_imported_libraries(raw["name"], d)
     return GameSystem.from_dict(copy.deepcopy(d)).to_dict()
+
+
+def _check_imported_libraries(sname: str, d: Dict[str, Any]) -> None:
+    """A file's library entries checked as their editors check them (S8):
+    each entry's shape (prefab's checks for tile templates, functions and
+    status / zone definitions; tables through check_table_text; aliases
+    starting with a real command; tags, watchers, var labels, damage and
+    healing steps), then every formula the system stores, as `!system
+    lint` reads them: a construct the sandbox refuses refuses the file (a
+    call to a function the file doesn't define is allowed, as the editors
+    allow it). Raises VTTError naming the entry; changes nothing."""
+    import damage as _damage
+    from prefab import (_check_tile_template, _check_formula_function,
+                        _check_status_definition, _check_grant_condition)
+    own = f"System `{sname}`"
+
+    def lib(kind: str) -> Dict[str, Any]:
+        v = d.get(kind)
+        return v if isinstance(v, dict) else {}
+
+    for tname, entry in lib("tile_templates").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: tile template `{tname}` isn't an object.")
+        lib("tile_templates")[tname] = _check_tile_template(
+            entry, sname, tname, own)
+    for fname, entry in lib("formula_functions").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: function `{fname}` isn't an object.")
+        lib("formula_functions")[fname] = _check_formula_function(
+            entry, sname, fname, own)
+    for st, entry in lib("status_definitions").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: status definition `{st}` isn't an "
+                           f"object.")
+        _check_status_definition(entry, sname, st, owner=own)
+    for zname, entry in lib("zone_definitions").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: zone definition `{zname}` isn't an "
+                           f"object.")
+        check_zone_def_name(zname)
+        _check_grant_condition(entry, f"{own}: zone definition `{zname}`")
+        lib("zone_definitions")[zname] = normalize_zone_def(entry)
+    tables = {k: v for k, v in lib("tables").items()}
+    for tname, text in tables.items():
+        if not isinstance(text, str):
+            raise VTTError(f"{own}: table `{tname}` isn't text.")
+        try:
+            check_table_text(tname, text, tables)
+        except FormulaError as ex:
+            raise VTTError(f"{own}: table `{tname}`: {ex}")
+    for aname, expansion in lib("aliases").items():
+        if not isinstance(expansion, str) or not expansion.strip():
+            raise VTTError(f"{own}: alias `{aname}` has no expansion.")
+        if aname.lower() in registry._handlers:
+            raise VTTError(f"{own}: alias `{aname}` takes a command's name.")
+        try:
+            tokens = split_command_line(expansion)
+        except ValueError as ex:
+            raise VTTError(f"{own}: alias `{aname}`: {ex}")
+        if not tokens or tokens[0] not in registry._handlers:
+            raise VTTError(f"{own}: alias `{aname}` must start with a real "
+                           f"command.")
+    for mname, body in lib("macros").items():
+        if not isinstance(body, str):
+            raise VTTError(f"{own}: macro `{mname}` isn't text.")
+    for tag, desc in lib("tag_vocabulary").items():
+        check_tag(tag)
+        if not isinstance(desc, str):
+            raise VTTError(f"{own}: the description of tag `{tag}` isn't "
+                           f"text.")
+    for wname, spec in lib("watchers").items():
+        why = watcher_spec_problem(spec)
+        if why:
+            raise VTTError(f"{own}: watcher `{wname}`: {why}")
+    for path, label in lib("var_labels").items():
+        why = var_label_problem(path, label)
+        if why:
+            raise VTTError(f"{own}: var label `{path}`: {why}")
+    for kind, key in (("damage", "damage_steps"),
+                      ("healing", "healing_steps")):
+        for step_name, step in lib(key).items():
+            try:
+                lib(key)[step_name] = _damage.normalize_step(kind, step)
+            except VTTError as ex:
+                raise VTTError(f"{own}: {kind} step `{step_name}`: {ex}")
+    known = frozenset(lib("formula_functions"))
+    settings = d.get("settings") or {}
+    for where, src, mode, params, action_mode in _system_formula_slots(
+            lambda k: (settings.get(k) or {}).get("value"), lib):
+        err = _lint_one(src, mode, known, params, action_mode)
+        if err and not re.match(r"Function '(\w+)' is not allowed\.", err):
+            raise VTTError(f"{own}: {where}: {err}")
 
 
 def _merged_system(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
@@ -31048,7 +31703,11 @@ async def _run_action_dispatch(
             action.target_type, pruned, m, actor_id, missing=missing,
             missing_corpse=missing_corpse, map_of=map_of,
         )
-        args_dict = parse_args_tokens(remaining)
+        try:
+            args_dict = parse_args_tokens(remaining)
+        except VTTError as ex:
+            raise VTTError(str(ex).rstrip(".")
+                           + _action_args_hint(action, actor_id, remaining))
     except VTTError as ex:
         return await ctx.send(f"❌ action `{action.name}`: {ex}")
     from action import dedupe_targets

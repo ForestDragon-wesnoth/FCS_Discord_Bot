@@ -543,10 +543,14 @@ DICE_LOG: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
     "DICE_LOG", default=None)
 
 
-def _note_roll(label: Any, spec: Any, total: Any) -> None:
+def _note_roll(label: Any, spec: Any, total: Any,
+               owner: Optional[str] = None) -> None:
+    """Note a roll for the action dice line (#520): its label, spec, total
+    and the unit whose formula made it (`self`, V27), so a view that can't
+    see that unit doesn't read the roll."""
     log = DICE_LOG.get()
     if log is not None:
-        log.append((label, spec, total))
+        log.append((label, spec, total, owner))
 
 
 def _dice_test(op: str, n: int):
@@ -830,7 +834,8 @@ def _parse_dice(spec: Any, where: str) -> list:
     return out
 
 
-def _roll_impl(rng, spec: Any, label: Any = None) -> int:
+def _roll_impl(rng, spec: Any, label: Any = None,
+               owner: Optional[str] = None) -> int:
     """roll("2d6+3", label=None): evaluate dice notation and return the
     integer total. Thin wrapper over roll_detail (which also returns the
     per-term breakdown); the label names the roll on an action's dice
@@ -838,7 +843,7 @@ def _roll_impl(rng, spec: Any, label: Any = None) -> int:
     if label is not None and not isinstance(label, str):
         raise FormulaError("roll(spec, label=None): label must be text.")
     total = roll_detail(rng, spec)[0]
-    _note_roll(label, spec, total)
+    _note_roll(label, spec, total, owner)
     return total
 
 
@@ -890,6 +895,13 @@ def _echo(text: Any, limit: int = 60) -> str:
 # a player's `!roll odds 1000d1000` can't stall the bot.
 _ODDS_MAX_STEPS = 2_000_000
 _ODDS_MAX_KEEP_COMBOS = 200_000
+# The odds work one top-level command may do in all (X28): every
+# dice_distribution of the command (`!roll odds`, roll_odds / roll_mean in
+# formulas and `$()`) charges its steps here, faces and an exploding die's
+# chain included, so a message of many million-face calls stops at the
+# first that passes it. None outside a command (the per-call limit only).
+ODDS_BUDGET: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
+    "vtt_odds_budget", default=None)
 # An exploding die's chain is cut once its probability falls below this.
 _ODDS_EXPLODE_EPS = 1e-12
 
@@ -905,6 +917,8 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
     where = "dice odds"
     steps = 0
 
+    box = ODDS_BUDGET.get()
+
     def _spend(n: int) -> None:
         nonlocal steps
         steps += n
@@ -912,6 +926,13 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
             raise FormulaError(
                 f"'{_echo(spec)}' has too many outcomes to work out exact "
                 f"odds.")
+        if box is not None:
+            box[0] += n
+            if box[0] > _ODDS_MAX_STEPS:
+                raise FormulaError(
+                    f"'{_echo(spec)}': this command has already worked out "
+                    f"as many dice odds as one command may "
+                    f"({_ODDS_MAX_STEPS:,} steps).")
 
     def _conv(a: Dict[int, Any], b: Dict[int, Any]) -> Dict[int, Any]:
         _spend(len(a) * len(b))
@@ -930,6 +951,7 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
         out: Dict[int, float] = {}
         base, depth = 0, 0
         while True:
+            _spend(g.hi - g.lo)
             for f in range(g.lo, g.hi):
                 v = base + worth(f)
                 out[v] = out.get(v, 0.0) + reach * p
@@ -946,6 +968,9 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
         if isinstance(g, int):
             dist = {v + g: w for v, w in dist.items()}
             continue
+        # The faces are counted before their table is built (X28: a
+        # million-face die built two tables before any step was counted).
+        _spend(g.hi - g.lo + 1)
         fw = g.face_weights()
         worth = g.score if g.success is not None else (lambda f: f)
         if g.keep is not None:
@@ -1116,17 +1141,21 @@ def roll_table_pick(rng, spec: Any) -> str:
 # entries it leaves out follow in the order written). An entry `@<table>`
 # rolls that table when picked, and `{<dice>}` inside an entry's text is
 # replaced by a roll of the dice (#459).
-_TABLE_RANK_RE = re.compile(r"(?:^|\s)rank=(\S*)\s*$")
 _TABLE_DICE_RE = re.compile(r"\{([^{}]*)\}")
 
 
 def split_table_rank(text: str) -> Tuple[str, Optional[List[str]]]:
-    """(spec, rank or None) of a named table's stored text."""
-    mm = _TABLE_RANK_RE.search(text)
-    if mm is None:
+    """(spec, rank or None) of a named table's stored text: the rank is
+    everything after the last ` rank=` (at the start or after a space), so
+    it names entries holding spaces (L57: `rank=a bow,gold` read `a` as
+    the rank and made `gold rank=a bow` an entry)."""
+    i = text.rfind("rank=")
+    while i > 0 and not text[i - 1].isspace():
+        i = text.rfind("rank=", 0, i)
+    if i < 0:
         return text, None
-    rank = [w.strip() for w in mm.group(1).split(",") if w.strip()]
-    return text[:mm.start()].rstrip(), rank
+    rank = [w.strip() for w in text[i + 5:].split(",") if w.strip()]
+    return text[:i].rstrip(), rank
 
 
 def table_text(spec: str, rank: Optional[List[str]]) -> str:
@@ -1294,10 +1323,16 @@ def roll_named_table(rng, tables: Dict[str, str], name: str, *,
 def table_odds_rows(tables: Dict[str, str], name: str, *,
                     adjust: Optional[Dict[str, float]] = None,
                     keep: Optional[Tuple[str, int]] = None,
-                    limit: int = 8) -> List[Tuple[int, str, float]]:
+                    limit: int = 8, row_limit: int = 500
+                    ) -> Tuple[List[Tuple[int, str, float]], bool]:
     """The chances of a named table as rows (depth, entry, chance): each
     entry's overall chance, an `@` entry's sub-table rows under it, one
-    level deeper. best / worst change the top table's chances."""
+    level deeper. best / worst change the top table's chances. Entries of
+    one level naming the same sub-table are one row (`@ b` and `@  b`); a
+    path stops at a table it already passed through, its row marked
+    "(back to `t`)" (X27: a loop between two tables of six entries listed
+    two million rows). Returns (rows, cut): at most `row_limit` rows, cut
+    True when more were left out."""
     def _probs(text: str, adj: Optional[Dict[str, float]]) -> list:
         pairs = adjusted_entries(text, adj or {})
         total = sum(w for _k, w in pairs)
@@ -1321,18 +1356,41 @@ def table_odds_rows(tables: Dict[str, str], name: str, *,
             worse = max(0.0, worse - p[k])
         top = [(k, out[k]) for k, _p in top]
     rows: List[Tuple[int, str, float]] = []
+    cut = [False]
 
-    def _walk(entries: list, chance: float, depth: int, seen: int) -> None:
+    def _grouped(entries: list) -> list:
+        out: list = []
+        at: Dict[str, int] = {}
         for k, pk in entries:
+            sub = table_sub(k)
+            if sub is None:
+                out.append([k, pk, None])
+            elif sub in at:
+                out[at[sub]][1] += pk
+            else:
+                at[sub] = len(out)
+                out.append([f"@{sub}", pk, sub])
+        return out
+
+    def _walk(entries: list, chance: float, depth: int,
+              path: Tuple[str, ...]) -> None:
+        for k, pk, sub in _grouped(entries):
             if pk <= 0:
                 continue
-            rows.append((depth, k, chance * pk))
-            sub = table_sub(k)
-            if sub is not None and sub in tables and seen < limit:
+            if len(rows) >= row_limit:
+                cut[0] = True
+                return
+            back = sub is not None and sub in path
+            rows.append((depth, k + (f" (back to `{sub}`)" if back else ""),
+                         chance * pk))
+            if sub is not None and not back and sub in tables \
+                    and len(path) < limit:
                 _walk(_probs(tables[sub], None), chance * pk, depth + 1,
-                      seen + 1)
-    _walk(top, 1.0, 0, 1)
-    return rows
+                      path + (sub,))
+                if cut[0]:
+                    return
+    _walk(top, 1.0, 0, (name,))
+    return rows, cut[0]
 
 
 def _roll(spec: Any, label: Any = None) -> int:
@@ -1351,7 +1409,7 @@ def _roll(spec: Any, label: Any = None) -> int:
 
 
 def _roll_dice_impl(rng, spec: Any, all: Any = False,
-                    label: Any = None) -> list:
+                    label: Any = None, owner: Optional[str] = None) -> list:
     if not isinstance(all, bool):
         raise FormulaError("roll_dice(spec, all=False): all= must be True or "
                            "False.")
@@ -1364,7 +1422,7 @@ def _roll_dice_impl(rng, spec: Any, all: Any = False,
     except FormulaError as ex:
         raise FormulaError(str(ex).replace("roll(spec)", "roll_dice(spec)",
                                            1))
-    _note_roll(label, spec, total)
+    _note_roll(label, spec, total, owner)
     return out
 
 
@@ -5706,6 +5764,9 @@ class FormulaEngine:
         # Closures over `rng` (no `_r=rng` default): an extra positional
         # argument used to land on the RNG parameter (a raw Python error).
         rng = self._match.formula_rng() if self._match else random
+        # Whose roll it is on an action's dice line (V27): this formula's
+        # `self`.
+        owner = ctx.target if isinstance(ctx.target, str) else None
         if rng is not random:
             def random_int(lo, hi):
                 return _random_int_impl(rng, lo, hi)
@@ -5720,14 +5781,14 @@ class FormulaEngine:
                 return _shuffle_impl(rng, v)
 
             def roll(spec, label=None):
-                return _roll_impl(rng, spec, label)
+                return _roll_impl(rng, spec, label, owner)
 
             def chance(percent):
                 return _chance_impl(rng, percent)
 
             def roll_dice(spec, all=False, label=None):
-                return _charge(_roll_dice_impl(rng, spec, all, label),
-                               "roll_dice")
+                return _charge(_roll_dice_impl(rng, spec, all, label,
+                                               owner), "roll_dice")
             for fn in (random_int, random_string, pick, shuffle, roll,
                        chance, roll_dice):
                 fn.__wrapped__ = _ALLOWED_FUNCS[fn.__name__]

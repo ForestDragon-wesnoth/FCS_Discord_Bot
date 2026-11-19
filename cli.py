@@ -72,6 +72,11 @@ class CLICtx:
     async def send(self, message: str):
         print(message)
 
+    async def post_to_channel(self, channel_key: str, text: str):
+        """A post to another channel (a reaction window shown to a team's
+        channel, R5): shown here with the channel it went to."""
+        await self.send(f"📨 to `{channel_key}`:\n{text}")
+
     async def prompt_choice(self, prompt, options, lo, hi):
         """Interactive mid-action choice prompt (choose / choose_number).
         Returns the typed answer as a string, or None to cancel. Blocking

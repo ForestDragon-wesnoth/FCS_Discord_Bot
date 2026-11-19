@@ -37,6 +37,10 @@ scenario's workspace, and replies with the completed line (`→ ...`) and the
 candidates; `??` / `?!` lines after it check that reply. Quote <text> to
 keep a trailing space: `?tab "!ent hp "`.
 
+Roster boards: a line `?board list|state [reserve=<n>]` prints the messages
+a `!list` / `!state` autoupdate board (Discord-only in play) would show in
+the scenario's channel now.
+
 Usage:
     python run_scenarios.py                 # run all, summarize failures
     python run_scenarios.py -v              # also print a transcript
@@ -135,6 +139,11 @@ class _Ctx:
     async def send(self, message: str) -> None:
         self.out.append(message)
 
+    async def post_to_channel(self, channel_key: str, text: str) -> None:
+        """A post to another channel (R5: a reaction window shown to a
+        team's channel), printed in the transcript with its channel."""
+        self.out.append(f"📨 to `{channel_key}`:\n{text}")
+
 
 def _interpret_escapes(raw: str) -> str:
     """Convert the documentation escapes `\\n` and `\\t` into the real
@@ -168,7 +177,7 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str
         for ln in body.splitlines():
             if ln.strip().lower().startswith("expected:"):
                 break
-            if ln.startswith(("!", _TAB_PREFIX, _FILE_PREFIX)) \
+            if ln.startswith(("!", _TAB_PREFIX, _FILE_PREFIX, _BOARD_PREFIX)) \
                     or ln.startswith(_EXPECT_PREFIXES):
                 cmds.append(ln)
         out.append((num, title, cmds, allows))
@@ -295,6 +304,39 @@ def _file_edit(line: str, words: List[str], st, ctx) -> List[str]:
     return out
 
 
+# `?board list|state [reserve=<n>]`: the messages a `!list` / `!state`
+# autoupdate board in the scenario's channel would show now (Discord-only
+# in play), one `[message i/n]` line before each; a state board's map
+# message reads `(the map board)`.
+_BOARD_PREFIX = "?board "
+
+
+def _board_reply(line: str, mgr, ctx) -> List[str]:
+    import vtt_commands
+    words = line[len(_BOARD_PREFIX):].split()
+    if not words or words[0] not in vtt_commands.AUTOUPDATE_KINDS:
+        return ["💥 Usage: ?board list|state [reserve=<n>]"]
+    kind = words[0]
+    given = next((w.split("=", 1)[1] for w in words[1:]
+                  if w.startswith("reserve=")), None)
+    mid = mgr.get_active_for_channel(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid else None
+    if m is None:
+        return ["(no match in this channel)"]
+    try:
+        slots = vtt_commands.autoupdate_reserve(m, kind, given)
+    except vtt_commands.VTTError as e:
+        return [f"❌ {e}"]
+    text = vtt_commands.autoupdate_board_text(mgr, m, ctx.channel_key, kind)
+    msgs = vtt_commands.autoupdate_board_messages(m, text, slots, kind)
+    out: List[str] = []
+    for i, msg in enumerate(msgs, 1):
+        out.append(f"[message {i}/{len(msgs)}, "
+                   f"{len(msg) if msg is not None else 0} characters]")
+        out.append(msg if msg is not None else "(the map board)")
+    return out
+
+
 def _tab_reply(line: str, mgr, ctx) -> List[str]:
     """The reply for a `?tab <text>` line: what Tab does at its end."""
     from completion import apply_completion, complete, format_candidates
@@ -357,6 +399,14 @@ async def _run_cmds(cmds: List[str], workspaces) -> List[Tuple[str, List[str]]]:
             continue
         if line.startswith(_FILE_PREFIX):
             out = _file_action(line, workspaces, ctx)
+            transcript.append((line, out))
+            previous = out
+            continue
+        if line.startswith(_BOARD_PREFIX):
+            try:
+                out = _board_reply(line, workspaces.get(ctx.guild_key), ctx)
+            except Exception as e:  # noqa: BLE001 - surface as a flagged failure
+                out = [f"💥 Uncaught: {type(e).__name__}: {e}"]
             transcript.append((line, out))
             previous = out
             continue

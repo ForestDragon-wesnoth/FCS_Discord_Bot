@@ -28120,7 +28120,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 !status apply u burn 2 3
 !ent status u add mark
 !ent info u short
-?? Status: burn ×2 (3), mark
+?? Status: burn ×2 (3 turns), mark
 !status def rot
 !status display rot "rot (-{lost} max hp)"
 ?? `rot` shows as `rot (-{lost} max hp)` in `{statuses}`.
@@ -28128,7 +28128,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 !ent status u set rot lost 30
 !system set default entity_line_format "{name}: {statuses}"
 !list
-?? U: burn ×2 (3), mark, rot (-30 max hp)
+?? U: burn ×2 (3 turns), mark, rot (-30 max hp)
 !system set default status_line_format "{?level?}{level}x {/?}{name}"
 !status display rot
 !list
@@ -28139,7 +28139,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 ?? U corpse: 2x burn, mark, 1x rot
 
 Expected: `!ent info` lists each status with its level and duration
-(`burn ×2 (3)`); a status with neither shows its name. A `{statuses}`
+(`burn ×2 (3 turns)`); a status with neither shows its name. A `{statuses}`
 placeholder gives entity_line_format / entity_info_format /
 corpse_line_format the same text, each status through the
 status_line_format rule (any instance field is a placeholder) or its
@@ -34264,7 +34264,7 @@ HARNESS-ALLOWS-ERRORS (a stray word after `!ent info <id>` is refused)
 ?! description:
 ?! hp:
 !ent info knight short
-?? Status: bleed ×2 (3)
+?? Status: bleed ×2 (3 turns)
 ?? Inventory: {sword, rations}
 ?! Details
 ?! A sworn sword
@@ -34351,7 +34351,7 @@ SCENARIO 1009 — The description's readable vars: whitelist, blacklist paths, `
 ?? - max_hp: 12
 !system set default entity_description_line_limit 3
 !ent info mage
-?? more lines)
+?? more lines (`!ent get mage <var>` reads one; the rule entity_description_line_limit)
 !assert "len(rule_get('entity_description_hidden_vars')) > 0"
 !system unset default entity_description_hidden_vars
 !system unset default entity_description_shown_vars
@@ -34367,8 +34367,10 @@ values is joined, a bool reads yes / no, a 0 still shows. A blacklist path
 spell's and the cloak's). The whitelist entity_description_shown_vars
 (`stats, gear.cloak`) shows only those paths, the blacklist still applying
 inside them. Dropping `@engine` from the blacklist puts hp / max_hp in
-Details; entity_description_line_limit 3 cuts the section with a count of
-the lines left out.
+Details; entity_description_line_limit 3 cuts the section with a bullet
+counting the lines left out and naming `!ent get` (a bullet: as a plain
+line after the list, Discord ran it and the next header together). The
+rule's default is no limit.
 
 SCENARIO 1010 — Action visibility: all, allies, used; `!action list` / `info`, `!find action:`, Tab; what a use records
 ---------------------------------------------------------------------------------------------------------------------
@@ -37262,7 +37264,7 @@ SCENARIO 1058 — Layered status stacking in real use: a burn DoT dealing its le
 !assert "status_layers('a', 'burn') == [[3, 2], [1, 5]] and status_layers('b', 'burn') == [[3, 2], [1, 5]]"
 !assert "status_level('a', 'burn') == 3 and status_duration('a', 'burn') == 5"
 !ent info a short
-?? Status: burn ×3 (5): ×3 for 2, then ×1 for 3 more
+?? Status: burn ×3 (5 turns): ×3 for 2, then ×1 for 3 more
 !turn next
 !turn next
 !assert "entity['a'].hp == 17 and status_layers('a', 'burn') == [[3, 1], [1, 4]]"
@@ -45232,3 +45234,821 @@ a label must be text. The line is about the acting unit: with fog on, a
 channel seeing as blue doesn't get the line of the 2x1 orc out of its
 sight (an action a formula starts, here `!eval`), gets the hero's, and
 red's channel gets the orc's.
+
+
+SCENARIO 1232 — A dragged corpse takes its located parts, its snake segments and its trail along (R3)
+----------------------------------------------------------------------------------------------------
+
+!match new dr Dr 14 10
+!match use dr
+!map new cave 12 12
+!ent add boss Boss 30 2 2 10 map=main footprint_w=2
+!part add boss boss_arm Arm 10 10
+!part locate boss_arm 5 2
+!ent kill boss
+!ent tp boss 8 5
+?? Moved the corpse of `boss` to (8,5)
+!ent revive boss
+!assert "entity[boss].x == 8 and entity[boss].y == 5 and entity[boss_arm].x == 11 and entity[boss_arm].y == 5"
+!ent kill boss
+!ent tp boss 9 6 cave
+!ent revive boss
+!assert "map_of('boss') == 'cave' and map_of('boss_arm') == 'cave' and entity[boss_arm].x == 12 and entity[boss_arm].y == 6"
+!ent kill boss
+!ent tp boss 11 6 cave
+?? ❌ corpse `boss`: its part `boss_arm` would lie at (14,6)
+!ent add snk Snake 20 6 3 5 map=main
+!part segment snk snk_s1 Seg 5 5
+!part segment snk snk_s2 Seg 5 5
+!eval "entity[snk].before = [entity[snk_s1].x - entity[snk].x, entity[snk_s1].y - entity[snk].y, entity[snk_s2].x - entity[snk].x, entity[snk_s2].y - entity[snk].y]"
+!ent kill snk
+!ent tp snk 10 7
+!ent revive snk
+!assert "entity[snk].x == 10 and entity[snk].y == 7"
+!assert "[entity[snk_s1].x - entity[snk].x, entity[snk_s1].y - entity[snk].y, entity[snk_s2].x - entity[snk].x, entity[snk_s2].y - entity[snk].y] == entity[snk].before"
+!ent move snk 1 left
+!assert "entity[snk].x == 9 and entity[snk_s1].x - entity[snk].x <= 2"
+HARNESS-ALLOWS-ERRORS
+
+Expected: dragging a corpse moves its whole body (R3): the 2x1 boss's
+located arm, three cells to its right, comes back three cells to the
+right of where the corpse was dragged, on the map it was dragged to. A
+drag that would put a located part off the map is refused, naming it. A
+snake's segments keep their offsets from the head, and its trail moves
+with it, so its first walk after the revive lays the body behind the head
+where the drag left it.
+
+
+SCENARIO 1233 — A write to a corpse under a partial template is recorded in its marker (S7)
+------------------------------------------------------------------------------------------
+
+!match new cp Cp 10 10
+!match use cp
+!ent add orc Orc 20 2 2 5 footprint_w=2 footprint_h=2
+!template import axe_p {"kind": "partial", "data": {"name": "Axe", "damage": 8, "edge": "keen"}}
+!template give axe_p orc gear.axe
+!ent kill orc
+!ent set_var orc gear.axe.damage 20
+!ent delete_var orc gear.axe.edge
+!ent revive orc
+!ent get orc gear.axe.__template
+?? "damage"
+?? "edge"
+!template save orc orc_t
+!template show orc_t vars.gear
+?? "damage": 20
+?? "edge"
+!template resync orc
+!assert "entity[orc].gear.axe.damage == 20 and var_get('orc', 'gear.axe.edge', 'gone') == 'gone'"
+!ent kill orc
+!ent set_var orc gear.axe.damage 8
+!ent revive orc
+!ent get orc gear.axe.__template
+?! "damage"
+
+Expected: a corpse write under a partial's marker is recorded there as
+a living unit's write is (S7): after the revive the marker lists the
+changed `damage` and the removed `edge`, so the save writes both and a
+resync keeps them. Writing the partial's own value back on the corpse
+takes `damage` off the list again.
+
+
+SCENARIO 1234 — `!ent clone` without coordinates finds a cell for the body and its located parts (K4)
+----------------------------------------------------------------------------------------------------
+
+!match new kc Kc 14 10
+!match use kc
+!ent add big Big 30 3 3 5 footprint_w=2 footprint_h=2
+!part add big big_arm Arm 10 10
+!part locate big_arm 5 3
+!ent add rock Rock 5 7 4 1
+!ent add rock2 Rock 5 7 6 1
+!ent clone big big2
+?? Cloned `big` → `big2`
+!assert "abs(entity[big2_big_arm].x - entity[big2].x) == 2 and entity[big2_big_arm].y == entity[big2].y"
+!ent clone big big4 count=2 near=6
+?? 2 copies
+!assert "exists('big41_big_arm') and exists('big42_big_arm')"
+!ent clone big big5 count=40 near=1
+?? ❌
+HARNESS-ALLOWS-ERRORS
+
+Expected: the search for a clone's cell also places the copy's located
+arm at its offset (K4): an anchor whose arm cell a rock takes is passed
+over for the next one, where both fit; `count=2` places each copy with
+its arm clear of the earlier copies. Forty copies within one cell don't
+fit, and nothing is cloned.
+
+
+SCENARIO 1235 — An undo that would change nothing offers the step before; a round's autosave comes with its first turn (T13, T12, L56)
+---------------------------------------------------------------------------------------------------------------------------------
+
+!match new un Un 10 10
+!match use un
+!ent add a A 20 1 1 30 footprint_w=2
+!ent add rare_frost_bear Bear 20 4 1 20
+!turn next
+?? It is now **A**'s turn (id `a`)
+!turn next
+?? (id `rare_frost_bear`)
+!turn forecast 2
+?? `rare_frost_bear` **Bear**
+!turn next
+!undo turn 1
+?? Nothing has changed since a's turn began (round 2): `!undo turn 1` lands where the board is now. Undo to the start of rare_frost_bear's turn (round 1) instead? `!undo turn 2` does it.
+!ent hp a 15
+!undo turn 1
+?? Undid 1 turn(s). Now at start of a's turn (round 2).
+!assert "entity[a].hp == 20"
+!undo turn 1
+?? Nothing has changed since a's turn began
+!undo turn 2
+?? Undid 2 turn(s). Now at start of rare_frost_bear's turn (round 1).
+!undo round 1 confirm
+?? Undid 1 round(s). Now at start of round 1.
+!turn
+?? ➡️ `a` **A**
+?? `rare_frost_bear` **Bear**
+!undo round 1 confirm
+?? Nothing has changed since round 1 began: `!undo round 1` lands where the board is now. There is no earlier one to go back to.
+!turn next
+?? It is now **Bear**'s turn (id `rare_frost_bear`)
+!turn next
+!turn next
+!ent hp rare_frost_bear 5
+!undo round 1 confirm
+?? Undid 1 round(s). Now at start of round 2.
+!turn next
+?? It is now **Bear**'s turn (id `rare_frost_bear`)
+!assert "entity[rare_frost_bear].hp == 20"
+
+Expected: `!undo turn 1` goes back to the start of the turn under way;
+when nothing has changed since it began, the reply says so and offers
+the turn before ("Undo to the start of rare_frost_bear's turn (round 1)
+instead?"): Discord asks with Yes / No buttons, the CLI and GUI ask
+inline, here the reply names `!undo turn 2`; after a change it undoes
+it. The same for `!undo round`. A round's autosave is taken as its first
+turn begins (T12), so `!undo round 1` lands on A's turn under way and the
+next `!turn next` goes to the Bear (A's turn isn't given twice), in
+round 1 and again in round 2. The turn line and the forecast name units
+by their whole id, as does the bare `!turn` order (L56: `rare_fro` named
+nothing).
+
+
+SCENARIO 1236 — Tab offers corpses to the `!ent` forms that take them; an action's positional word names what it takes (L56)
+--------------------------------------------------------------------------------------------------------------------------
+
+!match new tc Tc 10 10
+!match use tc
+!ent add hero Hero 20 1 1 5 team=red fog_vision_radius=2
+!ent add pal Pal 10 2 1 4 team=blue footprint_w=2
+!ent add far Far 10 9 9 3 team=blue
+!ent kill pal
+!ent kill far
+?tab "!ent get "
+?? far
+?? pal
+?tab "!ent get pal "
+?? hp
+?tab "!ent var_move hero hp "
+?? pal
+!match fog on
+!match bind pov=red
+?tab "!ent get "
+?? pal
+?! far
+?tab "!ent tp "
+?? pal
+!match bind pov=omniscient
+!ent set_var hero actions.sprint.target none
+!ent set_var hero actions.sprint.body "n = args.steps\nd = args.dir"
+!action hero sprint 2 right
+?? `sprint` takes arguments as `key=value` (its formulas read `steps=`, `dir=`); `!action info hero sprint` describes it.
+!help mount
+?? !mount list [<vehicle>]
+HARNESS-ALLOWS-ERRORS
+
+Expected: `!ent get`, `tp`, `var_move` and the others that take a
+corpse's id offer corpses in Tab, and a corpse's vars after its id; under
+a team view only the corpses the view sees (Pal lies in red's sight, Far
+doesn't). A positional word after an action's name is refused naming the
+keys its formulas read and `!action info`. `!help mount` gives the list
+form's optional vehicle.
+
+
+SCENARIO 1237 — A server name of many emoji still gets its label file (W12)
+-------------------------------------------------------------------------
+
+!as server 1294368645421727999
+!as servername 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+!match new lb Lb 5 5
+?file list
+?? 0 server - 🔥🔥🔥
+
+Expected: a label file's name is cut by its bytes (W12): sixty emoji
+(240 bytes) used to make a name too long for the file system, and the
+warning printed after every command; the name is now cut to fit, and
+the file's first line keeps the whole name.
+
+
+SCENARIO 1238 — A list board fills its reserved messages from the top (W15)
+---------------------------------------------------------------------------
+
+!match new lbd Lbd 8 8
+!match use lbd
+!ent add hero Hero 10 1 1 5 team=blue
+!ent add orc Orc 8 3 3 3 team=red
+?board list
+?? [message 1/5
+?? → Hero (hero): HP: 10/10
+?? [message 5/5, 38 characters]
+?? [reserved message for list autoupdate]
+!ent hp orc 2
+?board list reserve=2
+?? Orc (orc): HP: 2/8
+?? [message 2/2
+?! [message 3/
+!system set default autoupdate_reserved_text "(spare {kind} slot)"
+!system set default autoupdate_reserved_messages 3
+?board list
+?? [message 3/3, 17 characters]
+?? (spare list slot)
+!system set default autoupdate_reserved_text ""
+?board list reserve=2
+?? [message 2/2, 1 characters]
+!batch ent add a1 A1 1 5 5 1 ; ent add a2 A2 1 5 6 1 ; ent add a3 A3 1 5 7 1 ; ent add a4 A4 1 6 5 1
+!system set default entity_line_format "{name} zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+?board list reserve=2
+?? ✂️ … about
+?? this board holds 2 message(s). Turn it on again with more (`!list autoupdate on reserve=<n>`, or the rule `autoupdate_reserved_messages`).
+?! A4 zzz
+?board list reserve=4
+?! ✂️
+?? A4 zzz
+!list autoupdate on
+?? Auto-update boards are a Discord-only feature
+
+Expected: `?board list` shows the messages a `!list autoupdate` board
+posts in this channel. Five by default (autoupdate_reserved_messages):
+the roster in the first, the other four the reserved text. A change
+(Orc to 2 hp) shows on the next read, as a refresh would edit it.
+`reserve=` overrides the count, the rules give the count and the
+spare text (`{kind}` names the board; empty shows a dot). With long
+lines the roster takes several messages; past the last one it is cut
+with a note naming how much and how to make room, and four messages
+hold it whole. Outside Discord the command says boards are Discord-only.
+
+
+SCENARIO 1239 — A state board's map takes the message after the text (W15)
+--------------------------------------------------------------------------
+
+!match new sbd Sbd 8 8
+!match use sbd
+!ent add hero Hero 10 1 1 5 team=blue
+!ent add ogre Ogre 20 4 4 3 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent add imp Imp 3 7 7 1 team=red
+?board state reserve=3
+?? [message 1/3
+?? **Sbd** `sbd`
+?? Current Round Number: **1**
+?? Ogre (ogre): HP: 20/20
+?? [message 2/3, 0 characters]
+?? (the map board)
+?? [message 3/3, 39 characters]
+?? [reserved message for state autoupdate]
+!system set default entity_line_format "{name} zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+?board state reserve=3
+?? [message 2/3
+?? Imp zzz
+?? [message 3/3, 0 characters]
+?! reserved message
+?board state reserve=2
+?? this board holds 2 message(s)
+?? [message 2/2, 0 characters]
+?board state reserve=1
+?? ❌ A `!state` board needs at least 2 messages (its map takes one), and `reserve=1` gives 1.
+!system set default autoupdate_reserved_messages 1
+?board state
+?? and the rule `autoupdate_reserved_messages` gives 1
+!state autoupdate on reserve=1
+?? A `!state` board needs at least 2 messages
+HARNESS-ALLOWS-ERRORS
+
+Expected: a state board shows the summary and the roster (the 2×2 Ogre
+listed like any unit), then the map in a message of its own (the map
+board, which the surface draws with its buttons), then the reserved
+messages. When long lines push the roster into a second message (the
+Imp's line) the map moves down to the third, and with two messages the
+roster is cut before the map with the note, which counts the map's
+message. A state board needs two messages: `reserve=1` and the rule at 1
+are refused.
+
+
+SCENARIO 1240 — A board reads as the channel's players do; who turns one on (W15)
+---------------------------------------------------------------------------------
+
+!match new vbd Vbd 8 8
+!match use vbd
+!ent add hero Hero 10 1 1 5 team=blue fog_vision_radius=1
+!ent add scout Scout 6 2 2 4 team=red fog_vision_radius=1
+!ent add spy Spy 5 8 8 3 team=blue
+!ent set_var scout secret 42
+!system set default private_vars secret
+!system set default entity_line_format "{name} ({id}) {hp}/{max_hp} s={secret}"
+!match fog on
+!match bind pov=red
+?board list
+?? Scout (scout) 6/6 s=?
+?? Hero (hero)
+?! Spy
+?! s=42
+!list
+?? Scout (scout) 6/6 s=?
+?! Spy
+!match bind pov=omniscient
+?board list
+?? Spy (spy)
+?? s=?
+!list autoupdate maybe
+?? ❌ Usage: `!list autoupdate [on|off] [reserve=<n>]`.
+!list autoupdate off reserve=2
+?? ❌ `reserve=` goes with `on`.
+!list autoupdate on reserve=x
+?? ❌ `reserve=x` isn't a whole number.
+!list autoupdate on reserve=21
+?? ❌ `reserve=` takes 1 to 20 messages.
+!list autoupdate on size=2
+?? Unknown option `size=`
+!system set default autoupdate_reserved_messages 21
+?? 20
+!as player bob
+!list autoupdate on
+?? needs host approval
+!state autoupdate on
+?? needs host approval
+!list
+?? Hero (hero)
+HARNESS-ALLOWS-ERRORS
+
+Expected: a board shows the roster as a player of its channel reads it,
+whoever turned it on: under red's fogged view the blue Spy far away
+isn't listed and the private `secret` shows `?`, as `!list` shows the
+channel; in a channel without a team view everyone is listed and the
+private var still reads `?` (a player reads the board, never a host).
+`!list autoupdate` refuses a stray word, `reserve=` with `off`, a
+count that isn't a whole number or past the rule's ceiling (20) and an
+unknown option; the rule refuses 21 the same way. A player's `!list
+autoupdate on` / `!state autoupdate on` waits for a host's approval (a
+board keeps posting in the channel), while `!list` stays open.
+
+
+SCENARIO 1241 — Table odds group a sub-table, stop at a loop and keep to a row limit; a rank names entries with spaces (X27, L57)
+--------------------------------------------------------------------------------------------------------------------------------
+
+!match new to To 5 5
+!match use to
+!table def a6 "@ b6,@  b6,@   b6,@    b6,@     b6,@      b6"
+!table def b6 "@ a6,@  a6,@   a6,@    a6,@     a6,@      a6"
+!as player bob
+!table odds a6
+?? @b6
+?? @a6 (back to `a6`)
+?! @b6 (back
+!as host
+!table def c "x,y,@d,@e"
+!table def d "1,2,@c"
+!table def e "p,q,@d"
+!table odds c
+?? @c (back to `c`)
+?? 2.78%
+!system set default table_odds_row_limit 5
+!table odds c
+?? the rows past 5 are left out (table_odds_row_limit).
+!table def loot "a sword:2, a bow, gold"
+!table rank loot "a bow,gold"
+?? `a bow`, `gold`, `a sword`
+?! gold rank
+!table odds loot
+?? a sword
+!assert "len(table_roll('loot', path=True)) >= 1"
+!table def loot2 "a sword:2, a bow, gold rank=a bow,gold"
+!table rank loot2
+?? best first: `a bow`, `gold`, `a sword`.
+
+Expected: `!table odds` lists the entries of one table that name the same
+sub-table as one row (`@ b6` and `@  b6` are both `@b6`), and a path ends
+at a table it already passed through, marked "(back to `a6`)": the loop
+of two tables of six entries each, two million rows before, is two
+rows. A three-table loop ends each path where it comes back. The rule
+table_odds_row_limit cuts a longer listing with a note. A rank naming
+entries with spaces (`a bow`) is read to the end of the text, so the
+table keeps its three entries; the same rank typed into `!table def` is
+read the same way.
+
+
+SCENARIO 1242 — Dice odds count the faces first and share one budget per command (X28)
+--------------------------------------------------------------------------------------
+
+!match new dd Dd 5 5
+!match use dd
+!as player bob
+!roll odds d1000000 >= 999999
+?? has too many outcomes to work out exact odds.
+!roll odds d600000 >= 599999
+?? 🎲 P(`d600000`
+!roll "$(roll_mean('d600000') + roll_mean('d600000'))"
+?? this command has already worked out as many dice odds as one command may
+!roll "$(round(roll_mean('d600000')))"
+?? 300000
+?! as many dice odds
+!as host
+!eval "roll_mean('2d6') == 7 and roll_odds('2d6', '>=', 12) == 1/36"
+?? True
+HARNESS-ALLOWS-ERRORS
+
+Expected: a die's faces count against the odds limit before their table
+is built (X28: a million-face die built two million-entry tables before
+anything was counted), so a d1000000 is refused while a d600000 is
+worked out (a group's table and the total's each count). Every odds call of one command shares one budget: two
+d600000 means in one player's `$()` stop at the second, while a new
+command works one out again. Small dice are unchanged.
+
+
+SCENARIO 1243 — An action body reads `affected` without the reaction exchange (R4)
+----------------------------------------------------------------------------------
+
+!match new af Af 8 8
+!match use af
+!ent add orc Orc 30 2 2 3 team=red footprint_w=2 footprint_h=2
+!ent add elf Elf 20 4 2 5 team=blue
+!ent add imp Imp 20 7 7 1 team=blue
+!ent set_var orc actions.spin.target none
+!ent set_var orc actions.spin.affects "entities_within(self, 1, relation='hostile')"
+!ent set_var orc actions.spin.body "for u in each(affected):\n    deal_damage(u, 3)"
+!action orc spin
+?? 🩸 **Elf** (`elf`) takes 3 damage from Orc.
+!assert "entity[elf].hp == 17 and entity[imp].hp == 20"
+!ent set_var orc actions.hit.target entity
+!ent set_var orc actions.hit.body "say('hit ' + str(affected))"
+!action orc hit imp
+?? hit ['imp']
+!ent set_var orc actions.bad.target none
+!ent set_var orc actions.bad.affects "1/0"
+!ent set_var orc actions.bad.body "say(str(affected))"
+!action orc bad
+?? ❌ action `bad`: [affects]
+!assert "entity[elf].hp == 17"
+HARNESS-ALLOWS-ERRORS
+
+Expected: no unit holds a reaction, so `!action` runs without the
+exchange, and the body still reads `affected`: the units the `affects`
+formula gives (the elf next to the 2×2 orc's body, not the far imp), or
+an entity action's targets. An `affects` formula that fails refuses the
+action before its body runs.
+
+
+SCENARIO 1244 — !system import checks a file's library entries as their editors do (S8)
+--------------------------------------------------------------------------------------
+
+!system new kit
+!system func def kit dbl x "x * 2"
+!system table def kit loot "gold, gems"
+!system alias def kit hp ent hp
+!system tile new kit lava
+!system tile data kit lava glyph "~"
+!system export kit kit.json
+?file copy saves/kit.json saves/k1.json
+?file set saves/k1.json systems.0.formula_functions.dbl.body "while x:\n    x = x - 1"
+!system import k1.json as=k1
+?? System `kit`: function `dbl`: Disallowed syntax: While
+?file copy saves/kit.json saves/k2.json
+?file set saves/k2.json systems.0.tables.loot "gold, @loot"
+!system import k2.json as=k2
+?? System `kit`: table `loot`: entry `@loot` names the table itself
+?file copy saves/kit.json saves/k3.json
+?file set saves/k3.json systems.0.aliases.zz "zz again"
+!system import k3.json as=k3
+?? System `kit`: alias `zz` must start with a real command.
+?file copy saves/kit.json saves/k4.json
+?file set saves/k4.json systems.0.tile_templates.lava.data "x"
+!system import k4.json as=k4
+?? System `kit`: tile template `lava`: `data` must be an object.
+?file copy saves/kit.json saves/k5.json
+?file set saves/k5.json systems.0.formula_functions.dbl.params 1.5
+!system import k5.json as=k5
+?? System `kit`: function `dbl`: `params` must be a list of names.
+!system list
+?! k1
+?! k5
+!system import kit.json as=kit2
+?? created `kit2`
+!system lint kit2
+?? all clean
+HARNESS-ALLOWS-ERRORS
+
+Expected: an imported file's library entries go through the checks their
+editors make: a function body the sandbox refuses (a while loop), a
+table naming itself, an alias that doesn't start with a real command, a
+tile template whose data isn't an object and a function whose params
+aren't a list each refuse the whole import, naming the entry, and no
+system is created. A clean file still imports and lints clean.
+
+
+SCENARIO 1245 — A queued `!turn next` doesn't outlive its turn; a status says "1 turn left" (L57)
+------------------------------------------------------------------------------------------------
+
+!match new qt Qt 6 6
+!match use qt
+!ent add a A 10 1 1 30
+!ent add b B 10 3 3 20
+!ent add c C 10 5 5 10
+!turn next
+?? It is now **A**'s turn
+!as player bob
+!turn next
+?? needs host approval (request `r1`
+!as host
+!turn next
+?? It is now **B**'s turn
+!approve r1
+?? ❌ `!turn next` (request `r1`, by bob) was asked during a turn that is over, so it doesn't run.
+!turn
+?? ➡️ `b` **B**
+!as player bob
+!turn next
+!as host
+!approve r2
+?? It is now **C**'s turn
+!status apply a burn 1 1
+!ent info a
+?? burn (level 1), 1 turn left
+?! 1 turns left
+!status apply b burn 1 3
+!ent info b
+?? 3 turns left
+HARNESS-ALLOWS-ERRORS
+
+Expected: a player's `!turn next` asked on A's turn and approved once the
+host moved to B's would end B's turn; the approval refuses it, naming
+the request, and B keeps the turn. One asked and approved on the same
+turn runs. The description's status line reads "1 turn left" and "3
+turns left" (`{turns_word}`).
+
+
+SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: status_visibility_condition and a status's own visibility condition
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sv Sv 9 9
+!match use sv
+!ent add orc Orc 30 2 2 5
+!ent add hero Hero 30 6 6 3
+!ent set_var orc team red
+!ent set_var hero team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc footprint_h 2
+!status def burn
+!status def cursed
+!status sprite cursed fx_curse
+!status apply orc burn 2 3
+!status apply orc cursed 1 1
+!list
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns), cursed ×1 (1 turn)
+?? Hero (hero): HP: 30/30 X,Y: 6,6 facing up
+?! Hero (hero): HP: 30/30 X,Y: 6,6 facing up |
+!status visibility cursed "is_part_of_team(self, pov_team)"
+?? `cursed` shows to a team view while
+!match bind pov=blue
+!list
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns)
+?! cursed
+!find status:cursed
+?! orc
+!find status:burn
+?? orc
+!ent info orc
+?? burn
+?! cursed
+!map scene list
+?! fx_curse
+!match bind pov=red
+!list
+?? burn ×2 (3 turns), cursed ×1 (1 turn)
+!map scene list
+?? overlay `orc` at (2,2) 2x2 stretch — sprite fx_curse
+!match bind pov=blue
+!system set default status_visibility_condition "status_name != 'burn'"
+!list
+?! burn
+?! cursed
+!status visibility cursed
+?? Cleared `cursed`'s visibility condition (it follows status_visibility_condition)
+!list
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | cursed ×1 (1 turn)
+!status visibility cursed "entity[zqxnobody].hp > 0"
+!list
+?? cursed ×1 (1 turn)
+!status level burn 3 visibility_condition "False"
+!status apply orc burn 3 3
+!system set default status_visibility_condition ""
+!list
+?! burn
+?? cursed
+!match bind pov=omniscient
+!list
+?? burn ×3 (3 turns), cursed ×1 (1 turn)
+!status visibility cursed "corpse_team == pov_team"
+!ent kill orc
+!match bind pov=blue
+!ent info orc
+?! cursed
+!match bind pov=red
+!ent info orc
+?? cursed
+!assert "corpse_status_has('orc', 'burn')"
+
+Expected: the default entity_line_format ends with the unit's statuses
+(`| burn ×2 (3 turns), cursed ×1 (1 turn)`), each through
+status_line_format, which says how many turns are left; a unit without
+statuses has no `|`. A status's own visibility condition (`!status
+visibility`, self = the bearer) hides `cursed` from blue's view in the
+line, `!find status:` and the description, while red, the bearer's team,
+sees it; the image overlay of `cursed` over the 2×2 orc goes the same
+way. The status_visibility_condition rule covers the statuses without
+a condition of their own (`burn` hidden from blue); clearing the
+status's condition puts it back under the rule. A condition that fails
+shows the status. A level entry's condition (burn level 3: `False`) hides
+the status at that level only; the omniscient view sees everything. A
+corpse's statuses follow the same conditions with corpse_team bound.
+Formulas see every status (`corpse_status_has` finds the hidden burn).
+
+
+SCENARIO 1247 — The action dice line leaves out the rolls of units the channel's view can't see (V27)
+------------------------------------------------------------------------------------------------------
+
+!match new dv Dv 9 9
+!match use dv
+!system set default random_seed 3
+!system set default action_dice_line on
+!ent add orc Orc 30 2 2 5
+!ent add zqxspy Spy 30 4 2 3
+!ent add elf Elf 30 2 4 2
+!ent set_var orc team red
+!ent set_var zqxspy team blue
+!ent set_var elf team blue
+!ent set_var orc footprint_w 2
+!ent set_var orc footprint_h 2
+!gpassive add zqxdodge on_damage_taken "roll('1d20', label='zqxevade')"
+!ent set_var orc actions.swing.target none
+!ent set_var orc actions.swing.body "for u in entities_within(self, 1, 'square_radius', 'hostile'):\n    deal_damage(u, roll('1d6', label='hit'))"
+!action orc swing
+?? zqxevade 1d20
+?? 🎲 hit 1d6
+!defvar add fog_vision_radius 0
+!ent set_var orc fog_vision_radius 0
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or self != 'zqxspy'"
+!match bind pov=red
+!action orc swing
+?? 🎲 hit 1d6 →
+?? zqxevade 1d20 →
+?! zqxspy
+?! Spy
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team)"
+!action orc swing
+?? 🎲 hit 1d6 →
+?! zqxevade
+!match bind pov=omniscient
+!action orc swing
+?? 🎲 hit 1d6 →
+?? · zqxevade 1d20 →
+
+Expected: a 2×2 orc's swing hits the spy and the elf next to its body;
+each takes damage, and a global passive rolls `zqxevade` for the unit hit.
+The omniscient view's dice line lists every roll. Bound to red, with the
+spy hidden (entity_visibility_condition) and the elf seen, the line keeps
+the orc's own hit rolls and the elf's evade roll and leaves out the spy's
+(the damage line about the spy is dropped too). With both blue units
+hidden, only the orc's rolls stay. A roll is noted with the unit whose
+formula made it (`self`); the actor's own rolls follow the line's tag.
+
+
+SCENARIO 1248 — A host names a unit the channel's view hides, under pov_host_names_hidden (W16)
+------------------------------------------------------------------------------------------------
+
+!match new wh Wh 9 9
+!match use wh
+!ent add cat Cat 60 4 4 5
+!ent add hero Hero 30 6 4 3
+!ent set_var cat team red
+!ent set_var hero team blue
+!ent set_var cat footprint_w 2
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or not status_has(self, 'cloak')"
+!status def cloak
+!status apply cat cloak
+!ent set_var cat actions.claws.target entity
+!ent set_var cat actions.claws.body "entity[target].hp = entity[target].hp - 5"
+!match bind pov=blue
+!action cat claws hero
+?? Could not find a unit named `cat`
+!system set default pov_host_names_hidden on
+!action cat claws hero
+?? `someone` used action `claws` on `Hero`.
+?! Cat
+!list
+?? Hero (hero): HP: 25/30
+?! cat
+!assert "entity[hero].hp == 25"
+!as player bob
+!ent info cat
+?? Could not find a unit named `cat`
+!as host
+!match var set pov_host_names_hidden false
+!action cat claws hero
+?? Could not find a unit named `cat`
+!match var set pov_host_names_hidden true
+!system set default pov_host_names_hidden off
+!system set default host_reveal_warning on
+!ent info cat short
+?? HP: 60/60
+?? this command named `cat`, hidden from it
+!assert "entity[hero].hp == 25"
+HARNESS-ALLOWS-ERRORS
+
+Expected: the cat is invisible to blue. In the channel bound to blue a
+host's `!action cat claws hero` refuses the cat like a missing unit; with
+the pov_host_names_hidden rule on it runs (the hero drops to 25), and the
+reply names the cat as `someone`, the channel's view. A player there still
+can't name the cat. A match var of the rule's name overrides the rule
+either way (false refuses with the rule on, true takes the cat with the
+rule off). A host's read of the hidden unit ends with the
+host_reveal_warning note while that rule is on.
+
+
+SCENARIO 1249 — A reaction window goes to the channels of the teams that may react; a deferred action's log carries its author (R5, L57)
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+!match new rc Rc 9 9
+!match use rc
+!ent add cat Cat 60 4 4 5
+!ent add hero Hero 30 6 4 3
+!ent set_var cat team red
+!ent set_var hero team blue
+!ent set_var cat footprint_w 2
+!ent set_var cat footprint_h 2
+!ent set_var cat actions.claws.target entity
+!ent set_var cat actions.claws.tags melee
+!ent set_var cat actions.claws.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var hero actions.dodge.reacts_to melee
+!ent set_var hero actions.dodge.before "incoming.avoid = True"
+!as channel blue
+?? Now typing in channel `blue`.
+!match use rc
+!match bind pov=blue
+!as channel redc
+!match use rc
+!match bind pov=red
+!as channel CLI
+!action cat claws hero
+?? 📨 to `blue`:
+?? Hero can react: `!react hero dodge`
+?! 📨 to `redc`
+!as channel blue
+!as player bob
+!react hero pass
+?? needs host approval (request `r1`
+!as host
+!as channel CLI
+!approve r1
+?? ✅ Approved `r1`
+!assert "entity[hero].hp == 25"
+!host access set react all
+!action cat claws hero
+!as channel blue
+!as player bob
+!react hero pass
+?? 🤚 Hero passes.
+!as host
+!as channel CLI
+!assert "entity[hero].hp == 20"
+!log 5 by=cli
+?? used `claws`
+!log 5 by=bob
+?! claws
+!dry !action cat claws hero
+?! 📨
+!react skip
+!batch strict !action cat claws hero ; !ent tp zqxnobody 1 1
+?! 📨
+HARNESS-ALLOWS-ERRORS
+
+Expected: the GM types `!action cat claws hero` in an unbound channel. The
+window shows there, and its listing also goes to `blue`, the channel bound
+to the team of the unit that may react (the hero); `redc` (the cat's team)
+gets nothing. Bob answers in `blue`; his `!react` still needs a host's
+approval. Approved, the window closes and the claws land (hero 25). With
+`!host access set react all`, bob's own `!react hero pass` closes the
+next window and the claws land again (20); the event log's entries for
+both claws carry the GM, who started the action, though bob's answer
+closed the window. A `!dry` run and a `!batch strict`
+whose later line fails open a window that never stays, so nothing is
+posted.

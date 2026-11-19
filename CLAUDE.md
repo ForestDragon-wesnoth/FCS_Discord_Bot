@@ -192,6 +192,10 @@ code. How the harness works (`run_scenarios.py`, scenarios in
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
+- **Roster boards** (Discord-only in play): `?board list|state
+  [reserve=<n>]` prints the messages a `!list` / `!state` autoupdate board
+  in the scenario's channel would show now, `[message i/n, <chars>]`
+  before each (1238-1240).
 - **Isolation.** Each scenario gets its own temp data folder (real storage
   commits) and a temp saves folder; `!as restart` reloads everything from
   disk as a bot restart would.
@@ -444,10 +448,18 @@ back, load the schema with `ToolSearch` before calling
   `getattr`, so the engine stays surface-agnostic and the harness exercises
   the fallback: `supports_color`, `viewport_capable`, `message_limit`,
   `auto_approve`, `post_scene_image`, `show_scene_view`, `set_autoupdate`,
-  `offer_resume`, `prompt_choice`, `retire_server_boards`. The Discord
-  adapter also routes `!<alias>` through `on_command_error`, never pings
-  (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
-  board whose channel was unbound.
+  `set_roster_autoupdate`, `offer_resume`, `offer_confirm`, `prompt_choice`,
+  `retire_server_boards`, `post_to_channel` (a post to another channel of
+  the server: a reaction window, §7.23). The Discord adapter also routes `!<alias>`
+  through `on_command_error`, never pings (`AllowedMentions.none()`),
+  splits long replies fence-aware (`vtt_commands.split_message`, at
+  `MESSAGE_LIMIT`), and retires a board whose channel was unbound. A button click is answered first
+  (`_ack_click`, D12: Discord refuses an answer after 3 s, and a click
+  that waited behind another command used to drop its request); only then
+  does it touch the queue, and a refused answer leaves everything as it
+  was with one console line. A post the channel refuses (Missing
+  Permissions) is no crash (`DiscordCtxWrapper._post`, D11): the command
+  keeps its effect and the console names the channel once.
 - **`test_sequences.txt`**: the scenarios (§2).
 - **`docs/audit_history.md`**: the narratives of audit passes 2-54 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
@@ -725,7 +737,12 @@ plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
 - **Server name file:** each Discord server's folder (named by its
   numeric id) holds `0 server - <name>.txt` (`storage.server_label_file`:
   characters no file system takes become `_`), whose first lines give the
-  server's name and id. `Storage.label_server` writes it at bot startup
+  server's name and id (the name cut to `SERVER_LABEL_NAME_BYTES`
+  encoded bytes, W12, 1237; a name is recorded once tried, so a failing
+  write warns once). The server's trash folder (`data/.trash/<key>/`)
+  gets the same file (`_write_label`: at a wipe and with every label
+  write, W13; its readers skip names that aren't a stamp).
+  `Storage.label_server` writes it at bot startup
   for every server with a folder (`_label_servers`, an on_ready listener
   in discord_commands.py) and after a commit whose `mgr.guild_name`
   differs from the name last written (a new server's first save, a rename
@@ -1346,7 +1363,9 @@ hardcodes**.
   a body part, and is all-or-nothing (`_rollback_match` on any refusal).
   Without coordinates (#590) each copy lands on the anchor nearest the
   source's body centre where its whole body fits, clear of the source
-  (`_clone_spot`: `_nearest_fit_cell`, the dismount search, ties by row);
+  (`_clone_spot`: `_nearest_fit_cell`, the dismount search, ties by row,
+  its `fits` test placing the copy's located parts at their offsets, K4,
+  1234);
   `count=<n>` copies (at most summon_event_limit), `near=<r>` bounds the
   search (1188).
 - **Summons** (`Match.summon_entity`): `summon(template, x, y)` /
@@ -1724,7 +1743,9 @@ hardcodes**.
   `skip_all_round_limit`, stopping early once a round changes no status
   (permanent stuns) → `_start_current_turn`. The reply prints hook
   output first and the `turn_start_message_format` line last (unit
-  placeholders, `{short_id}`, `{round}`; `turn_start_hidden_message_format`
+  placeholders, `{id}` by default (L56: `{short_id}`, the first 8
+  characters, named nothing a command takes), `{round}`;
+  `turn_start_hidden_message_format`
   for a unit the channel's view can't see; empty = no line) (770).
 - **Removal and death mid-turn:** removing the current unit sets
   `turn_vacated`, so the next `!turn next` starts the successor without
@@ -1983,9 +2004,24 @@ hardcodes**.
   (`prefab._check_status_definition`).
 - **Display:** status sprite overlays (§7.13); the `{statuses}` roster
   placeholder (`vtt_commands._statuses_text`, in the default
-  entity_info_format): each status through its definition's `display`
-  format (`!status display`) else the `status_line_format` rule, its
-  instance fields as placeholders (885).
+  entity_line_format after a ` | ` and in entity_info_format): each status
+  through its definition's `display` format (`!status display`) else the
+  `status_line_format` rule (`burn ×2 (3 turns)`), its instance fields as
+  placeholders plus `{turns_word}` (885, 1246).
+- **Visibility** (user request, 1246): which team views see a status is
+  its own `visibility_condition` (`logic.STATUS_VISIBILITY_FIELD`,
+  `status_field`: instance key, definition, level entries; `!status
+  visibility <name> [formula]`) else the `status_visibility_condition`
+  rule (expression; self = the bearer, status_name, pov_team; corpse_id /
+  corpse_team on a corpse; empty = shown, a failing formula shows it).
+  `Match.status_visible_to` / `visible_statuses`, applied in
+  `presented_statuses` (a disguise's decoys are shown as they are), so the
+  placeholders, the description, `!find status:`, `!simulate`'s report
+  and the image overlays (`entity_overlays`) follow it; corpse lines,
+  descriptions and `!find dead status:` use the command's view
+  (`command_pov`). Formulas see every status. Lint, promote and the
+  formula-text hiding read the conditions (`_status_level_formulas`,
+  `_FORMULA_FIELD_KEYS`).
 
 ### 7.5 Modifiers (derived stats)
 
@@ -2101,7 +2137,13 @@ hardcodes**.
   on / labelled), `action_dice_line_format` and `action_dice_roll_format`,
   surfaced tagged as about the actor (`unit_tag`), so a view that can't
   see it drops it; each reaction half is its own run_action, so its line
-  is about the reacting unit (user call).
+  is about the reacting unit (user call). Each roll also notes the unit
+  whose formula made it (its `self`, bound when the namespace is built,
+  V27, user call, 1247); a roll by another unit than the actor (a hook on
+  a target) is a `logic.DICE_ROLL_RE` marker in the line, and the reply
+  filter keeps the rolls of units (or corpses) the channel's view sees
+  (`join_dice_rolls`, `_dice_roll_shown`), dropping a line left with none.
+  The actor's own rolls stay, one per target its body hit.
 - **Rider actions:** a rider gets its slot's actions plus the vehicle's
   actions whose `allowed_slots` list its slot; `mount_action_actor` decides
   who is `source`; `vehicle` / `rider` / `slot` are always bound.
@@ -2767,10 +2809,16 @@ hardcodes**.
   vitals that can't be deleted, text team, checked tags, no reserved or
   derived size var, a footprint still on the map), no clamps, var hooks
   or death check; each write lays a NEW record, so earlier states keep
-  theirs. Moves (`Match.corpse_move`, `!ent tp <corpse> x y [map]`,
+  theirs. A write under a partial template's marker is recorded in it
+  as a living unit's is (`_track_corpse_write`, S7, 1233). Moves
+  (`Match.corpse_move`, `!ent tp <corpse> x y [map]`,
   `corpse_move(eid, x, y, map=)`): the body on the map and off voids,
   units and corpses don't block, another map takes it along (not into a
-  map it holds as a wreck); no tile or zone hook fires (§8). The
+  map it holds as a wreck); the stored located parts and snake segments
+  keep their offsets and the trail vars move too, a part landing off the
+  map refusing the drag (R3, 1232; a revive displaced by
+  `revive_blocked_mode nearest` shifts the trail the same way); no tile
+  or zone hook fires (§8). The
   non-host pre-check of `!ent` lets these subcommands
   (`_ENT_CORPSE_SUBS`) name a visible corpse (`_typed_corpse` for the
   writes: a host reaches any).
@@ -3106,7 +3154,9 @@ hardcodes**.
   buttons last as long as the request and the message says when it
   expired. `!as wait <seconds>` (CLI / harness) ages every request. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
-  `_channel_pointed_at`). A request whose command an open reaction
+  `_channel_pointed_at`). A request records the `turns_elapsed` it was
+  asked on, and a `!turn next` approved on a later turn is refused (it
+  would end that turn; L57, 1245). A request whose command an open reaction
   window holds stays queued (`approval_waits`: `!approve`, `!approve
   all` and the Discord button answer why it waits and use nothing up;
   1164).
@@ -3138,7 +3188,14 @@ hardcodes**.
   words). A HOST's command still reaches a hidden unit (user call: a host
   may reveal on purpose; `!ent dump` / `diff` show everything); with the
   `host_reveal_warning` rule on (default off) it ends with a ⚠️ naming the
-  hidden units it named (`_HOST_REVEALS`). A glued part shows while the
+  hidden units it named (`_HOST_REVEALS`). The reads that answer a hidden
+  unit like a missing one (`_query_eid`, `_query_unit_or_corpse`: `!action`,
+  `!ent info`, ...) refuse it to a host too, unless
+  `pov_host_names_hidden` (rule, default off; a match var of that name, a
+  bool, overrides it, `_host_names_hidden`; W16, user call, 1248) lets a
+  host play a hidden unit from the players' channel; the replies still
+  pass through the channel's view (the action-used line names it
+  `someone`). A glued part shows while the
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`); a host's in a channel with a team view
@@ -3204,8 +3261,15 @@ hardcodes**.
   (`!map pan/center/view`). Discord fits a 2000-char message by dropping
   rulers, then colour, then legend; one reply takes at most
   `reply_message_cap` messages, then a cut note, and one command at most
-  `command_message_cap` (20) in all (a sweep, batch or macro posts a reply
-  per line), then one note counting the rest (`flush_dropped`). Commands run from the
+  `command_message_cap` (20, owner ceiling 1000, W14) in all (a sweep,
+  batch or macro posts a reply per line), then one note counting the rest
+  (`flush_dropped`). Under `cut_output_attachment` (default on, W14, user
+  call) the reply's cut note carries the whole reply as `reply.txt` and
+  the command's note its whole output as `output.txt`
+  (`DiscordCtxWrapper._cut_file`, ANSI codes stripped): kept on Discord
+  only, counted against the server's storage limit when posted and held
+  to the server's upload size (`guild.filesize_limit`), else the note
+  says why it isn't attached. Commands run from the
   Approve / Resume buttons use the same adapter (`_InteractionCtx` is a
   `DiscordCtxWrapper`); a pan click is acknowledged before it waits for
   the command lock.
@@ -3234,13 +3298,34 @@ hardcodes**.
   `SpriteLoader` re-reads a sprite whose file appeared or changed (path +
   mtime) and keeps PNGs at most `_SPRITE_MAX_SIDE` px.
 - **Surfaces:** `!map image`, `!map mode text|image` (plain `!map` posts an
-  image), `!map autoupdate` boards (Discord, runtime-only), `!map scene
-  [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI;
+  image), `!map autoupdate` boards (Discord, runtime-only), roster
+  boards (below), `!map scene [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI;
   the map, the log and the input are panes of one vertical `PanedWindow`
   (`GuiApp._panes`): dragging the bar between two resizes them, and a
   window resize stretches only the map, so the log and the input keep the
   height they were dragged to; the Ctrl+R search bar opens inside the
   input's pane).
+- **Roster boards** (W15, user design, 1238-1240): `!list autoupdate
+  [on|off] [reserve=<n>]` and `!state autoupdate ...` (host-gated, as
+  `!map autoupdate`; Discord-only, runtime-only) post a set of messages
+  once and edit them after every command: `reserve=` else the rule
+  `autoupdate_reserved_messages` (5, ceiling 20; a state board needs 2),
+  since a board can't post more later. `vtt_commands.
+  autoupdate_board_text` builds the text as a PLAYER of the channel reads
+  `!list` (the channel's team view, `VarReader(host=False)`, formula text
+  hidden under `formula_text_visibility host`), whoever turned it on;
+  `autoupdate_board_messages` packs it from the top
+  (`split_message`), the unused messages showing
+  `autoupdate_reserved_text` (`{kind}`), text past the last one cut with
+  a note naming `reserve=` and the rule. A state board is the summary
+  (`_match_top_text`) and the roster, then the map in the message after
+  the text (`None` in the packing; drawn by `_apply_board(kind="state")`
+  with its own pan / browse buttons, `_BoardView.kind`), so the map moves
+  down as the roster grows. The adapter (`_roster_boards`, keyed by
+  channel and kind) edits only the messages whose text changed, retires
+  a board on unbind or `!server wipe` (first message noted, the rest
+  deleted), replaces an old board of the kind when turned on again, and
+  keeps the server loaded while one is up.
 - **Input editing** (gui.py and cli.py): Tab completes (`completion.py`;
   bash-style, a second Tab lists the choices), Up / Down recall this
   session's commands (GUI: only on the input's first / last line, so they
@@ -3256,7 +3341,9 @@ hardcodes**.
   body; `quote_unclosed`, Discord too), joined with `\n`. History is per session (user
   call); the CLI keeps answers to choose() prompts out of it. Completion
   under a team view offers only what that view's queries show: unit ids,
-  their teams, actions, statuses and mount slots of visible units.
+  their teams, actions, statuses and mount slots of visible units; the
+  `!ent` forms that take a corpse (`_ENT_CORPSE_SUBS`) offer the corpses
+  the view sees and their vars (L56, 1236).
   The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
@@ -3387,7 +3474,13 @@ hardcodes**.
   unknown rule dropped with a note), each parent present without a loop
   or a chain past the owner limit, and every template / prefab
   (`check_template` against the server's library plus the file's,
-  `check_prefab`, the saver checks) before changing anything; then the
+  `check_prefab`, the saver checks) and every library entry as its
+  editor checks it (`_check_imported_libraries`: prefab's checkers for
+  tile templates, functions and status / zone definitions,
+  `check_table_text`, aliases starting with a real command, tags,
+  watchers, var labels, steps; then every formula through
+  `_system_formula_slots`, the slot list `!system lint` reads too, a call
+  to an undefined function allowed; S8, 1244) before changing anything; then the
   systems go in through `_switch_systems` (all or nothing, every match
   re-applies its rules: units take the var names they give; size rule
   problems put it back), one `!system undo` step; then the templates
@@ -3424,8 +3517,8 @@ hardcodes**.
   (`logic.COMMAND_USER`, set in `_run_top`); `command_attribution` (words
   history / log / diff) picks where it shows. `!log [n] type= who= round=
   by=` filters (n ≥ 1; an unknown type is refused) (771, 822).
-- **Roster text:** `entity_line_format`, `entity_info_format` (`{statuses}`,
-  §7.4),
+- **Roster text:** `entity_line_format` (ends with `{statuses}` by
+  default), `entity_info_format` (`{statuses}`, §7.4),
   `corpse_line_format`, `body_part_entity_line_suffix`,
   `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`
   templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.
@@ -3536,7 +3629,21 @@ hardcodes**.
   export's own number replaced the match's snapshot of that number).
   `!history note <text|->` labels the newest snapshot (`Snapshot.note`,
   saved in the history index, one line of at most `HISTORY_NOTE_MAX`);
-  `!history list` and the undo previews show it (1177).
+  `!history list` and the undo previews show it (1177). An `!undo turn
+  N` / `round N` whose restore point equals the board now (the start of
+  the turn under way, nothing changed since) says so and offers the step
+  before, yes / no (`_undo_changes_nothing`, `_offer_further`; user
+  design, T13, 1235): Discord asks with Yes / No buttons
+  (`offer_confirm`, `_ConfirmView`: only the asker answers, Yes runs
+  `!undo <kind> <N+1> confirm` as a typed command), the CLI and GUI ask
+  inline (`prompt_choice`; yes restores N+1 in the same command), other
+  surfaces name the command. A round's autosave is taken as its first
+  turn begins (T12, user call): `_begin_turn` records it with the turn
+  autosave of that moment (`record_turn(with_round=)`, the round's
+  sequence first, so undoing to that turn keeps it), once per round per
+  `Match.round_saved` (saved, undo state; a file without it reads its
+  round number), so a restore shows that unit's turn under way and
+  `!turn next` goes on to the next unit.
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`
   (`team_add` refuses a non-number; `!team clear <team> [path]` takes a
   dotted path and refuses a team with nothing to clear);
@@ -3559,7 +3666,10 @@ hardcodes**.
   `item:weight` weighted, through `roll_table_pick`) and a leading `<n>x`
   repeating any roll, at most `roll_repeat_limit` (owner ceiling) (888);
   `roll_odds(spec, op, n, percent=False)` (a fraction) and
-  `roll_mean(spec)` (#361, pure, no RNG); `roll_table` (finite weights,
+  `roll_mean(spec)` (#361, pure, no RNG); `dice_distribution` counts a
+  group's faces and an exploding chain's entries before building them,
+  and every odds call of one top-level command shares one budget
+  (`formula.ODDS_BUDGET`, set in `_run_top`, `_ODDS_MAX_STEPS`; X28, 1242); `roll_table` (finite weights,
   keyed entries), `band` (ranges may be negative; an unreadable or
   backwards band is refused; success tiers compose from it, #105 struck,
   1227), `pick` / `shuffle`; `roll_dice(spec, all=False, label=None)`
@@ -3568,7 +3678,8 @@ hardcodes**.
   (1172).
 - **Named tables** (`Match.tables`, name -> text; `!table def | roll |
   odds | rank | list | show | remove | rename`, `!system table`): the text
-  is the spec, optionally ending ` rank=a,b` (the entries best first,
+  is the spec, optionally ending ` rank=a,b` (everything after the last
+  ` rank=`, so a ranked entry may hold spaces, L57; the entries best first,
   `split_table_rank` / `table_text`; entries left out follow in the order
   written, the fallback when there is no rank, user call; `!table rank`
   writes it). An entry `@<table>` rolls that table when picked and
@@ -3587,7 +3698,9 @@ hardcodes**.
   [...]` (`_table_roll_opts`, `_table_roll_reply`; #610, 1190, 1228-1229).
   `!table odds <name> [...]` (a player read, #362, `table_odds_rows`):
   each entry's chance, a sub-table's entries under it with their overall
-  chance, best / worst from the rank (P(best = i) = W_i^n - W_(i+1)^n,
+  chance (entries of one level naming the same sub-table one row, a path
+  ending "(back to `t`)" at a table it already passed through, at most
+  `table_odds_row_limit` rows, then a note; X27, 1241), best / worst from the rank (P(best = i) = W_i^n - W_(i+1)^n,
   W_i the chance of i or worse; 1230). All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
   `random_seed` rule when set, else the match's own `rng_seed` (made at
@@ -4225,7 +4338,8 @@ dump` is the raw data for the GM.
   `entity_description_<section>_format` rule (entity_info_format's
   placeholders; the list sections take `{items}`, one
   `entity_description_status_format` / `_action_format` / `_part_format`
-  line each). A section with nothing to show is left out. The header shows
+  line each; the status line's `{turns_word}` is `turn` for a duration
+  of 1, L57). A section with nothing to show is left out. The header shows
   the unit's `description` var, a status its definition's `description`
   data (level entries layered), an action its `description`. The mount
   section names the vehicle a rider rides (`_riding_format`, the
@@ -4235,7 +4349,9 @@ dump` is the raw data for the GM.
 - **Data:** the unit's vars as an indented list (`_description_vars` /
   `_description_tree`: a dict of plain values on one line, a dict's
   `description` after its key, plain lists joined, bools yes / no), cut at
-  `entity_description_line_limit`. `__` keys and `actions` dicts never
+  `entity_description_line_limit` (default -1, none; a cut ends with a
+  bullet naming `!ent get`, `_description_cut`: as a plain line Discord
+  ran it into the next header). `__` keys and `actions` dicts never
   show; `entity_description_shown_vars` (paths, empty = all) is the
   whitelist, `entity_description_hidden_vars` the blacklist (paths,
   `*.<key>` at any depth, `@engine` = every var a VAR_NAME_RULES rule names
@@ -4350,7 +4466,10 @@ lists what isn't built; 1093-1122).
   `action_condition_message_format`, `action_condition_text`; `!action
   list` marks an unmet one through `action_condition_ok` with no target,
   1216),
-  `cancelled_action_cost` (refund / pay). `run_action(steps=,
+  `cancelled_action_cost` (refund / pay). A body run without the
+  exchange (no unit holds a reaction, no prepare) still reads `affected`
+  (`run_action` evaluates `_affects` when a program names it; a failing
+  `affects` refuses with reason `affects`; R4, 1243). `run_action(steps=,
   preset_locals=, prepare_out=, body_out=, finish=, skip_checks=,
   extra_bindings=, fail_out=, target_out=)` runs any of the programs as
   one transaction. `fail(...)` takes the word `refund` (`REFUND`, a
@@ -4453,6 +4572,21 @@ lists what isn't built; 1093-1122).
   poll that fired, never for a read or inside an action body; 1170).
   Expiry (`settle_expiry`, at the start of the next command on the match
   but `!as`) journals the command as state; `!as wait` ages windows.
+  Posting (R5, user call: option b, 1249): when a window opens
+  (`_announce`), `_note_team_posts` records on the manager
+  (`mgr._window_posts`, runtime) the window's listing for every channel
+  bound with the team view of a unit still to answer, other than the
+  channel it opened in; the outermost command posts them at its end
+  (`_post_window_elsewhere`), each filtered by its channel's view
+  (`_ChannelCtx`), through the surface's `post_to_channel` (Discord: the
+  guild's channel, failures one console line; the CLI, GUI and harness
+  print `📨 to <channel>`; replays and `!simulate` have none). A rollback
+  (`_restore_all_matches`: `!dry`, `!batch strict`) drops the posts. A
+  player's `!react` still needs approval unless an access override opens
+  it. The exchange records its author (`ex["by"]`), and its body runs
+  under it (`COMMAND_USER`), so the action's log entries name who started
+  it whoever's answer closed the window (L57, 1249). `!as channel <key>`
+  (CLI / harness) types into another channel.
 - **Resolution** (`_advance`, phases before -> before_run -> body ->
   after_open -> after -> after_run -> done, so a paused step resumes
   where it stopped; `_drive` runs the stack, then the queue): picks

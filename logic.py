@@ -400,6 +400,9 @@ def settle_status_layers(inst: Any, cap: Callable[[Any], Any]) -> None:
 
 
 STATUS_LEVELS_FIELD = "levels"
+# A status's own visibility condition (an expression replacing the
+# status_visibility_condition rule for it; status_field reads it).
+STATUS_VISIBILITY_FIELD = "visibility_condition"
 STATUS_LEVEL_EXCLUDED = ("stack", "max_level", "tags", "removes",
                          "blocked_by", "hooks", "data", STATUS_LEVELS_FIELD,
                          "level")
@@ -600,6 +603,12 @@ UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\
 SAY_NAME_RE = re.compile("\u2063#([^|\u2063]*)\\|([^|\u2063]*)\\|([^\u2063]*)\u2063")
 SAY_TEAM_RE = re.compile("\u2063@([^\u2063]*)\u2063")
 SAY_OPEN_MARK = "\u2063!\u2063"
+# One roll of an action's dice line made by a unit's formula (V27):
+#   UNIT_LINE_TAG "%<match>|<unit>|<text>" UNIT_LINE_TAG
+# The reply filter keeps the rolls of the units the channel's view sees,
+# joined with ` · `, and drops a line left with none.
+DICE_ROLL_RE = re.compile("\u2063%([^|\u2063]*)\\|([^|\u2063]*)\\|([^\u2063]*)\u2063")
+DICE_ROLL_SEP = " · "
 # How many say(private=True) lines a match keeps waiting for a host (the
 # oldest go first).
 HELD_SAY_MAX = 200
@@ -624,7 +633,23 @@ def say_plain_text(text: str) -> str:
     when the line was made (the event log's text)."""
     text = SAY_NAME_RE.sub(lambda mo: mo.group(3), text)
     text = SAY_TEAM_RE.sub("", text).replace(SAY_OPEN_MARK, "")
+    text = join_dice_rolls(text, lambda _m, _u: True)
     return UNIT_LINE_RE.sub("", text)
+
+
+def join_dice_rolls(line: str, shown: Any) -> Optional[str]:
+    """`line` with its marked dice rolls (DICE_ROLL_RE) replaced by the
+    texts of those `shown(match_id, unit)` keeps, joined with
+    DICE_ROLL_SEP; None when it had rolls and keeps none."""
+    found = list(DICE_ROLL_RE.finditer(line))
+    if not found:
+        return line
+    kept = [mo.group(3) for mo in found
+            if not mo.group(2) or shown(mo.group(1), mo.group(2))]
+    if not kept:
+        return None
+    return (line[:found[0].start()] + DICE_ROLL_SEP.join(kept)
+            + line[found[-1].end():])
 
 
 # While the engine runs something on behalf of one unit outside a command
@@ -3124,10 +3149,14 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # is present and truthy. Dotted paths supported. Scenarios 4-6
     # cover the templating behavior.
     "entity_line_format": {
-        "default": "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
+        "default": ("{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing "
+                    "{facing}{?statuses?} | {statuses}{/?}"),
         "schema": {"type": "str"},
         "desc": (
             "Single-line template for an entity row (used in !list, !state). "
+            "The default ends with the unit's statuses as the channel's view "
+            "sees them ({statuses}: status_line_format per status, "
+            "status_visibility_condition deciding which show). "
             "Placeholders: {key} substitutes a value; {?key?}...{/?} renders inner "
             "only if the key is present and truthy. Dotted paths supported: "
             "{inventory.sword.damage}. Built-in keys: id, name, x, y, facing, team, "
@@ -3156,15 +3185,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "status_line_format": {
-        "default": ("{name}{?level?} ×{level}{/?}{?duration?} ({duration})"
-                    "{/?}{?layers?}: {layers}{/?}"),
+        "default": ("{name}{?level?} ×{level}{/?}{?duration?} ({duration} "
+                    "{turns_word}){/?}{?layers?}: {layers}{/?}"),
         "schema": {"type": "str"},
         "desc": (
             "How one status shows in the `{statuses}` placeholder of "
             "entity_line_format / entity_info_format / corpse_line_format "
             "(statuses joined with `, `, by name). Placeholders: {name}, and "
             "every field of the status instance ({level}, {duration}, any "
-            "custom field such as {lost_max_hp}); {layers} for a status "
+            "custom field such as {lost_max_hp}); {turns_word} (`turn` for "
+            "a duration of 1, else `turns`); {layers} for a status "
             "holding layers of several levels (layered stacking: `×3 for 2, "
             "then ×1 for 3 more`); {?key?}...{/?} shows a part "
             "only when the field is set. A status definition's own `display` "
@@ -3268,14 +3298,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     "entity_description_status_format": {
         "default": (
             "- {name}{?level?} (level {level}){/?}{?duration?}, {duration} "
-            "turns left{/?}{?description?}: {description}{/?}"
+            "{turns_word} left{/?}{?description?}: {description}{/?}"
         ),
         "schema": {"type": "str"},
         "desc": (
             "One status in the description. Placeholders: `{name}` and the "
             "instance's fields (level, duration, its data; the definition's "
             "level entries at its level fill fields the instance lacks), so "
-            "a `description` in the definition's data shows here. A "
+            "a `description` in the definition's data shows here, and "
+            "`{turns_word}` (`turn` for a duration of 1, else `turns`). A "
             "permanent status has no duration."
         ),
     },
@@ -3327,11 +3358,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "entity_description_line_limit": {
-        "default": 60,
-        "schema": {"type": "int", "min": 1, "max": 1000},
+        "default": -1,
+        "schema": {"type": "int", "min": 1, "max": 1000, "unlimited": True},
         "desc": (
             "The most lines the description's data section prints; the "
-            "rest are counted in a last line."
+            "rest are counted in a last bullet naming `!ent get`, which "
+            "reads one var. -1 (default) = no limit: a long description "
+            "takes several messages, and on Discord what passes "
+            "reply_message_cap goes in an attached file "
+            "(cut_output_attachment)."
         ),
     },
     "entity_description_actions_format": {
@@ -3673,6 +3708,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "The most rolls one `!roll Nx ...` makes (`!roll 6x 4d6kh3`, "
             "`!roll 2x none, crit`): N past it is refused."
+        ),
+    },
+    "table_odds_row_limit": {
+        "default": 500,
+        "schema": {"type": "int", "min": 1, "max": 5000, "ceiling": True},
+        "desc": (
+            "The most rows `!table odds` lists (a sub-table's entries "
+            "under the entry naming it count as rows); past it the listing "
+            "stops with a note. Entries of one table naming the same "
+            "sub-table are one row, and a path stops at a table it "
+            "already passed through."
         ),
     },
     "table_nesting_limit": {
@@ -4020,6 +4066,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "access` instead). Omniscient channels are unaffected either way."
         ),
     },
+    "pov_host_names_hidden": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a host's command in a channel with a team POV (one "
+            "players read) may name units that view hides: `!action`, "
+            "`!ent info` and the other reads that answer a hidden unit like "
+            "a missing one take it, so a GM can play an invisible enemy's "
+            "turn from the players' channel. The replies still pass "
+            "through the channel's view: lines about a unit it hides are "
+            "dropped and a name in the action-used line reads as "
+            "say_hidden_unit_name. A match var of the same name (true / "
+            "false, `!match var set pov_host_names_hidden true`) overrides "
+            "the rule for that match. Off (default) = a host's reads refuse "
+            "a hidden unit there as a player's do (`!list full`, `!map "
+            "full` and an unbound channel show everything)."
+        ),
+    },
     "host_reveal_warning": {
         "default": False,
         "schema": {"type": "bool"},
@@ -4088,6 +4152,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Malformed formula = treated as visible. Example: "
             "\"is_part_of_team(self, pov_team) or not status_has(self, "
             "'hidden')\"."
+        ),
+    },
+    "status_visibility_condition": {
+        "default": "",
+        "schema": {"type": "str", "formula": "expression"},
+        "desc": (
+            "Formula expression deciding whether a team POV (a player "
+            "channel) sees a status on a unit or corpse. Truthy = shown, "
+            "falsy = left out. Bindings: self = the bearer (None for a "
+            "corpse, which binds corpse_id and corpse_team), status_name, "
+            "pov_team. A "
+            "status's own `visibility_condition` (`!status visibility "
+            "<name> <formula>`; instance key, definition, level entries) "
+            "replaces this rule for it. Empty (default) = every status "
+            "shows. Omniscient views bypass it; a malformed formula shows "
+            "the status. Applies to the reads players make: {statuses} / "
+            "{status_csv} in the unit, card and corpse lines, the "
+            "description's statuses, `!find status:` and the status "
+            "overlays of images; formulas see every status. Example: "
+            "\"is_part_of_team(self, pov_team) or status_name != "
+            "'cursed'\"."
         ),
     },
     # Fake-statblock / disguise (116): the entity var holding a display-only,
@@ -4912,13 +4997,53 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "command_message_cap": {
         "default": 20,
-        "schema": {"type": "int", "min": 1, "max": 200, "ceiling": True},
+        "schema": {"type": "int", "min": 1, "max": 1000, "ceiling": True},
         "desc": (
             "Discord: the most messages one command may post in all (a "
             "`!foreach` over many units, a long `!batch` or macro, each "
             "line posting its own reply). Past it the command keeps "
             "running, its further replies are left out and one note says "
             "how many. Each reply is also capped by reply_message_cap."
+        ),
+    },
+    "cut_output_attachment": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Discord: when reply_message_cap cuts a reply, its cut note "
+            "carries the whole reply as `reply.txt`; when "
+            "command_message_cap leaves messages out, the note at the end "
+            "carries the command's whole output as `output.txt`. The file "
+            "lives on Discord only (the bot keeps no copy); it is counted "
+            "against the server's storage limit when posted and must fit "
+            "the upload size Discord allows in the server, else the note "
+            "says why it isn't attached. Off: the note alone."
+        ),
+    },
+    "autoupdate_reserved_messages": {
+        "default": 5,
+        "schema": {"type": "int", "min": 1, "max": 20, "ceiling": True},
+        "desc": (
+            "Discord: how many messages a new `!list autoupdate` or `!state "
+            "autoupdate` board posts and keeps (a board can't post more "
+            "later, so it reserves its room at the start). The text fills "
+            "them from the top; the ones it doesn't need show "
+            "autoupdate_reserved_text. Text past the last one is cut with a "
+            "note saying how much and how to make room. `reserve=<n>` on "
+            "the command overrides it for that board; a board keeps its "
+            "count until it is turned on again. A `!state` board's map "
+            "takes one message of its own. Each refresh edits every "
+            "message of the board."
+        ),
+    },
+    "autoupdate_reserved_text": {
+        "default": "[reserved message for {kind} autoupdate]",
+        "schema": {"type": "str"},
+        "desc": (
+            "Discord: the text of a `!list` / `!state` autoupdate board's "
+            "messages that its content doesn't need (see "
+            "autoupdate_reserved_messages). {kind} is `list` or `state`. "
+            "Empty shows a single dot, as Discord refuses an empty message."
         ),
     },
     # Auto-legend: a glyph->meaning key appended under the map. Seeds a new
@@ -5476,7 +5601,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     # ---- Match history / autosave / undo --------------------------------
     # The MatchHistory module (see match_history.py) takes three kinds of
-    # autosave: round-start (after on_round_start hooks), turn-start
+    # autosave: round-start (as the round's first turn begins), turn-start
     # (after on_turn_start hooks), and pre-command (before each mutating
     # command). The three rules below cap how much of each is kept; the
     # three thresholds below them gate the "are you sure?" prompt for
@@ -5511,9 +5636,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Cap on retained round-start autosaves. -1 = unlimited (default; "
             "the original spec is 'every start of round, for the entirety of "
             "the match'). 0 = disable round autosaves. N>0 = keep the most "
-            "recent N round-start snapshots. Round-start snapshots are taken "
-            "AFTER on_round_start hooks fire, so restoring one puts the "
-            "match at the state players would have seen as the round began."
+            "recent N round-start snapshots. A round's snapshot is taken as "
+            "its first turn begins (after the on_round_start hooks and that "
+            "unit's turn-start effects), so restoring one shows that unit's "
+            "turn under way, as the turn autosave of the same moment does."
         ),
     },
     "autosave_round_snapshot_mode": {
@@ -5888,7 +6014,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "turn_start_message_format": {
-        "default": "It is now **{name}**'s turn (id `{short_id}`)",
+        "default": "It is now **{name}**'s turn (id `{id}`)",
         "schema": {"type": "str"},
         "desc": (
             "The line `!turn next` ends with, naming whose turn it is now. "
@@ -5980,7 +6106,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "turn_forecast_line_format": {
-        "default": "`{short_id}` **{name}**",
+        "default": "`{id}` **{name}**",
         "schema": {"type": "str"},
         "desc": (
             "How `!turn forecast` names each unit in its list (the unit "
@@ -6023,7 +6149,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "extra_turn_message_format": {
-        "default": "It is now **{name}**'s extra turn (id `{short_id}`).",
+        "default": "It is now **{name}**'s extra turn (id `{id}`).",
         "schema": {"type": "str"},
         "desc": (
             "The line `!turn next` ends with when the turn it starts is an "
@@ -13277,6 +13403,11 @@ class Match:
     # what turn-based durations key on. Never decremented (a history restore
     # rolls it back with the rest of the state).
     turns_elapsed: int = 0
+    # The round whose round-start autosave was taken (T12): the snapshot is
+    # taken as the round's first turn begins (_begin_turn), so restoring
+    # it shows that unit's turn under way. Undo state, so a restore into a
+    # round doesn't take the round's autosave again.
+    round_saved: int = 0
     # The match's own RNG seed (made at creation; the random_seed rule, when
     # set, overrides it) and the position its RNG had reached, in 32-bit
     # words drawn (CountingRandom), so every match's rolls can be replayed
@@ -17538,7 +17669,8 @@ class Match:
 
     def _nearest_fit_cell(self, e: "Entity", ox: float, oy: float,
                           mp: "Map", avoid: Optional[Set[Tuple[int, int]]] = None,
-                          block_mode: Optional[str] = "tp"
+                          block_mode: Optional[str] = "tp",
+                          fits: Optional[Callable[[int, int], bool]] = None
                           ) -> Optional[Tuple[int, int]]:
         """The anchor cell nearest the point (ox, oy) where `e`'s whole
         footprint is on map `mp`, covers no other unit (ties by y then x),
@@ -17559,7 +17691,8 @@ class Match:
                             c in avoid for c in self.entity_cells(rider, gx, gy))) \
                         and not (block_mode and any(
                             self._check_block(rider.id, cx, cy, block_mode, mp)
-                            for cx, cy in self.entity_cells(rider, gx, gy))):
+                            for cx, cy in self.entity_cells(rider, gx, gy))) \
+                        and (fits is None or fits(gx, gy)):
                     key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
                     if best is None or key < best:
                         best = key
@@ -19444,7 +19577,8 @@ class Match:
 
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,
-                            extras: Optional[Dict[str, Any]] = None) -> bool:
+                            extras: Optional[Dict[str, Any]] = None,
+                            cond: Optional[str] = None) -> bool:
         """Shared evaluator behind the *_visibility_condition rules
         (entity / tile / zone / corpse). An omniscient viewer (pov_team
         is None) sees everything; an empty rule means visible; a
@@ -19455,7 +19589,9 @@ class Match:
         one; tiles/zones/corpses pass None)."""
         if pov_team is None:
             return True
-        cond = str(self.rules.get(rule_key, "")).strip()
+        # `cond` replaces the rule (a status's own visibility_condition).
+        cond = (cond if cond is not None
+                else str(self.rules.get(rule_key, ""))).strip()
         if not cond:
             return True
         ex = dict(extras or {})
@@ -19721,6 +19857,9 @@ class Match:
             # Wall-clock seconds (#135): requests are runtime-only, so the
             # clock decides their expiry and no replay reads it.
             "queued_at": time.time(),
+            # The turn it was asked on: a `!turn next` approved once that
+            # turn is over would end a later one (L57).
+            "turns_elapsed": self.turns_elapsed,
         }
         self.pending_requests[rid] = req
         return req
@@ -21356,11 +21495,8 @@ class Match:
             log.extend(self.fire_tile_time_hooks("on_round_start"))
             log.extend(self.fire_zone_time_hooks("on_round_start"))
             log.extend(self.fire_scheduled_round())
-            # Autosave: round start happens after on_round_start hooks
-            # so that restoring the snapshot gives the players the
-            # state they would have seen as the round began (with any
-            # hook side-effects already applied).
-            self.history.record_round(self)
+            # The round-start autosave is taken as the round's first turn
+            # begins (_begin_turn, T12).
             # An opening round_start hook/tick may have removed every
             # entity — nothing to start.
             if not self.turn_order:
@@ -21756,7 +21892,15 @@ class Match:
         self.turns_elapsed += 1
         self._note_actor()
         self._fire_reminders()
-        self.history.record_turn(self)
+        # The round's autosave comes with its first turn (T12): restoring it
+        # shows that unit's turn under way, its turn-start effects run, as
+        # the turn autosave of the same moment does. Taken before the turn
+        # autosave, so undoing to that turn keeps it.
+        with_round = (self.round_started and self.round_saved < self.round_number
+                      and not self.rules.get("atb_enabled"))
+        if with_round:
+            self.round_saved = self.round_number
+        self.history.record_turn(self, with_round=with_round)
 
     def reminder_line(self, r: Dict[str, Any]) -> str:
         """A reminder's line (reminder_message_format; a secret one marked)."""
@@ -22171,7 +22315,8 @@ class Match:
             log.extend(self.fire_tile_time_hooks("on_round_start"))
             log.extend(self.fire_zone_time_hooks("on_round_start"))
             log.extend(self.fire_scheduled_round())
-            self.history.record_round(self)
+            # The round-start autosave is taken as the round's first turn
+            # begins (_begin_turn, T12).
 
     _ROUND_FMT_RE = re.compile(r"\{(round|match)(?:\.([\w.]+))?\}")
 
@@ -27017,6 +27162,27 @@ class Match:
         cv = ent.get("vars") if isinstance(ent, dict) else None
         return cv if isinstance(cv, dict) else {}
 
+    def _track_corpse_write(self, corpse: Dict[str, Any],
+                            new_vars: Dict[str, Any], path: str,
+                            deleted: bool) -> None:
+        """A corpse write under a partial template's marker is recorded in
+        it, as write_var records a living unit's (S7), so the revived
+        unit's next save keeps it and a resync doesn't undo it."""
+        if TEMPLATE_MARKER not in json.dumps(new_vars, default=str):
+            return
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if not isinstance(ent, dict):
+            return
+        token = LEGACY_IDS_OK.set(True)
+        try:
+            tmp = Entity.from_dict(dict(ent, vars={}))
+        except Exception:
+            return
+        finally:
+            LEGACY_IDS_OK.reset(token)
+        tmp.__dict__["vars"] = new_vars
+        self.track_template_change(tmp, path, deleted)
+
     def corpse_var_set(self, cid: str, path: str, value: Any) -> Any:
         """Write `value` at dotted `path` in the corpse's vars (#268); the
         value before (None when absent). Store checks only (see above)."""
@@ -27033,6 +27199,7 @@ class Match:
             node = nxt
         old = node.get(keys[-1])
         node[keys[-1]] = _own_value(value)
+        self._track_corpse_write(corpse, cur, path, False)
         self._store_corpse_vars(cid, mp, corpse, cur)
         return old
 
@@ -27059,6 +27226,7 @@ class Match:
         if not isinstance(node, dict) or keys[-1] not in node:
             return False
         del node[keys[-1]]
+        self._track_corpse_write(corpse, cur, path, True)
         self._store_corpse_vars(cid, mp, corpse, cur)
         return True
 
@@ -27082,6 +27250,35 @@ class Match:
                     f"corpse `{cid}`: ({cx},{cy}) {dest.off_text(cx, cy)} "
                     f"(its body would cover it).")
         rec = dict(corpse)
+        # The body moves whole (R3): its located parts and snake segments
+        # keep their offset from the anchor, and a snake's trail moves
+        # with it, as a revive displaced to another cell shifts them.
+        dx, dy = int(x) - ox, int(y) - oy
+        if dx or dy:
+            parts = []
+            for pd in rec.get("parts") or []:
+                pd = jcopy(pd) if isinstance(pd, dict) else pd
+                if isinstance(pd, dict) and (pd.get("vars") or {}).get(
+                        "__part_located"):
+                    px = int(pd.get("x", ox)) + dx
+                    py = int(pd.get("y", oy)) + dy
+                    if not dest.in_bounds(px, py):
+                        raise OutOfBounds(
+                            f"corpse `{cid}`: its part `{pd.get('id')}` "
+                            f"would lie at ({px},{py}), "
+                            f"{dest.off_text(px, py)}.")
+                    pd["x"], pd["y"] = px, py
+                if isinstance(pd, dict) and isinstance(pd.get("vars"), dict):
+                    Match._shift_snake_path_vars(pd["vars"], dx, dy)
+                parts.append(pd)
+            if "parts" in rec:
+                rec["parts"] = parts
+            ent = rec.get("entity")
+            if isinstance(ent, dict) and isinstance(ent.get("vars"), dict):
+                ent = dict(ent)
+                ent["vars"] = jcopy(ent["vars"])
+                Match._shift_snake_path_vars(ent["vars"], dx, dy)
+                rec["entity"] = ent
         if dest is src:
             rec["x"], rec["y"] = int(x), int(y)
             src.corpses[cid] = rec
@@ -27185,6 +27382,9 @@ class Match:
                         if (pd.get("vars") or {}).get("__part_located"):
                             pd["x"] = int(pd.get("x", x)) + dx
                             pd["y"] = int(pd.get("y", y)) + dy
+                    # A snake's trail moves with it.
+                    Match._shift_snake_path_vars(e.vars, dx, dy)
+                    e.mark_changed()
                     x, y = near
             except VTTError:
                 # Nothing was revived: the corpse goes back where it lay
@@ -28958,6 +29158,7 @@ class Match:
             "rules": copy.deepcopy(self.rules),
             "round_number": self.round_number,
             "turns_elapsed": self.turns_elapsed,
+            "round_saved": self.round_saved,
             "rng_seed": self.rng_seed,
             "schedule_seq": self.schedule_seq,
             "rng_pos": self.rng_position(),
@@ -29168,6 +29369,9 @@ class Match:
         # m.rules already set above
         m.round_number = int(d.get("round_number", 1))
         m.turns_elapsed = int(d.get("turns_elapsed", 0))
+        # A file from before T12 has no marker: its round's autosave, if
+        # any, was taken at the wrap.
+        m.round_saved = int(d.get("round_saved", m.round_number))
         try:
             m.schedule_seq = max(0, int(d.get("schedule_seq", 0)))
         except (TypeError, ValueError):
@@ -29792,15 +29996,61 @@ class Match:
                     out.pop(total_v, None)
         return out
 
+    def status_visible_to(self, name: str, inst: Any,
+                          pov_team: Optional[str], *,
+                          eid: Optional[str] = None,
+                          corpse_id: Optional[str] = None) -> bool:
+        """Whether team `pov_team` sees status `name` (instance `inst`) on
+        unit `eid` (self) or on corpse `corpse_id`: the status's own
+        visibility_condition (status_field: instance, definition, level
+        entries) else the status_visibility_condition rule. Omniscient
+        (None) sees all; empty = shown; a formula that fails shows it."""
+        if pov_team is None:
+            return True
+        own = self.status_field(inst, name, STATUS_VISIBILITY_FIELD)
+        cond = own if isinstance(own, str) and own.strip() else None
+        if cond is None and not str(self.rules.get(
+                "status_visibility_condition", "")).strip():
+            return True
+        ex: Dict[str, Any] = {"status_name": name}
+        if corpse_id is not None:
+            ex["corpse_id"] = corpse_id
+            loc = self.find_corpse(corpse_id)
+            ent = loc[2].get("entity") if loc is not None \
+                and isinstance(loc[2], dict) else None
+            cv = ent.get("vars") if isinstance(ent, dict) else None
+            ex["corpse_team"] = team_text(cv.get(str(self.rules.get(
+                "team_var", "team")))) if isinstance(cv, dict) else None
+        return self._visibility_visible("status_visibility_condition",
+                                        pov_team, target=eid, extras=ex,
+                                        cond=cond)
+
+    def visible_statuses(self, status: Any, pov_team: Optional[str],
+                         eid: Optional[str] = None,
+                         corpse_id: Optional[str] = None) -> Dict[str, Any]:
+        """`status` (name -> instance) without the statuses pov_team
+        doesn't see (status_visible_to); the same dict when none hides."""
+        if not isinstance(status, dict):
+            return {}
+        if pov_team is None or not status:
+            return status
+        hidden = [n for n, inst in status.items()
+                  if not self.status_visible_to(str(n), inst, pov_team,
+                                                eid=eid, corpse_id=corpse_id)]
+        if not hidden:
+            return status
+        return {k: v for k, v in status.items() if k not in hidden}
+
     def presented_statuses(self, e: "Entity",
                            pov_team: Optional[str] = None) -> Dict[str, Any]:
         """The statuses `e` presents to `pov_team`: the real ones, or under a
         disguise its `status` dict (name -> instance data), none when it has
         no such key (the image hides status overlays under a disguise too).
-        Read-only."""
+        A real status status_visibility_condition hides from pov_team is
+        left out (a disguise's decoys are what it shows). Read-only."""
         dis = self._effective_disguise(e, pov_team)
         if dis is None:
-            return e.status
+            return self.visible_statuses(e.status, pov_team, e.id)
         st = dis.get("status")
         return {str(k): v for k, v in st.items()} \
             if isinstance(st, dict) else {}
@@ -30122,7 +30372,7 @@ class Match:
             return []
         out: List[Dict[str, Any]] = []
         default_layer = self._layer_rule("sprite_layer_overlay", 150)
-        statuses = e.status if isinstance(e.status, dict) else {}
+        statuses = self.visible_statuses(e.status, pov_team, e.id)
         for sname in sorted(statuses):
             inst = statuses.get(sname)
             inst = inst if isinstance(inst, dict) else {}
@@ -31730,14 +31980,31 @@ class Match:
         one = str(self.rules.get("action_dice_roll_format",
                                  "{label} {spec} → {total}"))
         shown = []
-        for label, spec, total in rolls:
-            shown.append(one.replace("{label}", str(label or ""))
-                         .replace("{spec}", str(spec))
-                         .replace("{total}", str(total)).strip())
+        marked = False
+        for r in rolls:
+            label, spec, total = r[0], r[1], r[2]
+            owner = r[3] if len(r) > 3 else None
+            text = (one.replace("{label}", str(label or ""))
+                    .replace("{spec}", str(spec))
+                    .replace("{total}", str(total)).strip())
+            text = text.replace(UNIT_LINE_TAG, "")
+            # A roll another unit's formula made (a hook on a target, V27)
+            # is marked with that unit, so a view that can't see it drops
+            # the roll; the actor's own rolls follow the line's own tag.
+            if owner and owner != actor_id:
+                marked = True
+            shown.append((owner if owner and owner != actor_id else "",
+                          text))
         fmt = str(self.rules.get("action_dice_line_format", "🎲 {rolls}"))
         if not fmt.strip():
             return ""
-        return (fmt.replace("{rolls}", " · ".join(shown))
+        if marked:
+            rolls_text = "".join(
+                f"{UNIT_LINE_TAG}%{self.id}|{o}|{t}"
+                f"{UNIT_LINE_TAG}" for o, t in shown)
+        else:
+            rolls_text = DICE_ROLL_SEP.join(t for _o, t in shown)
+        return (fmt.replace("{rolls}", rolls_text)
                 .replace("{actor_name}", self.say_name(actor_id))
                 .replace("{actor}", actor_id)
                 .replace("{action}", action_name))

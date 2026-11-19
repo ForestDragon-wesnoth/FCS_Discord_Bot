@@ -119,16 +119,24 @@ SERVER_LOGS: Dict[str, Tuple[str, str]] = {
 SERVER_LABEL_PREFIX = "0 server - "
 SERVER_LABEL_SUFFIX = ".txt"
 SERVER_LABEL_NAME_MAX = 80
+# The name part's most bytes once encoded (W12): a file name holds 255
+# bytes on common file systems, and the write goes through a temporary
+# name about 40 bytes longer; an emoji takes 4 bytes, a CJK character 3.
+SERVER_LABEL_NAME_BYTES = 150
 _LABEL_BAD_CHARS = set('<>:"/\\|?*')
 
 
 def server_label_file(name: str, key: str) -> str:
     """The label file's name for server `name`: characters no file system
     takes become `_`, whitespace runs one space, cut at
-    SERVER_LABEL_NAME_MAX, the key when nothing is left."""
+    SERVER_LABEL_NAME_MAX characters and SERVER_LABEL_NAME_BYTES encoded
+    bytes, the key when nothing is left."""
     text = "".join("_" if (c in _LABEL_BAD_CHARS or ord(c) < 32) else c
                    for c in str(name))
-    text = " ".join(text.split())[:SERVER_LABEL_NAME_MAX].rstrip(" .")
+    text = " ".join(text.split())[:SERVER_LABEL_NAME_MAX]
+    while len(text.encode("utf-8")) > SERVER_LABEL_NAME_BYTES:
+        text = text[:-1]
+    text = text.rstrip(" .")
     return f"{SERVER_LABEL_PREFIX}{text or key}{SERVER_LABEL_SUFFIX}"
 
 
@@ -737,40 +745,65 @@ class Storage:
     # ---- server label file ---------------------------------------------
     def label_server(self, key: str, name: str, force: bool = False) -> bool:
         """Write server `key`'s label file (SERVER_LABEL_PREFIX) naming
-        `name`, replacing an older one, when its folder exists. Without
-        `force`, only when `name` differs from the name last written in this
-        process. Returns whether it wrote. The local workspace has none."""
-        if key == LOCAL_WORKSPACE or not self.has_server(key):
+        `name`, replacing an older one, in its folder and in its trash
+        folder (`data/.trash/<key>/`, W13), whichever exist. Without
+        `force`, only when `name` differs from the name last written (or
+        tried) in this process, so a write that fails warns once per name
+        (W12). Returns whether it wrote. The local workspace has none."""
+        if key == LOCAL_WORKSPACE:
             return False
         name = str(name)
         if not force and self._labels.get(key) == name:
             return False
-        sdir = self.server_dir(key)
+        tdir = os.path.join(self._trash_root(), key)
+        has_trash = os.path.isdir(tdir)
+        if not self.has_server(key) and not has_trash:
+            return False        # nothing to label yet: try again later
+        self._labels[key] = name
+        wrote = False
+        if self.has_server(key):
+            wrote = self._write_label(self.server_dir(key), key, name, key)
+        if has_trash:
+            wrote = self._write_label(tdir, key, name, TRASH_DIR) or wrote
+        return wrote
+
+    def _write_label(self, folder: str, key: str, name: str,
+                     usage_key: str) -> bool:
+        """Write the label file naming `name` into `folder`, removing an
+        older label there; its bytes count toward `usage_key`."""
         fname = server_label_file(name, key)
+        trash = usage_key == TRASH_DIR
         text = (f"Discord server: {name}\n"
                 f"Server id: {key}\n"
                 f"Written by the bot on "
                 f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}.\n\n"
-                f"This folder holds that server's data. The bot writes this "
-                f"file at startup and when the server's name changes; editing "
-                f"or deleting it changes nothing else.\n")
-        path = os.path.join(sdir, fname)
+                + ("This folder holds that server's wiped data (`!server "
+                   "wipe`), kept for 24 hours. "
+                   if trash else "This folder holds that server's data. ")
+                + "The bot writes this file at startup and when the "
+                  "server's name changes; editing or deleting it changes "
+                  "nothing else.\n")
+        path = os.path.join(folder, fname)
         delta = -_file_size(path)
         try:
             _write_text(path, text)
             delta += _file_size(path)
-            for other in os.listdir(sdir):
-                opath = os.path.join(sdir, other)
+            for other in os.listdir(folder):
+                opath = os.path.join(folder, other)
                 if (other != fname and _is_label_file(other)
                         and os.path.isfile(opath)):
                     delta -= _file_size(opath)
                     os.remove(opath)
         except OSError as ex:
-            print(f"⚠️ [{key}] couldn't write the server name file: {ex}")
+            print(f"⚠️ [{key}] couldn't write the server name file"
+                  f"{' in the trash' if trash else ''}: {ex}")
             return False
         finally:
-            self._add_usage(key, delta)
-        self._labels[key] = name
+            if trash:
+                if TRASH_DIR in self._usage:
+                    self._usage[TRASH_DIR] += delta
+            else:
+                self._add_usage(key, delta)
         return True
 
     def label_on_disk(self, key: str) -> Optional[str]:
@@ -1924,6 +1957,11 @@ class Storage:
         self.commit_all_one(mgr)
         entry = os.path.join(self._trash_root(), key, f"{time.time():.3f}-{scope}")
         os.makedirs(entry, exist_ok=True)
+        # The trash folder names its server too (W13).
+        name = getattr(mgr, "guild_name", None) or self._labels.get(key)
+        if name:
+            self._write_label(os.path.join(self._trash_root(), key), key,
+                              str(name), TRASH_DIR)
         moved = ["matches"] + (["systems.json", "saves", "templates",
                                 "prefabs"]
                                if scope == "all" else [])

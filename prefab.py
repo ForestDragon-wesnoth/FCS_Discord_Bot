@@ -585,12 +585,13 @@ def _check_unit_dict(u: Any, name: str, where: str) -> None:
 
 
 def _check_tile_template(entry: Dict[str, Any], name: str,
-                         tname: str) -> Dict[str, Any]:
+                         tname: str, owner: Optional[str] = None
+                         ) -> Dict[str, Any]:
     """A carried tile template as `!tile def` would hold it: `data` an
     object the store accepts (its facing a direction), `hooks` tile hook
     names mapped to formula text, tags that parse. A number as `data`
     crashed every `!map` of the match it was stamped into (S13)."""
-    who = f"Prefab `{name}`: tile template `{tname}`"
+    who = f"{owner or f'Prefab `{name}`'}: tile template `{tname}`"
     data = entry.get("data", {})
     if data is None:
         data = {}
@@ -619,11 +620,12 @@ def _check_tile_template(entry: Dict[str, Any], name: str,
 
 
 def _check_formula_function(entry: Dict[str, Any], name: str,
-                            fname: str) -> Dict[str, Any]:
+                            fname: str, owner: Optional[str] = None
+                            ) -> Dict[str, Any]:
     """A carried formula function as `!func def` would hold it: named by
     its key, a list of parameter names `check_formula_function` accepts,
     a body of text (L34)."""
-    who = f"Prefab `{name}`: function `{fname}`"
+    who = f"{owner or f'Prefab `{name}`'}: function `{fname}`"
     if entry.get("name", fname) != fname:
         raise VTTError(f"{who}: its `name` must be `{fname}`, the key it "
                        f"is stored under.")
@@ -650,11 +652,12 @@ _STATUS_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
 
 
 def _check_status_definition(entry: Dict[str, Any], name: str,
-                             sname: str, level: Optional[str] = None) -> None:
+                             sname: str, level: Optional[str] = None,
+                             owner: Optional[str] = None) -> None:
     """A carried status definition holds what `!status` would store: a
     stack mode and tick time it knows, a whole max_level, formulas and
     hooks as text, tags and tag filters that parse."""
-    who = f"Prefab `{name}`: status definition `{sname}`" + (
+    who = f"{owner or f'Prefab `{name}`'}: status definition `{sname}`" + (
         f" level `{level}`" if level else "")
     if level is None:
         logic.check_status_name(sname)
@@ -668,7 +671,7 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
     if ml is not None and (isinstance(ml, bool) or not isinstance(ml, int)
                            or ml < 0):
         raise VTTError(f"{who}: max_level must be a whole number >= 0.")
-    for k in ("tick", "display"):
+    for k in ("tick", "display", logic.STATUS_VISIBILITY_FIELD):
         if entry.get(k) is not None and not isinstance(entry[k], str):
             raise VTTError(f"{who}: `{k}` must be text.")
     for k, choices in (("resist_affects", logic.RESIST_AFFECTS),
@@ -720,7 +723,7 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
         if bad:
             raise VTTError(f"{who}: level `{spec}` can't set "
                            f"{', '.join(bad)}.")
-        _check_status_definition(lent, name, sname, spec)
+        _check_status_definition(lent, name, sname, spec, owner)
 
 
 # ---- geometry -----------------------------------------------------------------

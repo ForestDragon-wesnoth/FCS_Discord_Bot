@@ -59,6 +59,11 @@ class GuiCtx:
     async def send(self, message: str):
         self.app.log(message)
 
+    async def post_to_channel(self, channel_key: str, text: str):
+        """A post to another channel (a reaction window shown to a team's
+        channel, R5): shown here with the channel it went to."""
+        await self.send(f"📨 to `{channel_key}`:\n{text}")
+
     def show_scene_view(self, pov, hidden=None, coords=None,
                         legend=None, mp=None) -> None:
         """A `!map` with its own view options (`as=`, `full`, `hide=`,

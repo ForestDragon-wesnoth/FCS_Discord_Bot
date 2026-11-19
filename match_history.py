@@ -538,7 +538,8 @@ class MatchHistory:
 
     Each Match owns one MatchHistory instance via Match.history. The
     history is mutated by:
-      - Match.next_turn() → record_round / record_turn
+      - Match._begin_turn() → record_turn (with the round's snapshot at
+        a round's first turn)
       - the command dispatcher → record_command (with dedup against
         no-op commands)
       - !history save / restore / delete / undo
@@ -746,20 +747,19 @@ class MatchHistory:
 
     # ---- recording (called by Match.next_turn and the dispatcher) ----
 
-    def record_round(self, match: "Match") -> Snapshot:
-        """Snapshot taken at the start of a round, after on_round_start
-        hooks have already fired. Called from Match.next_turn()."""
-        s = self._make_snapshot(match, "round")
-        self.round_saves.append(s)
-        self._prune_rounds(match)
-        return s
-
-    def record_turn(self, match: "Match") -> Snapshot:
+    def record_turn(self, match: "Match", with_round: bool = False) -> Snapshot:
         """Snapshot taken at the start of an entity's turn, after
         on_turn_start hooks have fired. Bumps the turn counter, which
         cascades into command-snapshot pruning (commands are scoped to
-        their enclosing turn for retention purposes)."""
+        their enclosing turn for retention purposes). `with_round`: the
+        round's first turn (T12), whose round-start snapshot of the same
+        moment is taken first (its sequence before the turn's, so undoing
+        to this turn keeps it)."""
         self._turn_index += 1
+        if with_round:
+            r = self._make_snapshot(match, "round")
+            self.round_saves.append(r)
+            self._prune_rounds(match)
         s = self._make_snapshot(match, "turn")
         self.turn_saves.append(s)
         self._prune_turns(match)
