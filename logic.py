@@ -3185,7 +3185,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "status_line_format": {
-        "default": ("{name}{?level?} ×{level}{/?}{?duration?} ({duration} "
+        "default": ("{name}{?stacked?} ×{stacked}{/?}{?duration?} ({duration} "
                     "{turns_word}){/?}{?layers?}: {layers}{/?}"),
         "schema": {"type": "str"},
         "desc": (
@@ -3193,7 +3193,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entity_line_format / entity_info_format / corpse_line_format "
             "(statuses joined with `, `, by name). Placeholders: {name}, and "
             "every field of the status instance ({level}, {duration}, any "
-            "custom field such as {lost_max_hp}); {turns_word} (`turn` for "
+            "custom field such as {lost_max_hp}); {stacked} (the level "
+            "when above 1, so a level-1 status shows no `×1`); "
+            "{turns_word} (`turn` for "
             "a duration of 1, else `turns`); {layers} for a status "
             "holding layers of several levels (layered stacking: `×3 for 2, "
             "then ×1 for 3 more`); {?key?}...{/?} shows a part "

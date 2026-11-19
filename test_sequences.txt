@@ -33542,7 +33542,8 @@ SCENARIO 992 — A zone-held status follows its zones; a permanent status stays 
 !ent move u 2 left
 !assert "status_level('u', 'bless') == 1"
 !ent info u short
-?? bless ×1
+?? bless
+?! bless ×
 ?! __zone
 !status def hex
 !status apply u hex
@@ -44839,6 +44840,20 @@ SCENARIO 1224 — !system import: replace or merge, matches take the rules, all 
 ?? ❌ Can't import `saves/bad.json`: `rpg`: `friendlyfire` is true or false, got 'yes'.
 !system func list rpg
 ?? tpl
+?file set saves/bad.json systems.0.settings.friendlyfire.value true
+?file set saves/bad.json systems.0.settings.default_entity_passives {"value": -1}
+!system import bad.json
+?? `default_entity_passives` is a list, got -1.
+?file set saves/bad.json systems.0.settings.default_entity_passives {"value": []}
+?file set saves/bad.json systems.0.settings.command_access {"value": [1]}
+!system import bad.json
+?? `command_access` is a JSON object, got [1].
+?file set saves/bad.json systems.0.settings.command_access {"value": {}}
+?file set saves/bad.json systems.0.formula_functions.dbl {"name": "dbl", "params": ["x"]}
+!system import bad.json
+?? function `dbl`: `body` must be formula text.
+!system func list rpg
+?? tpl
 ?file write saves/junk.json {"format": "something"}
 !system import junk.json
 ?? isn't a system file
@@ -44859,8 +44874,11 @@ the `tpl` function) stay; the match on it takes the rules at once, so the
 file's: lowest_first and `tpl` go. The import is one `!system undo` step. A
 file holding a rule value its rule refuses is refused whole, naming it,
 and changes nothing; a file that isn't a system file and an unknown mode
-are refused. Importing needs the `systems` capability (and `files` to
-read the file), exporting the `files` capability.
+are refused, as is a list or object rule holding another kind of value
+(a passive list of -1 crashed the import) and a function without a body
+(it returned None into its caller's arithmetic). Importing needs the
+`systems` capability (and `files` to read the file), exporting the
+`files` capability.
 
 
 SCENARIO 1225 — Dice pools: success counts, failures, rerolls, Fate dice and d% (#104)
@@ -45813,7 +45831,7 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 !status apply orc burn 2 3
 !status apply orc cursed 1 1
 !list
-?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns), cursed ×1 (1 turn)
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns), cursed (1 turn)
 ?? Hero (hero): HP: 30/30 X,Y: 6,6 facing up
 ?! Hero (hero): HP: 30/30 X,Y: 6,6 facing up |
 !status visibility cursed "is_part_of_team(self, pov_team)"
@@ -45836,7 +45854,7 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 ?! fx_curse
 !match bind pov=red
 !list
-?? burn ×2 (3 turns), cursed ×1 (1 turn)
+?? burn ×2 (3 turns), cursed (1 turn)
 !map scene list
 ?? overlay `orc` at (2,2) 2x2 stretch — sprite fx_curse
 !match bind pov=blue
@@ -45847,10 +45865,10 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 !status visibility cursed
 ?? Cleared `cursed`'s visibility condition (it follows status_visibility_condition)
 !list
-?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | cursed ×1 (1 turn)
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | cursed (1 turn)
 !status visibility cursed "entity[zqxnobody].hp > 0"
 !list
-?? cursed ×1 (1 turn)
+?? cursed (1 turn)
 !status level burn 3 visibility_condition "False"
 !status apply orc burn 3 3
 !system set default status_visibility_condition ""
@@ -45859,7 +45877,7 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 ?? cursed
 !match bind pov=omniscient
 !list
-?? burn ×3 (3 turns), cursed ×1 (1 turn)
+?? burn ×3 (3 turns), cursed (1 turn)
 !status visibility cursed "corpse_team == pov_team"
 !ent kill orc
 !match bind pov=blue
@@ -45868,12 +45886,26 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 !match bind pov=red
 !ent info orc
 ?? cursed
+!match bind pov=blue
+!find dead show:status
+?? [status=—]
+!ent add mask Mask 20 8 8 4
+!ent set_var mask team red
+!status apply mask cursed 1 5
+!status apply mask burn 2 5
+!ent set_var mask disguise.name Rock
+!eval "entity[mask].disguise.status = {'sleep': {}}"
+!find hp>0 show:status
+?? Rock (mask)
+?? [status=sleep]
+?! [status=burn
 !assert "corpse_status_has('orc', 'burn')"
 
 Expected: the default entity_line_format ends with the unit's statuses
-(`| burn ×2 (3 turns), cursed ×1 (1 turn)`), each through
+(`| burn ×2 (3 turns), cursed (1 turn)`), each through
 status_line_format, which says how many turns are left; a unit without
-statuses has no `|`. A status's own visibility condition (`!status
+statuses has no `|`, and a level-1 status shows no `×1` (`{stacked}`,
+the level above 1). A status's own visibility condition (`!status
 visibility`, self = the bearer) hides `cursed` from blue's view in the
 line, `!find status:` and `show:status` and the description, while red, the bearer's team,
 sees it; the image overlay of `cursed` over the 2×2 orc goes the same
@@ -45882,7 +45914,10 @@ a condition of their own (`burn` hidden from blue); clearing the
 status's condition puts it back under the rule. A condition that fails
 shows the status. A level entry's condition (burn level 3: `False`) hides
 the status at that level only; the omniscient view sees everything. A
-corpse's statuses follow the same conditions with corpse_team bound.
+corpse's statuses follow the same conditions with corpse_team bound,
+in its description and in `!find dead ... show:status` (burn, at level
+3, shows `—`). A disguised unit's `show:status` column lists the
+disguise's statuses (`sleep`), as its line does (V29).
 Formulas see every status (`corpse_status_has` finds the hidden burn).
 
 

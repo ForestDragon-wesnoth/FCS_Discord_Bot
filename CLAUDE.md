@@ -2006,8 +2006,9 @@ hardcodes**.
   placeholder (`vtt_commands._statuses_text`, in the default
   entity_line_format after a ` | ` and in entity_info_format): each status
   through its definition's `display` format (`!status display`) else the
-  `status_line_format` rule (`burn ×2 (3 turns)`), its instance fields as
-  placeholders plus `{turns_word}` (885, 1246).
+  `status_line_format` rule (`burn ×2 (3 turns)`), its instance fields
+  as placeholders plus `{turns_word}` and `{stacked}` (the level above 1,
+  so the default shows no `×1`, L58) (885, 1246).
 - **Visibility** (user request, 1246): which team views see a status is
   its own `visibility_condition` (`logic.STATUS_VISIBILITY_FIELD`,
   `status_field`: instance key, definition, level entries; `!status
@@ -3472,13 +3473,16 @@ hardcodes**.
   <file> [as=<name>] [mode=replace|merge]` (`systems` capability, plus
   `files`, and `templates` / `prefabs` when it carries them) checks
   every rule value as `!system set` would (`_checked_rule_value`; an
-  unknown rule dropped with a note), each parent present without a loop
+  unknown rule dropped with a note; a list / dict rule must hold that
+  kind, each default passive and clamp is checked as `!defpassive add` /
+  `!gclamp add` would store it and each event_log_format entry is text,
+  S9), each parent present without a loop
   or a chain past the owner limit, and every template / prefab
   (`check_template` against the server's library plus the file's,
   `check_prefab`, the saver checks) and every library entry as its
   editor checks it (`_check_imported_libraries`: prefab's checkers for
-  tile templates, functions and status / zone definitions,
-  `check_table_text`, aliases starting with a real command, tags,
+  tile templates, functions (a body required, S9) and status / zone
+  definitions, `check_table_text`, aliases starting with a real command, tags,
   watchers, var labels, steps; then every formula through
   `_system_formula_slots`, the slot list `!system lint` reads too, a call
   to an undefined function allowed; S8, 1244) before changing anything; then the
@@ -3636,7 +3640,9 @@ hardcodes**.
   before, yes / no (`_undo_changes_nothing`, `_offer_further`; user
   design, T13, 1235): Discord asks with Yes / No buttons
   (`offer_confirm`, `_ConfirmView`: only the asker answers, Yes runs
-  `!undo <kind> <N+1> confirm` as a typed command), the CLI and GUI ask
+  `!undo <kind> <N+1> confirm` as a typed command, refused once
+  `turns_elapsed` differs from the `stamp` taken when it asked, since the
+  count is relative to that turn, L58), the CLI and GUI ask
   inline (`prompt_choice`; yes restores N+1 in the same command), other
   surfaces name the command. A round's autosave is taken as its first
   turn begins (T12, user call): `_begin_turn` records it with the turn

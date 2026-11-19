@@ -576,12 +576,15 @@ class DiscordCtxWrapper:
 
 
     async def offer_confirm(self, m, question: str, name: str,
-                            args: list) -> None:
+                            args: list, stamp=None) -> None:
         """A yes / no question a command asks (an `!undo` that would change
         nothing offers the step past it): the question with Yes / No
-        buttons; Yes runs `!<name> <args>` as the clicker."""
+        buttons; Yes runs `!<name> <args>` as the clicker. `stamp` is the
+        match's turns_elapsed when asked: a Yes after a turn has passed
+        runs nothing (the offered count is relative to that turn)."""
         try:
-            view = _ConfirmView(m.id, self.user_id, name, args, self._mgr)
+            view = _ConfirmView(m.id, self.user_id, name, args, self._mgr,
+                                stamp=stamp)
             view.message = await self._ctx.send(question, view=view)
         except Exception:
             await self._post(question + f" Type `{_shown_cmd(name, args)}` "
@@ -956,8 +959,9 @@ class _ConfirmView(discord.ui.View):
     leaves things as they are. Both disable the buttons."""
 
     def __init__(self, match_id: str, asker: str, name: str, args: list,
-                 mgr, timeout: float = 600.0):
+                 mgr, timeout: float = 600.0, stamp=None):
         super().__init__(timeout=timeout)
+        self._stamp = stamp
         self._mid = match_id
         self._asker = asker
         self._name = name
@@ -990,6 +994,15 @@ class _ConfirmView(discord.ui.View):
         if not await _ack_click(interaction, "Yes"):
             return
         if not await self._mine(interaction):
+            return
+        m = self._mgr.matches.get(self._mid)
+        if self._stamp is not None and (
+                m is None or m.turns_elapsed != self._stamp):
+            await _click_reply(
+                interaction, "❌ The turn has moved on since this question, "
+                f"so `{_shown_cmd(self._name, self._args)}` would undo to "
+                "another point. Ask again with `!undo`.", ephemeral=True)
+            await self._disable(interaction)
             return
         await self._disable(interaction)
         ictx = _InteractionCtx(interaction, self._mgr)

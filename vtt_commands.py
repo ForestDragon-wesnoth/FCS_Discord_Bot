@@ -24,7 +24,7 @@ from logic import DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
-from logic import reserved_var_path_error, file_refs
+from logic import reserved_var_path_error, file_refs, _check_template_passives_clamps
 from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem, STATUS_VISIBILITY_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
@@ -2942,6 +2942,12 @@ def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
         ctx["name"] = name
         ctx.setdefault("turns_word", "turn" if ctx.get("duration") == 1
                        else "turns")
+        # {stacked}: the level when above 1 (the default format shows no
+        # "×1" on a status that has a level of 1).
+        lvl = ctx.get("level")
+        if (isinstance(lvl, (int, float)) and not isinstance(lvl, bool)
+                and lvl > 1):
+            ctx.setdefault("stacked", lvl)
         ctx.pop(STATUS_LAYERS_KEY, None)
         if status_layers_of(inst) is not None:
             ctx["layers"] = status_layers_text(status_layers_of(inst))
@@ -19268,6 +19274,12 @@ _ODDS_TABLE_MAX = 40   # distribution rows shown when no comparison is given
 
 
 def _fmt_pct(p: float) -> str:
+    # Chances summed in floats (a merged odds row of six 1/6s) land a few
+    # units in the last place off 0 or 1: read those as exact.
+    if abs(p - 1) < 1e-9:
+        p = 1.0
+    elif abs(p) < 1e-12:
+        p = 0.0
     if 0 < p < 0.00005:
         return "<0.01%"
     if 0.99995 < p < 1:
@@ -20640,7 +20652,7 @@ async def _offer_further(ctx, m: Match, kind: str, n: int,
     args = [kind, str(n + 1), "confirm"]
     offer = getattr(ctx, "offer_confirm", None)
     if offer is not None:
-        await offer(m, question, "undo", args)
+        await offer(m, question, "undo", args, stamp=m.turns_elapsed)
         return None
     prompt = getattr(ctx, "prompt_choice", None)
     if prompt is not None:
@@ -31064,6 +31076,29 @@ def _checked_rule_value(key: str, v: Any) -> Any:
         if not isinstance(v, str):
             raise VTTError(f"`{key}` is text, got {v!r}.")
         return _coerce_rule_value(key, v)
+    want = {"list": list, "dict": dict}.get(t)
+    if want is not None and not isinstance(v, want):
+        raise VTTError(f"`{key}` is a {'list' if want is list else 'JSON object'}"
+                       f", got {v!r}.")
+    if key in ("default_entity_passives", "default_clamps"):
+        # Each item as `!defpassive add` / `!gclamp add` would store it.
+        kf = "id" if key == "default_entity_passives" else "path"
+        what = "passive" if kf == "id" else "clamp"
+        for item in v:
+            if not isinstance(item, dict) or not isinstance(item.get(kf), str):
+                raise VTTError(f"`{key}`: each {what} is an object with a "
+                               f"text `{kf}`, got {item!r}.")
+            _check_template_passives_clamps(
+                {f"{what}s": {item[kf]: dict(item)}}, f"`{key}`")
+            try:
+                (Passive if kf == "id" else ClampSpec).from_dict(item)
+            except (VTTError, KeyError, TypeError) as ex:
+                raise VTTError(f"`{key}`: {what} `{item[kf]}`: {ex}")
+    elif key == "event_log_format":
+        for etype, fmt in v.items():
+            if not isinstance(fmt, str):
+                raise VTTError(f"`{key}`: the format of `{etype}` is text, "
+                               f"got {fmt!r}.")
     json_text(v)
     return v
 
