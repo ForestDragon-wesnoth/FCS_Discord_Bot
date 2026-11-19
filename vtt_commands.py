@@ -18353,18 +18353,21 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
 _SHOW_STATUS_COLUMNS: frozenset = frozenset({"status", "statuses"})
 
 
-def _fmt_status_names(e) -> str:
+def _fmt_status_names(e, pov: Optional[str] = None) -> str:
     """An entity's statuses as a compact display string: sorted names, each
     annotated `name(level)` when its level is set and greater than 1.
-    Empty string when the entity has none.
+    Empty string when the entity has none. Under a team view `pov`, the
+    statuses that view sees (a disguise's, status visibility).
 
     Joined with '/' rather than ', ' because `show:` already separates its
     COLUMNS with ', ' — a comma here would make `[status=burn, slow, hp=40]`
     read as three columns instead of two.
     """
+    status = (e._match.presented_statuses(e, pov)
+              if pov is not None and e._match is not None else e.status)
     out = []
-    for name in sorted(e.status or {}):
-        data = e.status.get(name)
+    for name in sorted(status or {}):
+        data = status.get(name)
         lvl = data.get("level") if isinstance(data, dict) else None
         try:
             show_lvl = lvl is not None and float(lvl) > 1
@@ -19012,9 +19015,11 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                     # lookup renders '—'. This pseudo-column reads the real
                     # status dict; a level > 1 is shown as name(level).
                     if h[0] == "unit":
-                        names = _fmt_status_names(h[1])
+                        names = _fmt_status_names(h[1], pov)
                     else:
-                        st = (h[1][1][2].get("entity") or {}).get("status")
+                        st = m.visible_statuses(
+                            (h[1][1][2].get("entity") or {}).get("status"),
+                            pov, corpse_id=h[1][0])
                         names = ", ".join(sorted(st)) if isinstance(
                             st, dict) else ""
                     cells.append(f"{col}={names or '—'}")

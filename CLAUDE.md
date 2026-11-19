@@ -2016,8 +2016,9 @@ hardcodes**.
   corpse_team on a corpse; empty = shown, a failing formula shows it).
   `Match.status_visible_to` / `visible_statuses`, applied in
   `presented_statuses` (a disguise's decoys are shown as they are), so the
-  placeholders, the description, `!find status:`, `!simulate`'s report
-  and the image overlays (`entity_overlays`) follow it; corpse lines,
+  placeholders, the description, `!find status:` and `show:status`
+  (`_fmt_status_names(e, pov)`), `!simulate`'s report and the image
+  overlays (`entity_overlays`) follow it; corpse lines,
   descriptions and `!find dead status:` use the command's view
   (`command_pov`). Formulas see every status. Lint, promote and the
   formula-text hiding read the conditions (`_status_level_formulas`,

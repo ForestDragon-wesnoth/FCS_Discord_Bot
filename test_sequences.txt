@@ -45826,6 +45826,9 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 ?! orc
 !find status:burn
 ?? orc
+!find status:burn show:status
+?? [status=burn(2)]
+?! cursed
 !ent info orc
 ?? burn
 ?! cursed
@@ -45872,7 +45875,7 @@ Expected: the default entity_line_format ends with the unit's statuses
 status_line_format, which says how many turns are left; a unit without
 statuses has no `|`. A status's own visibility condition (`!status
 visibility`, self = the bearer) hides `cursed` from blue's view in the
-line, `!find status:` and the description, while red, the bearer's team,
+line, `!find status:` and `show:status` and the description, while red, the bearer's team,
 sees it; the image overlay of `cursed` over the 2×2 orc goes the same
 way. The status_visibility_condition rule covers the statuses without
 a condition of their own (`burn` hidden from blue); clearing the
