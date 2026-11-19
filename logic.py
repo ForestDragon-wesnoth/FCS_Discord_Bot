@@ -203,6 +203,12 @@ STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
 # lost lines), so the status lines (#309) stay quiet.
 STATUS_LINES_QUIET: "contextvars.ContextVar[bool]" = (
     contextvars.ContextVar("vtt_status_lines_quiet", default=False))
+# The (match, unit, status) a `!status` command or `!ent status` acts on
+# directly: its reply already reports the change, so their status lines
+# (#309) stay quiet (user call); a status None = every status of the unit.
+# Changes the command's hooks make elsewhere still print.
+STATUS_LINES_SKIP: "contextvars.ContextVar[frozenset]" = (
+    contextvars.ContextVar("vtt_status_lines_skip", default=frozenset()))
 
 # The causes the on_status_removed bindings and a definition's on_removed
 # hook read as `removed_by`.
@@ -24841,8 +24847,11 @@ class Match:
         transform is swapping statuses. Tagged as about the unit, and for
         the team views the status's visibility condition or the unit's
         disguise keeps it from, a STATUS_HIDE_RE marker naming them."""
+        skip = STATUS_LINES_SKIP.get()
         if STATUS_LINES_QUIET.get() or not self.rules.get(
-                "status_change_lines", True):
+                "status_change_lines", True) or (
+                skip and ((self.id, eid, name) in skip
+                          or (self.id, eid, None) in skip)):
             return []
         e = self.entities.get(eid)
         if e is None:

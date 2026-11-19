@@ -2041,7 +2041,11 @@ hardcodes**.
   over `_line_teams`) it carries a `STATUS_HIDE_RE` marker naming those
   teams, which `_filter_unit_lines` drops. A transform's swap runs under
   `STATUS_LINES_QUIET` (it prints its own lines), and a `transform`
-  removal prints none.
+  removal prints none. The `!status` commands (apply, force, counter,
+  dispel, transfer) and `!ent status` report their change in their reply,
+  so the lines of the (unit, status) they act on stay quiet
+  (`STATUS_LINES_SKIP`, `vtt_commands._quiet_status_lines`; user call);
+  what their hooks change elsewhere still prints.
 - **Blocked applications** (#389, 1263): `apply_status` reports a refusal
   through `Match.status_blocked` (the blocked line, then on_status_blocked
   passives and a definition's `on_blocked` hook, bound `block_reason`

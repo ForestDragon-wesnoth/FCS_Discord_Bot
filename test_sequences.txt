@@ -46623,37 +46623,44 @@ SCENARIO 1261 — Status gain, loss and level lines; per-status lines and the sw
 !ent add orc Orc 30 3 3 10
 !status def burn
 !status def wet
-!status apply orc burn 1 3 source=mage
+!eval "status_apply('orc', 'burn', 1, 3, source='mage')"
 ?? Orc gains burn for 3 turns.
-!status apply orc burn 3
+!eval "status_apply('orc', 'burn', 3)"
 ?? Orc's burn is now level 3 (was 1).
-!status counter orc burn add -1
+!eval "status_counter_add('orc', 'burn', -1)"
 ?! burn is now
+!status apply orc burn 4
+?! Orc's burn is now
 !ent set_var mage actions.soak.target entity
 !ent set_var mage actions.soak.body "status_apply(target, 'wet', 2)"
 !action mage soak orc
 ?? Orc gains wet ×2.
 !status message wet lost "{name} dries off ({removed_by})."
-!status dispel orc wet
+!eval "status_dispel('orc', 'wet')"
 ?? Orc dries off (dispel).
-!status message burn gained none
 !status dispel orc burn
-!status apply orc burn 1
+?? Dispelled 1 status(es) matching `burn` from `orc`: `burn`
+?! Orc loses burn
+!status message burn gained none
+!eval "status_apply('orc', 'burn', 1)"
 ?! Orc gains burn
 !status message burn gained -
 !system set default status_gained_message_format "{name} catches {status} from {source}."
 !status dispel orc burn
-!status apply orc burn 1 source=mage
+!eval "status_apply('orc', 'burn', 1, source='mage')"
 ?? Orc catches burn from Mage.
 !system set default status_change_lines off
-!status dispel orc burn
+!eval "status_dispel('orc', 'burn')"
 ?! Orc loses burn
 !assert "not status_has('orc', 'burn')"
 
 Expected: with status_change_lines on (the default, #309) a status's
 arrival, departure and level change each print a line about the unit,
-whatever caused them (the soak action's status_apply too); a duration
-change prints none. A status's own line replaces the rule's (`{removed_by}`
+whatever caused them (a formula's status_apply, the soak action); a
+duration change prints none. The `!status` commands report their own
+change in their reply, so they print no status line for it (`!status
+apply` raising burn to 4, `!status dispel`, whose reply names what it
+removed). A status's own line replaces the rule's (`{removed_by}`
 names the cause), `none` silences it, `-` restores the rule's. The rule's
 format reads `{source}` as the applier's name. Off, no status lines print.
 
@@ -46674,25 +46681,25 @@ SCENARIO 1262 — Status lines follow the channel's view: hidden statuses, disgu
 !status def cursed
 !status visibility cursed "is_part_of_team(self, pov_team)"
 !match bind pov=blue
-!status apply orc burn 1
+!eval "status_apply('orc', 'burn', 1)"
 ?? Orc gains burn.
-!status apply orc cursed 1
+!eval "status_apply('orc', 'cursed', 1)"
 ?! Orc gains cursed
-!status apply spy burn 1
+!eval "status_apply('spy', 'burn', 1)"
 ?! gains burn
 !match bind pov=red
-!status apply orc burn 2
+!eval "status_apply('orc', 'burn', 2)"
 ?? Orc's burn is now level 2 (was 1).
-!status dispel orc cursed
+!eval "status_dispel('orc', 'cursed')"
 ?? Orc loses cursed.
 !match bind pov=omniscient
-!status apply spy burn 2
+!eval "status_apply('spy', 'burn', 2)"
 ?? Spy's burn is now level 2 (was 1).
 !system set default fog_enabled_by_default true
 !ent set_var hero fog_vision_radius 1
 !match fog on
 !match bind pov=blue
-!status apply orc burn 3
+!eval "status_apply('orc', 'burn', 3)"
 ?! Orc's burn
 
 Expected: a status line is about its unit and its status (#309). In a
@@ -46726,23 +46733,24 @@ SCENARIO 1263 — Blocked applications: on_status_blocked, the definition's on_b
 !ent set_var orc tags undead
 !passive add orc pb on_status_blocked "entity[self].got = [status_name, block_reason, status_applier, status_level_tried, status_duration_tried]"
 !status hook fear on_blocked "entity[self].hook = block_reason"
-!status apply orc fear 1 2 source=mage
+!eval "status_apply('orc', 'fear', 1, 2, source='mage')"
 ?? Orc is unaffected by fear (immune).
 !assert "entity[orc].got == ['fear', 'immune', 'mage', 1, 2] and entity[orc].hook == 'immune'"
 !status apply orc poison 2
-?? Orc is unaffected by poison (resisted).
+?? `orc`: `poison` fully resisted
+?! unaffected by poison
 !assert "entity[orc].got[1] == 'resisted'"
 !status apply orc wet 1
-!status apply orc burn 1
+!eval "status_apply('orc', 'burn', 1)"
 ?? Orc is unaffected by burn (blocked_by).
-!status force orc burn 1
+!eval "status_force('orc', 'burn', 1)"
 ?? Orc is unaffected by burn (blocked_by).
-!status apply orc holy 1
+!eval "status_apply('orc', 'holy', 1)"
 ?? Orc is unaffected by holy (tag).
-!status apply ohead fear 1
+!eval "status_apply('ohead', 'fear', 1)"
 ?? is unaffected by fear (part_immune).
 !status message holy blocked "The light passes through {name}."
-!status apply orc holy 1
+!eval "status_apply('orc', 'holy', 1)"
 ?? The light passes through Orc.
 !ent set_var orc got none
 !zone fill pit 6 6 8 8
@@ -46760,5 +46768,6 @@ the status's own on_blocked hook: immunity, resistance taking the level
 below 1, a blocking status (also for a forced application, which skips
 only immunity and resistance), a cannot_affect_units_with_tag filter and
 a body part's own immunity. A status's blocked_message replaces the rule's
-line. A zone's grant blocked by immunity is tried at every settle, so it
+line. `!status apply`'s own refusal says why, so it prints no blocked
+line (the hook still fires). A zone's grant blocked by immunity is tried at every settle, so it
 fires neither the hook nor the line (the 2x2 orc stepping into the pit).
