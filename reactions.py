@@ -39,7 +39,7 @@ import dataclasses
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from logic import (COMMAND_USER, VTTError, UnitFlags, jcopy, _own_value,
+from logic import (COMMAND_USER, APPROVED_BY, VTTError, UnitFlags, jcopy, _own_value,
                    tag_filter_matches, ACTION_IMMUNE_FIELDS,
                    ACTION_FORBID_FIELDS, FORMULA_TEXT_HIDDEN,
                    JOURNAL_AS_STATE)
@@ -640,6 +640,8 @@ def _option_line(m: Any, ex: Dict[str, Any], uid: str,
                 " <unit ...>", "location": " <x> <y>", "location_list":
                 " <x> <y> ...", "corpse": " <corpse>", "corpse_list":
                 " <corpse ...>"}.get(act.target_type, "")
+        if act.direction_target:
+            tail = " <x> <y>|<direction> [n]"
         return f"`!react {uid} {act.name}{tail}`"
     names = ", ".join(cmd(a) for a, _v in opts)
     return (m.unit_tag(uid) + f"- {_name(m, uid)} can react: {names} — or "
@@ -1302,11 +1304,15 @@ async def _advance(env: _Env, seq: int) -> str:
         # The action's own log entries carry whoever started it (L57),
         # whichever command's answer closed the window.
         utoken = COMMAND_USER.set(ex["by"]) if ex.get("by") else None
+        atoken = (APPROVED_BY.set(ex.get("approved_by") or None)
+                  if ex.get("by") else None)
         try:
             r = await _body_phase(env, seq)
         finally:
             if utoken is not None:
                 COMMAND_USER.reset(utoken)
+            if atoken is not None:
+                APPROVED_BY.reset(atoken)
         if r == "suspended":
             return "window"
         ex = _ex(env.m, seq)
@@ -1745,6 +1751,8 @@ def _new_exchange(m: Any, action: Any, *, actor_id: str, eff: str,
         "picks": [], "pick_seq": 0, "channel": channel,
         "by": COMMAND_USER.get() or "",
     }
+    if APPROVED_BY.get():
+        ex["approved_by"] = APPROVED_BY.get()
     for u in affected:
         ex["incoming"][u] = jcopy(base)
     # The forecasts `prepare` made: each target's copy holds what they came
@@ -2036,7 +2044,8 @@ async def react_pick(ctx: Any, mgr: Any, m: Any, uid: str, requested: str,
     target, remaining = parse_target(act.target_type, rest, m, uid,
                                      missing=missing,
                                      missing_corpse=missing_corpse,
-                                     map_of=map_of)
+                                     map_of=map_of,
+                                     directions=act.direction_target)
     args = parse_args_tokens(remaining)
     target, dup = dedupe_targets(act.target_type, target, act.name)
     _pick(m, ex, uid, act, via, phase, target=target, args=args,

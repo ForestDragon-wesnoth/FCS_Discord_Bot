@@ -2067,7 +2067,15 @@ hardcodes**.
   the map of a location / location_list target's cells (the actor's by
   default; not an action arg there, 880); `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
-  [x, y] → location, ids checked, lists non-empty). A successful
+  [x, y] → location, ids checked, lists non-empty). An action holding
+  `direction_target: true` (W17, user design: opt-in, a `location`
+  target only) also takes a direction word and an optional count
+  (`!action ogre dash left 2`, `!react hero dodge right`,
+  `use_action(u, 'dash', 'right 3')`): the cell that many steps from the
+  acting unit's ANCHOR, for a multi-tile body where its anchor shifts to
+  (`action._direction_cell`; diagonals per allow_diagonal_movement; a
+  reaction counts from the reacting unit); without the field a direction
+  word is refused naming it (1251). A successful
   `!action` (and a resolved exchange) ends with the
   `action_used_message_format` line (`Match.action_used_line`: {actor},
   {action}, {target} as the checks left it, a cell as (x,y), lists joined;
@@ -3156,7 +3164,12 @@ hardcodes**.
   buttons last as long as the request and the message says when it
   expired. `!as wait <seconds>` (CLI / harness) ages every request. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
-  `_channel_pointed_at`). A request records the `turns_elapsed` it was
+  `_channel_pointed_at`), credited to the requester (L58, user call:
+  `_RequesterChannelCtx.credited_to` -> COMMAND_USER; `logic.APPROVED_BY`
+  names the approver as `approved_by` on the event-log entries, the
+  journal entry and a deferred exchange, and in the undo step's `by`,
+  `attribution_text`: "ana (approved by cli)"; a replay sets it from the
+  entry, 1250). A request records the `turns_elapsed` it was
   asked on, and a `!turn next` approved on a later turn is refused (it
   would end that turn; L57, 1245). A request whose command an open reaction
   window holds stays queued (`approval_waits`: `!approve`, `!approve
@@ -3195,9 +3208,12 @@ hardcodes**.
   `!ent info`, ...) refuse it to a host too, unless
   `pov_host_names_hidden` (rule, default off; a match var of that name, a
   bool, overrides it, `_host_names_hidden`; W16, user call, 1248) lets a
-  host play a hidden unit from the players' channel; the replies still
-  pass through the channel's view (the action-used line names it
-  `someone`). A glued part shows while the
+  host ACT with a hidden unit from the players' channel (`!action` /
+  `!react`: `_query_eid(read=False)`); the replies still pass through the
+  channel's view (the action-used line names it `someone`). Reads stay
+  refused there with a note that the rule opens actions only (V28, user
+  call: their reply would show the unit to the players), on a missing
+  unit too, so the note is no oracle. A glued part shows while the
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`); a host's in a channel with a team view
