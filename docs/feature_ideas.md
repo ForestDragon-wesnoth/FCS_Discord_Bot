@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #620). #264-#615 come from review passes by
+(the highest so far is #621). #264-#615 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -14,7 +14,7 @@ full (everything its entry asks for or assumes), its number moves to
 part keeps its entry, trimmed to what is still open. When the user strikes
 or rejects one, it moves to "Off the list".
 
-**Shipped:** #349, #350, #351, #352, #353, #324, #431, #354 (the formula language: `-=`, unpacking, read subscripts, f-strings, type tests, `return`, `:=`, line numbers), #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
+**Shipped:** #116, #267, #310, #309, #389 (statuses: `max_duration`, `if_source_lost`, ticks on the applier's clock, gain / loss / level lines, blocked applications), #349, #350, #351, #352, #353, #324, #431, #354 (the formula language: `-=`, unpacking, read subscripts, f-strings, type tests, `return`, `:=`, line numbers), #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
 #75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #135 (`pending_request_expiry_seconds`), #221 (`default_passives_existing_units`, on by default), #89, #326, #269, #270, #271, #325 (formula helpers: `chance`, `exists` / `is_alive`, cell sets, `cell_toward` / `cell_behind`, `roll_dice`, dict helpers), #123, #134, #328, #266, #111, #282, #275, #59 and #124 (`!turn roll`, `initiative_reroll_each_round`), #395, #457, #460, #539, #540, #522, #396 (formula helpers: `teams` / `group_names`, `entities_in_cells`, `plural` / `ordinal` / `list_text`, `own_turns`, `fits_at`, `free_cells_near`, `corpse_cell` / `corpses_within`), #587, #590, #605, #610, #600, #434, #538, #453, #456 (destroyed parts marked, `!ent clone` without coordinates, `!zone copy`, table roll counts and `!roll <table>`, `!mount list` for the match, `!ent add` with vars, the empty turn order explained, `!find` aggregates, `!template list has=`), #535, #268, #329, #454 (corpses: read with `!ent info` / `get`, written and looted, dragged, swept with `!find dead` / `!foreach dead`), #104, #361, #253, #459, #362, #520 (dice pools, rerolls, Fate dice and d%; `roll_odds` / `roll_mean`; table roll adjustments, ranks and best / worst; sub-tables and dice in entries; `!table odds`; the action dice line), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
@@ -60,7 +60,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#115 Hidden statuses** (shipped in part).
   - Shipped: `status_visibility_condition` and a status's own `visibility_condition` (`!status visibility`) keep a status out of a team view's unit lines, card, description, `!find status:` (`count` too) and `show:status`, and image overlays.
   - Open: a player's `$()` / `!assert` / read-only `!eval` still read every status (`status_has(boss, 'cursed')`), as formulas do. The private-vars treatment (`Match.private_view`) would run such reads with the hidden statuses left out.
-- **#116 `max_duration` on status definitions,** the duration twin of `max_level`.
 - **#117 Zone and tile lifetimes.** `expires_in` on zones and placed tiles, counted on `turns_elapsed` (a 3-turn fire wall, a smoke cloud).
 - **#118 `zone_grow(name, n)` / `zone_shrink`, plus `!zone grow/shrink`.** Optionally stopped by block conditions; for spreading fire, expanding gas and a closing storm circle.
 - **#119 One-shot hooks.** A `once` flag on tile and zone hooks, for pressure plates and mines.
@@ -192,7 +191,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 - **#264 Looks by state.** A unit's `looks` list of `{condition, glyph, sprite, color}`; the first entry whose condition holds decides how it draws (bloodied, enraged, burrowed). Today `color` takes a formula and `glyph` / `sprite` are fixed vars.
 - **#265 Facing follows movement.** A rule `move_sets_facing` (`off` / `walk` / `all`, with a per-unit override): a step turns the unit the way it stepped. Today a walk leaves facing alone, so a `side_hit` game needs `!ent face` after every move.
-- **#267 Statuses that end with their source.** A definition field `source_lost: keep | remove`: when the applier dies or leaves, the status goes (removed_by `source`). For taunts, grapples and concentration buffs; builds on the `__source` field from #25.
 - **#272 Default parameters for `!func`.** `!func def mitigated raw,armor=0 "..."`, plus keyword calls.
 - **#273 Descriptions on GM definitions.** A `describe` subcommand on `!func`, `!macro`, `!alias`, `!table`, `!watch`, tile templates and zone definitions, shown in their lists and in `!help function`, and ready for the handbook export (#231).
 - **#274 Spawn overrides.** `!template spawn orc 3 3 team=red vars.hp=20 name="Orc Chief"` and an `overrides=` dict on `summon_template`. Plain values; #251 covers formulas evaluated at spawn.
@@ -210,8 +208,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#289 Host handover.** `!host owner <user>`: the owner passes the match on; an administrator can do it for an owner who left the server.
 - **#307 `actions_used(eid, since='own_turn', tag=None, name=None)`.** The action twin of `reactions_used`, over a saved log of successful uses. "One attack per turn" and "no action twice in a row" become one line in a cost or condition, before #24 exists.
 - **#308 Own-turn-only actions.** A rule `actions_need_own_turn` (default off) with a per-action `any_time` field and a refusal format rule. Today every body tests `current_id()` itself.
-- **#309 Status gain and loss lines.** `status_applied_message_format` / `status_removed_message_format`, a per-definition override, tagged as lines about the unit, empty by default. The status twin of #247; today a status applied by a formula arrives silently.
-- **#310 Ticks on the applier's clock.** `tick_when: source_turn_start | source_turn_end`, for "until the end of the caster's next turn". Builds on `__source`, pairs with #267.
 - **#311 Zone targets.** Action target types `zone` and `zone_list`: a checked name, seen through the channel's view, bound with `.name` and `.cells`. Doors, chests and traps are zones by the ground / object rule (CLAUDE.md §7.12), and today an action on one takes its name as raw text.
 - **#312 Unit-or-cell targets.** `target: entity_or_location`, for a spell cast at a creature or at a point.
 - **#313 Relative directions.** `forward`, `back`, `left`, `right` in `!ent move`, `!ent push`, `!ent face` and `move_step`, read from the unit's facing. Pairs with #265.
@@ -244,7 +240,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#386 Unit-side zone and tile hooks.** `on_zone_entered`, `on_zone_exited` and `on_tile_entered` as passive hooks on the unit, with the zone's name and tags bound. A vampire's sunlight weakness then lives in the vampire; today only the zone or tile can hold the hook.
 - **#387 on_kill.** Fires on the killer (own, team and global passives) with `victim` bound. Today "heal when I kill" is a global on_death passive comparing `killer`.
 - **#388 on_part_destroyed on the body.** Fires on the root when one of its parts is destroyed, with `part` bound.
-- **#389 Blocked status applications.** An `on_status_blocked` hook and a `status_blocked_message_format` line ("Immune!") carrying the reason: immune, resisted to 0, blocked_by, a tag block. Pairs with #309.
 - **#390 `move_kind` in movement hooks.** walk / tp / push / pull / swap / carried bound in on_entity_moved, on_entity_step and the tile and zone enter / exit / stop hooks. #220 gives it to block conditions; hooks need it for "the trap springs on a walk, the lava burns on any entry".
 - **#391 Actions that end the turn.** An action field `ends_turn` and a formula `end_turn()`: the turn passes once the action and its reaction exchange have resolved, when the actor is the acting unit. Solis's standard action works this way; today the player types `!turn next`, and no formula can advance the turn.
 - **#392 Reveal fog from formulas.** `reveal_cells(team, cells, turns=None)` and `reveal_clear`. A flare or a scouting skill needs it; `!reveal_fog` exists as a command only.
@@ -385,6 +380,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Open question: for a multi-tile body, the line between body centres, or the best line between any two covered cells (as sight already uses). Rec: centres, cheap and predictable; the best pair when a rule asks for it.
 - **#619 Last known positions.** When a unit drops out of a team's view (hidden, undetected, out of fog range), the team keeps a "last seen" marker on its cell for `last_seen_turns` turns (0 = off): the unit's glyph greyed, or a rule glyph, with its name as that team last saw it. A `last_seen(team, eid)` read gives the cell and the turn. Stealth play reads it constantly; built on #6's team markers.
 - **#620 Hit from the unseen** (composes today; an example scenario, no engine code). A global `on_damage_taken` passive (self = the unit hit), checked in a probe: `if attacker and not team_sees_entity(entity[self].team, attacker): say_to(entity[self].team, 'Something hits ' + entity[self].name + ' from the ' + direction_to(entity_center(self), entity_center(attacker)) + '!')` prints "Something hits Hero from the up_left!" in the defender's team channel while the attacker stays `someone`. With #6, a short-lived arrow marker on the defender's edge. A creature that decloaks when it attacks (the Umbra Cattus) removes its cloak status in its own `on_action_used` passive; one that stays cloaked doesn't. The scenario documents both, and whether the defender learns a distance band too is up to the formula.
+- **#621 Blocked status grants.** A zone whose grant is blocked (immunity, resistance, blocked_by, a tag filter) fires neither on_status_blocked nor the blocked line (#389), since a grant is tried again at every settle and would fire per step. Firing once per unit per entry into the zone (an "immune to the fire zone" line when it steps in) needs a per-unit record of the blocked grants.
 
 ## Medium (a subsystem slice)
 
@@ -798,7 +794,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 ## Suggested groupings
 
 - **Formula ergonomics:** #89, #194
-- **Status bundle:** #114, #115, #116, #150
+- **Status bundle:** #114, #115, #150, #621
 - **Zone bundle:** #117, #118, #119
 - **Discord table play:** #128, #148, #182, then #28 and #198
 - **Tactical combat:** #16 → #24 → #36
@@ -824,7 +820,7 @@ From the #264-#348 reviews:
 - **Targeting:** #269, #270, #275, #286, #287, #291, #292, #311, #312, #313, #314
 - **Objects as zones:** #311, #338, #339
 - **Action limits:** #307, #308, #24
-- **Status order and lifetime:** #266, #267, #290, #296, #309, #310, #340, #344
+- **Status order and lifetime:** #266, #290, #296, #340, #344
 - **Private information:** #342, #343
 - **Formula ergonomics (review):** #324, #325, #326, #272
 - **Engine upkeep:** #346, #347, #348
@@ -844,7 +840,7 @@ From the #349-#385 review:
 
 From the #386-#418 review:
 
-- **Hooks:** #386, #387, #388, #389, #390
+- **Hooks:** #386, #387, #388, #390
 - **Formula twins of commands:** #391, #392, #393, #394, #395, #396, #397
 - **Approvals and players:** #398, #399, #400, #401
 - **Looks and reads:** #402, #403, #404, #405, #406, #407, #408
