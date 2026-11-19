@@ -1882,12 +1882,13 @@ hardcodes**.
   new match, §7.16) describe a status ONCE; an instance resolves behaviour from
   the definition of the same name. Duration decrement and self-removal live
   in the GM's tick formula; the engine forces no decay (390-391).
-- **Definition hooks** (`!status hook <name> <on_added|on_removed|on_changed>
+- **Definition hooks** (`!status hook <name> <on_added|on_removed|on_changed|on_blocked>
   [formula]`, the definition's `hooks`; `logic.STATUS_DEF_HOOKS`): run by
   `fire_status_event` after the on_status_* passives, self = the bearer,
   while the unit exists. Removal hooks (passives too) bind `removed_by`:
   `dispel`, `transfer`, `removes` (another status's `removes`), `zone`
-  (a granting zone let go, §7.12), `transform` (§7.11), `expired`
+  (a granting zone let go, §7.12), `transform` (§7.11), `source` (its
+  applier lost, #267), `expired`
   (a counter reached 0, or the status's own tick removed it:
   `logic.STATUS_TICKING`) or `removed`; `_emit_status_diff(removed_by=)`
   carries a caller's cause (884). The formula status functions surface
@@ -1993,6 +1994,66 @@ hardcodes**.
   and an application with a duration under every stack mode leave it so
   (the add returns None; `add_level` still adds its level; L38, user
   call, 683, 992); `status_counter_set` gives it one (960).
+- **max_duration** (#116, 1258): a definition's `max_duration` (`!status
+  maxduration <name> <n|->`; a level entry may set its own) caps every
+  stored duration as max_level caps the level: `Match._cap_status_dict`
+  (called by `_cap_live_status` on every status change, by apply_status
+  before its no-change test, by `_cap_unit_status_levels` for statuses a
+  unit arrives with), each layer at its own level (`settle_status_layers`'
+  `dur_cap`; a layered application caps its layer before merging, so a
+  capped layer can't push a lower one out of the front). A permanent
+  status stays permanent (user call); lowering the cap shortens live
+  instances (`recap_status`, also after a level entry's edit).
+- **Statuses that end with their source** (#267, 1259): `if_source_lost`
+  keep / remove (`status_field`; `!status if_source_lost`, else the rule
+  `status_default_if_source_lost`, keep; user's name for GM clarity). The
+  source is the instance's `__source` (#227, the latest applier, user
+  call). Lost = dies (any death, a destroyed body part though it stays)
+  or leaves (despawn, transfer): `Entity.remove` scrubs the key of kept
+  ones and, on a despawn, ends the others (`end_sourced_statuses`,
+  removed_by `source`); a death ends them in `_process_death_one` after
+  its guard (the pairs taken before the removal), a destroyed part in
+  `_process_part_death`. A revive brings nothing back.
+- **Ticks on the applier's clock** (#310, 1260): tick_when
+  `source_turn_start` / `source_turn_end` (`SOURCE_TICK_WHENS`, a
+  definition or level entry). `fire_status_tick` at a turn phase adds a
+  source pass (only while some definition uses them,
+  `_source_clock_defined`): every unit outside the turn's units holding
+  such a status whose source (`_tick_source`: `__source` while not lost,
+  `status_source_lost`) is among them, in turn order. Without a source,
+  applied by the bearer, or once the source is lost, it ticks on the
+  bearer's own turn at that phase (user call). Plain counting: duration 1
+  applied during the caster's turn ends at that turn's end (user call:
+  "until the end of your next turn" is duration 2). Skipped turns tick
+  as the bearer's do; extra turns follow the status's extra_turn_ticks.
+- **Status lines** (#309, 1261-1262): `Match.status_line(kind, ...)`
+  from `_emit_status_diff`: gained / lost / changed (a level change only)
+  through `status_gained|lost|changed_message_format`, replaced per status
+  by `gained_message` / `lost_message` / `changed_message` (`status_field`;
+  `!status message <name> <kind> [<format> | none | -]`, "" = no line),
+  all under the switch `status_change_lines` (default on, user call: GMs
+  wanting their own turn it off and compose on_status_* passives with
+  say()). Placeholders: the unit message ones plus {status}, {level},
+  {old_level}, {duration}, {level_text}, {duration_text}, {source},
+  {removed_by}, {block_reason}; the name is a say() marker. A line is a
+  unit line, and when some team view may not read it (the status's
+  visibility condition, a disguise fooling it; judged when it is made,
+  over `_line_teams`) it carries a `STATUS_HIDE_RE` marker naming those
+  teams, which `_filter_unit_lines` drops. A transform's swap runs under
+  `STATUS_LINES_QUIET` (it prints its own lines), and a `transform`
+  removal prints none. The `!status` commands (apply, force, counter,
+  dispel, transfer) and `!ent status` report their change in their reply,
+  so the lines of the (unit, status) they act on stay quiet
+  (`STATUS_LINES_SKIP`, `vtt_commands._quiet_status_lines`; user call);
+  what their hooks change elsewhere still prints.
+- **Blocked applications** (#389, 1263): `apply_status` reports a refusal
+  through `Match.status_blocked` (the blocked line, then on_status_blocked
+  passives and a definition's `on_blocked` hook, bound `block_reason`
+  (`STATUS_BLOCK_REASONS`: immune, resisted, blocked_by, tag,
+  part_immune), `status_applier`, `status_level_tried`,
+  `status_duration_tried`). A zone's grant passes `report_block=False`
+  (user call: not yet supported for grants, tried at every settle; idea
+  #621).
 - **Dispel / transfer:** `status_dispel(eid, token, max)` (token-only, no
   undispellable guard, user call); `status_transfer(from, to, name)` removes
   from the source unconditionally and re-applies on the destination through

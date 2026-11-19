@@ -199,11 +199,22 @@ def record_trace(kind: str, who: str, path: str, old: Any = None,
 # from that unit inside its own tick is an expiry (`removed_by` expired).
 STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
     contextvars.ContextVar("vtt_status_ticking", default=None))
+# Set while a transform swaps statuses (it prints its own kept / gained /
+# lost lines), so the status lines (#309) stay quiet.
+STATUS_LINES_QUIET: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_status_lines_quiet", default=False))
+# The (match, unit, status) a `!status` command or `!ent status` acts on
+# directly: its reply already reports the change, so their status lines
+# (#309) stay quiet (user call); a status None = every status of the unit.
+# Changes the command's hooks make elsewhere still print.
+STATUS_LINES_SKIP: "contextvars.ContextVar[frozenset]" = (
+    contextvars.ContextVar("vtt_status_lines_skip", default=frozenset()))
 
 # The causes the on_status_removed bindings and a definition's on_removed
 # hook read as `removed_by`.
 STATUS_REMOVAL_CAUSES = ("expired", "dispel", "transfer", "removes",
-                         "zone", "transform", "damage", "removed")
+                         "zone", "transform", "damage", "source",
+                         "removed")
 # Statuses that break on damage (#235, #25): a status (instance key, else
 # its definition at its level) with `removed_on_damage` true goes when its
 # bearer takes damage (removed_by `damage`); one with `break_at_damage: N`
@@ -216,6 +227,12 @@ STATUS_DAMAGE_COUNT_KEY = "damage_counted"
 # Who applied a status (#227's `source=`, status_source): a unit id in the
 # instance, scrubbed when that unit leaves the match.
 STATUS_SOURCE_KEY = "__source"
+# What a status does when the unit that applied it dies or leaves (#267):
+# a definition / instance / level-entry field, else the
+# status_default_if_source_lost rule.
+STATUS_SOURCE_LOST_MODES = ("keep", "remove")
+# Ticks on the applier's clock (#310): a definition's tick_when.
+SOURCE_TICK_WHENS = ("source_turn_start", "source_turn_end")
 # Transforms and statuses: a status that arrived with a form records the
 # stash path of that transform here, so reverting it takes the status back;
 # a stash records the flavor of the transform that made it (`merge` for
@@ -232,7 +249,20 @@ TRANSFORM_KEEP_VAR = "__transform_keep_vars"
 # each one follows.
 STATUS_DEF_HOOKS = {"on_status_added": "on_added",
                     "on_status_removed": "on_removed",
-                    "on_status_changed": "on_changed"}
+                    "on_status_changed": "on_changed",
+                    "on_status_blocked": "on_blocked"}
+# Why an application didn't land (#389): the on_status_blocked hook's
+# `block_reason` and the status_blocked_message_format line's.
+STATUS_BLOCK_REASONS = ("immune", "resisted", "blocked_by", "tag",
+                        "part_immune")
+# The status lines (#309 / #389): kind -> (the rule, the per-status field
+# that replaces it: instance, definition, level entries).
+STATUS_LINE_KINDS = {
+    "gained": ("status_gained_message_format", "gained_message"),
+    "lost": ("status_lost_message_format", "lost_message"),
+    "changed": ("status_changed_message_format", "changed_message"),
+    "blocked": ("status_blocked_message_format", "blocked_message"),
+}
 
 # Status fields restricting actions (#234), by what they do: a list of
 # action tags or action names each, and beside each a `<field>_unless`
@@ -395,21 +425,28 @@ def write_status_layers(inst: Dict[str, Any],
         inst.pop(STATUS_LAYERS_KEY, None)
 
 
-def settle_status_layers(inst: Any, cap: Callable[[Any], Any]) -> None:
+def settle_status_layers(inst: Any, cap: Callable[[Any], Any],
+                         dur_cap: Optional[Callable[[Any, Any], Any]] = None
+                         ) -> bool:
     """Keep `inst`'s layers true to it: each layer's level held by `cap`
-    (max_level), the list rebuilt as a front, and dropped (collapsed to the
-    instance's own level and duration) when a write changed either."""
+    (max_level) and its duration by `dur_cap(level, duration)`
+    (max_duration at that level, #116), the list rebuilt as a front, and
+    dropped (collapsed to the instance's own level and duration) when a
+    write changed either. True when the layers stay."""
     layers = status_layers_of(inst)
     if layers is None:
         if isinstance(inst, dict):
             inst.pop(STATUS_LAYERS_KEY, None)
-        return
+        return False
     front = status_layer_front([[cap(lv), du] for lv, du in layers])
     lv, du = inst.get("level"), inst.get("duration")
     if not same_value(lv, front[0][0]) or not same_value(du, front[-1][1]):
         inst.pop(STATUS_LAYERS_KEY, None)
-        return
+        return False
+    if dur_cap is not None:
+        front = status_layer_front([[a, dur_cap(a, b)] for a, b in front])
     write_status_layers(inst, front)
+    return True
 
 
 STATUS_LEVELS_FIELD = "levels"
@@ -622,6 +659,12 @@ SAY_OPEN_MARK = "\u2063!\u2063"
 # joined with ` · `, and drops a line left with none.
 DICE_ROLL_RE = re.compile("\u2063%([^|\u2063]*)\\|([^|\u2063]*)\\|([^\u2063]*)\u2063")
 DICE_ROLL_SEP = " · "
+# A status line (#309 / #389) the status's visibility or a disguise keeps
+# from some team views: UNIT_LINE_TAG "$<match>|<teams>" UNIT_LINE_TAG,
+# <teams> the views that may not read it, joined with STATUS_HIDE_SEP; the
+# reply filter drops the line for them.
+STATUS_HIDE_RE = re.compile("\u2063\\$([^|\u2063]*)\\|([^\u2063]*)\u2063")
+STATUS_HIDE_SEP = "\u001f"
 # How many say(private=True) lines a match keeps waiting for a host (the
 # oldest go first).
 HELD_SAY_MAX = 200
@@ -647,6 +690,7 @@ def say_plain_text(text: str) -> str:
     text = SAY_NAME_RE.sub(lambda mo: mo.group(3), text)
     text = SAY_TEAM_RE.sub("", text).replace(SAY_OPEN_MARK, "")
     text = join_dice_rolls(text, lambda _m, _u: True)
+    text = STATUS_HIDE_RE.sub("", text)
     return UNIT_LINE_RE.sub("", text)
 
 
@@ -2454,6 +2498,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "layered status shows, collapsing its layers. "
             "A first application (status not yet present) always just sets "
             "the given level/duration regardless of mode."
+        ),
+    },
+    "status_default_if_source_lost": {
+        "default": "keep",
+        "schema": {"type": "enum", "choices": ["keep", "remove"]},
+        "desc": (
+            "What a status does when the unit that applied it (its "
+            "source, `source=` / the acting unit, read with "
+            "status_source) dies, is destroyed as a body part or leaves "
+            "the match (despawn, transfer), for statuses without their "
+            "own `if_source_lost` (`!status if_source_lost <name> "
+            "<keep|remove>`; an instance key or a level entry sets it "
+            "too): 'keep' (default) leaves it, 'remove' removes it "
+            "(removed_by `source`), for taunts, grapples and "
+            "concentration buffs. A status records only its latest "
+            "applier, so a re-application by another unit makes that "
+            "unit its source. A revive doesn't bring a removed status "
+            "back; a transform keeps the unit, so it loses nothing."
         ),
     },
     "status_resist_sources": {
@@ -6249,6 +6311,73 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "the cell. Empty = no line."
         ),
     },
+    "status_change_lines": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "#309 / #389: print a line when a unit gains or loses a status, "
+            "when a status's level changes, and when an application doesn't "
+            "land, whatever caused it (a command, an action, a passive, a "
+            "zone; a transform prints its own lines instead). The lines are "
+            "status_gained_message_format, status_lost_message_format, "
+            "status_changed_message_format and status_blocked_message_format, "
+            "each replaced for one status by its `gained_message` / "
+            "`lost_message` / `changed_message` / `blocked_message` "
+            "(`!status message`; empty = no line for it). A line is about "
+            "its unit: a channel whose view can't see the unit, the status "
+            "(its visibility condition) or through the unit's disguise "
+            "doesn't show it. Off = no status lines; a GM can compose their "
+            "own from on_status_added / on_status_removed / on_status_changed "
+            "/ on_status_blocked passives and say()."
+        ),
+    },
+    "status_gained_message_format": {
+        "default": "{name} gains {status}{level_text}{duration_text}.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line when a unit gains a status (status_change_lines). "
+            "Placeholders: the death_message_format ones ({name}, {id}, "
+            "{x}, {y}, {team}, {round}, the unit's vars) plus {status}, "
+            "{level}, {duration} (empty when permanent), {level_text} "
+            "(` ×<level>` above 1, else empty), {duration_text} (` for <n> "
+            "turn(s)`, empty when permanent), {source} (who applied it, "
+            "named as the view sees it; empty when none). Empty = no line."
+        ),
+    },
+    "status_lost_message_format": {
+        "default": "{name} loses {status}.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line when a unit loses a status (status_change_lines): "
+            "status_gained_message_format's placeholders (as the status "
+            "stood before it went) plus {removed_by} (expired, dispel, "
+            "transfer, removes, zone, damage, source, removed). Empty = no "
+            "line."
+        ),
+    },
+    "status_changed_message_format": {
+        "default": "{name}'s {status} is now level {level} (was {old_level}).",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line when a status's level changes on a unit "
+            "(status_change_lines; a change of its duration or data prints "
+            "nothing): status_gained_message_format's placeholders plus "
+            "{old_level}. Empty = no line."
+        ),
+    },
+    "status_blocked_message_format": {
+        "default": "{name} is unaffected by {status} ({block_reason}).",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line when an application of a status doesn't land "
+            "(status_change_lines, #389): status_gained_message_format's "
+            "placeholders (the level and duration tried) plus "
+            "{block_reason}: immune, resisted (resistance took it below 1), "
+            "blocked_by (a status the unit holds blocks it), tag "
+            "(cannot_affect_units_with_tag) or part_immune (a body part's "
+            "status immunity). A zone's grant prints none. Empty = no line."
+        ),
+    },
     "revive_message_format": {
         "default": "✨ **{name}** (`{id}`) was revived.",
         "schema": {"type": "str"},
@@ -7703,6 +7832,12 @@ HOOK_NAMES: Set[str] = {
     "on_status_added",
     "on_status_removed",
     "on_status_changed",
+    # An application that didn't land (#389), fired on the unit it was
+    # meant for: block_reason (immune / resisted / blocked_by / tag /
+    # part_immune), status_name, status_applier (who applied it, or None),
+    # status_level_tried / status_duration_tried. Not fired for a zone's
+    # grant (it is tried again at every settle).
+    "on_status_blocked",
     "on_var_created",
     "on_var_changed",
     "on_var_removed",
@@ -10549,13 +10684,14 @@ class Entity:
         # with none).
         m.damage_records.pop(self.id, None)
         # The statuses it applied forget it (#227): a later unit under the
-        # id didn't apply them.
-        for o in m.entities.values():
-            for inst in (o.status or {}).values():
-                if isinstance(inst, dict) and \
-                        inst.get(STATUS_SOURCE_KEY) == self.id:
-                    del inst[STATUS_SOURCE_KEY]
-                    o.mark_changed()
+        # id didn't apply them. Those whose if_source_lost says remove
+        # (#267) go once the unit is out (below).
+        source_gone = m.statuses_sourced_by(self.id)
+        for oid, sname in source_gone:
+            inst = m.entities[oid].status.get(sname)
+            if not m.removes_with_source(inst, sname):
+                del inst[STATUS_SOURCE_KEY]
+                m.entities[oid].mark_changed()
         # scrub from turn order & clamp active index, drop its extra turns
         m._leave_turns(self.id)
         # The round's memory forgets a unit that leaves for good (a despawn,
@@ -10595,6 +10731,9 @@ class Entity:
                                        defer_riders=defer_riders))
         self._match = None
         m._rebuild_turn_order()
+        # A death ends them in Match._process_death, outside its guard.
+        if despawn:
+            log.extend(m.end_sourced_statuses(source_gone))
         return log
 
     # Teleport (absolute move)
@@ -14927,7 +15066,7 @@ class Match:
             if linger:
                 seed[ZONE_LINGER_KEY] = linger
             log += self.apply_status(eid, sname, spec["level"],
-                                     seed_data=seed)
+                                     seed_data=seed, report_block=False)
             if e.status.get(sname) is not None:
                 self._grant_changes += 1
 
@@ -23808,19 +23947,52 @@ class Match:
         application."""
         e = self.entities.get(entity_id)
         inst = e.status.get(name) if e is not None else None
-        sdef = self.status_definitions.get(name) or {}
         for d in (inst, after):
-            lvl = d.get("level") if isinstance(d, dict) else None
-            if isinstance(lvl, (int, float)) and not isinstance(lvl, bool):
-                capped = self._cap_status_level(sdef, lvl)
-                if capped != lvl:
-                    d["level"] = capped
-            # Layers (layered stacking) follow the instance: capped, and
-            # collapsed when a write set the level or duration itself.
-            if isinstance(d, dict) and STATUS_LAYERS_KEY in d:
-                settle_status_layers(
-                    d, lambda v: self._cap_status_level(sdef, v))
+            self._cap_status_dict(name, d)
         return after
+
+    def _cap_status_dict(self, name: str, d: Any) -> None:
+        """Status instance `d` of `name` held to max_level and
+        max_duration in place (its layers each at their own level)."""
+        if not isinstance(d, dict):
+            return
+        sdef = self.status_definitions.get(name) or {}
+        lvl = d.get("level")
+        if isinstance(lvl, (int, float)) and not isinstance(lvl, bool):
+            capped = self._cap_status_level(sdef, lvl)
+            if capped != lvl:
+                d["level"] = capped
+        # Layers (layered stacking) follow the instance: capped, and
+        # collapsed when a write set the level or duration itself.
+        layered = False
+        if STATUS_LAYERS_KEY in d:
+            layered = settle_status_layers(
+                d, lambda v: self._cap_status_level(sdef, v),
+                lambda lv, du: self.cap_status_duration(name, lv, du))
+        if not layered and "duration" in d:
+            du = d["duration"]
+            capped = self.cap_status_duration(
+                name, self.status_level(d), du)
+            if capped is not du:
+                d["duration"] = capped
+
+    def status_max_duration(self, name: str, level: Any) -> Optional[int]:
+        """Status `name`'s max_duration at `level` (#116: the definition's,
+        its level entries on top), None when uncapped (absent, 0 or
+        unreadable)."""
+        v = self.status_def_view(name, level).get("max_duration")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            return None
+        return int(v)
+
+    def cap_status_duration(self, name: str, level: Any, du: Any) -> Any:
+        """`du` held to status `name`'s max_duration at `level`: a number
+        above it comes back as the cap, anything else (a permanent None, a
+        shorter one, text) unchanged (#116)."""
+        if isinstance(du, bool) or not isinstance(du, (int, float)):
+            return du
+        cap = self.status_max_duration(name, level)
+        return cap if cap is not None and du > cap else du
 
     def status_layers(self, inst: Any, name: str) -> List[List[Any]]:
         """`inst`'s layers, highest level first: its stored ones, else the
@@ -23862,13 +24034,11 @@ class Match:
                                        copy.deepcopy(inst)))
 
     def _cap_unit_status_levels(self, e: "Entity") -> None:
-        """Every status instance on `e` held to its max_level, silently: for
+        """Every status instance on `e` held to its max_level and
+        max_duration, silently: for
         statuses a unit is created or transformed with."""
         for name, inst in e.status.items():
-            lvl = inst.get("level") if isinstance(inst, dict) else None
-            if isinstance(lvl, (int, float)) and not isinstance(lvl, bool):
-                inst["level"] = self._cap_status_level(
-                    self.status_definitions.get(name) or {}, lvl)
+            self._cap_status_dict(name, inst)
 
     def recap_status(self, name: str) -> List[str]:
         """After a definition's max_level changes: every live instance of
@@ -23980,7 +24150,8 @@ class Match:
                      *, force: bool = False,
                      seed_data: Optional[Dict[str, Any]] = None,
                      rounding: Optional[str] = None,
-                     source: Optional[str] = None) -> List[str]:
+                     source: Optional[str] = None,
+                     report_block: bool = True) -> List[str]:
         """Apply status `name` to entity `eid`, honoring the definition's
         `stack` mode (else the status_default_stack rule) when the status
         is already present. A FIRST application seeds the definition's
@@ -24001,7 +24172,17 @@ class Match:
 
         `source` (#227) records the unit that applied it
         (STATUS_SOURCE_KEY, read by status_source): the latest application
-        that lands names it (a `none` stack mode changes nothing)."""
+        that lands names it (a `none` stack mode changes nothing).
+
+        An application that doesn't land (immunity, full resistance,
+        blocked_by, a tag block, a part's immunity) prints the blocked line
+        and fires on_status_blocked (#389) unless `report_block` is False
+        (a zone's grant, tried again at every settle)."""
+
+        def blocked(reason: str, extra: Optional[List[str]] = None
+                    ) -> List[str]:
+            return (extra or []) + self.status_blocked(
+                eid, name, reason, level, duration, source, report_block)
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -24011,13 +24192,14 @@ class Match:
         if e.is_part:
             if name in self._part_status_names(
                     e, "__status_immune", "part_status_immune"):
-                return []
+                return blocked("part_immune")
             if name in self._part_status_names(
                     e, "__status_redirect", "part_status_redirect"):
                 if e.part_of in self.entities:
                     return self.apply_status(e.part_of, name, level, duration,
                                              force=force, seed_data=seed_data,
-                                             source=source)
+                                             source=source,
+                                             report_block=report_block)
                 return []
         sdef = self.status_definitions.get(name) or {}
         new_level = None if level is None else int(level)
@@ -24027,7 +24209,7 @@ class Match:
         blockers = self._statuses_matching_tokens(
             e, self._token_list(sdef.get("blocked_by")))
         if blockers:
-            return []
+            return blocked("blocked_by")
         # Resistance / immunity gating — skipped entirely when force=True.
         # Resistance reduces a LEVEL being added/set, mode-aware (via
         # _resistance_applies) so an implicit add_level +1 is resisted just
@@ -24041,7 +24223,7 @@ class Match:
         warns: List[str] = []
         if not force:
             if self.status_tag_block(e, name, new_level):
-                return []
+                return blocked("tag")
             cur = e.status.get(name)
             at = (self.status_level(cur) if cur is not None else
                   (new_level if new_level is not None else 1))
@@ -24059,14 +24241,15 @@ class Match:
             if lv_fold is None and du_fold is None:
                 imm, _r = self.status_resistance(eid, name)
                 if imm:
-                    return []
+                    return blocked("immune")
                 warns = self._resist_inputs(e, name)[2]
             for fold in (lv_fold, du_fold):
                 if fold is None:
                     continue
                 warns = fold["warnings"]
                 if not fold["applies"]:
-                    return warns
+                    return blocked("immune" if fold.get("immune")
+                                   else "resisted", warns)
             if lv_fold is not None and lv_fold["steps"]:
                 new_level = lv_fold["value"]
             if du_fold is not None and du_fold["steps"]:
@@ -24148,6 +24331,9 @@ class Match:
                       self.status_level(inst))
                 du = new_duration if new_duration is not None \
                     else cur_duration
+                # Its duration held at its own level first (#116), so a
+                # capped layer can't push a lower one out of the front.
+                du = self.cap_status_duration(name, lv, du)
                 if layers is not None:
                     front = status_layer_front(layers + [[lv, du]])
                     if front != layers:
@@ -24157,6 +24343,10 @@ class Match:
                     self.rules.get("status_default_stack", "layered")))
                 == "none"):
             e.status[name][STATUS_SOURCE_KEY] = source
+        if name in e.status:
+            # max_level / max_duration (#116) before the comparison, so a
+            # capped application that changes nothing fires nothing.
+            self._cap_live_status(eid, name, None)
         after = copy.deepcopy(e.status.get(name))
         log = ([] if before == after
                else self._emit_status_diff(eid, name, before, after))
@@ -24308,13 +24498,35 @@ class Match:
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
         log: List[str] = []
-        for eid in targets:
+        # Ticks on the applier's clock (#310): a status whose tick_when is
+        # source_turn_start / source_turn_end ticks on its source's turn,
+        # wherever its bearer stands in the order; without a source (none
+        # recorded, or lost: gone, a destroyed part) or applied by the
+        # bearer it ticks on the bearer's own turn at that phase.
+        target_set = set(targets)
+        source_when = ("source_" + when
+                       if when in ("turn_start", "turn_end") else None)
+        jobs: List[Tuple[str, Optional[List[str]]]] = [
+            (eid, None) for eid in targets]
+        if source_when is not None and self._source_clock_defined():
+            order = list(self.turn_order) + [
+                x for x in self.entities if x not in set(self.turn_order)]
+            for bid in order:
+                b = self.entities.get(bid)
+                if b is None or bid in target_set or not b.status:
+                    continue
+                names = [n for n in self.status_tick_order(b)
+                         if self._tick_source(b.status.get(n)) in target_set]
+                if names:
+                    jobs.append((bid, names))
+        for eid, only in jobs:
             e = self.entities.get(eid)
             if e is None:
                 continue
             # Snapshot status names so status_remove during the tick
             # doesn't break iteration; highest tick_priority first (#266).
-            for sname in self.status_tick_order(e):
+            for sname in (only if only is not None
+                          else self.status_tick_order(e)):
                 if extra and sname in e.status and \
                         not self._ticks_on_extra_turn(e.status[sname], sname):
                     continue
@@ -24336,7 +24548,17 @@ class Match:
                     sdef = self.status_def_view(
                         sname, self.status_level(e.status.get(sname)))
                     def_when = sdef.get("tick_when") or "turn_end"
-                    if def_when != when:
+                    if def_when in SOURCE_TICK_WHENS:
+                        if def_when != source_when:
+                            continue
+                        tsrc = self._tick_source(e.status.get(sname))
+                        # On the source's turn (a bearer outside this turn's
+                        # units comes from the source pass), else on the
+                        # bearer's own when the source is none or lost.
+                        if only is None and tsrc is not None \
+                                and tsrc not in target_set:
+                            continue
+                    elif def_when != when:
                         continue
                     src = sdef.get("tick")
                 elif sdef is not None:
@@ -24373,6 +24595,32 @@ class Match:
                     STATUS_TICKING.reset(ticking)
         return log
 
+    def _source_clock_defined(self) -> bool:
+        """Whether any status definition (or a level entry of one) ticks
+        on its source's clock (#310), so a turn tick looks at other units'
+        statuses at all."""
+        for sdef in self.status_definitions.values():
+            if not isinstance(sdef, dict):
+                continue
+            if sdef.get("tick_when") in SOURCE_TICK_WHENS:
+                return True
+            lv = sdef.get(STATUS_LEVELS_FIELD)
+            if isinstance(lv, dict) and any(
+                    isinstance(x, dict)
+                    and x.get("tick_when") in SOURCE_TICK_WHENS
+                    for x in lv.values()):
+                return True
+        return False
+
+    def _tick_source(self, inst: Any) -> Optional[str]:
+        """The unit whose turns a source-clock status ticks on (#310): its
+        recorded source while that source isn't lost, else None (the
+        bearer's own clock)."""
+        src = inst.get(STATUS_SOURCE_KEY) if isinstance(inst, dict) else None
+        if not isinstance(src, str) or self.status_source_lost(inst):
+            return None
+        return src
+
     def _has_turn_tick(self, e: "Entity", sname: str) -> bool:
         """Whether status `sname` on `e` ticks on turns (turn_start /
         turn_end): its definition's tick at its level, else the global
@@ -24381,7 +24629,8 @@ class Match:
         if sname in self.status_definitions and self._own_tick(e, sname):
             view = self.status_def_view(
                 sname, self.status_level(e.status.get(sname)))
-            return (view.get("tick_when") or "turn_end") in turn_whens
+            return (view.get("tick_when") or "turn_end") in (
+                turn_whens + SOURCE_TICK_WHENS)
         if sname in self.status_definitions and \
                 not self._timed_status(e, sname):
             return False
@@ -24418,6 +24667,7 @@ class Match:
         *, old_value: Optional[Dict[str, Any]] = None,
         new_value: Optional[Dict[str, Any]] = None,
         removed_by: Optional[str] = None,
+        **blocked: Any,
     ) -> List[str]:
         """_fire_status_event under the status_hook_recursion_limit rule: a
         hook that changes a status fires hooks again, so a chain past the
@@ -24437,7 +24687,7 @@ class Match:
         try:
             return self._fire_status_event(
                 when, entity_id, status_name, old_value=old_value,
-                new_value=new_value, removed_by=removed_by)
+                new_value=new_value, removed_by=removed_by, **blocked)
         finally:
             self._status_event_depth -= 1
             if self._status_event_depth == 0:
@@ -24448,6 +24698,10 @@ class Match:
         *, old_value: Optional[Dict[str, Any]] = None,
         new_value: Optional[Dict[str, Any]] = None,
         removed_by: Optional[str] = None,
+        block_reason: Optional[str] = None,
+        applier: Optional[str] = None,
+        level_tried: Any = None,
+        duration_tried: Any = None,
     ) -> List[str]:
         """Fire passives matching `when` for a status lifecycle event.
 
@@ -24469,8 +24723,7 @@ class Match:
         """
         if when not in HOOK_NAMES:
             return []
-        if when not in ("on_status_added", "on_status_removed",
-                        "on_status_changed"):
+        if when not in STATUS_DEF_HOOKS:
             return []
         e = self.entities.get(entity_id)
         if e is None:
@@ -24485,6 +24738,11 @@ class Match:
             "hook_name": when,
             "removed_by": removed_by,
         }
+        if when == "on_status_blocked":
+            extras.update({"block_reason": block_reason,
+                           "status_applier": applier,
+                           "status_level_tried": level_tried,
+                           "status_duration_tried": duration_tried})
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
         # A global/team handler may have removed the entity (kill/remove);
@@ -24540,7 +24798,8 @@ class Match:
             self.log_event("status_added", entity=entity_id,
                            name=self._entity_name(entity_id),
                            status=status_name)
-            log = self.fire_status_event(
+            log = self.status_line("gained", entity_id, status_name, after)
+            log += self.fire_status_event(
                 "on_status_added", entity_id, status_name,
                 old_value=None, new_value=after,
             )
@@ -24551,12 +24810,19 @@ class Match:
             if removed_by is None:
                 removed_by = ("expired" if STATUS_TICKING.get()
                               == (entity_id, status_name) else "removed")
-            log = self.fire_status_event(
+            log = ([] if removed_by == "transform" else self.status_line(
+                "lost", entity_id, status_name, before,
+                {"removed_by": removed_by}))
+            log += self.fire_status_event(
                 "on_status_removed", entity_id, status_name,
                 old_value=before, new_value=None, removed_by=removed_by,
             )
         elif not same_value(before, after):
-            log = self.fire_status_event(
+            old_lv = self.status_level(before)
+            log = ([] if same_value(old_lv, self.status_level(after))
+                   else self.status_line("changed", entity_id, status_name,
+                                         after, {"old_level": old_lv}))
+            log += self.fire_status_event(
                 "on_status_changed", entity_id, status_name,
                 old_value=before, new_value=after,
             )
@@ -24570,6 +24836,91 @@ class Match:
         # chokepoint here.
         if entity_id in self.entities:
             log.extend(self.check_death(entity_id))
+        return log
+
+    def status_line(self, kind: str, eid: str, name: str, inst: Any,
+                    extra: Optional[Dict[str, Any]] = None) -> List[str]:
+        """The status line of `kind` (STATUS_LINE_KINDS: gained, lost,
+        changed, blocked; #309 / #389) for status `name` (instance `inst`;
+        the one tried, for blocked) on unit `eid`, as a one-item list, or
+        [] when status_change_lines is off, the format is empty or a
+        transform is swapping statuses. Tagged as about the unit, and for
+        the team views the status's visibility condition or the unit's
+        disguise keeps it from, a STATUS_HIDE_RE marker naming them."""
+        skip = STATUS_LINES_SKIP.get()
+        if STATUS_LINES_QUIET.get() or not self.rules.get(
+                "status_change_lines", True) or (
+                skip and ((self.id, eid, name) in skip
+                          or (self.id, eid, None) in skip)):
+            return []
+        e = self.entities.get(eid)
+        if e is None:
+            return []
+        rule, field = STATUS_LINE_KINDS[kind]
+        fmt = self.status_field(inst, name, field)
+        if not isinstance(fmt, str):
+            fmt = str(self.rules.get(rule, "") or "")
+        if not fmt.strip():
+            return []
+        lv = self.status_level(inst)
+        du = inst.get("duration") if isinstance(inst, dict) else None
+        if isinstance(du, bool) or not isinstance(du, (int, float)):
+            du = None
+        src = inst.get(STATUS_SOURCE_KEY) if isinstance(inst, dict) else None
+        vals: Dict[str, Any] = {
+            "status": name, "level": lv,
+            "duration": "" if du is None else du,
+            "level_text": f" ×{lv}" if lv != 1 else "",
+            "duration_text": ("" if du is None else
+                              f" for {du} turn{'' if du == 1 else 's'}"),
+            "source": self.say_name(src) if isinstance(src, str) else "",
+        }
+        vals.update(extra or {})
+        text = self.render_unit_message(fmt, eid, self.say_name(eid), e.x,
+                                        e.y, e.vars, e.part_of or "", vals)
+        hidden = []
+        for t in self._line_teams():
+            if self._effective_disguise(e, t) is not None or \
+                    not self.status_visible_to(name, inst, t, eid=eid):
+                hidden.append(t)
+        mark = (f"{UNIT_LINE_TAG}${self.id}|{STATUS_HIDE_SEP.join(hidden)}"
+                f"{UNIT_LINE_TAG}" if hidden else "")
+        return [self.unit_tag(eid) + mark + text]
+
+    def _line_teams(self) -> List[str]:
+        """The team views a line may be read under: every unit's body
+        team, the teams holding team data, the channels' views."""
+        teams = {self.body_team(u) for u in self.entities.values()}
+        teams |= {str(t) for t in self.team_data}
+        teams |= {str(meta["pov"]) for meta in self.bound_channels.values()
+                  if isinstance(meta, dict) and meta.get("pov")
+                  and meta.get("pov") != "omniscient"}
+        teams.discard(None)
+        teams.discard("")
+        return sorted(str(t) for t in teams)
+
+    def status_blocked(self, eid: str, name: str, reason: str,
+                       level: Any, duration: Any, source: Optional[str],
+                       report: bool = True) -> List[str]:
+        """An application of status `name` to `eid` that didn't land
+        (#389): the status_blocked_message_format line, then the
+        on_status_blocked passives and the definition's on_blocked hook,
+        with block_reason, status_applier, status_level_tried and
+        status_duration_tried bound. `report` False (a zone's grant)
+        does nothing."""
+        if not report or eid not in self.entities:
+            return []
+        tried: Dict[str, Any] = {"level": 1 if level is None else level}
+        if duration is not None:
+            tried["duration"] = duration
+        if isinstance(source, str):
+            tried[STATUS_SOURCE_KEY] = source
+        log = self.status_line("blocked", eid, name, tried,
+                               {"block_reason": reason})
+        log += self.fire_status_event(
+            "on_status_blocked", eid, name, block_reason=reason,
+            applier=source, level_tried=tried["level"],
+            duration_tried=duration)
         return log
 
     def carried_body(self, e: "Entity") -> List["Entity"]:
@@ -26263,6 +26614,54 @@ class Match:
             return []
         return self._process_death(entity_id)
 
+    def statuses_sourced_by(self, src: str) -> List[Tuple[str, str]]:
+        """(unit, status) of every status a unit of the match holds that
+        `src` applied (#227 `__source`), in unit order."""
+        out: List[Tuple[str, str]] = []
+        for o in self.entities.values():
+            for sname, inst in (o.status or {}).items():
+                if isinstance(inst, dict) and \
+                        inst.get(STATUS_SOURCE_KEY) == src:
+                    out.append((o.id, sname))
+        return out
+
+    def removes_with_source(self, inst: Any, name: str) -> bool:
+        """Whether status `name` (instance `inst`) ends when its source is
+        lost (#267): its `if_source_lost` (instance, definition, level
+        entries), else the status_default_if_source_lost rule."""
+        v = self.status_field(inst, name, "if_source_lost")
+        if v not in STATUS_SOURCE_LOST_MODES:
+            v = self.rules.get("status_default_if_source_lost", "keep")
+        return v == "remove"
+
+    def end_sourced_statuses(self, pairs: List[Tuple[str, str]]
+                             ) -> List[str]:
+        """Remove each (unit, status) whose source was lost and whose
+        if_source_lost says remove (removed_by `source`, #267). A unit or
+        status gone meanwhile (an earlier removal's hooks) is skipped."""
+        log: List[str] = []
+        for oid, sname in pairs:
+            o = self.entities.get(oid)
+            inst = o.status.get(sname) if o is not None else None
+            if not isinstance(inst, dict) or \
+                    not self.removes_with_source(inst, sname):
+                continue
+            before = copy.deepcopy(inst)
+            del o.status[sname]
+            log.extend(self._emit_status_diff(oid, sname, before, None,
+                                              removed_by="source"))
+        return log
+
+    def status_source_lost(self, inst: Any) -> bool:
+        """Whether the unit that applied a status is lost: named, and gone
+        from the match or a destroyed body part (#310 falls back to the
+        bearer's clock then)."""
+        src = inst.get(STATUS_SOURCE_KEY) if isinstance(inst, dict) else None
+        if not isinstance(src, str):
+            return False
+        u = self.entities.get(src)
+        return u is None or bool(u.vars.get("__part_destroyed"))
+
     def status_source(self, eid: str, name: str) -> Optional[str]:
         """Who applied status `name` on unit `eid` (#227 `source=`), while
         that unit is in the match; None otherwise."""
@@ -26378,6 +26777,7 @@ class Match:
         # Counted right before the `try` that takes it back: an error
         # between the two (a stack overflow in the copy above) left the
         # guard up, and no unit of the match could die until a restart.
+        lost_pairs: List[Tuple[str, str]] = []
         self._death_processing += 1
         self._dying_ids.add(entity_id)
         try:
@@ -26412,6 +26812,11 @@ class Match:
                          part.map))
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
+            # The statuses it and its parts applied that end with their
+            # source (#267), ended below, outside the death guard.
+            lost_pairs = self.statuses_sourced_by(entity_id)
+            for part in self.entity_part_subtree(entity_id):
+                lost_pairs += self.statuses_sourced_by(part.id)
             e.remove(despawn=False, corpse_kept=(result == "corpse"),
                      defer_riders=True)
             # Cascade: the creature is gone, so its body parts go with it
@@ -26431,6 +26836,7 @@ class Match:
         finally:
             self._death_processing = max(0, self._death_processing - 1)
             self._dying_ids.discard(entity_id)
+        log.extend(self.end_sourced_statuses(lost_pairs))
         # Its riders, then the occupants of the maps it carried. Outside
         # the death guard, so a death effect that kills a rider or an
         # occupant (or a unit near it) runs that death.
@@ -26735,6 +27141,11 @@ class Match:
             log.extend(self._mount_vehicle_died(
                 p.id, copy.deepcopy(p.vars),
                 (p.x, p.y) + self.entity_footprint(p), p.map, remains=True))
+        # The statuses it applied that end with their source (#267): a
+        # destroyed limb is a lost source, though it stays in the match.
+        if p.id in self.entities:
+            log.extend(self.end_sourced_statuses(
+                self.statuses_sourced_by(p.id)))
         # A destroyed limb LINGERS attached (it doesn't route through
         # Entity.remove), so resolve its anchored auras here too — same
         # delete/freeze/suspend rule as any anchor loss. Idempotent if a
@@ -28203,10 +28614,20 @@ class Match:
             out.setdefault(path, []).append(p)
         return out
 
-    def _transform_status_swap(self, u: "Entity", old: Any, form: Any, *,
-                               mode: str, form_tag: Optional[str],
-                               revert_tag: Optional[str],
-                               add_form: bool) -> List[str]:
+    def _transform_status_swap(self, u: "Entity", old: Any, form: Any,
+                               **kw: Any) -> List[str]:
+        """_transform_status_swap_inner with the status lines (#309) quiet:
+        a transform prints its own kept / gained / lost lines."""
+        tok = STATUS_LINES_QUIET.set(True)
+        try:
+            return self._transform_status_swap_inner(u, old, form, **kw)
+        finally:
+            STATUS_LINES_QUIET.reset(tok)
+
+    def _transform_status_swap_inner(self, u: "Entity", old: Any, form: Any, *,
+                                     mode: str, form_tag: Optional[str],
+                                     revert_tag: Optional[str],
+                                     add_form: bool) -> List[str]:
         """Give unit `u` (a transformed unit or a body part on a path both
         forms share) its statuses after a transform: `u` held `old`, its
         new form brings `form`. Each old status goes (on_removed fires,

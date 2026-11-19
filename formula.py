@@ -4507,6 +4507,13 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # dispel, transfer, removes, zone (a granting
                         # zone let go, #136), transform, removed); None
                         # elsewhere.
+    "block_reason",     # on_status_blocked (#389): immune, resisted,
+                        # blocked_by, tag or part_immune; None elsewhere.
+    "status_applier",   # on_status_blocked: who applied the status that
+                        # didn't land (None when nobody is named).
+    "status_level_tried",     # on_status_blocked: the level tried.
+    "status_duration_tried",  # on_status_blocked: the duration tried
+                              # (None = permanent).
     "transform_kind",   # on_transformed: transform, replace or revert;
                         # None elsewhere.
     "skip_status",      # on_turn_skipped: the status(es) whose skips_turn

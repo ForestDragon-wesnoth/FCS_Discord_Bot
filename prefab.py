@@ -648,6 +648,7 @@ def _check_formula_function(entry: Dict[str, Any], name: str,
 _STATUS_STACK_MODES = ("layered", "refresh", "add_level", "extend",
                        "replace", "none")
 _STATUS_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
+                      "source_turn_start", "source_turn_end",
                       "never")
 
 
@@ -671,12 +672,18 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
     if ml is not None and (isinstance(ml, bool) or not isinstance(ml, int)
                            or ml < 0):
         raise VTTError(f"{who}: max_level must be a whole number >= 0.")
-    for k in ("tick", "display", logic.STATUS_VISIBILITY_FIELD):
+    md = entry.get("max_duration")
+    if md is not None and (isinstance(md, bool) or not isinstance(md, int)
+                           or md < 0):
+        raise VTTError(f"{who}: max_duration must be a whole number >= 0.")
+    for k in ("tick", "display", logic.STATUS_VISIBILITY_FIELD,
+              *(f for _r, f in logic.STATUS_LINE_KINDS.values())):
         if entry.get(k) is not None and not isinstance(entry[k], str):
             raise VTTError(f"{who}: `{k}` must be text.")
     for k, choices in (("resist_affects", logic.RESIST_AFFECTS),
                        ("resist_rounding", logic.RESIST_ROUNDINGS),
-                       ("on_transform", logic.TRANSFORM_STATUS_FLAGS)):
+                       ("on_transform", logic.TRANSFORM_STATUS_FLAGS),
+                       ("if_source_lost", logic.STATUS_SOURCE_LOST_MODES)):
         if entry.get(k) is not None and entry[k] not in choices:
             raise VTTError(f"{who}: `{k}` must be one of "
                            f"{', '.join(choices)}.")

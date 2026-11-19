@@ -28092,7 +28092,7 @@ SCENARIO 884 — Status definition hooks: on_added / on_removed / on_changed, an
 !status hook curse on_changed
 ?? ❌ `curse` has no on_changed hook.
 !status hook curse on_gone "1"
-?? ❌ hook must be one of: on_added, on_changed, on_removed.
+?? ❌ hook must be one of: on_added, on_blocked, on_changed, on_removed.
 
 Expected: HARNESS-ALLOWS-ERRORS. What a status does when it arrives,
 leaves or changes lives in its definition (`!status hook`), run with
@@ -28927,7 +28927,7 @@ SCENARIO 901 — Pass 47 small fixes: reminder text, empty system macro, trace c
 !help function round
 ?? **`round(x, ndigits=None)`**
 ?tab "!system status hook default burn "
-?? on_added  on_changed  on_removed
+?? on_added  on_blocked  on_changed  on_removed
 ?! turn_end
 ?tab "!system status when default burn "
 ?? turn_end
@@ -46474,3 +46474,300 @@ quotes it: a program, an action body, and a `!func` (named, its own
 line, which the caller's error carries). A one-line formula keeps its
 wording. Under formula_text_visibility host a player's error names the
 line number only, since the line is formula text.
+
+
+SCENARIO 1258 — max_duration caps every duration of a status, each layer at its own level (#116)
+---------------------------------------------------------------------------------------------------
+
+!match new md Md 8 8
+!match use md
+!ent add orc Orc 30 2 2 5
+!status def burn
+!status maxduration burn 3
+?? `burn` max_duration = 3
+!status apply orc burn 1 10
+?? duration=3
+!status level burn 2 max_duration 1
+!status apply orc burn 2 5
+!assert "status_layers('orc', 'burn') == [[2, 1], [1, 3]]"
+!status counter orc burn add 10
+!assert "status_layers('orc', 'burn') == [[2, 1], [1, 3]]"
+!ent status orc set burn duration 9
+?? (capped by `burn`'s max_duration)
+!assert "status_level('orc', 'burn') == 2 and status_duration('orc', 'burn') == 1"
+!status def ward
+!status apply orc ward 1
+!status maxduration ward 2
+!assert "status_duration('orc', 'ward') == None"
+!status counter orc ward set 9
+!assert "status_duration('orc', 'ward') == 2"
+!status def slow
+!status apply orc slow 1 6
+!status maxduration slow 4
+!assert "status_duration('orc', 'slow') == 4"
+!status maxduration slow -
+!status apply orc slow 1 6
+!assert "status_duration('orc', 'slow') == 6"
+!status maxduration slow 0.5
+?? ❌ max_duration must be a whole number from 1
+!status list
+?? `burn` (when=turn_end, max_dur=3
+HARNESS-ALLOWS-ERRORS
+
+Expected: a status's max_duration (#116, `!status maxduration`) caps its
+duration at every write, like max_level caps the level: an application
+of 10 lands as 3, and a level entry gives level 2 its own cap of 1. With
+layers each layer is held at its own level's cap, so burn 2 for 5 over
+burn 1 for 3 keeps both layers (×2 for 1, then ×1 for 3), and a counter
+adding 10 leaves them there. A direct write is capped and the reply says
+so. A permanent status stays permanent when a cap arrives; a counter set
+gives it a duration, held to the cap. Lowering the cap shortens live
+instances (slow 6 -> 4); `-` removes it. A cap that isn't a whole number
+is refused.
+
+
+SCENARIO 1259 — Statuses that end with their source: if_source_lost and status_default_if_source_lost (#267)
+-----------------------------------------------------------------------------------------------------------------
+
+!match new sl Sl 10 10
+!match use sl
+!ent add mage Mage 10 1 1 20
+!ent set_var mage footprint_w 2
+!ent set_var mage footprint_h 2
+!ent add orc Orc 30 5 5 10
+!ent add ogre Ogre 40 8 2 5
+!part add ogre oarm arm 10 10
+!status def taunt
+!status if_source_lost taunt remove
+?? `taunt` if_source_lost = remove
+!status def mark
+!status hook taunt on_removed "entity[self].why = removed_by"
+!status apply orc taunt 1 source=mage
+!status apply orc mark 1 source=mage
+!status apply mage mark 1 source=oarm
+!status apply ogre taunt 1 source=oarm
+!ent kill mage
+?? Orc loses taunt.
+!assert "not status_has('orc', 'taunt') and entity[orc].why == 'source'"
+!assert "status_has('orc', 'mark') and status_source('orc', 'mark') == None"
+!ent damage oarm 10
+?? Ogre loses taunt.
+!assert "not status_has('ogre', 'taunt') and entity[ogre].why == 'source'"
+!ent revive mage
+!assert "not status_has('orc', 'taunt')"
+!system set default status_default_if_source_lost remove
+!status apply orc mark 1 source=ogre
+!status apply orc taunt 1 source=ogre
+!status if_source_lost taunt keep
+!ent remove ogre
+!assert "not status_has('orc', 'mark') and status_has('orc', 'taunt')"
+!status if_source_lost taunt bogus
+?? ❌ if_source_lost must be one of: keep, remove
+HARNESS-ALLOWS-ERRORS
+
+Expected: a status whose if_source_lost is remove (#267) goes when the
+unit that applied it is lost, with removed_by `source` and the lost line:
+the 2x2 mage's death takes the orc's taunt, and the ogre's arm destroyed
+as a limb takes the ogre's taunt though the arm stays attached. A status
+left by default (keep) stays and forgets its source. A revive brings
+nothing back. Under the status_default_if_source_lost rule set to remove,
+a status without its own field goes when its source is despawned, while
+one set to keep stays. A word outside keep / remove is refused.
+
+
+SCENARIO 1260 — Ticks on the applier's clock: tick_when source_turn_start / source_turn_end (#310)
+---------------------------------------------------------------------------------------------------
+
+!match new sc Sc 10 10
+!match use sc
+!ent add mage Mage 10 1 1 20
+!ent add orc Orc 10 3 3 10
+!ent add ogre Ogre 10 5 5 5
+!status def hex
+!status when hex source_turn_end
+?? on the turns of the unit that applied it
+!status tick hex "status_counter_add(self, 'hex', -1)"
+!status apply orc hex 1 2 source=mage
+!status apply ogre hex 1 2
+!status apply mage hex 1 5 source=mage
+!turn next
+!assert "status_duration('orc', 'hex') == 2 and status_duration('ogre', 'hex') == 2"
+!turn next
+!assert "status_duration('orc', 'hex') == 1 and status_duration('mage', 'hex') == 4"
+!turn next
+!assert "status_duration('orc', 'hex') == 1 and status_duration('ogre', 'hex') == 2"
+!turn next
+!assert "status_duration('ogre', 'hex') == 1"
+!turn next
+!assert "not status_has('orc', 'hex')"
+!status apply orc hex 1 3 source=mage
+!ent kill mage
+!turn next
+!turn next
+!assert "status_duration('orc', 'hex') == 2"
+
+Expected: a status ticking at source_turn_end (#310) counts down at the
+end of its source's turns: the orc's hex (from the mage) drops at the end
+of the mage's turn, not the orc's; the ogre's, applied with no source,
+ticks at the end of the ogre's own turns; the mage's own hex ticks on its
+own turns. Once the mage dies, the orc's new hex falls back to the orc's
+own turn end.
+
+
+SCENARIO 1261 — Status gain, loss and level lines; per-status lines and the switch (#309)
+-------------------------------------------------------------------------------------------
+
+!match new st St 10 10
+!match use st
+!ent add mage Mage 10 1 1 20
+!ent add orc Orc 30 3 3 10
+!status def burn
+!status def wet
+!eval "status_apply('orc', 'burn', 1, 3, source='mage')"
+?? Orc gains burn for 3 turns.
+!eval "status_apply('orc', 'burn', 3)"
+?? Orc's burn is now level 3 (was 1).
+!eval "status_counter_add('orc', 'burn', -1)"
+?! burn is now
+!status apply orc burn 4
+?! Orc's burn is now
+!ent set_var mage actions.soak.target entity
+!ent set_var mage actions.soak.body "status_apply(target, 'wet', 2)"
+!action mage soak orc
+?? Orc gains wet ×2.
+!status message wet lost "{name} dries off ({removed_by})."
+!eval "status_dispel('orc', 'wet')"
+?? Orc dries off (dispel).
+!status dispel orc burn
+?? Dispelled 1 status(es) matching `burn` from `orc`: `burn`
+?! Orc loses burn
+!status message burn gained none
+!eval "status_apply('orc', 'burn', 1)"
+?! Orc gains burn
+!status message burn gained -
+!system set default status_gained_message_format "{name} catches {status} from {source}."
+!status dispel orc burn
+!eval "status_apply('orc', 'burn', 1, source='mage')"
+?? Orc catches burn from Mage.
+!system set default status_change_lines off
+!eval "status_dispel('orc', 'burn')"
+?! Orc loses burn
+!assert "not status_has('orc', 'burn')"
+
+Expected: with status_change_lines on (the default, #309) a status's
+arrival, departure and level change each print a line about the unit,
+whatever caused them (a formula's status_apply, the soak action); a
+duration change prints none. The `!status` commands report their own
+change in their reply, so they print no status line for it (`!status
+apply` raising burn to 4, `!status dispel`, whose reply names what it
+removed). A status's own line replaces the rule's (`{removed_by}`
+names the cause), `none` silences it, `-` restores the rule's. The rule's
+format reads `{source}` as the applier's name. Off, no status lines print.
+
+
+SCENARIO 1262 — Status lines follow the channel's view: hidden statuses, disguises, unseen units (#309)
+--------------------------------------------------------------------------------------------------------
+
+!match new sv2 Sv2 12 12
+!match use sv2
+!ent add orc Orc 30 2 2 5
+!ent add hero Hero 30 6 6 3
+!ent add spy Spy 30 9 9 4
+!ent set_var orc team red
+!ent set_var hero team blue
+!ent set_var spy team red
+!ent set_var spy disguise.name Villager
+!status def burn
+!status def cursed
+!status visibility cursed "is_part_of_team(self, pov_team)"
+!match bind pov=blue
+!eval "status_apply('orc', 'burn', 1)"
+?? Orc gains burn.
+!eval "status_apply('orc', 'cursed', 1)"
+?! Orc gains cursed
+!eval "status_apply('spy', 'burn', 1)"
+?! gains burn
+!match bind pov=red
+!eval "status_apply('orc', 'burn', 2)"
+?? Orc's burn is now level 2 (was 1).
+!eval "status_dispel('orc', 'cursed')"
+?? Orc loses cursed.
+!match bind pov=omniscient
+!eval "status_apply('spy', 'burn', 2)"
+?? Spy's burn is now level 2 (was 1).
+!system set default fog_enabled_by_default true
+!ent set_var hero fog_vision_radius 1
+!match fog on
+!match bind pov=blue
+!eval "status_apply('orc', 'burn', 3)"
+?! Orc's burn
+
+Expected: a status line is about its unit and its status (#309). In a
+channel viewing as blue, the orc's burn shows, its cursed (visible only
+to its own team) doesn't, and a line about the disguised spy is dropped
+since blue's view sees a villager. Viewing as red, the cursed loss shows.
+Without a team view the host reads every line. Under fog a unit blue
+can't see takes its lines with it.
+
+
+SCENARIO 1263 — Blocked applications: on_status_blocked, the definition's on_blocked and the blocked line (#389)
+-----------------------------------------------------------------------------------------------------------------
+
+!match new bl Bl 12 10
+!match use bl
+!ent add mage Mage 10 1 1 20
+!ent add orc Orc 30 3 3 10
+!ent set_var orc footprint_w 2
+!ent set_var orc footprint_h 2
+!part add orc ohead head 10 10
+!ent set_var ohead __status_immune fear
+!status def fear
+!status def burn
+!status def wet
+!status def poison
+!status blockedby burn wet
+!ent set_var orc status_immune fear
+!ent set_var orc status_resist.poison 5
+!status def holy
+!status cannot_affect_units_with_tag holy undead
+!ent set_var orc tags undead
+!passive add orc pb on_status_blocked "entity[self].got = [status_name, block_reason, status_applier, status_level_tried, status_duration_tried]"
+!status hook fear on_blocked "entity[self].hook = block_reason"
+!eval "status_apply('orc', 'fear', 1, 2, source='mage')"
+?? Orc is unaffected by fear (immune).
+!assert "entity[orc].got == ['fear', 'immune', 'mage', 1, 2] and entity[orc].hook == 'immune'"
+!status apply orc poison 2
+?? `orc`: `poison` fully resisted
+?! unaffected by poison
+!assert "entity[orc].got[1] == 'resisted'"
+!status apply orc wet 1
+!eval "status_apply('orc', 'burn', 1)"
+?? Orc is unaffected by burn (blocked_by).
+!eval "status_force('orc', 'burn', 1)"
+?? Orc is unaffected by burn (blocked_by).
+!eval "status_apply('orc', 'holy', 1)"
+?? Orc is unaffected by holy (tag).
+!eval "status_apply('ohead', 'fear', 1)"
+?? is unaffected by fear (part_immune).
+!status message holy blocked "The light passes through {name}."
+!eval "status_apply('orc', 'holy', 1)"
+?? The light passes through Orc.
+!ent set_var orc got none
+!zone fill pit 6 6 8 8
+!zone grant pit fear
+!ent tp orc 6 6
+?! unaffected by fear
+!assert "entity[orc].got == 'none' and not status_has('orc', 'fear')"
+!status force orc fear 1
+!assert "status_has('orc', 'fear')"
+
+Expected: an application that doesn't land (#389) prints the blocked
+line and fires on_status_blocked on the unit it was meant for, with
+block_reason, status_applier and the level and duration tried bound, then
+the status's own on_blocked hook: immunity, resistance taking the level
+below 1, a blocking status (also for a forced application, which skips
+only immunity and resistance), a cannot_affect_units_with_tag filter and
+a body part's own immunity. A status's blocked_message replaces the rule's
+line. `!status apply`'s own refusal says why, so it prints no blocked
+line (the hook still fires). A zone's grant blocked by immunity is tried at every settle, so it
+fires neither the hook nor the line (the 2x2 orc stepping into the pit).

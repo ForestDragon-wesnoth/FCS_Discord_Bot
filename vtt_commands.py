@@ -16,10 +16,10 @@ from logic import (
 )
 
 # Passive system
-from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY, glyph_problem
+from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
-from logic import APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import STATUS_LINES_SKIP, STATUS_HIDE_RE, STATUS_HIDE_SEP, STATUS_LINE_KINDS, APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -12656,6 +12656,8 @@ async def _system_status(ctx: ReplyContext, args: List[str],
                 bits.append(f"stack={d['stack']}")
             if d.get("max_level"):
                 bits.append(f"max_lvl={d['max_level']}")
+            if d.get("max_duration"):
+                bits.append(f"max_dur={d['max_duration']}")
             if not (isinstance(d.get("tick"), str) and d["tick"].strip()):
                 bits.append("no tick")
             src = "" if name in s.status_definitions else " (inherited)"
@@ -13249,17 +13251,20 @@ registry.annotate_sub(
         "!system status <list <system> | info <system> <name> | "
         "def <system> <name> | rename <system> <name> <new_name> | "
         "copy <system> <name> <new_name> | tick <system> <name> <formula ...> | "
-        "hook <system> <name> <on_added|on_removed|on_changed> [<formula ...>] | "
+        "hook <system> <name> <on_added|on_removed|on_changed|on_blocked> [<formula ...>] | "
+        "message <system> <name> <gained|lost|changed|blocked> [<format ...>|none|-] | "
         "display <system> <name> [<format ...>] | "
         "visibility <system> <name> [<formula ...>] | "
-        "when <system> <name> <turn_end|turn_start|round_start|round_end|never> | "
+        "when <system> <name> <turn_end|turn_start|round_start|round_end|source_turn_start|source_turn_end|never> | "
         "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
         "stack <system> <name> <layered|refresh|add_level|extend|replace|none> | "
-        "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
+        "maxlevel <system> <name> <n> | maxduration <system> <name> <n|-> | "
+        "data <system> <name> <path> <value> | "
         "tick_priority <system> <name> <n|-> | "
         "resist_affects <system> <name> <level|duration|both|-> | "
         "resist_rounding <system> <name> <floor|ceil|round|-> | "
         "on_transform <system> <name> <keep|drop|-> | "
+        "if_source_lost <system> <name> <keep|remove|-> | "
         "removed_on_damage <system> <name> <on|off> | "
         "break_at_damage <system> <name> <n|-> | "
         "damage_filter <system> <name> [<filter ...>] | "
@@ -13714,6 +13719,188 @@ async def _ent_group_subcmd(ctx, args, mgr, m):
     return await _help_fallback(ctx, ["ent", "group"], args[1] if len(args) > 1 else None)
 
 
+async def _ent_status_body(ctx: ReplyContext, args: List[str],
+                           m: "Match", eid: str, e: "Entity") -> Any:
+    """`!ent status <id> <action> ...` (split out so the status lines
+    of the unit stay quiet while it runs: its reply reports the
+    change, #309)."""
+    action = args[2].lower()
+
+    if action == "list":
+        if not e.status:
+            return await ctx.send(f"`{eid}` status: (none)")
+        lines = [f"**`{eid}` statuses:**"]
+        for name in sorted(e.status.keys()):
+            data = e.status[name]
+            if isinstance(data, dict) and data:
+                fields = ", ".join(f"{k}={v!r}" for k, v in sorted(data.items()))
+                lines.append(f"- `{name}` ({fields})")
+            else:
+                lines.append(f"- `{name}` (no data)")
+        return await ctx.send("\n".join(lines))
+
+    if action == "clear":
+        n = len(e.status)
+        # Snapshot for event firing, then mutate. on_status_removed
+        # fires once per status (in insertion order so reactions
+        # have a stable ordering).
+        removed = [(name, copy.deepcopy(data))
+                   for name, data in e.status.items()]
+        e.status.clear()
+        event_log: List[str] = []
+        for name, data in removed:
+            event_log.extend(m._emit_status_diff(eid, name, data, None))
+        tail = "\n" + "\n".join(event_log) if event_log else ""
+        return await ctx.send(f"Cleared {n} status(es) from `{eid}`.{tail}")
+
+    if action in ("add", "remove", "rm", "del-status",
+                  "info", "set", "del"):
+        if len(args) < 4:
+            return await ctx.send(
+                f"❌ `!ent status {eid} {action}` needs a status name."
+            )
+        name = args[3]
+        if action == "add":
+            if len(args) > 4:
+                # `add burn level=3` used to add a bare burn and drop the rest.
+                return await ctx.send(
+                    f"❌ Unexpected `{' '.join(args[4:])}` — `!ent status "
+                    f"{eid} add {name}` adds an empty status; set fields with "
+                    f"`!ent status {eid} set {name} <path> <value>` or use "
+                    f"`!status apply`.")
+            if name not in e.status:
+                before = None
+                e.status[name] = {}
+                after = copy.deepcopy(e.status[name])
+                event_log = m._emit_status_diff(eid, name, before, after)
+                msg = f"Added status `{name}` to `{eid}`."
+                if event_log:
+                    msg += "\n" + "\n".join(event_log)
+                return await ctx.send(msg)
+            return await ctx.send(
+                f"Status `{name}` already on `{eid}` (no change; use "
+                f"`set` to edit its data)."
+            )
+        if action in ("remove", "rm", "del-status"):
+            if name in e.status:
+                before = copy.deepcopy(e.status[name])
+                del e.status[name]
+                event_log = m._emit_status_diff(eid, name, before, None)
+                msg = f"Removed status `{name}` from `{eid}`."
+                if event_log:
+                    msg += "\n" + "\n".join(event_log)
+                return await ctx.send(msg)
+            return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
+        if action == "info":
+            if name not in e.status:
+                return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
+            data = e.status[name]
+            if not data:
+                return await ctx.send(f"**`{eid}.{name}`** (no data)")
+            body = json.dumps(data, indent=2, default=str)
+            return await ctx.send(f"**`{eid}.{name}`**\n```json\n{body}\n```")
+        if action == "set":
+            if len(args) < 6:
+                return await ctx.send(
+                    f"❌ `!ent status {eid} set {name}` needs <path> "
+                    f"and <value>."
+                )
+            path = args[4]
+            value = _parse_scalar(args[5])
+            check_store_path(path, "status path")
+            value = checked_status_value(path, value, f"`{eid}.{name}`")
+            check_status_self_grant(name, path, value)
+            # Snapshot for the diff-based event firing. Use None for
+            # the "status didn't exist" case so set acts as an
+            # implicit add when applied to a fresh status.
+            before = copy.deepcopy(e.status.get(name)) if name in e.status else None
+            data = e.status.setdefault(name, {})
+            # Walk the dotted path, creating intermediate dicts.
+            parts_path = path.split(".")
+            cur = data
+            for i, key in enumerate(parts_path[:-1]):
+                existing = cur.get(key)
+                if existing is not None and not isinstance(existing, dict):
+                    where = ".".join(parts_path[:i + 1])
+                    return await ctx.send(
+                        f"❌ `{eid}.{name}` value at '{where}' is "
+                        f"{type(existing).__name__}, not a dict."
+                    )
+                if key not in cur:
+                    cur[key] = {}
+                cur = cur[key]
+            cur[parts_path[-1]] = value
+            after = copy.deepcopy(e.status[name])
+            event_log = m._emit_status_diff(eid, name, before, after)
+            # What is stored now: a level is held to max_level, and the
+            # status hooks the change fired may have changed it again.
+            stored: Any = (m.entities[eid].status.get(name)
+                           if eid in m.entities else None)
+            for key in parts_path:
+                stored = (stored.get(key) if isinstance(stored, dict)
+                          else None)
+            msg = f"Set `{eid}.{name}.{path}` = {stored!r}."
+            cap = (m.status_definitions.get(name) or {}).get("max_level")
+            dcap = (m.status_max_duration(
+                name, m.status_level(m.entities[eid].status.get(name)))
+                if eid in m.entities else None)
+            if stored != value:
+                msg += (f" (capped by `{name}`'s max_level)"
+                        if path == "level" and cap and stored == cap
+                        else f" (capped by `{name}`'s max_duration)"
+                        if path == "duration" and dcap and stored == dcap
+                        else f" (set to {value!r}; then changed by the "
+                             f"status hooks it fired)")
+            if event_log:
+                msg += "\n" + "\n".join(event_log)
+            return await ctx.send(msg)
+        if action == "del":
+            if len(args) < 5:
+                return await ctx.send(
+                    f"❌ `!ent status {eid} del {name}` needs a "
+                    f"<path>. (For removing the status itself use "
+                    f"`!ent status {eid} remove {name}`.)"
+                )
+            if name not in e.status:
+                return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
+            path = args[4]
+            before = copy.deepcopy(e.status[name])
+            data = e.status[name]
+            parts_path = path.split(".")
+            chain = [data]
+            for i, key in enumerate(parts_path[:-1]):
+                cur = chain[-1]
+                if not isinstance(cur, dict) or key not in cur:
+                    where = ".".join(parts_path[:i + 1])
+                    return await ctx.send(
+                        f"❌ `{eid}.{name}` has no value at '{where}'."
+                    )
+                chain.append(cur[key])
+            leaf = chain[-1]
+            if not isinstance(leaf, dict) or parts_path[-1] not in leaf:
+                return await ctx.send(
+                    f"❌ `{eid}.{name}` has no value at '{path}'."
+                )
+            del leaf[parts_path[-1]]
+            # Prune empty intermediate dicts.
+            for i in range(len(chain) - 1, 0, -1):
+                if chain[i]:
+                    break
+                del chain[i - 1][parts_path[i - 1]]
+            after = copy.deepcopy(e.status[name])
+            event_log = m._emit_status_diff(eid, name, before, after)
+            msg = f"Removed `{eid}.{name}.{path}`."
+            if event_log:
+                msg += "\n" + "\n".join(event_log)
+            return await ctx.send(msg)
+    return await ctx.send(
+        f"❌ unknown status action `{action}`. Use add / remove / "
+        f"set / del / info / list / clear."
+    )
+
+# tp (absolute)
+    return None
+
 @registry.command("ent", raw_args=True, usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands. Note: <id> parameter also accepts 'this' or 'current', to target the entity whose turn it is right now")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Show authoritative help if no subcommand was given
@@ -14122,176 +14309,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         e = m.entities[eid]
-        action = args[2].lower()
+        with _quiet_status_lines(m, (eid, None)):
+            return await _ent_status_body(ctx, args, m, eid, e)
 
-        if action == "list":
-            if not e.status:
-                return await ctx.send(f"`{eid}` status: (none)")
-            lines = [f"**`{eid}` statuses:**"]
-            for name in sorted(e.status.keys()):
-                data = e.status[name]
-                if isinstance(data, dict) and data:
-                    fields = ", ".join(f"{k}={v!r}" for k, v in sorted(data.items()))
-                    lines.append(f"- `{name}` ({fields})")
-                else:
-                    lines.append(f"- `{name}` (no data)")
-            return await ctx.send("\n".join(lines))
-
-        if action == "clear":
-            n = len(e.status)
-            # Snapshot for event firing, then mutate. on_status_removed
-            # fires once per status (in insertion order so reactions
-            # have a stable ordering).
-            removed = [(name, copy.deepcopy(data))
-                       for name, data in e.status.items()]
-            e.status.clear()
-            event_log: List[str] = []
-            for name, data in removed:
-                event_log.extend(m._emit_status_diff(eid, name, data, None))
-            tail = "\n" + "\n".join(event_log) if event_log else ""
-            return await ctx.send(f"Cleared {n} status(es) from `{eid}`.{tail}")
-
-        if action in ("add", "remove", "rm", "del-status",
-                      "info", "set", "del"):
-            if len(args) < 4:
-                return await ctx.send(
-                    f"❌ `!ent status {eid} {action}` needs a status name."
-                )
-            name = args[3]
-            if action == "add":
-                if len(args) > 4:
-                    # `add burn level=3` used to add a bare burn and drop the rest.
-                    return await ctx.send(
-                        f"❌ Unexpected `{' '.join(args[4:])}` — `!ent status "
-                        f"{eid} add {name}` adds an empty status; set fields with "
-                        f"`!ent status {eid} set {name} <path> <value>` or use "
-                        f"`!status apply`.")
-                if name not in e.status:
-                    before = None
-                    e.status[name] = {}
-                    after = copy.deepcopy(e.status[name])
-                    event_log = m._emit_status_diff(eid, name, before, after)
-                    msg = f"Added status `{name}` to `{eid}`."
-                    if event_log:
-                        msg += "\n" + "\n".join(event_log)
-                    return await ctx.send(msg)
-                return await ctx.send(
-                    f"Status `{name}` already on `{eid}` (no change; use "
-                    f"`set` to edit its data)."
-                )
-            if action in ("remove", "rm", "del-status"):
-                if name in e.status:
-                    before = copy.deepcopy(e.status[name])
-                    del e.status[name]
-                    event_log = m._emit_status_diff(eid, name, before, None)
-                    msg = f"Removed status `{name}` from `{eid}`."
-                    if event_log:
-                        msg += "\n" + "\n".join(event_log)
-                    return await ctx.send(msg)
-                return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
-            if action == "info":
-                if name not in e.status:
-                    return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
-                data = e.status[name]
-                if not data:
-                    return await ctx.send(f"**`{eid}.{name}`** (no data)")
-                body = json.dumps(data, indent=2, default=str)
-                return await ctx.send(f"**`{eid}.{name}`**\n```json\n{body}\n```")
-            if action == "set":
-                if len(args) < 6:
-                    return await ctx.send(
-                        f"❌ `!ent status {eid} set {name}` needs <path> "
-                        f"and <value>."
-                    )
-                path = args[4]
-                value = _parse_scalar(args[5])
-                check_store_path(path, "status path")
-                value = checked_status_value(path, value, f"`{eid}.{name}`")
-                check_status_self_grant(name, path, value)
-                # Snapshot for the diff-based event firing. Use None for
-                # the "status didn't exist" case so set acts as an
-                # implicit add when applied to a fresh status.
-                before = copy.deepcopy(e.status.get(name)) if name in e.status else None
-                data = e.status.setdefault(name, {})
-                # Walk the dotted path, creating intermediate dicts.
-                parts_path = path.split(".")
-                cur = data
-                for i, key in enumerate(parts_path[:-1]):
-                    existing = cur.get(key)
-                    if existing is not None and not isinstance(existing, dict):
-                        where = ".".join(parts_path[:i + 1])
-                        return await ctx.send(
-                            f"❌ `{eid}.{name}` value at '{where}' is "
-                            f"{type(existing).__name__}, not a dict."
-                        )
-                    if key not in cur:
-                        cur[key] = {}
-                    cur = cur[key]
-                cur[parts_path[-1]] = value
-                after = copy.deepcopy(e.status[name])
-                event_log = m._emit_status_diff(eid, name, before, after)
-                # What is stored now: a level is held to max_level, and the
-                # status hooks the change fired may have changed it again.
-                stored: Any = (m.entities[eid].status.get(name)
-                               if eid in m.entities else None)
-                for key in parts_path:
-                    stored = (stored.get(key) if isinstance(stored, dict)
-                              else None)
-                msg = f"Set `{eid}.{name}.{path}` = {stored!r}."
-                cap = (m.status_definitions.get(name) or {}).get("max_level")
-                if stored != value:
-                    msg += (f" (capped by `{name}`'s max_level)"
-                            if path == "level" and cap and stored == cap
-                            else f" (set to {value!r}; then changed by the "
-                                 f"status hooks it fired)")
-                if event_log:
-                    msg += "\n" + "\n".join(event_log)
-                return await ctx.send(msg)
-            if action == "del":
-                if len(args) < 5:
-                    return await ctx.send(
-                        f"❌ `!ent status {eid} del {name}` needs a "
-                        f"<path>. (For removing the status itself use "
-                        f"`!ent status {eid} remove {name}`.)"
-                    )
-                if name not in e.status:
-                    return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
-                path = args[4]
-                before = copy.deepcopy(e.status[name])
-                data = e.status[name]
-                parts_path = path.split(".")
-                chain = [data]
-                for i, key in enumerate(parts_path[:-1]):
-                    cur = chain[-1]
-                    if not isinstance(cur, dict) or key not in cur:
-                        where = ".".join(parts_path[:i + 1])
-                        return await ctx.send(
-                            f"❌ `{eid}.{name}` has no value at '{where}'."
-                        )
-                    chain.append(cur[key])
-                leaf = chain[-1]
-                if not isinstance(leaf, dict) or parts_path[-1] not in leaf:
-                    return await ctx.send(
-                        f"❌ `{eid}.{name}` has no value at '{path}'."
-                    )
-                del leaf[parts_path[-1]]
-                # Prune empty intermediate dicts.
-                for i in range(len(chain) - 1, 0, -1):
-                    if chain[i]:
-                        break
-                    del chain[i - 1][parts_path[i - 1]]
-                after = copy.deepcopy(e.status[name])
-                event_log = m._emit_status_diff(eid, name, before, after)
-                msg = f"Removed `{eid}.{name}.{path}`."
-                if event_log:
-                    msg += "\n" + "\n".join(event_log)
-                return await ctx.send(msg)
-        return await ctx.send(
-            f"❌ unknown status action `{action}`. Use add / remove / "
-            f"set / del / info / list / clear."
-        )
-
-    # tp (absolute)
     if sub == "tp":#and len(args) >= 4:
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "tp"):
             return
@@ -16121,6 +16141,20 @@ def _say_team_shown(ctx: ReplyContext, m: Optional["Match"],
     return _acts_as_host(ctx, m) or ctx_is_admin(ctx)
 
 
+@contextlib.contextmanager
+def _quiet_status_lines(m: "Match", *pairs: Tuple[str, Optional[str]]):
+    """Keep the status lines (#309) of these (unit, status) pairs quiet
+    while a `!status` / `!ent status` command acts on them: its reply
+    already reports the change (user call). Status None = all of the
+    unit's."""
+    tok = STATUS_LINES_SKIP.set(STATUS_LINES_SKIP.get() | frozenset(
+        (m.id, eid, name) for eid, name in pairs if eid))
+    try:
+        yield
+    finally:
+        STATUS_LINES_SKIP.reset(tok)
+
+
 def _filter_unit_lines(text: str, ctx: ReplyContext, mgr: MatchManager) -> str:
     """`text` with tagged unit lines the channel's view can't see dropped
     and the tags stripped from the rest; say() markers (#215): names as the
@@ -16145,6 +16179,15 @@ def _filter_unit_lines(text: str, ctx: ReplyContext, mgr: MatchManager) -> str:
                 continue
             line = SAY_TEAM_RE.sub("", line)
         line = line.replace(SAY_OPEN_MARK, "")
+        hmo = STATUS_HIDE_RE.search(line)
+        if hmo is not None:
+            # A status line a view may not read (#309): the status's
+            # visibility or the unit's disguise keeps it from that team.
+            m, pov = seen()
+            if m is not None and m.id == hmo.group(1) and pov is not None \
+                    and str(pov) in hmo.group(2).split(STATUS_HIDE_SEP):
+                continue
+            line = STATUS_HIDE_RE.sub("", line)
         if DICE_ROLL_RE.search(line):
             m, pov = seen()
             line = join_dice_rolls(
@@ -25141,12 +25184,14 @@ for _sub, _usage in (
         ("def", "!status def <name>"),
         ("drop", "!status drop <name>"),
         ("tick", "!status tick <name> <formula ...>"),
-        ("hook", "!status hook <name> <on_added|on_removed|on_changed> [<formula ...>]"),
+        ("hook", "!status hook <name> <on_added|on_removed|on_changed|on_blocked> [<formula ...>]"),
         ("display", "!status display <name> [<format ...>]"),
+        ("message", "!status message <name> <gained|lost|changed|blocked> [<format ...>|none|-]"),
         ("visibility", "!status visibility <name> [<formula ...>]"),
-        ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
+        ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|source_turn_start|source_turn_end|never>"),
         ("stack", "!status stack <name> <layered|refresh|add_level|extend|replace|none>"),
         ("maxlevel", "!status maxlevel <name> <n>"),
+        ("maxduration", "!status maxduration <name> <n|->"),
         ("data", "!status data <name> <path> <value>"),
         ("tags", "!status tags <name> <csv ...>"),
         ("removes", "!status removes <name> <tokens ...>"),
@@ -25182,6 +25227,17 @@ registry.annotate_sub(
           "immune, `!ent replace` drops it. An instance's own "
           "`on_transform` key and level entries (`!status level`) "
           "override the definition's."),
+)
+registry.annotate_sub(
+    "status", "if_source_lost",
+    usage="!status if_source_lost <name> <keep|remove|->",
+    desc=("#267: what the status does when the unit that applied it (its "
+          "source, `status_source`) dies, is destroyed as a body part or "
+          "leaves the match: `keep` leaves it, `remove` removes it "
+          "(removed_by `source`; taunts, grapples, concentration). `-` "
+          "goes back to the status_default_if_source_lost rule. An "
+          "instance's own key and level entries override the "
+          "definition's. A status records only its latest applier."),
 )
 registry.annotate_sub(
     "status", "removed_on_damage",
@@ -25282,22 +25338,26 @@ for _sub in ACTION_RESTRICTION_FIELDS:
               f"clears it."))
 
 
-_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end", "never")
+_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
+               "source_turn_start", "source_turn_end", "never")
 _STACK_MODES = ("layered", "refresh", "add_level", "extend", "replace",
                 "none")
 # The `!status` subcommands that edit definitions, which `!system status`
 # runs on a system's library too: sub -> the words it needs.
 _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     "hook": 3, "display": 2, "visibility": 2,
+                    "message": 3,
                     "when": 3, "sprite": 3,
-                    "stack": 3, "maxlevel": 3, "data": 4, "tags": 2,
+                    "stack": 3, "maxlevel": 3, "maxduration": 3,
+                    "data": 4, "tags": 2,
                     "removes": 2, "blockedby": 2,
                     **{f: 2 for f in ACTION_RESTRICTION_FIELDS},
                     **{f + UNLESS_SUFFIX: 2
                        for f in ACTION_RESTRICTION_FIELDS},
                     GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2,
                     "level": 3, "resist_affects": 3, "resist_rounding": 3,
-                    "on_transform": 3, "removed_on_damage": 3,
+                    "on_transform": 3, "if_source_lost": 3,
+                    "removed_on_damage": 3,
                     "break_at_damage": 3, "damage_filter": 2,
                     "tick_priority": 3}
 
@@ -25312,10 +25372,12 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "resist_affects": "resist_affects",
                      "resist_rounding": "resist_rounding",
                      "on_transform": "on_transform",
+                     "if_source_lost": "if_source_lost",
                      "removed_on_damage": "removed_on_damage",
                      "break_at_damage": "break_at_damage",
                      "damage_filter": "damage_filter",
                      "tick_priority": "tick_priority",
+                     "max_duration": "maxduration",
                      **{f: f for f in ACTION_RESTRICTION_FIELDS},
                      **{f + UNLESS_SUFFIX: f + UNLESS_SUFFIX
                         for f in ACTION_RESTRICTION_FIELDS}}
@@ -25449,6 +25511,9 @@ async def _status_level_sub(ctx: ReplyContext, args: List[str], m: Any,
             levels.pop(spec, None)
         if not levels:
             sdef.pop(STATUS_LEVELS_FIELD, None)
+        recap = getattr(m, "recap_status", None)
+        if root == "max_duration" and recap is not None:
+            reply = "\n".join([reply] + recap(name))
         return f"At level `{spec}`: {reply}"
     _check_tail(args, 5, (), f"{usage} <name> <level> <field> <value>")
     check_store_path(field, "level entry field")
@@ -25618,6 +25683,35 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         return (f"Set `{name}`'s {hook} hook (runs after the "
                 f"on_status_* passives)." + (f"\n{warn}" if warn else ""))
 
+    if sub == "message":
+        # #309 / #389: this status's own gained / lost / changed / blocked
+        # line, over the status_*_message_format rule.
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "message"):
+            return ""
+        name, kind = args[1], args[2].lower()
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        if kind not in STATUS_LINE_KINDS:
+            return (f"❌ The line is one of: "
+                    f"{', '.join(STATUS_LINE_KINDS)}.")
+        rule, field = STATUS_LINE_KINDS[kind]
+        sdef = m.status_definitions[name]
+        text = " ".join(args[3:]).strip()
+        if not text:
+            cur = sdef.get(field)
+            return (f"`{name}`'s {kind} line: "
+                    + (f"`{cur}`" if isinstance(cur, str) and cur
+                       else "none (silenced)" if cur == ""
+                       else f"the {rule} rule"))
+        if text == "-":
+            sdef.pop(field, None)
+            return f"`{name}`'s {kind} line follows the {rule} rule again."
+        if text.lower() == "none":
+            sdef[field] = ""
+            return f"`{name}` prints no {kind} line."
+        sdef[field] = text.replace("\\n", "\n")
+        return f"`{name}`'s {kind} line = `{sdef[field]}`."
+
     if sub == "display":
         if await return_help_if_not_enough_args(ctx, args, 2, "status", "display"):
             return ""
@@ -25643,6 +25737,12 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         if when not in _TICK_WHENS:
             return (f"❌ when must be one of: {', '.join(_TICK_WHENS)}.")
         m.status_definitions[name]["tick_when"] = when
+        if when in SOURCE_TICK_WHENS:
+            # #310: the applier's clock.
+            return (f"`{name}` ticks at {when}: on the turns of the unit "
+                    f"that applied it (its source), wherever its bearer "
+                    f"stands; without a source, or once the source dies or "
+                    f"leaves, at the bearer's own {when[7:]}.")
         return (f"`{name}` ticks at {when}.")
 
     if sub == "sprite":
@@ -25760,7 +25860,8 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         return (f"`{name}` tick_priority = {m.status_definitions[name][sub]}"
                 f": a unit's statuses tick highest first.")
 
-    if sub in ("resist_affects", "resist_rounding", "on_transform"):
+    if sub in ("resist_affects", "resist_rounding", "on_transform",
+               "if_source_lost"):
         # #232: what resistance changes on this status, and how its result
         # rounds (over the status_resist_rounding rule); what a transform
         # does with it (keep / drop over the transform's flavor); `-`
@@ -25773,7 +25874,8 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->")
         choices = {"resist_affects": RESIST_AFFECTS,
                    "resist_rounding": RESIST_ROUNDINGS,
-                   "on_transform": TRANSFORM_STATUS_FLAGS}[sub]
+                   "on_transform": TRANSFORM_STATUS_FLAGS,
+                   "if_source_lost": STATUS_SOURCE_LOST_MODES}[sub]
         if val in ("-", "default", "clear"):
             m.status_definitions[name].pop(sub, None)
             return (f"`{name}` {sub} cleared ("
@@ -25781,7 +25883,9 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                        "resist_rounding":
                            "the status_resist_rounding rule rounds it).",
                        "on_transform": "a transform keeps it, a replace "
-                                       "drops it)."}[sub])
+                                       "drops it).",
+                       "if_source_lost": "the status_default_if_source_lost "
+                                         "rule decides)."}[sub])
         if val not in choices:
             return f"❌ {sub} must be one of: {', '.join(choices)} (or `-`)."
         m.status_definitions[name][sub] = val
@@ -25813,6 +25917,33 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         log = m.recap_status(name)
         return ("\n".join([f"`{name}` max_level = {max(0, n)}."]
                                          + log))
+
+    if sub == "maxduration":
+        # #116: the duration twin of max_level; a level entry may set its
+        # own (`!status level <name> <level> max_duration <n>`).
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "maxduration"):
+            return ""
+        _check_tail(args, 3, (), "!status maxduration <name> <n|->")
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        sdef = m.status_definitions[name]
+        if args[2] in ("-", "0"):
+            sdef.pop("max_duration", None)
+            return f"`{name}` has no max_duration now (durations uncapped)."
+        try:
+            n = int(args[2])
+        except ValueError:
+            n = -1
+        if n < 1 or n > 10 ** 9:
+            return ("❌ max_duration must be a whole number from 1 (`-` or "
+                    "0 = uncapped).")
+        sdef["max_duration"] = n
+        recap = getattr(m, "recap_status", None)
+        log = recap(name) if recap is not None else []
+        return "\n".join([f"`{name}` max_duration = {n}: no duration "
+                          f"of it runs longer (permanent ones stay "
+                          f"permanent)."] + log)
 
     if sub == "data":
         if await return_help_if_not_enough_args(ctx, args, 4, "status", "data"):
@@ -25946,13 +26077,13 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|rename|copy|tick|hook|display|visibility|when|stack|maxlevel|tick_priority|data|tags|"
+    usage=("!status <def|drop|rename|copy|tick|hook|display|message|visibility|when|stack|maxlevel|maxduration|tick_priority|data|tags|"
            "removes|blockedby|forbids_actions_with_tag|forbids_actions_with_name|"
            "immune_to_actions_with_tag|immune_to_actions_with_name|"
            "forbids_actions_with_tag_unless|forbids_actions_with_name_unless|"
            "immune_to_actions_with_tag_unless|immune_to_actions_with_name_unless|"
            "grants_unit_tags|cannot_affect_units_with_tag|"
-           "resist|resist_affects|resist_rounding|on_transform|"
+           "resist|resist_affects|resist_rounding|on_transform|if_source_lost|"
            "removed_on_damage|break_at_damage|damage_filter|"
            "counter|dispel|transfer|sprite|level|list|info|"
            "apply|force> ..."),
@@ -25978,12 +26109,24 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         "resistible move). `sprite <name> <key|clear> [opacity=<n>] [tint=<name>] "
         "[layer=<n>]` sets a graphics OVERLAY drawn over afflicted entities "
         "(e.g. a burning overlay; default layer 150, above entities). "
-        "`hook <name> <on_added|on_removed|on_changed> <formula>` stores "
+        "`hook <name> <on_added|on_removed|on_changed|on_blocked> <formula>` stores "
         "what the status does when it arrives, leaves or changes on a unit "
         "(self = the bearer; status_name, old_value, new_value and, on "
         "removal, removed_by: expired / dispel / transfer / removes / "
-        "zone / transform / removed), run after the on_status_* passives; no formula clears "
-        "it. "
+        "zone / transform / damage / source / removed), or when an "
+        "application doesn't land (on_blocked: block_reason, "
+        "status_applier, status_level_tried, status_duration_tried; not "
+        "for a zone's grant), run after the on_status_* passives; no "
+        "formula clears it. "
+        "`message <name> <gained|lost|changed|blocked> [<format ...> | "
+        "none | -]` replaces the status_*_message_format line for this "
+        "status (`none` = no line for it, `-` = the rule's again). "
+        "`if_source_lost <name> <keep|remove|->` ends it when the unit "
+        "that applied it dies or leaves. "
+        "`maxduration <name> <n|->` caps every duration of the status "
+        "(applications, counters, writes, each layer at its own level; a "
+        "level entry may set its own `max_duration`); permanent ones stay "
+        "permanent, and lowering it shortens live instances. "
         "`display <name> <format>` sets how the status shows in the "
         "`{statuses}` roster placeholder (its fields are placeholders, as in "
         "the status_line_format rule); no format clears it. "
@@ -25997,7 +26140,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         "`immune_to_actions_with_tag|immune_to_actions_with_name` keep "
         "such actions off it; each takes a `<field>_unless <name> "
         "<formula>` lifting it while true. "
-        "Subcommands: def, drop, rename, copy, tick, hook, display, when, stack, maxlevel, tick_priority, "
+        "Subcommands: def, drop, rename, copy, tick, hook, display, when, stack, maxlevel, maxduration, tick_priority, "
         "data, tags, removes, blockedby, the action restrictions, list, info, "
         "apply, force, dispel, transfer, sprite."
     ),
@@ -26091,9 +26234,10 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         had_layers = (field == "duration" and pe is not None
                       and status_layers_of(pe.status.get(sname)) is not None)
         try:
-            new = FormulaEngine(m).eval_expression(
-                f"{prim}('{eid}', '{sname}', {value}, '{field}')",
-                EvalCtx(this=m.current_entity_id(), target=eid))
+            with _quiet_status_lines(m, (eid, sname)):
+                new = FormulaEngine(m).eval_expression(
+                    f"{prim}('{eid}', '{sname}', {value}, '{field}')",
+                    EvalCtx(this=m.current_entity_id(), target=eid))
         except FormulaError as ex:
             return await ctx.send(f"❌ {ex}")
         e = m.entities.get(eid)
@@ -26130,13 +26274,22 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 max_count = int(args[3])
             except ValueError:
                 return await ctx.send("❌ max must be an integer.")
+        de = m.entities.get(eid)
+        names = sorted(m._statuses_matching_tokens(
+            de, m._token_list(token))) if de is not None else []
+        if max_count > 0:
+            names = names[:max_count]
         try:
-            n, event_log = m.dispel_statuses(eid, token, max_count)
+            with _quiet_status_lines(m, *((eid, n) for n in names)):
+                n, event_log = m.dispel_statuses(eid, token, max_count)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
+        gone = [x for x in names if de is None or x not in de.status]
+        which = (": " + ", ".join(f"`{x}`" for x in gone)) if gone else ""
         return await ctx.send(
-            f"Dispelled {n} status(es) matching `{token}` from `{eid}`.{tail}")
+            f"Dispelled {n} status(es) matching `{token}` from "
+            f"`{eid}`{which}.{tail}")
 
     if sub == "transfer":
         # !status transfer <from_eid> <to_eid> <name>  — resistible move.
@@ -26146,7 +26299,8 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         tid = _resolve_eid(m, args[2])
         name = args[3]
         try:
-            landed, event_log = m.transfer_status(fid, tid, name)
+            with _quiet_status_lines(m, (fid, name), (tid, name)):
+                landed, event_log = m.transfer_status(fid, tid, name)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
@@ -26168,6 +26322,8 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 bits.append(f"stack={d['stack']}")
             if d.get("max_level"):
                 bits.append(f"max_lvl={d['max_level']}")
+            if d.get("max_duration"):
+                bits.append(f"max_dur={d['max_duration']}")
             if not (isinstance(d.get("tick"), str) and d["tick"].strip()):
                 bits.append("no tick")
             lv = d.get(STATUS_LEVELS_FIELD)
@@ -26242,9 +26398,16 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             pre_reason = m.status_apply_block_reason(eid, name, level,
                                                      duration, rounding)
             pre_inst = copy.deepcopy(m.entities[eid].status[name])
+        ae = m.entities.get(eid)
         try:
-            event_log = m.apply_status(eid, name, level, duration, force=force,
-                                       rounding=rounding, source=source)
+            # A part's redirect lands on its parent: the reply names that.
+            with _quiet_status_lines(
+                    m, (eid, name),
+                    (ae.part_of if ae is not None and ae.is_part else "",
+                     name)):
+                event_log = m.apply_status(eid, name, level, duration,
+                                           force=force, rounding=rounding,
+                                           source=source)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
@@ -26264,7 +26427,8 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if e.is_part and name not in e.status:
             if name in m._part_status_names(e, "__status_immune", "part_status_immune"):
                 return await ctx.send(
-                    f"`{eid}` is immune to `{name}` (part rule) — no effect.")
+                    f"`{eid}` is immune to `{name}` (part rule) — no "
+                    f"effect.{tail}")
             if name in m._part_status_names(e, "__status_redirect", "part_status_redirect"):
                 return await ctx.send(
                     f"`{name}` on body part `{eid}` redirected to its parent "
