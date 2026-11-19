@@ -1839,6 +1839,20 @@ async def run_action(
         extras = dict(extra_ctx) if extra_ctx else {}
         extras.setdefault("action_name", action.name)
         extras.setdefault("action_tags", list(action.tags))
+        # `affected` outside the reaction exchange (R4): the units its
+        # `affects` gives, else its unit targets, as the exchange binds it;
+        # it was None unless some unit on the match held a reaction. Read
+        # only when a program names it (an `affects` formula costs a
+        # namespace).
+        if "affected" not in extras and any(
+                "affected" in src for _k, src in programs):
+            from reactions import _affects
+            try:
+                extras["affected"] = _affects(match, action, actor_id,
+                                              target, dict(args))
+            except VTTError as err:
+                return _finish_action_fail(ActionFail(str(err),
+                                                      reason="affects"))
         eval_ctx = EvalCtx(
             this=match.current_entity_id(),
             target=actor_id,

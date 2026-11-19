@@ -3268,14 +3268,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     "entity_description_status_format": {
         "default": (
             "- {name}{?level?} (level {level}){/?}{?duration?}, {duration} "
-            "turns left{/?}{?description?}: {description}{/?}"
+            "{turns_word} left{/?}{?description?}: {description}{/?}"
         ),
         "schema": {"type": "str"},
         "desc": (
             "One status in the description. Placeholders: `{name}` and the "
             "instance's fields (level, duration, its data; the definition's "
             "level entries at its level fill fields the instance lacks), so "
-            "a `description` in the definition's data shows here. A "
+            "a `description` in the definition's data shows here, and "
+            "`{turns_word}` (`turn` for a duration of 1, else `turns`). A "
             "permanent status has no duration."
         ),
     },
@@ -3677,6 +3678,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "The most rolls one `!roll Nx ...` makes (`!roll 6x 4d6kh3`, "
             "`!roll 2x none, crit`): N past it is refused."
+        ),
+    },
+    "table_odds_row_limit": {
+        "default": 500,
+        "schema": {"type": "int", "min": 1, "max": 5000, "ceiling": True},
+        "desc": (
+            "The most rows `!table odds` lists (a sub-table's entries "
+            "under the entry naming it count as rows); past it the listing "
+            "stops with a note. Entries of one table naming the same "
+            "sub-table are one row, and a path stops at a table it "
+            "already passed through."
         ),
     },
     "table_nesting_limit": {
@@ -19773,6 +19785,9 @@ class Match:
             # Wall-clock seconds (#135): requests are runtime-only, so the
             # clock decides their expiry and no replay reads it.
             "queued_at": time.time(),
+            # The turn it was asked on: a `!turn next` approved once that
+            # turn is over would end a later one (L57).
+            "turns_elapsed": self.turns_elapsed,
         }
         self.pending_requests[rid] = req
         return req

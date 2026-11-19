@@ -25,10 +25,10 @@ from logic import COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
 from logic import reserved_var_path_error, file_refs
-from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args
+from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows, ODDS_BUDGET
 
 import os
 import difflib
@@ -1165,6 +1165,10 @@ class CommandRegistry:
         # Which units hold private vars, memoized for this command (X21).
         scan_token = (PRIVATE_SCAN.set({}) if PRIVATE_SCAN.get() is None
                       else None)
+        # The dice odds work this command may do in all (X28); a nested
+        # run shares the outer command's.
+        odds_token = (ODDS_BUDGET.set([0]) if ODDS_BUDGET.get() is None
+                      else None)
         # Lines about one unit (deaths, revives) carry a tag naming it; every
         # reply of this command drops those its channel's view can't see
         # and strips the tag from the rest.
@@ -1243,6 +1247,8 @@ class CommandRegistry:
             PARTIAL_CACHE.reset(cache_token)
             if scan_token is not None:
                 PRIVATE_SCAN.reset(scan_token)
+            if odds_token is not None:
+                ODDS_BUDGET.reset(odds_token)
             CURRENT_WORKSPACE.reset(ws_token)
             COMMAND_CTX.reset(cctx_token)
             FORMULA_LOG_SINK.reset(sink_token)
@@ -3409,6 +3415,10 @@ def _description_statuses(m: Match, status: Dict[str, Any]) -> List[str]:
                                sctx)
         sctx = _hide_formula_fields(sctx)
         sctx["name"] = name
+        # "1 turn left", "3 turns left" (L57); a GM field of the name wins.
+        if "turns_word" not in sctx:
+            sctx["turns_word"] = ("turn" if sctx.get("duration") == 1
+                                  else "turns")
         lines.append(_render_template(fmt, sctx))
     return lines
 
@@ -10471,6 +10481,17 @@ async def run_approved_request(req: dict, ctx: ReplyContext,
     request's match only for the run, then restored, unless the command
     itself changed it (an approved `!match use`)."""
     ch = req.get("channel_key") or ctx.channel_key
+    m = mgr.matches.get(req.get("match_id") or "")
+    if (m is not None and str(req.get("name", "")).lower() == "turn"
+            and [str(a).lower() for a in req.get("args") or []][:1]
+            == ["next"]
+            and req.get("turns_elapsed") is not None
+            and req["turns_elapsed"] != m.turns_elapsed):
+        # L57: approved on a later turn, it would end that one instead.
+        await ctx.send(f"❌ `!turn next` (request `{req.get('id')}`, by "
+                       f"{req.get('user_name')}) was asked during a turn "
+                       f"that is over, so it doesn't run.")
+        return
     run_ctx = ctx if ch == ctx.channel_key else _RequesterChannelCtx(ctx, ch)
     # Never the approver's `!again` command: a Discord button click runs this
     # at the top level, where run() would record it.
@@ -11825,6 +11846,101 @@ def _mentions_note(m: Match, name: str, what: str) -> Optional[str]:
             f"written: {shown}.")
 
 
+def _function_or_none(fdef: Any) -> "Optional[FormulaFunction]":
+    """A stored formula function, None when the entry isn't one (a file
+    brought `{}` or a number as its params: S8)."""
+    if not isinstance(fdef, dict):
+        return None
+    try:
+        fn = FormulaFunction.from_dict(fdef)
+        list(fn.params)
+    except Exception:          # noqa: BLE001 - any wrong shape
+        return None
+    if not isinstance(fn.body, str) or not all(isinstance(p, str)
+                                               for p in fn.params):
+        return None
+    return fn
+
+
+def _system_formula_slots(rule_value: Callable[[str], Any],
+                          library: Callable[[str], Dict[str, Any]]):
+    """(where, formula, mode, params, action_mode) of every formula a
+    system stores: formula rules, default passives, tile templates'
+    hooks / block / opaque, function bodies, damage and healing steps,
+    status ticks, hooks, `_unless` and level entries, watchers (the
+    library's and those statuses give), zone definitions' hooks / block /
+    opaque / grant_condition. Shared by `!system lint` and `!system
+    import` (S8), which read rules and libraries through the two
+    callables; an entry of the wrong shape gives no slots (the import
+    refuses it first)."""
+    def _dict(x: Any) -> Dict[str, Any]:
+        return x if isinstance(x, dict) else {}
+    for k in sorted(RULES_REGISTRY):
+        mode = (RULES_REGISTRY[k].get("schema") or {}).get("formula")
+        if mode:
+            yield (f"rule `{k}`", rule_value(k),
+                   "eval" if mode == "expression" else "exec", frozenset(),
+                   False)
+    for spec in rule_value("default_entity_passives") or []:
+        if isinstance(spec, dict):
+            yield (f"default passive `{spec.get('id')}`", spec.get("formula"),
+                   "exec", frozenset(), False)
+    for tname, tdef in sorted(_dict(library("tile_templates")).items()):
+        tdef = _dict(tdef)
+        for when, src in sorted(_dict(tdef.get("hooks")).items()):
+            yield (f"tile template `{tname}` hook `{when}`", src, "exec",
+                   frozenset(), False)
+        for key in ("block", "opaque"):
+            yield (f"tile template `{tname}` {key}",
+                   _dict(tdef.get("data")).get(key), "eval", frozenset(),
+                   False)
+    for fname, fdef in sorted(_dict(library("formula_functions")).items()):
+        fn = _function_or_none(fdef)
+        if fn is not None:
+            yield (f"function `{fname}`", fn.body, "exec",
+                   frozenset(fn.params), False)
+    for lib_name, noun in (("damage_steps", "damage"),
+                           ("healing_steps", "healing")):
+        for sname, step in sorted(_dict(library(lib_name)).items()):
+            yield (f"{noun} step `{sname}`", _dict(step).get("formula"),
+                   "exec", frozenset(), True)
+    statuses = sorted(_dict(library("status_definitions")).items())
+    for sname, sdef in statuses:
+        sdef = _dict(sdef)
+        hooks = _dict(sdef.get("hooks"))
+        for where, src in ([("tick", sdef.get("tick"))]
+                           + [(f"{h} hook", hooks[h]) for h in sorted(hooks)]):
+            yield (f"status `{sname}` {where}", src, "exec", frozenset(),
+                   False)
+        for fld in ACTION_RESTRICTION_FIELDS:
+            yield (f"status `{sname}` {fld}{UNLESS_SUFFIX}",
+                   sdef.get(fld + UNLESS_SUFFIX), "eval", frozenset(), False)
+        for where, src, mode in _status_level_formulas(sdef):
+            yield (f"status `{sname}` {where}", src, mode, frozenset(),
+                   False)
+    watch = [(f"watcher `{wname}`", w) for wname, w in sorted(
+        _dict(library("watchers")).items())]
+    for sname, sdef in statuses:
+        watch += [(f"status `{sname}` {where}", spec)
+                  for where, spec in _status_watchers(_dict(sdef))]
+    for where, spec in watch:
+        yield from _watcher_slots(where, spec)
+    for zname, zdef in sorted(_dict(library("zone_definitions")).items()):
+        try:
+            zdef = normalize_zone_def(zdef)
+        except VTTError:
+            continue
+        for when, src in sorted(zdef["hooks"].items()):
+            yield (f"zone definition `{zname}` hook `{when}`", src, "exec",
+                   frozenset(), False)
+        for key in ("block", "opaque"):
+            yield (f"zone definition `{zname}` {key}", zdef["data"].get(key),
+                   "eval", frozenset(), False)
+        if zdef.get("grant_condition"):
+            yield (f"zone definition `{zname}` grant_condition",
+                   zdef["grant_condition"], "eval", frozenset(), False)
+
+
 def _system_lint(mgr: MatchManager, s: Any) -> str:
     """`!system lint <name>`: every formula the system and its matches
     store, checked at once. Each is checked when stored, but a function
@@ -11850,30 +11966,6 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         else:
             bad.append(f"❌ {where}: {err}")
 
-    n = 0
-    for k in sorted(RULES_REGISTRY):
-        mode = (RULES_REGISTRY[k].get("schema") or {}).get("formula")
-        if mode:
-            n += 1
-            check(f"rule `{k}`", mgr.system_value(s, k),
-                  "eval" if mode == "expression" else "exec", sys_known,
-                  soft=True)
-    for spec in mgr.system_value(s, "default_entity_passives") or []:
-        if isinstance(spec, dict):
-            n += 1
-            check(f"default passive `{spec.get('id')}`", spec.get("formula"),
-                  "exec", sys_known, soft=True)
-    for tname, tdef in sorted(mgr.system_library(s, "tile_templates").items()):
-        tdef = tdef if isinstance(tdef, dict) else {}
-        for when, src in sorted((tdef.get("hooks") or {}).items()):
-            n += 1
-            check(f"tile template `{tname}` hook `{when}`", src, "exec",
-                  sys_known, soft=True)
-        for key in ("block", "opaque"):
-            n += 1
-            check(f"tile template `{tname}` {key}",
-                  (tdef.get("data") or {}).get(key), "eval", sys_known,
-                  soft=True)
     def check_name(where: str, fname: str, params: List[Any]) -> None:
         # A name stored before the reserved names were refused (an older
         # save) would shadow an engine helper or never be called.
@@ -11882,64 +11974,19 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         except VTTError as ex:
             bad.append(f"❌ {where}: {ex}")
 
+    n = 0
     for fname, fdef in sorted(mgr.system_library(s, "formula_functions").items()):
-        fn = FormulaFunction.from_dict(fdef)
-        n += 1
+        fn = _function_or_none(fdef)
+        if fn is None:
+            bad.append(f"❌ function `{fname}`: isn't a function (a name, "
+                       f"a list of parameters and a body)")
+            continue
         check_name(f"function `{fname}`", fname, fn.params)
-        check(f"function `{fname}`", fn.body, "exec", sys_known,
-              frozenset(fn.params), soft=True)
-    for lib_name, noun in (("damage_steps", "damage"),
-                           ("healing_steps", "healing")):
-        for sname, step in sorted(mgr.system_library(s, lib_name).items()):
-            n += 1
-            check(f"{noun} step `{sname}`", step.get("formula"), "exec",
-                  sys_known, action_mode=True, soft=True)
-    for sname, sdef in sorted(
-            mgr.system_library(s, "status_definitions").items()):
-        sdef = sdef if isinstance(sdef, dict) else {}
-        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
-        for where, src in ([("tick", sdef.get("tick"))]
-                           + [(f"{h} hook", hooks[h]) for h in sorted(hooks)]):
-            if isinstance(src, str) and src.strip():
-                n += 1
-                check(f"status `{sname}` {where}", src, "exec", sys_known,
-                      soft=True)
-        for fld in ACTION_RESTRICTION_FIELDS:
-            src = sdef.get(fld + UNLESS_SUFFIX)
-            if isinstance(src, str) and src.strip():
-                n += 1
-                check(f"status `{sname}` {fld}{UNLESS_SUFFIX}", src, "eval",
-                      sys_known, soft=True)
-        for where, src, mode in _status_level_formulas(sdef):
-            n += 1
-            check(f"status `{sname}` {where}", src, mode, sys_known,
-                  soft=True)
-    sys_watch = [(f"watcher `{wname}`", w) for wname, w in sorted(
-        mgr.system_library(s, "watchers").items())]
-    for sname, sdef in sorted(
-            mgr.system_library(s, "status_definitions").items()):
-        sys_watch += [(f"status `{sname}` {where}", spec)
-                      for where, spec in _status_watchers(sdef)]
-    for where, spec in sys_watch:
-        for slot, src, mode, _p, _a in _watcher_slots(where, spec):
-            if isinstance(src, str) and src.strip():
-                n += 1
-                check(slot, src, mode, sys_known, soft=True)
-    for zname, zdef in sorted(
-            mgr.system_library(s, "zone_definitions").items()):
-        zdef = normalize_zone_def(zdef)
-        for when, src in sorted(zdef["hooks"].items()):
-            n += 1
-            check(f"zone definition `{zname}` hook `{when}`", src, "exec",
-                  sys_known, soft=True)
-        for key in ("block", "opaque"):
-            n += 1
-            check(f"zone definition `{zname}` {key}", zdef["data"].get(key),
-                  "eval", sys_known, soft=True)
-        if zdef.get("grant_condition"):
-            n += 1
-            check(f"zone definition `{zname}` grant_condition",
-                  zdef["grant_condition"], "eval", sys_known, soft=True)
+    for where, src, mode, params, action_mode in _system_formula_slots(
+            lambda k: mgr.system_value(s, k),
+            lambda kind: mgr.system_library(s, kind)):
+        n += 1
+        check(where, src, mode, sys_known, params, action_mode, soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
@@ -28766,9 +28813,13 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         limit = int(m.rules.get(
             "table_nesting_limit",
             RULES_REGISTRY["table_nesting_limit"]["default"]))
+        row_limit = int(m.rules.get(
+            "table_odds_row_limit",
+            RULES_REGISTRY["table_odds_row_limit"]["default"]))
         try:
-            rows = table_odds_rows(m.tables, name, adjust=adjust, keep=keep,
-                                   limit=limit)
+            rows, cut = table_odds_rows(m.tables, name, adjust=adjust,
+                                        keep=keep, limit=limit,
+                                        row_limit=row_limit)
         except FormulaError as ex:
             return await ctx.send(f"❌ {ex}")
         head = f"🎲 table `{name}`"
@@ -28781,8 +28832,10 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         width = max(len("  " * d + k) for d, k, _p in rows) if rows else 0
         lines = [f"{'  ' * d + k:<{width}}  {_fmt_pct(p):>7}"
                  for d, k, p in rows]
+        tail = (f"\n✂️ … the rows past {row_limit} are left out "
+                f"(table_odds_row_limit)." if cut else "")
         return await ctx.send(head + ":\n```\n" + "\n".join(lines)
-                              + "\n```")
+                              + "\n```" + tail)
 
     if sub == "rank":
         if await return_help_if_not_enough_args(ctx, args, 2, "table", "rank"):
@@ -30902,7 +30955,100 @@ def _imported_system(mgr: MatchManager, raw: Any,
             raise VTTError(f"`{raw['name']}`: `{lib}` isn't an object.")
     if d.get("parent") is not None and not isinstance(d["parent"], str):
         raise VTTError(f"`{raw['name']}`: `parent` isn't a system name.")
+    _check_imported_libraries(raw["name"], d)
     return GameSystem.from_dict(copy.deepcopy(d)).to_dict()
+
+
+def _check_imported_libraries(sname: str, d: Dict[str, Any]) -> None:
+    """A file's library entries checked as their editors check them (S8):
+    each entry's shape (prefab's checks for tile templates, functions and
+    status / zone definitions; tables through check_table_text; aliases
+    starting with a real command; tags, watchers, var labels, damage and
+    healing steps), then every formula the system stores, as `!system
+    lint` reads them: a construct the sandbox refuses refuses the file (a
+    call to a function the file doesn't define is allowed, as the editors
+    allow it). Raises VTTError naming the entry; changes nothing."""
+    import damage as _damage
+    from prefab import (_check_tile_template, _check_formula_function,
+                        _check_status_definition, _check_grant_condition)
+    own = f"System `{sname}`"
+
+    def lib(kind: str) -> Dict[str, Any]:
+        v = d.get(kind)
+        return v if isinstance(v, dict) else {}
+
+    for tname, entry in lib("tile_templates").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: tile template `{tname}` isn't an object.")
+        lib("tile_templates")[tname] = _check_tile_template(
+            entry, sname, tname, own)
+    for fname, entry in lib("formula_functions").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: function `{fname}` isn't an object.")
+        lib("formula_functions")[fname] = _check_formula_function(
+            entry, sname, fname, own)
+    for st, entry in lib("status_definitions").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: status definition `{st}` isn't an "
+                           f"object.")
+        _check_status_definition(entry, sname, st, owner=own)
+    for zname, entry in lib("zone_definitions").items():
+        if not isinstance(entry, dict):
+            raise VTTError(f"{own}: zone definition `{zname}` isn't an "
+                           f"object.")
+        check_zone_def_name(zname)
+        _check_grant_condition(entry, f"{own}: zone definition `{zname}`")
+        lib("zone_definitions")[zname] = normalize_zone_def(entry)
+    tables = {k: v for k, v in lib("tables").items()}
+    for tname, text in tables.items():
+        if not isinstance(text, str):
+            raise VTTError(f"{own}: table `{tname}` isn't text.")
+        try:
+            check_table_text(tname, text, tables)
+        except FormulaError as ex:
+            raise VTTError(f"{own}: table `{tname}`: {ex}")
+    for aname, expansion in lib("aliases").items():
+        if not isinstance(expansion, str) or not expansion.strip():
+            raise VTTError(f"{own}: alias `{aname}` has no expansion.")
+        if aname.lower() in registry._handlers:
+            raise VTTError(f"{own}: alias `{aname}` takes a command's name.")
+        try:
+            tokens = split_command_line(expansion)
+        except ValueError as ex:
+            raise VTTError(f"{own}: alias `{aname}`: {ex}")
+        if not tokens or tokens[0] not in registry._handlers:
+            raise VTTError(f"{own}: alias `{aname}` must start with a real "
+                           f"command.")
+    for mname, body in lib("macros").items():
+        if not isinstance(body, str):
+            raise VTTError(f"{own}: macro `{mname}` isn't text.")
+    for tag, desc in lib("tag_vocabulary").items():
+        check_tag(tag)
+        if not isinstance(desc, str):
+            raise VTTError(f"{own}: the description of tag `{tag}` isn't "
+                           f"text.")
+    for wname, spec in lib("watchers").items():
+        why = watcher_spec_problem(spec)
+        if why:
+            raise VTTError(f"{own}: watcher `{wname}`: {why}")
+    for path, label in lib("var_labels").items():
+        why = var_label_problem(path, label)
+        if why:
+            raise VTTError(f"{own}: var label `{path}`: {why}")
+    for kind, key in (("damage", "damage_steps"),
+                      ("healing", "healing_steps")):
+        for step_name, step in lib(key).items():
+            try:
+                lib(key)[step_name] = _damage.normalize_step(kind, step)
+            except VTTError as ex:
+                raise VTTError(f"{own}: {kind} step `{step_name}`: {ex}")
+    known = frozenset(lib("formula_functions"))
+    settings = d.get("settings") or {}
+    for where, src, mode, params, action_mode in _system_formula_slots(
+            lambda k: (settings.get(k) or {}).get("value"), lib):
+        err = _lint_one(src, mode, known, params, action_mode)
+        if err and not re.match(r"Function '(\w+)' is not allowed\.", err):
+            raise VTTError(f"{own}: {where}: {err}")
 
 
 def _merged_system(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:

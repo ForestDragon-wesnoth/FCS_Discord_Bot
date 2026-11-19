@@ -3132,7 +3132,9 @@ hardcodes**.
   buttons last as long as the request and the message says when it
   expired. `!as wait <seconds>` (CLI / harness) ages every request. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
-  `_channel_pointed_at`). A request whose command an open reaction
+  `_channel_pointed_at`). A request records the `turns_elapsed` it was
+  asked on, and a `!turn next` approved on a later turn is refused (it
+  would end that turn; L57, 1245). A request whose command an open reaction
   window holds stays queued (`approval_waits`: `!approve`, `!approve
   all` and the Discord button answer why it waits and use nothing up;
   1164).
@@ -3443,7 +3445,13 @@ hardcodes**.
   unknown rule dropped with a note), each parent present without a loop
   or a chain past the owner limit, and every template / prefab
   (`check_template` against the server's library plus the file's,
-  `check_prefab`, the saver checks) before changing anything; then the
+  `check_prefab`, the saver checks) and every library entry as its
+  editor checks it (`_check_imported_libraries`: prefab's checkers for
+  tile templates, functions and status / zone definitions,
+  `check_table_text`, aliases starting with a real command, tags,
+  watchers, var labels, steps; then every formula through
+  `_system_formula_slots`, the slot list `!system lint` reads too, a call
+  to an undefined function allowed; S8, 1244) before changing anything; then the
   systems go in through `_switch_systems` (all or nothing, every match
   re-applies its rules: units take the var names they give; size rule
   problems put it back), one `!system undo` step; then the templates
@@ -3629,7 +3637,10 @@ hardcodes**.
   `item:weight` weighted, through `roll_table_pick`) and a leading `<n>x`
   repeating any roll, at most `roll_repeat_limit` (owner ceiling) (888);
   `roll_odds(spec, op, n, percent=False)` (a fraction) and
-  `roll_mean(spec)` (#361, pure, no RNG); `roll_table` (finite weights,
+  `roll_mean(spec)` (#361, pure, no RNG); `dice_distribution` counts a
+  group's faces and an exploding chain's entries before building them,
+  and every odds call of one top-level command shares one budget
+  (`formula.ODDS_BUDGET`, set in `_run_top`, `_ODDS_MAX_STEPS`; X28, 1242); `roll_table` (finite weights,
   keyed entries), `band` (ranges may be negative; an unreadable or
   backwards band is refused; success tiers compose from it, #105 struck,
   1227), `pick` / `shuffle`; `roll_dice(spec, all=False, label=None)`
@@ -3638,7 +3649,8 @@ hardcodes**.
   (1172).
 - **Named tables** (`Match.tables`, name -> text; `!table def | roll |
   odds | rank | list | show | remove | rename`, `!system table`): the text
-  is the spec, optionally ending ` rank=a,b` (the entries best first,
+  is the spec, optionally ending ` rank=a,b` (everything after the last
+  ` rank=`, so a ranked entry may hold spaces, L57; the entries best first,
   `split_table_rank` / `table_text`; entries left out follow in the order
   written, the fallback when there is no rank, user call; `!table rank`
   writes it). An entry `@<table>` rolls that table when picked and
@@ -3657,7 +3669,9 @@ hardcodes**.
   [...]` (`_table_roll_opts`, `_table_roll_reply`; #610, 1190, 1228-1229).
   `!table odds <name> [...]` (a player read, #362, `table_odds_rows`):
   each entry's chance, a sub-table's entries under it with their overall
-  chance, best / worst from the rank (P(best = i) = W_i^n - W_(i+1)^n,
+  chance (entries of one level naming the same sub-table one row, a path
+  ending "(back to `t`)" at a table it already passed through, at most
+  `table_odds_row_limit` rows, then a note; X27, 1241), best / worst from the rank (P(best = i) = W_i^n - W_(i+1)^n,
   W_i the chance of i or worse; 1230). All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
   `random_seed` rule when set, else the match's own `rng_seed` (made at
@@ -4295,7 +4309,8 @@ dump` is the raw data for the GM.
   `entity_description_<section>_format` rule (entity_info_format's
   placeholders; the list sections take `{items}`, one
   `entity_description_status_format` / `_action_format` / `_part_format`
-  line each). A section with nothing to show is left out. The header shows
+  line each; the status line's `{turns_word}` is `turn` for a duration
+  of 1, L57). A section with nothing to show is left out. The header shows
   the unit's `description` var, a status its definition's `description`
   data (level entries layered), an action its `description`. The mount
   section names the vehicle a rider rides (`_riding_format`, the
@@ -4422,7 +4437,10 @@ lists what isn't built; 1093-1122).
   `action_condition_message_format`, `action_condition_text`; `!action
   list` marks an unmet one through `action_condition_ok` with no target,
   1216),
-  `cancelled_action_cost` (refund / pay). `run_action(steps=,
+  `cancelled_action_cost` (refund / pay). A body run without the
+  exchange (no unit holds a reaction, no prepare) still reads `affected`
+  (`run_action` evaluates `_affects` when a program names it; a failing
+  `affects` refuses with reason `affects`; R4, 1243). `run_action(steps=,
   preset_locals=, prepare_out=, body_out=, finish=, skip_checks=,
   extra_bindings=, fail_out=, target_out=)` runs any of the programs as
   one transaction. `fail(...)` takes the word `refund` (`REFUND`, a
