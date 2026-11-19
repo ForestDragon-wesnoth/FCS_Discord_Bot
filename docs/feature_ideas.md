@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #615). #264-#615 come from review passes by
+(the highest so far is #620). #264-#615 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -57,8 +57,9 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#107 Line-of-effect areas.** A `los=True` option on `cells_in_burst` / `cells_in_cone` and `!map preview`, so an explosion stops at walls.
 - **#112 Bar placeholders** for `entity_line_format` and #68: `{hp_bar}` (▰▰▰▱▱, width from a rule), and `{bar:mana:max_mana}` for any pair of vars.
 - **#114 Status glyph and color on the ASCII map.** A status definition's `glyph` / `color` (with a priority) show on the bearer. This is the text twin of status overlay sprites.
-- **#115 Hidden statuses.** A definition flag (or a visibility formula) keeps a status out of non-host views: `!ent info`, `show:status`, `status:` selectors. For curses and tracking marks.
-  - Note: hidden statuses need the existence-oracle treatment #70's private vars got (`VAR_READER`, CLAUDE.md §7.22): `status:`, `show:status`, `count` and `$()` must treat a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
+- **#115 Hidden statuses** (shipped in part).
+  - Shipped: `status_visibility_condition` and a status's own `visibility_condition` (`!status visibility`) keep a status out of a team view's unit lines, card, description, `!find status:` (`count` too) and `show:status`, and image overlays.
+  - Open: a player's `$()` / `!assert` / read-only `!eval` still read every status (`status_has(boss, 'cursed')`), as formulas do. The private-vars treatment (`Match.private_view`) would run such reads with the hidden statuses left out.
 - **#116 `max_duration` on status definitions,** the duration twin of `max_level`.
 - **#117 Zone and tile lifetimes.** `expires_in` on zones and placed tiles, counted on `turns_elapsed` (a 3-turn fire wall, a smoke cloud).
 - **#118 `zone_grow(name, n)` / `zone_shrink`, plus `!zone grow/shrink`.** Optionally stopped by block conditions; for spreading fire, expanding gas and a closing storm circle.
@@ -388,6 +389,11 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - `!template resync all <partial> [preview]` resyncs them as one undo step, all or nothing, each keeping its own changes as the single-unit form does.
   - `!template delete` names the live holders in loaded matches before it goes (the usedby listing of #370).
 
+- **#617 Sums along a sight line.** `line_sum(a, b, path, map=)` (and `line_max`): adds up a tile or zone data field (`concealment`, `cover`) over the cells between two units or cells, on the walk `has_los` takes, the end cells left out. Stealth formulas need "how much is in the way" (#616); a `for` loop over `cells_in_line` with `tile_get` builds it today, but a visibility formula is an expression and runs per viewer per unit per render, so it needs a native, cell-budgeted read.
+  - Open question: for a multi-tile body, the line between body centres, or the best line between any two covered cells (as sight already uses). Rec: centres, cheap and predictable; the best pair when a rule asks for it.
+- **#619 Last known positions.** When a unit drops out of a team's view (hidden, undetected, out of fog range), the team keeps a "last seen" marker on its cell for `last_seen_turns` turns (0 = off): the unit's glyph greyed, or a rule glyph, with its name as that team last saw it. A `last_seen(team, eid)` read gives the cell and the turn. Stealth play reads it constantly; built on #6's team markers.
+- **#620 Hit from the unseen** (composes today; an example scenario, no engine code). A global `on_damage_taken` passive (self = the unit hit), checked in a probe: `if attacker and not team_sees_entity(entity[self].team, attacker): say_to(entity[self].team, 'Something hits ' + entity[self].name + ' from the ' + direction_to(entity_center(self), entity_center(attacker)) + '!')` prints "Something hits Hero from the up_left!" in the defender's team channel while the attacker stays `someone`. With #6, a short-lived arrow marker on the defender's edge. A creature that decloaks when it attacks (the Umbra Cattus) removes its cloak status in its own `on_action_used` passive; one that stays cloaked doesn't. The scenario documents both, and whether the defender learns a distance band too is up to the formula.
+
 ## Medium (a subsystem slice)
 
 ### Still open
@@ -695,6 +701,13 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#567 Team vision kept between commands.** A team's sight set survives from one command to the next and is updated by what changed. Today vision is memoised for one render pass, so every board refresh after every command recomputes each viewing team's sight (§8 lists "vision caching beyond one render" under later). The unit index already announces every move, footprint change and removal to listeners; a per-team cache listens, and also drops on opacity changes (tile, zone and void edits) and fog rule changes. `FCS_SPATIAL_CHECK=1` compares every cached answer with a fresh computation, as for the other caches. Worth building only after measuring: first time a board refresh on a large fogged map with the benchmark suite (#347).
 - **#614 What happens when.** `!match upcoming` lists the scheduled future in one place. Today the pieces live in separate commands (`!schedule list`, `!remind list`, the extra-turn queue in `!turn`), and temporary fog reveals have no listing at all. One timeline ordered by due turn or round: schedules, reminders, queued extra turns, reveals that expire, and zone and tile lifetimes once #117 exists, each line saying what and when ("round 4: sched_1", "in 2 turns: reminder 1"). Hosts see everything in a channel without a team view; players see the public reminders and their own team's reveals. The future-facing companion of `!match waiting` (#525).
 - **#615 Maps from formulas.** `map_create(name, w, h)`, `map_create(name, prefab=...)` and `map_delete(name)`. Today the formula list has map reads (`maps`, `map_of`, `map_carrier`, `inner_maps`, `outer_map`) and map vars but no way to make or remove a map, so an action can move a unit to another map only if it already exists. The functions call what `!map new`, `!map new from=<prefab>` and `!map delete` call, with the same checks (`match_cell_limit`, name rules, `map_delete_mode`, the prefab's system test), and return the map's name, minted on a clash as zone names are. With the `__delete_when_empty` map var this gives instanced interiors: stepping through a portal creates the pocket room from a prefab, moves the party in, and the room disappears when the last unit leaves. Journal replays stay exact because a prefab read is already recorded with its command. Open question: a per-command cap on maps created, in the style of `summon_event_limit`; one with an owner ceiling is recommended.
+- **#618 Noise.** Loud actions give away an approximate position, sharper the louder and the closer.
+  - `make_noise(x, y, loudness, source=None, tags=None, map=None)` (mutating; an action body calls it, a gun loud, a crossbow quieter), `!noise <x> <y> <loudness> [source=]` for hosts.
+  - Rule `noise_hearing_formula` (an expression read per listening unit: self = the listener, `noise_loudness`, `noise_distance`, `noise_source`, `noise_tags` bound): returns how well that unit hears it, 0 = not at all. A team takes its best listener.
+  - What a team gets: a team-only marker (#6) of an area holding the source, a radius from `noise_area_formula` (louder and closer = smaller; 0 = the exact cell), centred on a point drawn with the match RNG so the true cell is inside but not at the centre (replays repeat it); a `say_to` line by `noise_message_format` ("🔊 gunfire to the NE, about 6 tiles"); the listener's `on_noise_heard` passive (`noise_cell`, `noise_radius` bound). The marker lasts `noise_marker_turns`.
+  - Hearing never shows the unit: it stays undetected (#616) unless sight says otherwise. Repeated noises each leave their own area; narrowing them down is the players' job. Lines and markers follow the views like other team-only output.
+  - Optional: an action field `noise` (an expression, the action's loudness, emitted after a successful body), keeping the loudness on the weapon ("what X does is stored in X").
+  - Open question: whether a team hears its own units' noise (probably yes for allies' positions, no marker for its own).
 
 ## Large (arcs of several PRs)
 
@@ -778,6 +791,17 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#570 Custom resolution pipelines.** The damage pipeline's machinery for kinds the GM declares: a to-hit bonus, a movement cost, a morale check.
   - Today: `damage.KINDS` holds two kinds, damage and healing. Each has a step library (`Match.damage_steps` / `healing_steps`, also system libraries), steps with side, order, filter and description (`normalize_step`, `ordered_steps`), the `step_` helpers reading `STEP_FRAME`, and `!damage explain`.
   - (The entry arrived cut off at this point; the design, surface and open questions are still to come.)
+- **#616 Detection levels (stealth).** Whether a team sees a unit becomes three states, undetected / detected / visible, decided per observing unit by profile, concealment, distance and optics. Asked for FCS3 (PvP ambushes): "you know something is there, but not what".
+  - Today: `entity_visibility_condition` is one yes / no per team (self = the unit, `pov_team`); it can't read WHICH of the team's units is looking, so distance from the observer, the observer's own stance and its optics can't enter it, and there is no middle state. Fog (vision radius, `fog_los`) decides cells, not units.
+  - Design: a rule `detection_score_formula` (expression; self = the observed unit, `viewer` = the observing unit, `viewer_distance` bound) giving a number per pair; `detection_threshold` and `visibility_threshold` cut it into the three states, so detecting is easier than seeing. A team's state for a unit is the best over its living units (own units always visible; allied shared vision later). The GM's formula carries the factors: the unit's profile from its size (#242) and a stance var (prone, crouched), concealment from #617's `line_sum`, distance, the viewer's stance (a prone viewer sees less), optics as a viewer item whose modifier raises the score inside its arc (`relative_angle(viewer, self) <= 15`), big units harder to hide. `entity_visibility_condition` stays the hard gate (false = undetected whatever the score).
+  - A detected unit is a contact: the map draws `contact_glyph` / `contact_sprite` (`?`), the roster lists `contact_line_format` ("Unknown contact at (5,7)"), no stats, no name, statuses or tags; lines that name it print `contact_name`. Built on the disguise path (a presented stand-in), so every read already routed through `presented_*` follows.
+  - Cost: pairs of observers and units per view per render. A rule `detection_max_range` (ceiling) prefilters by the spatial index; results memoized per vision pass like fog stamping; the simple shapes read natively where they can.
+  - Open questions (to settle before building):
+    1. Can a team target or query a contact, and by what name? Its id names the unit outright. Option: per-team stand-in ids (`c1`, `c2`) stable while detected, accepted by `!action`, `!dist`, `!find`. Rec: stand-in ids.
+    2. A contact's exact cell, or a blurred area like #618's noise? Rec: the cell (the map draws the `?` there); blur is #618's job.
+    3. Does detection read per render (live) or settle at turn boundaries? Live is simplest and matches fog; turn-settled is cheaper and gives "you spot them at the start of your turn". Rec: live, with the memo.
+    4. Interplay with fog: fog hides cells, detection hides units inside seen cells. A detected unit in a fogged cell: shown as a contact (sight beyond the fog radius through optics) or not? Rec: detection may reach past the fog radius only through `detection_max_range`.
+  - Tools that grow with it: #424 (`!ent seenby` per state and per observer), #277 (explain sight with the score's parts), #435 (a reveal makes a unit visible), #619 (last known positions), #618 (noise), #620 (hits from the unseen).
 
 ## Suggested groupings
 
@@ -922,3 +946,7 @@ From the #610-#615 review:
 - **Transforms and templates:** #611, #613
 - **The match at a glance:** #614
 - **Maps from formulas:** #615
+
+From the FCS3 stealth discussion:
+
+- **Stealth and detection:** #6 (team markers) → #617 → #616, then #618, #619, #620; with #424, #435 and #277

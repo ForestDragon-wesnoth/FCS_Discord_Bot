@@ -2006,8 +2006,9 @@ hardcodes**.
   placeholder (`vtt_commands._statuses_text`, in the default
   entity_line_format after a ` | ` and in entity_info_format): each status
   through its definition's `display` format (`!status display`) else the
-  `status_line_format` rule (`burn ×2 (3 turns)`), its instance fields as
-  placeholders plus `{turns_word}` (885, 1246).
+  `status_line_format` rule (`burn ×2 (3 turns)`), its instance fields
+  as placeholders plus `{turns_word}` and `{stacked}` (the level above 1,
+  so the default shows no `×1`, L58) (885, 1246).
 - **Visibility** (user request, 1246): which team views see a status is
   its own `visibility_condition` (`logic.STATUS_VISIBILITY_FIELD`,
   `status_field`: instance key, definition, level entries; `!status
@@ -2016,8 +2017,9 @@ hardcodes**.
   corpse_team on a corpse; empty = shown, a failing formula shows it).
   `Match.status_visible_to` / `visible_statuses`, applied in
   `presented_statuses` (a disguise's decoys are shown as they are), so the
-  placeholders, the description, `!find status:`, `!simulate`'s report
-  and the image overlays (`entity_overlays`) follow it; corpse lines,
+  placeholders, the description, `!find status:` and `show:status`
+  (`_fmt_status_names(e, pov)`), `!simulate`'s report and the image
+  overlays (`entity_overlays`) follow it; corpse lines,
   descriptions and `!find dead status:` use the command's view
   (`command_pov`). Formulas see every status. Lint, promote and the
   formula-text hiding read the conditions (`_status_level_formulas`,
@@ -2065,7 +2067,15 @@ hardcodes**.
   the map of a location / location_list target's cells (the actor's by
   default; not an action arg there, 880); `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
-  [x, y] → location, ids checked, lists non-empty). A successful
+  [x, y] → location, ids checked, lists non-empty). An action holding
+  `direction_target: true` (W17, user design: opt-in, a `location`
+  target only) also takes a direction word and an optional count
+  (`!action ogre dash left 2`, `!react hero dodge right`,
+  `use_action(u, 'dash', 'right 3')`): the cell that many steps from the
+  acting unit's ANCHOR, for a multi-tile body where its anchor shifts to
+  (`action._direction_cell`; diagonals per allow_diagonal_movement; a
+  reaction counts from the reacting unit); without the field a direction
+  word is refused naming it (1251). A successful
   `!action` (and a resolved exchange) ends with the
   `action_used_message_format` line (`Match.action_used_line`: {actor},
   {action}, {target} as the checks left it, a cell as (x,y), lists joined;
@@ -3154,7 +3164,12 @@ hardcodes**.
   buttons last as long as the request and the message says when it
   expired. `!as wait <seconds>` (CLI / harness) ages every request. Approved commands run with the approver's authority in the
   requester's channel against the request's match (`run_approved_request`,
-  `_channel_pointed_at`). A request records the `turns_elapsed` it was
+  `_channel_pointed_at`), credited to the requester (L58, user call:
+  `_RequesterChannelCtx.credited_to` -> COMMAND_USER; `logic.APPROVED_BY`
+  names the approver as `approved_by` on the event-log entries, the
+  journal entry and a deferred exchange, and in the undo step's `by`,
+  `attribution_text`: "ana (approved by cli)"; a replay sets it from the
+  entry, 1250). A request records the `turns_elapsed` it was
   asked on, and a `!turn next` approved on a later turn is refused (it
   would end that turn; L57, 1245). A request whose command an open reaction
   window holds stays queued (`approval_waits`: `!approve`, `!approve
@@ -3193,9 +3208,12 @@ hardcodes**.
   `!ent info`, ...) refuse it to a host too, unless
   `pov_host_names_hidden` (rule, default off; a match var of that name, a
   bool, overrides it, `_host_names_hidden`; W16, user call, 1248) lets a
-  host play a hidden unit from the players' channel; the replies still
-  pass through the channel's view (the action-used line names it
-  `someone`). A glued part shows while the
+  host ACT with a hidden unit from the players' channel (`!action` /
+  `!react`: `_query_eid(read=False)`); the replies still pass through the
+  channel's view (the action-used line names it `someone`). Reads stay
+  refused there with a note that the rule opens actions only (V28, user
+  call: their reply would show the unit to the players), on a missing
+  unit too, so the note is no oracle. A glued part shows while the
   body it sits on shows (`_pov_hides`) (939). Whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
   preview) are host-only while anything is hidden
   (`_whole_board_read_blocked`); a host's in a channel with a team view
@@ -3471,13 +3489,16 @@ hardcodes**.
   <file> [as=<name>] [mode=replace|merge]` (`systems` capability, plus
   `files`, and `templates` / `prefabs` when it carries them) checks
   every rule value as `!system set` would (`_checked_rule_value`; an
-  unknown rule dropped with a note), each parent present without a loop
+  unknown rule dropped with a note; a list / dict rule must hold that
+  kind, each default passive and clamp is checked as `!defpassive add` /
+  `!gclamp add` would store it and each event_log_format entry is text,
+  S9), each parent present without a loop
   or a chain past the owner limit, and every template / prefab
   (`check_template` against the server's library plus the file's,
   `check_prefab`, the saver checks) and every library entry as its
   editor checks it (`_check_imported_libraries`: prefab's checkers for
-  tile templates, functions and status / zone definitions,
-  `check_table_text`, aliases starting with a real command, tags,
+  tile templates, functions (a body required, S9) and status / zone
+  definitions, `check_table_text`, aliases starting with a real command, tags,
   watchers, var labels, steps; then every formula through
   `_system_formula_slots`, the slot list `!system lint` reads too, a call
   to an undefined function allowed; S8, 1244) before changing anything; then the
@@ -3635,7 +3656,9 @@ hardcodes**.
   before, yes / no (`_undo_changes_nothing`, `_offer_further`; user
   design, T13, 1235): Discord asks with Yes / No buttons
   (`offer_confirm`, `_ConfirmView`: only the asker answers, Yes runs
-  `!undo <kind> <N+1> confirm` as a typed command), the CLI and GUI ask
+  `!undo <kind> <N+1> confirm` as a typed command, refused once
+  `turns_elapsed` differs from the `stamp` taken when it asked, since the
+  count is relative to that turn, L58), the CLI and GUI ask
   inline (`prompt_choice`; yes restores N+1 in the same command), other
   surfaces name the command. A round's autosave is taken as its first
   turn begins (T12, user call): `_begin_turn` records it with the turn

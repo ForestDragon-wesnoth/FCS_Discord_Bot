@@ -634,8 +634,8 @@ def _check_formula_function(entry: Dict[str, Any], name: str,
         params = []
     if not isinstance(params, list):
         raise VTTError(f"{who}: `params` must be a list of names.")
-    body = entry.get("body", "")
-    if not isinstance(body, str):
+    body = entry.get("body")
+    if not isinstance(body, str) or not body.strip():
         raise VTTError(f"{who}: `body` must be formula text.")
     try:
         logic.check_formula_function(fname, params)

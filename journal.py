@@ -257,7 +257,9 @@ def _short(tokens: Any) -> str:
 def entry_text(e: Dict[str, Any]) -> str:
     """One entry as a line of `!match journal`."""
     kind = e.get("kind")
-    by = f" by {e['by']}" if e.get("by") else ""
+    by = (f" by {e['by']}" + (f" (approved by {e['approved_by']})"
+                               if e.get("approved_by") else "")
+          if e.get("by") else "")
     head = f"#{e.get('n')} {e.get('at', '?')}{by}: "
     if kind == "cmd":
         return head + "`!" + _short(e.get("cmd")) + "`"

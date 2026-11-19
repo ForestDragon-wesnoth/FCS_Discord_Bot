@@ -19,12 +19,12 @@ from logic import (
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
-from logic import DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
-from logic import reserved_var_path_error, file_refs
+from logic import reserved_var_path_error, file_refs, _check_template_passives_clamps
 from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem, STATUS_VISIBILITY_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
@@ -1173,9 +1173,11 @@ class CommandRegistry:
         # reply of this command drops those its channel's view can't see
         # and strips the tag from the rest.
         ctx = _UnitLineCtx(ctx, mgr)
-        user_token = COMMAND_USER.set(ctx_user_name(ctx) if ctx_user(ctx)
-                                      or getattr(ctx, "user_name", None)
-                                      else None)
+        # An approved request is credited to its requester (L58).
+        user_token = COMMAND_USER.set(
+            getattr(ctx, "credited_to", None)
+            or (ctx_user_name(ctx) if ctx_user(ctx)
+                or getattr(ctx, "user_name", None) else None))
         # A passive's use_action runs through this command's context (#36).
         cctx_token = COMMAND_CTX.set(ctx)
         # `map='view'` in a formula: the map this channel views on the
@@ -1593,9 +1595,10 @@ class CommandRegistry:
                     # A formula sent units to another match: undoing this
                     # step changes this match only (_is_transfer_label).
                     label += _TRANSFER_OUT_MARK
-                m_post.history.record_command(m_post, label,
-                                              pre_state=pre_state,
-                                              by=COMMAND_USER.get() or "")
+                m_post.history.record_command(
+                    m_post, label, pre_state=pre_state,
+                    by=attribution_text(COMMAND_USER.get(),
+                                        APPROVED_BY.get()))
 
         # Condition-watchers: re-check on the active match now the top-level
         # command has settled (edge-triggered effects fire here). Only the
@@ -1665,7 +1668,8 @@ class CommandRegistry:
                         opre, om.to_dict(include_history=False)):
                     om.history.record_command(
                         om, _command_label(name, args), pre_state=opre,
-                        by=COMMAND_USER.get() or "")
+                        by=attribution_text(COMMAND_USER.get(),
+                                            APPROVED_BY.get()))
                     if om.has_watchers():
                         hide_tok = FORMULA_TEXT_HIDDEN.set(text_hidden)
                         try:
@@ -1814,6 +1818,10 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
              # The author's server authority: a replay runs the command with
              # no more than this (lines it refused live stay refused).
              "auth": _auth_record(ctx)}
+    if APPROVED_BY.get():
+        # A player's request a host approved: credited to the player, run
+        # with the approver's authority (L58).
+        entry["approved_by"] = APPROVED_BY.get()
     if ctx_role_ids(ctx):
         # The author's roles: per-role access overrides judge them again.
         entry["roles"] = list(ctx_role_ids(ctx))
@@ -2942,6 +2950,12 @@ def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
         ctx["name"] = name
         ctx.setdefault("turns_word", "turn" if ctx.get("duration") == 1
                        else "turns")
+        # {stacked}: the level when above 1 (the default format shows no
+        # "×1" on a status that has a level of 1).
+        lvl = ctx.get("level")
+        if (isinstance(lvl, (int, float)) and not isinstance(lvl, bool)
+                and lvl > 1):
+            ctx.setdefault("stacked", lvl)
         ctx.pop(STATUS_LAYERS_KEY, None)
         if status_layers_of(inst) is not None:
             ctx["layers"] = status_layers_text(status_layers_of(inst))
@@ -10385,10 +10399,13 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                 # The prefabs it read, as it read them.
                 pf_token = PREFAB_REPLAY.set(
                     journal_replay_prefabs(e, prefabs_seen))
+                ab_token = APPROVED_BY.set(
+                    str(e["approved_by"]) if e.get("approved_by") else None)
                 try:
                     with _channel_pointed_at(mgr, rctx.channel_key, mid):
                         await registry.run(toks[0], toks[1:], rctx, mgr)
                 finally:
+                    APPROVED_BY.reset(ab_token)
                     PARTIAL_CACHE.reset(cache_token)
                     PREFAB_REPLAY.reset(pf_token)
                 if verbose:
@@ -10481,11 +10498,15 @@ class _RequesterChannelCtx:
     """The approver's context re-pointed at the channel the request came
     from: the approver's identity and authority, the approver's replies,
     but the REQUESTER's channel for everything keyed by channel (active
-    match, binding + POV, viewport camera)."""
+    match, binding + POV, viewport camera), and the requester's name for
+    attribution (`credited_to`: event log, journal, undo step)."""
 
-    def __init__(self, inner: ReplyContext, channel_key: str):
+    def __init__(self, inner: ReplyContext, channel_key: str,
+                 credited_to: Optional[str] = None):
         self._inner = inner
         self.channel_key = channel_key
+        # Whom the command is credited to (the requester, L58).
+        self.credited_to = credited_to
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -10512,10 +10533,14 @@ async def run_approved_request(req: dict, ctx: ReplyContext,
                        f"{req.get('user_name')}) was asked during a turn "
                        f"that is over, so it doesn't run.")
         return
-    run_ctx = ctx if ch == ctx.channel_key else _RequesterChannelCtx(ctx, ch)
+    # The approver's authority in the requester's channel, credited to the
+    # requester, the approver named beside it (L58, user call).
+    run_ctx = _RequesterChannelCtx(ctx, ch, req.get("user_name")
+                                   or req.get("user_id"))
     # Never the approver's `!again` command: a Discord button click runs this
     # at the top level, where run() would record it.
     depth = _RUN_DEPTH.set(max(_RUN_DEPTH.get(), 1))
+    ab_token = APPROVED_BY.set(ctx_user_name(ctx))
     try:
         # The lock first, then the re-point: a command running in the
         # requester's channel must finish before the channel shows the
@@ -10524,6 +10549,7 @@ async def run_approved_request(req: dict, ctx: ReplyContext,
             with _channel_pointed_at(mgr, ch, req.get("match_id")):
                 await registry.run(req["name"], req["args"], run_ctx, mgr)
     finally:
+        APPROVED_BY.reset(ab_token)
         _RUN_DEPTH.reset(depth)
 
 
@@ -16297,15 +16323,22 @@ def _host_names_hidden(ctx: ReplyContext, m: "Match") -> bool:
     return on and _acts_as_host(ctx, m)
 
 
-def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
-    """Resolve an entity id for a read-only query, treating an entity the
-    channel's POV can't see exactly like a missing one (same message, which
-    echoes what was typed — never the resolved id). A host under
-    pov_host_names_hidden reaches a hidden unit (W16)."""
+def _query_eid(ctx: ReplyContext, m: "Match", token: str, *,
+               read: bool = True) -> str:
+    """Resolve an entity id for a query, treating an entity the channel's
+    POV can't see exactly like a missing one (same message, which echoes
+    what was typed — never the resolved id). A host under
+    pov_host_names_hidden reaches a hidden unit when the command acts with
+    it (`read=False`: `!action`, `!react`; W16); a read (the default) is
+    refused there like a missing unit, with a note that the rule opens
+    actions only, since its reply would show the unit to the players
+    reading the channel (V28, user call). The note follows any unit the
+    view can't find, so it tells nothing about whether one exists."""
     eid = _resolve_eid(m, token, view=False)
     pov = _query_pov(ctx, m)
-    if eid in m.entities and pov is not None and _pov_hides(m, pov, eid) \
-            and _host_names_hidden(ctx, m):
+    names_hidden = pov is not None and _host_names_hidden(ctx, m)
+    if eid in m.entities and names_hidden and not read \
+            and _pov_hides(m, pov, eid):
         reveals = _HOST_REVEALS.get()
         if reveals is not None and eid not in reveals \
                 and m.rules.get("host_reveal_warning", False):
@@ -16315,10 +16348,15 @@ def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
         if pov is not None:
             # Under a team view a hidden unit and a missing one read alike,
             # and the wording says either may be the case.
+            note = (" pov_host_names_hidden lets a host act with a hidden "
+                    "unit here, never read it: its reply would show the "
+                    "unit to the players reading this channel. Read it in "
+                    "a channel without a team view."
+                    if names_hidden and read else "")
             raise NotFound(
                 f"Could not find a unit named `{token}`. Either it does not "
                 f"exist, or this channel currently does not have permission "
-                f"to view it.")
+                f"to view it.{note}")
         raise NotFound(f"Entity '{token}' not found.")
     return eid
 
@@ -16333,8 +16371,7 @@ def _query_unit_or_corpse(ctx: ReplyContext, m: "Match", token: str
         loc = m.find_corpse(eid)
         pov = _query_pov(ctx, m)
         if loc is not None and (pov is None or m.corpse_visible_to(
-                eid, loc[2], loc[0], loc[1], pov, loc[3])
-                or _host_names_hidden(ctx, m)):
+                eid, loc[2], loc[0], loc[1], pov, loc[3])):
             return eid, loc
     return _query_eid(ctx, m, token), None
 
@@ -18353,18 +18390,21 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
 _SHOW_STATUS_COLUMNS: frozenset = frozenset({"status", "statuses"})
 
 
-def _fmt_status_names(e) -> str:
+def _fmt_status_names(e, pov: Optional[str] = None) -> str:
     """An entity's statuses as a compact display string: sorted names, each
     annotated `name(level)` when its level is set and greater than 1.
-    Empty string when the entity has none.
+    Empty string when the entity has none. Under a team view `pov`, the
+    statuses that view sees (a disguise's, status visibility).
 
     Joined with '/' rather than ', ' because `show:` already separates its
     COLUMNS with ', ' — a comma here would make `[status=burn, slow, hp=40]`
     read as three columns instead of two.
     """
+    status = (e._match.presented_statuses(e, pov)
+              if pov is not None and e._match is not None else e.status)
     out = []
-    for name in sorted(e.status or {}):
-        data = e.status.get(name)
+    for name in sorted(status or {}):
+        data = status.get(name)
         lvl = data.get("level") if isinstance(data, dict) else None
         try:
             show_lvl = lvl is not None and float(lvl) > 1
@@ -19012,9 +19052,11 @@ async def _find_cmd_impl(ctx: ReplyContext, args: List[str],
                     # lookup renders '—'. This pseudo-column reads the real
                     # status dict; a level > 1 is shown as name(level).
                     if h[0] == "unit":
-                        names = _fmt_status_names(h[1])
+                        names = _fmt_status_names(h[1], pov)
                     else:
-                        st = (h[1][1][2].get("entity") or {}).get("status")
+                        st = m.visible_statuses(
+                            (h[1][1][2].get("entity") or {}).get("status"),
+                            pov, corpse_id=h[1][0])
                         names = ", ".join(sorted(st)) if isinstance(
                             st, dict) else ""
                     cells.append(f"{col}={names or '—'}")
@@ -19263,6 +19305,12 @@ _ODDS_TABLE_MAX = 40   # distribution rows shown when no comparison is given
 
 
 def _fmt_pct(p: float) -> str:
+    # Chances summed in floats (a merged odds row of six 1/6s) land a few
+    # units in the last place off 0 or 1: read those as exact.
+    if abs(p - 1) < 1e-9:
+        p = 1.0
+    elif abs(p) < 1e-12:
+        p = 0.0
     if 0 < p < 0.00005:
         return "<0.01%"
     if 0.99995 < p < 1:
@@ -20635,7 +20683,7 @@ async def _offer_further(ctx, m: Match, kind: str, n: int,
     args = [kind, str(n + 1), "confirm"]
     offer = getattr(ctx, "offer_confirm", None)
     if offer is not None:
-        await offer(m, question, "undo", args)
+        await offer(m, question, "undo", args, stamp=m.turns_elapsed)
         return None
     prompt = getattr(ctx, "prompt_choice", None)
     if prompt is not None:
@@ -22749,7 +22797,8 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     lines = [f"**Event log** (showing {len(entries)} of {of}):"]
     show_by = _attribution_shown(m, "log")
     for e in entries:
-        by = f" — by {e['by']}" if show_by and e.get("by") else ""
+        by = (f" — by {attribution_text(e['by'], e.get('approved_by'))}"
+              if show_by and e.get("by") else "")
         lines.append(f"`R{e.get('round')}` " + _render_event(m, e) + by)
     return await ctx.send("\n".join(lines))
 
@@ -29960,7 +30009,7 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     # A unit the channel's view hides reads like a missing one, as in the
     # list / info forms (it used to run, and its refusals named it).
-    actor_id = _query_eid(ctx, m, args[0])
+    actor_id = _query_eid(ctx, m, args[0], read=False)
     requested = args[1]
     tail = list(args[2:])
     await _run_action_dispatch(
@@ -30014,14 +30063,14 @@ async def react_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) < 2:
         raise VTTError("Usage: `!react <eid> <reaction> [target...]`, "
                        "`!react <eid> pass` or `!react skip`.")
-    uid = _query_eid(ctx, m, args[0])
+    uid = _query_eid(ctx, m, args[0], read=False)
     if args[1].lower() == "pass":
         _check_tail(args, 2, (), "!react <eid> pass")
         return await reactions.react_pass(ctx, mgr, m, uid)
 
     def missing(eid: str, token: str) -> None:
         if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
-            _query_eid(ctx, m, token)
+            _query_eid(ctx, m, token, read=False)
 
     def missing_corpse(cid: str) -> None:
         _query_corpse(ctx, m, cid)
@@ -31059,6 +31108,29 @@ def _checked_rule_value(key: str, v: Any) -> Any:
         if not isinstance(v, str):
             raise VTTError(f"`{key}` is text, got {v!r}.")
         return _coerce_rule_value(key, v)
+    want = {"list": list, "dict": dict}.get(t)
+    if want is not None and not isinstance(v, want):
+        raise VTTError(f"`{key}` is a {'list' if want is list else 'JSON object'}"
+                       f", got {v!r}.")
+    if key in ("default_entity_passives", "default_clamps"):
+        # Each item as `!defpassive add` / `!gclamp add` would store it.
+        kf = "id" if key == "default_entity_passives" else "path"
+        what = "passive" if kf == "id" else "clamp"
+        for item in v:
+            if not isinstance(item, dict) or not isinstance(item.get(kf), str):
+                raise VTTError(f"`{key}`: each {what} is an object with a "
+                               f"text `{kf}`, got {item!r}.")
+            _check_template_passives_clamps(
+                {f"{what}s": {item[kf]: dict(item)}}, f"`{key}`")
+            try:
+                (Passive if kf == "id" else ClampSpec).from_dict(item)
+            except (VTTError, KeyError, TypeError) as ex:
+                raise VTTError(f"`{key}`: {what} `{item[kf]}`: {ex}")
+    elif key == "event_log_format":
+        for etype, fmt in v.items():
+            if not isinstance(fmt, str):
+                raise VTTError(f"`{key}`: the format of `{etype}` is text, "
+                               f"got {fmt!r}.")
     json_text(v)
     return v
 
@@ -31509,7 +31581,9 @@ async def _action_info(
         f"**`{act.name}`** on `{actor_id}`",
         f"Path:        `{shown_path}`",
         f"Container:   `{container}`",
-        f"Target type: `{act.target_type}`",
+        f"Target type: `{act.target_type}`"
+        + (" (or a direction from the actor's anchor: `left`, `right 2`)"
+           if act.direction_target else ""),
         f"Tags:        {_action_tags_text(act, m if private else None)}",
         f"Description: {desc}",
     ]
@@ -31692,7 +31766,7 @@ async def _run_action_dispatch(
         def missing(eid: str, token: str) -> None:
             # A unit the view hides reads like a missing one.
             if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
-                _query_eid(ctx, m, token)
+                _query_eid(ctx, m, token, read=False)
         def missing_corpse(cid: str) -> None:
             _query_corpse(ctx, m, cid)
         def map_of(spec: str) -> str:
@@ -31702,6 +31776,7 @@ async def _run_action_dispatch(
         target_value, remaining = parse_target(
             action.target_type, pruned, m, actor_id, missing=missing,
             missing_corpse=missing_corpse, map_of=map_of,
+            directions=action.direction_target,
         )
         try:
             args_dict = parse_args_tokens(remaining)

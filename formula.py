@@ -8640,8 +8640,9 @@ class FormulaEngine:
                 )
             from action import coerce_target, dedupe_targets
             try:
-                target_arg = coerce_target(action.target_type, target_arg,
-                                           match, name, eid)
+                target_arg = coerce_target(
+                    action.target_type, target_arg, match, name, eid,
+                    directions=action.direction_target)
             except VTTError as ex:
                 raise FormulaError(f"use_action: {ex}")
             target_arg, dup_note = dedupe_targets(action.target_type,

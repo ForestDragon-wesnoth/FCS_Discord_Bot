@@ -52,7 +52,7 @@ import re
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import (VTTError, NotFound, same_value, CROSS_MATCH_GUARD, VAR_READER, normalize_tags, caller_capabilities, MATCH_CAPABILITIES,
+from logic import (VTTError, NotFound, FACING_VECTORS, CARDINAL_DIRECTIONS, same_value, CROSS_MATCH_GUARD, VAR_READER, normalize_tags, caller_capabilities, MATCH_CAPABILITIES,
                    ACTIONS_USED_MAX,
                    check_tag_filter, tag_filter_matches, tag_filter_empty,
                    RULES_REGISTRY)
@@ -585,6 +585,11 @@ class Action:
     # (ReactionSpec.condition).
     condition: str = ""
     condition_message: str = ""
+    # W17 (user design): a location target also takes a direction word
+    # and an optional count (`left`, `right 2`): the cell that many steps
+    # from the acting unit's anchor that way. Off unless the action holds
+    # `direction_target: true`.
+    direction_target: bool = False
     # Set when the action is a reaction (it holds a `before` and / or
     # `after` half).
     reaction: Optional["ReactionSpec"] = None
@@ -689,9 +694,27 @@ class Action:
                             f"({type(condition_message).__name__}); the "
                             f"rule's wording applies.")
             condition_message = ""
+        direction_target = False
+        dt = raw.get("direction_target")
+        if dt is not None:
+            if isinstance(dt, bool):
+                direction_target = dt
+            elif isinstance(dt, str) and dt.strip().lower() in (
+                    "true", "false"):
+                direction_target = dt.strip().lower() == "true"
+            else:
+                problems.append(f"`{full_path}.direction_target` is true "
+                                f"or false, not {dt!r}; directions aren't "
+                                f"taken.")
+            if direction_target and target_type != "location":
+                problems.append(f"`{full_path}.direction_target` applies to "
+                                f"a `location` target only; this action's "
+                                f"is `{target_type}`.")
+                direction_target = False
         return Action(
             name=name, body=body, description=description,
             target_type=target_type,
+            direction_target=direction_target,
             container_path=container_path, full_path=full_path,
             allowed_slots=allowed_slots,
             tags=tags, tag_sources=sources, tag_problems=problems,
@@ -1058,6 +1081,40 @@ class SourceProxy:
             m.surface_log(log)
 
 
+def _count_word(tok: str) -> bool:
+    """A direction's count: a whole number word (`2`), no `=`."""
+    return tok.isdigit()
+
+
+def _direction_cell(match: Any, actor: Optional[str], word: str,
+                    tokens: List[str], map_name: Optional[str]) -> "Coord":
+    """W17: the cell `n` steps from the actor's anchor toward `word` (n the
+    count after it, default 1), on the actor's map. The anchor is the
+    unit's top-left cell, so for a multi-tile body the direction is where
+    the anchor shifts to (user call)."""
+    ae = match.entities.get(actor) if actor else None
+    if ae is None:
+        raise VTTError(f"`{word}` counts from the acting unit, and there is "
+                       f"none here; give `<x> <y>`.")
+    if word not in CARDINAL_DIRECTIONS and not match.rules.get(
+            "allow_diagonal_movement", False):
+        raise VTTError(f"`{word}` is diagonal, and allow_diagonal_movement "
+                       f"is off; give `<x> <y>` or up / down / left / "
+                       f"right.")
+    n = 1
+    if len(tokens) > 1 and _count_word(tokens[1]):
+        n = int(tokens[1])
+        if n < 1 or n > 10 ** 6:
+            raise VTTError(f"the count after `{word}` is a whole number "
+                           f"from 1, got {tokens[1]}.")
+    home = match.map_of(ae)
+    if map_name is not None and map_name != home.name:
+        raise VTTError(f"`{word}` counts from `{ae.id}` on map "
+                       f"`{home.name}`; map= can't name another map.")
+    dx, dy = FACING_VECTORS[word]
+    return _check_on_map(match, ae.x + dx * n, ae.y + dy * n, actor, None)
+
+
 def _check_on_map(match: Any, x: int, y: int,
                   actor: Optional[str] = None,
                   map_name: Optional[str] = None) -> "Coord":
@@ -1210,6 +1267,7 @@ def parse_target(
     missing: Optional[Any] = None,
     missing_corpse: Optional[Any] = None,
     map_of: Optional[Any] = None,
+    directions: bool = False,
 ) -> Tuple[Any, List[str]]:
     """Consume the leading tokens that constitute the target and
     return `(target_value, remaining_tokens)`. The remaining tokens
@@ -1235,6 +1293,12 @@ def parse_target(
     other command with coordinates names one; `map_of(spec)` turns the word
     into a map name (the caller's view rules), and the key is not an
     action arg for those targets.
+
+    `directions` (the action's `direction_target`, W17): a location target
+    also takes a direction word and an optional count (`left`, `right 2`),
+    the cell that many steps from the actor's anchor that way; diagonals
+    where allow_diagonal_movement is on. A word typed for an action
+    without it is refused with the way to opt in.
     """
     # `missing(eid, token)`: the caller's test for a unit to treat as
     # missing (one the channel's view hides), raising its own refusal.
@@ -1275,9 +1339,21 @@ def parse_target(
         check(eid, eid_token)
         return eid, list(tokens[1:])
     if target_type == "location":
+        if tokens and tokens[0].lower() in FACING_VECTORS:
+            word = tokens[0].lower()
+            if not directions:
+                raise VTTError(
+                    f"`{tokens[0]}` is a direction; this action takes "
+                    f"`<x> <y>` coords. An action takes direction words "
+                    f"when it holds `direction_target: true`.")
+            return (_direction_cell(match, actor, word, tokens, map_name),
+                    list(tokens[2:] if len(tokens) > 1
+                         and _count_word(tokens[1]) else tokens[1:]))
         if len(tokens) < 2:
             raise VTTError(
-                "expected `<x> <y>` coords after the action name."
+                "expected `<x> <y>` coords after the action name"
+                + (" (or a direction: `left`, `right 2`)."
+                   if directions else ".")
             )
         try:
             x = int(tokens[0]); y = int(tokens[1])
@@ -1377,7 +1453,8 @@ def dedupe_targets(target_type: str, value: Any,
 
 
 def coerce_target(target_type: str, value: Any, match: "Match",
-                  name: str, actor: Optional[str] = None) -> Any:
+                  name: str, actor: Optional[str] = None,
+                  directions: bool = False) -> Any:
     """use_action()'s target turned into what the action's body gets from
     `!action` (parse_target): an entity id, a Coord (from [x, y] or a
     Coord), a list of either, a corpse id or None, checked the same way.
@@ -1385,6 +1462,14 @@ def coerce_target(target_type: str, value: Any, match: "Match",
     failed with a Python error."""
     def _coord(v: Any) -> "Coord":
         mname = None
+        if directions and isinstance(v, str):
+            # W17: 'left' or 'right 2', as typed after the action name.
+            words = v.split()
+            if (words and words[0].lower() in FACING_VECTORS
+                    and (len(words) == 1 or (len(words) == 2
+                                             and _count_word(words[1])))):
+                return _direction_cell(match, actor, words[0].lower(),
+                                       words, None)
         if isinstance(v, Coord):
             x, y, mname = v.x, v.y, v.map
         elif (isinstance(v, (list, tuple)) and len(v) in (2, 3)
@@ -1395,7 +1480,10 @@ def coerce_target(target_type: str, value: Any, match: "Match",
             mname = v[2] if len(v) == 3 else None
         else:
             raise VTTError(f"action `{name}` takes a location target: "
-                           f"[x, y] or [x, y, map], got {v!r}.")
+                           f"[x, y] or [x, y, map]"
+                           + (", or a direction ('left', 'right 2')"
+                              if directions else "")
+                           + f", got {v!r}.")
         return _check_on_map(match, x, y, actor, mname)
 
     def _eid(v: Any) -> str:

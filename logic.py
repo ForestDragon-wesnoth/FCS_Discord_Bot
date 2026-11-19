@@ -33,6 +33,19 @@ FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
 COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
     contextvars.ContextVar("vtt_command_user", default=None))
 
+# The host who approved the running command, while a player's approved
+# request runs (L58, user call): the command is credited to the player
+# (COMMAND_USER) and this names the approver beside it (`approved_by` on
+# its event-log entries, journal entry and undo step). None otherwise.
+APPROVED_BY: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("vtt_approved_by", default=None))
+
+
+def attribution_text(by: Any, approved_by: Any) -> str:
+    """`ana` or `ana (approved by cli)`: who a command is credited to."""
+    by = str(by or "")
+    return f"{by} (approved by {approved_by})" if by and approved_by else by
+
 # The reply context of the running top-level command (CommandRegistry._run_top
 # sets it): an action a formula outside any action starts (a passive's
 # use_action) runs through it (#36).
@@ -3185,7 +3198,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "status_line_format": {
-        "default": ("{name}{?level?} ×{level}{/?}{?duration?} ({duration} "
+        "default": ("{name}{?stacked?} ×{stacked}{/?}{?duration?} ({duration} "
                     "{turns_word}){/?}{?layers?}: {layers}{/?}"),
         "schema": {"type": "str"},
         "desc": (
@@ -3193,7 +3206,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entity_line_format / entity_info_format / corpse_line_format "
             "(statuses joined with `, `, by name). Placeholders: {name}, and "
             "every field of the status instance ({level}, {duration}, any "
-            "custom field such as {lost_max_hp}); {turns_word} (`turn` for "
+            "custom field such as {lost_max_hp}); {stacked} (the level "
+            "when above 1, so a level-1 status shows no `×1`); "
+            "{turns_word} (`turn` for "
             "a duration of 1, else `turns`); {layers} for a status "
             "holding layers of several levels (layered stacking: `×3 for 2, "
             "then ×1 for 3 more`); {?key?}...{/?} shows a part "
@@ -4071,10 +4086,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "bool"},
         "desc": (
             "Whether a host's command in a channel with a team POV (one "
-            "players read) may name units that view hides: `!action`, "
-            "`!ent info` and the other reads that answer a hidden unit like "
-            "a missing one take it, so a GM can play an invisible enemy's "
-            "turn from the players' channel. The replies still pass "
+            "players read) may act with units that view hides: `!action` "
+            "and `!react` take such a unit as the actor or a target, so a "
+            "GM can play an invisible enemy's turn from the players' "
+            "channel. Reads (`!ent info`, `!ent get`, `!action list`, "
+            "`!dist`, ...) still refuse it there, with a note: their reply "
+            "would show the unit to the players (user call, V28); read it "
+            "in a channel without a team view. The replies still pass "
             "through the channel's view: lines about a unit it hides are "
             "dropped and a name in the action-used line reads as "
             "say_hidden_unit_name. A match var of the same name (true / "
@@ -29097,6 +29115,8 @@ class Match:
         by = COMMAND_USER.get()
         if by and "by" not in entry:
             entry["by"] = by
+            if APPROVED_BY.get():
+                entry["approved_by"] = APPROVED_BY.get()
         self.event_log.append(entry)
         self._trim_event_log()
         return True
