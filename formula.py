@@ -404,6 +404,57 @@ class FormulaError(VTTError):
     pass
 
 
+class _ReturnSignal(BaseException):
+    """`return value` in a program (#324): unwinds to where the program
+    runs (eval_program, a `!func` call), which takes `value` as the
+    result. A BaseException, so no `except Exception` on the way turns
+    it into an error."""
+
+    def __init__(self, value: Any = None):
+        super().__init__()
+        self.value = value
+
+
+def _raise_return(value: Any = None) -> None:
+    raise _ReturnSignal(value)
+
+
+def _line_note(exc: BaseException, src: str, filename: str,
+               where: str = "") -> str:
+    """#354: ` (line n: `text`)` for a runtime error of a multi-line body:
+    the deepest frame of the body's compiled code in the exception's
+    traceback, its line quoted from the source (only the number while
+    formula text is hidden from the caller). Empty for a one-line body or
+    an error raised before the body ran."""
+    import traceback as _tb
+    lines = (src or "").split("\n")
+    if sum(1 for ln in lines if ln.strip()) < 2:
+        return ""
+    lineno = None
+    for frame, ln in _tb.walk_tb(exc.__traceback__):
+        if frame.f_code.co_filename == filename:
+            lineno = ln
+    if lineno is None or not 1 <= lineno <= len(lines):
+        return ""
+    if FORMULA_TEXT_HIDDEN.get():
+        return f" ({where}line {lineno})"
+    text = lines[lineno - 1].strip()
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return f" ({where}line {lineno}: `{text}`)"
+
+
+def _noted(err: "FormulaError", note: str) -> "FormulaError":
+    """`err` with the line note added once: an inner body's note stays
+    (the error names the deepest line it can)."""
+    if note and not getattr(err, "_line_noted", False):
+        err.args = (f"{err.args[0] if err.args else ''}{note}",) \
+            + tuple(err.args[1:])
+    if note:
+        err._line_noted = True
+    return err
+
+
 # --- whitelists --------------------------------------------------------------
 
 # Random helpers, exposed to formulas under user-facing names. Wrapped
@@ -2251,6 +2302,11 @@ def _runtime_msg(e: BaseException) -> str:
     arguments`, not the private `FormulaEngine._namespace.<locals>.
     _slot_capacity()` it is implemented as."""
     msg = _IMPL_NAME_RE.sub(r"\1()", str(e))
+    mu = re.search(r"cannot unpack non-iterable (\w+) object", msg)
+    if mu is not None:
+        kind = {"int": "a number", "float": "a number", "bool": "a bool",
+                "NoneType": "None"}.get(mu.group(1), mu.group(1))
+        return f"unpacking (a, b = ...) needs a list, got {kind}."
     mt = _NO_KW_RE.search(msg)
     if mt is not None:
         # A C builtin (abs) says it differently (L37).
@@ -3091,6 +3147,102 @@ def _check_text_size(out: str, fname: str, limit: int) -> str:
     return out
 
 
+def _kind_word(v: Any) -> str:
+    """A value's kind as a formula author reads it."""
+    if v is None:
+        return "None"
+    if isinstance(v, bool):
+        return "a bool"
+    if isinstance(v, (int, float)):
+        return "a number"
+    if isinstance(v, str):
+        return "text"
+    if isinstance(v, (list, tuple)):
+        return "a list"
+    if isinstance(v, dict):
+        return "a dict"
+    return f"a {type(v).__name__}"
+
+
+def _index(container: Any, key: Any) -> Any:
+    """`x[i]` / `d['key']` (#351): one item of a list (a whole number,
+    negative from the end), a dict (a key) or text (a character).
+    Refused when it isn't there, naming the index or key; get(x, k,
+    default) is the soft read."""
+    from action import Coord as _Coord
+    if isinstance(container, _Coord):
+        container = [container.x, container.y]
+    if isinstance(container, dict):
+        if isinstance(key, (str, int)) and not isinstance(key, bool):
+            if key in container:
+                return container[key]
+            if not isinstance(key, str) and str(key) in container:
+                return container[str(key)]
+        shown = ", ".join(str(k) for k in list(container)[:8])
+        more = ", ..." if len(container) > 8 else ""
+        raise FormulaError(
+            f"no key {key!r} in the dict (its keys: {shown or 'none'}{more}); "
+            f"get(d, key, default) reads one that may be missing.")
+    if isinstance(container, (list, tuple, str)):
+        if isinstance(key, bool) or not isinstance(key, int):
+            raise FormulaError(
+                f"a {'list' if not isinstance(container, str) else 'text'} "
+                f"index is a whole number, got {_kind_word(key)}.")
+        n = len(container)
+        if not -n <= key < n:
+            what = "item" if not isinstance(container, str) else "character"
+            raise FormulaError(
+                f"index {key} is past the end of {n} {what}"
+                f"{'' if n == 1 else 's'} (the first is 0, the last -1).")
+        return container[key]
+    raise FormulaError(
+        f"`x[...]` reads a list, a dict or text, got {_kind_word(container)}.")
+
+
+def _fval(v: Any, spec: str, limit: int) -> str:
+    """One f-string field (#352): the value as text, or through a format
+    spec as fmt() takes one."""
+    if spec:
+        if not _FMT_SPEC.match(spec):
+            raise FormulaError(f"f-string: unsupported format spec '{spec}'.")
+        try:
+            return format(v, spec)
+        except (ValueError, TypeError) as ex:
+            raise FormulaError(f"f-string: {{...:{spec}}}: {ex}")
+    return _text_of(v, limit, "f-string")
+
+
+def _fstr(*parts: Any, limit: int) -> str:
+    out = "".join(str(p) for p in parts)
+    if len(out) > limit:
+        raise FormulaError(
+            f"f-string: the text is {len(out)} characters, over the "
+            f"formula_size_limit of {limit}.")
+    return out
+
+
+def _is_number(v: Any) -> bool:
+    """is_number(value): whether the value is a number (True and False
+    aren't)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_text(v: Any) -> bool:
+    """is_text(value): whether the value is text."""
+    return isinstance(v, str)
+
+
+def _is_list(v: Any) -> bool:
+    """is_list(value): whether the value is a list (a coordinate is
+    one)."""
+    return isinstance(v, (list, tuple))
+
+
+def _is_dict(v: Any) -> bool:
+    """is_dict(value): whether the value is a dict."""
+    return isinstance(v, dict)
+
+
 def _upper(v: Any) -> str:
     """upper(text): the text in upper case."""
     return _text_arg(v, "upper").upper()
@@ -3365,6 +3517,10 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "replace": _replace,
     "join": _join,
     "fmt": _fmt,
+    "is_number": _is_number,
+    "is_text": _is_text,
+    "is_list": _is_list,
+    "is_dict": _is_dict,
     "plural": _plural,
     "ordinal": _ordinal,
     "list_text": _list_text,
@@ -4086,6 +4242,15 @@ assert _MAP_ARG_FUNCS <= _TUPLE_FREE_FUNCS, (
     _MAP_ARG_FUNCS - _TUPLE_FREE_FUNCS)
 
 
+# `return` typed in an expression (a condition, a `$()`), where it can't
+# parse (#324).
+_RETURN_WORD = re.compile(r"(^|[\s;:(])return\b")
+_RETURN_IN_EXPRESSION = (
+    "`return` belongs in a program (an action, a passive, a `!func`, a "
+    "hook); a condition or `$()` is one expression, and its value is the "
+    "result.")
+
+
 def validate_arg_safe(src: str) -> None:
     """Validate a `$(...)` inline-argument expression: it must be a pure
     EXPRESSION (no assignments — guaranteed by eval-mode parsing) that calls
@@ -4095,6 +4260,8 @@ def validate_arg_safe(src: str) -> None:
     try:
         tree = ast.parse(src, mode="eval")
     except SyntaxError as ex:
+        if _RETURN_WORD.search(src):
+            raise FormulaError(_RETURN_IN_EXPRESSION)
         # An assignment / statement in a $() arg lands here (eval mode rejects
         # them) — surface it as the "no mutation" rule, not a raw SyntaxError.
         raise FormulaError(
@@ -4131,9 +4298,15 @@ def program_is_read_only(src: str) -> bool:
         return True     # it can't run, so it changes nothing
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
-            if not all(isinstance(t, ast.Name) for t in node.targets):
+            if not all(isinstance(t, ast.Name) or (
+                    isinstance(t, (ast.Tuple, ast.List)) and all(
+                        isinstance(e, ast.Name) for e in t.elts))
+                       for t in node.targets):
                 return False
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.Delete)):
+        elif isinstance(node, ast.AugAssign):
+            if not isinstance(node.target, ast.Name):
+                return False
+        elif isinstance(node, (ast.AnnAssign, ast.Delete)):
             return False
         elif isinstance(node, ast.Call):
             if not (isinstance(node.func, ast.Name)
@@ -4190,6 +4363,9 @@ _ALLOWED_NODES: Tuple[type, ...] = (
     # A lambda, allowed only as the function argument of the higher-order
     # helpers (_HOF_FUNCS); _validate_tree refuses one anywhere else.
     ast.Lambda, ast.arguments, ast.arg,
+    # `name := value` (#431): binds a local (a program's) or a name for the
+    # one expression (a condition, a `$()`), never stored.
+    ast.NamedExpr,
 )
 
 # Higher-order helpers: their second argument is a function, a `!func` name
@@ -4624,9 +4800,20 @@ def _collect_action_locals(tree: ast.AST) -> "frozenset[str]":
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
-                if isinstance(tgt, ast.Name):
-                    _check_binding_name(tgt.id, "a local")
-                    locals_set.add(tgt.id)
+                names = ([tgt] if isinstance(tgt, ast.Name) else
+                         [e for e in tgt.elts if isinstance(e, ast.Name)]
+                         if isinstance(tgt, (ast.Tuple, ast.List)) else [])
+                for nm in names:
+                    if nm.id == _AUG_TMP:
+                        continue
+                    _check_binding_name(nm.id, "a local")
+                    locals_set.add(nm.id)
+        elif (isinstance(node, ast.NamedExpr)
+              and isinstance(node.target, ast.Name)
+              and node.target.id != _AUG_TMP):
+            # `name := value` (#431) binds a local too.
+            _check_binding_name(node.target.id, "a local")
+            locals_set.add(node.target.id)
     return frozenset(locals_set)
 
 
@@ -4680,6 +4867,153 @@ def _refuse_engine_names(tree: ast.AST) -> None:
     # Every parse path passes here first, so the constants' lowercase
     # spellings are rewritten here too (in place: the root is never a Name).
     _LowercaseConstants().visit(tree)
+    # And the language's sugar (#349 / #351 / #352): `-=`, read
+    # subscripts and f-strings become forms the transformer and the
+    # validator already know.
+    _SugarTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
+
+
+# The engine's own names a transformed formula calls or binds (the user's
+# source can't name them, _refuse_engine_names): the validator lets them
+# through.
+_AUG_TMP = "__aug"
+_ENGINE_HELPER_NAMES = frozenset({
+    "__read", "__write", "__read_match", "__write_match", "__loop_tick",
+    "__index", "__fstr", "__fval", "__return", _AUG_TMP})
+
+
+def _simple_who(node: ast.AST) -> bool:
+    """An entity[...] index that reads the same twice: a name or a
+    constant."""
+    return isinstance(node, (ast.Name, ast.Constant))
+
+
+class _SugarTransformer(ast.NodeTransformer):
+    """Rewrites the formula language's conveniences into its core forms,
+    before any check runs:
+    - `T op= V` (#349) into `T = T op V` for every target an assignment
+      takes (a local, entity[x].path, match.path, an action binding's
+      attribute); an entity[...] index that isn't a name or a constant is
+      evaluated once (bound to an engine temp by `:=`), so
+      `entity[pick(units)].hp -= 5` hits one unit. The read refuses a var
+      the unit lacks, as any read does.
+    - `x[i]` (#351) into `__index(x, i)`: a read only (a subscript can't be
+      assigned), a miss refused; `entity[...]` keeps its meaning.
+    - f"..." (#352) into `__fstr(...)` with each field `__fval(value,
+      spec)`, the spec limited as fmt()'s."""
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        node.value = self.visit(node.value)
+        t = node.target
+        if isinstance(t, ast.Subscript) and not _entity_subscript(t):
+            raise FormulaError(
+                "A subscript only reads (`cells[0]`, `d['key']`); it can't "
+                "be assigned. Build a new value (with_key, insert_at) or "
+                "write entity[x].path.")
+        if isinstance(t, ast.Name):
+            store, load = t, ast.Name(id=t.id, ctx=ast.Load())
+        elif isinstance(t, ast.Attribute):
+            store = t
+            load = copy.deepcopy(t)
+            # The chain's root: an entity[...] index read twice is bound
+            # once.
+            cur_s, cur_l = store, load
+            while isinstance(cur_s, ast.Attribute):
+                cur_s, cur_l = cur_s.value, cur_l.value
+            if _entity_subscript(cur_s) and not _simple_who(cur_s.slice):
+                cur_s.slice = ast.NamedExpr(
+                    target=ast.Name(id=_AUG_TMP, ctx=ast.Store()),
+                    value=cur_s.slice)
+                cur_l.slice = ast.Name(id=_AUG_TMP, ctx=ast.Load())
+            for n in ast.walk(load):
+                if hasattr(n, "ctx"):
+                    n.ctx = ast.Load()
+            load = self.visit(load)
+            store = self.visit(store)
+        else:
+            raise FormulaError(
+                f"`{type(t).__name__}` can't take an augmented assignment "
+                f"(+=, -=, ...): assign a local, entity[x].path or "
+                f"match.path.")
+        value = ast.BinOp(left=load, op=node.op, right=node.value)
+        return ast.copy_location(
+            ast.Assign(targets=[store], value=ast.copy_location(value, node)),
+            node)
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        # #324: `return value` ends the program with that value
+        # (_ReturnSignal, caught where the program runs); `return fail` is
+        # the return-shaped fail() of an action (user call).
+        v = node.value
+        if isinstance(v, ast.Name) and v.id == "fail":
+            call = ast.Call(func=ast.Name(id="fail", ctx=ast.Load()),
+                            args=[], keywords=[])
+        else:
+            call = ast.Call(func=ast.Name(id="__return", ctx=ast.Load()),
+                            args=[self.visit(v) if v is not None
+                                  else ast.Constant(value=None)],
+                            keywords=[])
+        return ast.copy_location(ast.Expr(value=call), node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        if _entity_subscript(node):
+            node.slice = self.visit(node.slice)
+            return node
+        if not isinstance(node.ctx, ast.Load):
+            raise FormulaError(
+                "A subscript only reads (`cells[0]`, `d['key']`); it can't "
+                "be assigned. Build a new value (with_key, insert_at) or "
+                "write entity[x].path.")
+        if isinstance(node.slice, ast.Slice):
+            raise FormulaError(
+                "A subscript takes one index or key; for a part of a list "
+                "use slice(items, start, end) (or take / drop).")
+        return ast.copy_location(ast.Call(
+            func=ast.Name(id="__index", ctx=ast.Load()),
+            args=[self.visit(node.value), self.visit(node.slice)],
+            keywords=[]), node)
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> ast.AST:
+        parts: List[ast.AST] = []
+        for v in node.values:
+            if isinstance(v, ast.Constant):
+                parts.append(v)
+                continue
+            if not isinstance(v, ast.FormattedValue):
+                raise FormulaError("This f-string part isn't supported.")
+            if v.conversion not in (-1, ord("s")):
+                raise FormulaError(
+                    "An f-string field can't take !r or !a (or `=`); write "
+                    "{value} or {value:spec}.")
+            spec = ""
+            if v.format_spec is not None:
+                fs = v.format_spec
+                if not (isinstance(fs, ast.JoinedStr) and all(
+                        isinstance(p, ast.Constant) for p in fs.values)):
+                    raise FormulaError(
+                        "An f-string format spec is written out, not "
+                        "computed ({x:>5}, not {x:>{w}}).")
+                spec = "".join(str(p.value) for p in fs.values)
+                if not _FMT_SPEC.match(spec):
+                    raise FormulaError(
+                        f"f-string: unsupported format spec '{spec}' (an "
+                        f"alignment <, > or ^, a sign, a width of up to 3 "
+                        f"digits, a precision of up to 2 and a type d, f, "
+                        f"e, g, % or s).")
+            parts.append(ast.copy_location(ast.Call(
+                func=ast.Name(id="__fval", ctx=ast.Load()),
+                args=[self.visit(v.value), ast.Constant(value=spec)],
+                keywords=[]), v))
+        return ast.copy_location(ast.Call(
+            func=ast.Name(id="__fstr", ctx=ast.Load()), args=parts,
+            keywords=[]), node)
+
+
+def _entity_subscript(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "entity")
 
 
 def _check_binding_name(name: str, what: str) -> None:
@@ -4743,6 +5077,9 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         if isinstance(slice_node, ast.Index):  # py<=3.8 wrapper, defensive
             slice_node = slice_node.value
         if isinstance(slice_node, ast.Name):
+            if slice_node.id == _AUG_TMP:
+                # The index an augmented assignment bound once (#349).
+                return ast.Name(id=_AUG_TMP, ctx=ast.Load())
             if slice_node.id in _ENTITY_TOKEN_NAMES:
                 # Special token (self/this/current/parent) — pass the token
                 # string; resolve_who maps it to a concrete entity id.
@@ -4918,8 +5255,17 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         # Transform RHS (may itself contain entity[X].path reads).
         node.value = self.visit(node.value)
         if len(node.targets) != 1:
-            raise FormulaError("Chained / tuple assignment is not supported.")
+            raise FormulaError("Chained assignment (a = b = ...) is not "
+                               "supported; write one line per name.")
         target = node.targets[0]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            # Destructuring (#350): `x, y = nearest_cell(...)` binds plain
+            # locals, in a program.
+            if not (self.locals_ok or self.action_mode) or not all(
+                    isinstance(e, ast.Name) for e in target.elts):
+                raise FormulaError(
+                    "Unpacking (a, b = ...) binds plain local names only.")
+            return node
         # match.<path> = value — rewrite to __write_match("path", value).
         # Checked first so the reserved root works in every mode and isn't
         # captured by the action-mode bare-Name local rule below.
@@ -4964,14 +5310,9 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         )
         return ast.copy_location(ast.Expr(value=call), node)
 
-    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
-        raise FormulaError(
-            "Augmented assignment (+= etc.) is not supported; "
-            "use 'entity[X].var = entity[X].var + amount' instead."
-        )
-
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
-        # Bare entity[X] without .attribute, or any other subscripting.
+        # A bare entity[X] without .attribute (the sugar pass made every
+        # other subscript an __index read).
         if isinstance(node.value, ast.Name) and node.value.id == "entity":
             raise FormulaError("entity[X] must be followed by .path.")
         raise FormulaError("Subscripting is not allowed (only entity[X].path).")
@@ -5142,8 +5483,7 @@ def _validate_tree(
         if not isinstance(n, _ALLOWED_NODES):
             raise FormulaError(f"Disallowed syntax: {type(n).__name__}")
         if isinstance(n, ast.Name):
-            if (n.id not in ("__read", "__write", "__read_match",
-                             "__write_match", "__loop_tick")
+            if (n.id not in _ENGINE_HELPER_NAMES
                     and n.id not in _ALLOWED_FUNCS
                     and n.id not in _MATCH_FUNC_NAMES
                     and n.id not in HOOK_CONTEXT_NAMES
@@ -5173,8 +5513,7 @@ def _validate_tree(
             if not isinstance(n.func, ast.Name):
                 raise FormulaError("Only direct function calls are allowed.")
             fname = n.func.id
-            if (fname not in ("__read", "__write", "__read_match",
-                              "__write_match", "__loop_tick")
+            if (fname not in _ENGINE_HELPER_NAMES
                     and fname not in _ALLOWED_FUNCS
                     and fname not in _MATCH_FUNC_NAMES
                     and fname not in known_funcs
@@ -5699,6 +6038,10 @@ class FormulaEngine:
             "__read_match":  lambda path:        self._read_match(path),
             "__write_match": lambda path, value: self._write_match(path, value),
             "__loop_tick": _loop_tick,
+            "__index": _index,
+            "__return": _raise_return,
+            "__fval": lambda v, spec: _fval(v, spec, size_limit),
+            "__fstr": lambda *p: _fstr(*p, limit=size_limit),
             **_ALLOWED_FUNCS,
             # Bounded arithmetic (_ArithGuardTransformer) + the cell budget.
             # The cells_in_* wrappers pass `limit` themselves, so a formula
@@ -12612,6 +12955,12 @@ class FormulaEngine:
                         if expr_code is None:
                             return None
                         return eval(expr_code, call_ns)
+                    except _ReturnSignal as r:
+                        return r.value          # `return value` (#324)
+                    except FormulaError as ex:
+                        raise _noted(ex, _line_note(
+                            ex, fdef.body, "<formula-fn>",
+                            f"in `{fdef.name}`, "))
                     finally:
                         self._fn_depth -= 1
                 return _call
@@ -12870,6 +13219,8 @@ class FormulaEngine:
         try:
             tree = ast.parse(src, mode=mode)
         except SyntaxError as e:
+            if mode == "eval" and _RETURN_WORD.search(src):
+                raise FormulaError(_RETURN_IN_EXPRESSION)
             raise FormulaError(f"Syntax error: {e.msg}")
         # In action mode every bare-name Assign target becomes an
         # implicit local; pre-collect them all so the validator allows
@@ -12878,9 +13229,9 @@ class FormulaEngine:
         # that point, but the validator accepts the static program).
         _refuse_engine_names(tree)
         program = mode == "exec"
-        if program:
-            known_params = known_params | _collect_program_locals(
-                tree, known_funcs, action_mode)
+        # A program's locals; an expression's `:=` names (#431).
+        known_params = known_params | _collect_program_locals(
+            tree, known_funcs, action_mode)
         tree = _EntityAccessTransformer(
             known_params, action_mode=action_mode, locals_ok=program,
             attr_roots=attr_roots,
@@ -12940,6 +13291,17 @@ class FormulaEngine:
                 # "Runtime error:" is kept for raw Python errors.
                 raise FormulaError(str(e))
             raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
+
+    def _returned(self, value: Any, action_mode: bool) -> Any:
+        """A program's `return value` (#324). An action, a reaction half
+        and a damage step (action mode) don't read a value: one given
+        there is noted with a ⚠️."""
+        if action_mode and value is not None and self._match is not None:
+            self._match.surface_log([
+                "⚠️ `return <value>` in an action, a reaction half or a "
+                "damage step ends it; the value isn't used there (`return` "
+                "alone ends it, `return fail` fails it)."])
+        return value
 
     def eval_program(self, src: str, ctx: EvalCtx,
                      *, action_mode: bool = False,
@@ -13006,12 +13368,19 @@ class FormulaEngine:
         for k, v in preset.items():
             if k not in ns or k in full_locals:
                 ns[k] = v
+        returned = False
         try:
-            if full.body:
-                exec(compile(_guard_arith(full), "<formula>", "exec"), ns)
+            try:
+                if full.body:
+                    exec(compile(_guard_arith(full), "<formula>", "exec"), ns)
+            except _ReturnSignal as r:
+                # `return value` (#324) ends the program with that value.
+                returned, ret_value = True, r.value
             if locals_out is not None:
                 locals_out.clear()
                 locals_out.update({k: ns[k] for k in full_locals if k in ns})
+            if returned:
+                return self._returned(ret_value, action_mode)
             if trailing_expr is None:
                 return None
             expr_tree = ast.Expression(body=trailing_expr)
@@ -13023,10 +13392,13 @@ class FormulaEngine:
                 expr_tree, known_funcs=known, known_params=full_locals,
                 action_mode=action_mode,
             )
-            return eval(compile(_guard_arith(expr_tree), "<formula>", "eval"),
-                        ns)
-        except FormulaError:
-            raise
+            try:
+                return eval(compile(_guard_arith(expr_tree), "<formula>",
+                                    "eval"), ns)
+            except _ReturnSignal as r:
+                return self._returned(r.value, action_mode)
+        except FormulaError as e:
+            raise _noted(e, _line_note(e, src, "<formula>"))
         except Exception as e:
             # Action-system exceptions (ActionFail / ActionEngineFault)
             # propagate unwrapped — they carry user-visible messages the
@@ -13036,11 +13408,12 @@ class FormulaEngine:
             from action import ActionFail, ActionEngineFault, ChoiceNeeded
             if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
+            note = _line_note(e, src, "<formula>")
             if isinstance(e, VTTError):
                 # The engine refused something (an entity not found, a cell
                 # occupied, a budget exceeded) and its message says what.
                 # "Runtime error:" is kept for raw Python errors.
-                raise FormulaError(str(e))
+                raise _noted(FormulaError(str(e)), note)
             name = getattr(e, "name", None)
             if isinstance(e, NameError) and name in full_locals:
                 # A name assigned anywhere in a program is its local from
@@ -13049,10 +13422,11 @@ class FormulaEngine:
                         f"entity['{name}'] for the unit `{name}`."
                         if self._match is not None
                         and name in self._match.entities else "")
-                raise FormulaError(
+                raise _noted(FormulaError(
                     f"`{name}` is used before it is assigned (it is a "
-                    f"local of this formula).{unit}")
-            raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
+                    f"local of this formula).{unit}"), note)
+            raise _noted(FormulaError(f"Runtime error: {_runtime_msg(e)}"),
+                         note)
 
 
 # --- arg-token resolution ($(...) substitution) -----------------------------

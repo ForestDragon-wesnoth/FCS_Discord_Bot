@@ -46219,3 +46219,258 @@ allow_diagonal_movement; a cell off the map and a count below 1 are
 refused. use_action takes the same words as text ('right 3') for an
 action that opts in. A reaction counts from the reacting unit: the
 hero's `dodge right` is the cell right of the hero.
+
+
+SCENARIO 1252 — Augmented assignment: -= / += on locals, unit vars, match vars and an action's container (#349)
+---------------------------------------------------------------------------------------------------------------
+
+!match new aa Aa 9 9
+!match use aa
+!ent add hero Hero 30 2 2 5
+!ent add orc Orc 40 5 5 3
+!ent set_vars orc footprint_w=2 footprint_h=2
+!ent set_var hero inv.potions 3
+!eval "entity[hero].hp -= 5\nentity[hero].hp"
+?? = `25`
+!eval "total = 10\ntotal *= 3\ntotal -= 4\ntotal"
+?? = `26`
+!eval "match.alarm = 1\nmatch.alarm += 2\nmatch.alarm"
+?? = `3`
+!eval "entity[hero].inv.potions -= 1"
+!assert "entity[hero].inv.potions == 2"
+!eval "entity[orc].footprint_w += 1"
+!assert "footprint_width('orc') == 3 and occupies('orc', 7, 6)"
+!func def nxt - "match.picks += 1\n'orc'"
+!eval "match.picks = 0\nentity[nxt()].hp -= 4"
+!assert "match.picks == 1 and entity[orc].hp == 36"
+!eval "entity[hero].mana -= 1"
+?? Variable 'mana' is not defined
+!assert "not var_has('hero', 'mana')"
+!eval "b = [1, 2]\nb[0] += 1"
+?? A subscript only reads
+!ent set_var hero inv.actions.drink.body "source.potions -= 1\nentity[self].hp += 10"
+!action hero drink
+!assert "entity[hero].inv.potions == 1 and entity[hero].hp == 30"
+!clamp add hero hp max=32 mode=hard
+!eval "entity[hero].hp += 50"
+!assert "entity[hero].hp == 32"
+HARNESS-ALLOWS-ERRORS
+
+Expected: `T op= V` (user design, #349) compiles to `T = T op V` for every
+target an assignment takes: a local (`total *= 3`), `entity[x].path`
+(nested too), `match.path` and, in an action, its container (an
+item's `source.potions -= 1`). It is the same read and write as the long
+form, so the clamp still holds hp at 32 and a footprint write still
+checks the body fits (the 2×2 orc grows to 3 wide). An entity[...] index
+that isn't a name or a constant is evaluated once: `entity[nxt()].hp -=
+4` calls nxt() a single time. A var the unit lacks is refused, naming
+it, and changes nothing (user call); a subscript can't be assigned.
+
+
+SCENARIO 1253 — Destructuring and the walrus: unpacking locals, := in conditions, `$()` and programs (#350, #431)
+---------------------------------------------------------------------------------------------------------------
+
+!match new dw Dw 9 9
+!match use dw
+!ent add hero Hero 30 2 2 5
+!ent add orc Orc 40 5 5 3
+!ent set_vars orc footprint_w=2 footprint_h=2
+!eval "x, y = nearest_cell('orc', 'hero')\n[x, y]"
+?? = `[5, 5]`
+!eval "a, b = 1, 2\na, b = b, a\n[a, b]"
+?? = `[2, 1]`
+!eval "a, b = [1, 2, 3]"
+?? too many values to unpack
+!eval "entity[hero].x, b = 1, 2"
+?? Unpacking (a, b = ...) binds plain local names only
+!ent set_var hero actions.zap.target location
+!ent set_var hero actions.zap.body "tx, ty = target\nentity[self].last = tx * 10 + ty"
+!action hero zap 4 3
+!assert "entity[hero].last == 43"
+!assert "(d := entity_distance('hero', 'orc')) <= 5 and d > 1"
+!ent hp hero "$((h := entity[hero].hp) - 1)"
+!assert "entity[hero].hp == 29"
+!ent hp hero "$((k := kill('orc')))"
+?? function 'kill' changes game state and is banned
+!assert "entity[orc].hp == 40"
+!eval "(kill := 3) > 1"
+?? `kill` can't be a local's name
+!eval "if (t := nearest_entity('hero', 'any')) and entity_distance('hero', t) < 9:\n    entity[t].marked = 1"
+!assert "entity[orc].marked == 1"
+!watch add near "(d := entity_distance('hero', 'orc')) <= 2 and d >= 0" "say('close')"
+!ent tp hero 3 4
+?? close
+HARNESS-ALLOWS-ERRORS
+
+Expected: a program unpacks a list into plain locals (#350): a
+coordinate (`x, y = nearest_cell(...)`, the nearest cell of the 2×2 orc's
+body), a swap, a location target in an action (`tx, ty = target`).
+Unpacking the wrong number of values is a runtime error, and only bare
+names unpack. `name := value` (#431, user call: expressions and programs)
+binds a name inside an expression: an `!assert` condition, a `$()`
+argument (the name lives for that expression and stores nothing), a
+program's `if` (binding the unit it then marks) and a watcher condition.
+A `$()` walrus around a mutator is refused like any mutator and changes
+nothing, and a walrus can't take a function's name.
+
+
+SCENARIO 1254 — Read subscripts and type tests (#351, #353)
+------------------------------------------------------------
+
+!match new st St 9 9
+!match use st
+!ent add hero Hero 30 2 2 5
+!ent set_var hero inv.potions 3
+!eval "c = nearest_cell('hero', 'hero')\n[c[0], c[-1]]"
+?? = `[2, 2]`
+!eval "entity[hero].inv['potions']"
+?? = `3`
+!eval "'abc'[1]"
+?? = `'b'`
+!eval "[10, 20, 30][5]"
+?? index 5 is past the end of 3 items
+!eval "entity[hero].inv['nope']"
+?? no key 'nope' in the dict (its keys: potions)
+!eval "get(entity[hero].inv, 'nope', 0)"
+?? = `0`
+!eval "[1, 2, 3][0:2]"
+?? use slice(items, start, end)
+!eval "x = [1]\nx[0] = 5"
+?? A subscript only reads
+!eval "5[0]"
+?? reads a list, a dict or text, got a number
+!eval "[is_number(3), is_number(True), is_text('a'), is_list([1]), is_dict({}), is_list(nearest_cell('hero', 'hero'))]"
+?? = `[True, False, True, True, True, True]`
+!func def total v "if is_list(v):\n    return sum(v)\nif is_dict(v):\n    return sum(values(v))\nv"
+!eval "[total([1, 2, 3]), total({'a': 4, 'b': 5}), total(7)]"
+?? = `[6, 9, 7]`
+!help function is_number
+?? whether the value is a number (True and False aren't)
+HARNESS-ALLOWS-ERRORS
+
+Expected: `x[i]` and `d['key']` read (#351): a list index (negative
+counts from the end), a dict key, a character of text, a unit var's
+dict. A miss is refused naming the index or key (user call); get() with
+a default stays the soft read. A slice points at slice(), an assignment
+to a subscript is refused, and a value that can't be indexed names its
+kind. is_number / is_text / is_list / is_dict (#353, True isn't a
+number, a coordinate is a list) let a `!func` take several shapes.
+
+
+SCENARIO 1255 — f-strings: fields, number and alignment specs, refusals (#352)
+-------------------------------------------------------------------------------
+
+!match new fs Fs 9 9
+!match use fs
+!ent add hero Hero 30 2 2 5
+!eval "f'{entity[hero].name} has {entity[hero].hp:>4} hp, {0.456:.0%}, {2/3:.2f}'"
+?? = `'Hero has   30 hp, 46%, 0.67'`
+!eval "f'{{braces}} and {[1, 2]}'"
+?? = `'{braces} and [1, 2]'`
+!eval "f'{entity[hero].hp!r}'"
+?? can't take !r or !a
+!eval "w = 3\nf'{entity[hero].hp:{w}}'"
+?? is written out, not computed
+!eval "f'{entity[hero].hp:,}'"
+?? unsupported format spec ','
+!eval "f'{entity[hero].name:d}'"
+?? Unknown format code 'd'
+!ent set_var hero actions.greet.body "say(f'{entity[self].name} waves ({entity[self].hp} hp)')"
+!action hero greet
+?? Hero waves (30 hp)
+!ent hp hero "$(len(f'{kill(\"hero\")}'))"
+?? function 'kill' changes game state and is banned
+!assert "entity[hero].hp == 30"
+!assert "f'{entity[hero].hp}' == '30'"
+HARNESS-ALLOWS-ERRORS
+
+Expected: f"..." (#352) fills each field like fmt(): a value as text, or
+through a format spec limited to numbers and alignment (user call: an
+alignment, a sign, a width of up to 3 digits, a precision of up to 2 and
+a type d / f / e / g / % / s). `!r` / `!a`, a computed spec and any other
+spec are refused when the formula compiles; a spec that doesn't fit the
+value is a clean error. `{{` writes a brace. A `$()` f-string calling a
+mutator is refused like any `$()` mutator.
+
+
+SCENARIO 1256 — return: !func values, passive results, an action's early end and `return fail` (#324)
+------------------------------------------------------------------------------------------------------
+
+!match new rt Rt 9 9
+!match use rt
+!ent add hero Hero 30 2 2 5
+!ent add orc Orc 40 5 5 3
+!ent set_vars orc footprint_w=2 footprint_h=2
+!func def clampdmg d "if d <= 0:\n    return 0\nreturn min(d, 10)"
+!eval "[clampdmg(-3), clampdmg(4), clampdmg(40)]"
+?? = `[0, 4, 10]`
+!eval "for u in each([1, 2, 3]):\n    if u == 2:\n        return u * 10\n99"
+?? = `20`
+!passive add hero p1 on_turn_start "if entity[self].hp > 20:\n    return 'healthy'\n'hurt'"
+!turn next
+?? → 'healthy'
+!ent set_var hero actions.poke.target entity
+!ent set_var hero actions.poke.body "entity[target].hp -= 3\nif entity[target].hp < 100:\n    return\nentity[target].hp -= 50"
+!action hero poke orc
+?? used action `poke` on `Orc`
+!assert "entity[orc].hp == 37"
+!ent set_var hero actions.flop.target entity
+!ent set_var hero actions.flop.body "entity[target].hp -= 3\nreturn fail"
+!action hero flop orc
+?? the action failed
+!assert "entity[orc].hp == 37"
+!ent set_var hero actions.val.body "return 5"
+!action hero val
+?? `return <value>` in an action, a reaction half or a damage step ends it; the value isn't used there
+!watch add w1 "return entity[hero].hp > 0" "say('x')"
+?? `return` belongs in a program
+!find hero "$(return 3)"
+?? `return` belongs in a program
+!eval "return fail"
+?? Function 'fail' is not allowed
+HARNESS-ALLOWS-ERRORS
+
+Expected: `return` (#324, user design) ends a program where it stands.
+In a `!func` its value is the function's result (a guard clause without
+nested ifs), also from inside a loop; a passive's value is what its ⚙️
+line shows. In an action a bare `return` ends it as a success, keeping
+what it did (the orc loses 3, not 53); `return fail` is the return-shaped
+fail(): the action fails and its writes are rolled back; `return
+<value>` there ends it with a ⚠️ that the value isn't used. In an
+expression (a condition, `$()`) `return` is refused with a pointer to
+programs, and `return fail` outside an action names fail() as unknown.
+
+
+SCENARIO 1257 — Runtime errors name the line of a multi-line body (#354)
+--------------------------------------------------------------------------
+
+!match new ln Ln 9 9
+!match use ln
+!ent add hero Hero 30 2 2 5
+!eval "a = 1\nb = 2\nc = entity[nobody].hp + a"
+?? Entity 'nobody' not found. (line 3: `c = entity[nobody].hp + a`)
+!eval "a = 1\nb = a + 'x'"
+?? (line 2: `b = a + 'x'`)
+!eval "entity[nobody].hp"
+?! (line
+!func def g x "y = x * 2\nz = entity[nobody].hp\ny"
+!eval "a = 1\nb = g(1)"
+?? (in `g`, line 2: `z = entity[nobody].hp`)
+!ent set_var hero actions.bad.body "x = 1\ny = entity[nobody].hp\nz = 3"
+!action hero bad
+?? (line 2: `y = entity[nobody].hp`)
+!system set default formula_text_visibility host
+!host access set eval all
+!as player bob
+!eval "a = 1\nb = entity[nobody].hp"
+?? (line 2)
+?! `b = entity
+!as host
+HARNESS-ALLOWS-ERRORS
+
+Expected: an error while a multi-line body runs (#354, user call) ends
+with the line it happened on, counted from 1 of the body as typed, and
+quotes it: a program, an action body, and a `!func` (named, its own
+line, which the caller's error carries). A one-line formula keeps its
+wording. Under formula_text_visibility host a player's error names the
+line number only, since the line is formula text.

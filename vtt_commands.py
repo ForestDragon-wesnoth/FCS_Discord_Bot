@@ -27146,7 +27146,8 @@ registry.annotate_sub(
         "parameters. `<body>` is the rest of the line — a formula "
         "program whose trailing expression (if any) is the return "
         "value; a body ending on an if / elif / else returns the "
-        "trailing value of the branch that ran. Example: "
+        "trailing value of the branch that ran, and `return value` "
+        "ends the body with that value anywhere. Example: "
         "`!func def mitigated raw,armor \"max(raw - armor, 0)\"` then "
         "call it from any formula as `mitigated(entity[self].atk, 3)`. "
         "The body is validated at definition time; parameters and the "
@@ -29124,7 +29125,10 @@ def _check_watcher_formulas(cond: str, effect: str,
         # then read as not met forever.
         try:
             validate_formula(cond, mode="eval", known_funcs=known)
-        except FormulaError:
+        except FormulaError as cex:
+            from formula import _RETURN_IN_EXPRESSION
+            if str(cex) == _RETURN_IN_EXPRESSION:
+                return f"❌ {cex}"
             validate_program(cond, known_funcs=known)
             return ("❌ A watcher condition is an expression (true or "
                     "false): it can't assign or hold statements — put "
