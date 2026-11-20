@@ -680,10 +680,23 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
               *(f for _r, f in logic.STATUS_LINE_KINDS.values())):
         if entry.get(k) is not None and not isinstance(entry[k], str):
             raise VTTError(f"{who}: `{k}` must be text.")
+    if entry.get("glyph") not in (None, "") and \
+            logic.glyph_problem(entry["glyph"]):
+        raise VTTError(f"{who}: `glyph`: "
+                       f"{logic.glyph_problem(entry['glyph'])}.")
+    if entry.get("color") not in (None, "") and \
+            entry["color"] not in logic.TEXT_COLORS:
+        raise VTTError(f"{who}: `color` must be a palette name.")
+    dp = entry.get("display_priority")
+    if dp is not None and (isinstance(dp, bool)
+                           or not isinstance(dp, (int, float))):
+        raise VTTError(f"{who}: `display_priority` must be a number.")
     for k, choices in (("resist_affects", logic.RESIST_AFFECTS),
                        ("resist_rounding", logic.RESIST_ROUNDINGS),
                        ("on_transform", logic.TRANSFORM_STATUS_FLAGS),
-                       ("if_source_lost", logic.STATUS_SOURCE_LOST_MODES)):
+                       ("if_source_lost", logic.STATUS_SOURCE_LOST_MODES),
+                       ("duration_mode", logic.STATUS_DURATION_MODES),
+                       ("duration_when", logic.STATUS_TICK_WHENS)):
         if entry.get(k) is not None and entry[k] not in choices:
             raise VTTError(f"{who}: `{k}` must be one of "
                            f"{', '.join(choices)}.")

@@ -2092,6 +2092,24 @@ hardcodes**.
   applied during the caster's turn ends at that turn's end (user call:
   "until the end of your next turn" is duration 2). Skipped turns tick
   as the bearer's do; extra turns follow the status's extra_turn_ticks.
+  The source pass (`only` in `fire_status_tick`) runs source-clock ticks
+  and countdowns only (`Match._clock_matches`): it ran plain ticks of
+  statuses the acting unit had applied too, 2 a round (1287).
+- **Automatic durations** (#233, user design, 1285-1287): a status's
+  `duration_mode` (`status_field`; `!status duration_mode <name>
+  <manual|auto|->`), else the rule `status_default_duration_mode`
+  (manual, user call), decides whether the engine counts its duration
+  down. Under auto, `fire_status_tick` calls `Match.count_down_status`
+  after the tick formula, at `Match.status_duration_when` (`!status
+  duration_when`; default its tick time: the definition's tick_when, the
+  status_tick_when rule for a status that rule ticks, else turn_end):
+  the counter path (every layer, a permanent status kept, removed_by
+  expired). "Until your next turn" is duration 1 at turn_start,
+  source_turn_start the caster's (no `expires` field, user call). Skipped
+  turns count down, extra turns per extra_turn_ticks;
+  `_source_clock_defined` and `_has_turn_tick` read `duration_when` too.
+  `_has_round_logic` compared status tick times with hook names and never
+  listed a round status tick in ATB's warning (fixed with it).
 - **Status lines** (#309, 1261-1262): `Match.status_line(kind, ...)`
   from `_emit_status_diff`: gained / lost / changed (a level change only)
   through `status_gained|lost|changed_message_format`, replaced per status
@@ -2182,6 +2200,19 @@ hardcodes**.
   read as words wherever a status shows (user call: `×5` read as a
   multiplier): `{level_text}` is ` level 5`, the layers `level 3 for 2,
   then level 1 for 3 more`.
+- **Map look** (#114, user design, 1288-1289): a status's `glyph` (one
+  column, `glyph_problem`), `color` (a palette name) and
+  `display_priority` (`status_field`; `!status glyph <name>
+  <glyph|clear>` (`-` is a glyph), `!status color`, `!status
+  display_priority`). `Match.status_look(e, pov)`: among the statuses the
+  view sees, the highest priority holding a glyph and, apart, the highest
+  holding a colour (a tie: the status gained first); none under a
+  disguise fooling the view. `entity_glyph` / `entity_color` put it
+  before the unit's own (user call: over its custom glyph too), so ASCII,
+  the image scene (a glyph-drawn unit, the outline) and the GUI agree;
+  `legend_label_entity` appends the statuses ("Ogre (stun, burn)").
+  `entity_has_custom_glyph` ignores it (a region part doesn't start
+  drawing over its parent). Sprite effects from statuses are idea #624.
 - **Visibility** (user request, 1246): which team views see a status is
   its own `visibility_condition` (`logic.STATUS_VISIBILITY_FIELD`,
   `status_field`: instance key, definition, level entries; `!status
@@ -5077,12 +5108,21 @@ rejected already. Update this section in the PR that resolves an item.
   level or duration and a counter set collapse a layered status to the
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
-  only that pair. A layer-aware version of each is open (idea #563).
+  only that pair. A layer-aware version of each is open (idea #625,
+  which took over #563, with the summed `layered_sum` mode).
 
 - **W21 part 1 and part 4** (user): fully derived stats are planned
   (idea #252, when is open); loadout limits come back slightly later
   (idea #622, the proposed answers in it). Template hooks on corpses are
   on hold (idea #623).
+
+- **Template hooks on stored snapshots** (user: discuss later): a unit
+  snapshot stored in a var (`!ent store_entity_into_var`, or
+  `entity_snapshot` written with a var set) carries its partial
+  templates' markers, so the write fires on_template_applied for each of
+  them on the unit holding the var. Passives filtered with target= /
+  scope= to their own containers (`class`, `equipped`) ignore it; a
+  passive with no target sees it.
 
 - **Dragged corpses fire no hooks** (user: a known limitation; code it
   when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross

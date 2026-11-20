@@ -233,6 +233,13 @@ STATUS_SOURCE_KEY = "__source"
 STATUS_SOURCE_LOST_MODES = ("keep", "remove")
 # Ticks on the applier's clock (#310): a definition's tick_when.
 SOURCE_TICK_WHENS = ("source_turn_start", "source_turn_end")
+# Every tick_when (and duration_when, #233) a status can name.
+STATUS_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
+                     "source_turn_start", "source_turn_end", "never")
+# Automatic durations (#233): a status's `duration_mode`, else the
+# status_default_duration_mode rule. `auto` = the engine counts its
+# duration down by one at its `duration_when` (default: when it ticks).
+STATUS_DURATION_MODES = ("manual", "auto")
 # Transforms and statuses: a status that arrived with a form records the
 # stash path of that transform here, so reverting it takes the status back;
 # a stash records the flavor of the transform that made it (`merge` for
@@ -2643,6 +2650,30 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "applier, so a re-application by another unit makes that "
             "unit its source. A revive doesn't bring a removed status "
             "back; a transform keeps the unit, so it loses nothing."
+        ),
+    },
+    "status_default_duration_mode": {
+        "default": "manual",
+        "schema": {"type": "enum", "choices": ["manual", "auto"]},
+        "desc": (
+            "Who counts a status's duration down, for statuses without "
+            "their own `duration_mode` (`!status duration_mode <name> "
+            "<manual|auto>`; an instance key or a level entry sets it "
+            "too). 'manual' (default): the GM's tick formula does it "
+            "(`status_counter_add(self, status_name, -1)`), or nothing "
+            "does. 'auto': the engine takes 1 off the duration at the "
+            "status's `duration_when` (`!status duration_when`; default "
+            "the time it ticks: its definition's tick_when, else the "
+            "status_tick_when rule for a status that rule ticks, else "
+            "turn_end), right AFTER its tick formula ran, and removes it "
+            "at 0 (removed_by `expired`), as status_counter_add does: "
+            "every layer of a layered status counts down, a permanent "
+            "status (no duration) stays. Example: 'until your next turn' "
+            "is duration 1 with duration_when turn_start; 'until the "
+            "caster's next turn' uses source_turn_start. A skipped turn "
+            "counts down like the tick does; an extra turn follows the "
+            "status's extra_turn_ticks. Under 'auto' a tick formula must "
+            "not count down itself as well, or each turn takes 2."
         ),
     },
     "status_resist_sources": {
@@ -22815,7 +22846,10 @@ class Match:
             for p in e.passives.values():
                 if any(h in rnames for h in p.hooks):
                     return True
-        if str(self.rules.get("status_tick_when", "never")) in rnames and \
+        # Status ticks name the phase without `on_` (round_start); this
+        # compared them with the hook names and never matched.
+        whens = ("round_start", "round_end")
+        if str(self.rules.get("status_tick_when", "never")) in whens and \
                 str(self.rules.get("status_tick_formula", "")).strip():
             return True
         for sdef in self.status_definitions.values():
@@ -22824,8 +22858,15 @@ class Match:
                     merge_layer(sdef, ent) for ent in (
                         sdef.get(STATUS_LEVELS_FIELD) or {}).values()
                     if isinstance(ent, dict)]:
-                if str(lay.get("tick_when", "turn_end")) in rnames and \
+                if str(lay.get("tick_when", "turn_end")) in whens and \
                         str(lay.get("tick", "")).strip():
+                    return True
+                # An automatic countdown at a round phase (#233).
+                if lay.get("duration_when") in whens and (
+                        lay.get("duration_mode") == "auto"
+                        or (lay.get("duration_mode") is None
+                            and self.rules.get(
+                                "status_default_duration_mode") == "auto")):
                     return True
         if any(s.get("kind") == "round" for s in self.scheduled):
             return True
@@ -25105,60 +25146,157 @@ class Match:
                     continue
                 # A status WITH a definition runs its own tick at its own
                 # tick_when (default turn_end); a def-less status falls back
-                # to the global status_tick_formula at the global when.
+                # to the global status_tick_formula at the global when. The
+                # source pass (`only`) runs only source-clock ticks: a plain
+                # tick of a status some unit applied ran at its source's
+                # turn too (5 -> 4 -> 3 a round).
+                inst = e.status.get(sname)
                 sdef = self.status_definitions.get(sname)
+                src = None
                 if sdef is not None and self._own_tick(e, sname):
                     # The tick and its when as the instance's level reads
                     # them (#259).
                     sdef = self.status_def_view(
-                        sname, self.status_level(e.status.get(sname)))
-                    def_when = sdef.get("tick_when") or "turn_end"
-                    if def_when in SOURCE_TICK_WHENS:
-                        if def_when != source_when:
-                            continue
-                        tsrc = self._tick_source(e.status.get(sname))
-                        # On the source's turn (a bearer outside this turn's
-                        # units comes from the source pass), else on the
-                        # bearer's own when the source is none or lost.
-                        if only is None and tsrc is not None \
-                                and tsrc not in target_set:
-                            continue
-                    elif def_when != when:
-                        continue
-                    src = sdef.get("tick")
-                elif sdef is not None:
+                        sname, self.status_level(inst))
+                    if self._clock_matches(
+                            inst, sdef.get("tick_when") or "turn_end",
+                            when, source_when, only, target_set):
+                        src = sdef.get("tick")
+                elif only is None and global_active and (
+                        sdef is None or self._timed_status(e, sname)):
                     # A definition without a tick of its own (one written
                     # for its data) falls back to the global formula while
                     # the instance has a duration (user call, Y2: such a
                     # status never counted down).
-                    if not global_active or not self._timed_status(e, sname):
-                        continue
                     src = global_src
-                else:
-                    if not global_active:
-                        continue
-                    src = global_src
-                ctx = EvalCtx(
-                    this=this_id, target=eid,
-                    extras={"status_name": sname},
-                )
-                ticking = STATUS_TICKING.set((eid, sname))
-                try:
-                    engine.eval_program(src, ctx)
-                except FormulaError as ex:
-                    log.extend(hook_output(self, "error", self.unit_line(
-                        eid, f"⚠️ status_tick on `{eid}.{sname}` "
-                             f"({when}) FAILED: {ex}")))
-                except Exception as ex:
-                    ref = crash_ref(f"status_tick on `{eid}.{sname}` "
-                                    f"({when})", ex)
-                    log.extend(hook_output(self, "error", self.unit_line(
-                        eid, f"⚠️ status_tick on `{eid}.{sname}` "
-                             f"({when}) CRASHED{ref}: "
-                             f"{type(ex).__name__}: {ex}")))
-                finally:
-                    STATUS_TICKING.reset(ticking)
+                if src is not None:
+                    log.extend(self._run_status_tick(
+                        engine, EvalCtx, FormulaError, src, eid, sname,
+                        when, this_id))
+                # Automatic durations (#233): after the tick, at the
+                # status's duration_when.
+                e = self.entities.get(eid)
+                if e is None:
+                    break
+                inst = e.status.get(sname)
+                if inst is not None and self.status_auto_duration(
+                        inst, sname) and self._clock_matches(
+                        inst, self.status_duration_when(inst, sname),
+                        when, source_when, only, target_set):
+                    ticking = STATUS_TICKING.set((eid, sname))
+                    try:
+                        log.extend(self.count_down_status(eid, sname))
+                    finally:
+                        STATUS_TICKING.reset(ticking)
         return log
+
+    def _run_status_tick(self, engine: Any, EvalCtx: Any, FormulaError: Any,
+                         src: str, eid: str, sname: str, when: str,
+                         this_id: Any) -> List[str]:
+        """Run one status tick formula; its failure is a ⚠️ line."""
+        log: List[str] = []
+        ctx = EvalCtx(
+            this=this_id, target=eid,
+            extras={"status_name": sname},
+        )
+        ticking = STATUS_TICKING.set((eid, sname))
+        try:
+            engine.eval_program(src, ctx)
+        except FormulaError as ex:
+            log.extend(hook_output(self, "error", self.unit_line(
+                eid, f"⚠️ status_tick on `{eid}.{sname}` "
+                     f"({when}) FAILED: {ex}")))
+        except Exception as ex:
+            ref = crash_ref(f"status_tick on `{eid}.{sname}` "
+                            f"({when})", ex)
+            log.extend(hook_output(self, "error", self.unit_line(
+                eid, f"⚠️ status_tick on `{eid}.{sname}` "
+                     f"({when}) CRASHED{ref}: "
+                     f"{type(ex).__name__}: {ex}")))
+        finally:
+            STATUS_TICKING.reset(ticking)
+        return log
+
+    def _clock_matches(self, inst: Any, w: str, when: str,
+                       source_when: Optional[str], only: Any,
+                       target_set: Set[str]) -> bool:
+        """Whether a status whose tick (or countdown) runs at `w` runs now,
+        at phase `when` of the turn of `target_set`'s units. A source-clock
+        `w` (#310) runs on its source's turn (the source pass, `only`
+        given), else on the bearer's own when it has no source or lost it;
+        any other `w` only on the bearer's own clock."""
+        if w in SOURCE_TICK_WHENS:
+            if w != source_when:
+                return False
+            tsrc = self._tick_source(inst)
+            return not (only is None and tsrc is not None
+                        and tsrc not in target_set)
+        return only is None and w == when
+
+    def status_auto_duration(self, inst: Any, name: str) -> bool:
+        """Whether the engine counts status `name`'s duration down (#233):
+        its `duration_mode` (instance, definition, level entries), else
+        the status_default_duration_mode rule."""
+        v = self.status_field(inst, name, "duration_mode")
+        if v not in STATUS_DURATION_MODES:
+            v = self.rules.get("status_default_duration_mode", "manual")
+        return v == "auto"
+
+    def status_duration_when(self, inst: Any, name: str) -> str:
+        """When an automatic duration counts down (#233): the status's
+        `duration_when`, else when it ticks (its definition's tick_when;
+        the status_tick_when rule for a status that rule ticks), else
+        turn_end."""
+        v = self.status_field(inst, name, "duration_when")
+        if v in STATUS_TICK_WHENS:
+            return v
+        if name in self.status_definitions:
+            tw = self.status_field(inst, name, "tick_when")
+            if tw in STATUS_TICK_WHENS and (
+                    tw != "turn_end" or self._has_own_tick(inst, name)):
+                return tw
+        if not self._has_own_tick(inst, name):
+            gw = self.rules.get("status_tick_when", "never")
+            src = self.rules.get("status_tick_formula", "")
+            if gw in STATUS_TICK_WHENS and gw != "never" and \
+                    isinstance(src, str) and src.strip():
+                return gw
+        return "turn_end"
+
+    def _has_own_tick(self, inst: Any, name: str) -> bool:
+        """Whether status `name`'s definition gives `inst` a tick formula of
+        its own (at its level)."""
+        if name not in self.status_definitions:
+            return False
+        body = self.status_def_view(
+            name, self.status_level(inst)).get("tick")
+        return isinstance(body, str) and bool(body.strip())
+
+    def count_down_status(self, eid: str, name: str, delta: Any = -1
+                          ) -> List[str]:
+        """Add `delta` to `eid`'s status `name`'s duration as
+        status_counter_add does (#233): every layer of a layered status, a
+        permanent one untouched, the status removed at 0 (removed_by
+        expired). Returns the hook log."""
+        e = self.entities.get(eid)
+        inst = e.status.get(name) if e is not None else None
+        if not isinstance(inst, dict):
+            return []
+        if status_layers_of(inst) is not None:
+            return self.tick_status_layers(eid, name, delta)[1]
+        dur = self.status_field(inst, name, "duration")
+        if isinstance(dur, bool) or not isinstance(dur, (int, float)):
+            return []
+        new = dur + delta
+        if new == int(new):
+            new = int(new)
+        before = copy.deepcopy(inst)
+        if new <= 0:
+            del e.status[name]
+            return self._emit_status_diff(eid, name, before, None,
+                                          removed_by="expired")
+        inst["duration"] = new
+        return self._emit_status_diff(eid, name, before, copy.deepcopy(inst))
 
     def _source_clock_defined(self) -> bool:
         """Whether any status definition (or a level entry of one) ticks
@@ -25167,12 +25305,14 @@ class Match:
         for sdef in self.status_definitions.values():
             if not isinstance(sdef, dict):
                 continue
-            if sdef.get("tick_when") in SOURCE_TICK_WHENS:
+            # A tick or an automatic countdown (#233) on the source's clock.
+            keys = ("tick_when", "duration_when")
+            if any(sdef.get(k) in SOURCE_TICK_WHENS for k in keys):
                 return True
             lv = sdef.get(STATUS_LEVELS_FIELD)
             if isinstance(lv, dict) and any(
                     isinstance(x, dict)
-                    and x.get("tick_when") in SOURCE_TICK_WHENS
+                    and any(x.get(k) in SOURCE_TICK_WHENS for k in keys)
                     for x in lv.values()):
                 return True
         return False
@@ -25191,6 +25331,11 @@ class Match:
         turn_end): its definition's tick at its level, else the global
         status_tick_formula at status_tick_when."""
         turn_whens = ("turn_start", "turn_end")
+        inst = e.status.get(sname)
+        if self.status_auto_duration(inst, sname) and \
+                self.status_duration_when(inst, sname) in (
+                    turn_whens + SOURCE_TICK_WHENS):
+            return True  # an automatic countdown (#233)
         if sname in self.status_definitions and self._own_tick(e, sname):
             view = self.status_def_view(
                 sname, self.status_level(e.status.get(sname)))
@@ -30800,6 +30945,33 @@ class Match:
             return None
         return d
 
+    def status_look(self, e: "Entity", pov_team: Optional[str] = None
+                    ) -> Dict[str, Tuple[str, str]]:
+        """What `e`'s statuses do to its map look (#114): {"glyph": (glyph,
+        status), "color": (colour, status)}, each from the status with the
+        highest `display_priority` (instance, definition, level entries;
+        default 0; a tie goes to the status gained first) among those
+        holding a usable `glyph` (one character) / `color` (a palette name),
+        read separately. Only statuses `pov_team`'s view sees count, and a
+        unit disguised to it shows none (as its overlays)."""
+        if not e.status or \
+                self._effective_disguise(e, pov_team) is not None:
+            return {}
+        best: Dict[str, Tuple[float, str, str]] = {}
+        for sname, inst in self.visible_statuses(
+                e.status, pov_team, e.id).items():
+            pr = self.status_field(inst, sname, "display_priority")
+            pr = pr if isinstance(pr, (int, float)) and \
+                not isinstance(pr, bool) else 0
+            g = glyph_of(self.status_field(inst, sname, "glyph"))
+            c = self.status_field(inst, sname, "color")
+            for key, val, ok in (("glyph", g, glyph_ok(g)),
+                                 ("color", c, isinstance(c, str)
+                                  and c in TEXT_COLORS)):
+                if ok and (key not in best or pr > best[key][0]):
+                    best[key] = (pr, val, str(sname))
+        return {k: (v[1], v[2]) for k, v in best.items()}
+
     def entity_glyph(self, e: "Entity",
                      pov_team: Optional[str] = None) -> str:
         """The map symbol for `e`: a per-facing `glyphs.<facing>` var wins,
@@ -30809,8 +30981,13 @@ class Match:
         ignored and falls through — same rule as tile/zone glyphs. When `e`
         is disguised to `pov_team` (116), the disguise's glyph/glyphs are
         resolved first; a disguise without a glyph falls through to the real
-        resolution."""
+        resolution. A status's glyph (#114, status_look) comes before the
+        unit's own."""
         facing = getattr(e, "facing", "")
+        if e.status:
+            sg = self.status_look(e, pov_team).get("glyph")
+            if sg is not None:
+                return sg[0]
         dis = self._effective_disguise(e, pov_team)
         if dis is not None:
             dglyphs = dis.get("glyphs")
@@ -30852,7 +31029,12 @@ class Match:
         team literally named 'red' renders red). Unknown names -> None. When
         `e` is disguised to `pov_team` (116), only the disguise speaks: its
         `color`, else the colour of the team its `vars` give, else none (the
-        real unit's colour would give it away)."""
+        real unit's colour would give it away). A status's colour (#114,
+        status_look) comes before the unit's own."""
+        if e.status:
+            sc = self.status_look(e, pov_team).get("color")
+            if sc is not None:
+                return sc[0]
         dis = self._effective_disguise(e, pov_team)
         if dis is not None:
             dc = dis.get("color")
@@ -31255,7 +31437,14 @@ class Match:
             # A private `legend` var labels nothing for a reader who may
             # not read it: the unit's name stands in (L50).
             val = self.reader_vars(e, pov_team).get("legend")
-        return self._legend_value(val, self.entity_display_name(e, pov_team))
+        label = self._legend_value(val,
+                                   self.entity_display_name(e, pov_team))
+        look = self.status_look(e, pov_team) if e.status else {}
+        if label is not None and look:
+            # The statuses giving its glyph / colour (#114): "orc (stunned)".
+            names = list(dict.fromkeys(v[1] for v in look.values()))
+            label = f"{label} ({', '.join(names)})"
+        return label
 
     def legend_label_tile(self, data: Any) -> Optional[str]:
         """A tile's legend label: its own `legend` data, else its

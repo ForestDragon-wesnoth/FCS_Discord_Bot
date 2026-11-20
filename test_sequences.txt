@@ -47826,3 +47826,280 @@ teleported away it doesn't. `!mod show` names the source as
 `bard:class.song`. A status's records reach the team the same way
 (anthem +5: knight 10 + 2 + 5 = 17, bard 15). A dead holder's records
 stop. An unknown `applies_to` word is named and left out.
+
+
+
+
+SCENARIO 1285 — Automatic durations: duration_mode auto, the default rule, after the tick, layers, permanent (#233)
+--------------------------------------------------------------------------------------------------------------------
+
+!match new ad Ad 10 10
+!match use ad
+!ent add hero Hero 10 1 1 20
+!ent add orc Orc 10 3 3 10
+!status def burn
+!status tick burn "entity[self].hp -= status_duration(self, 'burn')"
+!status duration_mode burn auto
+?? the engine takes 1 off its duration at `turn_end`
+!status duration_mode burn sometimes
+?? duration_mode must be one of: manual, auto
+!status apply orc burn 1 3
+!turn next
+!turn next
+!turn next
+!assert "entity[orc].hp == 7 and status_duration('orc', 'burn') == 2"
+!turn next
+!turn next
+!assert "entity[orc].hp == 5 and status_duration('orc', 'burn') == 1"
+!turn next
+!turn next
+?? Orc loses burn
+!assert "entity[orc].hp == 4 and not status_has('orc', 'burn')"
+!status def ward
+!status apply hero ward 1 2
+!status apply hero ward 3 1
+!status apply orc ward
+!system set default status_default_duration_mode auto
+!turn next
+?? Hero's ward is now level 1 (was 3)
+!assert "status_layers('hero', 'ward') == [[1, 1]] and status_duration('orc', 'ward') == None"
+!turn next
+!turn next
+?? Hero loses ward
+!assert "status_has('orc', 'ward')"
+!status duration_mode ward manual
+!status apply hero ward 1 1
+!turn next
+!turn next
+!assert "status_duration('hero', 'ward') == 1"
+!status duration_mode ward -
+?? the status_default_duration_mode rule decides
+!status level burn 2 duration_mode manual
+!status apply hero burn 2 2
+!turn next
+!turn next
+!assert "status_duration('hero', 'burn') == 2"
+
+Expected: `duration_mode auto` (#233) makes the engine count a status's
+duration down by 1 at its tick time, right after the tick formula ran: the
+orc's burn 1 for 3 deals 3, 2, 1 (the tick reads the duration before the
+countdown) and ends after the third with "Orc loses burn" (removed_by
+expired). An unknown word is refused. With the status_default_duration_mode
+rule set to auto, a status without a mode of its own counts down too: the
+hero's layered ward (3 for 1 + 1 for 2) falls to level 1, then ends; the
+orc's permanent ward stays. A definition's own `manual` beats the rule; `-`
+goes back to it; a level entry (`!status level burn 2 duration_mode
+manual`) beats the definition at that level, so the hero's burn 2 stays at
+2.
+
+
+SCENARIO 1286 — duration_when: until your next turn, until the caster's next turn, skipped and extra turns, a body part (#233)
+--------------------------------------------------------------------------------------------------------------------------------
+
+!match new dw Dw 12 12
+!match use dw
+!ent add mage Mage 10 1 1 20
+!ent add ogre Ogre 30 5 5 10
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre ogre_arm arm 5 5
+!ent add orc Orc 10 9 9 5
+!system set default status_default_duration_mode auto
+!status def rest
+!status duration_when rest turn_start
+!status def guard
+!status duration_when guard source_turn_start
+!status def stun
+!status data stun skips_turn true
+!status duration_when stun turn_start
+!status apply orc rest 1 1
+!status apply orc guard 1 1 source=mage
+!status apply ogre stun 1 1
+!status apply ogre_arm rest 1 2
+!turn next
+?? Orc loses guard
+!assert "status_has('orc', 'rest') and status_has('ogre', 'stun')"
+!turn next
+?? Ogre loses stun
+?? Orc loses rest
+!assert "not status_has('ogre', 'stun') and not status_has('orc', 'rest') and status_duration('ogre_arm', 'rest') == 1"
+!turn next
+!status def haste
+!status duration_when haste turn_end
+!status apply mage haste 1 2
+!turn next
+?? arm loses rest
+!turn grant mage
+!turn next
+!turn next
+!assert "status_duration('mage', 'haste') == 1"
+!ent status mage set haste extra_turn_ticks true
+!turn grant mage
+!turn next
+!turn next
+?? Mage loses haste
+!assert "not status_has('mage', 'haste')"
+!status duration_when guard sometimes
+?? duration_when must be one of
+!status duration_when guard -
+?? an automatic duration counts down when the status ticks
+
+Expected: `duration_when` (#233) sets when an automatic duration counts
+down. "Until the caster's next turn": the orc's guard (source_turn_start,
+applied by the mage) ends as the mage's turn starts; "until your next
+turn": its rest (duration 1, turn_start) ends as the orc's own turn starts.
+A stun with skips_turn counting down at turn_start ends on the ogre's
+skipped turn (the skip runs its statuses' turn ticks), and the 2x2 ogre's
+arm (a body part riding its clock) counts its rest down at the same turn
+start, then ends it at the ogre's next. An extra turn counts down only for
+a status whose extra_turn_ticks is on: the mage's haste keeps 1 through an
+extra turn before the instance gets the flag, then ends with the next
+extra turn. An unknown word is refused; `-` goes back to
+the tick time.
+
+
+SCENARIO 1287 — A status applied by another unit ticks on its bearer's clock beside source-clock statuses; ATB warns of round ticks (#310, #233)
+----------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sp Sp 10 10
+!match use sp
+!ent add mage Mage 10 1 1 20
+!ent add orc Orc 10 3 3 10
+!status def hex
+!status when hex source_turn_end
+!status def poison
+!status tick poison "status_counter_add(self, 'poison', -1)"
+!status apply orc poison 1 5 source=mage
+!status apply orc hex 1 5 source=mage
+!turn next
+!turn next
+!assert "status_duration('orc', 'poison') == 5"
+!turn next
+!assert "status_duration('orc', 'poison') == 4"
+!turn next
+!turn next
+!assert "status_duration('orc', 'poison') == 3"
+!status def regen
+!status when regen round_start
+!status tick regen "entity[self].hp += 1"
+!system set default atb_enabled true
+!turn next
+?? round status ticks
+
+Expected: once a definition ticks on its source's clock (#310), the turn
+tick also visits other units' statuses whose source is acting. That pass
+used to run their plain ticks too, so the mage's poison on the orc (a
+turn_end tick) ticked at the end of the mage's turn and again at the end
+of the orc's, 2 a round. Now the source pass runs only source-clock ticks
+and countdowns: the poison drops once a round, at the orc's turn end. The
+ATB switch's one-time warning lists a round-start status tick as dormant
+round logic (it compared the tick times with the hook names and never
+found one).
+
+
+
+SCENARIO 1288 — Status glyph and colour on the map: priority, legend, a 2x2 body, level entries, instances (#114)
+-----------------------------------------------------------------------------------------------------------------
+
+!match new gl Gl 8 5
+!match use gl
+!ent add orc Orc 10 2 2 5 team=red
+!ent add ogre Ogre 30 5 2 4 team=blue
+!ent set_vars ogre footprint_w=2 footprint_h=2 glyph=O
+!status def stun
+!status glyph stun z
+?? shows its bearer as `z` on the map
+!status color stun yellow
+!status def burn
+!status color burn red
+!status display_priority burn 5
+!status apply orc stun
+!status apply ogre stun
+!status apply ogre burn
+!map legend=on
+?? 2 . z . . z z . .
+?? 3 . . . . z z . .
+?? z — Orc (stun), Ogre (stun, burn)
+!map scene list
+?? entity `orc` at (2,2) — glyph z, color yellow
+?? entity `ogre` at (5,2) 2x2 stretch — glyph z, color red
+!status def frozen
+!status glyph frozen *
+!status display_priority frozen 2
+!status apply orc frozen
+!map legend=on
+?? * — Orc (frozen, stun)
+!status level stun 3 glyph Z
+!status level stun 3 display_priority 9
+!status apply orc stun 3
+!map legend=on
+?? Z — Orc (stun)
+!ent status orc set stun glyph s
+!map legend=on
+?? s — Orc (stun)
+!ent status orc remove stun
+!ent status orc remove frozen
+!status glyph stun clear
+?? `stun` glyph cleared
+!map legend=on
+?? > — Orc
+?? O — Ogre (burn)
+
+Expected: a status's `glyph` / `color` (#114) replace its bearer's on the
+map while it holds the status: the stun shows the orc and every cell of
+the 2x2 ogre as `z`; of several statuses the highest display_priority wins,
+the glyph and the colour picked apart (the ogre's `z` from the stun, its
+red from the burn at priority 5). The legend names the statuses behind the
+look ("Ogre (stun, burn)"), and the image scene draws the same glyph and
+colour. Priority picks between glyphs (frozen at 2 over stun at 0); a
+level entry (stun 3: `Z` at priority 9) and an instance key (`s`) take
+precedence over the definition. With the statuses gone or the glyph
+cleared, the unit's own glyph (`>`, the ogre's `O`) is back; the ogre keeps
+the burn's colour.
+
+
+SCENARIO 1289 — Status looks follow the view: visibility, disguise; refusals and prefab checks (#114)
+-------------------------------------------------------------------------------------------------------
+
+!match new gv Gv 8 5
+!match use gv
+!ent add orc Orc 10 2 2 5 team=red
+!ent add elf Elf 10 5 2 4 team=blue
+!status def stun
+!status glyph stun z
+!status def curse
+!status glyph curse c
+!status visibility curse "pov_team == 'red'"
+!status apply orc stun
+!status apply elf curse
+!ent set_var orc disguise.name Rock
+!ent set_var orc disguise.glyph R
+!match bind pov=blue
+!map legend=on
+?? R — Rock
+?? v — Elf
+!match bind pov=red
+!map legend=on
+?? z — Orc (stun)
+?? c — Elf (curse)
+!match bind
+!status glyph stun 😀
+?? two columns wide
+!status color stun plaid
+?? color must be a palette name
+!status display_priority stun high
+?? display_priority must be a number
+!status glyph stun -
+?? shows its bearer as `-`
+!prefab import pz {"kind": "prefab", "width": 1, "height": 1, "system": "default", "definitions": {"status_definitions": {"daze": {"glyph": "ab"}}}}
+?? `glyph`: a glyph is exactly one character
+!prefab import pz {"kind": "prefab", "width": 1, "height": 1, "system": "default", "definitions": {"status_definitions": {"daze": {"color": "plaid"}}}}
+?? `color` must be a palette name
+
+Expected: a status look follows the channel's view (#114): to blue the
+disguised orc is its disguise (`R`, "Rock"), its stun hidden as overlays
+are, and the elf's curse is hidden by its visibility condition, so the elf
+shows its facing arrow (`v`); red, the orc's own team, sees the stun's `z` and, by the
+condition, the curse's `c`. A glyph two columns wide, a colour outside the
+palette and a priority that isn't a number are refused; `-` is a glyph
+(only `clear` clears). A prefab carrying a status definition with a bad
+glyph or colour is refused at import.

@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
+from logic import STATUS_DURATION_MODES, STATUS_TICK_WHENS, STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
 from logic import STATUS_LINES_SKIP, STATUS_HIDE_RE, STATUS_HIDE_SEP, STATUS_LINE_KINDS, APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, say_plain_text, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, passive_hooks, VAR_HOOKS, PATH_HOOKS, TEMPLATE_ROUTE, template_route, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
@@ -26302,6 +26302,59 @@ registry.annotate_sub(
           "definition's. A status records only its latest applier."),
 )
 registry.annotate_sub(
+    "status", "glyph",
+    usage="!status glyph <name> <glyph|clear>",
+    desc=("#114: one character shown on the map in place of its bearer's "
+          "own glyph while it holds the status (a stunned unit as `z`); in "
+          "images it is the glyph a unit without a sprite is drawn with. "
+          "Of several statuses with a glyph, the highest `display_priority` "
+          "shows (a tie: the one gained first). Hidden under a disguise and "
+          "from a view the status's visibility hides it from; the legend "
+          "reads `orc (stunned)`. An instance key and level entries "
+          "override it. `clear` clears (`-` is a glyph)."),
+)
+registry.annotate_sub(
+    "status", "color",
+    usage="!status color <name> <colour|->",
+    desc=("#114: a palette colour for its bearer on the map while it holds "
+          "the status, over the unit's own `color` and its team's (in "
+          "images the unit's outline). Of several, the highest "
+          "`display_priority` shows; picked apart from the glyph. `-` "
+          "clears."),
+)
+registry.annotate_sub(
+    "status", "display_priority",
+    usage="!status display_priority <name> <n|->",
+    desc=("#114: which status's glyph / colour a unit shows when it holds "
+          "several: the highest number (default 0; a tie goes to the "
+          "status gained first). `-` clears."),
+)
+registry.annotate_sub(
+    "status", "duration_mode",
+    usage="!status duration_mode <name> <manual|auto|->",
+    desc=("#233: who counts the status's duration down. `manual`: the "
+          "GM's tick formula (`status_counter_add(self, status_name, "
+          "-1)`), or nothing. `auto`: the engine takes 1 off at its "
+          "`duration_when` (`!status duration_when`; default when it "
+          "ticks), after the tick formula, and removes it at 0 "
+          "(removed_by `expired`); every layer counts down, a permanent "
+          "status stays. `-` goes back to the status_default_duration_mode "
+          "rule. An instance's own key and level entries override the "
+          "definition's."),
+)
+registry.annotate_sub(
+    "status", "duration_when",
+    usage=("!status duration_when <name> <turn_end|turn_start|round_start|"
+           "round_end|source_turn_start|source_turn_end|never|->"),
+    desc=("#233: when an automatic duration (`duration_mode auto`) counts "
+          "down, apart from when the status ticks. 'Until your next turn' "
+          "is duration 1 with `turn_start`; 'until the caster's next turn' "
+          "`source_turn_start` (the applier's clock, as for ticks). `-` "
+          "goes back to the default: the status's tick_when, else the "
+          "status_tick_when rule for a status that rule ticks, else "
+          "turn_end."),
+)
+registry.annotate_sub(
     "status", "removed_on_damage",
     usage="!status removed_on_damage <name> <on|off>",
     desc=("#235: on = its bearer taking damage removes the status "
@@ -26419,6 +26472,8 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     GRANTS_UNIT_TAGS: 2, STATUS_UNIT_TAG_BLOCK: 2,
                     "level": 3, "resist_affects": 3, "resist_rounding": 3,
                     "on_transform": 3, "if_source_lost": 3,
+                    "duration_mode": 3, "duration_when": 3,
+                    "glyph": 3, "color": 3, "display_priority": 3,
                     "removed_on_damage": 3,
                     "break_at_damage": 3, "damage_filter": 2,
                     "tick_priority": 3}
@@ -26435,6 +26490,10 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "resist_rounding": "resist_rounding",
                      "on_transform": "on_transform",
                      "if_source_lost": "if_source_lost",
+                     "duration_mode": "duration_mode",
+                     "duration_when": "duration_when",
+                     "glyph": "glyph", "color": "color",
+                     "display_priority": "display_priority",
                      "removed_on_damage": "removed_on_damage",
                      "break_at_damage": "break_at_damage",
                      "damage_filter": "damage_filter",
@@ -26923,7 +26982,7 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                 f": a unit's statuses tick highest first.")
 
     if sub in ("resist_affects", "resist_rounding", "on_transform",
-               "if_source_lost"):
+               "if_source_lost", "duration_mode", "duration_when"):
         # #232: what resistance changes on this status, and how its result
         # rounds (over the status_resist_rounding rule); what a transform
         # does with it (keep / drop over the transform's flavor); `-`
@@ -26937,7 +26996,9 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         choices = {"resist_affects": RESIST_AFFECTS,
                    "resist_rounding": RESIST_ROUNDINGS,
                    "on_transform": TRANSFORM_STATUS_FLAGS,
-                   "if_source_lost": STATUS_SOURCE_LOST_MODES}[sub]
+                   "if_source_lost": STATUS_SOURCE_LOST_MODES,
+                   "duration_mode": STATUS_DURATION_MODES,
+                   "duration_when": STATUS_TICK_WHENS}[sub]
         if val in ("-", "default", "clear"):
             m.status_definitions[name].pop(sub, None)
             return (f"`{name}` {sub} cleared ("
@@ -26947,11 +27008,62 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                        "on_transform": "a transform keeps it, a replace "
                                        "drops it).",
                        "if_source_lost": "the status_default_if_source_lost "
-                                         "rule decides)."}[sub])
+                                         "rule decides).",
+                       "duration_mode": "the status_default_duration_mode "
+                                        "rule decides).",
+                       "duration_when": "an automatic duration counts "
+                                        "down when the status ticks)."
+                       }[sub])
         if val not in choices:
             return f"❌ {sub} must be one of: {', '.join(choices)} (or `-`)."
         m.status_definitions[name][sub] = val
+        if sub == "duration_mode" and val == "auto":
+            return (f"`{name}` duration_mode = auto: the engine takes 1 off "
+                    f"its duration at `{m.status_duration_when(None, name)}`"
+                    f" (after its tick) and removes it at 0. A tick formula "
+                    f"that counts down too takes 2 a turn.")
         return f"`{name}` {sub} = {val}."
+
+    if sub in ("glyph", "color", "display_priority"):
+        # #114: the bearer's map look while it holds the status.
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
+            return ""
+        name, val = args[1], args[2]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->")
+        sdef = m.status_definitions[name]
+        # `-` is a glyph too (a unit lying down): only the words clear it.
+        if val.lower() in (("clear", "none") if sub == "glyph"
+                           else ("-", "clear", "none")):
+            sdef.pop(sub, None)
+            return f"`{name}` {sub} cleared."
+        if sub == "glyph":
+            prob = glyph_problem(val)
+            if prob:
+                return f"❌ {prob}"
+            sdef[sub] = val
+            return (f"`{name}` shows its bearer as `{val}` on the map (over "
+                    f"the unit's own glyph; the status with the highest "
+                    f"display_priority wins).")
+        if sub == "color":
+            from logic import TEXT_COLORS
+            if val.lower() not in TEXT_COLORS:
+                return (f"❌ color must be a palette name: "
+                        f"{', '.join(sorted(TEXT_COLORS))}.")
+            sdef[sub] = val.lower()
+            return (f"`{name}` colours its bearer {val.lower()} on the map "
+                    f"(over the unit's own colour; the status with the "
+                    f"highest display_priority wins).")
+        try:
+            n = float(val)
+        except ValueError:
+            n = float("nan")
+        if n != n or n in (float("inf"), float("-inf")):
+            return "❌ display_priority must be a number (or `-`)."
+        sdef[sub] = int(n) if n == int(n) else n
+        return (f"`{name}` display_priority = {sdef[sub]}: among a unit's "
+                f"statuses with a glyph or colour, the highest shows.")
 
     if sub == "stack":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "stack"):

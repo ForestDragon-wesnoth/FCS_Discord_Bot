@@ -133,6 +133,12 @@ both buffs) each had an answer the text alone didn't settle (5b7e05c).
   machine_amount, tag, growing, heal}`), read by one function; a count-only
   status needs no tick of its own (status_tick_formula counts a defined
   status without a tick down, 078902a).
+- The engine can count durations down itself: `status_default_duration_mode
+  auto` (or `!status duration_mode <name> auto`) takes 1 off after each
+  tick at the status's `duration_when`, so no tick repeats the decrement.
+  "Until your next turn" is duration 1 with `duration_when turn_start`;
+  "until the caster's next turn" `source_turn_start`. Under auto, a tick
+  that also counts down takes 2 a turn.
 - A packet's own line prints before everything a death it causes prints.
   A system that words its own damage lines passes them as `message=` on
   `deal_damage` / `heal` (the damage_message_format placeholders); a
