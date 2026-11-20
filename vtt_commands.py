@@ -1585,7 +1585,14 @@ class CommandRegistry:
                 ctx, mgr, name, args, pre_active_mid, pre_state, touched)
         finally:
             FORMULA_TEXT_HIDDEN.reset(hide_tok)
-        if pre_state is not None and pre_active_mid in mgr.matches:
+        # A `!match rerun` rebuilt this match with its own undo history: the
+        # rerun itself is no step of it (W19: `!undo command 2` lands on the
+        # recorded run's step).
+        fresh = _RERUN_FRESH.get()
+        if fresh is not None:
+            _RERUN_FRESH.set(None)
+        if pre_state is not None and pre_active_mid in mgr.matches and \
+                id(mgr.matches[pre_active_mid]) != fresh:
             m_post = mgr.matches[pre_active_mid]
             if post_state is None:
                 post_state = m_post.to_dict(include_history=False)
@@ -5232,6 +5239,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _match_journal(ctx, args, mgr)
     if sub == "replay":
         return await _match_replay(ctx, args, mgr)
+    if sub == "rerun":
+        return await _match_rerun(ctx, args, mgr)
     if sub == "rng":
         m = active_match(mgr, ctx)
         rule_seed = str(m.rules.get("random_seed", "") or "")
@@ -5417,6 +5426,25 @@ registry.annotate_sub(
           "match; `verbose` shows every replayed command's replies. Reports "
           "the first entry after which the state differs from the "
           "recording. Administrators only."))
+registry.annotate_sub(
+    "match", "rerun", usage="!match rerun [<id>] | !match rerun undo [<id>]",
+    desc=("Rebuild a match from the CURRENT system and templates and run "
+          "its journal again (W19): a new match with the same id, name, "
+          "size, system, owner and dice seed, then every command the "
+          "journal recorded, each as its author in its channel, with the "
+          "dice where the recording had them, so a crit stays a crit when "
+          "a fix changed an earlier command's roll count. An undo, history "
+          "restore, `!run` file or resume runs again as the command it was "
+          "(the rebuilt undo history makes `!undo command 2` land on the "
+          "same step; a `!run` file is read as it is now). Recorded system "
+          "and template changes are skipped (the current versions are the "
+          "point), as are commands that need another match (reported). "
+          "Every entry runs; the report lists by number each command that "
+          "now refuses. The old match is replaced only once the rebuild "
+          "has run, and kept 24 hours: `!match rerun undo` puts it back "
+          "(its state and journal; its undo history is gone). Needs the "
+          "journal from the match's creation (command_journal_limit). A "
+          "host of the match."))
 registry.annotate_sub(
     "match", "rng", usage="!match rng [set <seed> [<pos>]]",
     desc=("Show the seed this match rolls from and how far into its "
@@ -10482,6 +10510,296 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
             if first_off is None else
             f"⚠️ The replay stopped matching the recording {first_off}.")
     await ctx.send("\n".join([head] + out + [tail]))
+
+
+# ---- !match rerun (W19) -------------------------------------------------
+_RERUN_KEEP_SECONDS = 24 * 3600
+# The match a `!match rerun` just built (its id()), read once by the
+# command's undo step so the rerun itself isn't one.
+_RERUN_FRESH: "contextvars.ContextVar[Optional[int]]" = \
+    contextvars.ContextVar("vtt_rerun_fresh", default=None)
+# Commands that need another match: a rerun reports and skips them.
+_RERUN_OTHER_MATCH = {("ent", "transfer"), ("ent", "copy"),
+                      ("match", "link"), ("match", "unlink"),
+                      ("match", "delete"), ("match", "clone"),
+                      ("match", "rename")}
+
+
+def _rerun_handover(mgr: MatchManager, before: Match, after: Match) -> None:
+    """A match taking over another's id (a rerun, its undo): its undo
+    snapshots number on from the one it replaces, so none takes a sequence
+    whose file on disk is the other's, and the journal files are written
+    afresh (storage appends to a segment it thinks it has written)."""
+    after.history._seq = max(after.history._seq, before.history._seq)
+    st = storage_of(mgr)
+    jw = getattr(st, "_jwritten", None) if st is not None else None
+    if isinstance(jw, dict):
+        jw.get(mgr.guild_key, {}).pop(before.id, None)
+
+
+def _rerun_trash_dir(mgr: MatchManager) -> Optional[str]:
+    st = storage_of(mgr)
+    if st is None or not getattr(st, "persist", False):
+        return None
+    return os.path.join(st._trash_root(), mgr.guild_key, "reruns")
+
+
+def _rerun_keep(mgr: MatchManager, old: Match) -> None:
+    """Keep the replaced match 24 h for `!match rerun undo`: a file in the
+    server's trash (reruns/) when the data folder persists, else memory."""
+    rec = {"at": time.time(), "match": old.id,
+           "state": old.to_dict(include_history=False),
+           "journal": copy.deepcopy(old.journal.segments)
+           if old.journal is not None else None}
+    d = _rerun_trash_dir(mgr)
+    if d is None:
+        keep = getattr(mgr, "_rerun_kept", None)
+        if keep is None:
+            keep = mgr._rerun_kept = {}
+        keep[old.id] = rec
+        return
+    os.makedirs(d, exist_ok=True)
+    for f in os.listdir(d):
+        p = os.path.join(d, f)
+        stamp = f.partition("-")[0]
+        try:
+            if time.time() - float(stamp) > _RERUN_KEEP_SECONDS:
+                os.remove(p)
+        except (ValueError, OSError):
+            continue
+    write_json_file(os.path.join(d, f"{rec['at']:.3f}-{old.id}.json"), rec)
+
+
+def _rerun_kept(mgr: MatchManager, mid: str
+                ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """The newest kept copy of match `mid` within 24 h, and its file."""
+    d = _rerun_trash_dir(mgr)
+    if d is None:
+        rec = (getattr(mgr, "_rerun_kept", None) or {}).get(mid)
+        if rec and time.time() - rec["at"] <= _RERUN_KEEP_SECONDS:
+            return rec, None
+        return None, None
+    if not os.path.isdir(d):
+        return None, None
+    best = None
+    for f in os.listdir(d):
+        stamp, _, rest = f.partition("-")
+        if rest != f"{mid}.json":
+            continue
+        try:
+            t = float(stamp)
+        except ValueError:
+            continue
+        if time.time() - t <= _RERUN_KEEP_SECONDS and (
+                best is None or t > best[0]):
+            best = (t, os.path.join(d, f))
+    if best is None:
+        return None, None
+    try:
+        with open(best[1], encoding="utf-8") as fh:
+            return json.load(fh), best[1]
+    except (OSError, ValueError):
+        return None, None
+
+
+async def _match_rerun(ctx: ReplyContext, args: List[str],
+                       mgr: MatchManager):
+    """`!match rerun [<id>]` / `!match rerun undo [<id>]` (W19)."""
+    rest = list(args[1:])
+    undo = bool(rest) and rest[0].lower() == "undo"
+    if undo:
+        rest = rest[1:]
+    if len(rest) > 1:
+        raise VTTError("Usage: `!match rerun [<id>]` | `!match rerun undo "
+                       "[<id>]`.")
+    if rest:
+        mid = rest[0]
+    else:
+        mid = mgr.active_by_channel.get(ctx.channel_key) or ""
+        if not mid:
+            raise VTTError("No active match for this channel: `!match rerun "
+                           "<id>`.")
+    m = mgr.matches.get(mid)
+    if undo:
+        return await _match_rerun_undo(ctx, mgr, mid, m)
+    if m is None:
+        raise NotFound(f"Match '{mid}' not found.")
+    require_target_host(ctx, m, "rerun it")
+    j = m.journal
+    if j is None or not j.segments:
+        raise VTTError(f"`{mid}` has no command journal to rerun "
+                       f"(command_journal_limit is 0, or it was turned on "
+                       f"after the match began).")
+    segs = j.segments
+    start = segs[0].get("start") or {}
+    entries = [e for seg in segs for e in seg.get("entries") or []]
+    if start.get("reason") != "created" or segs[0].get("no", 1) != 1:
+        first = next((e.get("n") for e in entries if isinstance(
+            e.get("n"), int)), None)
+        raise VTTError(
+            f"`{mid}`'s journal doesn't reach back to the match's creation "
+            f"(it holds {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+            + (f", from #{first}" if first else "")
+            + "): the entries before were dropped past "
+              "command_journal_limit, or the journal began later. A rerun "
+              "needs every command from the start.")
+    st = start.get("state") or {}
+    smaps = st.get("maps") or {}
+    if len(smaps) != 1 or st.get("entities"):
+        raise VTTError(f"`{mid}` began as a copy of another match (it held "
+                       f"units or several maps when its journal started), "
+                       f"so a rerun can't rebuild it from its system alone.")
+    sysname = st.get("system_name") or m.system_name
+    if sysname not in mgr.systems:
+        raise VTTError(f"`{mid}` was made on system `{sysname}`, which this "
+                       f"server no longer has.")
+    mp0 = next(iter(smaps.values()))
+    try:
+        w, h = int(mp0.get("width") or mp0.get("grid_width")), \
+            int(mp0.get("height") or mp0.get("grid_height"))
+    except (TypeError, ValueError):
+        w, h = m.get_map().grid_width, m.get_map().grid_height
+    # The old match steps aside while the new one runs under its id.
+    old = mgr.matches.pop(mid)
+    refused: List[str] = []
+    skipped: List[str] = []
+    ran = 0
+    try:
+        mgr.create_match(mid, str(st.get("name") or m.name), w, h,
+                         system_name=sysname, owner=st.get("owner"))
+        nm = mgr.matches[mid]
+        _rerun_handover(mgr, old, nm)
+        nm.cohosts = list(st.get("cohosts") or [])
+        nm.uid = old.uid
+        _replay_rng(nm, [st.get("rng_seed"), st.get("rng_pos", 0)])
+        nm.journal = None
+        ensure_journal(mgr, nm, "created")
+        handled = getattr(mgr, "_journal_handled", None)
+        if handled is not None:
+            handled.add(mid)
+        for e in entries:
+            n = e.get("n")
+            kind = e.get("kind")
+            nm = mgr.matches.get(mid)
+            if nm is None:
+                skipped.append(f"#{n} and after (the match was deleted)")
+                break
+            toks = [str(t) for t in e.get("cmd") or []]
+            if kind in ("systems", "template"):
+                continue
+            if kind == "state" and (not toks or toks[0].startswith("(")):
+                skipped.append(f"#{n} (stored state, no command)")
+                continue
+            if not toks:
+                continue
+            key = (toks[0].lower(), toks[1].lower() if len(toks) > 1 else "")
+            if key[0] == "match" and key[1] in ("rerun", "replay"):
+                continue
+            if key in _RERUN_OTHER_MATCH:
+                skipped.append(f"#{n} `!{' '.join(toks)}`"[:80]
+                               + " (needs another match)")
+                continue
+            rng = e.get("rng")
+            if isinstance(rng, list) and len(rng) >= 2:
+                _replay_rng(nm, rng[:2])
+            nm.paused = None
+            rctx = _ReplayCtx(ctx, str(e.get("ch") or ctx.channel_key),
+                              e.get("uid"), str(e.get("by") or ""))
+            auth = e.get("auth")
+            auth = auth if isinstance(auth, list) and len(auth) in (2, 3) \
+                else [False, False]
+            rctx.is_admin = bool(auth[0]) and ctx_is_admin(ctx)
+            rctx.is_bot_owner = bool(auth[1]) and ctx_is_bot_owner(ctx)
+            rctx.capabilities = [
+                c for c in (auth[2] if len(auth) == 3
+                            and isinstance(auth[2], list) else [])
+                if isinstance(c, str) and ctx_can(ctx, c)]
+            roles = e.get("roles")
+            rctx.role_ids = tuple(str(r) for r in roles) \
+                if isinstance(roles, list) else ()
+            cache_token = PARTIAL_CACHE.set({})
+            ab_token = APPROVED_BY.set(
+                str(e["approved_by"]) if e.get("approved_by") else None)
+            try:
+                with _channel_pointed_at(mgr, rctx.channel_key, mid):
+                    await registry.run(toks[0], toks[1:], rctx, mgr)
+            finally:
+                APPROVED_BY.reset(ab_token)
+                PARTIAL_CACHE.reset(cache_token)
+            ran += 1
+            bad = next((r for r in rctx.replies
+                        if r.lstrip().startswith(("❌", "💥"))), None)
+            if bad is not None:
+                refused.append(f"#{n} `!{' '.join(toks)}`"[:90] + " → "
+                               + bad.strip().splitlines()[0][:150])
+            await asyncio.sleep(0)
+    except Exception:
+        # The rebuild failed as a whole: the old match stays as it was.
+        mgr.matches[mid] = old
+        raise
+    if mid not in mgr.matches:
+        mgr.matches[mid] = old
+        raise VTTError(f"The rerun deleted `{mid}`; the old match stays.")
+    _rerun_keep(mgr, old)
+    _RERUN_FRESH.set(id(mgr.matches[mid]))
+    audit_note(f"!match rerun {mid}: rebuilt from system `{sysname}` "
+                    f"and its journal ({ran} command(s))")
+    out = [f"🔁 Rebuilt `{mid}` from system `{sysname}` and ran {ran} "
+           f"journal command{'s' if ran != 1 else ''} again."]
+    if refused:
+        out.append(f"⚠️ {len(refused)} command{'s' if len(refused) != 1 else ''} "
+                   f"now refuse{'s' if len(refused) == 1 else ''}:")
+        out += [f"- {r}" for r in refused[:30]]
+        if len(refused) > 30:
+            out.append(f"- … and {len(refused) - 30} more")
+    else:
+        out.append("✅ Every command ran as before (none refused).")
+    if skipped:
+        out.append("Skipped: " + "; ".join(skipped[:10])
+                   + (f" (+{len(skipped) - 10} more)"
+                      if len(skipped) > 10 else "") + ".")
+    out.append("The old match is kept 24 hours: `!match rerun undo` puts it "
+               "back.")
+    await ctx.send("\n".join(out))
+
+
+async def _match_rerun_undo(ctx: ReplyContext, mgr: MatchManager, mid: str,
+                            m: Optional[Match]):
+    rec, path = _rerun_kept(mgr, mid)
+    if rec is None:
+        raise VTTError(f"No match `{mid}` replaced by a rerun in the last 24 "
+                       f"hours.")
+    if m is not None:
+        require_target_host(ctx, m, "put its pre-rerun version back")
+    else:
+        _require_match_creator(ctx, mgr)
+    old = Match.from_dict(copy.deepcopy(rec["state"]))
+    if old.system_name not in mgr.systems:
+        raise VTTError(f"The kept match is on system `{old.system_name}`, "
+                       f"which this server no longer has.")
+    if rec.get("journal"):
+        j = Journal()
+        j.segments = copy.deepcopy(rec["journal"])
+        ns = [e.get("n", 0) for e in j.entries()]
+        j.next_n = max(ns) + 1 if ns else 1
+        old.journal = j
+    if m is not None:
+        _rerun_handover(mgr, m, old)
+    mgr.matches[mid] = old
+    mgr.apply_system_rules(old)
+    handled = getattr(mgr, "_journal_handled", None)
+    if handled is not None:
+        handled.add(mid)
+    if path is not None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    else:
+        (getattr(mgr, "_rerun_kept", None) or {}).pop(mid, None)
+    audit_note(f"!match rerun undo {mid}: the pre-rerun match restored")
+    await ctx.send(f"↩️ `{mid}` is back as it was before the rerun (its "
+                   f"undo history from then is gone).")
 
 
 async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,

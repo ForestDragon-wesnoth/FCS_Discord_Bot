@@ -47363,3 +47363,84 @@ gate as typed (`!ent info` is a player read). A player's `!ent hp huntr`
 waits for approval as typed; when a host approves it, the refusal names
 the suggestions as text (the approver didn't type it, so nothing is
 offered).
+
+SCENARIO 1276 — !match rerun: rebuild a match from the current system and run its journal again (W19)
+-------------------------------------------------------------------------------------------------------
+!system new rrs
+!system set rrs random_seed rr1
+!system func def rrs dmg - "3"
+!system func def rrs bonus - "1"
+!match new rr RR 8 6 rrs
+!match use rr
+!match var set note x
+!ent add a A 20 1 1 30
+!ent add b B 20 3 1 20
+!ent set_var a actions.hit.target entity
+!ent set_var a actions.hit.body "entity[target].hp -= dmg() + roll('1d4')"
+!ent set_var a actions.zap.target entity
+!ent set_var a actions.zap.body "entity[target].hp -= bonus()"
+!turn next
+!action a hit b
+!assert "entity[b].hp == 15"
+!action a zap b
+!ent move b 1 down
+!undo command 1
+!match new other OT 4 4
+!match use rr
+!match link other
+!system func def rrs dmg - "5"
+!system func remove rrs bonus
+!match rerun
+?? 🔁 Rebuilt `rr` from system `rrs` and ran
+?? ⚠️ 1 command now refuses:
+?? `!action a zap b`
+?? (needs another match)
+?? `!match rerun undo` puts it back.
+!assert "entity[b].hp == 13"
+!assert "entity[b].y == 1"
+!assert "match_var_get('note') == 'x'"
+!as restart
+!match use rr
+!match journal 2
+?? `!ent move b 1 down`
+!undo command 1
+?? Reverted past `!action a hit b`.
+!assert "entity[b].hp == 20"
+!match rerun undo
+?? ↩️ `rr` is back as it was before the rerun
+!assert "entity[b].hp == 14"
+!match rerun undo
+?? ❌ No match `rr` replaced by a rerun in the last 24 hours.
+!as player bob
+!match rerun
+?? needs host approval
+!as host
+!match new short SH 4 4 rrs
+!match use short
+!system set rrs command_journal_limit 2
+!ent add u U 5 1 1
+!ent add v V 5 2 1
+!ent add w W 5 3 1
+!ent add x X 5 4 1
+!ent add y Y 5 1 2
+!ent add z Z 5 2 2
+!match rerun
+?? doesn't reach back to the match's creation
+
+Expected: a match on system `rrs` hits b with an action whose damage
+comes from the system's `dmg()` (3) plus a d4 (a 2 under the seed: b 20 → 15), and
+zaps it for `bonus()` (1, b at 14); b moves and the move is undone; the match
+is linked to another. Then the system changes: `dmg()` becomes 5 and
+`bonus` is removed. `!match rerun` rebuilds `rr` from the system as it is
+now and runs the journal again with the recorded dice: the hit deals 5
+plus the same 2 (b at 13), the zap refuses (reported by entry number),
+the undo lands on the same step (b back at row 1), the link to the other
+match is skipped and reported, and match vars set by commands come back.
+The rerun is no undo step of its own: the rebuilt history's last step is
+the hit (the zap refused), so `!undo command 1` takes it back (b at 20).
+The rebuilt match, its undo history and its journal (the commands it
+ran) survive a restart. `!match rerun undo` restores the pre-rerun match
+(b at 14), once. A
+player's rerun waits for a host. A match whose journal no longer reaches
+its creation (command_journal_limit 2 keeps the newest two segments) is
+refused.
