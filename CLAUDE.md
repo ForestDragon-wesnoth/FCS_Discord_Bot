@@ -5084,6 +5084,14 @@ rejected already. Update this section in the PR that resolves an item.
   (idea #622, the proposed answers in it). Template hooks on corpses are
   on hold (idea #623).
 
+- **Template hooks on stored snapshots** (user: discuss later): a unit
+  snapshot stored in a var (`!ent store_entity_into_var`, or
+  `entity_snapshot` written with a var set) carries its partial
+  templates' markers, so the write fires on_template_applied for each of
+  them on the unit holding the var. Passives filtered with target= /
+  scope= to their own containers (`class`, `equipped`) ignore it; a
+  passive with no target sees it.
+
 - **Dragged corpses fire no hooks** (user: a known limitation; code it
   when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross
   tiles and zones without their enter / exit / stop hooks.
