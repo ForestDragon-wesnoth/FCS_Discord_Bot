@@ -46897,3 +46897,109 @@ move_kind bound, so the vampire's sunlight weakness lives in the vampire
 per cell the 2x2 body newly covers. A push carries the vampire out of the
 sun, and the sun moving onto it fires on_zone_entered with move_kind
 `zone`.
+
+
+SCENARIO 1268 — One passive on several hooks: when=a,b, hook_name, listed and removed once (#489)
+--------------------------------------------------------------------------------------------------
+
+!match new mh Mh 8 6
+!match use mh
+!ent add hero Hero 10 2 2 10
+!ent add ogre Ogre 30 5 3 5
+!ent set_var hero seen x
+!passive add hero tick on_turn_start,on_revive,on_var_changed target=hp scope=exact "entity[self].seen = entity[self].seen + ';' + hook_name"
+?? Added passive `tick` (on_turn_start,on_revive,on_var_changed) watching `hp` scope=`exact` to `hero`.
+!passive list hero
+?? - `tick` (on_turn_start,on_revive,on_var_changed on `hp` scope=`exact`)
+!passive info hero tick
+?? Hooks: `on_turn_start`, `on_revive`, `on_var_changed`
+!turn next
+?? ⚙️ passive `hero.tick` fired on `hero` (on_turn_start)
+!ent hp hero 7
+?? (on_var_changed)
+!ent kill hero
+!ent revive hero
+?? ⚙️ passive `hero.tick` fired on `hero` (on_revive)
+!assert "entity[hero].seen == 'x;on_turn_start;on_var_changed;on_var_changed;on_var_changed;on_revive'"
+!ent set_var hero mood calm
+!assert "entity[hero].seen == 'x;on_turn_start;on_var_changed;on_var_changed;on_var_changed;on_revive'"
+!passive add hero bad on_turn_start,,on_revive "1"
+?? holds an empty hook name
+!passive add hero bad on_turn_start,on_turn_start "1"
+?? names `on_turn_start` twice
+!passive add hero bad on_var_written,on_var_changed "1"
+?? `on_var_written` already fires for `on_var_changed`
+!passive add hero bad on_turn_start,on_nothing "1"
+?? Unknown passive hook 'on_nothing'
+!passive remove hero tick
+?? Removed passive `tick` from `hero`.
+!passive list hero
+?? `hero` has no passives.
+?tab "!passive add hero x on_turn_start,on_re"
+?? → '!passive add hero x on_turn_start,on_revive '
+
+Expected: a passive's <when> takes several hooks joined by commas (#489):
+the hero's `tick` fires on its turn start, on writes to hp (target and
+scope apply to the var hook) and on its revive, writing the hook that fired
+(`hook_name`, now bound for every hook) into `seen`: the turn start, the hp
+write, the death's and the revive's hp writes, the revive. A write to
+another var fires nothing. The list shows it once, info names each hook,
+the fired line names the hook that fired, and one `!passive remove` takes
+it off. Refused: an empty word, a hook named twice, on_var_written beside
+one of the var events it already covers, an unknown hook. Tab completes the
+word after the last comma.
+
+
+SCENARIO 1269 — Hook lists on global, team and default passives; a 2x2 body; restart and template (#489)
+---------------------------------------------------------------------------------------------------------
+
+!match new mg Mg 10 8
+!match use mg
+!ent add ogre Ogre 30 2 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2 team=red
+!ent add imp Imp 5 7 6 4
+!eval "entity[ogre].log = []"
+!team passive add red steps on_entity_moved,on_entity_step "entity[self].log = entity[self].log + [hook_name]"
+?? Added team passive `steps` (on_entity_moved,on_entity_step) to `red`.
+!ent move ogre 2 right
+!assert "entity[ogre].log == ['on_entity_step', 'on_entity_step', 'on_entity_moved']"
+!match var set hits ""
+!gpassive add g1 on_turn_end,event:boom "match_var_set('hits', match_var_get('hits') + hook_name + ' ')"
+!emit boom
+!turn next
+!turn next
+!assert "match_var_get('hits') == 'event:boom on_turn_end '"
+!defpassive add dp on_entity_spawned,on_revive "entity[self].born = hook_name"
+?? Added default passive `dp` (on_entity_spawned,on_revive)
+!ent add rat Rat 3 8 2 2
+!assert "entity[rat].born == 'on_entity_spawned'"
+!ent kill rat
+!ent revive rat
+!assert "entity[rat].born == 'on_revive'"
+!template save ogre brute
+!template spawn brute 6 2
+!passive list brute
+?? - `dp` (on_entity_spawned,on_revive)
+!eval "entity[brute].log = []"
+!ent move brute 1 down
+!assert "entity[brute].log == ['on_entity_step', 'on_entity_moved']"
+!as restart
+!match use mg
+!team passive list red
+?? - `steps` (on_entity_moved,on_entity_step)
+!eval "entity[ogre].log = []"
+!ent move ogre 1 down
+!assert "entity[ogre].log == ['on_entity_step', 'on_entity_moved']"
+!team passive add red bad on_kill,on_kill "1"
+?? names `on_kill` twice
+!defpassive remove dp
+
+Expected: hook lists work on every kind of passive (#489). A team passive
+on on_entity_moved,on_entity_step fires on the 2x2 ogre for each step and
+once for the move, `hook_name` telling them apart. A global one on
+on_turn_end and a custom event fires on the emit and at the turn's end. A
+default passive on on_entity_spawned,on_revive reaches a new rat at spawn
+and again at its revive (a revive is a spawn too, so both fire, on_revive
+last). A template saved from the ogre spawns a `brute` holding the default
+passive with its list, and the team passive fires on the brute's steps; the
+lists survive a restart. A team passive naming a hook twice is refused.

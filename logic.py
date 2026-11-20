@@ -7656,8 +7656,10 @@ MODIFIER_OPS: Tuple[str, ...] = ("add", "inc%", "more%", "set", "min", "max")
 #    - on_round_end        fired after each round (once per entity in turn_order)
 #    - on_entity_spawned   fired once when an entity is spawned via Entity.spawn
 #
-#    For these, formula context exposes: this, self. Var-event bindings
-#    (changed_key, old_value, new_value, hook_name) are bound to None.
+#    For these, formula context exposes: this, self and hook_name (the
+#    hook that fired, so a passive listening to several, #489, tells them
+#    apart). The other var-event bindings (changed_key, old_value,
+#    new_value) are bound to None.
 #
 # 2. Var hooks (carry a payload describing a single var-event):
 #    - on_var_created      a previously-nonexistent path was just created.
@@ -7930,6 +7932,39 @@ def is_event_hook(when: Any) -> bool:
             and when.startswith(_EVENT_WHEN_PREFIX)
             and len(when) > len(_EVENT_WHEN_PREFIX))
 
+def passive_hooks(when: Any) -> List[str]:
+    """The hooks a passive's `when` names (#489): one hook, or several
+    joined by commas (`on_turn_start,on_revive`), each a HOOK_NAMES entry
+    or `event:<name>`. Refuses an empty word, a hook named twice, and
+    on_var_written beside on_var_created / changed / removed (the
+    catch-all already covers them, so the passive would fire twice)."""
+    if not isinstance(when, str) or not when.strip():
+        raise VTTError("A passive needs a hook: `!help passive` lists them.")
+    words = [w.strip() for w in when.split(",")]
+    out: List[str] = []
+    for w in words:
+        if not w:
+            raise VTTError(f"`{when}` holds an empty hook name (two commas "
+                           f"in a row, or one at an end).")
+        if w not in HOOK_NAMES and not is_event_hook(w):
+            allowed = ", ".join(sorted(HOOK_NAMES))
+            raise VTTError(
+                f"Unknown passive hook '{w}'. Allowed: {allowed}; "
+                f"or a custom event subscription 'event:<name>'.")
+        if w in out:
+            raise VTTError(f"`{when}` names `{w}` twice.")
+        out.append(w)
+    if "on_var_written" in out:
+        both = [h for h in ("on_var_created", "on_var_changed",
+                            "on_var_removed") if h in out]
+        if both:
+            raise VTTError(
+                f"`on_var_written` already fires for `{both[0]}` (it is the "
+                f"catch-all of created / changed / removed); list one or "
+                f"the other.")
+    return out
+
+
 # Tile hooks live in tiles[(x, y)]["hooks"][<name>] as formula strings.
 # Movement hooks (on_enter / on_exit / on_stop) fire when an entity
 # transits a tile via Entity.tp / Entity.move_dirs (and
@@ -8069,7 +8104,12 @@ class Passive:
                     subscription. Use hook_name to discriminate inside an
                     on_var_written passive.)
 
-    For non-var hooks, all four bindings above are None.
+    For non-var hooks, hook_name is the hook that fired and the other three
+    are None.
+
+    `when` may list several hooks joined by commas (#489,
+    `on_turn_start,on_revive`): one passive, listed and removed once,
+    firing on each (`hooks`, `fires_on`; `passive_hooks` checks the list).
 
     --- Filtering var hooks: `target` + `scope` ---
 
@@ -8119,12 +8159,10 @@ class Passive:
         if self.extra_turns is not None and \
                 not isinstance(self.extra_turns, bool):
             raise VTTError("Passive extra_turns must be true, false or unset.")
-        if self.when not in HOOK_NAMES and not is_event_hook(self.when):
-            allowed = ", ".join(sorted(HOOK_NAMES))
-            raise VTTError(
-                f"Unknown passive hook '{self.when}'. Allowed: {allowed}; "
-                f"or a custom event subscription 'event:<name>'."
-            )
+        # One hook or several (#489); stored joined by commas, so the
+        # saved shape stays one text.
+        self.hooks = tuple(passive_hooks(self.when))
+        self.when = ",".join(self.hooks)
         if not isinstance(self.formula, str):
             raise VTTError("Passive formula must be a string.")
         if not isinstance(self.target, str):
@@ -8134,6 +8172,15 @@ class Passive:
             raise VTTError(
                 f"Unknown passive scope '{self.scope}'. Allowed: {allowed}"
             )
+
+    def fires_on(self, hook: str) -> bool:
+        """Whether this passive listens to `hook` (one of its hooks)."""
+        return hook in self.hooks
+
+    @property
+    def var_hooks(self) -> bool:
+        """Whether any of its hooks is a var hook (target / scope apply)."""
+        return any(h in VAR_HOOKS for h in self.hooks)
 
     def matches_event(self, changed_key: str) -> bool:
         """
@@ -8716,26 +8763,31 @@ def _run_passive_line(engine, p: "Passive", ctx, *, target_id: str,
                 if tps.get(p.id) is p:
                     label = f"team passive `{team}.{p.id}`"
                     break
+    when = p.when
+    if len(p.hooks) > 1:
+        fired = (getattr(ctx, "extras", None) or {}).get("hook_name")
+        if isinstance(fired, str) and fired:
+            when = fired
     try:
         result = engine.eval_program(p.formula, ctx)
         if result is None:
-            return "fired", f"⚙️ {label} fired on `{target_id}` ({p.when})"
+            return "fired", f"⚙️ {label} fired on `{target_id}` ({when})"
         return ("result",
-                f"⚙️ {label} fired on `{target_id}` ({p.when}) → {result!r}")
+                f"⚙️ {label} fired on `{target_id}` ({when}) → {result!r}")
     except FormulaError as ex:
-        return "error", f"⚠️ {label} on `{target_id}` ({p.when}) FAILED: {ex}"
+        return "error", f"⚠️ {label} on `{target_id}` ({when}) FAILED: {ex}"
     except RecursionError:
         # Hooks that keep setting each other off past what Python's stack
         # holds (a var_hook_recursion_limit raised past ~90 levels): the
         # chain stops here, as at the limit; no crash entry, nothing broke.
         return "error", (
-            f"⚠️ {label} on `{target_id}` ({p.when}) stopped: hooks set "
+            f"⚠️ {label} on `{target_id}` ({when}) stopped: hooks set "
             f"each other off too deep (lower var_hook_recursion_limit).")
     except Exception as ex:
         # Defensive: programmer-error or unexpected bug shouldn't nuke a turn.
-        ref = crash_ref(f"{label} on `{target_id}` ({p.when})", ex)
+        ref = crash_ref(f"{label} on `{target_id}` ({when})", ex)
         return "error", (
-            f"💥 {label} on `{target_id}` ({p.when}) CRASHED{ref}: "
+            f"💥 {label} on `{target_id}` ({when}) CRASHED{ref}: "
             f"{type(ex).__name__}: {ex}")
 
 
@@ -22364,15 +22416,15 @@ class Match:
         tile/zone on_round_* time-hooks."""
         rnames = ("on_round_start", "on_round_end")
         for p in self.global_passives.values():
-            if p.when in rnames:
+            if any(h in rnames for h in p.hooks):
                 return True
         for ps in self.team_passives.values():
             for p in ps.values():
-                if p.when in rnames:
+                if any(h in rnames for h in p.hooks):
                     return True
         for e in self.entities.values():
             for p in e.passives.values():
-                if p.when in rnames:
+                if any(h in rnames for h in p.hooks):
                     return True
         if str(self.rules.get("status_tick_when", "never")) in rnames and \
                 str(self.rules.get("status_tick_formula", "")).strip():
@@ -22767,7 +22819,7 @@ class Match:
         `extras` and move_kind bound; nothing when no passive of the unit,
         its team or the match listens (the per-step common case)."""
         if eid not in self.entities or not self._ordered_passives(
-                eid, lambda p: p.when == when):
+                eid, lambda p: p.fires_on(when)):
             return []
         return self.fire_hook(when, target_ids=[eid], extras={
             **extras, "hook_name": when, "move_kind": MOVE_KIND.get()})
@@ -24862,7 +24914,7 @@ class Match:
         log: List[str] = []
         # A global/team handler may have removed the entity (kill/remove);
         # its own passives don't fire from beyond the grave.
-        self._run_ordered(engine, ctx, entity_id, lambda p: p.when == when,
+        self._run_ordered(engine, ctx, entity_id, lambda p: p.fires_on(when),
                           log)
         # Then the status definition's own hook (`!status hook`): what a
         # status does on arrival / removal / change lives in the status.
@@ -25220,7 +25272,7 @@ class Match:
         with move_hook_level(self.rules, log, self.id, move=True) as fire:
             if fire:
                 self._run_ordered(engine, ctx, entity_id,
-                                  lambda p: p.when == "on_entity_moved", log)
+                                  lambda p: p.fires_on("on_entity_moved"), log)
         # Fog memory: a move can reveal new cells for the mover's team —
         # fold current vision into its explored set (no-op unless memory
         # on). Other entities a passive moved record via their own fires.
@@ -25279,7 +25331,7 @@ class Match:
         with move_hook_level(self.rules, log, self.id) as fire:
             if fire:
                 self._run_ordered(engine, ctx, entity_id,
-                                  lambda p: p.when == "on_entity_step", log)
+                                  lambda p: p.fires_on("on_entity_step"), log)
         # Fog memory: capture cells revealed mid-path, per step (the
         # once-per-move record in fire_entity_moved would miss a stepwise
         # move's intermediate vision).
@@ -25320,7 +25372,7 @@ class Match:
         ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
         log: List[str] = []
         self._run_ordered(engine, ctx, actor_id,
-                          lambda p: p.when == "on_action_used", log)
+                          lambda p: p.fires_on("on_action_used"), log)
         return log
 
     def fire_action_used_on_target(
@@ -25360,7 +25412,7 @@ class Match:
         ctx = EvalCtx(this=this_id, target=target_id, extras=extras)
         log: List[str] = []
         self._run_ordered(engine, ctx, target_id,
-                          lambda p: p.when == "on_action_used_on_target", log)
+                          lambda p: p.fires_on("on_action_used_on_target"), log)
         return log
 
     def fire_action_failed(
@@ -25403,7 +25455,7 @@ class Match:
         ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
         log: List[str] = []
         self._run_ordered(engine, ctx, actor_id,
-                          lambda p: p.when == "on_action_failed", log)
+                          lambda p: p.fires_on("on_action_failed"), log)
         return log
 
     # ---- summon / entity-template helpers --------------------------------
@@ -29048,6 +29100,9 @@ class Match:
         # Lazy import to avoid logic <-> formula import cycle.
         from formula import FormulaEngine, EvalCtx
 
+        # hook_name names the hook that fired, so a passive listening to
+        # several (#489) tells them apart.
+        extras = {"hook_name": when, **(extras or {})}
         log: List[str] = []
         if target_ids is None:
             target_ids = list(self.turn_order)
@@ -29055,10 +29110,10 @@ class Match:
         engine = FormulaEngine(self)
         if passive_filter is None:
             def pred(p):
-                return p.when == when
+                return p.fires_on(when)
         else:
             def pred(p):
-                return p.when == when and passive_filter(p)
+                return p.fires_on(when) and passive_filter(p)
 
         for tid in target_ids:
             e = self.entities.get(tid)
@@ -29121,7 +29176,7 @@ class Match:
             # handlers (self = target). All by priority; a handler that
             # removed the target stops its own handlers afterward.
             for p, kind in self._ordered_passives(
-                    target, lambda p: p.when == when):
+                    target, lambda p: p.fires_on(when)):
                 if kind == "own" and target not in self.entities:
                     continue
                 if kind == "global":
@@ -29229,7 +29284,7 @@ class Match:
         for hook in (kind_hook, "on_var_written"):
             self._run_ordered(
                 engine, ctx, entity_id,
-                lambda p, h=hook: p.when == h and p.matches_event(ev.key),
+                lambda p, h=hook: p.fires_on(h) and p.matches_event(ev.key),
                 log)
 
         return log
@@ -29328,7 +29383,7 @@ class Match:
         # own passives firing from beyond the grave.
         self._run_ordered(
             engine, ctx, entity_id,
-            lambda p: (p.when == "on_var_write_attempt"
+            lambda p: (p.fires_on("on_var_write_attempt")
                        and p.matches_event(path)), log)
 
         return log
@@ -33113,11 +33168,12 @@ def _check_template_passives_clamps(spec: Dict[str, Any], what: str) -> None:
             if field_name == "clamps":
                 continue
             when, formula = v.get("when"), v.get("formula")
-            if not isinstance(when, str) or (when not in HOOK_NAMES
-                                             and not is_event_hook(when)):
+            try:
+                passive_hooks(when)
+            except VTTError as ex:
                 raise VTTError(f"{what}: passive `{k}` needs `when`: a hook "
-                               f"(`!help passive`) or `event:<name>`, got "
-                               f"{when!r}.")
+                               f"(`!help passive`), `event:<name>` or several "
+                               f"joined by commas, got {when!r} ({ex})")
             if not isinstance(formula, str) or not formula.strip():
                 raise VTTError(f"{what}: passive `{k}` needs `formula`: the "
                                f"program it runs.")

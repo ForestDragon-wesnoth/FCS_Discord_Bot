@@ -1501,6 +1501,16 @@ hardcodes**.
   stands, else its corpse's cell), so a channel whose view can't see it
   drops them (987); a tile's or zone's hook lines (`fired for <unit>`)
   the same way (`Match._hook_lines_about`, 1159).
+- **Several hooks per passive** (#489, 1268-1269): `when` may list hooks
+  joined by commas (`on_turn_start,on_revive`), on every passive add;
+  `logic.passive_hooks` checks the list (an empty word, a hook twice, or
+  on_var_written beside a var event it already covers is refused) and the
+  Passive keeps it as `hooks` (`when` stays the joined text, so saves keep
+  one string). Every fire site matches with `Passive.fires_on(hook)`
+  (never `p.when ==`); `fire_hook` binds `hook_name` for every hook, so
+  the body tells which fired, and a multi-hook passive's fired / error
+  line names that hook. Listed and removed once; target / scope apply to
+  its var hooks (`Passive.var_hooks`).
 - **Default passives** (`default_entity_passives`, `!defpassive`): copied
   onto every unit at `Entity.spawn` (`_apply_default_passives`). With
   `default_passives_existing_units` on (default; #221, user call, 1091-1092)

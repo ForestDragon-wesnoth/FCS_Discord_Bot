@@ -14,7 +14,7 @@ full (everything its entry asks for or assumes), its number moves to
 part keeps its entry, trimmed to what is still open. When the user strikes
 or rejects one, it moves to "Off the list".
 
-**Shipped:** #387, #388, #390, #386 (hooks: on_kill, on_part_destroyed, move_kind, unit-side zone and tile hooks), #116, #267, #310, #309, #389 (statuses: `max_duration`, `if_source_lost`, ticks on the applier's clock, gain / loss / level lines, blocked applications), #349, #350, #351, #352, #353, #324, #431, #354 (the formula language: `-=`, unpacking, read subscripts, f-strings, type tests, `return`, `:=`, line numbers), #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
+**Shipped:** #387, #388, #390, #386, #489 (hooks: on_kill, on_part_destroyed, move_kind, unit-side zone and tile hooks, one passive on several hooks), #116, #267, #310, #309, #389 (statuses: `max_duration`, `if_source_lost`, ticks on the applier's clock, gain / loss / level lines, blocked applications), #349, #350, #351, #352, #353, #324, #431, #354 (the formula language: `-=`, unpacking, read subscripts, f-strings, type tests, `return`, `:=`, line numbers), #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
 #75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #135 (`pending_request_expiry_seconds`), #221 (`default_passives_existing_units`, on by default), #89, #326, #269, #270, #271, #325 (formula helpers: `chance`, `exists` / `is_alive`, cell sets, `cell_toward` / `cell_behind`, `roll_dice`, dict helpers), #123, #134, #328, #266, #111, #282, #275, #59 and #124 (`!turn roll`, `initiative_reroll_each_round`), #395, #457, #460, #539, #540, #522, #396 (formula helpers: `teams` / `group_names`, `entities_in_cells`, `plural` / `ordinal` / `list_text`, `own_turns`, `fits_at`, `free_cells_near`, `corpse_cell` / `corpses_within`), #587, #590, #605, #610, #600, #434, #538, #453, #456 (destroyed parts marked, `!ent clone` without coordinates, `!zone copy`, table roll counts and `!roll <table>`, `!mount list` for the match, `!ent add` with vars, the empty turn order explained, `!find` aggregates, `!template list has=`), #535, #268, #329, #454 (corpses: read with `!ent info` / `get`, written and looted, dragged, swept with `!find dead` / `!foreach dead`), #104, #361, #253, #459, #362, #520 (dice pools, rerolls, Fate dice and d%; `roll_odds` / `roll_mean`; table roll adjustments, ranks and best / worst; sub-tables and dice in entries; `!table odds`; the action dice line), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
@@ -280,7 +280,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#455 Cell sweeps.** `!foreach cells:<rect | zone:name | tag:filter> ; <command with $x $y>`. Map building in one line ("fire on every cell of the gas zone"); `!foreach` walks units only.
 - **#458 Repeating schedules.** `every=<n>` on `schedule`, `schedule_on` and `!schedule`. Today a body reschedules itself through a `!func`.
 - **#461 Passive guards.** `if=<expression>` on any passive, shown in the lists and read natively for the simple shapes the death condition already uses, so a guarded passive skips the namespace build. Pairs with #327.
-- **#462 One-shot passives.** A `once` word on a passive: it fires one time and removes itself ("the first time you drop below half"). Watchers have it; passives do not.
+- **#462 One-shot passives.** A `once` word on a passive: it fires one time and removes itself ("the first time you drop below half"). Watchers have it; passives do not. Open questions (user: both a and b look to have a niche; decide later): (a) the passive is spent after its first run, whatever it does; (b) it is spent only after a run whose result is truthy (`return True`), so the body decides ("the first time hp drops below half" checks and returns); (c) a `condition=` expression beside `once`, read before the body. Also open: a global or team `once` passive is one passive, so its first firing removes it for every unit, while a default passive is a copy per unit and is spent per unit; and whether spent means removed (gone from `!passive list`) or kept and marked spent (re-armable, like a watcher's `once_each`).
 - **#463 Passive error limit.** A rule `passive_error_limit`: a passive that errors that many times running is switched off with a ⚠️ until a host re-enables it. A broken global passive prints its error for every unit on every hook.
 - **#464 Collapsed repeat lines.** Identical ⚠️ and ⚙️ lines in one reply fold into one with a count ("×12").
 - **#465 Per-reaction modes.** `!react mode <eid> <reaction> ask|auto|never`: a player's standing order per reaction ("always dodge, ask about block"). `__reaction_mode` covers all of a unit's reactions at once, and `auto_when` belongs to the GM.
@@ -302,7 +302,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#486 Explain a status instance.** `!status view <eid> <name>`: every effective field at the instance's level with its origin (instance, definition, which level entry). Per-level layering makes that hard to read off `!status info`.
 - **#487 Explain a clamp.** `!clamp why <eid> <path>`: the clamps that apply (unit, system default), each bound's current value and whether a soft clamp is dormant.
 - **#488 Bracket access for statuses and corpses.** `status[self].burn.level -= 1`, `corpse[gob3].inventory`, and `rule.<name>` as a read. Extends #373 to the remaining stores.
-- **#489 Passives on several hooks.** `when=on_turn_start,on_revive`: one body, several hooks. Today the passive is added once per hook.
 - **#490 Query events.** `ask(name, payload, target=None)` fires the event's handlers and returns their values as a list. A system gets its own extension points ("does anything forbid this?", "bonus to hit from anyone"); `emit` returns nothing to its caller.
 - **#491 Turn-clock schedules.** `clock='turns'` on `schedule`: a match-level schedule counting turn boundaries. `schedule` raises under ATB, and `schedule_on` needs a unit.
 - **#492 `!func rename`.** Renames a function and rewrites its calls in every stored formula, listing what it changed. Statuses, zones, tables and macros rename this way; `!func` has def and list.
@@ -836,7 +835,7 @@ From the #349-#385 review:
 
 From the #386-#418 review:
 
-- **Hooks:** #119, #462, #489, #120
+- **Hooks:** #119, #462, #120
 - **Formula twins of commands:** #391, #392, #393, #394, #395, #396, #397
 - **Approvals and players:** #398, #399, #400, #401
 - **Looks and reads:** #402, #403, #404, #405, #406, #407, #408
@@ -868,7 +867,7 @@ From the #483-#513 review (#501 and later come with a build sketch and the open 
 
 - **Catching silent mistakes:** #483, #484, #485, #498
 - **Explain tools:** #486, #487
-- **Formulas and hooks:** #488, #489, #490, #491, #492, #493
+- **Formulas and hooks:** #488, #490, #491, #492, #493
 - **Rules as data:** #494, #495, #497, #511
 - **Table comfort:** #499, #500, #501, #503, #505
 - **Building encounters:** #502, #504, #509
