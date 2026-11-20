@@ -90,6 +90,15 @@ class GuiCtx:
         self.app._preview = highlights
         self.app._preview_map = mp.name if mp is not None else None
 
+    async def offer_suggestions(self, question, name, choices):
+        """W20: a near-miss name's corrected commands, asked in a dialog;
+        the one picked runs after this command, as if typed."""
+        labels = [label for label, _a in choices]
+        ans = await self.prompt_choice(question, labels + ["no"], None, None)
+        for label, args in choices:
+            if ans == label:
+                self.queued = (name, args)
+
     async def prompt_choice(self, prompt, options, lo, hi):
         from tkinter import simpledialog
         if options is not None:
@@ -665,11 +674,17 @@ class GuiApp:
         if not parts:
             return
         root, *args = parts
-        try:
-            self.loop.run_until_complete(
-                registry.run(root, args, self.ctx, self.mgr))
-        except Exception as e:
-            self.log(f"❌ {e}")
+        while root is not None:
+            self.ctx.queued = None
+            try:
+                self.loop.run_until_complete(
+                    registry.run(root, args, self.ctx, self.mgr))
+            except Exception as e:
+                self.log(f"❌ {e}")
+            # A "did you mean" the user accepted runs next (W20).
+            root, args = getattr(self.ctx, "queued", None) or (None, [])
+            if root is not None:
+                self.log(f"> !{root} " + " ".join(args))
 
     def run(self):
         try:

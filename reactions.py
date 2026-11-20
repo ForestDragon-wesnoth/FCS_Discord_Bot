@@ -2030,8 +2030,9 @@ async def react_pick(ctx: Any, mgr: Any, m: Any, uid: str, requested: str,
                               requested, m.rules)
         if not found:
             names = ", ".join(f"`{n}`" for n in by_name) or "none"
-            raise VTTError(f"`{uid}` can't pick `{requested}` now. It can "
-                           f"pick: {names}.")
+            from logic import DidYouMean
+            raise DidYouMean(f"`{uid}` can't pick `{requested}` now. It can "
+                             f"pick: {names}.", requested, list(by_name))
         if len(found) > 1:
             raise VTTError(f"`{uid}` has {len(found)} reactions named "
                            f"`{requested}`: name one by its path ("

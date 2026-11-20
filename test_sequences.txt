@@ -47287,3 +47287,79 @@ lists a bounce from the hero in chain order (the ogre first);
 `:2` as max jump stops it at two links, and `!foreach` sweeps it in that
 order. In blue's fogged channel the chain skips the units blue can't see,
 so neither the ogre nor C1 shows. `!map random` is a host command.
+
+SCENARIO 1275 — "Did you mean": near-miss action names and unit ids (W20)
+-------------------------------------------------------------------------
+!match new dy DY 10 6
+!match use dy
+!ent add hunter Hunter 30 2 2 9
+!ent add hunter2 Hunter 30 3 2 8
+!ent add grazer Grazer 40 6 2 5
+!ent add spy Spy 10 9 5 4
+!ent set_var hunter actions.fire_arrows.target entity
+!ent set_var hunter actions.fire_arrows.body "entity[target].hp -= 3"
+!ent set_var hunter actions.flame_arrows.target entity
+!ent set_var hunter actions.flame_arrows.body "entity[target].hp -= 5"
+!action hunter fire_arows grazer
+?? ❌ no action `fire_arows` on `hunter`.
+?? 💡 Did you mean `fire_arrows`?
+?pick fire_arrows
+?? `Hunter` used action `fire_arrows` on `Grazer`.
+!assert "entity[grazer].hp == 37"
+!ent info grazr
+?? 💡 Did you mean `grazer`?
+?pick no
+?! Grazer
+!ent info hunter3
+?! Did you mean
+!ent hp grazr -1
+?? 💡 Did you mean `grazer`?
+?pick grazer
+!assert "entity[grazer].hp == 36"
+!batch ent info grazr ; ent info hunter
+?? ❌ Entity 'grazr' not found. Did you mean `grazer`?
+?! ?pick
+!system set default suggestion_similarity 0
+!ent info grazr
+?! Did you mean
+!system set default suggestion_similarity 75
+!ent set_var hunter team blue
+!ent set_var hunter2 team blue
+!ent set_var spy team red
+!match fog on
+!ent set_var hunter fog_vision_radius 2
+!ent set_var hunter2 fog_vision_radius 2
+!as channel blue
+!match use dy
+!match bind pov=blue
+!as player bob
+!ent info sppy
+?! spy
+!ent info huntr
+?? 💡 Did you mean `hunter`, `hunter2`?
+?pick hunter
+?? **Hunter** (`hunter`)
+!ent hp huntr -1
+?? needs host approval (request `r1`
+!as host
+!approve r1
+?? Did you mean `hunter`, `hunter2`?
+?! ?pick
+!as channel CLI
+
+Expected: a near-miss action name offers the close names (75% by the
+suggestion_similarity rule): `fire_arows` offers `fire_arrows` (and not
+`flame_arrows`, under 75%), and picking it runs the corrected command as
+typed. A
+near-miss unit id offers the unit (`grazr` → `grazer`); `?pick no` runs
+nothing. `hunter3` names no unit and offers nothing: `hunter` and
+`hunter2` differ from it only in digits. A corrected `!ent hp` changes
+grazer's hp once picked. Inside a batch nobody can be asked: the refusal
+names the suggestion as text. At 0 the rule offers nothing. In blue's
+fogged channel a player mistyping the hidden spy gets no suggestion (it
+would reveal the unit), while a near-miss of a unit the view shows is
+offered (`huntr`: `hunter` and `hunter2`) and the pick runs through the
+gate as typed (`!ent info` is a player read). A player's `!ent hp huntr`
+waits for approval as typed; when a host approves it, the refusal names
+the suggestions as text (the approver didn't type it, so nothing is
+offered).

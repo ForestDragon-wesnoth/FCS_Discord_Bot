@@ -947,6 +947,17 @@ class VTTError(Exception):
 class OutOfBounds(VTTError):
     pass
 
+
+class DidYouMean(VTTError):
+    """A lookup that missed a name (W20): `token` as typed and the names
+    it could have meant (`candidates`, unfiltered); the refusal offers the
+    close ones (vtt_commands._miss_suggestions)."""
+
+    def __init__(self, message: str, token: str, candidates: Any) -> None:
+        super().__init__(message)
+        self.token = str(token)
+        self.candidates = [str(c) for c in candidates or ()]
+
 class Occupied(VTTError):
     pass
 
@@ -6447,6 +6458,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`!match resume` unpauses and runs the held commands in order, "
             "`!match resume drop` unpauses and discards them. Read-only "
             "commands and `!match pause/resume` themselves always run."
+        ),
+    },
+    "suggestion_similarity": {
+        "default": 75,
+        "schema": {"type": "int", "min": 0, "max": 100},
+        "desc": (
+            "How close a mistyped action name or unit id must be to a real "
+            "one for the refusal to offer it (W20), as a percentage "
+            "(difflib's similarity ratio; 0 = never offer). A typed command "
+            "offers up to 3 such names: on Discord as buttons only the "
+            "person who typed it can click (each runs the corrected "
+            "command as if typed, through the gate and the approval "
+            "queue), in the CLI and GUI as a prompt; inside a batch, macro, "
+            "sweep or action the refusal names them as text. Unit "
+            "candidates come from the units the channel's view shows; ids "
+            "that differ only in their digits (`hunter2` / `hunter3`) "
+            "never suggest each other."
         ),
     },
     "pending_request_expiry_seconds": {

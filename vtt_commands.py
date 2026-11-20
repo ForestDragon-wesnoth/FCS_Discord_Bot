@@ -1,8 +1,8 @@
 ## vtt_commands.py (framework‑agnostic commands + registry)
 # vtt_commands.py
 from __future__ import annotations
-from typing import Callable, Dict, List, Optional, Protocol, Any, Set, Tuple
-from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
+from typing import Callable, Dict, Iterable, List, Optional, Protocol, Any, Set, Tuple
+from logic import MatchManager, Match, Entity, VTTError, DidYouMean, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 from match_history import MatchHistory, Snapshot, HistoryError, _now_iso
 from storage import storage_of, valid_id, fmt_bytes, server_label_file
 from prefab import capture_prefab, check_prefab, check_prefab_name, stamp_prefab, system_allows, Turn, PREFAB_KINDS
@@ -861,7 +861,10 @@ class CommandRegistry:
             result = await h(ctx, args, mgr)
             await _close_unanswered_window(ctx, mgr, name, args)
         except VTTError as e:
-            await ctx.send(f"❌ {e}")
+            # Inside a batch / macro / sweep / action nobody can be asked:
+            # a near-miss name is named in the refusal (W20).
+            await _refuse_with_suggestions(ctx, mgr, name, args, e,
+                                           offer=False)
             # A failed `!assert` stops the enclosing batch / run / foreach /
             # macro: the sentinel travels back up through each handler's
             # return value (see ASSERT_STOP).
@@ -1504,7 +1507,8 @@ class CommandRegistry:
             result = await h(ctx, args, mgr)
             await _close_unanswered_window(ctx, mgr, name, args)
         except VTTError as e:
-            await ctx.send(f"❌ {e}")
+            await _refuse_with_suggestions(ctx, mgr, name, args, e,
+                                           offer=_RUN_DEPTH.get() <= 1)
         except Exception as e:
             ref = crash_ref(f"command `{name}`", e)
             note = _crash_rollback(mgr, pre_active_mid,
@@ -2221,6 +2225,135 @@ def _command_lock(mgr: MatchManager) -> "asyncio.Lock":
 
 
 # Nesting depth of CommandRegistry.run within one asyncio task (see run()).
+# ---- "did you mean" (W20) ---------------------------------------------
+# A refusal for a unit id nobody holds, worded by the lookups in one of
+# these shapes, names the missing id; a DidYouMean carries its own
+# candidates (an action name).
+_UNIT_MISS_RES = (
+    re.compile(r"Entity '([^'\s]+)' not found"),
+    re.compile(r"Entity `([^`\s]+)` not found"),
+    re.compile(r"Could not find a unit named `([^`\s]+)`"),
+    re.compile(r"No corpse with id '([^'\s]+)'"),
+    re.compile(r"Could not find a corpse named `([^`\s]+)`"),
+)
+_SUGGEST_MAX = 3
+
+
+def _suggestion_threshold(ctx: ReplyContext, mgr: MatchManager) -> int:
+    """The suggestion_similarity rule of the channel's match, else of the
+    channel's default system."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid else None
+    if m is not None:
+        val = m.rules.get("suggestion_similarity", 75)
+    else:
+        try:
+            sysname = (mgr.default_system_per_channel.get(ctx.channel_key)
+                       or mgr.default_system_name)
+            s = mgr.systems.get(sysname) or mgr.systems.get("default")
+            val = mgr.system_value(s, "suggestion_similarity") \
+                if s is not None else 75
+        except Exception:      # noqa: BLE001 - a hint is never worth a crash
+            val = 75
+    try:
+        return max(0, min(100, int(val)))
+    except (TypeError, ValueError):
+        return 75
+
+
+def _near_names(token: str, pool: Iterable[str], threshold: int
+                ) -> List[str]:
+    """The names of `pool` at least `threshold`% similar to `token`
+    (difflib's ratio), closest first, at most _SUGGEST_MAX. Names that
+    are `token` apart from their digits (`hunter2` for `hunter3`) never
+    count: a typed digit is a choice, not a slip (user call)."""
+    if threshold <= 0:
+        return []
+    low = token.lower()
+    bare = re.sub(r"\d", "", low)
+    scored = []
+    for name in dict.fromkeys(str(p) for p in pool):
+        nl = name.lower()
+        if nl == low or re.sub(r"\d", "", nl) == bare:
+            continue
+        r = difflib.SequenceMatcher(None, low, nl).ratio() * 100
+        if r >= threshold:
+            scored.append((-r, name))
+    return [n for _r, n in sorted(scored)[:_SUGGEST_MAX]]
+
+
+def _visible_unit_names(ctx: ReplyContext, mgr: MatchManager) -> List[str]:
+    """The unit and corpse ids the channel's view shows (a suggestion
+    never names what the view hides)."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid else None
+    if m is None:
+        return []
+    pov = _query_pov(ctx, m)
+    out = [eid for eid in m.entities if not _pov_hides(m, pov, eid)]
+    for mp, x, y, cid, c in m.every_corpse():
+        if pov is None or m.corpse_visible_to(cid, c, x, y, pov, mp):
+            out.append(cid)
+    return out
+
+
+def _miss_suggestions(ctx: ReplyContext, mgr: MatchManager,
+                      args: List[str], e: Exception
+                      ) -> Tuple[Optional[str], List[str]]:
+    """(the typed word, the names it may have meant) for refusal `e`, or
+    (None, [])."""
+    try:
+        if isinstance(e, DidYouMean):
+            token, pool = e.token, e.candidates
+        else:
+            text = str(e)
+            token = None
+            for rx in _UNIT_MISS_RES:
+                mt = rx.search(text)
+                if mt:
+                    token = mt.group(1)
+                    break
+            if token is None or token not in [str(a) for a in args]:
+                return None, []
+            pool = _visible_unit_names(ctx, mgr)
+        if token not in [str(a) for a in args]:
+            return None, []
+        return token, _near_names(token, pool,
+                                  _suggestion_threshold(ctx, mgr))
+    except Exception:          # noqa: BLE001 - a hint is never worth a crash
+        return None, []
+
+
+async def _refuse_with_suggestions(ctx: ReplyContext, mgr: MatchManager,
+                                   name: str, args: List[str],
+                                   e: Exception, *, offer: bool) -> None:
+    """Send refusal `e`. When it names a word close to real names (W20):
+    a command typed at top level, on a surface that can ask
+    (`offer_suggestions`), offers each corrected command to the person who
+    typed it; anywhere else the refusal names them."""
+    token, names = _miss_suggestions(ctx, mgr, args, e)
+    if not names:
+        await ctx.send(f"❌ {e}")
+        return
+    quoted = ", ".join(f"`{n}`" for n in names)
+    asker = getattr(ctx, "offer_suggestions", None)
+    if offer and asker is not None and APPROVED_BY.get() is None:
+        await ctx.send(f"❌ {e}")
+        choices = []
+        for n in names:
+            new_args, done = [], False
+            for a in args:
+                if not done and str(a) == token:
+                    new_args.append(n)
+                    done = True
+                else:
+                    new_args.append(a)
+            choices.append((n, new_args))
+        await asker(f"💡 Did you mean {quoted}?", name, choices)
+        return
+    await ctx.send(f"❌ {e} Did you mean {quoted}?")
+
+
 _RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
     "vtt_run_depth", default=0)
 # True while `!again` replays a command (see again_cmd).
@@ -32391,9 +32524,8 @@ async def _action_info(
     if not matches:
         avail = sorted(actions.keys())
         hint = (" Available: " + ", ".join(f"`{n}`" for n in avail)) if avail else ""
-        return await ctx.send(
-            f"❌ no action `{requested}` on `{actor_id}`.{hint}"
-        )
+        raise DidYouMean(f"no action `{requested}` on `{actor_id}`.{hint}",
+                         requested, avail)
     if len(matches) > 1:
         lines = [
             f"There are {len(matches)} actions named `{requested}` on "
@@ -32566,9 +32698,9 @@ async def _run_action_dispatch(
                 hint = " Available: " + ", ".join(f"`{n}`" for n in avail) + "."
             else:
                 hint = ""
-            return await ctx.send(
-                f"❌ no action `{requested_name}` on `{actor_id}`.{hint}"
-            )
+            raise DidYouMean(
+                f"no action `{requested_name}` on `{actor_id}`.{hint}",
+                requested_name, avail)
         if len(matches) > 1:
             # Disambiguation menu: list all locations, the user re-
             # issues with the full path.

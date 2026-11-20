@@ -590,6 +590,17 @@ class DiscordCtxWrapper:
             await self._post(question + f" Type `{_shown_cmd(name, args)}` "
                                         f"to do it.")
 
+    async def offer_suggestions(self, question: str, name: str,
+                                choices: list) -> None:
+        """W20: a near-miss name's corrected commands as buttons (one per
+        name, then No); a click by the person who typed the command runs
+        that command as if typed."""
+        try:
+            view = _SuggestView(self.user_id, name, choices, self._mgr)
+            view.message = await self._ctx.send(question, view=view)
+        except Exception:
+            await self._post(question)
+
     async def offer_resume(self, m, entry: dict):
         """A host's command held on a paused match (pause_affects_hosts):
         ask to unpause, with Resume & run / Cancel buttons. Called by the
@@ -951,6 +962,84 @@ class _ResumeView(discord.ui.View):
         except Exception:
             pass
         self.stop()
+
+class _SuggestView(discord.ui.View):
+    """W20: "did you mean" buttons under a refusal: one per suggested
+    name, then No. Only the person who typed the command may click; a name
+    runs the corrected command as a typed one (the gate, the approval
+    queue and the journal see it as typed)."""
+
+    def __init__(self, asker: str, name: str, choices: list, mgr,
+                 timeout: float = 600.0):
+        super().__init__(timeout=timeout)
+        self._asker = asker
+        self._name = name
+        self._mgr = mgr
+        self.message = None
+        for label, args in choices:
+            btn = discord.ui.Button(label=str(label)[:80],
+                                    style=discord.ButtonStyle.primary)
+            btn.callback = self._make_pick(list(args))
+            self.add_item(btn)
+        no = discord.ui.Button(label="No", style=discord.ButtonStyle.secondary)
+        no.callback = self._no
+        self.add_item(no)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            pass
+
+    async def _mine(self, interaction) -> bool:
+        if str(getattr(interaction.user, "id", "")) != self._asker:
+            await _click_reply(interaction, "❌ These suggestions are for "
+                               "the person who typed the command.",
+                               ephemeral=True)
+            return False
+        return True
+
+    def _make_pick(self, args: list):
+        async def pick(interaction):
+            if not await _ack_click(interaction, "suggestion"):
+                return
+            if not await self._mine(interaction):
+                return
+            await self._disable(interaction)
+            ictx = _InteractionCtx(interaction, self._mgr)
+            depth = vtt_commands._RUN_DEPTH.set(0)
+            try:
+                await registry.run(self._name, args, ictx, self._mgr)
+            finally:
+                vtt_commands._RUN_DEPTH.reset(depth)
+                await ictx.flush_dropped()
+            if _boards or _roster_boards:
+                mid = self._mgr.active_by_channel.get(ictx.channel_key)
+                if mid:
+                    await _refresh_boards_for_match(self._mgr, mid)
+        return pick
+
+    async def _no(self, interaction):
+        if not await _ack_click(interaction, "No"):
+            return
+        if not await self._mine(interaction):
+            return
+        await _click_reply(interaction, "Left as it is.", ephemeral=True)
+        await self._disable(interaction)
+
+    async def _disable(self, interaction):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        self.stop()
+
 
 class _ConfirmView(discord.ui.View):
     """Yes / No under a question a command asked (`offer_confirm`): Yes
