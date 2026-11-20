@@ -192,6 +192,9 @@ code. How the harness works (`run_scenarios.py`, scenarios in
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
+- **"Did you mean" offers** (W20): `?pick <name>` answers the last offer
+  as a click would (runs the corrected command), `?pick no` drops it
+  (1275).
 - **Roster boards** (Discord-only in play): `?board list|state
   [reserve=<n>]` prints the messages a `!list` / `!state` autoupdate board
   in the scenario's channel would show now, `[message i/n, <chars>]`
@@ -485,6 +488,11 @@ back, load the schema with `ToolSearch` before calling
 - **`docs/combat_systems_fit.md`**: three tabletop combat systems the user's
   group wrote (Solis, FCS1, NCS), what the bot can't do for them and what
   costs needless work; the background of ideas #200-#255.
+- **`docs/building_a_game_system.md`**: how to build a full game system on
+  the bot (generating it from code, data shapes, one attack pipeline,
+  statuses and time, the engine timing a system works around, testing),
+  from building, playing and auditing the Solis port. Read it before
+  writing or auditing a system.
 
 ### The cross-cutting chokepoints (memorize these)
 
@@ -1263,6 +1271,13 @@ return):
   the multi-map build needed only three follow-up questions, each about a
   gap the doc hadn't reached.
 
+### Building a game system
+
+When the task is a full game system (a ruleset written as rules, functions,
+statuses, templates and actions), read `docs/building_a_game_system.md`
+first: it lists the bugs a system build meets and the defaults for what a
+rules text leaves open.
+
 ### Communicating
 
 - **Short, direct messages** with content over ceremony. Lead with the
@@ -1799,7 +1814,10 @@ hardcodes**.
 - **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
   unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
   schedules, the turn autosave); under ATB <id>'s bar resets as if it had
-  filled; before the first turn it starts round 1 at <id>. `!turn set
+  filled; before the first turn it starts round 1 at <id>. A unit that
+  dies to its own turn-start effects passes the turn on as under `!turn
+  next` (`_pass_dead_turn`; ATB `_atb_start_next`), and the reply names
+  whoever holds it (`_turn_now_line`, 1270). `!turn set
   <id> quiet` only moves the pointer (53, 827).
 - **`!turn next`** (`Match.next_turn`): turn-end hooks / ticks → advance (round
   wrap fires round hooks, ticks, `round_start_message_format` line) → skip
@@ -2137,9 +2155,12 @@ hardcodes**.
   placeholder (`vtt_commands._statuses_text`, in the default
   entity_line_format after a ` | ` and in entity_info_format): each status
   through its definition's `display` format (`!status display`) else the
-  `status_line_format` rule (`burn ×2 (3 turns)`), its instance fields
-  as placeholders plus `{turns_word}` and `{stacked}` (the level above 1,
-  so the default shows no `×1`, L58) (885, 1246).
+  `status_line_format` rule (`burn level 2 (3 turns)`), its instance
+  fields as placeholders plus `{turns_word}` and `{stacked}` (the level
+  above 1, so the default shows no `level 1`, L58) (885, 1246). Levels
+  read as words wherever a status shows (user call: `×5` read as a
+  multiplier): `{level_text}` is ` level 5`, the layers `level 3 for 2,
+  then level 1 for 3 more`.
 - **Visibility** (user request, 1246): which team views see a status is
   its own `visibility_condition` (`logic.STATUS_VISIBILITY_FIELD`,
   `status_field`: instance key, definition, level entries; `!status
@@ -2369,6 +2390,32 @@ hardcodes**.
   where a corpse lies (#454, 1198-1199); `sum:` / `avg:` / `min:` / `max:<var>` print
   the count and the total over the matches holding a finite number there,
   read through the query view and the var reader (#453, 1193).
+- **Command twins of formula functions** (W18, user picks, 1272-1274):
+  `!ent clear_var` (var_clear), `!say [to=<team>] <text>` (say / say_to:
+  posted here and, through the R5 post queue `mgr._window_posts`, to every
+  other bound channel, `to=` only that team's; `{<unit id>}` names a unit
+  as each view sees it; a public line is a `say` log entry), `!log add`
+  (log()), `!ent spawn_from_var` (summon_from), `!ent damage ...
+  spread[=<mode>] [fragments=] [origin=<x,y> radius=]` (damage_spread),
+  `!ent hit_location` (side_hit + hit_location), `!dist <a> <b> side
+  [flank=<c>]`, `!map raycast` and `!map random [free] [rect|zone=]
+  [for=] [fit=]` (host-elevated, reserved map names), `!find` / `!foreach`
+  `chain:<eid>:<count>[:<jump>]` (chain_targets in chain order;
+  `formula.QUERY_HIDDEN` keeps the bounce off units the query view hides).
+  The function-backed forms call the function through `_call_function`,
+  all or nothing as `!eval`.
+- **"Did you mean"** (W20, user design, 1275): a refusal naming an action
+  the unit lacks (`logic.DidYouMean` from `!action` / `!react`, carrying
+  the candidates) or a unit id no unit holds (the lookups' NotFound
+  wordings, `_UNIT_MISS_RES`) offers the names at least
+  `suggestion_similarity` % close (difflib, default 75, 0 = off), at most
+  3; ids equal apart from digits never suggest each other; unit candidates
+  are what the channel's view shows (`_refuse_with_suggestions`). A typed
+  top-level command on a surface with `offer_suggestions` asks the typer
+  (Discord `_SuggestView` buttons + No, only the typer; the CLI / GUI
+  prompt queues the pick, `ctx.queued`; the harness `?pick <name>|no`);
+  the pick runs as a typed command. Batch / macro / sweep / action lines,
+  an approval and a replay get the names as text.
 - **`!assert [--as eid] "<expr>" [msg]`**: read-only; a failure raises
   `AssertionStop`, and batch / run / foreach / macro stop on the `ASSERT_STOP`
   sentinel; in an action, `cmd('assert ...')` fails the action (601-603).
@@ -2973,6 +3020,13 @@ hardcodes**.
   non-host pre-check of `!ent` lets these subcommands
   (`_ENT_CORPSE_SUBS`) name a visible corpse (`_typed_corpse` for the
   writes: a host reaches any).
+- **`!corpse`** (W18, user design, 1271): shorthands over the corpse forms,
+  each running the existing command with the `!ent` subcommand names
+  (`corpse_cmd`): `list` (`!find dead`, the channel's map or `map=`),
+  `info` / `get` / `set_var` / `delete_var` / `tp` / `var_move` (the
+  destination path defaulting to the source's) / `revive`, `remove <id>
+  ...` (several, one undo step), `clear [map=]` (every corpse the view sees
+  on the map). A living unit's id is refused; Tab offers corpses.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
   `revert`; `!ent replace`, `replace_form`): swaps name, vars, passives,
   clamps and the part subtree; keeps id, position, facing, team, turn slot
@@ -3934,6 +3988,22 @@ hardcodes**.
   RNG restored, and reports the first
   entry whose state hash differs; the rebuilt match takes the recording as
   its journal (`_REPLAYING`) (778-780).
+- **`!match rerun [<id>]`** (W19, user design, 1276): a match rebuilt
+  from the CURRENT system and templates (`!match new` from the journal's
+  creation state: name, size, system, owner, co-hosts, dice seed, uid),
+  then every journal entry run as its author in its channel with the RNG
+  restored before it (the replay's `_ReplayCtx` and authority rule); a
+  `state` entry runs as its command (an undo lands on the rebuilt history);
+  systems / template entries skipped; commands naming another match
+  (`_RERUN_OTHER_MATCH`) reported and skipped; the report lists entries
+  that now refuse. Refused when the journal doesn't reach the creation
+  (reason `created`, segment 1) or the match began holding units. The old
+  match is replaced after the run and kept 24 h (`reruns/` in the server
+  trash, memory without persistence): `!match rerun undo` restores its
+  state and journal. The rerun is no undo step (`_RERUN_FRESH`).
+  `_rerun_handover`: the new history numbers on from the old sequence and
+  the journal files are rewritten (a reused sequence or segment number
+  read or appended to the old match's files).
 - **Formula reference:** `formula.function_reference()` (built once from a
   throwaway match's namespace) gives every function's signature (the call
   forms its docstring opens with, `_doc_call_forms`, else the code's
@@ -4935,6 +5005,14 @@ rejected already. Update this section in the PR that resolves an item.
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
   limitation, left as is (user: note it); idea #555 proposes the fix.
+- **A lethal quiet `deal_damage`** (after pass 78, asked, unanswered):
+  the death line surfaces inside the packet, before the caller's own
+  `say()`; proposed: a per-call `message=` format for the packet's line.
+- **A failed reaction `before` half** (after pass 78, asked, unanswered):
+  the pick is spent (its window closed at the pick) and the attack lands;
+  proposed: check a reaction's `target_condition` at pick time with the
+  attack (`actor`, `incoming`) bound, so a refused pick leaves the window
+  open.
 - **Corpse targets and immunity:** `corpse` / `corpse_list` action
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known
