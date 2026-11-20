@@ -1268,6 +1268,7 @@ def _stamp_corpses(m: Match, mp: Map, pf: Dict[str, Any], turn: Turn,
         mp.lay_corpse(nid, c, ent["x"], ent["y"])
 
 
+@logic.template_routed("stamp")
 def _spawn_units(m: Match, mp: Map, pf: Dict[str, Any],
                  units: List[Dict[str, Any]], idmap: Dict[str, str],
                  x: int, y: int, team: Optional[str],

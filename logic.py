@@ -774,6 +774,64 @@ SIZE_DERIVING: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_size_deriving", default=False)
 
 
+# Template hooks (W22): the route a partial template's marker lands on a
+# unit by (or leaves it by), for on_template_applied / on_template_removed's
+# `applied_by` / `removed_by`. Set by each route around its writes (the
+# outermost wins: a template spawn's summon stays `spawn`); unset = a plain
+# write / delete. TEMPLATE_QUIET fires nothing (a revive, a transfer, a
+# resync's own writes, which it reports itself); a give fires removed and
+# applied for every marker it replaces or writes, even the same template.
+TEMPLATE_ROUTE: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("vtt_template_route", default=None))
+TEMPLATE_QUIET = "_quiet"
+TEMPLATE_EXPLICIT_ROUTES = frozenset({"give"})
+
+
+@contextlib.contextmanager
+def template_route(word: str):
+    """Name the route of the template markers written inside (the
+    outermost route wins)."""
+    if TEMPLATE_ROUTE.get() is not None:
+        yield
+        return
+    token = TEMPLATE_ROUTE.set(word)
+    try:
+        yield
+    finally:
+        TEMPLATE_ROUTE.reset(token)
+
+
+def template_routed(word: str):
+    """Decorator: run the function under template_route(word)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapped(*a, **k):
+            with template_route(word):
+                return fn(*a, **k)
+        return wrapped
+    return deco
+
+
+def template_marker_list(value: Any, prefix: str = ""
+                         ) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """(path, template name, container) of every live partial marker in
+    `value`, outermost first (a container's nested markers follow it);
+    `prefix` is the path of `value` itself."""
+    out: List[Tuple[str, str, Dict[str, Any]]] = []
+
+    def walk(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        mk = node.get(TEMPLATE_MARKER)
+        if _is_live_marker(mk):
+            out.append((path, mk["name"], node))
+        for k, v in node.items():
+            if k != TEMPLATE_MARKER and isinstance(v, dict):
+                walk(v, f"{path}.{k}" if path else str(k))
+    walk(value, prefix)
+    return out
+
+
 @contextlib.contextmanager
 def _outside_derivation():
     """Run the hooks an engine write or spawn fires as ordinary code, out of
@@ -783,15 +841,18 @@ def _outside_derivation():
     tracked, S17) and PLACEMENT_IGNORE (a stamped rider's spawn hooks can't
     place a unit on its vehicle's cell, S17)."""
     if not (SIZE_DERIVING.get() or TEMPLATE_TRACK_OFF.get()
-            or PLACEMENT_IGNORE.get()):
+            or PLACEMENT_IGNORE.get() or TEMPLATE_ROUTE.get() is not None):
         yield
         return
     t1 = SIZE_DERIVING.set(False)
     t2 = TEMPLATE_TRACK_OFF.set(False)
     t3 = PLACEMENT_IGNORE.set(())
+    # A hook's own template writes name their own route (W22).
+    t4 = TEMPLATE_ROUTE.set(None)
     try:
         yield
     finally:
+        TEMPLATE_ROUTE.reset(t4)
         PLACEMENT_IGNORE.reset(t3)
         TEMPLATE_TRACK_OFF.reset(t2)
         SIZE_DERIVING.reset(t1)
@@ -2152,6 +2213,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entries) and its team data's `watchers` are always read on top. "
             "Per-unit override: `__watcher_sources` (replaces this list) and "
             "/ or `__watcher_sources_add` (extends it)."
+        ),
+    },
+    "status_grant_sources": {
+        "default": "equipped",
+        "schema": {"type": "str", "var_roots": True},
+        "desc": (
+            "Comma-separated vars roots walked for the `grants` a unit's items "
+            "and class hold (W21): a container under one of these roots "
+            "holding `grants: {<status>: {level, data, linger}}` (a zone "
+            "grant's shape) puts each status on its unit while it is there "
+            "and takes it off when it goes, through the zone grants' "
+            "machinery: one instance per status whatever holds it (zones and "
+            "items), at the highest level among them; a status the unit got "
+            "otherwise is never taken over; the last holder letting go "
+            "removes it (removed_by `grant`; a zone-only one `zone`), or "
+            "leaves it lingering for the holder's `linger` turns. A held "
+            "status a cleanse or dispel removes comes back when the command "
+            "ends. `status_held_by(eid, status)` names the holders (zones, "
+            "and items as `item:<path>`). Per-unit override: "
+            "`__status_grant_sources` (replaces this list) and / or "
+            "`__status_grant_sources_add` (extends it)."
         ),
     },
     "temp_hp_sources": {
@@ -7946,6 +8028,15 @@ HOOK_NAMES: Set[str] = {
     # (`!ent transform`, transform()), replace (`!ent replace`,
     # replace_form()) or revert.
     "on_transformed",
+    # Template hooks (W22): a partial template's marker landed on the unit
+    # (applied) or left it (removed). Fired on the unit, once per marker
+    # (applied outermost first, removed innermost first), with
+    # `template_name`, `template_path` (the container's path, '' = the
+    # vars root) and `applied_by` / `removed_by` bound, plus the container
+    # as `new_value` / `old_value`. Passives filter by `target=` /
+    # `scope=` against the path, as var hooks do.
+    "on_template_applied",
+    "on_template_removed",
 }
 
 # Custom event-bus subscription. A passive whose `when` is "event:<name>"
@@ -8084,6 +8175,11 @@ VAR_HOOKS: Set[str] = {
     "on_var_write_attempt",
 }
 
+# Hooks a passive's target= / scope= filter by path: the var hooks and the
+# template hooks (W22), whose path is the template's container.
+TEMPLATE_HOOKS: Set[str] = {"on_template_applied", "on_template_removed"}
+PATH_HOOKS: Set[str] = VAR_HOOKS | TEMPLATE_HOOKS
+
 # Valid values for Passive.scope (var-hook filtering).
 #   exact     — fires only when changed_key == target
 #   children  — fires when changed_key is a direct child of target
@@ -8208,8 +8304,9 @@ class Passive:
 
     @property
     def var_hooks(self) -> bool:
-        """Whether any of its hooks is a var hook (target / scope apply)."""
-        return any(h in VAR_HOOKS for h in self.hooks)
+        """Whether any of its hooks filters by path (target / scope apply):
+        a var hook or a template hook."""
+        return any(h in PATH_HOOKS for h in self.hooks)
 
     def matches_event(self, changed_key: str) -> bool:
         """
@@ -10767,6 +10864,15 @@ class Entity:
             spawn_log = match.fire_hook("on_entity_spawned",
                                         target_ids=[self.id])
         log = rename_notes + size_log + spawn_log
+        # Template hooks (W22): the partials it arrives holding (a revive
+        # and a transfer bring nothing new: the unit already had them).
+        route = TEMPLATE_ROUTE.get()
+        if (not REVIVING.get() and route != TEMPLATE_QUIET
+                and self.id in match.entities):
+            news = template_marker_list(self.vars)
+            if news:
+                log += match.template_change(self, [], news,
+                                             route or "spawn")
         # Spawn event — but NOT during a revive (the entity sits in the
         # death-suppressed set only across the revive's spawn window), so
         # a revive emits just its own "revive" event, not a duplicate
@@ -11439,6 +11545,23 @@ class Entity:
                     combined.append(self._match.unit_line(self.id, (
                         f"⚠️ `{self.id}`'s own size is set to {size_named} "
                         f"({value}); {total} ({info['category']}).")))
+        # Statuses its items hold (W21) settle at once, so a template hook
+        # recalculating stats reads them.
+        if (self._match is not None and self.id in self._match.entities
+                and self._match.held_grant_write(self, path, old_post_attempt,
+                                                 value)):
+            combined += self._match.sync_zone_grants({self.id})
+        # Template hooks (W22): a partial's marker written or replaced here.
+        route = TEMPLATE_ROUTE.get()
+        if (self._match is not None and route != TEMPLATE_QUIET
+                and self.id in self._match.entities
+                and (isinstance(old_post_attempt, dict)
+                     or isinstance(value, dict))):
+            stored = _path_resolve(self.vars, path)
+            combined += self._match.template_change(
+                self, template_marker_list(old_post_attempt, path),
+                template_marker_list(stored, path), route or "write",
+                "replace")
         # verbosity 'detailed': annotate a DESTRUCTIVE write — one that
         # replaced an existing subtree, so `inventory = 5` over a populated
         # dict silently drops its keys. NOTE _diff_subtree collapses a
@@ -11609,6 +11732,16 @@ class Entity:
         if self._match is not None and self.id in self._match.entities \
                 and _size_trigger(self._match, path, self):
             log += self._match.sync_body_size(self)
+        if (self._match is not None and self.id in self._match.entities
+                and self._match.held_grant_write(self, path, old, None)):
+            log += self._match.sync_zone_grants({self.id})
+        # Template hooks (W22): the partials' markers the deleted value held.
+        route = TEMPLATE_ROUTE.get()
+        if (self._match is not None and route != TEMPLATE_QUIET
+                and isinstance(old, dict) and self.id in self._match.entities):
+            log += self._match.template_change(
+                self, template_marker_list(old, path), [],
+                route or "delete", "move" if route == "move" else "delete")
         # Removing the init or team var also dirties turn order — same
         # policy gate as write_var above. Initiative being removed means
         # the entity drops out of turn_order entirely (since
@@ -13569,12 +13702,20 @@ class UnitFlags:
     # The unit's vars hold a reaction (#36): an `actions` entry with a
     # `before` or `after` half.
     REACTIONS = 4
+    # A container under the unit's status_grant_sources roots holds
+    # `grants` (W21): statuses its items and class hold on it.
+    HELD_GRANTS = 8
+    # The unit's own data holds a modifier record's `applies_to` (W21):
+    # it may give its team records.
+    TEAM_RECORDS = 16
 
     def __init__(self) -> None:
         self.flags: Dict[str, int] = {}
         self.holders: Dict[int, Set[str]] = {self.WATCHERS: set(),
                                              self.ZONE_GRANT: set(),
-                                             self.REACTIONS: set()}
+                                             self.REACTIONS: set(),
+                                             self.HELD_GRANTS: set(),
+                                             self.TEAM_RECORDS: set()}
         self.changed: Set[str] = set()
         self.ctx: Any = None
 
@@ -13598,6 +13739,12 @@ class UnitFlags:
                     f |= self.ZONE_GRANT
         if _holds_reaction(e.vars):
             f |= self.REACTIONS
+        if match._holds_held_grants(e):
+            f |= self.HELD_GRANTS
+        if _holds_key(e.vars, MODIFIER_APPLIES_KEY) or any(
+                _holds_key(i, MODIFIER_APPLIES_KEY)
+                for i in e.status.values()):
+            f |= self.TEAM_RECORDS
         return f
 
     def _set(self, eid: str, f: int) -> None:
@@ -13614,7 +13761,8 @@ class UnitFlags:
         if match._spatial.listeners.count(self.changed) == 0:
             match._spatial.listeners.append(self.changed)
             self.ctx = None
-        ctx = (id(match.entities), match.rules.get("watcher_sources"))
+        ctx = (id(match.entities), match.rules.get("watcher_sources"),
+               match.rules.get("status_grant_sources"))
         if ctx != self.ctx:
             self.ctx = ctx
             self.flags.clear()
@@ -13648,6 +13796,16 @@ def _holds_reaction(node: Any, depth: int = 0) -> bool:
         return True
     return any(_holds_reaction(v, depth + 1) for k, v in node.items()
                if k != "actions" and isinstance(v, dict))
+
+
+# A modifier record's reach (W21): self (default), team (every living
+# unit of its holder's team) or team_others (all of them but the holder).
+MODIFIER_APPLIES_KEY = "applies_to"
+# The key of an item's / class's status grants (W21), as a zone's.
+HELD_GRANTS_KEY = "grants"
+# A held grant's source in a status's ZONE_GRANT_KEY list: `item:<path>`
+# (zone names take id characters, so no zone reads as one).
+HELD_GRANT_PREFIX = "item:"
 
 
 def _holds_key(node: Any, key: str) -> bool:
@@ -14949,27 +15107,44 @@ class Match:
                     per = want.setdefault(eid, {})
                     for sname in grants:
                         per.setdefault(sname, []).append(zname)
+        # What the units' items and class hold (W21): alive units, hidden
+        # riders included (the item travels with its unit).
+        for eid in sorted(self._uflags.holders_of(self,
+                                                  UnitFlags.HELD_GRANTS)):
+            if scope is not None and eid not in scope:
+                continue
+            e = self.entities.get(eid)
+            if e is None or not e.is_alive:
+                continue
+            for sname, held in self.held_status_grants(e).items():
+                per = want.setdefault(eid, {}).setdefault(sname, [])
+                for path, _entry in held:
+                    src = HELD_GRANT_PREFIX + path
+                    if src not in per:
+                        per.append(src)
         return want
 
-    def _grant_linger(self, zones: List[str], status: str) -> int:
+    def _grant_linger(self, zones: List[str], status: str,
+                      eid: str = "") -> int:
         """The linger of the zone whose grant of `status` the unit holds
         (the one `_grant_spec` takes the level and data from; user call,
         L42: leaving a level-5 zone with linger 2 and a level-3 one with
         linger 5 lingers 2 turns, at level 5)."""
-        zn = self._grant_source(zones, status)
+        zn = self._grant_source(zones, status, eid)
         if zn is None:
             return 0
-        g = self.zone_grants_of(self.find_zone(zn)).get(status) or {}
+        g = self._grant_entry(eid, zn, status)
         lv = g.get("linger")
         return lv if isinstance(lv, int) and not isinstance(lv, bool) else 0
 
-    def _grant_source(self, zones: List[str], sname: str) -> Optional[str]:
+    def _grant_source(self, zones: List[str], sname: str,
+                      eid: str = "") -> Optional[str]:
         """The zone of `zones` whose grant of `sname` a unit holds: the one
         granting the highest level (the first of those tied), else the
         first zone."""
         best_zone, best_level = None, None
         for zn in zones:
-            g = self.zone_grants_of(self.find_zone(zn)).get(sname) or {}
+            g = self._grant_entry(eid, zn, sname)
             lv = g.get("level")
             if isinstance(lv, bool) or not isinstance(lv, (int, float)):
                 lv = None
@@ -15085,12 +15260,16 @@ class Match:
                 found = True
                 break
         if not found:
-            found = bool(self._uflags.holders_of(self, UnitFlags.ZONE_GRANT))
+            found = bool(self._uflags.holders_of(self, UnitFlags.ZONE_GRANT)
+                         or self._uflags.holders_of(self,
+                                                    UnitFlags.HELD_GRANTS))
         if SPATIAL_CHECK:
             want = any(self.zone_grants_of(z) for mp in self.maps.values()
                        for z in mp.zones.values()) or any(
                 isinstance(inst, dict) and ZONE_GRANT_KEY in inst
-                for e in self.entities.values() for inst in e.status.values())
+                for e in self.entities.values()
+                for inst in e.status.values()) or any(
+                self._holds_held_grants(e) for e in self.entities.values())
             if want != found:
                 raise SpatialCheckError(f"grant index: _grants_present = "
                                         f"{found}, scan {want}")
@@ -15135,7 +15314,7 @@ class Match:
                 continue
             zones = per.get(sname, [])
             if zones:
-                linger = self._grant_linger(zones, sname)
+                linger = self._grant_linger(zones, sname, eid)
                 if inst.get(ZONE_GRANT_KEY) != zones:
                     inst[ZONE_GRANT_KEY] = list(zones)
                     self._grant_changes += 1
@@ -15164,16 +15343,21 @@ class Match:
                                               copy.deepcopy(after))
             else:
                 del e.status[sname]
-                log += self._emit_status_diff(eid, sname, before, None,
-                                              removed_by="zone")
+                held = any(str(z).startswith(HELD_GRANT_PREFIX)
+                           for z in (before.get(ZONE_GRANT_KEY) or ()))
+                log += self._emit_status_diff(
+                    eid, sname, before, None,
+                    removed_by="grant" if held else "zone")
         # What a covering zone grants and the unit lacks.
         for sname in sorted(per):
             e = self.entities.get(eid)
-            if e is None or not self._grant_eligible(e):
+            # (The zones' targets are eligible units, the items' alive
+            # ones: a hidden rider keeps what its gear holds.)
+            if e is None or not e.is_alive:
                 break
             zones = per[sname]
             inst = e.status.get(sname)
-            linger = self._grant_linger(zones, sname)
+            linger = self._grant_linger(zones, sname, eid)
             if isinstance(inst, dict) and ZONE_GRANT_KEY in inst:
                 continue
             if isinstance(inst, dict) and inst.get(ZONE_LINGERING_KEY):
@@ -15195,7 +15379,7 @@ class Match:
             if e.is_part and sname in self._part_status_names(
                     e, "__status_redirect", "part_status_redirect"):
                 continue    # it would land on the parent
-            spec = self._grant_spec(zones, sname)
+            spec = self._grant_spec(zones, sname, eid)
             sdef = self.status_definitions.get(sname) or {}
             seed = (copy.deepcopy(sdef.get("data"))
                     if isinstance(sdef.get("data"), dict) else {})
@@ -15209,14 +15393,15 @@ class Match:
             if e.status.get(sname) is not None:
                 self._grant_changes += 1
 
-    def _grant_spec(self, zones: List[str], sname: str) -> Dict[str, Any]:
+    def _grant_spec(self, zones: List[str], sname: str,
+                    eid: str = "") -> Dict[str, Any]:
         """What `zones` (holding status `sname`) give it now: the highest
         level any of them grants (None: none sets one) and the data of the
         zone granting it (the first of those tied, else the first zone)."""
         best_level = None
         best_data: Any = None
         for zn in zones:
-            g = self.zone_grants_of(self.find_zone(zn)).get(sname) or {}
+            g = self._grant_entry(eid, zn, sname)
             lv = g.get("level")
             if isinstance(lv, bool) or not isinstance(lv, (int, float)):
                 lv = None
@@ -15240,7 +15425,7 @@ class Match:
         inst = e.status.get(sname)
         if not isinstance(inst, dict):
             return []
-        spec = self._grant_spec(zones, sname)
+        spec = self._grant_spec(zones, sname, e.id)
         old = inst.get(ZONE_SPEC_KEY)
         if same_value(old, spec):
             return []
@@ -18228,13 +18413,74 @@ class Match:
                 child = f"{base}[{i}]" if base else f"[{i}]"
                 self._walk_modifier_bundles(it, child, out)
 
-    def _raw_modifier_records(self, e: "Entity") -> List[Tuple[dict, str]]:
-        """Every (record, source) contributing to `e`, aggregated live from
-        its sources: each status instance's `modifiers`, the match vars'
-        and its map's vars' bundles, its team data's, the direct
-        `entity.modifiers` slot, and each scan-root subtree. Source is a
-        readable label (e.g. `status:burning.fireboost`, `equipped.sword.0`)
-        for the list_mods breakdown."""
+    def _raw_modifier_records(self, e: "Entity"
+                              ) -> List[Tuple[dict, str, str]]:
+        """Every (record, source, holder) contributing to `e`, aggregated
+        live from its sources: each status instance's `modifiers`, the
+        match vars' and its map's vars' bundles, its team data's, the direct
+        `entity.modifiers` slot, each scan-root subtree, then (W21) the
+        records its teammates hold with `applies_to` team / team_others.
+        Source is a readable label (e.g. `status:burning.fireboost`,
+        `equipped.sword.0`, `bard:class.song` for a teammate's) for the
+        list_mods breakdown; holder is the unit holding the record ('' for
+        the match's, a map's and the team data's)."""
+        out: List[Tuple[dict, str, str]] = [
+            (r, s_, e.id) for r, s_ in self._status_modifier_records(e)]
+        # Match-wide and map-wide modifiers (#108): a `modifiers` bundle in
+        # the match vars applies to every unit, one in a map's vars to the
+        # units on that map (weather, darkness, an anti-magic field).
+        if "modifiers" in self.vars:
+            for key, rec in self._bundle_items(self.vars["modifiers"]):
+                out.append((rec, self._mod_source("match", key), ""))
+        mp = self.maps.get(e.map)
+        if mp is not None and "modifiers" in mp.vars:
+            for key, rec in self._bundle_items(mp.vars["modifiers"]):
+                out.append((rec, self._mod_source(f"map:{mp.name}", key),
+                            ""))
+        # Team-scoped modifiers: a `modifiers` bundle in the entity's team
+        # data applies to every member.
+        team = e.team
+        if team is not None:
+            tdata = self.team_data.get(team)
+            if isinstance(tdata, dict) and "modifiers" in tdata:
+                for key, rec in self._bundle_items(tdata["modifiers"]):
+                    out.append((rec, self._mod_source(f"team:{team}", key),
+                                ""))
+        out += [(r, s_, e.id) for r, s_ in self._vars_modifier_records(e)]
+        # A teammate's records reaching the team (W21): `applies_to` team
+        # or team_others, while the teammate is alive in the match.
+        if team is not None:
+            for t in self._team_record_holders(team):
+                if t.id == e.id:
+                    continue
+                for rec, src in (self._status_modifier_records(t)
+                                 + self._vars_modifier_records(t)):
+                    if isinstance(rec, dict) and rec.get("applies_to") in (
+                            "team", "team_others"):
+                        out.append((rec, f"{t.id}:{src}", t.id))
+        return out
+
+    def _team_record_holders(self, team: str) -> List["Entity"]:
+        """The living units of `team` that may hold a record with
+        `applies_to` (W21): those whose own data holds the key
+        (UnitFlags.TEAM_RECORDS) and those holding a status whose
+        definition does, in turn order then id."""
+        defs = {n for n, d in self.status_definitions.items()
+                if _holds_key(d, MODIFIER_APPLIES_KEY)}
+        ids = set(self._uflags.holders_of(self, UnitFlags.TEAM_RECORDS))
+        if defs:
+            ids |= {u.id for u in self.entities.values()
+                    if any(n in defs for n in u.status)}
+        out = [self.entities[i] for i in ids if i in self.entities]
+        out = [u for u in out if u.team == team and u.is_alive
+               and u._match is self]
+        order = {eid: n for n, eid in enumerate(self.turn_order)}
+        return sorted(out, key=lambda u: (order.get(u.id, len(order)), u.id))
+
+    def _status_modifier_records(self, e: "Entity"
+                                 ) -> List[Tuple[dict, str]]:
+        """(record, source) of `e`'s statuses' `modifiers` (the instance's
+        and its level entries')."""
         out: List[Tuple[dict, str]] = []
         for sname, sdata in e.status.items():
             if not isinstance(sdata, dict):
@@ -18257,24 +18503,13 @@ class Match:
             if "modifiers" in sdata:
                 for key, rec in self._bundle_items(sdata["modifiers"]):
                     out.append((rec, self._mod_source(f"status:{sname}", key)))
-        # Match-wide and map-wide modifiers (#108): a `modifiers` bundle in
-        # the match vars applies to every unit, one in a map's vars to the
-        # units on that map (weather, darkness, an anti-magic field).
-        if "modifiers" in self.vars:
-            for key, rec in self._bundle_items(self.vars["modifiers"]):
-                out.append((rec, self._mod_source("match", key)))
-        mp = self.maps.get(e.map)
-        if mp is not None and "modifiers" in mp.vars:
-            for key, rec in self._bundle_items(mp.vars["modifiers"]):
-                out.append((rec, self._mod_source(f"map:{mp.name}", key)))
-        # Team-scoped modifiers: a `modifiers` bundle in the entity's team
-        # data applies to every member.
-        team = e.team
-        if team is not None:
-            tdata = self.team_data.get(team)
-            if isinstance(tdata, dict) and "modifiers" in tdata:
-                for key, rec in self._bundle_items(tdata["modifiers"]):
-                    out.append((rec, self._mod_source(f"team:{team}", key)))
+        return out
+
+    def _vars_modifier_records(self, e: "Entity"
+                               ) -> List[Tuple[dict, str]]:
+        """(record, source) of `e`'s own `modifiers` var and the bundles
+        under its modifier_sources roots."""
+        out: List[Tuple[dict, str]] = []
         if "modifiers" in e.vars:
             for key, rec in self._bundle_items(e.vars["modifiers"]):
                 out.append((rec, self._mod_source("modifiers", key)))
@@ -18321,31 +18556,44 @@ class Match:
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
 
-        def _ev(expr: Any) -> Any:
+        def _ev(expr: Any, holder: str = "") -> Any:
+            extras = dict(context)
+            extras.setdefault("record_holder", holder or None)
             return engine.eval_expression(
                 str(expr),
-                EvalCtx(this=this_id, target=eid, extras=dict(context)),
+                EvalCtx(this=this_id, target=eid, extras=extras),
             )
 
         def _note(src: str, what: str) -> None:
             if problems is not None and f"`{src}`: {what}" not in problems:
                 problems.append(f"`{src}`: {what}")
 
-        def _cond_ok(m: dict, src: str) -> bool:
+        def _cond_ok(m: dict, src: str, holder: str = "") -> bool:
             cond = m.get("condition", "")
             if not cond:
                 return True
             try:
-                return bool(_ev(cond))
+                return bool(_ev(cond, holder))
             except FormulaError as ex:
                 _note(src, f"condition error ({formula_text(str(ex))})")
                 return False          # malformed condition -> inactive (fail safe)
 
-        records = self._raw_modifier_records(e)
+        # A unit's own record with `applies_to` team_others reaches only its
+        # teammates; an unknown word is named and left out (W21).
+        records = []
+        for m, src, holder in self._raw_modifier_records(e):
+            to = m.get(MODIFIER_APPLIES_KEY) if isinstance(m, dict) else None
+            if holder and to not in (None, "self", "team", "team_others"):
+                _note(src, f"applies_to {to!r} isn't self, team or "
+                           f"team_others")
+                continue
+            if holder == eid and to == "team_others":
+                continue
+            records.append((m, src, holder))
 
         # Pass 1: expand the query tag set from grants_tags (vs original tags).
         granted: "set[str]" = set()
-        for m, src in records:
+        for m, src, holder in records:
             if not m.get("grants_tags"):
                 continue
             if str(m.get("stat", "")) != str(stat):
@@ -18354,14 +18602,14 @@ class Match:
             if not self._record_tags_ok(m.get("tags"), tagset) \
                     or (notg & tagset):
                 continue
-            if not _cond_ok(m, src):
+            if not _cond_ok(m, src, holder):
                 continue
             granted |= self._modifier_tagset(m.get("grants_tags"))
         eff_tags = tagset | granted
 
         # Pass 2: filter + resolve against the expanded tag set.
         out: List[dict] = []
-        for m, src in records:
+        for m, src, holder in records:
             if str(m.get("stat", "")) != str(stat):
                 continue
             try:
@@ -18374,12 +18622,12 @@ class Match:
             notg = self._modifier_tagset(m.get("not_tags"))
             if notg & eff_tags:
                 continue
-            if not _cond_ok(m, src):
+            if not _cond_ok(m, src, holder):
                 continue
             raw_val = m.get("value", 0)
             if isinstance(raw_val, str):
                 try:
-                    raw_val = _ev(raw_val)
+                    raw_val = _ev(raw_val, holder)
                 except FormulaError as ex:
                     _note(src, f"value error ({formula_text(str(ex))})")
                     continue          # malformed value -> skip this modifier
@@ -18671,6 +18919,90 @@ class Match:
                     continue
             out.append(e)
         return out
+
+    def _effective_grant_sources(self, e: "Entity") -> List[str]:
+        """The vars roots walked for an item's / class's status `grants` on
+        `e` (W21): `__status_grant_sources` (replaces the rule) or the
+        status_grant_sources rule, plus `__status_grant_sources_add`."""
+        override = e.vars.get("__status_grant_sources")
+        if isinstance(override, list):
+            roots = [str(r) for r in override]
+        else:
+            roots = [r.strip() for r in
+                     str(self.rules.get("status_grant_sources", "equipped")
+                         ).split(",") if r.strip()]
+        add = e.vars.get("__status_grant_sources_add")
+        if isinstance(add, list):
+            roots = roots + [str(r) for r in add]
+        return roots
+
+    def _holds_held_grants(self, e: "Entity") -> bool:
+        """Whether a container under `e`'s status_grant_sources roots holds
+        a `grants` key (UnitFlags.HELD_GRANTS)."""
+        for root in self._effective_grant_sources(e):
+            node: Any = e.vars
+            for seg in root.split("."):
+                node = node.get(seg) if isinstance(node, dict) else None
+            if node is not None and _holds_key(node, HELD_GRANTS_KEY):
+                return True
+        return False
+
+    def held_grant_write(self, e: "Entity", path: str, old: Any,
+                         new: Any) -> bool:
+        """Whether a write / delete at `path` can change what `e`'s items
+        hold (W21): at, under or above one of its grant source roots, and a
+        `grants` key on the path or in the old or new value."""
+        roots = self._effective_grant_sources(e)
+        if not any(path == r or path.startswith(r + ".")
+                   or r.startswith(path + ".") for r in roots):
+            return False
+        return (HELD_GRANTS_KEY in path.split(".")
+                or _holds_key(old, HELD_GRANTS_KEY)
+                or _holds_key(new, HELD_GRANTS_KEY))
+
+    def held_status_grants(self, e: "Entity"
+                           ) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
+        """status -> [(container path, grant entry)] of every `grants` dict
+        found at or under `e`'s status_grant_sources roots (W21; `__` keys
+        skipped, a `grants` dict not descended)."""
+        out: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+
+        def walk(node: Any, path: str) -> None:
+            if not isinstance(node, dict):
+                return
+            g = node.get(HELD_GRANTS_KEY)
+            if isinstance(g, dict):
+                for sname, entry in g.items():
+                    if isinstance(entry, dict):
+                        out.setdefault(str(sname), []).append((path, entry))
+            for k, v in node.items():
+                if k == HELD_GRANTS_KEY or str(k).startswith("__"):
+                    continue
+                if isinstance(v, dict):
+                    walk(v, f"{path}.{k}")
+        seen: Set[str] = set()
+        for root in self._effective_grant_sources(e):
+            if root in seen:
+                continue
+            seen.add(root)
+            node: Any = e.vars
+            for seg in root.split("."):
+                node = node.get(seg) if isinstance(node, dict) else None
+            walk(node, root)
+        return out
+
+    def _grant_entry(self, eid: str, src: str, sname: str) -> Dict[str, Any]:
+        """The grant of `sname` that source `src` gives unit `eid`: a zone's
+        (by name) or an item's (`item:<path>` in the unit's vars)."""
+        if src.startswith(HELD_GRANT_PREFIX):
+            e = self.entities.get(eid)
+            node: Any = e.vars if e is not None else None
+            for seg in src[len(HELD_GRANT_PREFIX):].split("."):
+                node = node.get(seg) if isinstance(node, dict) else None
+            g = node.get(HELD_GRANTS_KEY) if isinstance(node, dict) else None
+            g = g.get(sname) if isinstance(g, dict) else None
+            return g if isinstance(g, dict) else {}
+        return self.zone_grants_of(self.find_zone(src)).get(sname) or {}
 
     def _effective_watcher_sources(self, e: "Entity") -> List[str]:
         """The vars roots scanned for held `watchers` on `e`: the per-unit
@@ -25600,6 +25932,7 @@ class Match:
                         p.get("var_names") or out.get("var_names"))))
         return out
 
+    @template_routed("spawn")
     def spawn_template(self, name: str, template: Dict[str, Any], x: int, y: int,
                        near_radius: Optional[int] = None,
                        mp: Optional["Map"] = None) -> Tuple[str, List[str]]:
@@ -26164,7 +26497,8 @@ class Match:
             raise VTTError(f"`{name}` is an entity template; `!template "
                            f"spawn` it. Only partials are given to a unit.")
         value = self.template_materialize({TEMPLATE_MARKER: name})
-        return e.write_var(path, value)
+        with template_route("give"):
+            return e.write_var(path, value)
 
     def template_containers(self, e: "Entity") -> List[Tuple[str, Dict[str, Any]]]:
         """(path, marker) of every marked container in e's vars, outermost
@@ -26205,6 +26539,10 @@ class Match:
         path = "" if path in ("", ".") else path
         node = self._marked_container_at(e, path)
         mk = node[TEMPLATE_MARKER]
+        # Template hooks (W22): removed then applied for every marker the
+        # container holds, as a swap; its own writes fire none.
+        olds = [(p, n, jcopy(c)) for p, n, c in
+                template_marker_list(node, path)]
         live = copy.deepcopy(self._container_base(
             e.vars, path, self.unit_names_for(e.var_names)))
         file = self._dematerialize(node, None)
@@ -26225,6 +26563,7 @@ class Match:
         from action import _rollback_match
         pre = self.to_dict(include_history=False)
         token = TEMPLATE_TRACK_OFF.set(True)
+        rtoken = TEMPLATE_ROUTE.set(TEMPLATE_QUIET)
         try:
             if path:
                 log += e.write_var(path, live)
@@ -26250,7 +26589,14 @@ class Match:
             _rollback_match(self, None, pre)
             raise
         finally:
+            TEMPLATE_ROUTE.reset(rtoken)
             TEMPLATE_TRACK_OFF.reset(token)
+        if e.id in self.entities:
+            found, now = ((True, e.vars) if not path
+                          else _rel_get(e.vars, path))
+            if found:
+                log += self.template_change(
+                    e, olds, template_marker_list(now, path), "resync")
         return log
 
     def detach_container(self, e: "Entity", path: str) -> str:
@@ -26358,6 +26704,7 @@ class Match:
             n += 1
         return f"{base}{n}"
 
+    @template_routed("summon")
     def summon_entity(
         self, template: Any, x: int, y: int, *,
         id_prefix: Optional[str] = None,
@@ -28599,7 +28946,8 @@ class Match:
                         form_tag: Optional[str] = None,
                         revert_tag: Optional[str] = None,
                         add_form: bool = True,
-                        kind: str = "transform") -> List[str]:
+                        kind: str = "transform",
+                        stash_path: Optional[str] = None) -> List[str]:
         """Replace `e`'s statblock in place from `statblock` (a
         capture_statblock dict or a summon-style template), PRESERVING e's id,
         position, facing, team, and turn-order slot. HP carries per `hp_mode`
@@ -28809,6 +29157,12 @@ class Match:
                 f"the transform stopped."]
         self._death_check_suppressed_ids.add(e.id)
         log: List[str] = list(drop_log)
+        # Template hooks (W22): the forms' partials, compared once the new
+        # body stands.
+        old_marks = [t for t in template_marker_list(e.vars)
+                     if not stash_path or not (t[0] == stash_path or
+                                               t[0].startswith(stash_path
+                                                               + "."))]
         try:
             e.vars = new_vars
             e.name = sb.get("name") or e.name
@@ -28823,10 +29177,11 @@ class Match:
             self._turn_order_dirty = True
             self._rebuild_turn_order()
             self._restamp_anchors_for(e.id)
-            log += self._apply_statblock_parts(e, sb.get("parts"))
-            seg = sb.get("segments")
-            if seg:
-                log += self._apply_statblock_parts(e, seg)
+            with template_route(kind):
+                log += self._apply_statblock_parts(e, sb.get("parts"))
+                seg = sb.get("segments")
+                if seg:
+                    log += self._apply_statblock_parts(e, seg)
         finally:
             self._death_check_suppressed_ids.discard(e.id)
         swap = dict(mode=statuses, form_tag=form_tag, revert_tag=revert_tag,
@@ -28840,6 +29195,9 @@ class Match:
                 if part.id in self.entities:
                     log += self._transform_status_swap(
                         part, old, part.status, **swap)
+        if e.id in self.entities and TEMPLATE_ROUTE.get() != TEMPLATE_QUIET:
+            log += self.template_change(e, old_marks,
+                                        template_marker_list(e.vars), kind)
         if e.id in self.entities:
             log += self.fire_hook("on_transformed", target_ids=[e.id],
                                   extras={"transform_kind": kind})
@@ -29019,7 +29377,9 @@ class Match:
             form_tag=str(stash_path) if stash_path else None,
             kind="transform" if statuses == "merge" else "replace")
         if stash_path and e.id in self.entities:
-            e.write_var(str(stash_path), snap)
+            # The stashed form's partials aren't the unit's (W22).
+            with template_route(TEMPLATE_QUIET):
+                e.write_var(str(stash_path), snap)
         return log
 
     def revert_entity(self, eid: str, stash_path: str,
@@ -29049,9 +29409,11 @@ class Match:
         if snap.get(TRANSFORM_MODE_KEY) == "merge":
             return self.apply_statblock(
                 e, snap, hp_mode=hp_mode, statuses="merge",
-                revert_tag=str(stash_path), add_form=False, kind="revert")
+                revert_tag=str(stash_path), add_form=False, kind="revert",
+                stash_path=str(stash_path))
         return self.apply_statblock(e, snap, hp_mode=hp_mode,
-                                    statuses="replace", kind="revert")
+                                    statuses="replace", kind="revert",
+                                    stash_path=str(stash_path))
 
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)
@@ -29353,6 +29715,83 @@ class Match:
                 lambda p, h=hook: p.fires_on(h) and p.matches_event(ev.key),
                 log)
 
+        return log
+
+    # ---- template hooks (W22) ----
+    def template_change(self, e: "Entity",
+                        olds: List[Tuple[str, str, Dict[str, Any]]],
+                        news: List[Tuple[str, str, Dict[str, Any]]],
+                        applied_by: str,
+                        removed_by: Optional[str] = None) -> List[str]:
+        """Fire on_template_removed for the markers of `olds` that left and
+        on_template_applied for those of `news` that arrived (by path and
+        name; a give and a resync, TEMPLATE_EXPLICIT_ROUTES and `resync`,
+        fire both for every marker, the same template included).
+        Removed innermost first, then applied outermost first."""
+        if not (olds or news):
+            return []
+        if applied_by in TEMPLATE_EXPLICIT_ROUTES or applied_by == "resync":
+            gone, came = list(olds), list(news)
+        else:
+            okeys = {(p, n) for p, n, _c in olds}
+            nkeys = {(p, n) for p, n, _c in news}
+            gone = [t for t in olds if (t[0], t[1]) not in nkeys]
+            came = [t for t in news if (t[0], t[1]) not in okeys]
+        events = ([("on_template_removed", t, removed_by or applied_by)
+                   for t in reversed(gone)]
+                  + [("on_template_applied", t, applied_by) for t in came])
+        if not events:
+            return []
+        log: List[str] = []
+        for hook, (path, name, node), how in events:
+            if e.id not in self.entities or e._match is not self:
+                break
+            log += self._fire_template_event(e.id, hook, path, name, node,
+                                             how)
+        return log
+
+    def _fire_template_event(self, eid: str, hook: str, path: str,
+                             name: str, node: Any, how: str) -> List[str]:
+        """One template hook on unit `eid`: its passives whose target /
+        scope match `path`, under the var hooks' recursion limit."""
+        if not self._ordered_passives(
+                eid, lambda p: p.fires_on(hook) and p.matches_event(path)):
+            return []
+        limit = int(self.rules.get("var_hook_recursion_limit", 128))
+        if self._var_event_depth >= limit:
+            if not self._var_event_warned \
+                    and self.var_warn_verbosity() != "off":
+                self._var_event_warned = True
+                self._var_event_warnings.append(
+                    f"⚠️ var-hook recursion limit ({limit}) reached on "
+                    f"`{hook}` for `{eid}.{path or '(root)'}`; suppressing "
+                    f"further hook firing for this chain.")
+            return []
+        from formula import FormulaEngine, EvalCtx
+        applied = hook == "on_template_applied"
+        extras = {
+            "template_name": name,
+            "template_path": path,
+            "hook_name": hook,
+            "applied_by": how if applied else None,
+            "removed_by": None if applied else how,
+            "new_value": jcopy(node) if applied else None,
+            "old_value": None if applied else jcopy(node),
+        }
+        ctx = EvalCtx(this=self.current_entity_id(), target=eid,
+                      extras=extras)
+        log: List[str] = []
+        self._var_event_depth += 1
+        try:
+            with _outside_derivation():
+                self._run_ordered(
+                    FormulaEngine(self), ctx, eid,
+                    lambda p: p.fires_on(hook) and p.matches_event(path),
+                    log)
+        finally:
+            self._var_event_depth -= 1
+            if self._var_event_depth == 0:
+                self._var_event_warned = False
         return log
 
     # ---- var-write-attempt firing ----
@@ -34859,7 +35298,11 @@ class MatchManager:
         from action import _rollback_match
         pre_dest = dest.to_dict(include_history=False)
         try:
-            self._spawn_copies(src, dest, e, order, idmap, tx, ty, log, dmap)
+            # A transfer brings what the unit had (no template hooks, W22);
+            # a copy is a new unit holding its templates.
+            with template_route(TEMPLATE_QUIET if move else "copy"):
+                self._spawn_copies(src, dest, e, order, idmap, tx, ty, log,
+                                   dmap)
         except Exception:
             _rollback_match(dest, self, pre_dest)
             raise

@@ -62,6 +62,14 @@ both buffs) each had an answer the text alone didn't settle (5b7e05c).
   removes exactly what it added (a class change, a ring going quiet) and
   counts can skip it (summoned allies don't count toward "half the party
   dead") (4c5bb7a, 5b7e05c).
+- Let the engine carry what a class or item holds: statuses it holds
+  while present are `grants` in it (`status_grant_sources` naming the
+  roots), records it gives the team carry `applies_to: team` /
+  `team_others`, and its own setup and cleanup run from default passives
+  on `on_template_applied` / `on_template_removed` (one watching `class`
+  exactly, one `equipped` by children). A class change is then giving the
+  new class: the removed hook takes off what the old one added, and both
+  recalculate the stats.
 - A per-battle allowance several items share is a modifier stat summed over
   every source plus a used counter (`free_ammo`, `free_ammo_used`, 4ae56c4).
   A per-status damage bonus is a `<status>_damage` modifier the over-time
@@ -134,7 +142,23 @@ both buffs) each had an answer the text alone didn't settle (5b7e05c).
 - Say every effect: each status given (level and turns after resistance),
   each block (the amount stopped), each consumable use (what's left), each
   weak spot. Silent effects were the first match's main complaint (19e06ff,
-  2431a74, 8aa4243); one helper (solis_give_status) prints the status lines.
+  2431a74, 8aa4243).
+- The engine prints the status lines: a unit gaining or losing a status,
+  or its level changing (`status_change_lines`, on by default), with
+  per-status text (`system status message <system> <status>
+  gained|lost|changed|blocked <text>|none`). A system that prints its own
+  status lines turns one of the two off, or every change is said twice:
+  Solis printed both until it dropped its own helper's lines and set
+  burn's and invisibility's text, silenced its bookkeeping statuses and
+  reworded the blocked line (1045a85).
+- A stat change recalculates; it never adds or subtracts (the user's
+  rule). Anything that changes a stored stat derived from modifiers (max
+  hp, speed) changes the base and recalculates from the base plus every
+  modifier, so flat and percentage modifiers fold the same in any order.
+  Solis's two effects that added to and subtracted from max hp directly
+  broke this, and the max hp loss left hp above the new max (a scrounger
+  at 60/54 hp, e2fd4d8). A revive recalculates too, so gear taken off a
+  corpse stops counting (ac7326f).
 - Bookkeeping statuses stay out of team views (`system status visibility
   <system> <status> False`, d9bd426).
 

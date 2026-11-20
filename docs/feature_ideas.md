@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #621). #264-#615 come from review passes by
+(the highest so far is #623). #264-#615 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -376,6 +376,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#619 Last known positions.** When a unit drops out of a team's view (hidden, undetected, out of fog range), the team keeps a "last seen" marker on its cell for `last_seen_turns` turns (0 = off): the unit's glyph greyed, or a rule glyph, with its name as that team last saw it. A `last_seen(team, eid)` read gives the cell and the turn. Stealth play reads it constantly; built on #6's team markers.
 - **#620 Hit from the unseen** (composes today; an example scenario, no engine code). A global `on_damage_taken` passive (self = the unit hit), checked in a probe: `if attacker and not team_sees_entity(entity[self].team, attacker): say_to(entity[self].team, 'Something hits ' + entity[self].name + ' from the ' + direction_to(entity_center(self), entity_center(attacker)) + '!')` prints "Something hits Hero from the up_left!" in the defender's team channel while the attacker stays `someone`. With #6, a short-lived arrow marker on the defender's edge. A creature that decloaks when it attacks (the Umbra Cattus) removes its cloak status in its own `on_action_used` passive; one that stays cloaked doesn't. The scenario documents both, and whether the defender learns a distance band too is up to the formula.
 - **#621 Blocked status grants.** A zone whose grant is blocked (immunity, resistance, blocked_by, a tag filter) fires neither on_status_blocked nor the blocked line (#389), since a grant is tried again at every settle and would fire per step. Firing once per unit per entry into the zone (an "immune to the fire zone" line when it steps in) needs a per-unit record of the blocked grants.
+- **#623 Template hooks on corpses** (W22, on hold, user). on_template_applied / on_template_removed fire for living units only: a corpse write (`!ent delete_var <corpse>`, `var_move` off a body) fires no hook, and a hook firing there couldn't recalculate a corpse's stats (formulas reach a corpse only through `corpse_var` / `corpse_var_set` / `corpse_var_del`; `apply_mods` refuses a corpse id). An `on_revive` recalculation covers armor taken off a corpse meanwhile.
 
 ## Medium (a subsystem slice)
 
@@ -741,11 +742,12 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - A digest of what happened since your last turn (#146).
   - A deadline rule that skips the turn when time runs out; the unit does nothing, so this stays clear of AI.
   - For Discord tables that play over days.
-- **#252 Derived vars.**
-  - A var declared as a formula (`max_hp := round(apply_mods(self, 'max_hp', 50 * level))`) whose value is computed when it is read.
+- **#252 Derived vars** (W21 part 1, planned; when to build it is open, user: it needs a lot of testing; template hooks, W22, recalculate in the meantime).
+  - A var declared as a formula (`max_hp := round(apply_mods(self, 'max_hp', 50 * level))`) whose value is computed when it is read; or (W21's shape) a system rule `derived_stats` keeping a stored var equal to its folded modifiers over a base path, written through write_var under a derivation scope as sizes are, its pool (hp) following per `cap` / `raise` / `ratio`, `restat(eid, full=False)`.
   - The game need: NCS multiplies HP bonuses from class, armor and items, and Solis Endurance raises max hp by a percentage. A derived max hp would need no recomputation when gear changes.
   - Open questions: cycles between derived vars; whether var hooks fire when a derived value changes; how saves and undo store them; the cost per read. This is a larger shift than the rest of the list, since modifiers are pure queries today by design.
 
+- **#622 Loadout limits** (W21 part 4; the user: "we can come back to it slightly later"). A rule `loadout_limits` (merged entry by entry): name -> {field, roots, count, cap, mode}: the sum of `field` (times `count`) over the records under the roots against a cap; `warn` prints a ⚠️ after the write that passes it, `refuse` refuses that write. Proposed when it resumes: the cap a number or an expression (self = the unit, e.g. `apply_mods(self, 'weapon_slots', entity[self].base.weapon_slots)`), default mode `warn`, only a write that raises the total past the cap acts (a unit over the limit can still drop items), spawns and stamps only warn. One armor is a field `armor_slots: 1` with a cap of 1.
 - **#306 Encounter library.** A saved bundle of a prefab, the watchers, macros, reminders and match vars that go with it, and a turn-order setup, stamped into a match in one command. Sits between prefabs (#31) and system packs (#162).
 - **#348 Module split.** vtt_commands.py and logic.py are about 29,000 lines each; split them into packages by subsystem with pure moves. Every session reads less to find its way, and parallel PRs conflict less.
 - **#385 Server isolation.** Each server's commands run in their own worker process, so one server's slow command no longer delays the others. Locks, storage and routing are per server already; this removes the shared event loop behind most of the limit rules and ceilings.

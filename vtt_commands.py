@@ -19,7 +19,7 @@ from logic import (
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
-from logic import STATUS_LINES_SKIP, STATUS_HIDE_RE, STATUS_HIDE_SEP, STATUS_LINE_KINDS, APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, say_plain_text, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, passive_hooks, VAR_HOOKS, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import STATUS_LINES_SKIP, STATUS_HIDE_RE, STATUS_HIDE_SEP, STATUS_LINE_KINDS, APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, say_plain_text, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, passive_hooks, VAR_HOOKS, PATH_HOOKS, TEMPLATE_ROUTE, template_route, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -14782,16 +14782,17 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if dest_path.startswith(src_path + "."):
                 raise VTTError(f"`{dest_path}` is inside `{src_path}`, which "
                                f"the move deletes.")
-        if de is not None:
-            log = list(de.write_var(dest_path, copy.deepcopy(val)))
-        else:
-            log = []
-            m.corpse_var_set(dest_id, dest_path, copy.deepcopy(val))
-        if sub == "var_move":
-            if src_cid is not None:
-                m.corpse_var_del(src_id, src_path)
-            elif src_id in m.entities:
-                log.extend(m.entities[src_id].remove_var(src_path))
+        with template_route("move" if sub == "var_move" else "copy"):
+            if de is not None:
+                log = list(de.write_var(dest_path, copy.deepcopy(val)))
+            else:
+                log = []
+                m.corpse_var_set(dest_id, dest_path, copy.deepcopy(val))
+            if sub == "var_move":
+                if src_cid is not None:
+                    m.corpse_var_del(src_id, src_path)
+                elif src_id in m.entities:
+                    log.extend(m.entities[src_id].remove_var(src_path))
         verb = "Moved" if sub == "var_move" else "Copied"
 
         def who(rid: str, cid_: Optional[str]) -> str:
@@ -15409,9 +15410,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     else:  # a located part keeps its offset from the anchor
                         px, py = x + (oe.x - src.x), y + (oe.y - src.y)
                     clone = Entity.from_dict(payload)
-                    _, spawn_log = clone.spawn(
-                        m, px, py, initiative=(src.initiative if oid == src_id else None),
-                        map_name=cmap.name)
+                    with template_route("clone"):
+                        _, spawn_log = clone.spawn(
+                            m, px, py, initiative=(src.initiative if oid == src_id else None),
+                            map_name=cmap.name)
                     clone.facing = oe.facing
                     logs.extend(spawn_log)
                 m._restamp_parts_for(idmap[src_id])
@@ -22575,7 +22577,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e.mark_changed()
         # Mention target/scope in the ack only for var hooks where they apply
         scope_note = ""
-        if any(h in VAR_HOOKS for h in when.split(",")):
+        if any(h in PATH_HOOKS for h in when.split(",")):
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added passive `{pid}` ({when}){scope_note} to `{eid}`.")
 
@@ -22784,7 +22786,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             extra_turns=xturns,
         )
         scope_note = ""
-        if any(h in VAR_HOOKS for h in when.split(",")):
+        if any(h in PATH_HOOKS for h in when.split(",")):
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added global passive `{pid}` ({when}){scope_note}.")
 
@@ -23281,7 +23283,7 @@ async def _defpassive_on(ctx: ReplyContext, mgr: MatchManager,
         existing.append(spec.to_dict())
         refreshed = _write_specs(existing)
         scope_note = ""
-        if any(h in VAR_HOOKS for h in when.split(",")):
+        if any(h in PATH_HOOKS for h in when.split(",")):
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(
             f"Added default passive `{pid}` ({when}){scope_note} to system "
