@@ -951,6 +951,12 @@ _ODDS_MAX_KEEP_COMBOS = 200_000
 # formulas and `$()`) charges its steps here, faces and an exploding die's
 # chain included, so a message of many million-face calls stops at the
 # first that passes it. None outside a command (the per-call limit only).
+# A command's query view (W18 `!find chain:`): the ids it can't see, which
+# chain_targets leaves out of its pool so a chain never bounces through a
+# unit the channel's view hides. None = every unit (formulas see all).
+QUERY_HIDDEN: "contextvars.ContextVar[Optional[Any]]" = contextvars.ContextVar(
+    "fcs_query_hidden", default=None)
+
 ODDS_BUDGET: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
     "vtt_odds_budget", default=None)
 # An exploding die's chain is cut once its probability falls below this.
@@ -6966,6 +6972,10 @@ class FormulaEngine:
             # through every unit cost the square of the unit count, with no
             # limit charged).
             pool = {oid: oe for oid, oe, _ref in _candidates(start, relation)}
+            hidden = QUERY_HIDDEN.get()
+            if hidden is not None:
+                pool = {oid: oe for oid, oe in pool.items()
+                        if not hidden(oid)}
             while len(out) < n and pool:
                 # The jump distance is measured from the PREVIOUS link; with
                 # a max_jump only the units the cell index finds near it are
@@ -11051,7 +11061,8 @@ class FormulaEngine:
         def _packet(kind: str, fname: str, target: Any, amount: Any,
                     pool: Any, tags: Any, packet_tags: Any, dealer: Any,
                     source: Any, forecast: bool,
-                    quiet: Any = False) -> Dict[str, Any]:
+                    quiet: Any = False,
+                    message: Any = None) -> Dict[str, Any]:
             import damage as _damage
             tid, _te = _resolve_entity(target, fname)
             who, src = _packet_defaults(dealer, source)
@@ -11059,7 +11070,7 @@ class FormulaEngine:
                 res = _damage.run_packet(
                     match, kind, tid, amount, pool=pool, tags=tags,
                     packet_tags=packet_tags, dealer=who, source=src,
-                    forecast=forecast, quiet=bool(quiet))
+                    forecast=forecast, quiet=bool(quiet), message=message)
             except VTTError as ex:
                 raise FormulaError(f"{fname}: {ex}")
             match.surface_log(res["notes"] + res["log"])
@@ -11068,9 +11079,11 @@ class FormulaEngine:
         def _deal_damage(target: Any, damage: Any, pool: Any = None,
                          tags: Any = None, packet_tags: Any = None,
                          attacker: Any = _UNSET, source: Any = _UNSET,
-                         quiet: Any = False) -> Dict[str, Any]:
+                         quiet: Any = False,
+                         message: Any = None) -> Dict[str, Any]:
             """deal_damage(target, damage, pool=None, tags=None,
-            packet_tags=None, attacker=..., source=..., quiet=False): run a
+            packet_tags=None, attacker=..., source=..., quiet=False,
+            message=None): run a
             damage packet through the match's damage steps (attacker steps,
             then defender steps) and lower each pool once. `damage` is a
             number (one component) or a list of {amount, pool, tags};
@@ -11078,23 +11091,29 @@ class FormulaEngine:
             default: the damage_default_pool rule, the hp var). `attacker`
             and `source` default from where it runs (an action: its unit
             and the action; a status tick, a tile or zone hook: that).
+            `quiet` prints no line; `message` is this packet's line in
+            place of the damage_message_format rule (its placeholders;
+            "" = none), printed after the writes and before the hooks and
+            a death, so a lethal hit reads its own line first.
             Returns the damage taken per pool ({'hp': 18})."""
             return dict(_packet("damage", "deal_damage", target, damage,
                                 pool, tags, packet_tags, attacker, source,
-                                False, quiet)["taken"])
+                                False, quiet, message)["taken"])
 
         def _heal(target: Any, healing: Any, pool: Any = None,
                   tags: Any = None, packet_tags: Any = None,
                   healer: Any = _UNSET, source: Any = _UNSET,
-                  quiet: Any = False) -> Dict[str, Any]:
+                  quiet: Any = False,
+                  message: Any = None) -> Dict[str, Any]:
             """heal(target, healing, pool=None, tags=None, packet_tags=None,
-            healer=..., source=..., quiet=False): run a healing packet
+            healer=..., source=..., quiet=False, message=None): run a
+            healing packet
             through the match's healing steps (giver steps, then receiver
             steps) and raise each pool once; as deal_damage. Returns the
             healing received per pool."""
             return dict(_packet("healing", "heal", target, healing, pool,
                                 tags, packet_tags, healer, source,
-                                False, quiet)["taken"])
+                                False, quiet, message)["taken"])
 
         def _damage_forecast(target: Any, damage: Any, pool: Any = None,
                              tags: Any = None, packet_tags: Any = None,
@@ -11267,22 +11286,28 @@ class FormulaEngine:
 
         def _spread_packet(fname: str, tags: Any, packet_tags: Any,
                            attacker: Any, source: Any,
-                           quiet: Any) -> Dict[str, Any]:
+                           quiet: Any, message: Any = None
+                           ) -> Dict[str, Any]:
             who, src = _packet_defaults(attacker, source)
             return {"tags": tags, "packet_tags": packet_tags, "dealer": who,
-                    "source": src, "quiet": bool(quiet)}
+                    "source": src, "quiet": bool(quiet),
+                    "message": message}
 
         def _damage_part(part_token: Any, amount: Any, tags: Any = None,
                          packet_tags: Any = None, attacker: Any = _UNSET,
-                         source: Any = _UNSET, quiet: Any = False) -> int:
+                         source: Any = _UNSET, quiet: Any = False,
+                         message: Any = None) -> int:
             """damage_part(part, amount, tags=None, packet_tags=None,
-            attacker=..., source=..., quiet=False): a damage packet on a
+            attacker=..., source=..., quiet=False, message=None): a damage
+            packet on a
             body part (as deal_damage on it): the part's steps and writes
             (its hp stops at 0), then its share to the parent (the
             part_damage_to_main_percent_default rule, the part's
             damage_to_main_percent / to_main_cap vars, sent per
             part_damage_share_mode), then, at 0 hp, its destruction (its
-            on_death; a `vital` part kills the parent). Returns the hp
+            on_death; a `vital` part kills the parent); `quiet` /
+            `message` as deal_damage, for the part's own line (its share
+            prints the rule's line). Returns the hp
             damage the share took off the parent. A raw entity[part].hp
             write does not spill to main."""
             pid, _pe = _resolve_entity(part_token, "damage_part")
@@ -11291,7 +11316,7 @@ class FormulaEngine:
             to_main, _log = match.damage_part(
                 pid, amount, **_spread_packet("damage_part", tags,
                                               packet_tags, attacker,
-                                              source, quiet))
+                                              source, quiet, message))
             match.surface_log(_log)
             return to_main
         ns["damage_part"] = _damage_part
@@ -11301,10 +11326,11 @@ class FormulaEngine:
                            origin_y: Any = None, radius: Any = None,
                            tags: Any = None, packet_tags: Any = None,
                            attacker: Any = _UNSET, source: Any = _UNSET,
-                           quiet: Any = False) -> int:
+                           quiet: Any = False, message: Any = None) -> int:
             """damage_spread(target, total, mode=None, fragments=None,
             origin_x=None, origin_y=None, radius=None, tags=None,
-            packet_tags=None, attacker=..., source=..., quiet=False):
+            packet_tags=None, attacker=..., source=..., quiet=False,
+            message=None):
             distribute `total` area damage across the target's body parts,
             returning the hp damage that reached the parent. The total is
             DIVIDED among parts (each a damage packet on the part, as
@@ -11314,7 +11340,8 @@ class FormulaEngine:
             origin_x/origin_y + radius, only parts with a cell within radius
             (Chebyshev) of the origin are hit — a blast that doesn't reach the
             whole body (located + footprint-region parts). No (eligible) parts
-            -> full total to main. Loop entities_in_area(...) per entity."""
+            -> full total to main. Loop entities_in_area(...) per entity.
+            `quiet` / `message` as deal_damage, for each part's packet."""
             tid, _te = _resolve_entity(target_token, "damage_spread")
             if isinstance(total, bool) or not isinstance(total, (int, float)):
                 raise FormulaError("damage_spread(...): total must be a number.")
@@ -11335,7 +11362,7 @@ class FormulaEngine:
             to_main, _log = match.damage_spread(
                 tid, int(total), m, f, origin, radius_i,
                 **_spread_packet("damage_spread", tags, packet_tags,
-                                 attacker, source, quiet))
+                                 attacker, source, quiet, message))
             match.surface_log(_log)
             return to_main
         ns["damage_spread"] = _damage_spread

@@ -75,7 +75,7 @@ _FAILURE_MARKERS = ("Syntax error",)
 # lines. Game text may hold 💥 ("💥 Critical hit!"), so the emoji alone
 # isn't one (Y9).
 _CRASH_RE = re.compile(
-    r"💥 (?:Unexpected error|Uncaught|shlex parse error|\?file|Usage: \?file)"
+    r"💥 (?:Unexpected error|Uncaught|shlex parse error|\?file|\?pick|Usage: \?file)"
     r"|💥[^\n]*CRASHED")
 
 # Substrings that mark a top-level command error (a caught VTTError/FormulaError
@@ -144,6 +144,14 @@ class _Ctx:
         team's channel), printed in the transcript with its channel."""
         self.out.append(f"📨 to `{channel_key}`:\n{text}")
 
+    async def offer_suggestions(self, question: str, name: str,
+                                choices) -> None:
+        """W20: a near-miss name's corrected commands; `?pick <name>` on a
+        later line runs one as typed (`?pick no` drops them)."""
+        self.offered = (name, list(choices))
+        self.out.append(question + " (" + " / ".join(
+            f"`?pick {label}`" for label, _a in choices) + " / `?pick no`)")
+
 
 def _interpret_escapes(raw: str) -> str:
     """Convert the documentation escapes `\\n` and `\\t` into the real
@@ -177,7 +185,7 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str
         for ln in body.splitlines():
             if ln.strip().lower().startswith("expected:"):
                 break
-            if ln.startswith(("!", _TAB_PREFIX, _FILE_PREFIX, _BOARD_PREFIX)) \
+            if ln.startswith(("!", _TAB_PREFIX, _FILE_PREFIX, _BOARD_PREFIX, "?pick ")) \
                     or ln.startswith(_EXPECT_PREFIXES):
                 cmds.append(ln)
         out.append((num, title, cmds, allows))
@@ -409,6 +417,29 @@ async def _run_cmds(cmds: List[str], workspaces) -> List[Tuple[str, List[str]]]:
                 out = [f"💥 Uncaught: {type(e).__name__}: {e}"]
             transcript.append((line, out))
             previous = out
+            continue
+        if line.startswith("?pick "):
+            # W20: answer the last "did you mean" offer, as a click would.
+            label = line[len("?pick "):].strip()
+            offered = getattr(ctx, "offered", None)
+            ctx.offered = None
+            pick = None
+            if offered is not None:
+                pick = next((a for lb, a in offered[1] if lb == label), None)
+            if pick is None:
+                out = ([f"(no offer taken: `{label}`)"] if offered or
+                       label == "no" else ["💥 ?pick: nothing was offered"])
+                transcript.append((line, out))
+                previous = out
+                continue
+            ctx.out = []
+            try:
+                await registry.run(offered[0], pick, ctx,
+                                   workspaces.get(ctx.guild_key))
+            except Exception as e:  # noqa: BLE001
+                ctx.out.append(f"💥 Uncaught: {type(e).__name__}: {e}")
+            transcript.append((line, list(ctx.out)))
+            previous = list(ctx.out)
             continue
         if line.startswith(_TAB_PREFIX):
             try:

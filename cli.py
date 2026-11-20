@@ -77,6 +77,15 @@ class CLICtx:
         channel, R5): shown here with the channel it went to."""
         await self.send(f"📨 to `{channel_key}`:\n{text}")
 
+    async def offer_suggestions(self, question, name, choices):
+        """W20: a near-miss name's corrected commands, asked inline; the
+        one picked runs after this command, as if typed."""
+        labels = [label for label, _a in choices]
+        ans = await self.prompt_choice(question, labels + ["no"], None, None)
+        for label, args in choices:
+            if ans == label:
+                self.queued = (name, args)
+
     async def prompt_choice(self, prompt, options, lo, hi):
         """Interactive mid-action choice prompt (choose / choose_number).
         Returns the typed answer as a string, or None to cancel. Blocking
@@ -247,12 +256,18 @@ async def main():
                 continue
 
             root, *args = parts
-            try:
-                await registry.run(root, args, ctx,
-                                   workspaces.get(ctx.guild_key))
-            except Exception as e:
-                # Surface command/logic errors without killing the CLI
-                print(f"❌ {e}")
+            while root is not None:
+                ctx.queued = None
+                try:
+                    await registry.run(root, args, ctx,
+                                       workspaces.get(ctx.guild_key))
+                except Exception as e:
+                    # Surface command/logic errors without killing the CLI
+                    print(f"❌ {e}")
+                # A "did you mean" the user accepted runs next (W20).
+                root, args = ctx.queued or (None, [])
+                if root is not None:
+                    print(f"> !{root} " + " ".join(args))
         else:
             print("Commands must start with '!'")
     # Every command already wrote its changes; write once more on the way out.

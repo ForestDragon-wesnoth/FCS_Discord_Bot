@@ -947,6 +947,17 @@ class VTTError(Exception):
 class OutOfBounds(VTTError):
     pass
 
+
+class DidYouMean(VTTError):
+    """A lookup that missed a name (W20): `token` as typed and the names
+    it could have meant (`candidates`, unfiltered); the refusal offers the
+    close ones (vtt_commands._miss_suggestions)."""
+
+    def __init__(self, message: str, token: str, candidates: Any) -> None:
+        super().__init__(message)
+        self.token = str(token)
+        self.candidates = [str(c) for c in candidates or ()]
+
 class Occupied(VTTError):
     pass
 
@@ -3294,7 +3305,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "status_line_format": {
-        "default": ("{name}{?stacked?} ×{stacked}{/?}{?duration?} ({duration} "
+        "default": ("{name}{?stacked?} level {stacked}{/?}{?duration?} ({duration} "
                     "{turns_word}){/?}{?layers?}: {layers}{/?}"),
         "schema": {"type": "str"},
         "desc": (
@@ -3303,11 +3314,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "(statuses joined with `, `, by name). Placeholders: {name}, and "
             "every field of the status instance ({level}, {duration}, any "
             "custom field such as {lost_max_hp}); {stacked} (the level "
-            "when above 1, so a level-1 status shows no `×1`); "
+            "when above 1, so a level-1 status shows no `level 1`); "
             "{turns_word} (`turn` for "
             "a duration of 1, else `turns`); {layers} for a status "
-            "holding layers of several levels (layered stacking: `×3 for 2, "
-            "then ×1 for 3 more`); {?key?}...{/?} shows a part "
+            "holding layers of several levels (layered stacking: `level 3 for "
+            "2, then level 1 for 3 more`); {?key?}...{/?} shows a part "
             "only when the field is set. A status definition's own `display` "
             "format (`!status display <name> <format>`) replaces this one "
             "for that status, e.g. a burn that lists each level's timer."
@@ -5571,7 +5582,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": (
             "The line a damage packet prints (deal_damage, `!ent damage`) "
-            "unless it is quiet. Placeholders: the unit's ({name}, {id}, "
+            "unless it is quiet or the call gives its own `message=` "
+            "format (the same placeholders). Placeholders: the unit's ({name}, {id}, "
             "{x}, {y}, {team}, {round}, any var by name or dotted path), "
             "{amounts} (`18 damage and 5 stamina damage`), "
             "{damage_taken.<pool>} (what the steps decided), "
@@ -5588,7 +5600,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": (
             "The line a healing packet prints (heal, `!ent heal`) unless it "
-            "is quiet; as damage_message_format, with {healing_received.<pool>}, "
+            "is quiet or the call gives its own `message=`; as damage_message_format, with {healing_received.<pool>}, "
             "{healing_gained.<pool>} and {healing_giver}."
         ),
     },
@@ -6373,7 +6385,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Placeholders: the death_message_format ones ({name}, {id}, "
             "{x}, {y}, {team}, {round}, the unit's vars) plus {status}, "
             "{level}, {duration} (empty when permanent), {level_text} "
-            "(` ×<level>` above 1, else empty), {duration_text} (` for <n> "
+            "(` level <n>` above 1, else empty), {duration_text} (` for <n> "
             "turn(s)`, empty when permanent), {source} (who applied it, "
             "named as the view sees it; empty when none). Empty = no line."
         ),
@@ -6447,6 +6459,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`!match resume` unpauses and runs the held commands in order, "
             "`!match resume drop` unpauses and discards them. Read-only "
             "commands and `!match pause/resume` themselves always run."
+        ),
+    },
+    "suggestion_similarity": {
+        "default": 75,
+        "schema": {"type": "int", "min": 0, "max": 100},
+        "desc": (
+            "How close a mistyped action name or unit id must be to a real "
+            "one for the refusal to offer it (W20), as a percentage "
+            "(difflib's similarity ratio; 0 = never offer). A typed command "
+            "offers up to 3 such names: on Discord as buttons only the "
+            "person who typed it can click (each runs the corrected "
+            "command as if typed, through the gate and the approval "
+            "queue), in the CLI and GUI as a prompt; inside a batch, macro, "
+            "sweep or action the refusal names them as text. Unit "
+            "candidates come from the units the channel's view shows; ids "
+            "that differ only in their digits (`hunter2` / `hunter3`) "
+            "never suggest each other."
         ),
     },
     "pending_request_expiry_seconds": {
@@ -7168,7 +7197,7 @@ MAP_RESERVED_NAMES = frozenset({
     "scene", "image", "color", "teamcolor", "resize", "layer", "autoupdate",
     "legend", "coords", "pan", "center", "new", "list", "delete", "rename",
     "copy", "use", "var", "fog", "unseen", "attach", "detach", "void",
-    "shape"})
+    "shape", "raycast", "random"})
 
 
 def check_map_name(name: Any) -> None:
@@ -21976,6 +22005,7 @@ class Match:
                 log.extend(self.fire_hook(
                     "on_turn_skipped", target_ids=[eid],
                     extras={"skip_status": matched}))
+                self._pull_surfaced(log)
                 for when in ("turn_start", "turn_end"):
                     if self.extra_turn == eid and eid in self.entities:
                         log.extend(self.fire_status_tick(when))
@@ -22030,9 +22060,36 @@ class Match:
             log.extend(self._atb_reset_actor(self.entities[eid]))
             self._atb_last_skipped = False
         log.extend(self._atb_turn_phase(eid, "turn_start", act=True))
-        self.turn_vacated = None
+        e = self.entities.get(eid)
+        if e is None or not e.is_alive:
+            # It died to its own turn-start effects: as under `!turn next`,
+            # a dead unit never holds the turn, so it passes on at once.
+            self._pass_dead_turn(eid, log, atb)
+        else:
+            self.turn_vacated = None
         self._begin_turn()
         return log
+
+    def _pass_dead_turn(self, eid: str, log: List[str], atb: bool) -> None:
+        """`!turn set` gave the turn to a unit that died at its start: pass
+        the turn on the way `!turn next` does (the next unit's turn starts,
+        a round wrap on the way fires its hooks)."""
+        if not self.turn_order:
+            self.turn_vacated = None
+            self._pull_surfaced(log)
+            log.append("⏭ No one is left to take the turn.")
+            return
+        self._pull_surfaced(log)
+        log.append("⏭ The turn passes to the next unit.")
+        if atb:
+            self.turn_vacated = None
+            self._atb_start_next(log)
+            return
+        if self.turn_vacated is None and eid in self.turn_order:
+            # Dead but still in the order (an alive_condition that
+            # disagrees with the death pipeline): step past it.
+            self._advance_index(log)
+        self._start_current_turn(log)
 
     def _start_current_turn(self, log: List[str]) -> Optional[str]:
         """Start the turn of the unit at active_index: skip past skippable
@@ -22489,15 +22546,21 @@ class Match:
         if not self.turn_order:
             self._begin_turn()
             return (None, log)
-        # An actor that dies to its own turn-start effects never holds the
-        # turn (a dead unit can't act): the next charged unit is selected.
-        # Bounded by the order's size, like the round-mode loop.
+        new_cur = self._atb_start_next(log)
+        self._begin_turn()
+        return (new_cur, log)
+
+    def _atb_start_next(self, log: List[str]) -> Optional[str]:
+        """Select the next ATB actor and start its turn. An actor that dies
+        to its own turn-start effects never holds the turn (a dead unit
+        can't act): the next charged unit is selected. Bounded by the
+        order's size, like the round-mode loop. Returns the actor, or None
+        when nobody is left."""
         guard = len(self.turn_order) + 1
         while True:
             new_cur = self._atb_select(log)
             if new_cur is None:
-                self._begin_turn()
-                return (None, log)
+                return None
             # A skipped actor's turn still ELAPSES (bar already reset, status
             # ticks fire) but it performs no action.
             skipping = self._skipping_statuses(self.entities[new_cur])
@@ -22509,6 +22572,7 @@ class Match:
                 log.extend(self.fire_hook(
                     "on_turn_skipped", target_ids=[new_cur],
                     extras={"skip_status": matched}))
+                self._pull_surfaced(log)
             # turn_start for the new actor (active_index now points at it).
             log.extend(self._atb_turn_phase(
                 new_cur, "turn_start", act=not skipping))
@@ -22521,18 +22585,16 @@ class Match:
             if not self.turn_order:
                 self._pull_surfaced(log)
                 log.append("⏭ No one is left to take the turn.")
-                self._begin_turn()
-                return (None, log)
+                return None
             guard -= 1
             if guard <= 0:
                 self._pull_surfaced(log)
                 log.append("⏭ Every unit died at the start of its turn; the "
                            "turn stays here.")
-                break
+                return new_cur
             self._pull_surfaced(log)
             log.append("⏭ The turn passes to the next unit.")
-        self._begin_turn()
-        return (new_cur, log)
+        return new_cur
 
     def _advance_index(self, log: List[str]) -> None:
         """Advance active_index by one, handling round wrap: fire
@@ -22557,6 +22619,9 @@ class Match:
                 return
             new_index, wrapped = 0, True
         if wrapped:
+            # What the turn so far surfaced (a skipped unit's passives, its
+            # ticks) reads before the round lines.
+            self._pull_surfaced(log)
             line = self.round_message_line("round_end_message_format")
             if line:
                 log.append(line)
@@ -22742,6 +22807,7 @@ class Match:
             log.extend(self.fire_hook(
                 "on_turn_skipped", target_ids=[cur],
                 extras={"skip_status": matched}))
+            self._pull_surfaced(log)
             # The skipped turn still elapses: the unit's turn_start and
             # turn_end status ticks fire (no action surface), as under ATB.
             # Without them a stun counting down on its own turns never wore
@@ -25037,7 +25103,7 @@ class Match:
         vals: Dict[str, Any] = {
             "status": name, "level": lv,
             "duration": "" if du is None else du,
-            "level_text": f" ×{lv}" if lv != 1 else "",
+            "level_text": f" level {lv}" if lv != 1 else "",
             "duration_text": ("" if du is None else
                               f" for {du} turn{'' if du == 1 else 's'}"),
             "source": self.say_name(src) if isinstance(src, str) else "",

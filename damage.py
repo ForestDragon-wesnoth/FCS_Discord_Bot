@@ -515,10 +515,15 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
                pool: Any = None, tags: Any = None, packet_tags: Any = None,
                dealer: Optional[str] = None, source: Optional[str] = None,
                forecast: bool = False, quiet: bool = False,
+               message: Optional[str] = None,
                trace: Optional[List[Dict[str, Any]]] = None
                ) -> Dict[str, Any]:
     """Take one packet to `target` (module docstring). Returns {raw,
     taken, lost (per pool), components, dropped, notes, log, skipped}.
+
+    `message` replaces the {kind}_message_format rule for this packet's
+    own line ("" = no line); a body part's share to its parent is a
+    packet of its own and prints the rule's line.
 
     The target's death check is held from the first step through the
     writes, the share and the hooks, then runs once (design §10.9):
@@ -528,6 +533,13 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
     step that wrote the defender's hp to 0 killed it at once, so the
     packet found no hp to write, fired no hook and credited no killer)."""
     from logic import PACKET_KILLER
+    if message is not None:
+        if not isinstance(message, str):
+            raise VTTError("message= is the packet's line, a text "
+                           "(\"\" = no line).")
+        if quiet:
+            raise VTTError("`quiet` and `message` both decide the packet's "
+                           "line: give one (an empty message prints none).")
     held = (not forecast and isinstance(target, str)
             and target in m.entities
             and target not in m._death_check_deferred_ids)
@@ -537,7 +549,7 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
         result = _packet(m, kind, target, damage, pool=pool, tags=tags,
                          packet_tags=packet_tags, dealer=dealer,
                          source=source, forecast=forecast, quiet=quiet,
-                         trace=trace)
+                         message=message, trace=trace)
     finally:
         if held:
             m._death_check_deferred_ids.discard(target)
@@ -556,7 +568,7 @@ def run_packet(m: Any, kind: str, target: str, damage: Any, *,
 def _packet(m: Any, kind: str, target: str, damage: Any, *,
             pool: Any, tags: Any, packet_tags: Any,
             dealer: Optional[str], source: Optional[str],
-            forecast: bool, quiet: bool,
+            forecast: bool, quiet: bool, message: Optional[str],
             trace: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
     """run_packet's work, inside its held death check."""
     info = kind_info(kind)
@@ -665,7 +677,7 @@ def _packet(m: Any, kind: str, target: str, damage: Any, *,
             raise VTTError(f"damage_part `{target}`: {ex}"
                            if kind == "damage" else f"`{target}`: {ex}")
     # (run_packet holds the target's death check around all of this.)
-    _write_pools(m, kind, e, result, quiet)
+    _write_pools(m, kind, e, result, quiet, message)
     _record(m, kind, result)
     if e.is_part and share:
         _send_share(m, kind, result, share, quiet)
@@ -830,7 +842,8 @@ def _part_destroyed(m: Any, kind: str, result: Dict[str, Any]) -> None:
 
 
 def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any],
-                 quiet: bool = False) -> None:
+                 quiet: bool = False,
+                 message: Optional[str] = None) -> None:
     """Each pool once through write_var (a write a packet makes logs no
     hp_change entry); then the statuses that break, the packet's line and
     its event-log entry. The target's death check stays held (run_packet
@@ -870,7 +883,7 @@ def _write_pools(m: Any, kind: str, e: Any, result: Dict[str, Any],
     if kind == "damage" and target in m.entities:
         log.extend(_break_statuses(m, result))
     if target in m.entities:
-        _announce_packet(m, kind, result, quiet)
+        _announce_packet(m, kind, result, quiet, message)
     _log_packet(m, kind, result)
 
 
@@ -975,15 +988,17 @@ def components_text(m: Any, kind: str, comps: List[Dict[str, Any]]) -> str:
 
 
 def _announce_packet(m: Any, kind: str, result: Dict[str, Any],
-                     quiet: bool) -> None:
-    """The packet's line (damage_message_format / healing_message_format),
-    tagged as a line about the target, through surface_log; result['line']
-    records whether one was shown."""
+                     quiet: bool, message: Optional[str] = None) -> None:
+    """The packet's line (the call's `message`, else
+    damage_message_format / healing_message_format), tagged as a line
+    about the target, through surface_log; result['line'] records whether
+    one was shown."""
     info = kind_info(kind)
     result["line"] = None
     if quiet:
         return
-    fmt = str(m.rules.get(f"{kind}_message_format", "") or "")
+    fmt = message if message is not None else \
+        str(m.rules.get(f"{kind}_message_format", "") or "")
     if not fmt:
         return
     e = m.entities[result["target"]]

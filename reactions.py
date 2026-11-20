@@ -400,6 +400,66 @@ def _condition_bindings(m: Any, uid: str, act: Any,
     return {"source": SourceProxy(e, ract.container_path)}
 
 
+_CONDITIONED_TARGETS = ("entity", "entity_list", "location", "location_list")
+
+
+def reaction_target_check(m: Any, ex: Dict[str, Any], uid: str, act: Any,
+                          via: Optional[str], target: Any,
+                          args: Optional[Dict[str, Any]] = None
+                          ) -> Tuple[Any, List[Tuple[Any, str]]]:
+    """A reaction's target_condition (user call, after pass 78): judged
+    when `!react` picks it, so a refused pick records nothing and the
+    window stays open, and again when its half runs. Bound as its halves
+    bind: self = the reacting unit (its vehicle for a seat action, as
+    mount_routing decides), `reaction_target` the target picked (one
+    unit, or a location's cell), `reaction_args`, the incoming action's
+    `actor` / `target` / `args` / `action_name` / `action_tags` /
+    `affected`, `incoming` (the reacting unit's copy, read-only) and
+    `source`. Returns (the target kept, [(refused target, error)]): a
+    single target is kept or refused; a list keeps those that pass."""
+    from action import ArgsProxy
+    from formula import FormulaEngine
+    if not act.target_condition or act.target_type not in \
+            _CONDITIONED_TARGETS:
+        return target, []
+    eff, mextra, _ract = mount_routing(m, uid, act, via)
+    base = _condition_bindings(m, uid, act, via)
+    base["args"] = ArgsProxy(dict(ex.get("args") or {}))
+    base["reaction_args"] = ArgsProxy(dict(args or {}))
+
+    def ok(tid: Any) -> Tuple[bool, str]:
+        binds = dict(base)
+        binds["reaction_target"] = tid
+        ctx = _eval_ctx(m, ex, uid, False, extra=mextra or None)
+        ctx.target = eff
+        try:
+            return bool(FormulaEngine(m).eval_expression(
+                act.target_condition, ctx, attr_bindings=binds)), ""
+        except Exception as err:      # noqa: BLE001 - a refusal, not raised
+            return False, _formula_error(err)
+    if isinstance(target, list):
+        kept, refused = [], []
+        for tid in target:
+            good, err = ok(tid)
+            if good:
+                kept.append(tid)
+            else:
+                refused.append((tid, err))
+        return kept, refused
+    good, err = ok(target)
+    return (target, []) if good else (None, [(target, err)])
+
+
+def _target_text(tid: Any) -> str:
+    return f"({tid.x},{tid.y})" if hasattr(tid, "x") else f"`{tid}`"
+
+
+def _refused_text(act: Any, refused: List[Tuple[Any, str]]) -> str:
+    return "; ".join(f"{_target_text(t)} doesn't meet `{act.name}`'s "
+                     f"target condition" + (f" ({e})" if e else "")
+                     for t, e in refused)
+
+
 def _formula_error(ex: BaseException) -> str:
     if FORMULA_TEXT_HIDDEN.get():
         return "its formula failed"
@@ -597,6 +657,8 @@ def _auto_picks(m: Any, ex: Dict[str, Any], uid: str, phase: str,
                 continue
             if not ok:
                 continue
+        if reaction_target_check(m, ex, uid, act, via, own_target)[1]:
+            continue
         _pick(m, ex, uid, act, via, phase, target=own_target, auto=True)
         names.append(act.name)
     return names
@@ -1096,10 +1158,24 @@ async def _half(env: _Env, seq: int, n: int, half: str, pays: bool) -> str:
         return "gone"
     eff, mextra, act = mount_routing(m, uid, act, pick.get("via"))
     first = not pick.get("ran")
+    # The target_condition is judged here with the exchange bound
+    # (reaction_target_check), so run_action doesn't judge it again.
     half_act = dataclasses.replace(
         act, body=src, prepare="", cost=act.cost if pays else "",
-        say_format=act.say_format if first else "")
+        say_format=act.say_format if first else "", target_condition="")
     own_target = target_from_json(act.target_type, jcopy(pick.get("target")))
+    kept, refused = reaction_target_check(
+        m, ex, uid, act, pick.get("via"), own_target,
+        dict(pick.get("args") or {}))
+    if refused and (not isinstance(own_target, list) or not kept):
+        env.out.append(m.unit_tag(uid) + f"❌ {_name(m, uid)}'s "
+                       f"`{pick['name']}` failed: [target_condition] "
+                       + _refused_text(act, refused) + ".")
+        return "fail"
+    if refused:
+        env.out.append(m.unit_tag(uid) + "⚠️ " + _refused_text(act, refused)
+                       + ": left out.")
+        own_target = kept
     writable = half == "before"
     extra_ctx = {
         "actor": ex["eff_actor"],
@@ -2030,8 +2106,9 @@ async def react_pick(ctx: Any, mgr: Any, m: Any, uid: str, requested: str,
                               requested, m.rules)
         if not found:
             names = ", ".join(f"`{n}`" for n in by_name) or "none"
-            raise VTTError(f"`{uid}` can't pick `{requested}` now. It can "
-                           f"pick: {names}.")
+            from logic import DidYouMean
+            raise DidYouMean(f"`{uid}` can't pick `{requested}` now. It can "
+                             f"pick: {names}.", requested, list(by_name))
         if len(found) > 1:
             raise VTTError(f"`{uid}` has {len(found)} reactions named "
                            f"`{requested}`: name one by its path ("
@@ -2048,6 +2125,13 @@ async def react_pick(ctx: Any, mgr: Any, m: Any, uid: str, requested: str,
                                      directions=act.direction_target)
     args = parse_args_tokens(remaining)
     target, dup = dedupe_targets(act.target_type, target, act.name)
+    _kept, refused = reaction_target_check(m, ex, uid, act, via, target,
+                                           args)
+    if refused:
+        # Refused whole, list targets too: the pick records nothing and
+        # the window stays open for another try.
+        raise VTTError(f"`{uid}` can't pick `{act.name}` there: "
+                       + _refused_text(act, refused) + ".")
     _pick(m, ex, uid, act, via, phase, target=target, args=args,
           answers=answers)
     _refresh_done(m, ex)
