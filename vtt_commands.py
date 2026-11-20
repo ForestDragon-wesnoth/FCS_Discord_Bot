@@ -16056,7 +16056,8 @@ registry.annotate_sub(
     "ent", "damage",
     usage=("!ent damage <id> <amount> [spread|spread=<mode>] "
            "[fragments=<k>] [origin=<x,y>] [radius=<r>] [pool=<var>] "
-           "[tags=<a,b>] [packet_tags=<a,b>] [from=<unit>] [quiet]"),
+           "[tags=<a,b>] [packet_tags=<a,b>] [from=<unit>] "
+           "[quiet] [message=<format>]"),
     desc=("Deal damage through the damage pipeline (#25): the match's "
           "damage steps run (attacker steps, then defender steps), then "
           "each pool is lowered once and the unit's death is checked. "
@@ -16068,11 +16069,14 @@ registry.annotate_sub(
           "its part: `spread=<mode>` picks weighted / uniform / fragment / "
           "main_only (default aoe_default_mode), `fragments=` the fragment "
           "count, `origin=<x,y> radius=<r>` only the parts near a blast "
-          "point; the reply says how much reached the unit itself."))
+          "point; the reply says how much reached the unit itself. "
+          "`quiet` prints no packet line; `message=<format>` prints this "
+          "line in place of damage_message_format (its placeholders, "
+          "quoted when it has spaces; `message=` alone prints none)."))
 registry.annotate_sub(
     "ent", "heal",
     usage=("!ent heal <id> <amount> [pool=<var>] [tags=<a,b>] "
-           "[packet_tags=<a,b>] [from=<unit>] [quiet]"),
+           "[packet_tags=<a,b>] [from=<unit>] [quiet] [message=<format>]"),
     desc=("Heal through the healing pipeline (#25): the match's healing "
           "steps run (giver steps, then receiver steps), then each pool is "
           "raised once. Options as `!ent damage`."))
@@ -31411,10 +31415,16 @@ def _packet_kwargs(ctx: ReplyContext, m: Match, tail: List[str],
             quiet = True
             continue
         key, eq, val = t.partition("=")
+        if key.lower() == "message" and eq and "quiet" in allowed:
+            # The packet's own line (damage_message_format's
+            # placeholders); `message=` alone = no line.
+            opts["message"] = val
+            continue
         key = key.lower()
         if not eq or key not in allowed:
             raise VTTError(f"Unexpected `{t}`: options are "
-                           + ", ".join(f"`{k}=`" if k != "quiet" else "`quiet`"
+                           + ", ".join(f"`{k}=`" if k != "quiet" else
+                                       "`quiet`, `message=`"
                                        for k in allowed) + ".")
         if key == "from":
             opts["dealer"] = (None if val in ("", "-", "none")
@@ -31484,7 +31494,7 @@ async def _ent_packet(ctx: ReplyContext, m: Match, sub: str,
     res = _damage.run_packet(
         m, kind, eid, amount, pool=opts.get("pool"), tags=opts.get("tags"),
         packet_tags=opts.get("packet_tags"), dealer=opts.get("dealer"),
-        source="command", quiet=quiet)
+        source="command", quiet=quiet, message=opts.get("message"))
     lines = list(res["notes"])
     # The packet's own line (damage_message_format) was surfaced with the
     # lines its writes and hooks surfaced (a death line, a thorns hit):
@@ -31519,6 +31529,8 @@ async def _ent_spread(ctx: ReplyContext, m: Match, mgr: Any, eid: str,
                           "source": "command"}
     if quiet:
         kw["quiet"] = True
+    if "message" in opts:
+        kw["message"] = opts["message"]
     if "dealer" in opts:
         kw["attacker"] = opts["dealer"]
     if "fragments" in extra:

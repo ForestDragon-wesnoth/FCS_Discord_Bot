@@ -47444,3 +47444,112 @@ ran) survive a restart. `!match rerun undo` restores the pre-rerun match
 player's rerun waits for a host. A match whose journal no longer reaches
 its creation (command_journal_limit 2 keeps the newest two segments) is
 refused.
+
+SCENARIO 1277 — message= on a damage or healing packet: the call's own line before a death
+----------------------------------------
+!match new pm PM 8 6
+!match use pm
+!ent add c Cat 10 3 3
+!passive add c yowl on_death "say('the cat yowls')"
+!eval "deal_damage('c', 50, message='{name} burns for {amounts} from the trap')"
+?? Cat burns for 50 damage from the trap
+?! 🩸
+!assert "has_corpse('c')"
+!ent add d Dog 20 4 4
+!ent damage d 5 "message={name} is clawed for {damage_taken.hp}"
+?? Dog is clawed for 5
+!ent damage d 5 message=
+?? `d` takes 5 damage.
+!ent heal d 3 "message={name} mends {amounts}"
+?? Dog mends 3 healing
+!assert "entity[d].hp == 13"
+!ent add ogre Ogre 40 6 2 footprint_w=2 footprint_h=2
+!part add ogre oarm arm 10 10 damage_to_main_percent=50
+!eval "damage_part('oarm', 12, message='{name} loses {amounts}')"
+?? arm loses 12 damage
+?? 🩸 **Ogre** (`ogre`) takes 5 damage.
+!eval "damage_spread('ogre', 4, mode='uniform', message='{name} scorched {amounts}')"
+?? 🩸 **Ogre** (`ogre`) takes 2 damage.
+!assert "entity[ogre].hp == 33"
+!ent damage d 5 quiet message=x
+?? ❌ `quiet` and `message` both decide the packet's line
+!eval "heal('d', 2, message=5)"
+?? ❌ heal: message= is the packet's line, a text
+!assert "entity[d].hp == 13"
+
+Expected: `message=` replaces damage_message_format for one packet. A
+lethal deal_damage on the cat prints "Cat burns for 50 damage from the
+trap" ahead of everything the death prints (the on_death passive's
+line, then the death line): the call's own line comes first and needs no
+forecast. On `!ent damage` /
+`!ent heal` the option takes the rule's placeholders
+({damage_taken.hp}, {amounts}); `message=` alone prints no packet line
+(the command's plain confirmation stands in, as for `quiet`). On the
+2x2 ogre's arm damage_part prints "arm loses 12 damage", and the arm's
+50% share (5) reaches the ogre as its own packet with the rule's line;
+damage_spread over the ogre's one part (4 damage, arm already at 0)
+sends 2 on to the body (ogre 40 → 35 → 33). `quiet` with `message=` is
+refused, as is a message that isn't text; nothing changes (Dog at 13).
+
+SCENARIO 1278 — A reaction's target_condition is judged at the pick, with the attack bound: a refused pick leaves the window open
+---------------------------------------------------------------------------------------------------------------------------------
+!match new rp Rp 10 10
+!match use rp
+!ent add ogre Ogre 40 4 4 5
+!ent add hunter Hunter 30 7 4 3
+!ent add guard Guard 30 1 9 2
+!ent set_var guard actions.brace.reacts_to melee
+!ent set_var guard actions.brace.reacts_on any
+!ent set_var guard actions.brace.condition true
+!ent set_var guard actions.brace.before "x = 1"
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var ogre actions.claws.target entity
+!ent set_var ogre actions.claws.tags melee
+!ent set_var ogre actions.claws.prepare "dodge_rule = 'away'"
+!ent set_var hunter actions.dodge.reacts_to melee
+!ent set_var hunter actions.dodge.target location
+!ent set_var hunter actions.dodge.direction_target true
+!ent set_var hunter actions.dodge.target_condition "incoming.dodge_rule != 'away' or distance(reaction_target.x, reaction_target.y, coord_x(entity_center(actor)), coord_y(entity_center(actor)), 'manhattan') > distance(entity[self].x, entity[self].y, coord_x(entity_center(actor)), coord_y(entity_center(actor)), 'manhattan')"
+!ent set_var hunter actions.dodge.before "move_entity(self, reaction_target)\nincoming.dodged = True"
+!ent set_var ogre actions.claws.body "if not incoming.dodged:\n    entity[target].hp -= 5"
+!action ogre claws hunter
+?? reactions are offered
+!react hunter dodge left
+?? ❌ `hunter` can't pick `dodge` there: (6,4) doesn't meet `dodge`'s target condition.
+!assert "entity[hunter].x == 7"
+!react hunter dodge right
+?? Hunter picks `dodge`
+!react skip
+!assert "entity[hunter].x == 8 and entity[hunter].hp == 30"
+!ent tp hunter 7 4
+!action ogre claws hunter
+!react hunter dodge right
+?? Hunter picks `dodge`
+!ent tp ogre 8 5
+!react skip
+?? ❌ Hunter's `dodge` failed: [target_condition] (8,4) doesn't meet `dodge`'s target condition.
+!assert "entity[hunter].x == 7 and entity[hunter].hp == 25"
+!ent tp ogre 4 4
+!ent set_var hunter actions.dodge.target_condition "nope(reaction_target)"
+!action ogre claws hunter
+!react hunter dodge right
+?? its formula failed
+!react hunter pass
+!react skip
+!assert "entity[hunter].hp == 20"
+HARNESS-ALLOWS-ERRORS
+
+Expected: the 2×2 ogre (body centre (4,4)) claws the hunter at (7,4)
+(a guard far off holds a reaction to any melee, so each window waits for
+it and `!react skip` closes it);
+its prepare sets `dodge_rule = 'away'` in `incoming`. The hunter's dodge
+holds a target_condition read with the attack bound: `actor` the ogre,
+`incoming` the hunter's copy, `reaction_target` the cell picked, self the
+hunter. `!react hunter dodge left` picks (6,4), nearer the ogre: refused,
+nothing recorded, the window stays open, and `dodge right` ((8,4),
+farther) is picked; the hunter steps away and the claws miss (hp 30). In
+a second attack the pick is fine, then the host moves the ogre to (8,5)
+before the window closes: the condition is judged again when the half
+runs, (8,4) is now nearer, the dodge fails and the claws land (hp 25).
+A condition whose formula fails refuses the pick naming the failure;
+the hunter passes and takes the hit (hp 20).

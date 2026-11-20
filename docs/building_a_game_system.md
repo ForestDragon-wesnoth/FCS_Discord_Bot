@@ -105,9 +105,12 @@ both buffs) each had an answer the text alone didn't settle (5b7e05c).
   heal) until each condition ended with `not solis_heal_shot(actor,
   action_tags)` (2060d4e).
 - A reaction whose `before` half fails is spent and the attack lands: its
-  window closed when the pick was made. Say in the reaction's description
-  what it refuses (a dodge toward the attacker), so a player knows before
-  typing.
+  window closed when the pick was made. Put what a reaction refuses (a
+  dodge toward the attacker, a step the attack's `prepare` forbids) in
+  its `target_condition`: `!react` judges it at the pick, with the attack
+  bound (`actor`, `incoming`, `reaction_target`), and a refused pick
+  leaves the window open for another try. Keep the `before` half for
+  what can only fail once the reaction runs.
 
 ## Statuses and time
 
@@ -122,9 +125,12 @@ both buffs) each had an answer the text alone didn't settle (5b7e05c).
   machine_amount, tag, growing, heal}`), read by one function; a count-only
   status needs no tick of its own (status_tick_formula counts a defined
   status without a tick down, 078902a).
-- A lethal `deal_damage(..., quiet=True)` prints the death line before the
-  caller's own line: Solis prints the tick's line from `damage_forecast`
-  first, then deals it quietly (954503f).
+- A packet's own line prints before everything a death it causes prints.
+  A system that words its own damage lines passes them as `message=` on
+  `deal_damage` / `heal` (the damage_message_format placeholders); a
+  quiet packet followed by a `say()` puts the say after the death line
+  (Solis printed each tick's line from a `damage_forecast` first,
+  954503f, a forecast per tick that `message=` replaces).
 - Say every effect: each status given (level and turns after resistance),
   each block (the amount stopped), each consumable use (what's left), each
   weak spot. Silent effects were the first match's main complaint (19e06ff,

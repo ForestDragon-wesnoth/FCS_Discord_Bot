@@ -4692,7 +4692,8 @@ lists what isn't built; 1093-1122).
   run right before the body, in the same transaction), `affects`
   (expression, `target` a location's cell; default the unit targets),
   `target_condition` (expression, self = actor, `target` one target: a
-  unit, or a location target's cell, #540), `condition` on an action
+  unit, or a location target's cell, #540; a reaction's is bound as its
+  halves are, below), `condition` on an action
   that isn't a reaction (a precondition, Y4: an expression judged in
   `run_action` before prepare and the status checks, self = actor,
   `source` / `args` by attribute, `target` as typed; refusal reason
@@ -4722,6 +4723,16 @@ lists what isn't built; 1093-1122).
   (`reactions._body_less`), so the refusal changes nothing (L54).
   `UnitFlags.REACTIONS` indexes the units whose vars hold one; a rider is
   offered its seat's reactions (a vehicle isn't offered its seats').
+  A reaction's `target_condition` (user call, after pass 78, 1278;
+  `reactions.reaction_target_check`) is read with the halves' bindings:
+  self = the reacting unit (mount_routing's), `reaction_target` /
+  `reaction_args` its own, the incoming action's `actor` / `target` /
+  `args` / `action_name` / `action_tags` / `affected`, its read-only
+  `incoming` copy and `source`. `!react` judges it at the pick: a
+  refused target (a list refused whole) records nothing and the window
+  stays open; an auto pick it refuses isn't made; each half judges it
+  again before running (a list keeps the targets that pass, a ⚠️ naming
+  the rest), so run_action skips its own check there.
 - **Exchanges** (dicts, JSON): `Match.reaction_stack` (the top is the
   open window; `Match.reaction_exchange` is a property reading it) and
   `Match.reaction_queue`, saved, undo state; `reaction_seq`,
@@ -4900,7 +4911,11 @@ in full: 1123-1139).
   (`*_message_format`, `Match.render_unit_message`: unit placeholders,
   `{amounts}`, `{damage_taken.<pool>}`, `{components}`, `{attacker}` as a
   say() name marker, `{?key?}...{/?}`; tagged as a line about the target;
-  `quiet` skips it), the event-log entry (`damage` / `healing`; the hp
+  `quiet` skips it; a call's `message=` replaces the format for that
+  packet, "" none: deal_damage / heal / damage_part / damage_spread,
+  `!ent damage|heal ... message=`, refused beside `quiet`; so a lethal
+  hit's own line prints before what its death prints, with no forecast,
+  1277), the event-log entry (`damage` / `healing`; the hp
   writes run under `logic.PACKET_WRITE`, so write_var logs no
   `hp_change`, which a raw hp write logs), the records, a body part's
   share, then the hooks (`_fire_hooks`): `on_damage_taken` on the target,
@@ -5005,14 +5020,6 @@ rejected already. Update this section in the PR that resolves an item.
   rename`, `!system table|macro rename`) the hide keeps the old name and
   hides nothing; the renamed entry shows through in the child. Known
   limitation, left as is (user: note it); idea #555 proposes the fix.
-- **A lethal quiet `deal_damage`** (after pass 78, asked, unanswered):
-  the death line surfaces inside the packet, before the caller's own
-  `say()`; proposed: a per-call `message=` format for the packet's line.
-- **A failed reaction `before` half** (after pass 78, asked, unanswered):
-  the pick is spent (its window closed at the pick) and the attack lands;
-  proposed: check a reaction's `target_condition` at pick time with the
-  attack (`actor`, `incoming`) bound, so a refused pick leaves the window
-  open.
 - **Corpse targets and immunity:** `corpse` / `corpse_list` action
   targets skip the immune_to_actions_* check (a corpse's statuses are a
   snapshot; a dead flyer can be looted in melee). Kept for now, a known

@@ -5582,7 +5582,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": (
             "The line a damage packet prints (deal_damage, `!ent damage`) "
-            "unless it is quiet. Placeholders: the unit's ({name}, {id}, "
+            "unless it is quiet or the call gives its own `message=` "
+            "format (the same placeholders). Placeholders: the unit's ({name}, {id}, "
             "{x}, {y}, {team}, {round}, any var by name or dotted path), "
             "{amounts} (`18 damage and 5 stamina damage`), "
             "{damage_taken.<pool>} (what the steps decided), "
@@ -5599,7 +5600,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": (
             "The line a healing packet prints (heal, `!ent heal`) unless it "
-            "is quiet; as damage_message_format, with {healing_received.<pool>}, "
+            "is quiet or the call gives its own `message=`; as damage_message_format, with {healing_received.<pool>}, "
             "{healing_gained.<pool>} and {healing_giver}."
         ),
     },
