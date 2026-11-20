@@ -19,7 +19,7 @@ from logic import (
 from logic import STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
-from logic import STATUS_LINES_SKIP, STATUS_HIDE_RE, STATUS_HIDE_SEP, STATUS_LINE_KINDS, APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
+from logic import STATUS_LINES_SKIP, STATUS_HIDE_RE, STATUS_HIDE_SEP, STATUS_LINE_KINDS, APPROVED_BY, attribution_text, DICE_ROLL_RE, join_dice_rolls, COMMAND_CTX, SAY_HOST_VIEW, SAY_NAME_RE, SAY_TEAM_RE, SAY_OPEN_MARK, COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, passive_hooks, VAR_HOOKS, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref, MATCHES_TOUCHED, touch_match, VAR_TRACE, PREFAB_READS, PREFAB_REPLAY, prefab_read, FORMULA_TEXT_HIDDEN, formula_text, FORMULA_RULES, HIDDEN_FORMULA_TEXT, parse_size_scale, size_number_ok, derived_clamp_error, var_label_problem, var_label_for, VarReader, VAR_READER, PRIVATE_WITHHELD, redact_vars, privacy_spec, path_privacy, reader_sees, PRIVATE_SCAN, privacy_applies, TEMPLATE_PRIVATE_KEY, TEMPLATE_CREATOR_ONLY, TEMPLATE_NOTES_KEY, checked_template_notes, TemplateViewer, TEMPLATE_VIEWER, template_hidden, template_private_level, reader_template, CAPABILITIES, MATCH_CAPABILITIES, caller_capabilities, private_templates_hidden, private_template_names, mask_private_refs
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -4235,6 +4235,13 @@ def _priority_text(p) -> str:
     return out
 
 
+def _hooks_label(p) -> str:
+    """`Hook: x` or `Hooks: x, y` (#489) for a passive's info reply."""
+    if len(p.hooks) > 1:
+        return "Hooks: " + ", ".join(f"`{h}`" for h in p.hooks)
+    return f"Hook: `{p.when}`"
+
+
 def _format_passive_line(label: str, p) -> str:
     """One-line summary of a passive for `!passive list` / `!gpassive list`.
 
@@ -4243,8 +4250,7 @@ def _format_passive_line(label: str, p) -> str:
     a glance what each passive watches.
     """
     # Late import to avoid module-level coupling with logic's hook sets
-    from logic import VAR_HOOKS
-    if p.when in VAR_HOOKS:
+    if p.var_hooks:
         return (f"- `{label}` ({p.when} on `{p.target or '(root)'}` "
                 f"scope=`{p.scope}`{_priority_text(p)}): "
                 f"`{formula_text(p.formula)}`")
@@ -21508,10 +21514,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
-        if when not in HOOK_NAMES and not is_event_hook(when):
-            allowed = ", ".join(sorted(HOOK_NAMES))
-            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}; "
-                           f"or a custom event subscription 'event:<name>'.")
+        when = ",".join(passive_hooks(when))
         try:
             validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
         except FormulaError as ex:
@@ -21529,8 +21532,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e.mark_changed()
         # Mention target/scope in the ack only for var hooks where they apply
         scope_note = ""
-        from logic import VAR_HOOKS
-        if when in VAR_HOOKS:
+        if any(h in VAR_HOOKS for h in when.split(",")):
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added passive `{pid}` ({when}){scope_note} to `{eid}`.")
 
@@ -21613,16 +21615,15 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pid not in e.passives:
             raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
         p = e.passives[pid]
-        from logic import VAR_HOOKS
         scope_block = ""
-        if p.when in VAR_HOOKS:
+        if p.var_hooks:
             scope_block = (
                 f"Target: `{p.target or '(root)'}`\n"
                 f"Scope: `{p.scope}`\n"
             )
         return await ctx.send(
             f"**Passive `{eid}.{pid}`**\n"
-            f"Hook: `{p.when}`\n"
+            f"{_hooks_label(p)}\n"
             + (f"Priority: {p.priority}\n" if p.priority else "")
             + (f"On extra turns: {_extra_turns_text(p.extra_turns)}\n"
                if p.extra_turns is not None else "") +
@@ -21638,7 +21639,9 @@ registry.annotate_sub(
     usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] "<formula>"',
     desc=(
         "Attach a passive to an entity. <when> must be one of the hook names "
-        "(see `!passive hooks`). Formula is run as a program when the hook fires; "
+        "(see `!passive hooks`), or several joined by commas "
+        "(`on_turn_start,on_revive`: one passive, listed and removed once; "
+        "`hook_name` tells which fired). Formula is run as a program when the hook fires; "
         "inside it, `self` = the owning entity, `this` = current-turn entity. "
         "Quote the formula to preserve spaces. "
         "For VAR HOOKS (on_var_*) target+scope filter which events fire this passive: "
@@ -21725,10 +21728,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
-        if when not in HOOK_NAMES and not is_event_hook(when):
-            allowed = ", ".join(sorted(HOOK_NAMES))
-            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}; "
-                           f"or a custom event subscription 'event:<name>'.")
+        when = ",".join(passive_hooks(when))
         try:
             validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
         except FormulaError as ex:
@@ -21741,8 +21741,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             extra_turns=xturns,
         )
         scope_note = ""
-        from logic import VAR_HOOKS
-        if when in VAR_HOOKS:
+        if any(h in VAR_HOOKS for h in when.split(",")):
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added global passive `{pid}` ({when}){scope_note}.")
 
@@ -21793,16 +21792,15 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pid not in m.global_passives:
             raise NotFound(f"Global passive '{pid}' not found.")
         p = m.global_passives[pid]
-        from logic import VAR_HOOKS
         scope_block = ""
-        if p.when in VAR_HOOKS:
+        if p.var_hooks:
             scope_block = (
                 f"Target: `{p.target or '(root)'}`\n"
                 f"Scope: `{p.scope}`\n"
             )
         return await ctx.send(
             f"**Global passive `{pid}`**\n"
-            f"Hook: `{p.when}`\n"
+            f"{_hooks_label(p)}\n"
             + (f"Priority: {p.priority}\n" if p.priority else "")
             + (f"On extra turns: {_extra_turns_text(p.extra_turns)}\n"
                if p.extra_turns is not None else "") +
@@ -21818,7 +21816,7 @@ registry.annotate_sub(
     usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] "<formula>"',
     desc=(
         "Add a global passive. Fires once per entity in turn order on the given "
-        "hook. Inside the formula: `self` = the entity being iterated, "
+        "hook (or hooks, joined by commas: `on_turn_start,on_revive`). Inside the formula: `self` = the entity being iterated, "
         "`this` = current-turn entity. "
         "For VAR HOOKS (on_var_*) target+scope filter which events fire this passive: "
         "target=PATH (e.g. `inventory` or `inventory.sword`; empty=root); "
@@ -22239,9 +22237,8 @@ async def _defpassive_on(ctx: ReplyContext, mgr: MatchManager,
             )
         existing.append(spec.to_dict())
         refreshed = _write_specs(existing)
-        from logic import VAR_HOOKS
         scope_note = ""
-        if when in VAR_HOOKS:
+        if any(h in VAR_HOOKS for h in when.split(",")):
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(
             f"Added default passive `{pid}` ({when}){scope_note} to system "
@@ -22347,7 +22344,8 @@ registry.annotate_sub(
         "entity at creation (add / summon / revive), applied before "
         "on_entity_spawned fires. Same id/when/target/scope/formula syntax "
         "as !passive add but without the <entity_id> (it's not bound to one "
-        "entity). <when> must be a hook name (see !defpassive hooks). "
+        "entity). <when> must be a hook name (see !defpassive hooks), or "
+        "several joined by commas. "
         "Also put on the units already in the system's matches that lack "
         "the id, while default_passives_existing_units is on (default). "
         "Removable per-entity afterward; not re-enforced."
@@ -29621,10 +29619,10 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             team, pid, when = args[2], args[3], args[4]
             target_val, scope_val, prio, xturns, words = _passive_opts(args[5:])
             formula = normalize_body_source(" ".join(words).strip())
-            if when not in HOOK_NAMES and not is_event_hook(when):
-                return await ctx.send(
-                    f"❌ unknown hook `{when}`. Allowed: "
-                    f"{', '.join(sorted(HOOK_NAMES))}; or 'event:<name>'.")
+            try:
+                when = ",".join(passive_hooks(when.lower()))
+            except VTTError as ex:
+                return await ctx.send(f"❌ {ex}")
             if not formula:
                 return await ctx.send("❌ passive formula cannot be empty.")
             try:

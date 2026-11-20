@@ -4649,6 +4649,12 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # dealer of the damage packet that killed (None otherwise).
     "damage_taken", "damage_lost", "healing_received", "healing_gained",
     "killer",
+    # on_kill (#387): the unit killed; on_part_destroyed (#388): the part
+    # and the part it hung from.
+    "victim", "destroyed_part", "part_parent",
+    # How the moving unit got there (#390): walk, tp, push, pull, swap,
+    # carried, zone or map; bound in the movement hooks.
+    "move_kind",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get

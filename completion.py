@@ -496,7 +496,14 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
     if slot == "team":
         return _teams(mgr, ctx)
     if slot in ("when", "hook_name"):
-        return sorted(logic.HOOK_NAMES) + ["event:"]
+        names = sorted(logic.HOOK_NAMES) + ["event:"]
+        if slot == "when" and "," in word:
+            # A passive listing several hooks (#489): complete the word
+            # after the last comma, leaving out the hooks already listed.
+            head = word[:word.rindex(",") + 1]
+            done = set(head.split(","))
+            return [head + n for n in names if n not in done]
+        return names
     if slot in ("dir", "facing"):
         return _DIRECTIONS
     if slot == "region":
