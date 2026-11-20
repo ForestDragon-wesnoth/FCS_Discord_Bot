@@ -15705,16 +15705,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if fire_log:
                 out += "\n" + "\n".join(fire_log)
             return await ctx.send(out)
-        if _pov_hides(m, pov, eid):
-            # The reply lands in a channel whose POV can't see the actor.
-            now = str(m.rules.get("turn_start_hidden_message_format", "") or "")
-        else:
-            tctx = _entity_template_context(e, pov)
-            tctx.update({"short_id": eid[:8], "round": m.round_number})
-            fmt = str(m.rules.get(
-                "extra_turn_message_format" if m.extra_turn == eid
-                else "turn_start_message_format", "") or "")
-            now = _render_template(fmt, tctx) if fmt else ""
+        now = _turn_now_line(m, pov, eid)
         # In the order things happened: the turn-end / round lines and hook
         # output first, whose turn it now is last.
         lines = list(fire_log) + ([now] if now else [])
@@ -15741,8 +15732,17 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 m._mark_acted(eid)
             return await ctx.send(f"Active turn set to `{eid}` (round "
                                   f"{m.round_number}; no turn hooks ran).")
-        log = m.set_turn(eid)
-        lines = list(log) + [f"It is now `{eid}`'s turn (set by `!turn set`)."]
+        log = list(m.set_turn(eid)) + _take_formula_log()
+        cur = m.current_entity_id()
+        if cur == eid:
+            lines = log + [f"It is now `{eid}`'s turn (set by `!turn set`)."]
+        elif cur and cur in m.entities:
+            # It died to its own turn-start effects; the turn passed on as
+            # under `!turn next`.
+            now = _turn_now_line(m, _query_pov(ctx, m), cur)
+            lines = log + ([now] if now else [])
+        else:
+            lines = log + ["No one is left to take a turn."]
         return await ctx.send("\n".join(lines))
     if sub == "grant":
         return await ctx.send(_turn_grant(ctx, m, args[1:]))
@@ -18138,6 +18138,23 @@ def _roster_groups(m: "Match", units: List["Entity"], pov: Optional[str],
         marker = "→" if e.id == active_id else "  "
         out.append(f"  {marker} {_entity_line(e, pov)}")
     return out
+
+
+def _turn_now_line(m: "Match", pov: Optional[str], eid: str) -> str:
+    """The line naming whose turn it now is (turn_start_message_format, or
+    the hidden form for a channel whose view can't see the unit)."""
+    e = m.entities.get(eid)
+    if e is None:
+        return ""
+    if _pov_hides(m, pov, eid):
+        # The reply lands in a channel whose POV can't see the actor.
+        return str(m.rules.get("turn_start_hidden_message_format", "") or "")
+    tctx = _entity_template_context(e, pov)
+    tctx.update({"short_id": eid[:8], "round": m.round_number})
+    fmt = str(m.rules.get(
+        "extra_turn_message_format" if m.extra_turn == eid
+        else "turn_start_message_format", "") or "")
+    return _render_template(fmt, tctx) if fmt else ""
 
 
 @registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")

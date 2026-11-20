@@ -21976,6 +21976,7 @@ class Match:
                 log.extend(self.fire_hook(
                     "on_turn_skipped", target_ids=[eid],
                     extras={"skip_status": matched}))
+                self._pull_surfaced(log)
                 for when in ("turn_start", "turn_end"):
                     if self.extra_turn == eid and eid in self.entities:
                         log.extend(self.fire_status_tick(when))
@@ -22030,9 +22031,36 @@ class Match:
             log.extend(self._atb_reset_actor(self.entities[eid]))
             self._atb_last_skipped = False
         log.extend(self._atb_turn_phase(eid, "turn_start", act=True))
-        self.turn_vacated = None
+        e = self.entities.get(eid)
+        if e is None or not e.is_alive:
+            # It died to its own turn-start effects: as under `!turn next`,
+            # a dead unit never holds the turn, so it passes on at once.
+            self._pass_dead_turn(eid, log, atb)
+        else:
+            self.turn_vacated = None
         self._begin_turn()
         return log
+
+    def _pass_dead_turn(self, eid: str, log: List[str], atb: bool) -> None:
+        """`!turn set` gave the turn to a unit that died at its start: pass
+        the turn on the way `!turn next` does (the next unit's turn starts,
+        a round wrap on the way fires its hooks)."""
+        if not self.turn_order:
+            self.turn_vacated = None
+            self._pull_surfaced(log)
+            log.append("⏭ No one is left to take the turn.")
+            return
+        self._pull_surfaced(log)
+        log.append("⏭ The turn passes to the next unit.")
+        if atb:
+            self.turn_vacated = None
+            self._atb_start_next(log)
+            return
+        if self.turn_vacated is None and eid in self.turn_order:
+            # Dead but still in the order (an alive_condition that
+            # disagrees with the death pipeline): step past it.
+            self._advance_index(log)
+        self._start_current_turn(log)
 
     def _start_current_turn(self, log: List[str]) -> Optional[str]:
         """Start the turn of the unit at active_index: skip past skippable
@@ -22489,15 +22517,21 @@ class Match:
         if not self.turn_order:
             self._begin_turn()
             return (None, log)
-        # An actor that dies to its own turn-start effects never holds the
-        # turn (a dead unit can't act): the next charged unit is selected.
-        # Bounded by the order's size, like the round-mode loop.
+        new_cur = self._atb_start_next(log)
+        self._begin_turn()
+        return (new_cur, log)
+
+    def _atb_start_next(self, log: List[str]) -> Optional[str]:
+        """Select the next ATB actor and start its turn. An actor that dies
+        to its own turn-start effects never holds the turn (a dead unit
+        can't act): the next charged unit is selected. Bounded by the
+        order's size, like the round-mode loop. Returns the actor, or None
+        when nobody is left."""
         guard = len(self.turn_order) + 1
         while True:
             new_cur = self._atb_select(log)
             if new_cur is None:
-                self._begin_turn()
-                return (None, log)
+                return None
             # A skipped actor's turn still ELAPSES (bar already reset, status
             # ticks fire) but it performs no action.
             skipping = self._skipping_statuses(self.entities[new_cur])
@@ -22509,6 +22543,7 @@ class Match:
                 log.extend(self.fire_hook(
                     "on_turn_skipped", target_ids=[new_cur],
                     extras={"skip_status": matched}))
+                self._pull_surfaced(log)
             # turn_start for the new actor (active_index now points at it).
             log.extend(self._atb_turn_phase(
                 new_cur, "turn_start", act=not skipping))
@@ -22521,18 +22556,16 @@ class Match:
             if not self.turn_order:
                 self._pull_surfaced(log)
                 log.append("⏭ No one is left to take the turn.")
-                self._begin_turn()
-                return (None, log)
+                return None
             guard -= 1
             if guard <= 0:
                 self._pull_surfaced(log)
                 log.append("⏭ Every unit died at the start of its turn; the "
                            "turn stays here.")
-                break
+                return new_cur
             self._pull_surfaced(log)
             log.append("⏭ The turn passes to the next unit.")
-        self._begin_turn()
-        return (new_cur, log)
+        return new_cur
 
     def _advance_index(self, log: List[str]) -> None:
         """Advance active_index by one, handling round wrap: fire
@@ -22557,6 +22590,9 @@ class Match:
                 return
             new_index, wrapped = 0, True
         if wrapped:
+            # What the turn so far surfaced (a skipped unit's passives, its
+            # ticks) reads before the round lines.
+            self._pull_surfaced(log)
             line = self.round_message_line("round_end_message_format")
             if line:
                 log.append(line)
@@ -22742,6 +22778,7 @@ class Match:
             log.extend(self.fire_hook(
                 "on_turn_skipped", target_ids=[cur],
                 extras={"skip_status": matched}))
+            self._pull_surfaced(log)
             # The skipped turn still elapses: the unit's turn_start and
             # turn_end status ticks fire (no action surface), as under ATB.
             # Without them a stun counting down on its own turns never wore
