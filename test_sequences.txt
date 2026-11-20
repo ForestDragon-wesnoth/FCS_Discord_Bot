@@ -47994,3 +47994,112 @@ and countdowns: the poison drops once a round, at the orc's turn end. The
 ATB switch's one-time warning lists a round-start status tick as dormant
 round logic (it compared the tick times with the hook names and never
 found one).
+
+
+
+SCENARIO 1288 — Status glyph and colour on the map: priority, legend, a 2x2 body, level entries, instances (#114)
+-----------------------------------------------------------------------------------------------------------------
+
+!match new gl Gl 8 5
+!match use gl
+!ent add orc Orc 10 2 2 5 team=red
+!ent add ogre Ogre 30 5 2 4 team=blue
+!ent set_vars ogre footprint_w=2 footprint_h=2 glyph=O
+!status def stun
+!status glyph stun z
+?? shows its bearer as `z` on the map
+!status color stun yellow
+!status def burn
+!status color burn red
+!status display_priority burn 5
+!status apply orc stun
+!status apply ogre stun
+!status apply ogre burn
+!map legend=on
+?? 2 . z . . z z . .
+?? 3 . . . . z z . .
+?? z — Orc (stun), Ogre (stun, burn)
+!map scene list
+?? entity `orc` at (2,2) — glyph z, color yellow
+?? entity `ogre` at (5,2) 2x2 stretch — glyph z, color red
+!status def frozen
+!status glyph frozen *
+!status display_priority frozen 2
+!status apply orc frozen
+!map legend=on
+?? * — Orc (frozen, stun)
+!status level stun 3 glyph Z
+!status level stun 3 display_priority 9
+!status apply orc stun 3
+!map legend=on
+?? Z — Orc (stun)
+!ent status orc set stun glyph s
+!map legend=on
+?? s — Orc (stun)
+!ent status orc remove stun
+!ent status orc remove frozen
+!status glyph stun clear
+?? `stun` glyph cleared
+!map legend=on
+?? > — Orc
+?? O — Ogre (burn)
+
+Expected: a status's `glyph` / `color` (#114) replace its bearer's on the
+map while it holds the status: the stun shows the orc and every cell of
+the 2x2 ogre as `z`; of several statuses the highest display_priority wins,
+the glyph and the colour picked apart (the ogre's `z` from the stun, its
+red from the burn at priority 5). The legend names the statuses behind the
+look ("Ogre (stun, burn)"), and the image scene draws the same glyph and
+colour. Priority picks between glyphs (frozen at 2 over stun at 0); a
+level entry (stun 3: `Z` at priority 9) and an instance key (`s`) take
+precedence over the definition. With the statuses gone or the glyph
+cleared, the unit's own glyph (`>`, the ogre's `O`) is back; the ogre keeps
+the burn's colour.
+
+
+SCENARIO 1289 — Status looks follow the view: visibility, disguise; refusals and prefab checks (#114)
+-------------------------------------------------------------------------------------------------------
+
+!match new gv Gv 8 5
+!match use gv
+!ent add orc Orc 10 2 2 5 team=red
+!ent add elf Elf 10 5 2 4 team=blue
+!status def stun
+!status glyph stun z
+!status def curse
+!status glyph curse c
+!status visibility curse "pov_team == 'red'"
+!status apply orc stun
+!status apply elf curse
+!ent set_var orc disguise.name Rock
+!ent set_var orc disguise.glyph R
+!match bind pov=blue
+!map legend=on
+?? R — Rock
+?? v — Elf
+!match bind pov=red
+!map legend=on
+?? z — Orc (stun)
+?? c — Elf (curse)
+!match bind
+!status glyph stun 😀
+?? two columns wide
+!status color stun plaid
+?? color must be a palette name
+!status display_priority stun high
+?? display_priority must be a number
+!status glyph stun -
+?? shows its bearer as `-`
+!prefab import pz {"kind": "prefab", "width": 1, "height": 1, "system": "default", "definitions": {"status_definitions": {"daze": {"glyph": "ab"}}}}
+?? `glyph`: a glyph is exactly one character
+!prefab import pz {"kind": "prefab", "width": 1, "height": 1, "system": "default", "definitions": {"status_definitions": {"daze": {"color": "plaid"}}}}
+?? `color` must be a palette name
+
+Expected: a status look follows the channel's view (#114): to blue the
+disguised orc is its disguise (`R`, "Rock"), its stun hidden as overlays
+are, and the elf's curse is hidden by its visibility condition, so the elf
+shows its facing arrow (`v`); red, the orc's own team, sees the stun's `z` and, by the
+condition, the curse's `c`. A glyph two columns wide, a colour outside the
+palette and a priority that isn't a number are refused; `-` is a glyph
+(only `clear` clears). A prefab carrying a status definition with a bad
+glyph or colour is refused at import.

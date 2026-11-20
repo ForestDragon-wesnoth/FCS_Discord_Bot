@@ -30945,6 +30945,33 @@ class Match:
             return None
         return d
 
+    def status_look(self, e: "Entity", pov_team: Optional[str] = None
+                    ) -> Dict[str, Tuple[str, str]]:
+        """What `e`'s statuses do to its map look (#114): {"glyph": (glyph,
+        status), "color": (colour, status)}, each from the status with the
+        highest `display_priority` (instance, definition, level entries;
+        default 0; a tie goes to the status gained first) among those
+        holding a usable `glyph` (one character) / `color` (a palette name),
+        read separately. Only statuses `pov_team`'s view sees count, and a
+        unit disguised to it shows none (as its overlays)."""
+        if not e.status or \
+                self._effective_disguise(e, pov_team) is not None:
+            return {}
+        best: Dict[str, Tuple[float, str, str]] = {}
+        for sname, inst in self.visible_statuses(
+                e.status, pov_team, e.id).items():
+            pr = self.status_field(inst, sname, "display_priority")
+            pr = pr if isinstance(pr, (int, float)) and \
+                not isinstance(pr, bool) else 0
+            g = glyph_of(self.status_field(inst, sname, "glyph"))
+            c = self.status_field(inst, sname, "color")
+            for key, val, ok in (("glyph", g, glyph_ok(g)),
+                                 ("color", c, isinstance(c, str)
+                                  and c in TEXT_COLORS)):
+                if ok and (key not in best or pr > best[key][0]):
+                    best[key] = (pr, val, str(sname))
+        return {k: (v[1], v[2]) for k, v in best.items()}
+
     def entity_glyph(self, e: "Entity",
                      pov_team: Optional[str] = None) -> str:
         """The map symbol for `e`: a per-facing `glyphs.<facing>` var wins,
@@ -30954,8 +30981,13 @@ class Match:
         ignored and falls through — same rule as tile/zone glyphs. When `e`
         is disguised to `pov_team` (116), the disguise's glyph/glyphs are
         resolved first; a disguise without a glyph falls through to the real
-        resolution."""
+        resolution. A status's glyph (#114, status_look) comes before the
+        unit's own."""
         facing = getattr(e, "facing", "")
+        if e.status:
+            sg = self.status_look(e, pov_team).get("glyph")
+            if sg is not None:
+                return sg[0]
         dis = self._effective_disguise(e, pov_team)
         if dis is not None:
             dglyphs = dis.get("glyphs")
@@ -30997,7 +31029,12 @@ class Match:
         team literally named 'red' renders red). Unknown names -> None. When
         `e` is disguised to `pov_team` (116), only the disguise speaks: its
         `color`, else the colour of the team its `vars` give, else none (the
-        real unit's colour would give it away)."""
+        real unit's colour would give it away). A status's colour (#114,
+        status_look) comes before the unit's own."""
+        if e.status:
+            sc = self.status_look(e, pov_team).get("color")
+            if sc is not None:
+                return sc[0]
         dis = self._effective_disguise(e, pov_team)
         if dis is not None:
             dc = dis.get("color")
@@ -31400,7 +31437,14 @@ class Match:
             # A private `legend` var labels nothing for a reader who may
             # not read it: the unit's name stands in (L50).
             val = self.reader_vars(e, pov_team).get("legend")
-        return self._legend_value(val, self.entity_display_name(e, pov_team))
+        label = self._legend_value(val,
+                                   self.entity_display_name(e, pov_team))
+        look = self.status_look(e, pov_team) if e.status else {}
+        if label is not None and look:
+            # The statuses giving its glyph / colour (#114): "orc (stunned)".
+            names = list(dict.fromkeys(v[1] for v in look.values()))
+            label = f"{label} ({', '.join(names)})"
+        return label
 
     def legend_label_tile(self, data: Any) -> Optional[str]:
         """A tile's legend label: its own `legend` data, else its

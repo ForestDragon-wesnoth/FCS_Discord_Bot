@@ -26302,6 +26302,34 @@ registry.annotate_sub(
           "definition's. A status records only its latest applier."),
 )
 registry.annotate_sub(
+    "status", "glyph",
+    usage="!status glyph <name> <glyph|clear>",
+    desc=("#114: one character shown on the map in place of its bearer's "
+          "own glyph while it holds the status (a stunned unit as `z`); in "
+          "images it is the glyph a unit without a sprite is drawn with. "
+          "Of several statuses with a glyph, the highest `display_priority` "
+          "shows (a tie: the one gained first). Hidden under a disguise and "
+          "from a view the status's visibility hides it from; the legend "
+          "reads `orc (stunned)`. An instance key and level entries "
+          "override it. `clear` clears (`-` is a glyph)."),
+)
+registry.annotate_sub(
+    "status", "color",
+    usage="!status color <name> <colour|->",
+    desc=("#114: a palette colour for its bearer on the map while it holds "
+          "the status, over the unit's own `color` and its team's (in "
+          "images the unit's outline). Of several, the highest "
+          "`display_priority` shows; picked apart from the glyph. `-` "
+          "clears."),
+)
+registry.annotate_sub(
+    "status", "display_priority",
+    usage="!status display_priority <name> <n|->",
+    desc=("#114: which status's glyph / colour a unit shows when it holds "
+          "several: the highest number (default 0; a tie goes to the "
+          "status gained first). `-` clears."),
+)
+registry.annotate_sub(
     "status", "duration_mode",
     usage="!status duration_mode <name> <manual|auto|->",
     desc=("#233: who counts the status's duration down. `manual`: the "
@@ -26445,6 +26473,7 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     "level": 3, "resist_affects": 3, "resist_rounding": 3,
                     "on_transform": 3, "if_source_lost": 3,
                     "duration_mode": 3, "duration_when": 3,
+                    "glyph": 3, "color": 3, "display_priority": 3,
                     "removed_on_damage": 3,
                     "break_at_damage": 3, "damage_filter": 2,
                     "tick_priority": 3}
@@ -26463,6 +26492,8 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "if_source_lost": "if_source_lost",
                      "duration_mode": "duration_mode",
                      "duration_when": "duration_when",
+                     "glyph": "glyph", "color": "color",
+                     "display_priority": "display_priority",
                      "removed_on_damage": "removed_on_damage",
                      "break_at_damage": "break_at_damage",
                      "damage_filter": "damage_filter",
@@ -26992,6 +27023,47 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                     f" (after its tick) and removes it at 0. A tick formula "
                     f"that counts down too takes 2 a turn.")
         return f"`{name}` {sub} = {val}."
+
+    if sub in ("glyph", "color", "display_priority"):
+        # #114: the bearer's map look while it holds the status.
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
+            return ""
+        name, val = args[1], args[2]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->")
+        sdef = m.status_definitions[name]
+        # `-` is a glyph too (a unit lying down): only the words clear it.
+        if val.lower() in (("clear", "none") if sub == "glyph"
+                           else ("-", "clear", "none")):
+            sdef.pop(sub, None)
+            return f"`{name}` {sub} cleared."
+        if sub == "glyph":
+            prob = glyph_problem(val)
+            if prob:
+                return f"❌ {prob}"
+            sdef[sub] = val
+            return (f"`{name}` shows its bearer as `{val}` on the map (over "
+                    f"the unit's own glyph; the status with the highest "
+                    f"display_priority wins).")
+        if sub == "color":
+            from logic import TEXT_COLORS
+            if val.lower() not in TEXT_COLORS:
+                return (f"❌ color must be a palette name: "
+                        f"{', '.join(sorted(TEXT_COLORS))}.")
+            sdef[sub] = val.lower()
+            return (f"`{name}` colours its bearer {val.lower()} on the map "
+                    f"(over the unit's own colour; the status with the "
+                    f"highest display_priority wins).")
+        try:
+            n = float(val)
+        except ValueError:
+            n = float("nan")
+        if n != n or n in (float("inf"), float("-inf")):
+            return "❌ display_priority must be a number (or `-`)."
+        sdef[sub] = int(n) if n == int(n) else n
+        return (f"`{name}` display_priority = {sdef[sub]}: among a unit's "
+                f"statuses with a glyph or colour, the highest shows.")
 
     if sub == "stack":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "stack"):
