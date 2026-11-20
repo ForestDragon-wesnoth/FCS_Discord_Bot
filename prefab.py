@@ -683,7 +683,9 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
     for k, choices in (("resist_affects", logic.RESIST_AFFECTS),
                        ("resist_rounding", logic.RESIST_ROUNDINGS),
                        ("on_transform", logic.TRANSFORM_STATUS_FLAGS),
-                       ("if_source_lost", logic.STATUS_SOURCE_LOST_MODES)):
+                       ("if_source_lost", logic.STATUS_SOURCE_LOST_MODES),
+                       ("duration_mode", logic.STATUS_DURATION_MODES),
+                       ("duration_when", logic.STATUS_TICK_WHENS)):
         if entry.get(k) is not None and entry[k] not in choices:
             raise VTTError(f"{who}: `{k}` must be one of "
                            f"{', '.join(choices)}.")

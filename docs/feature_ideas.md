@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #623). #264-#615 come from review passes by
+(the highest so far is #625). #264-#615 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -24,6 +24,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 
 **Off the list:**
 - Rejected: edge-aware boarding.
+- Merged into another entry: #563 (layer-aware status writes, into #625).
 - Covered by what shipped: #35 (a preset is a parent system), #85 (`!history
   export` + `!history import` into a new match), #137 (a reach aura: a zone
   anchored to the unit, whose `on_enter` / `on_exit` hooks fire once per body
@@ -466,29 +467,9 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#146 "What changed" view.** `!map changes` marks the units and cells that changed since the start of the current turn (or since you last looked), for players catching up on Discord.
 - **#147 Image-map labels.** Optional HP bars, name labels and a row of status icons on sprites, each toggled by a rule.
 - **#148 Live combat log channel.** Event-log lines posted as they happen to a channel bound as `log`, filtered by that channel's POV.
-- **#150 Independent status stacks.** A definition mode where each application is its own instance with its own duration (three bleeds on three timers). Today one instance per name carries a level.
-  - A sketch written against the combat systems (docs/combat_systems_fit.md):
-    - `stack: independent`: each application keeps its own level and timer. `stack_effect` decides what the stacks do together:
-      - `highest`: only the highest level acts, while every level keeps its own duration (Solis);
-      - `sum`: the levels add up;
-      - `each`: each stack ticks on its own (three bleeds on three timers).
-    - Removes D4. `status_get` and #222's display read the effective level and list the stacks.
-  - From the combat systems:
-    - Showing the stacks in #222's status line, in Solis's own format: "(5 lvl1 burn, 2 lvl2 burn)".
-    - Solis Plague and Steelmoss: damage that grows each turn while the stack lives, resets when it expires and is kept when the status is reapplied; a per-stack counter field holds the growth.
-  - Open questions raised, then parked by the user (my recommendation after each):
-    1. Storage: one instance per name holding a `stacks` list (each stack its own level, duration, fields); the top-level `level` is the engine-kept effective level, so everything keyed by name keeps working. Rec: this, over separate `burn#2` instances.
-    2. Top-level `duration` = the longest stack's; direct writes of level / duration on a stacked instance refused with a pointer to `stack=` (or: applied to every stack).
-    3. Two knobs: `stack_level` (highest / sum / newest) and `stack_tick` (once / each, binding `stack_level` / `stack_id`), each with a default rule; or the sketch's single `stack_effect`. Rec: two (sum ticking once, highest ticking per stack).
-    4. Decay stays in the GM's tick: a counter outside a per-stack tick changes every stack, inside one only that stack; a stack at 0 drops, the last one removes the status (`expired`).
-    5. Re-application: `stack_merge` none (a new stack, default) / same_level (refresh that stack to the longer duration; Solis).
-    6. Cap: `max_stacks` with a rule `status_stack_overflow` (replace_shortest default / replace_oldest / refuse); `max_level` caps each stack and the summed level.
-    7. Data: the application's level, duration and seed data go on the new stack; definition `data` is copied into the instance once and shared.
-    8. Surface: `status_stacks(eid, name)` (stack dicts with a stable `id`), `stack=<id>` on status_get / status_set / counters, `status_stack_remove`, a `stacks` view on `!ent status` / `!status`.
-    9. Hooks stay status-level (on_added: first stack, on_removed: last, on_changed: a stack added / dropped or the effective level changed, with `stack_id` / `stack_event`), or new on_stack_added / on_stack_removed.
-    10. Resistance folds each application into its stack; dispel removes all stacks; transfer moves all; a zone grant owns one stack (marker on the stack).
-    11. Display: a `{stacks}` placeholder from a `status_stack_format` rule (default `{duration} lvl{level}`, joined ", ").
-    12. Switching a live status's mode converts instances (one stack of its level and duration; back: the effective level and longest duration), firing on_changed.
+- **#150 Stacks that tick on their own** (user, after the status bundle: on the list, out of that bundle's scope). Each application of a status is its own stack with its own level, duration, data and `__source`, and the status's tick runs once per stack (`stack_id` / `stack_level` bound): an archer's bleed deals its 2 a turn and credits the archer, a knight's deals its 5 and credits the knight, each ending on its own timer, with `if_source_lost` and source-clock ticks (#310) per stack. Neither `layered` (the highest level acts, one data dict and one source) nor #625's `layered_sum` (one tick at the summed level) can do this; today it is a data list in the instance plus a per-entry loop in the tick, with kill credit routed by hand.
+  - Also parked (user: skip for now): counting same-level stacks apart ("at 3 stacks of chill, freeze") and `max_stacks` with an overflow rule (replace the oldest / shortest, refuse).
+  - Design notes carried from the first sketch: one instance per name holding a stack list, the instance's level and duration engine-kept; a counter inside a per-stack tick changes that stack only; a stack at 0 drops and the last removes the status (`expired`); hooks stay status-level with `stack_id` / `stack_event` bound; resistance per application, dispel removes all, transfer moves all, a grant owns one stack; `status_stacks(eid, name)`, `stack=<id>` on the status reads and writes, a `{stacks}` placeholder.
 - **#151 Named selectors.** `!selector def enemies "team!=red hp>0"`, usable as `!foreach @enemies ; ...` and as `select('enemies')` in formulas.
 - **#152 Directional armor and coverage** (§8 combat layers). Per-part, per-side armor values and coverage %, with `armor_at(target, part, side)` and a mitigation helper the GM's damage formula calls. Primitives only.
 - **#153 Vehicle follow-ups** (§8). Cover for riders inside a vehicle, a footprint per rider, and shared fuel or initiative between nested vehicles.
@@ -679,7 +660,12 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#529 Unit and cell choices.** `choose_unit(prompt, ids)` and `choose_cell(prompt, cells)` beside `choose()`, which takes any list and matches the typed answer as text. `choose_unit` shows each option by the name the asker's view may read and accepts an id or that name. `choose_cell` accepts `x,y`, and on surfaces that draw maps marks the options with the preview highlight and numbers them. Both validate the answer and replay through `answer=` like `choose()`.
 - **#530 Question windows.** A body asks other units' players a question and waits: `ask_units(prompt, units, options)`. Today `choose()` asks only the player who ran the action, and reaction windows, the one place other players answer, are tied to reactions. The exchange stack that runs reaction windows gets a second window kind: the body stops at the call, each named unit's player answers with `!answer <eid> <option>`, the picks stay hidden from other teams until all are in (or the window expires with a default), and the body resumes with a dict of unit → answer, following the react-point machinery (the step re-runs from its start with the recorded answers). Uses: "each target drops prone or takes the damage", sealed bids, a defender choosing which part takes the hit. Open question: the default when a window expires (the first option, a named `default=`, or failing the action); a required `default=` is recommended.
 - **#531 Rectangular bodies that turn.** A 3×1 cart facing right becomes 1×3 when it faces up. Today a footprint is fixed vars; in a probe a 3×1 unit faced up and kept its 3×1 body, and only a prefab stamp's rotation swaps width and height. A per-unit var `__turns_with_facing` and a rule for the default (off): a facing change between a horizontal and a vertical direction swaps the two footprint vars through the normal fit check, pivoting on a rule-chosen cell (anchor or centre); a turn that doesn't fit is refused naming the blocking cell. Located parts keep their offsets rotated, riders and auras re-stamp. The rectangle-only slice of #39. Open question: the pivot; the centre is recommended, which keeps a long body in place.
-- **#563 Layer-aware status writes.** The other stacking modes and direct edits act on a layered status layer by layer. Today refresh, add_level, extend, replace, a direct write of level or duration, a counter set and a transfer onto a holder collapse a layered status to the level and longest duration it shows (burn 3 for 2 plus burn 1 for 5 becomes burn 3 for 5; §8, "acceptable for now, a known gap"). Each write gets a rule for layers: extend lengthens every layer; add_level raises the top layer; refresh and replace act on the layer at the applied level; a counter set on duration sets the longest layer and trims the rest to it; a transfer carries all layers and merges them into the holder's through the layer front. Each is a small, separately testable case. Open question: the per-mode rules above are a proposal; each is a design choice for the user.
+- **#625 Summed layers and layer tools** (user, after the status bundle: a medium entry; takes over #563). Status layers (the `layered` stack mode) get a summed sibling and layer-aware writes, since both modes rest on layers.
+  - `stack: layered_sum` (user's name: "summed" alone could mean summing over the whole duration). Each application stays its own `[level, duration]` layer, never merged or pruned; the status shows the SUM of the levels and the longest duration; a countdown ticks every layer, and a layer reaching 0 takes its level off the total. Three hits of bleed 1 for 3 turns on turns 1-3 read level 1, 2, 3, then 2, 1, gone. Decided (user): an application without a level adds a layer at the definition's `level` data, else 1; one without a duration lasts as long as the status does now (a first one is permanent, and a permanent layer never counts down); `max_level` caps the shown total while every layer stays whole (2 + 2 under max 3 shows 3, then 2 when one ends). Its `!status stack` and rule descriptions must explain it to a GM with that worked example.
+  - Proposed, not yet decided (each recommended when raised): a transfer onto a holder adds each moved layer as its own application; display `level 3 (2 for 1 turn, 1 for 3 turns)`; resistance per application and `max_duration` per layer, as under `layered`.
+  - Layer tools: `status_layer_set(eid, name, i, level=None, duration=None)` / `status_layer_remove(eid, name, i)`, `!status layers <eid> <name>` (a player read through the view) and `!status layer set|remove`; positions highest level first under `layered`, oldest first under `layered_sum`.
+  - Layer-aware writes (today each collapses the layers to the level and longest duration shown, a §8 known gap): a duration write (status_set, `!ent status set`, a counter set) sets the longest layer and trims the rest to at most it; a level write or a counter on the level changes the top layer (`layered`) or the newest (`layered_sum`), a layer falling to 0 dropping and the rest of a reduction carrying on; a transfer onto a holder applies each layer in the destination's mode; a grant's level acts on its own layer; a definition's mode change converts (`layered` -> `layered_sum` keeps every layer, back merges through the front, any other mode collapses).
+  - A per-application `stack=` override on `status_apply` / `!status apply` ("add 2 turns to every buff" = `stack=extend`), under which extend lengthens every layer, add_level raises the top (newest) layer, refresh and replace act on the layer at the applied level. Without it the other modes meet layers only after a definition's mode change.
 - **#564 Deep undo through the journal.** `!undo journal <n>` rewinds further back than the snapshots reach. Today command autosaves cover the last 10 turns (at most 500 commands); the journal usually holds far more, and the only use of it is an administrator replaying an exported file into a new match. The command rebuilds the state at journal entry n by replaying the current segment from its start up to that entry (the machinery `!match replay` has) and puts it in place as a restore does (rules from the system, bindings per `undo_channel_bindings_mode`, the queue carried). It asks for `confirm` with the entry's command and round, and snapshots the present first so the rewind itself can be undone. A divergence during the rebuild stops it and changes nothing.
 - **#566 Unit identity beyond ids.** Every unit gets a hidden permanent uid, and the engine's own links check it. Today an id is the only identity, so a link by id latches onto whoever holds the id later (§8: a suspended aura resumes around a different unit reusing its old anchor's id). The uid comes from a saved match counter (so replays agree), stays with the corpse and the revived unit, and is fresh for a clone, a copy or a new unit under a reused id. Aura anchors, status `__source`, queued extra turns, schedules and reaction records store the uid beside the id and treat a mismatch as "that unit is gone"; `uid(eid)` reads it for GM data wanting the same guarantee. The foundation #209's tracked references need.
 - **#567 Team vision kept between commands.** A team's sight set survives from one command to the next and is updated by what changed. Today vision is memoised for one render pass, so every board refresh after every command recomputes each viewing team's sight (§8 lists "vision caching beyond one render" under later). The unit index already announces every move, footprint change and removal to listeners; a per-team cache listens, and also drops on opacity changes (tile, zone and void edits) and fog rule changes. `FCS_SPATIAL_CHECK=1` compares every cached answer with a fresh computation, as for the other caches. Worth building only after measuring: first time a board refresh on a large fogged map with the benchmark suite (#347).
@@ -692,6 +678,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Hearing never shows the unit: it stays undetected (#616) unless sight says otherwise. Repeated noises each leave their own area; narrowing them down is the players' job. Lines and markers follow the views like other team-only output.
   - Optional: an action field `noise` (an expression, the action's loudness, emitted after a successful body), keeping the loudness on the weapon ("what X does is stored in X").
   - Open question: whether a team hears its own units' noise (probably yes for allies' positions, no marker for its own).
+- **#624 Sprite effects from statuses** (user, at #114). A status (definition, level entries, instance) changes how its bearer's sprite is drawn in images: colour modifications and shifts (hue, tint), blend modes, greyscale, invert, rotations and flips, with a priority deciding the order. Today a status adds overlay sprites only. The text map's twin is #114 (status glyph and colour).
 
 ## Large (arcs of several PRs)
 
@@ -791,7 +778,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 ## Suggested groupings
 
 - **Formula ergonomics:** #89, #194
-- **Status bundle:** #114, #115, #150, #621
+- **Status bundle:** #114, #115, #150, #621, #625
 - **Zone bundle:** #117, #118, #119
 - **Discord table play:** #128, #148, #182, then #28 and #198
 - **Tactical combat:** #16 → #24 → #36
@@ -902,7 +889,7 @@ From the #552-#567 review (#555, #556, #563, #566 and #567 answer items in CLAUD
 - **Systems:** #555
 - **Placement and hooks:** #556, #557, #559
 - **Command wording:** #561, #562
-- **Statuses:** #563
+- **Statuses:** #625 (was #563)
 - **Undo and identity:** #564, #566
 - **Performance:** #567
 
