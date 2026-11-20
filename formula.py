@@ -951,6 +951,12 @@ _ODDS_MAX_KEEP_COMBOS = 200_000
 # formulas and `$()`) charges its steps here, faces and an exploding die's
 # chain included, so a message of many million-face calls stops at the
 # first that passes it. None outside a command (the per-call limit only).
+# A command's query view (W18 `!find chain:`): the ids it can't see, which
+# chain_targets leaves out of its pool so a chain never bounces through a
+# unit the channel's view hides. None = every unit (formulas see all).
+QUERY_HIDDEN: "contextvars.ContextVar[Optional[Any]]" = contextvars.ContextVar(
+    "fcs_query_hidden", default=None)
+
 ODDS_BUDGET: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
     "vtt_odds_budget", default=None)
 # An exploding die's chain is cut once its probability falls below this.
@@ -6966,6 +6972,10 @@ class FormulaEngine:
             # through every unit cost the square of the unit count, with no
             # limit charged).
             pool = {oid: oe for oid, oe, _ref in _candidates(start, relation)}
+            hidden = QUERY_HIDDEN.get()
+            if hidden is not None:
+                pool = {oid: oe for oid, oe in pool.items()
+                        if not hidden(oid)}
             while len(out) < n and pool:
                 # The jump distance is measured from the PREVIOUS link; with
                 # a max_jump only the units the cell index finds near it are

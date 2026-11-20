@@ -21060,7 +21060,7 @@ SCENARIO 738 — Tab completion: commands, subcommands, literal words and option
 ?tab "!undo "
 ?? candidates: command  round  to  turn
 ?tab "!help ent s"
-?? set_var  set_vars  status  store_entity_into_var  swap
+?? set_var  set_vars  spawn_from_var  status  store_entity_into_var  swap
 ?tab "!batch ent hp hero 5 ; ent tp h"
 ?? candidates: healer  hero
 ?tab ent
@@ -28120,7 +28120,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 !status apply u burn 2 3
 !ent status u add mark
 !ent info u short
-?? Status: burn ×2 (3 turns), mark
+?? Status: burn level 2 (3 turns), mark
 !status def rot
 !status display rot "rot (-{lost} max hp)"
 ?? `rot` shows as `rot (-{lost} max hp)` in `{statuses}`.
@@ -28128,7 +28128,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 !ent status u set rot lost 30
 !system set default entity_line_format "{name}: {statuses}"
 !list
-?? U: burn ×2 (3 turns), mark, rot (-30 max hp)
+?? U: burn level 2 (3 turns), mark, rot (-30 max hp)
 !system set default status_line_format "{?level?}{level}x {/?}{name}"
 !status display rot
 !list
@@ -28139,7 +28139,7 @@ SCENARIO 885 — Status details for players: {statuses}, status_line_format and 
 ?? U corpse: 2x burn, mark, 1x rot
 
 Expected: `!ent info` lists each status with its level and duration
-(`burn ×2 (3 turns)`); a status with neither shows its name. A `{statuses}`
+(`burn level 2 (3 turns)`); a status with neither shows its name. A `{statuses}`
 placeholder gives entity_line_format / entity_info_format /
 corpse_line_format the same text, each status through the
 status_line_format rule (any instance field is a placeholder) or its
@@ -33543,12 +33543,12 @@ SCENARIO 992 — A zone-held status follows its zones; a permanent status stays 
 !assert "status_level('u', 'bless') == 1"
 !ent info u short
 ?? bless
-?! bless ×
+?! bless level
 ?! __zone
 !status def hex
 !status apply u hex
 !status apply u hex 2 3
-?? (level=2, duration=∞: ×2 for 3, then ×1 permanently)
+?? (level=2, duration=∞: level 2 for 3, then level 1 permanently)
 !status def ward
 !status stack ward add_level
 !status apply u ward
@@ -34265,7 +34265,7 @@ HARNESS-ALLOWS-ERRORS (a stray word after `!ent info <id>` is refused)
 ?! description:
 ?! hp:
 !ent info knight short
-?? Status: bleed ×2 (3 turns)
+?? Status: bleed level 2 (3 turns)
 ?? Inventory: {sword, rations}
 ?! Details
 ?! A sworn sword
@@ -37258,14 +37258,14 @@ SCENARIO 1058 — Layered status stacking in real use: a burn DoT dealing its le
 !status tick burn "entity[self].hp = entity[self].hp - status_level(self, 'burn')\nstatus_counter_add(self, 'burn', -1)"
 !status apply a burn 3 2
 !status apply a burn 1 5
-?? Applied `burn` to `a` (level=3, duration=5: ×3 for 2, then ×1 for 3 more)
+?? Applied `burn` to `a` (level=3, duration=5: level 3 for 2, then level 1 for 3 more)
 !status apply b burn 1 5
 !status apply b burn 3 2
-?? Applied `burn` to `b` (level=3, duration=5: ×3 for 2, then ×1 for 3 more)
+?? Applied `burn` to `b` (level=3, duration=5: level 3 for 2, then level 1 for 3 more)
 !assert "status_layers('a', 'burn') == [[3, 2], [1, 5]] and status_layers('b', 'burn') == [[3, 2], [1, 5]]"
 !assert "status_level('a', 'burn') == 3 and status_duration('a', 'burn') == 5"
 !ent info a short
-?? Status: burn ×3 (5 turns): ×3 for 2, then ×1 for 3 more
+?? Status: burn level 3 (5 turns): level 3 for 2, then level 1 for 3 more
 !turn next
 !turn next
 !assert "entity['a'].hp == 17 and status_layers('a', 'burn') == [[3, 1], [1, 4]]"
@@ -37376,11 +37376,11 @@ SCENARIO 1060 — A layered status over a permanent one: the shorter higher laye
 !status hook might on_changed "match_var_set('changes', match_var_get('changes', 0) + 1)"
 !status apply a might 1
 !status apply a might 3 2
-?? Applied `might` to `a` (level=3, duration=∞: ×3 for 2, then ×1 permanently)
+?? Applied `might` to `a` (level=3, duration=∞: level 3 for 2, then level 1 permanently)
 !assert "status_layers('a', 'might') == [[3, 2], [1, None]] and status_duration('a', 'might') == None"
 !assert "status_get('a', 'might', 'bonus') == 10 and match_var_get('changes') == 1"
 !status counter a might add -1
-?? `a.might`: ×3 for 1, then ×1 permanently.
+?? `a.might`: level 3 for 1, then level 1 permanently.
 !undo command
 !assert "status_layers('a', 'might') == [[3, 2], [1, None]]"
 !as restart
@@ -45831,14 +45831,14 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 !status apply orc burn 2 3
 !status apply orc cursed 1 1
 !list
-?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns), cursed (1 turn)
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn level 2 (3 turns), cursed (1 turn)
 ?? Hero (hero): HP: 30/30 X,Y: 6,6 facing up
 ?! Hero (hero): HP: 30/30 X,Y: 6,6 facing up |
 !status visibility cursed "is_part_of_team(self, pov_team)"
 ?? `cursed` shows to a team view while
 !match bind pov=blue
 !list
-?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn ×2 (3 turns)
+?? Orc (orc): HP: 30/30 X,Y: 2,2 facing down | burn level 2 (3 turns)
 ?! cursed
 !find status:cursed
 ?! orc
@@ -45854,7 +45854,7 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 ?! fx_curse
 !match bind pov=red
 !list
-?? burn ×2 (3 turns), cursed (1 turn)
+?? burn level 2 (3 turns), cursed (1 turn)
 !map scene list
 ?? overlay `orc` at (2,2) 2x2 stretch — sprite fx_curse
 !match bind pov=blue
@@ -45877,7 +45877,7 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 ?? cursed
 !match bind pov=omniscient
 !list
-?? burn ×3 (3 turns), cursed (1 turn)
+?? burn level 3 (3 turns), cursed (1 turn)
 !status visibility cursed "corpse_team == pov_team"
 !ent kill orc
 !match bind pov=blue
@@ -45902,9 +45902,9 @@ SCENARIO 1246 — Statuses in the unit lines, as the channel's view sees them: s
 !assert "corpse_status_has('orc', 'burn')"
 
 Expected: the default entity_line_format ends with the unit's statuses
-(`| burn ×2 (3 turns), cursed (1 turn)`), each through
+(`| burn level 2 (3 turns), cursed (1 turn)`), each through
 status_line_format, which says how many turns are left; a unit without
-statuses has no `|`, and a level-1 status shows no `×1` (`{stacked}`,
+statuses has no `|`, and a level-1 status shows no `level 1` (`{stacked}`,
 the level above 1). A status's own visibility condition (`!status
 visibility`, self = the bearer) hides `cursed` from blue's view in the
 line, `!find status:` and `show:status` and the description, while red, the bearer's team,
@@ -46518,7 +46518,7 @@ Expected: a status's max_duration (#116, `!status maxduration`) caps its
 duration at every write, like max_level caps the level: an application
 of 10 lands as 3, and a level entry gives level 2 its own cap of 1. With
 layers each layer is held at its own level's cap, so burn 2 for 5 over
-burn 1 for 3 keeps both layers (×2 for 1, then ×1 for 3), and a counter
+burn 1 for 3 keeps both layers (level 2 for 1, then level 1 for 3), and a counter
 adding 10 leaves them there. A direct write is capped and the reply says
 so. A permanent status stays permanent when a cap arrives; a counter set
 gives it a duration, held to the cap. Lowering the cap shortens live
@@ -46634,7 +46634,7 @@ SCENARIO 1261 — Status gain, loss and level lines; per-status lines and the sw
 !ent set_var mage actions.soak.target entity
 !ent set_var mage actions.soak.body "status_apply(target, 'wet', 2)"
 !action mage soak orc
-?? Orc gains wet ×2.
+?? Orc gains wet level 2.
 !status message wet lost "{name} dries off ({removed_by})."
 !eval "status_dispel('orc', 'wet')"
 ?? Orc dries off (dispel).
@@ -47056,3 +47056,234 @@ and c done, `!turn set e` onto another unit dying at its turn start passes
 over the stunned d to f, the one unit left to act. When the only unit left
 is g and it dies at the start of the turn `!turn set` gives it, the reply
 says no one is left to take a turn.
+
+SCENARIO 1271 — !corpse: shorthands over the corpse forms of !ent and !find (W18)
+----------------------------------------------------------------------------------
+!match new cp CP 10 6
+!match use cp
+!map new cave 6 4
+!ent add a A 10 1 1 30 map=main
+!ent add b B 10 2 1 20 map=main
+!ent add c C 10 3 1 10 map=main
+!ent add d D 10 2 2 5 map=cave
+!ent set_var b loot.gold 5
+!ent kill b
+!ent kill c
+!ent kill d
+!map use main
+!corpse list
+?? **2 matches:**
+?! D (`d`)
+!corpse list map=all
+?? **3 matches:**
+!corpse info b short
+?? **B** (`b`)
+!corpse get b loot.gold
+?? `loot.gold` = 5
+!corpse var_move b loot.gold a
+?? Moved corpse `b` vars.loot.gold to `a` vars.loot.gold.
+!assert "entity[a].loot.gold == 5"
+!corpse set_var c note hi
+!assert "corpse_var('c', 'note') == 'hi'"
+!corpse delete_var c note
+!assert "not corpse_has('c', 'note')"
+!corpse tp c 5 3
+?? Moved the corpse of `c` to (5,3).
+!corpse remove a
+?? ❌ `a` is a living unit, not a corpse
+!assert "exists('a')"
+!corpse revive b
+?? ✨ **B** (`b`) was revived.
+!corpse clear
+?? Removed 1 corpse on `main`: `c`. Its id is free again.
+!assert "has_corpse('d') and not has_corpse('c')"
+!undo command 1
+!assert "has_corpse('c')"
+!corpse remove c d
+?? Removed 2 corpses: `c`, `d`.
+!corpse clear
+?? No corpses to remove on `main`.
+?tab "!corpse info "
+?! candidates: a
+
+Expected: `!corpse` runs the existing corpse forms (W18). On a two-map
+match `list` covers the channel's map (b and c on `main`; d lies in the
+cave) and `map=all` every map. `info`, `get`, `var_move` (the destination
+path defaulting to the source's), `set_var`, `delete_var`, `tp` and
+`revive` behave as their `!ent` forms. A living unit's id is refused.
+`clear` removes the corpses on the channel's map in one undo step (one
+`!undo command` brings c back), `remove` takes several corpses across
+maps, and an empty `clear` says so. Tab offers corpses only.
+
+SCENARIO 1272 — !say, !say to=<team>, !log add, !ent clear_var (W18)
+---------------------------------------------------------------------
+!match new sy Sy 9 9
+!match use sy
+!ent add hero Hero 30 2 2 5
+!ent add cat Cat 30 7 7 3
+!ent set_var hero team blue
+!ent set_var cat team red
+!match fog on
+!as channel blue
+!match use sy
+!match bind pov=blue
+!as channel redc
+!match use sy
+!match bind pov=red
+!as channel CLI
+!say The ground shakes under {hero} and {cat}.
+?? The ground shakes under Hero and Cat.
+?? 📨 to `blue`:
+?? The ground shakes under Hero and someone.
+?? 📨 to `redc`:
+?? The ground shakes under someone and Cat.
+!say to=red {cat} hears footsteps.
+?? 📨 Sent to 1 channel with team `red`'s view.
+?? 📨 to `redc`:
+?? Cat hears footsteps.
+?! 📨 to `blue`
+!say to=green hi
+?? ⚠️ No other channel is bound with team `green`'s view
+!log add the bridge collapsed
+?? 📝 Added to the event log.
+!log 3
+?? 💬 The ground shakes under Hero and Cat.
+?? the bridge collapsed
+?! hears footsteps
+!as player bob
+!log add sneaky
+?? needs host approval
+!as host
+!ent set_var hero bag.a 1
+!ent set_var hero bag.b.c 2
+!match var set lost 0
+!passive add hero gone on_var_removed target=bag scope=children "match_var_set('lost', match_var_get('lost') + 1)"
+!ent clear_var hero bag
+?? Cleared `hero` vars.bag: removed `a`, `b`; the container stays, empty.
+!assert "entity[hero].bag == {} and match_var_get('lost') == 2"
+!ent clear_var hero bag.zz
+?? ❌ `hero` has no var at `bag.zz`.
+!ent clear_var hero team
+?? not a container: `!ent delete_var hero team` deletes it.
+
+Expected: `!say` posts a narration line here and in every other channel
+bound to the match, each naming units as its view sees them (blue sees
+the hero, red the cat; the other is someone), and logs it as a `say`
+entry. `!say to=red` reaches only red's channel and stays out of the log;
+a team with no bound channel gets a warning. `!log add` writes a custom
+event-log entry and is host-gated for players. `!ent clear_var` empties a
+container (each key's removal fires on_var_removed: two here), refuses a
+missing path and points a plain var at `!ent delete_var`.
+
+SCENARIO 1273 — Command twins on a multi-tile body: spread damage, hit location, a stored unit spawned (W18)
+------------------------------------------------------------------------------------------------------------
+!match new bp BP 12 8
+!match use bp
+!system set default random_seed w18seed
+!ent add ogre Ogre 60 4 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre oh head 10 10 damage_to_main_percent=100 hit_weights.front=20 hit_weights.back=1
+!part add ogre ob body 30 30 hit_weights.front=10 hit_weights.back=30
+!ent add hero Hero 30 4 1 9
+!ent face ogre up
+!ent hit_location ogre 4 1 aim=oh
+?? 🎯 A hit on `ogre` from (4,1) strikes its front
+?? it lands on `
+!ent damage ogre 20 spread=uniform
+?? 🩸 **head** (`oh`) takes 10 damage.
+?? 🩸 **body** (`ob`) takes 10 damage.
+?? Spread 20 damage over `ogre`'s body: 10 reached `ogre` itself.
+!assert "entity[oh].hp == 0 and entity[ob].hp == 20 and entity[ogre].hp == 50"
+!ent damage ogre 5 spread origin=4,3
+?? ❌ `origin=<x>,<y>` and `radius=<r>` go together
+!ent heal ogre 5 spread
+?? ❌ `spread` divides damage across body parts
+!ent store_entity_into_var ogre hero kept
+!ent spawn_from_var hero kept 9 5
+?? Spawned `ogre2` at (9,5) from `hero` vars.kept.
+!assert "footprint_width('ogre2') == 2 and len(parts('ogre2')) == 2"
+!ent spawn_from_var hero kept 9 5 id_prefix=twin
+?? ❌ summon: footprint at (9,5) is occupied
+!assert "not exists('twin')"
+!ent spawn_from_var hero nothere 1 7
+?? ❌ summon_from: `hero` has no template at vars 'nothere'.
+!undo command 2
+!assert "not exists('ogre2')"
+
+Expected: on a 2x2 ogre with a head and a body part, `!ent hit_location`
+rolls a part for a hit from (4,1), the ogre's front. `!ent damage ...
+spread=uniform` splits 20 into 10 per part; the head's 100% share sends 10
+to the ogre itself (60 → 50), the head stays at 0 hp. `origin=` needs
+`radius=`, and `spread` refuses a heal. A snapshot of the ogre stored in
+the hero's vars spawns as `ogre2` with its 2x2 body and both parts; a
+spawn onto taken cells is refused and changes nothing, as is a missing
+var. Undoing two commands takes `ogre2` away again.
+
+SCENARIO 1274 — Geometry for rulings: !dist side and flank=, !map raycast, !map random, !find chain: (W18)
+---------------------------------------------------------------------------------------------------------
+!match new gr GR 12 8
+!match use gr
+!system set default random_seed geo18
+!ent add ogre Ogre 60 4 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add hero Hero 30 4 1 9
+!ent add rogue Rogue 30 4 6 7
+!ent add c1 C1 10 9 1 1
+!ent add c3 C3 10 1 1 1
+!ent face ogre up
+!dist hero ogre side
+?? `hero` strikes `ogre`'s **front**
+!dist rogue ogre side flank=hero
+?? `rogue` strikes `ogre`'s **back** — `rogue` and `hero` **flank** `ogre`
+!dist hero c1 flank=rogue
+?? don't flank
+!dist hero 9 1 side
+?? ❌ `side` and `flank=` read two units
+!tile set 6 1 opaque true
+!map raycast 1 1 10 1
+?? lands at **(5,1)**, stopped by (6,1).
+!map raycast 1 2 10 2
+?? lands at **(10,2)**: the line is clear.
+!map random free 1 1 3 3
+?? 🎲 Random free cell of (1,1)-(3,3):
+!map random free for=ogre
+?? where `ogre` fits:
+!map random zone=nozone
+?? ❌ No zone `nozone`.
+!find chain:hero:3
+?? **3 matches:**
+?? - Ogre (ogre)
+!find chain:hero:2:2
+?? **2 matches:**
+!foreach chain:hero:2 ; ent set_var $id hop $i
+!assert "entity[ogre].hop == 1 and entity[rogue].hop == 2"
+!match fog on
+!ent set_var hero team blue
+!ent set_var rogue team blue
+!ent set_var ogre team red
+!ent set_var hero fog_vision_radius 1
+!ent set_var rogue fog_vision_radius 1
+!as channel blue
+!match use gr
+!match bind pov=blue
+!find chain:hero:3
+?! Ogre
+?! C1
+!as player bob
+!map random
+?? needs host approval
+!as host
+!as channel CLI
+
+Expected: `!dist <a> <b> side` names the side of b that a strikes from
+(the hero stands at the up-facing ogre's front, the rogue at its back),
+and `flank=` says whether two units flank the second (the hero and rogue
+do). `side` refuses a cell. `!map raycast` gives where a beam lands and
+what stops it. `!map random` picks a cell of an area, free, or where a
+unit's whole body fits, and refuses a missing zone. `!find chain:hero:3`
+lists a bounce from the hero in chain order (the ogre first);
+`:2` as max jump stops it at two links, and `!foreach` sweeps it in that
+order. In blue's fogged channel the chain skips the units blue can't see,
+so neither the ogre nor C1 shows. `!map random` is a host command.

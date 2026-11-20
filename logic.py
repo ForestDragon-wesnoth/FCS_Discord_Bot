@@ -3294,7 +3294,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "status_line_format": {
-        "default": ("{name}{?stacked?} ×{stacked}{/?}{?duration?} ({duration} "
+        "default": ("{name}{?stacked?} level {stacked}{/?}{?duration?} ({duration} "
                     "{turns_word}){/?}{?layers?}: {layers}{/?}"),
         "schema": {"type": "str"},
         "desc": (
@@ -3303,11 +3303,11 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "(statuses joined with `, `, by name). Placeholders: {name}, and "
             "every field of the status instance ({level}, {duration}, any "
             "custom field such as {lost_max_hp}); {stacked} (the level "
-            "when above 1, so a level-1 status shows no `×1`); "
+            "when above 1, so a level-1 status shows no `level 1`); "
             "{turns_word} (`turn` for "
             "a duration of 1, else `turns`); {layers} for a status "
-            "holding layers of several levels (layered stacking: `×3 for 2, "
-            "then ×1 for 3 more`); {?key?}...{/?} shows a part "
+            "holding layers of several levels (layered stacking: `level 3 for "
+            "2, then level 1 for 3 more`); {?key?}...{/?} shows a part "
             "only when the field is set. A status definition's own `display` "
             "format (`!status display <name> <format>`) replaces this one "
             "for that status, e.g. a burn that lists each level's timer."
@@ -6373,7 +6373,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Placeholders: the death_message_format ones ({name}, {id}, "
             "{x}, {y}, {team}, {round}, the unit's vars) plus {status}, "
             "{level}, {duration} (empty when permanent), {level_text} "
-            "(` ×<level>` above 1, else empty), {duration_text} (` for <n> "
+            "(` level <n>` above 1, else empty), {duration_text} (` for <n> "
             "turn(s)`, empty when permanent), {source} (who applied it, "
             "named as the view sees it; empty when none). Empty = no line."
         ),
@@ -7168,7 +7168,7 @@ MAP_RESERVED_NAMES = frozenset({
     "scene", "image", "color", "teamcolor", "resize", "layer", "autoupdate",
     "legend", "coords", "pan", "center", "new", "list", "delete", "rename",
     "copy", "use", "var", "fog", "unseen", "attach", "detach", "void",
-    "shape"})
+    "shape", "raycast", "random"})
 
 
 def check_map_name(name: Any) -> None:
@@ -25074,7 +25074,7 @@ class Match:
         vals: Dict[str, Any] = {
             "status": name, "level": lv,
             "duration": "" if du is None else du,
-            "level_text": f" ×{lv}" if lv != 1 else "",
+            "level_text": f" level {lv}" if lv != 1 else "",
             "duration_text": ("" if du is None else
                               f" for {du} turn{'' if du == 1 else 's'}"),
             "source": self.say_name(src) if isinstance(src, str) else "",

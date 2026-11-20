@@ -428,8 +428,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
             return sorted(logic.RULES_REGISTRY)
         if slot == "dest_path":
             ent = binds.get("dest_id")
-        if root == "ent" and sub in _ENT_CORPSE_SUBS and m is not None \
-                and ent not in _entity_ids(mgr, ctx):
+        if (root == "corpse" or root == "ent" and sub in _ENT_CORPSE_SUBS) \
+                and m is not None and ent not in _entity_ids(mgr, ctx):
             cv = _corpse_vars(mgr, ctx, ent)
             if cv is not None:
                 return _var_paths(cv, word)
@@ -458,7 +458,10 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
                 return sorted(str(p) for p in parts)
             return sorted(str(p.get("id", "")).replace(logic.TEMPLATE_ROOT + "_", "")
                           for p in parts or [] if isinstance(p, dict))
-        if root == "ent" and sub in _ENT_CORPSE_SUBS:
+        if root == "corpse" and slot != "dest_id":
+            # `!corpse` names corpses only (W18).
+            return _corpse_ids(mgr, ctx)
+        if root == "ent" and sub in _ENT_CORPSE_SUBS or root == "corpse":
             # These take a corpse's id too (L56).
             return sorted(set(_entity_ids(mgr, ctx))
                           | set(_corpse_ids(mgr, ctx)))
