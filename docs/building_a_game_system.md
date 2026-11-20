@@ -62,6 +62,14 @@ both buffs) each had an answer the text alone didn't settle (5b7e05c).
   removes exactly what it added (a class change, a ring going quiet) and
   counts can skip it (summoned allies don't count toward "half the party
   dead") (4c5bb7a, 5b7e05c).
+- Let the engine carry what a class or item holds: statuses it holds
+  while present are `grants` in it (`status_grant_sources` naming the
+  roots), records it gives the team carry `applies_to: team` /
+  `team_others`, and its own setup and cleanup run from default passives
+  on `on_template_applied` / `on_template_removed` (one watching `class`
+  exactly, one `equipped` by children). A class change is then giving the
+  new class: the removed hook takes off what the old one added, and both
+  recalculate the stats.
 - A per-battle allowance several items share is a modifier stat summed over
   every source plus a used counter (`free_ammo`, `free_ammo_used`, 4ae56c4).
   A per-status damage bonus is a `<status>_damage` modifier the over-time

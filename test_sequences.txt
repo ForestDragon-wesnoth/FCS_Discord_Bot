@@ -47712,3 +47712,117 @@ recalculation). A unit whose `class` held other data (`class={}` on
 same way (40 + 20 = 60). A hook that gives a
 template that fires the same hook stops at var_hook_recursion_limit
 with one warning.
+
+SCENARIO 1282 — Statuses an item or class holds: status_grant_sources, highest level, cleanse returns, own status kept (W21)
+-----------------------------------------------------------------------------------------------------------------------------
+!match new hg HG 10 8
+!match use hg
+!system set default status_grant_sources equipped,class
+!template import cloak {"kind":"partial","data":{"name":"Cloak","grants":{"blur":{"level":1,"data":{"note":"cloak"}}}}}
+!template import ring {"kind":"partial","data":{"name":"Ring","grants":{"blur":{"level":3}}}}
+!status def blur
+!ent add hero Hero 30 2 2
+!template give cloak hero equipped.cloak
+?? Hero gains blur.
+!assert "status_level('hero', 'blur') == 1 and status_held_by('hero', 'blur') == ['item:equipped.cloak'] and status_get('hero', 'blur', 'note') == 'cloak'"
+!template give ring hero equipped.ring
+?? Hero's blur is now level 3 (was 1).
+!assert "status_held_by('hero', 'blur') == ['item:equipped.cloak', 'item:equipped.ring']"
+!ent delete_var hero equipped.ring
+?? Hero's blur is now level 1 (was 3).
+!status dispel hero blur
+?? Hero gains blur.
+!assert "status_has('hero', 'blur')"
+!ent delete_var hero equipped.cloak
+?? Hero loses blur.
+!assert "not status_has('hero', 'blur')"
+!ent set_var hero inventory.cloak.name Cloak
+!eval "var_set('hero', 'inventory.cloak.grants', {'blur': {'level': 2}})"
+!assert "not status_has('hero', 'blur')"
+!ent var_move hero inventory.cloak hero equipped.cloak
+?? Hero gains blur level 2.
+!ent delete_var hero equipped.cloak
+!status apply hero blur 2
+!template give cloak hero equipped.cloak
+!assert "status_level('hero', 'blur') == 2 and status_held_by('hero', 'blur') == []"
+!ent delete_var hero equipped.cloak
+!assert "status_has('hero', 'blur')"
+
+Expected: with status_grant_sources `equipped,class`, a cloak whose
+partial holds `grants: {blur: {level 1, data}}` puts blur on its unit
+while it is worn (status_held_by names the holder as
+`item:equipped.cloak`, the grant's data lands in the instance); a ring
+granting it at level 3 raises it to 3, and taking the ring off brings
+it back to 1. A dispel removes it and it comes back as the command
+ends. Taking the cloak off removes it. The same item carried in
+`inventory` (not a source root) grants nothing; moving it into
+`equipped` puts blur on at its level 2. A blur the hero got on its own
+(level 2) is never taken over or removed by a cloak.
+
+SCENARIO 1283 — Held grants on bodies: a body part's own gear, a hidden rider keeping its gear's status, death and revive (W21)
+---------------------------------------------------------------------------------------------------------------------------------
+!match new hb HB 10 8
+!match use hb
+!template import cloak {"kind":"partial","data":{"name":"Cloak","grants":{"blur":{"level":1}}}}
+!status def blur
+!ent add ogre Ogre 40 2 2 footprint_w=2 footprint_h=2
+!part add ogre oarm arm 10 10
+!template give cloak oarm equipped.cloak
+!assert "status_has('oarm', 'blur') and not status_has('ogre', 'blur')"
+!ent add cart Cart 30 6 2 slots={}
+!eval "var_set('cart', 'slots', {'inside': {'capacity': 1}})"
+!ent add page Page 10 6 4
+!template give cloak page equipped.cloak
+!mount page cart inside
+!assert "status_has('page', 'blur')"
+!ent kill page
+!assert "not exists('page') and not corpse_status_has('page', 'blur')"
+!ent tp cart 8 6
+!ent revive page
+!assert "status_has('page', 'blur') and status_held_by('page', 'blur') == ['item:equipped.cloak']"
+
+Expected: a body part of a 2×2 ogre holds its own gear: its cloak's
+blur lands on the part, not on the ogre. A rider hidden inside a cart
+keeps its cloak's blur (the item travels with its unit; zone grants
+skip hidden riders). A death strips the held status from the corpse
+(it lies in the cart's cell, so the cart moves off before the revive);
+the revived page still wears the cloak and holds blur again.
+
+SCENARIO 1284 — Team records: applies_to team / team_others, record_holder, statuses' records, a dead holder (W21)
+-------------------------------------------------------------------------------------------------------------------
+!match new tr TR 10 8
+!match use tr
+!system set default modifier_sources equipped,class
+!ent add bard Bard 20 2 2 team=blue
+!ent add knight Knight 30 3 2 team=blue
+!ent add orc Orc 30 6 6 team=red
+!eval "var_set('bard', 'class.modifiers.song', {'stat': 'speed', 'op': 'add', 'value': 2, 'applies_to': 'team'})"
+!assert "apply_mods('bard', 'speed', 10) == 12 and apply_mods('knight', 'speed', 10) == 12 and apply_mods('orc', 'speed', 10) == 10"
+!ent set_var bard class.modifiers.song.applies_to team_others
+!assert "apply_mods('bard', 'speed', 10) == 10 and apply_mods('knight', 'speed', 10) == 12"
+!ent set_var bard class.modifiers.song.condition "entity_distance(self, record_holder) <= 1"
+!assert "apply_mods('knight', 'speed', 10) == 12"
+!ent tp knight 6 2
+!assert "apply_mods('knight', 'speed', 10) == 10"
+!ent tp knight 3 2
+!mod show knight speed 10
+?? add 2 (pri 0) [bard:class.song]
+!status def anthem
+!status apply bard anthem
+!eval "status_set('bard', 'anthem', 'modifiers', {'a': {'stat': 'speed', 'op': 'add', 'value': 5, 'applies_to': 'team'}})"
+!assert "apply_mods('knight', 'speed', 10) == 17 and apply_mods('bard', 'speed', 10) == 15"
+!ent kill bard
+!assert "apply_mods('knight', 'speed', 10) == 10"
+!eval "var_set('knight', 'modifiers.x', {'stat': 'speed', 'value': 1, 'applies_to': 'everyone'})"
+!mod show knight speed 10
+?? applies_to 'everyone' isn't self, team or team_others
+
+Expected: a bard's class record with `applies_to: team` reaches every
+living unit of its team (bard and knight 10 → 12; the red orc keeps
+10). `team_others` leaves the holder out (bard 10, knight 12). In a
+team record's condition `self` is the unit whose stat folds and
+`record_holder` the bard: within one cell the knight gets the song,
+teleported away it doesn't. `!mod show` names the source as
+`bard:class.song`. A status's records reach the team the same way
+(anthem +5: knight 10 + 2 + 5 = 17, bard 15). A dead holder's records
+stop. An unknown `applies_to` word is named and left out.

@@ -1526,6 +1526,27 @@ hardcodes**.
   the body tells which fired, and a multi-hook passive's fired / error
   line names that hook. Listed and removed once; target / scope apply to
   its var hooks (`Passive.var_hooks`).
+- **Template hooks** (W22, user design, 1279-1281): `on_template_applied`
+  / `on_template_removed` fire when a partial template's live marker lands
+  on a unit or leaves it, one event per marker (`template_marker_list`),
+  applied outermost first, removed innermost first, with `template_name`,
+  `template_path` (the container, '' = vars root), `applied_by` /
+  `removed_by` and the container as `new_value` / `old_value`; target= /
+  scope= filter the path (`PATH_HOOKS`, `Passive.var_hooks`).
+  `Match.template_change` compares the old and new markers by path and
+  name (write_var / remove_var walk only when either side is a dict). The
+  route is `logic.TEMPLATE_ROUTE` (`template_route` / `template_routed`,
+  the outermost wins; `_outside_derivation` clears it for a hook's own
+  writes): give (removed + applied even for the same template), spawn
+  (template spawns, summon_template), summon, clone, copy (var_copy,
+  `!ent copy`), move (var_move: applied at the destination, removed at
+  the source), stamp, write (removed_by replace), delete, resync (both,
+  for every marker; its own writes quiet), transform / replace / revert
+  (the two forms compared once the new body stands, the stash left out).
+  `Entity.spawn` fires applied for what a new unit holds; a revive
+  (REVIVING) and a transfer (`TEMPLATE_QUIET`) fire nothing, nor do a
+  death, a despawn and a detach (user calls). Corpses fire nothing (on
+  hold, idea #623). They share var_hook_recursion_limit.
 - **Default passives** (`default_entity_passives`, `!defpassive`): copied
   onto every unit at `Entity.spawn` (`_apply_default_passives`). With
   `default_passives_existing_units` on (default; #221, user call, 1091-1092)
@@ -2197,6 +2218,18 @@ hardcodes**.
   default order stays add, inc%, more%, set, min, max, 407, 883),
   `modifier_op_order` breaks ties; `modifier_stat_caps` clamps the result.
   An unknown op folds as add and `!mod show` flags it.
+- **Team records** (W21 part 3, 1284): a record a unit holds (its
+  statuses', its `modifiers` var's, its modifier_sources containers')
+  with `applies_to: team` reaches every living unit of its team
+  (`e.team`), `team_others` all of them but the holder, `self` (default)
+  only the holder; an unknown word is named and left out
+  (`gather_modifiers`). Teammates' records come last in
+  `_raw_modifier_records` (now (record, source, holder) triples, source
+  `<holder>:<path>`), read from `_team_record_holders` (UnitFlags
+  `TEAM_RECORDS` units plus holders of a status whose definition holds
+  `applies_to`). A record's value / condition binds `record_holder` (the
+  holding unit; None for match / map / team data) beside `self` (the unit
+  whose stat folds). A dead holder's records stop.
 - Pure query: the engine never applies modifiers; the GM threads
   `apply_mods(...)` / `list_mods(...)` through their own formulas. `!mod show
   <eid> <stat> [base] [tag ...]` (399-400, 406-408, 480) also lists records
@@ -3277,7 +3310,21 @@ hardcodes**.
   grant settling on a unit prints are tagged as lines about it (V14). A
   unit copied or transferred to another match leaves its zone-held
   statuses behind and the destination's zones settle on it (L40, 991).
-  A death strips the zone's
+  **Held grants** (W21 part 2, user design, 1282-1283): a container
+  under the `status_grant_sources` roots (default `equipped`, per-unit
+  `__status_grant_sources` / `_add`) holding `grants: {<status>: {level,
+  data, linger}}` holds those statuses through the same machinery: its
+  source in the instance's ZONE_GRANT_KEY list is `item:<path>`
+  (`HELD_GRANT_PREFIX`; `Match._grant_entry` reads a zone's or an item's
+  grant), `_desired_zone_grants` adds the units `UnitFlags.HELD_GRANTS`
+  marks (`held_status_grants`; alive units, hidden riders included), the
+  highest level among zones and items wins, the last source letting go
+  removes it (removed_by `grant`, `zone` when only zones held it). A
+  write or delete under a grant source root touching `grants`
+  (`held_grant_write`) settles that unit at once, before the template
+  hooks, so a setup hook reads the status; a dispelled held status comes
+  back at the next settle (user call). `status_held_by(eid, status)`
+  (ARG_SAFE) names the holders. A death strips the zone's
   statuses before the corpse snapshot; statblocks, templates and prefabs
   leave them out (`without_zone_grants`); `!zone rename` and `!status
   rename` follow. When to use one over enter / exit hooks is in `!help
@@ -5031,6 +5078,11 @@ rejected already. Update this section in the PR that resolves an item.
   level and longest duration it shows (burn 3 for 2 then 1 for 5 becomes
   3 for 5), and a transfer onto a unit already holding the status stacks
   only that pair. A layer-aware version of each is open (idea #563).
+
+- **W21 part 1 and part 4** (user): fully derived stats are planned
+  (idea #252, when is open); loadout limits come back slightly later
+  (idea #622, the proposed answers in it). Template hooks on corpses are
+  on hold (idea #623).
 
 - **Dragged corpses fire no hooks** (user: a known limitation; code it
   when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross

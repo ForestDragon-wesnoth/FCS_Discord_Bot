@@ -396,7 +396,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy, template_hidden, template_private_level, TEMPLATE_CREATOR_ONLY, template_route
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy, template_hidden, template_private_level, TEMPLATE_CREATOR_ONLY, template_route, ZONE_GRANT_KEY
 
 
 class FormulaError(VTTError):
@@ -3668,7 +3668,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_add(eid, name)               -> bool (True iff newly added)
     #   status_remove(eid, name)            -> bool (True iff removed)
     "status_has", "status_has_path", "status_get", "status_level_data",
-    "status_source",
+    "status_source", "status_held_by",
     "status_resisted",
     # status_level(eid, name) / status_duration(eid, name) -> 0 when the
     # unit lacks the status (#90); a level-less status reads 1, one
@@ -4112,7 +4112,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "teams", "group_names", "entities_in_cells", "own_turns", "fits_at",
     "free_cells_near", "corpse_cell", "corpses_within",
     "exists", "is_alive", "cell_behind",
-    "last_damage", "last_healing", "status_source",
+    "last_damage", "last_healing", "status_source", "status_held_by",
     "is_void", "void_cells", "zone_can_move",
     "status_layers",
     'watch_exists', 'watchers_of',
@@ -4520,6 +4520,8 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     "status_level_tried",     # on_status_blocked: the level tried.
     "status_duration_tried",  # on_status_blocked: the duration tried
                               # (None = permanent).
+    "record_holder",    # a modifier record's value / condition (W21): the
+                        # unit holding it (None for match / map / team data)
     "template_name",    # on_template_applied / _removed (W22): the partial
     "template_path",    # the container's path ('' = the vars root)
     "applied_by",       # give, spawn, summon, clone, copy, move, stamp,
@@ -7594,6 +7596,21 @@ class FormulaEngine:
                                    "a string.")
             return match.status_source(eid, name)
         ns["status_source"] = _status_source
+
+        def _status_held_by(eid_t: Any, name: Any) -> List[str]:
+            """status_held_by(eid, name): what holds status `name` on `eid`:
+            the zones granting it (by name) and the items or class granting
+            it (`item:<path>`, W21); [] for a status the unit got otherwise
+            or lacks. A cleanse skips the held ones with
+            `if not status_held_by(u, s)`."""
+            eid, e = _resolve_entity(eid_t, "status_held_by")
+            if not isinstance(name, str):
+                raise FormulaError("status_held_by(eid, name): name must be "
+                                   "a string.")
+            inst = e.status.get(name)
+            got = inst.get(ZONE_GRANT_KEY) if isinstance(inst, dict) else None
+            return [str(z) for z in got] if isinstance(got, list) else []
+        ns["status_held_by"] = _status_held_by
 
         # ---- sizes (#242) ----
         # A size reference is a unit (its body's total, or with own=True its
