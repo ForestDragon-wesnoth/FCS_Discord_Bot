@@ -774,6 +774,64 @@ SIZE_DERIVING: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_size_deriving", default=False)
 
 
+# Template hooks (W22): the route a partial template's marker lands on a
+# unit by (or leaves it by), for on_template_applied / on_template_removed's
+# `applied_by` / `removed_by`. Set by each route around its writes (the
+# outermost wins: a template spawn's summon stays `spawn`); unset = a plain
+# write / delete. TEMPLATE_QUIET fires nothing (a revive, a transfer, a
+# resync's own writes, which it reports itself); a give fires removed and
+# applied for every marker it replaces or writes, even the same template.
+TEMPLATE_ROUTE: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("vtt_template_route", default=None))
+TEMPLATE_QUIET = "_quiet"
+TEMPLATE_EXPLICIT_ROUTES = frozenset({"give"})
+
+
+@contextlib.contextmanager
+def template_route(word: str):
+    """Name the route of the template markers written inside (the
+    outermost route wins)."""
+    if TEMPLATE_ROUTE.get() is not None:
+        yield
+        return
+    token = TEMPLATE_ROUTE.set(word)
+    try:
+        yield
+    finally:
+        TEMPLATE_ROUTE.reset(token)
+
+
+def template_routed(word: str):
+    """Decorator: run the function under template_route(word)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapped(*a, **k):
+            with template_route(word):
+                return fn(*a, **k)
+        return wrapped
+    return deco
+
+
+def template_marker_list(value: Any, prefix: str = ""
+                         ) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """(path, template name, container) of every live partial marker in
+    `value`, outermost first (a container's nested markers follow it);
+    `prefix` is the path of `value` itself."""
+    out: List[Tuple[str, str, Dict[str, Any]]] = []
+
+    def walk(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        mk = node.get(TEMPLATE_MARKER)
+        if _is_live_marker(mk):
+            out.append((path, mk["name"], node))
+        for k, v in node.items():
+            if k != TEMPLATE_MARKER and isinstance(v, dict):
+                walk(v, f"{path}.{k}" if path else str(k))
+    walk(value, prefix)
+    return out
+
+
 @contextlib.contextmanager
 def _outside_derivation():
     """Run the hooks an engine write or spawn fires as ordinary code, out of
@@ -783,15 +841,18 @@ def _outside_derivation():
     tracked, S17) and PLACEMENT_IGNORE (a stamped rider's spawn hooks can't
     place a unit on its vehicle's cell, S17)."""
     if not (SIZE_DERIVING.get() or TEMPLATE_TRACK_OFF.get()
-            or PLACEMENT_IGNORE.get()):
+            or PLACEMENT_IGNORE.get() or TEMPLATE_ROUTE.get() is not None):
         yield
         return
     t1 = SIZE_DERIVING.set(False)
     t2 = TEMPLATE_TRACK_OFF.set(False)
     t3 = PLACEMENT_IGNORE.set(())
+    # A hook's own template writes name their own route (W22).
+    t4 = TEMPLATE_ROUTE.set(None)
     try:
         yield
     finally:
+        TEMPLATE_ROUTE.reset(t4)
         PLACEMENT_IGNORE.reset(t3)
         TEMPLATE_TRACK_OFF.reset(t2)
         SIZE_DERIVING.reset(t1)
@@ -7946,6 +8007,15 @@ HOOK_NAMES: Set[str] = {
     # (`!ent transform`, transform()), replace (`!ent replace`,
     # replace_form()) or revert.
     "on_transformed",
+    # Template hooks (W22): a partial template's marker landed on the unit
+    # (applied) or left it (removed). Fired on the unit, once per marker
+    # (applied outermost first, removed innermost first), with
+    # `template_name`, `template_path` (the container's path, '' = the
+    # vars root) and `applied_by` / `removed_by` bound, plus the container
+    # as `new_value` / `old_value`. Passives filter by `target=` /
+    # `scope=` against the path, as var hooks do.
+    "on_template_applied",
+    "on_template_removed",
 }
 
 # Custom event-bus subscription. A passive whose `when` is "event:<name>"
@@ -8084,6 +8154,11 @@ VAR_HOOKS: Set[str] = {
     "on_var_write_attempt",
 }
 
+# Hooks a passive's target= / scope= filter by path: the var hooks and the
+# template hooks (W22), whose path is the template's container.
+TEMPLATE_HOOKS: Set[str] = {"on_template_applied", "on_template_removed"}
+PATH_HOOKS: Set[str] = VAR_HOOKS | TEMPLATE_HOOKS
+
 # Valid values for Passive.scope (var-hook filtering).
 #   exact     — fires only when changed_key == target
 #   children  — fires when changed_key is a direct child of target
@@ -8208,8 +8283,9 @@ class Passive:
 
     @property
     def var_hooks(self) -> bool:
-        """Whether any of its hooks is a var hook (target / scope apply)."""
-        return any(h in VAR_HOOKS for h in self.hooks)
+        """Whether any of its hooks filters by path (target / scope apply):
+        a var hook or a template hook."""
+        return any(h in PATH_HOOKS for h in self.hooks)
 
     def matches_event(self, changed_key: str) -> bool:
         """
@@ -10767,6 +10843,15 @@ class Entity:
             spawn_log = match.fire_hook("on_entity_spawned",
                                         target_ids=[self.id])
         log = rename_notes + size_log + spawn_log
+        # Template hooks (W22): the partials it arrives holding (a revive
+        # and a transfer bring nothing new: the unit already had them).
+        route = TEMPLATE_ROUTE.get()
+        if (not REVIVING.get() and route != TEMPLATE_QUIET
+                and self.id in match.entities):
+            news = template_marker_list(self.vars)
+            if news:
+                log += match.template_change(self, [], news,
+                                             route or "spawn")
         # Spawn event — but NOT during a revive (the entity sits in the
         # death-suppressed set only across the revive's spawn window), so
         # a revive emits just its own "revive" event, not a duplicate
@@ -11439,6 +11524,17 @@ class Entity:
                     combined.append(self._match.unit_line(self.id, (
                         f"⚠️ `{self.id}`'s own size is set to {size_named} "
                         f"({value}); {total} ({info['category']}).")))
+        # Template hooks (W22): a partial's marker written or replaced here.
+        route = TEMPLATE_ROUTE.get()
+        if (self._match is not None and route != TEMPLATE_QUIET
+                and self.id in self._match.entities
+                and (isinstance(old_post_attempt, dict)
+                     or isinstance(value, dict))):
+            stored = _path_resolve(self.vars, path)
+            combined += self._match.template_change(
+                self, template_marker_list(old_post_attempt, path),
+                template_marker_list(stored, path), route or "write",
+                "replace")
         # verbosity 'detailed': annotate a DESTRUCTIVE write — one that
         # replaced an existing subtree, so `inventory = 5` over a populated
         # dict silently drops its keys. NOTE _diff_subtree collapses a
@@ -11609,6 +11705,13 @@ class Entity:
         if self._match is not None and self.id in self._match.entities \
                 and _size_trigger(self._match, path, self):
             log += self._match.sync_body_size(self)
+        # Template hooks (W22): the partials' markers the deleted value held.
+        route = TEMPLATE_ROUTE.get()
+        if (self._match is not None and route != TEMPLATE_QUIET
+                and isinstance(old, dict) and self.id in self._match.entities):
+            log += self._match.template_change(
+                self, template_marker_list(old, path), [],
+                route or "delete", "move" if route == "move" else "delete")
         # Removing the init or team var also dirties turn order — same
         # policy gate as write_var above. Initiative being removed means
         # the entity drops out of turn_order entirely (since
@@ -25600,6 +25703,7 @@ class Match:
                         p.get("var_names") or out.get("var_names"))))
         return out
 
+    @template_routed("spawn")
     def spawn_template(self, name: str, template: Dict[str, Any], x: int, y: int,
                        near_radius: Optional[int] = None,
                        mp: Optional["Map"] = None) -> Tuple[str, List[str]]:
@@ -26164,7 +26268,8 @@ class Match:
             raise VTTError(f"`{name}` is an entity template; `!template "
                            f"spawn` it. Only partials are given to a unit.")
         value = self.template_materialize({TEMPLATE_MARKER: name})
-        return e.write_var(path, value)
+        with template_route("give"):
+            return e.write_var(path, value)
 
     def template_containers(self, e: "Entity") -> List[Tuple[str, Dict[str, Any]]]:
         """(path, marker) of every marked container in e's vars, outermost
@@ -26205,6 +26310,10 @@ class Match:
         path = "" if path in ("", ".") else path
         node = self._marked_container_at(e, path)
         mk = node[TEMPLATE_MARKER]
+        # Template hooks (W22): removed then applied for every marker the
+        # container holds, as a swap; its own writes fire none.
+        olds = [(p, n, jcopy(c)) for p, n, c in
+                template_marker_list(node, path)]
         live = copy.deepcopy(self._container_base(
             e.vars, path, self.unit_names_for(e.var_names)))
         file = self._dematerialize(node, None)
@@ -26225,6 +26334,7 @@ class Match:
         from action import _rollback_match
         pre = self.to_dict(include_history=False)
         token = TEMPLATE_TRACK_OFF.set(True)
+        rtoken = TEMPLATE_ROUTE.set(TEMPLATE_QUIET)
         try:
             if path:
                 log += e.write_var(path, live)
@@ -26250,7 +26360,14 @@ class Match:
             _rollback_match(self, None, pre)
             raise
         finally:
+            TEMPLATE_ROUTE.reset(rtoken)
             TEMPLATE_TRACK_OFF.reset(token)
+        if e.id in self.entities:
+            found, now = ((True, e.vars) if not path
+                          else _rel_get(e.vars, path))
+            if found:
+                log += self.template_change(
+                    e, olds, template_marker_list(now, path), "resync")
         return log
 
     def detach_container(self, e: "Entity", path: str) -> str:
@@ -26358,6 +26475,7 @@ class Match:
             n += 1
         return f"{base}{n}"
 
+    @template_routed("summon")
     def summon_entity(
         self, template: Any, x: int, y: int, *,
         id_prefix: Optional[str] = None,
@@ -28599,7 +28717,8 @@ class Match:
                         form_tag: Optional[str] = None,
                         revert_tag: Optional[str] = None,
                         add_form: bool = True,
-                        kind: str = "transform") -> List[str]:
+                        kind: str = "transform",
+                        stash_path: Optional[str] = None) -> List[str]:
         """Replace `e`'s statblock in place from `statblock` (a
         capture_statblock dict or a summon-style template), PRESERVING e's id,
         position, facing, team, and turn-order slot. HP carries per `hp_mode`
@@ -28809,6 +28928,12 @@ class Match:
                 f"the transform stopped."]
         self._death_check_suppressed_ids.add(e.id)
         log: List[str] = list(drop_log)
+        # Template hooks (W22): the forms' partials, compared once the new
+        # body stands.
+        old_marks = [t for t in template_marker_list(e.vars)
+                     if not stash_path or not (t[0] == stash_path or
+                                               t[0].startswith(stash_path
+                                                               + "."))]
         try:
             e.vars = new_vars
             e.name = sb.get("name") or e.name
@@ -28823,10 +28948,11 @@ class Match:
             self._turn_order_dirty = True
             self._rebuild_turn_order()
             self._restamp_anchors_for(e.id)
-            log += self._apply_statblock_parts(e, sb.get("parts"))
-            seg = sb.get("segments")
-            if seg:
-                log += self._apply_statblock_parts(e, seg)
+            with template_route(kind):
+                log += self._apply_statblock_parts(e, sb.get("parts"))
+                seg = sb.get("segments")
+                if seg:
+                    log += self._apply_statblock_parts(e, seg)
         finally:
             self._death_check_suppressed_ids.discard(e.id)
         swap = dict(mode=statuses, form_tag=form_tag, revert_tag=revert_tag,
@@ -28840,6 +28966,9 @@ class Match:
                 if part.id in self.entities:
                     log += self._transform_status_swap(
                         part, old, part.status, **swap)
+        if e.id in self.entities and TEMPLATE_ROUTE.get() != TEMPLATE_QUIET:
+            log += self.template_change(e, old_marks,
+                                        template_marker_list(e.vars), kind)
         if e.id in self.entities:
             log += self.fire_hook("on_transformed", target_ids=[e.id],
                                   extras={"transform_kind": kind})
@@ -29019,7 +29148,9 @@ class Match:
             form_tag=str(stash_path) if stash_path else None,
             kind="transform" if statuses == "merge" else "replace")
         if stash_path and e.id in self.entities:
-            e.write_var(str(stash_path), snap)
+            # The stashed form's partials aren't the unit's (W22).
+            with template_route(TEMPLATE_QUIET):
+                e.write_var(str(stash_path), snap)
         return log
 
     def revert_entity(self, eid: str, stash_path: str,
@@ -29049,9 +29180,11 @@ class Match:
         if snap.get(TRANSFORM_MODE_KEY) == "merge":
             return self.apply_statblock(
                 e, snap, hp_mode=hp_mode, statuses="merge",
-                revert_tag=str(stash_path), add_form=False, kind="revert")
+                revert_tag=str(stash_path), add_form=False, kind="revert",
+                stash_path=str(stash_path))
         return self.apply_statblock(e, snap, hp_mode=hp_mode,
-                                    statuses="replace", kind="revert")
+                                    statuses="replace", kind="revert",
+                                    stash_path=str(stash_path))
 
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)
@@ -29353,6 +29486,83 @@ class Match:
                 lambda p, h=hook: p.fires_on(h) and p.matches_event(ev.key),
                 log)
 
+        return log
+
+    # ---- template hooks (W22) ----
+    def template_change(self, e: "Entity",
+                        olds: List[Tuple[str, str, Dict[str, Any]]],
+                        news: List[Tuple[str, str, Dict[str, Any]]],
+                        applied_by: str,
+                        removed_by: Optional[str] = None) -> List[str]:
+        """Fire on_template_removed for the markers of `olds` that left and
+        on_template_applied for those of `news` that arrived (by path and
+        name; a give and a resync, TEMPLATE_EXPLICIT_ROUTES and `resync`,
+        fire both for every marker, the same template included).
+        Removed innermost first, then applied outermost first."""
+        if not (olds or news):
+            return []
+        if applied_by in TEMPLATE_EXPLICIT_ROUTES or applied_by == "resync":
+            gone, came = list(olds), list(news)
+        else:
+            okeys = {(p, n) for p, n, _c in olds}
+            nkeys = {(p, n) for p, n, _c in news}
+            gone = [t for t in olds if (t[0], t[1]) not in nkeys]
+            came = [t for t in news if (t[0], t[1]) not in okeys]
+        events = ([("on_template_removed", t, removed_by or applied_by)
+                   for t in reversed(gone)]
+                  + [("on_template_applied", t, applied_by) for t in came])
+        if not events:
+            return []
+        log: List[str] = []
+        for hook, (path, name, node), how in events:
+            if e.id not in self.entities or e._match is not self:
+                break
+            log += self._fire_template_event(e.id, hook, path, name, node,
+                                             how)
+        return log
+
+    def _fire_template_event(self, eid: str, hook: str, path: str,
+                             name: str, node: Any, how: str) -> List[str]:
+        """One template hook on unit `eid`: its passives whose target /
+        scope match `path`, under the var hooks' recursion limit."""
+        if not self._ordered_passives(
+                eid, lambda p: p.fires_on(hook) and p.matches_event(path)):
+            return []
+        limit = int(self.rules.get("var_hook_recursion_limit", 128))
+        if self._var_event_depth >= limit:
+            if not self._var_event_warned \
+                    and self.var_warn_verbosity() != "off":
+                self._var_event_warned = True
+                self._var_event_warnings.append(
+                    f"⚠️ var-hook recursion limit ({limit}) reached on "
+                    f"`{hook}` for `{eid}.{path or '(root)'}`; suppressing "
+                    f"further hook firing for this chain.")
+            return []
+        from formula import FormulaEngine, EvalCtx
+        applied = hook == "on_template_applied"
+        extras = {
+            "template_name": name,
+            "template_path": path,
+            "hook_name": hook,
+            "applied_by": how if applied else None,
+            "removed_by": None if applied else how,
+            "new_value": jcopy(node) if applied else None,
+            "old_value": None if applied else jcopy(node),
+        }
+        ctx = EvalCtx(this=self.current_entity_id(), target=eid,
+                      extras=extras)
+        log: List[str] = []
+        self._var_event_depth += 1
+        try:
+            with _outside_derivation():
+                self._run_ordered(
+                    FormulaEngine(self), ctx, eid,
+                    lambda p: p.fires_on(hook) and p.matches_event(path),
+                    log)
+        finally:
+            self._var_event_depth -= 1
+            if self._var_event_depth == 0:
+                self._var_event_warned = False
         return log
 
     # ---- var-write-attempt firing ----
@@ -34859,7 +35069,11 @@ class MatchManager:
         from action import _rollback_match
         pre_dest = dest.to_dict(include_history=False)
         try:
-            self._spawn_copies(src, dest, e, order, idmap, tx, ty, log, dmap)
+            # A transfer brings what the unit had (no template hooks, W22);
+            # a copy is a new unit holding its templates.
+            with template_route(TEMPLATE_QUIET if move else "copy"):
+                self._spawn_copies(src, dest, e, order, idmap, tx, ty, log,
+                                   dmap)
         except Exception:
             _rollback_match(dest, self, pre_dest)
             raise

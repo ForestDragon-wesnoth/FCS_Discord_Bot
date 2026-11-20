@@ -396,7 +396,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy, template_hidden, template_private_level, TEMPLATE_CREATOR_ONLY
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy, template_hidden, template_private_level, TEMPLATE_CREATOR_ONLY, template_route
 
 
 class FormulaError(VTTError):
@@ -4520,6 +4520,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     "status_level_tried",     # on_status_blocked: the level tried.
     "status_duration_tried",  # on_status_blocked: the duration tried
                               # (None = permanent).
+    "template_name",    # on_template_applied / _removed (W22): the partial
+    "template_path",    # the container's path ('' = the vars root)
+    "applied_by",       # give, spawn, summon, clone, copy, move, stamp,
+                        # write, resync, transform, replace, revert
     "transform_kind",   # on_transformed: transform, replace or revert;
                         # None elsewhere.
     "skip_status",      # on_turn_skipped: the status(es) whose skips_turn
@@ -8233,14 +8237,15 @@ class FormulaEngine:
                         f"var_move: `{dest_path}` is inside `{src_path}`, "
                         f"which the move deletes.")
             val = copy.deepcopy(cur)
-            _end_write(deid, de, dest_path, val, "var_move")
-            try:
-                if se is not None:
-                    match.surface_log(se.remove_var(src_path))
-                else:
-                    match.corpse_var_del(seid, src_path)
-            except VTTError as ex:
-                raise FormulaError(str(ex))
+            with template_route("move"):
+                _end_write(deid, de, dest_path, val, "var_move")
+                try:
+                    if se is not None:
+                        match.surface_log(se.remove_var(src_path))
+                    else:
+                        match.corpse_var_del(seid, src_path)
+                except VTTError as ex:
+                    raise FormulaError(str(ex))
             engine._note_affected(seid)
             engine._note_affected(deid)
             return True
@@ -8271,7 +8276,8 @@ class FormulaEngine:
                 if not found:
                     return False
                 val = copy.deepcopy(cur)
-            _end_write(deid, de, dest_path, val, "var_copy")
+            with template_route("copy"):
+                _end_write(deid, de, dest_path, val, "var_copy")
             engine._note_affected(deid)
             return True
 

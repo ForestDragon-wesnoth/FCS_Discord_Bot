@@ -47553,3 +47553,162 @@ before the window closes: the condition is judged again when the half
 runs, (8,4) is now nearer, the dodge fails and the claws land (hp 25).
 A condition whose formula fails refuses the pick naming the failure;
 the hunter passes and takes the hit (hp 20).
+
+SCENARIO 1279 — Template hooks: on_template_applied / on_template_removed on gives, swaps, deletes, moves and resyncs (W22)
+---------------------------------------------------------------------------------------------------------------------------
+!match new th TH 8 8
+!match use th
+!template import ring {"kind":"partial","data":{"name":"Ring","bonus":5}}
+!template import cloak {"kind":"partial","data":{"name":"Cloak","gem":{"__template":"ring"}}}
+!ent add hero Hero 30 2 2
+!ent add bag Bag 5 4 4
+!gpassive add ga on_template_applied target=equipped scope=deep "say('applied {n} at {p} by {b}', n=template_name, p=template_path, b=applied_by)"
+!gpassive add gr on_template_removed target=equipped scope=deep "say('removed {n} at {p} by {b}', n=template_name, p=template_path, b=removed_by)"
+!passive add hero cls on_template_applied target=class scope=exact "entity[self].class_seen = new_value['name']"
+!template give ring hero equipped.ring
+?? applied ring at equipped.ring by give
+!template give cloak hero equipped.ring
+?? removed ring at equipped.ring by replace
+?? applied cloak at equipped.ring by give
+?? applied ring at equipped.ring.gem by give
+!template give cloak hero equipped.ring
+?? removed ring at equipped.ring.gem by replace
+?? removed cloak at equipped.ring by replace
+!ent set_var hero equipped.ring.name Shroud
+!template resync hero equipped.ring
+?? removed cloak at equipped.ring by resync
+?? applied cloak at equipped.ring by resync
+!assert "entity[hero].equipped.ring.name == 'Shroud'"
+!ent set_var hero equipped.ring.gem.bonus 9
+?! applied
+!eval "var_copy('hero', 'equipped.ring', 'hero', 'equipped.spare')"
+?? applied cloak at equipped.spare by copy
+!ent var_move hero equipped.spare bag equipped.loot
+?? applied cloak at equipped.loot by move
+?? removed cloak at equipped.spare by move
+!ent delete_var hero equipped.ring
+?? removed ring at equipped.ring.gem by delete
+?? removed cloak at equipped.ring by delete
+!template give ring hero class
+?! applied ring at class
+!assert "entity[hero].class_seen == 'Ring'"
+!ent set_var hero equipped.plain 3
+?! applied
+
+Expected: global passives watch `equipped` at scope deep (the var hooks'
+target / scope filter, matched against the template's container path);
+the hero's own passive watches `class` exactly. A give fires applied
+with `applied_by` give. A give over another template fires removed for
+the old one (`removed_by` replace), then applied for the new one: one
+event per marker, so the cloak's nested `gem` (built from the ring) gets
+its own, applied outermost first. A give of the same template over
+itself fires both too, removed innermost first (gem, then cloak). A
+resync fires removed then applied for every marker, by resync, and
+keeps the unit's own changes (the name Shroud). A plain write inside an
+item fires nothing. var_copy fires applied by copy; var_move fires
+applied on the destination and removed on the source, both by move; a
+delete fires removed by delete. The hero's `class` passive reads the
+container as `new_value` (class_seen = Ring); the globals don't watch
+`class`. A plain value fires nothing.
+
+SCENARIO 1280 — Template hooks on spawns: template spawn, a body part's own container, clone, copy, transfer, stamp, revive and transform (W22)
+-------------------------------------------------------------------------------------------------------------------------------------------------
+!match new ts TS 12 8
+!match new other OT 12 8
+!match use other
+!match link ts
+!gpassive add ga on_template_applied "say('OT {u}: applied {n} by {b}', u=self, n=template_name, b=applied_by)"
+!match use ts
+!template import ring {"kind":"partial","data":{"name":"Ring","bonus":5}}
+!ent add ogre Ogre 40 2 2 footprint_w=2 footprint_h=2
+!part add ogre oarm arm 10 10
+!gpassive add ga on_template_applied "say('{u}: applied {n} at {p} by {b}', u=self, n=template_name, p=template_path, b=applied_by)"
+!gpassive add gr on_template_removed "say('{u}: removed {n} at {p} by {b}', u=self, n=template_name, p=template_path, b=removed_by)"
+!template give ring oarm gear.ring
+?? arm: applied ring at gear.ring by give
+!template give ring ogre gear.ring
+!template save ogre ogret
+!template spawn ogret 6 2
+?? Ogre: applied ring at gear.ring by spawn
+?? arm: applied ring at gear.ring by spawn
+!assert "has_part('ogret', 'arm')"
+!ent clone ogre ogre2 9 2
+?? Ogre: applied ring at gear.ring by clone
+?? arm: applied ring at gear.ring by clone
+!prefab save ogpf 1 1 4 4
+!prefab stamp ogpf 9 5
+?? Ogre: applied ring at gear.ring by stamp
+!ent copy ogre other 2 2
+?? OT Ogre: applied ring by copy
+!ent transfer ogre2 other 6 6
+?! applied
+!ent kill ogret
+?! removed
+!ent revive ogret
+?! applied
+!ent add wolf Wolf 20 6 6
+!template give ring wolf fang
+!ent transform ogret wolf stash
+?? Wolf: removed ring at gear.ring by transform
+?? Wolf: applied ring at fang by transform
+?! at stash
+!ent revert ogret stash
+?? Ogre: removed ring at fang by revert
+?? Ogre: applied ring at gear.ring by revert
+!ent remove ogret
+?! removed
+
+Expected: on a 2×2 ogre with a body part that holds its own ring, a
+template spawn fires applied (by spawn) on the unit and, separately, on
+its part for the part's own container; a clone fires by clone and a
+prefab stamp by stamp (the prefab's ogre lands at 9,5). `!ent copy`
+into a linked match fires there by copy (a new unit holding the ring);
+a transfer fires nothing (the unit already had it). A death, a revive
+and a removal fire nothing: the corpse keeps the gear and the revived
+unit already had it. A transform compares the two forms: the ogre's
+ring at gear.ring is removed and the wolf form's ring at fang is
+applied, both by transform, and the stashed old form's partials fire
+nothing; a revert swaps them back, by revert.
+
+SCENARIO 1281 — Template hooks in real use: a class sets itself up when given and cleans up when taken off; a hook that gives a template (W22)
+----------------------------------------------------------------------------------------------------------------------------------------------
+!match new tc TC 8 8
+!match use tc
+!system set default modifier_sources equipped,class
+!template import knight {"kind":"partial","data":{"name":"Knight","modifiers":{"hp":{"stat":"max_hp","op":"add","value":20}},"start_item":"shield"}}
+!template import shield {"kind":"partial","data":{"name":"Shield","block":3}}
+!func def restat u "entity[u].max_hp = round(apply_mods(u, 'max_hp', entity[u].base_max_hp))\nentity[u].hp = min(entity[u].hp, entity[u].max_hp)"
+!defpassive add class_on on_template_applied target=class scope=exact "status_force(self, 'knighted')\ngive_template(self, 'pack.' + new_value['start_item'], new_value['start_item'])\nrestat(self)"
+!defpassive add class_off on_template_removed target=class scope=exact "status_dispel(self, 'knighted')\nif var_has(self, 'pack.' + old_value['start_item']):\n    var_del(self, 'pack.' + old_value['start_item'])\nrestat(self)"
+!defpassive add pack_log on_template_applied target=pack scope=children "say('{n} packed by {b}', n=template_name, b=applied_by)"
+!ent add hero Hero 50 2 2 base_max_hp=50
+!template give knight hero class
+?? shield packed by give
+!assert "entity[hero].max_hp == 70 and status_has('hero', 'knighted') and entity[hero].pack.shield.block == 3"
+!ent hp hero max
+!ent delete_var hero class
+!assert "entity[hero].max_hp == 50 and entity[hero].hp == 50 and not status_has('hero', 'knighted') and not var_has('hero', 'pack.shield')"
+!ent add squire Squire 40 4 4 base_max_hp=40 class={}
+!template give knight squire class
+!assert "entity[squire].max_hp == 60 and entity[squire].pack.shield.block == 3"
+!system set default var_hook_recursion_limit 2
+!defpassive add loop on_template_applied target=loop scope=exact "give_template(self, 'loop', 'shield')"
+!ent add page Page 10 6 6
+!template give shield page loop
+?? var-hook recursion limit (2) reached
+
+Expected: a knight class (a partial with a max hp modifier and a start
+item) sets itself up through default passives, as a system would: its
+applied hook (scope exact on `class`; modifier_sources reads `class`)
+forces the `knighted` status,
+gives the start item named in the class (`new_value` is the
+container), which fires the pack's own applied hook (by give, from
+inside the class's hook), and recalculates max hp from the base plus
+every modifier (50 + 20 = 70). Deleting the class runs the removed hook
+(`old_value` is the container): the status is dispelled, the start item
+taken back and max hp recalculated to 50 (hp 70 → 50 by the
+recalculation). A unit whose `class` held other data (`class={}` on
+`!ent add` stores the text "{}") gets the class over it and sets up the
+same way (40 + 20 = 60). A hook that gives a
+template that fires the same hook stops at var_hook_recursion_limit
+with one warning.
