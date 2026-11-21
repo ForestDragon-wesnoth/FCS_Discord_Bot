@@ -18533,6 +18533,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     for label, key in
                     (("sprite", "sprite"), ("glyph", "glyph"), ("color", "tint"))
                     if p.get(key)) or "nothing"
+                if p.get("label"):
+                    # A name sprite (entity_sprite_fallback name_text).
+                    what += (f", name text '"
+                             + p["label"].replace("\n", " / ")
+                             + f"' ({p.get('label_color')} on "
+                               f"{p.get('label_bg')})")
                 us = scene["unit_style"]
                 act = (", acting" if p.get("active") and us.get("active_on")
                        else "")
@@ -18542,6 +18548,9 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 look = ", ".join(f"{label} {e[key]}" for label, key in
                                  (("sprite", "sprite"), ("glyph", "glyph"),
                                   ("color", "tint")) if e.get(key)) or "fog"
+                if e.get("label"):
+                    look += ", name text '" + e["label"].replace(
+                        "\n", " / ") + "'"
                 lines.append(f"Legend: {look} = {', '.join(e['labels'])}")
         return await ctx.send("\n".join(lines))
     if args and args[0].lower() == "image":

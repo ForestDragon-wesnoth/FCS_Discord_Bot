@@ -123,6 +123,11 @@ _GLYPH_FILL = 0.7
 # The largest size a stretch body's glyph fallback is drawn at; a larger body
 # scales the drawn shape up (only the part in the window is built).
 _GLYPH_DRAW_MAX = 2048
+# The smallest text of a name sprite, as a share of its short side: a word
+# too long at this size is cut with "...".
+_NAME_TEXT_MIN = 0.10
+# Name sprites made, by (text, colours, size); shared by every renderer.
+_NAME_TEXT_CACHE: Dict[Tuple[Any, ...], "Image.Image"] = {}
 
 
 # ----------------------------------------------------------------------------
@@ -582,6 +587,21 @@ class SceneRenderer:
             return
         key = p.get("sprite")
         img = self.loader.get(key) if key else None
+        label = p.get("label")
+        if img is None and isinstance(label, str) and label:
+            # A name sprite (entity_sprite_fallback name_text): made here
+            # and drawn like any sprite. A stretch body's is made at the
+            # body's shape, so its text runs along the body.
+            if mode == "stretch":
+                bw, bh = w * cell, h * cell
+                k = min(1.0, _GLYPH_DRAW_MAX / max(bw, bh))
+                img = self.name_text_image(label, p.get("label_color"),
+                                           p.get("label_bg"),
+                                           max(1, round(bw * k)),
+                                           max(1, round(bh * k)))
+            else:
+                img = self.name_text_image(label, p.get("label_color"),
+                                           p.get("label_bg"), cell, cell)
         opacity = int(p.get("opacity", 100))
         outline = None
         if img is not None and p.get("kind") == "entity":
@@ -671,6 +691,79 @@ class SceneRenderer:
         bx, by = x0 + box[0], y0 + box[1]
         sx, sy = max(0, -bx), max(0, -by)
         canvas.alpha_composite(body, (bx + sx, by + sy), (sx, sy))
+
+    def name_text_image(self, text: str, color: Any, bg: Any,
+                        pw: int, ph: int) -> "Image.Image":
+        """A pw x ph name sprite: `bg` filling it, the lines of `text` (one
+        per line break) centred in `color` at the largest size at which
+        every line fits. A line too wide even at the smallest size
+        (_NAME_TEXT_MIN of the short side) is cut with "...", and lines
+        that don't fit below each other are dropped, the last kept one
+        ending with "..."."""
+        ck = (text, str(color), str(bg), pw, ph)
+        got = _NAME_TEXT_CACHE.get(ck)
+        if got is not None:
+            return got
+        fg = self._rgb(color) or (255, 255, 255)
+        back = self._rgb(bg) or (0, 0, 0)
+        img = Image.new("RGBA", (pw, ph), tuple(back[:3]) + (255,))
+        lines = [ln for ln in text.split("\n") if ln] or [text]
+        src = self._font_source_for(text.replace("\n", ""))
+        pad = max(1, round(min(pw, ph) * 0.06))
+        aw, ah = max(1, pw - 2 * pad), max(1, ph - 2 * pad)
+        d = ImageDraw.Draw(img)
+
+        def width(t: str, font) -> int:
+            b = d.textbbox((0, 0), t, font=font)
+            return b[2] - b[0]
+
+        def line_h(font) -> int:
+            try:
+                a, de = font.getmetrics()
+                return max(1, a + de)
+            except Exception:
+                b = d.textbbox((0, 0), "Ag", font=font)
+                return max(1, b[3] - b[1])
+
+        def fits(size: int) -> bool:
+            font = _load_font(src, size)
+            return (line_h(font) * len(lines) <= ah
+                    and all(width(ln, font) <= aw for ln in lines))
+        lo = max(6, round(min(pw, ph) * _NAME_TEXT_MIN))
+        hi = max(lo, ah)
+        size = lo
+        if fits(lo):
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if fits(mid):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            size = lo
+        font = _load_font(src, size)
+        lh = line_h(font)
+        keep = max(1, min(len(lines), ah // lh))
+        shown = lines[:keep]
+        if keep < len(lines):
+            shown[-1] = shown[-1] + "..."
+        out = []
+        for ln in shown:
+            if width(ln, font) > aw:
+                cut = ln.rstrip(".")
+                while cut and width(cut + "...", font) > aw:
+                    cut = cut[:-1]
+                ln = (cut + "...") if cut else ln[:1]
+            out.append(ln)
+        top = (ph - lh * len(out)) // 2
+        for i, ln in enumerate(out):
+            b = d.textbbox((0, 0), ln, font=font)
+            x = (pw - (b[2] - b[0])) // 2 - b[0]
+            d.text((x, top + i * lh), ln, font=font,
+                   fill=tuple(fg[:3]) + (255,))
+        if len(_NAME_TEXT_CACHE) >= 512:
+            _NAME_TEXT_CACHE.clear()
+        _NAME_TEXT_CACHE[ck] = img
+        return img
 
     def _outline_px(self, width: Optional[int] = None) -> int:
         """team_outline_width (or `width`) at sprite_cell_size cells, scaled
