@@ -3653,8 +3653,8 @@ hardcodes**.
   placements `active` and adds the `active_unit_sprite_effects` records to
   them (default an outline in `team_light`, white without a team colour,
   ringed around the team outline; `{}` = images mark nothing), sprites and
-  glyphs alike; `!map scene list` names the acting placement (895, 1294).
-- **Sprite effects** (#624, user design, 1292-1296): records that change
+  glyphs alike; `!map scene list` names the acting placement (895, 1295).
+- **Sprite effects** (#624, user design, 1293-1297): records that change
   how a picture is drawn in images (`logic.SPRITE_EFFECT_FIELDS`: tint,
   blend (multiply / screen / overlay / add / subtract / difference /
   lighten / darken), hue, saturation, greyscale, brightness, contrast,
@@ -3702,7 +3702,7 @@ hardcodes**.
   `!system effect <system> team|active|corpse`; `!help effects`;
   `sprite_effects_of(eid)` (read, loopable; the acting mark left out).
   Prefabs and system imports check carried bundles.
-- **Name sprites** (user design, 1290-1291): `entity_sprite_fallback`
+- **Name sprites** (user design, 1290-1292): `entity_sprite_fallback`
   (glyph default / `name_text`; a unit's `sprite_fallback` var wins)
   draws a unit without a sprite of its own as its name in images: the
   order is its own sprite (a disguise's first), the name sprite,
@@ -3726,7 +3726,23 @@ hardcodes**.
   sprite: tint, outline, opacity, the legend swatch (`_LEGEND_LOOK`
   carries the label). A region part draws over its parent only with its
   own sprite or glyph, as before. `!map scene list` prints `name text
-  '<lines / joined>' (<colour> on <background>)`. Zones and tiles: idea
+  '<lines / joined>' (<colour> on <background>)`. Line shaping (user
+  design, 1292; images only, all off by default): `name_text_split_after`
+  / `name_text_split_min_length` cut a one-word line longer than the
+  minimum every n characters (`logic.name_text_split`; a line holding a
+  space stays whole), both times a stretched body's width while
+  `name_text_split_scales_with_width` (on); `Match._name_text_fit` applies
+  them per placement, so `!map scene list` shows the cut lines.
+  `name_text_per_line_size` marks the placement `label_fit: per_line`
+  ("a size per line" in the scene list): `_per_line_sizes` gives each line
+  the largest size its width allows, then one ceiling, the largest whose
+  capped sizes stack within the height, limits the lines that could grow
+  past it (the widest keep their size, the short ones share what is
+  left). A unit's `sprite_label_per_line_size`, `sprite_label_split_after`
+  (0 = never cut), `sprite_label_split_min_length` and
+  `sprite_label_split_scales_with_width` vars override each rule for it
+  (read with `sprite_label`: the disguise's to a view it fools, through
+  the reader; a value of the wrong kind is ignored). Zones and tiles: idea
   #626.
 - **Intended ASCII / graphics differences:** corpses and overlays are
   graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
