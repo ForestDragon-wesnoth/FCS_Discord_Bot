@@ -396,7 +396,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy, template_hidden, template_private_level, TEMPLATE_CREATOR_ONLY, template_route, ZONE_GRANT_KEY
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number, VAR_TRACE, record_trace, tag_filter_matches, team_text, note_stored_tags, normalize_direction, parse_move_words, DIRECTION_VECTORS, prefab_read, prefab_read_names, FORMULA_RULES, FORMULA_TEXT_HIDDEN, size_number_ok, SIZE_LIMIT, VAR_READER as _VAR_READER, reader_template, private_templates_hidden, private_template_names, PRIVATE_REF_TEXT, jcopy, template_hidden, template_private_level, TEMPLATE_CREATOR_ONLY, template_route, ZONE_GRANT_KEY
 
 
 class FormulaError(VTTError):
@@ -2986,6 +2986,31 @@ def _zip(a: Any, b: Any) -> list:
     return [[x, y] for x, y in zip(_list_arg(a, "zip"), _list_arg(b, "zip"))]
 
 
+def _parse_moves(text: Any, *, limit: int = _DEFAULT_SIZE_LIMIT) -> list:
+    """parse_moves(text): the steps a `!ent move` path names, one direction
+    per step: parse_moves('2 right, up') gives ['right', 'right', 'up'].
+    Words split on spaces and commas; a direction alone is one step, a
+    whole number before a direction that many (any alias `!ent move`
+    takes: `r`, `east`, `nw`, `up-left`; the result holds the full names).
+    A sprint reads `steps = parse_moves(args.path)` and walks them with
+    move_step; diagonals are judged by move_step. Builds at most
+    formula_size_limit steps."""
+    if not isinstance(text, str):
+        raise FormulaError(
+            f"parse_moves(text): text must be text such as '2 right, up', "
+            f"got {_echo(text)}.")
+    try:
+        moves = parse_move_words(text)
+    except VTTError as ex:
+        raise FormulaError(f"parse_moves(text): {ex}")
+    total = sum(n for _d, n in moves)
+    if total > limit:
+        raise FormulaError(
+            f"parse_moves(text): would build more than {limit} steps (the "
+            f"formula_size_limit).")
+    return [normalize_direction(d) for d, n in moves for _ in range(n)]
+
+
 def _cell_key(c: Any, fname: str) -> tuple:
     """A cell of a cell list as a hashable key: [x, y] or [x, y, map]."""
     if (isinstance(c, (list, tuple)) and len(c) in (2, 3)
@@ -3504,6 +3529,7 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "reverse": _reverse,
     "flatten": _flatten,
     "zip": _zip,
+    "parse_moves": _parse_moves,
     "cells_union": _cells_union,
     "cells_minus": _cells_minus,
     "cells_intersect": _cells_intersect,
@@ -4409,7 +4435,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "values",
     "unique",
     "take", "drop", "slice", "remove_at", "insert_at", "reverse", "flatten",
-    "zip",
+    "zip", "parse_moves",
     "cells_union", "cells_minus", "cells_intersect", "items", "roll_dice",
     "shuffle",
     "team_members",
@@ -6092,6 +6118,8 @@ class FormulaEngine:
             "range": lambda *a: _charge(_range(*a, limit=size_limit),
                                         "range"),
             "each": lambda v: _charge(_each(v, limit=size_limit), "each"),
+            "parse_moves": lambda v: _charge(
+                _parse_moves(v, limit=size_limit), "parse_moves"),
             # The list helpers build lists too (#205).
             **{n: (lambda f, n: lambda *a: _charge(f(*a), n))(_ALLOWED_FUNCS[n], n)
                for n in ("take", "drop", "slice", "remove_at", "insert_at",

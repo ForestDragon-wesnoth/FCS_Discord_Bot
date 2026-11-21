@@ -48954,3 +48954,145 @@ beast's grant follows its tile's new cell (`tile:main:6,5`). Stamping a
 prefab of the beast's corner into a new match keeps the new match's own
 marsh (from the system, still granting slowed), which grants it to the
 stamped beast on arrival.
+
+SCENARIO 1305 — An action's default_arg: a sprint typed as `!action ogre sprint 2 right up`, walked with parse_moves on a 2x2 body
+-----------------------------------------------------------------------------------------------------------------------------------
+
+!match new sp Sprint 10 10
+!match use sp
+!ent add ogre Ogre 40 2 2 5
+!ent add rock Rock 10 8 2 1
+!ent set_vars ogre footprint_w=2 footprint_h=2 speed=4
+!ent set_var ogre actions.sprint.default_arg path
+!ent set_var ogre actions.sprint.body "steps = parse_moves(args.path) if 'path' in args else []\nn = entity[self].speed\nif len(steps) == 0 or len(steps) > n:\n    fail(entity[self].name + ' can go up to ' + str(n) + ' tiles')\nfor d in each(steps):\n    if not move_step(self, d):\n        fail('blocked going ' + d)\nsay('{u} sprints ' + args.path + '.', u=self)"
+!action info ogre sprint
+?? Bare words:  fill `path=` (`!action ogre sprint <words ...>`)
+!action ogre sprint 2 right down
+?? Ogre sprints 2 right down.
+!assert "entity[ogre].x == 4 and entity[ogre].y == 3"
+!action ogre sprint left,up
+?? Ogre sprints left,up.
+!assert "entity[ogre].x == 3 and entity[ogre].y == 2"
+!action ogre sprint 4 right
+?? blocked going right
+!assert "entity[ogre].x == 3 and entity[ogre].y == 2"
+!action ogre sprint 3 down 2 left
+?? Ogre can go up to 4 tiles
+!assert "entity[ogre].x == 3 and entity[ogre].y == 2"
+!action ogre sprint path=down
+?? Ogre sprints down.
+!assert "entity[ogre].x == 3 and entity[ogre].y == 3"
+!action ogre sprint up path=down
+?? `path` is given twice: as `path=` and as the words `up`
+!action ogre sprint 2 jump
+?? parse_moves(text): 'jump' is not a direction.
+!assert "entity[ogre].x == 3 and entity[ogre].y == 3"
+!ent set_var ogre actions.rest.default_arg amount
+!ent set_var ogre actions.rest.body "entity[self].rested = args.amount"
+!action ogre rest 5
+!assert "entity[ogre].rested == 5"
+!action ogre rest a long nap
+!assert "entity[ogre].rested == 'a long nap'"
+!eval "use_action('ogre', 'sprint', None, {'path': 'up'})"
+!assert "entity[ogre].x == 3 and entity[ogre].y == 2"
+
+Expected: the ogre (2x2, speed 4) holds a sprint whose `default_arg` is
+`path`, so the words after the action name fill `args.path` and
+`parse_moves` turns them into steps: `2 right down` walks it to (4,3),
+`left,up` to (3,2). `4 right` meets the rock on its third step, the
+action fails ("blocked going right") and rolls back the steps it made;
+five steps refuse before any move (speed 4). `path=down` still works
+as a plain argument; `path` given both ways is refused, and a word that
+isn't a direction fails parse_moves. One bare word is converted like a
+`key=value` value (`rest 5` stores the number 5), several stay text. A
+formula's use_action passes its args dict as before.
+
+SCENARIO 1306 — parse_moves(): the `!ent move` grammar as a step list, its refusals, its budget, and `!ent move` reading the same grammar
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new pm Moves 8 8
+!match use pm
+!ent add hero Hero 20 1 1 5
+!eval "parse_moves('2 right, up')"
+?? ['right', 'right', 'up']
+!eval "parse_moves('r 3 s nw up-left')"
+?? ['right', 'down', 'down', 'down', 'up_left', 'up_left']
+!assert "parse_moves('') == []"
+!assert "len(parse_moves('3 left 2 up')) == 5"
+!ent set_var hero note "$(len(parse_moves('2 down 2 right')))"
+!assert "entity[hero].note == 4"
+!eval "parse_moves('0 right')"
+?? parse_moves(text): A step count must be at least 1, got 0.
+!eval "parse_moves('2')"
+?? parse_moves(text): Count must be followed by a direction.
+!eval "parse_moves('2 sideways')"
+?? parse_moves(text): 'sideways' is not a direction.
+!eval "parse_moves(5)"
+?? parse_moves(text): text must be text such as '2 right, up'
+!eval "parse_moves('99999999 right')"
+?? parse_moves(text): would build more than
+!ent move hero 2 sideways
+?? ❌ 'sideways' is not a direction.
+!ent move hero 0 right
+?? ❌ A step count must be at least 1, got 0.
+!ent move hero 2 right, down
+!assert "entity[hero].x == 3 and entity[hero].y == 2"
+!help function parse_moves
+?? parse_moves(text)
+
+Expected: parse_moves reads the `!ent move` grammar (spaces or commas, a
+count before a direction, every alias) and returns one full direction
+name per step. It is a pure function, so a `$()` argument may use it.
+A count below 1, a count with no direction, a word that isn't a
+direction and a non-text argument are refused with the wording `!ent
+move` uses (the two share one parser); a step count past
+formula_size_limit is refused before the list is built. `!help function
+parse_moves` documents it.
+
+SCENARIO 1307 — default_arg that can't be used: list targets, reserved and malformed keys; bare words after an entity or a direction target
+---------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+
+!match new da Defaults 8 8
+!match use da
+!ent add mage Mage 20 2 2 5
+!ent add orc Orc 20 4 2 3
+!ent add imp Imp 20 4 4 3
+!ent set_var mage actions.volley.target entity_list
+!ent set_var mage actions.volley.default_arg power
+!ent set_var mage actions.volley.body "pass"
+!action info mage volley
+?? `actions.volley.default_arg` can't take words after an `entity_list` target
+!ent set_var mage actions.peek.target location
+!ent set_var mage actions.peek.default_arg map
+!ent set_var mage actions.peek.body "pass"
+!action info mage peek
+?? `actions.peek.default_arg` can't be `map`
+!ent set_var mage actions.bad.default_arg "two words"
+!ent set_var mage actions.bad.body "pass"
+!action info mage bad
+?? `actions.bad.default_arg` is an arg key
+!action mage bad up
+?? action arg `up` must be in `key=value` form
+!ent set_var mage actions.zap.target entity
+!ent set_var mage actions.zap.default_arg mode
+!ent set_var mage actions.zap.body "entity[target].hit = args.mode"
+!action mage zap orc fire and ice
+!assert "entity[orc].hit == 'fire and ice'"
+!ent set_var mage actions.hop.target location
+!ent set_var mage actions.hop.direction_target true
+!ent set_var mage actions.hop.default_arg style
+!ent set_var mage actions.hop.body "move_entity(self, target)\nentity[self].style = args.style"
+!action mage hop down 2 quietly
+!assert "entity[mage].x == 2 and entity[mage].y == 4 and entity[mage].style == 'quietly'"
+!action mage hop 3 3 loud
+!assert "entity[mage].x == 3 and entity[mage].y == 3 and entity[mage].style == 'loud'"
+
+Expected: `!action info` names a default_arg that can't be used: after
+an entity_list target (which takes every bare word as a target), `map`
+on a location target (where `map=` names the target's map), and a key
+with a space. Such an action refuses
+bare words as before. After an entity target the words after the unit
+fill the key (`zap orc fire and ice`), and after a direction target the
+words after the direction and its count (`hop down 2 quietly`) or after
+the coordinates.

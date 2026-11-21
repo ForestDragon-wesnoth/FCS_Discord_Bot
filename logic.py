@@ -1542,6 +1542,39 @@ def normalize_direction(token: str) -> Optional[str]:
     return _DIRECTION_ALIASES.get(t)
 
 
+def parse_move_words(text: str) -> List[Tuple[str, int]]:
+    """The `!ent move` grammar as (direction word, count) pairs: words
+    split on spaces and commas, a direction alone is one step, a whole
+    number n >= 1 before a direction is n steps (`2 right, up`). Shared by
+    `!ent move` and the parse_moves() formula function. Raises VTTError
+    naming the word it can't read; diagonals aren't judged here (the walk
+    checks allow_diagonal_movement)."""
+    tokens = str(text).replace(",", " ").split()
+    moves: List[Tuple[str, int]] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if normalize_direction(t) is not None:
+            moves.append((t, 1))
+            i += 1
+            continue
+        try:
+            n = int(t)
+        except ValueError:
+            raise VTTError(f"Unexpected token '{t}'.")
+        if n < 1:
+            # The walk ran max(1, n) steps: `0 right` moved one.
+            raise VTTError(f"A step count must be at least 1, got {n}.")
+        if i + 1 >= len(tokens):
+            raise VTTError("Count must be followed by a direction.")
+        d = tokens[i + 1]
+        if normalize_direction(d) is None:
+            raise VTTError(f"'{d}' is not a direction.")
+        moves.append((d, n))
+        i += 2
+    return moves
+
+
 def rotate_direction(facing: str, *, clockwise: bool, eight_way: bool) -> str:
     """Return the next direction one rotation step from `facing`.
 

@@ -2153,7 +2153,7 @@ async def react_pick(ctx: Any, mgr: Any, m: Any, uid: str, requested: str,
                                      missing_corpse=missing_corpse,
                                      map_of=map_of,
                                      directions=act.direction_target)
-    args = parse_args_tokens(remaining)
+    args = parse_args_tokens(remaining, act.default_arg)
     target, dup = dedupe_targets(act.target_type, target, act.name)
     _kept, refused = reaction_target_check(m, ex, uid, act, via, target,
                                            args)
