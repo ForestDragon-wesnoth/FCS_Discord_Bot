@@ -23,24 +23,6 @@ _BG_FILL = (20, 20, 24, 255)  # canvas backdrop behind everything
 # OR the configured one (default `ground_default`) can't be loaded, so cells
 # stay visible as terrain rather than a black void. A real background wins.
 _GROUND_FALLBACK = "#5b4632"  # muted brown earth
-def _unit_style(style: Any) -> Dict[str, int]:
-    """A scene's unit_style (team outline / tint rules), with the rule
-    defaults for anything missing or malformed."""
-    out: Dict[str, Any] = {"outline_width": 3, "outline_opacity": 100,
-                           "tint_opacity": 0, "active_width": 3}
-    if isinstance(style, dict):
-        for k in list(out):
-            try:
-                out[k] = max(0, int(style.get(k, out[k])))
-            except (TypeError, ValueError):
-                pass
-    on = style.get("active_on", True) if isinstance(style, dict) else True
-    out["active_on"] = bool(on)
-    color = style.get("active_color") if isinstance(style, dict) else None
-    out["active_color"] = color if isinstance(color, str) else "white"
-    return out
-
-
 # Fonts tried, in order, for a glyph outside ASCII (Pillow looks a bare file
 # name up in the system font folders). A host can also drop a font into a
 # `fonts/` folder of the sprites folder; those are tried first. Colour emoji
@@ -127,6 +109,8 @@ _GLYPH_DRAW_MAX = 2048
 # too long at this size is cut with "...".
 _NAME_TEXT_MIN = 0.10
 # Name sprites made, by (text, colours, size); shared by every renderer.
+# Effects drawn around a finished body (#624), the rest change the picture.
+_EDGE_EFFECTS = ("outline", "glow")
 _NAME_TEXT_CACHE: Dict[Tuple[Any, ...], "Image.Image"] = {}
 
 
@@ -214,7 +198,6 @@ class SceneRenderer:
         self.cell = max(1, int(cell_size))
         self._glyph_fonts: Dict[str, Optional[str]] = {}
         self._tint_fill = 40  # set from the scene by render()
-        self._unit = _unit_style(None)
         self._base = self.cell
 
     def font(self, box: Optional[int] = None, glyph: str = ""):
@@ -327,7 +310,6 @@ class SceneRenderer:
             self._tint_fill = max(0, min(100, int(scene.get("tint_fill_opacity", 40))))
         except (TypeError, ValueError):
             self._tint_fill = 40
-        self._unit = _unit_style(scene.get("unit_style"))
         try:
             self._base = max(1, int(scene.get("sprite_cell_size", cell)))
         except (TypeError, ValueError):
@@ -415,7 +397,7 @@ class SceneRenderer:
             sw.alpha_composite(Image.new("RGBA", (S, S), (r, g, b, a)))
             return sw
         mini = SceneRenderer(self.loader, S)
-        mini._tint_fill, mini._unit, mini._base = self._tint_fill, self._unit, self._base
+        mini._tint_fill, mini._base = self._tint_fill, self._base
         if kind == "fog":
             mini._draw_fog(sw, entry, 0, 0)
             return sw
@@ -603,27 +585,23 @@ class SceneRenderer:
                 img = self.name_text_image(label, p.get("label_color"),
                                            p.get("label_bg"), cell, cell)
         opacity = int(p.get("opacity", 100))
-        outline = None
-        if img is not None and p.get("kind") == "entity":
-            outline = self._rgb(p.get("tint"))
-        wpx = self._outline_px()
-        if outline is None or self._unit["outline_width"] <= 0:
-            outline = None
-        # The acting unit (active_unit_image_highlight): its team colour
-        # brightened halfway to white, else the active colour (white), as
-        # an outline around its sprite or glyph.
-        u = self._unit
-        if p.get("active") and p.get("kind") == "entity" and u["active_on"]:
-            team = self._rgb(p.get("tint"))
-            if team is not None:
-                outline = tuple((c + 255) // 2 for c in team[:3])
-            else:
-                outline = self._rgb(u["active_color"]) or (255, 255, 255)
-            wpx = self._outline_px(u["active_width"])
-            ring_op = 100
+        glyph = p.get("glyph")
+        has_glyph = isinstance(glyph, str) and bool(glyph)
+        # Sprite effects (#624): `effects` in the order they apply; a glyph
+        # drawn in its place skips the records meant for pictures only (the
+        # team look: a glyph is drawn in the unit's colour already), and a
+        # corpse's glyph takes `glyph_effects`.
+        if img is not None:
+            fx = list(p.get("effects") or [])
         else:
-            ring_op = None
-        margin = wpx + 2 if outline is not None else 0
+            fx = [r for r in (p.get("glyph_effects", p.get("effects")) or [])
+                  if isinstance(r, dict) and not r.get("picture_only")]
+        fx = [r for r in fx if isinstance(r, dict)]
+        team = self._rgb(p.get("tint"))
+        edges = [r for r in fx if r.get("effect") in _EDGE_EFFECTS]
+        body_fx = [r for r in fx if r.get("effect") not in _EDGE_EFFECTS]
+        ring_px = [self._edge_px(r) for r in edges]
+        margin = (sum(ring_px) + 2) if edges else 0
         # The body's pixels, and the box of them that is drawn: the window
         # plus `margin` on each side (the outline reads its neighbours).
         W, H = w * cell, h * cell
@@ -633,6 +611,15 @@ class SceneRenderer:
                min(H, rows * cell - y0 + margin))
         if box[2] <= box[0] or box[3] <= box[1]:
             return
+        if img is None and has_glyph and body_fx and mode == "stretch":
+            # A stretch body's glyph with effects: drawn whole (capped at
+            # _GLYPH_DRAW_MAX) and then handled as a picture, so a turn or a
+            # flip acts on the whole body.
+            k = min(1.0, _GLYPH_DRAW_MAX / max(W, H))
+            bw, bh = max(1, round(W * k)), max(1, round(H * k))
+            img = self._fill_glyph(glyph, bw, bh, p.get("glyph_tint", p.get(
+                "tint")), int(p.get("glyph_opacity", opacity)))
+            opacity = 100
         piece = None        # one cell's look, tiled over the box
         body = None         # the box's look, built directly
         if img is not None:
@@ -640,12 +627,9 @@ class SceneRenderer:
                 img = ImageOps.mirror(img)
             if p.get("flip_v"):
                 img = ImageOps.flip(img)
-            if p.get("kind") == "entity":
-                # A unit's colour: a blended tint (team_tint_opacity) and
-                # an outline around the sprite, added once the body is built.
-                img = self._tint(img, p.get("tint"), self._unit["tint_opacity"])
-            else:
+            if p.get("kind") != "entity":
                 img = self._tint(img, p.get("tint"))
+            img = self._apply_effects(img, body_fx, team)
             img = self._scale_alpha(img, opacity)
             if mode == "stretch":
                 iw, ih = img.size
@@ -656,8 +640,7 @@ class SceneRenderer:
             else:
                 piece = img.resize((cell, cell))
         else:
-            glyph = p.get("glyph")
-            if not (isinstance(glyph, str) and glyph):
+            if not has_glyph:
                 # A coloured zone / tile with no sprite or glyph: a
                 # translucent square of its colour (ASCII tints the `.`).
                 # Only those: a corpse's or overlay's tint recolours its
@@ -670,6 +653,7 @@ class SceneRenderer:
                     return
                 a = max(0, min(255, int(fill / 100.0 * 255)))
                 piece = Image.new("RGBA", (cell, cell), tuple(rgb[:3]) + (a,))
+                piece = self._apply_effects(piece, body_fx, team)
                 mode = "tile"
             else:
                 gtint = p.get("glyph_tint", p.get("tint"))
@@ -677,7 +661,9 @@ class SceneRenderer:
                 if mode == "stretch":
                     body = self._fill_glyph(glyph, W, H, gtint, gop, box)
                 else:
-                    piece = self._glyph_layer(glyph, cell, gtint, gop)
+                    piece = self._apply_effects(
+                        self._glyph_layer(glyph, cell, gtint, gop),
+                        body_fx, team)
         if body is None:
             body = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]),
                              (0, 0, 0, 0))
@@ -686,11 +672,210 @@ class SceneRenderer:
                     px, py = dx * cell - box[0], dy * cell - box[1]
                     body.alpha_composite(piece, (max(0, px), max(0, py)),
                                          (max(0, -px), max(0, -py)))
-        if outline is not None:
-            body = self._outline(body, outline, wpx, ring_op)
+        if edges:
+            body = self._edge_rings(body, edges, ring_px, team)
         bx, by = x0 + box[0], y0 + box[1]
         sx, sy = max(0, -bx), max(0, -by)
         canvas.alpha_composite(body, (bx + sx, by + sy), (sx, sy))
+
+    # -- sprite effects (#624) -------------------------------------------
+    def _effect_rgb(self, rec: Dict[str, Any], team: Optional[Tuple[int, ...]]
+                    ) -> Optional[Tuple[int, int, int]]:
+        """A record's colour: an [r, g, b] list, a name or #rrggbb, `team`
+        (the placement's colour) or `team_light` (that colour halfway to
+        white); its `fallback` when that has nothing, else None (the
+        record is skipped)."""
+        for key in ("color", "fallback"):
+            v = rec.get(key)
+            rgb: Optional[Tuple[int, ...]] = None
+            if isinstance(v, (list, tuple)) and len(v) == 3:
+                try:
+                    rgb = tuple(max(0, min(255, int(c))) for c in v)
+                except (TypeError, ValueError):
+                    rgb = None
+            elif v == "team":
+                rgb = team
+            elif v == "team_light":
+                rgb = (tuple((c + 255) // 2 for c in team[:3])
+                       if team is not None else None)
+            elif isinstance(v, str):
+                rgb = self._rgb(v)
+            if rgb is not None:
+                return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        return None
+
+    @staticmethod
+    def _num(rec: Dict[str, Any], key: str, default: float) -> float:
+        v = rec.get(key, default)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return default
+        return v if v == v else default
+
+    def _apply_effects(self, img: "Image.Image", fx: List[Dict[str, Any]],
+                       team: Optional[Tuple[int, ...]]) -> "Image.Image":
+        """`img` with each effect that changes the picture itself applied
+        in order (the edge effects come later, around the built body).
+        Alpha is kept, but for `opacity`, `rotate`, `scale` and `flip`."""
+        if not fx:
+            return img
+        from PIL import ImageChops, ImageEnhance
+        img = img.convert("RGBA")
+        for rec in fx:
+            eff = rec.get("effect")
+            alpha = img.getchannel("A")
+            rgb = img.convert("RGB")
+            strength = max(0.0, min(100.0, self._num(rec, "strength", 100)))
+            new = None
+            if eff in ("tint", "blend"):
+                col = self._effect_rgb(rec, team)
+                if col is None:
+                    continue
+                layer = Image.new("RGB", img.size, col)
+                mode = rec.get("mode", "multiply") if eff == "blend" \
+                    else "multiply"
+                op = {"multiply": ImageChops.multiply,
+                      "screen": ImageChops.screen,
+                      "overlay": ImageChops.overlay,
+                      "add": ImageChops.add,
+                      "subtract": ImageChops.subtract,
+                      "difference": ImageChops.difference,
+                      "lighten": ImageChops.lighter,
+                      "darken": ImageChops.darker}.get(mode)
+                if op is None:
+                    continue
+                new = op(rgb, layer)
+            elif eff == "hue":
+                hsv = rgb.convert("HSV")
+                h, s_, v = hsv.split()
+                shift = int(round(self._num(rec, "degrees", 0) / 360.0 * 256))
+                h = h.point(lambda x: (x + shift) % 256)
+                new = Image.merge("HSV", (h, s_, v)).convert("RGB")
+            elif eff == "saturation":
+                new = ImageEnhance.Color(rgb).enhance(
+                    self._num(rec, "amount", 100) / 100.0)
+            elif eff == "greyscale":
+                new = ImageOps.grayscale(rgb).convert("RGB")
+            elif eff == "brightness":
+                new = ImageEnhance.Brightness(rgb).enhance(
+                    self._num(rec, "amount", 100) / 100.0)
+            elif eff == "contrast":
+                new = ImageEnhance.Contrast(rgb).enhance(
+                    self._num(rec, "amount", 100) / 100.0)
+            elif eff == "invert":
+                new = ImageOps.invert(rgb)
+            elif eff == "opacity":
+                img = self._scale_alpha(img, int(self._num(rec, "amount", 100)))
+                continue
+            elif eff == "flip":
+                axis = rec.get("axis", "h")
+                if axis in ("h", "both"):
+                    img = ImageOps.mirror(img)
+                if axis in ("v", "both"):
+                    img = ImageOps.flip(img)
+                continue
+            elif eff == "rotate":
+                deg = self._num(rec, "degrees", 0)
+                if deg % 360:
+                    img = img.rotate(-deg, resample=Image.BICUBIC,
+                                     expand=False)
+                continue
+            elif eff == "scale":
+                k = self._num(rec, "percent", 100) / 100.0
+                if k > 0 and k != 1:
+                    nw = max(1, round(img.width * k))
+                    nh = max(1, round(img.height * k))
+                    small = img.resize((nw, nh), Image.LANCZOS)
+                    out = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                    out.alpha_composite(
+                        small.crop((max(0, (nw - img.width) // 2),
+                                    max(0, (nh - img.height) // 2),
+                                    max(0, (nw - img.width) // 2)
+                                    + min(nw, img.width),
+                                    max(0, (nh - img.height) // 2)
+                                    + min(nh, img.height))),
+                        (max(0, (img.width - nw) // 2),
+                         max(0, (img.height - nh) // 2)))
+                    img = out
+                continue
+            if new is None:
+                continue
+            if strength < 100:
+                new = Image.blend(rgb, new, strength / 100.0)
+            img = new.convert("RGBA")
+            img.putalpha(alpha)
+        return img
+
+    def _edge_px(self, rec: Dict[str, Any]) -> int:
+        """An outline's or glow's width at sprite_cell_size cells, scaled to
+        this cell size, in pixels."""
+        w = self._num(rec, "width", 3 if rec.get("effect") == "outline" else 8)
+        return max(1, round(w * self.cell / max(1, self._base)))
+
+    def _edge_rings(self, body, edges, widths, team):
+        """`body` with its outline / glow rings, each outside the ones
+        before it: out from the drawn shape where the body has transparent
+        room, and in from the body's border where the shape reaches it (so
+        the last ring is outermost there too). A glow is its ring
+        blurred."""
+        from PIL import ImageFilter, ImageChops
+        alpha = body.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
+        total = sum(widths)
+        pad = Image.new("L", (body.width + 2 * total, body.height + 2 * total),
+                        0)
+        pad.paste(alpha, (total, total))
+
+        def grown(d: int):
+            if d <= 0:
+                return pad
+            return pad.filter(ImageFilter.MaxFilter(2 * d + 1))
+
+        def band(inset: int, wpx: int):
+            # The shape's pixels from `inset` to inset + wpx in from the
+            # body's own border.
+            fr = Image.new("L", body.size, 0)
+            d = ImageDraw.Draw(fr)
+            o, i = inset, inset + wpx
+            if body.width > 2 * o and body.height > 2 * o:
+                d.rectangle([o, o, body.width - 1 - o, body.height - 1 - o],
+                            fill=255)
+                if body.width > 2 * i and body.height > 2 * i:
+                    d.rectangle([i, i, body.width - 1 - i,
+                                 body.height - 1 - i], fill=0)
+            return ImageChops.multiply(alpha, fr)
+
+        out = body.copy()
+        before = 0
+        for n, (rec, wpx) in enumerate(zip(edges, widths)):
+            rgb = self._effect_rgb(rec, team)
+            after = sum(widths[n + 1:])
+            if rgb is None:
+                before += wpx
+                continue
+            outer = ImageChops.subtract(grown(before + wpx), grown(before))
+            outer = outer.crop((total, total, total + body.width,
+                                total + body.height))
+            op = max(0.0, min(100.0, self._num(rec, "opacity", 100))) / 100.0
+            inner = band(after, wpx)
+            if rec.get("effect") == "glow":
+                # A soft halo: the outer ring blurred and drawn under the
+                # picture, the band inside the border blurred over it.
+                blur = ImageFilter.GaussianBlur(max(1, wpx / 2))
+                halo = Image.new("RGBA", body.size, rgb + (0,))
+                halo.putalpha(outer.filter(blur).point(
+                    lambda v, k=op: int(v * k)))
+                halo.alpha_composite(out)
+                out = halo
+                ring = inner.filter(blur)
+            else:
+                ring = ImageChops.lighter(outer, inner)
+            ring = ring.point(lambda v, k=op: int(v * k))
+            layer = Image.new("RGBA", body.size, rgb + (0,))
+            layer.putalpha(ring)
+            out.alpha_composite(layer)
+            before += wpx
+        return out
 
     def name_text_image(self, text: str, color: Any, bg: Any,
                         pw: int, ph: int) -> "Image.Image":
@@ -764,43 +949,6 @@ class SceneRenderer:
             _NAME_TEXT_CACHE.clear()
         _NAME_TEXT_CACHE[ck] = img
         return img
-
-    def _outline_px(self, width: Optional[int] = None) -> int:
-        """team_outline_width (or `width`) at sprite_cell_size cells, scaled
-        to this cell size, in pixels."""
-        w = self._unit["outline_width"] if width is None else width
-        return max(1, round(w * self.cell / max(1, self._base)))
-
-    def _outline(self, body, rgb, wpx: Optional[int] = None,
-                 opacity: Optional[int] = None):
-        """`body` with an outline in `rgb` around its drawn shape:
-        team_outline_width pixels at sprite_cell_size cells, scaled to this
-        cell size. Drawn outside the shape where the body has transparent
-        room, and just inside the body's edge where the shape reaches it."""
-        from PIL import ImageFilter, ImageChops
-        u = self._unit
-        wpx = wpx or self._outline_px()
-        alpha = body.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
-        pad = Image.new("L", (body.width + 2 * wpx, body.height + 2 * wpx), 0)
-        pad.paste(alpha, (wpx, wpx))
-        grown = pad.filter(ImageFilter.MaxFilter(2 * wpx + 1))
-        outer = ImageChops.subtract(grown, pad).crop(
-            (wpx, wpx, wpx + body.width, wpx + body.height))
-        # The shape's pixels within wpx of the body's own border.
-        frame = Image.new("L", body.size, 255)
-        if body.width > 2 * wpx and body.height > 2 * wpx:
-            ImageDraw.Draw(frame).rectangle(
-                [wpx, wpx, body.width - 1 - wpx, body.height - 1 - wpx], fill=0)
-        inner = ImageChops.multiply(alpha, frame)
-        ring = ImageChops.lighter(outer, inner)
-        op = u["outline_opacity"] if opacity is None else opacity
-        a = max(0, min(255, int(op / 100.0 * 255)))
-        ring = ring.point(lambda v: a if v else 0)
-        layer = Image.new("RGBA", body.size, tuple(rgb[:3]) + (0,))
-        layer.putalpha(ring)
-        out = body.copy()
-        out.alpha_composite(layer)
-        return out
 
     def _fill_glyph(self, glyph, bw, bh, tint, opacity, box=None):
         """The glyph fallback of a stretch-mode body: on a bw x bh body, the

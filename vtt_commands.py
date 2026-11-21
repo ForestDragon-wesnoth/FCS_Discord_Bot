@@ -16,6 +16,9 @@ from logic import (
 )
 
 # Passive system
+from logic import (SPRITE_EFFECTS_KEY, OVERLAY_EFFECTS_KEY, SPRITE_EFFECT_FIELDS,
+                   check_sprite_effect, check_sprite_effects, sprite_effect_items,
+                   sprite_effect_text, EFFECT_PROBLEMS)
 from logic import STATUS_DURATION_MODES, STATUS_TICK_WHENS, STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
 from logic import (check_library_folder, folder_label, folder_ancestors, LIBRARY_FOLDER_DEPTH,
                    folder_within)
@@ -529,6 +532,8 @@ def _systems_capability(name: str, sub: str, args: List[str]) -> bool:
             return False
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
+        if sub == "effect":         # !system effect <sys> <look> <action>
+            return len(args) < 4 or args[3].lower() != "list"
         if sub == "defvar" and len(args) >= 2 \
                 and args[1].lower() in ("map", "match"):
             return len(args) < 3 or args[2].lower() != "list"
@@ -2726,6 +2731,177 @@ def _seq_reach(toks: List[str], words: List[str], i: int, depth: int) -> int:
     return _seq_reach(rest, words, i + 1, depth)
 
 
+# ---- sprite effects (#624): one grammar for every holder ---------------
+EFFECT_ACTIONS_USAGE = ("add <name> <effect> [<field>=<value> ...] | "
+                        "remove <name> | list | clear")
+
+
+def effect_usage(prefix: str, inherits: bool = False) -> str:
+    """The usage forms of an `effect` subcommand after `prefix` (`!ent
+    effect <id>`), one full form per action, as the stray-word check reads
+    them."""
+    acts = ["add <name> <effect> [<field>=<value> ...]", "remove <name>"]
+    if inherits:
+        acts.append("hide <name>")
+    return " | ".join(f"{prefix} {a}" for a in acts + ["list", "clear"])
+_EFFECT_ACTIONS = ("add", "set", "remove", "del", "delete", "rm", "hide",
+                   "list", "clear")
+_EFFECT_TEXT_FIELDS = ("effect", "group", "condition", "mode", "axis")
+_RGB_TEXT_RE = re.compile(r"\[?\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]?\Z")
+
+
+def _effect_field_value(key: str, raw: str) -> Any:
+    """A typed `<field>=<value>`: a colour as a name, #rrggbb or r,g,b
+    (an [r, g, b] list), the text fields as text, the rest numbers."""
+    if key in ("color", "fallback"):
+        mt = _RGB_TEXT_RE.match(raw.strip())
+        if mt:
+            return [int(g) for g in mt.groups()]
+        return raw
+    if key in _EFFECT_TEXT_FIELDS:
+        return raw
+    try:
+        v = float(raw)
+    except ValueError:
+        return raw          # the check names the field and what it takes
+    return int(v) if v.is_integer() else v
+
+
+def _effects_as_named(bundle: Any) -> Dict[str, Any]:
+    """An effects bundle as a dict of named records (a list's records are
+    named by their place, 1 first; a lone record is `1`)."""
+    if isinstance(bundle, list):
+        return {str(i + 1): r for i, r in enumerate(bundle)}
+    if isinstance(bundle, dict):
+        if isinstance(bundle.get("effect"), str):
+            return {"1": bundle}
+        return dict(bundle)
+    return {}
+
+
+def effects_list_text(bundle: Any, what: str) -> str:
+    """`what`'s effects bundle, one line per record."""
+    items = sprite_effect_items(bundle) if bundle is not None else []
+    if not items:
+        return f"{what} has no sprite effects."
+    lines = [f"Sprite effects of {what}:"]
+    for k, r in items:
+        name = f"`{k}`" if k else "(one record)"
+        if r is None:
+            lines.append(f"• {name}: hidden (an inherited one is taken away)")
+            continue
+        try:
+            shown = sprite_effect_text(check_sprite_effect(r), source=False)
+        except VTTError as ex:
+            shown = f"⚠️ unusable: {ex}"
+        cond = r.get("condition") if isinstance(r, dict) else None
+        if isinstance(cond, str) and cond:
+            shown = shown.replace("(conditional)",
+                                  f"when {formula_text(cond)}")
+        lines.append(f"• {name}: {shown}")
+    return "\n".join(lines)
+
+
+_UNCHANGED = object()
+
+
+def edit_effects(words: List[str], bundle: Any, what: str, usage: str,
+                 inherits: bool = False) -> Tuple[Any, str]:
+    """One `effect` subcommand on a holder's bundle: `words` = [action,
+    ...]. Returns (the new bundle, None when it becomes empty, or
+    _UNCHANGED for `list`) and the reply. `inherits` (a tile over its
+    template, a zone over its definition) allows `hide <id>`."""
+    if not words:
+        raise VTTError(f"Usage: `{usage}`.")
+    act = words[0].lower()
+    if act not in _EFFECT_ACTIONS or (act == "hide" and not inherits):
+        raise VTTError(f"`{words[0]}` isn't an effect action — usage: "
+                       f"`{usage}`.")
+    if act == "list":
+        if len(words) > 1:
+            raise VTTError(f"Unexpected `{words[1]}` — usage: `{usage}`.")
+        return _UNCHANGED, effects_list_text(bundle, what)
+    if act == "clear":
+        if len(words) > 1:
+            raise VTTError(f"Unexpected `{words[1]}` — usage: `{usage}`.")
+        return None, f"Cleared the sprite effects of {what}."
+    if len(words) < 2:
+        raise VTTError(f"`{act}` needs an effect id — usage: `{usage}`.")
+    rid = words[1]
+    if not rid or rid.startswith("__") or "." in rid:
+        raise VTTError(f"`{rid}` can't name an effect: a word without dots "
+                       f"that doesn't start with `__`.")
+    named = _effects_as_named(bundle)
+    if act in ("remove", "del", "delete", "rm", "hide"):
+        if len(words) > 2:
+            raise VTTError(f"Unexpected `{words[2]}` — usage: `{usage}`.")
+        if act == "hide":
+            named[rid] = None
+            return named, (f"{what}: the inherited effect `{rid}` is taken "
+                           f"away (`remove {rid}` gives it back).")
+        if rid not in named:
+            raise NotFound(f"{what} has no effect `{rid}`.")
+        del named[rid]
+        return (named or None), f"Removed the effect `{rid}` from {what}."
+    if len(words) < 3:
+        raise VTTError(f"`add` needs an effect type — usage: `{usage}`. "
+                       f"The effects: {', '.join(SPRITE_EFFECT_FIELDS)} "
+                       f"(`!help effects`).")
+    rec: Dict[str, Any] = {"effect": words[2]}
+    for w in words[3:]:
+        if "=" not in w:
+            raise VTTError(f"Unexpected `{w}` — an effect's fields are "
+                           f"`<field>=<value>` (usage: `{usage}`).")
+        k, v = w.split("=", 1)
+        rec[k.strip()] = _effect_field_value(k.strip(), v)
+    checked = check_sprite_effect(rec)
+    stored = {k: checked[k] for k in rec if k in checked}
+    stored["effect"] = checked["effect"]
+    if "priority" in rec:
+        stored["priority"] = checked["priority"]
+    had = rid in named and named[rid] is not None
+    named[rid] = stored
+    return named, (f"{'Replaced' if had else 'Added'} the effect `{rid}` "
+                   f"on {what}: {sprite_effect_text(checked, source=False)}.")
+
+
+_SYSTEM_EFFECT_RULES = {"team": "team_sprite_effects",
+                        "active": "active_unit_sprite_effects",
+                        "corpse": "corpse_sprite_effects"}
+
+
+async def _system_effect(ctx: Any, args: List[str], mgr: Any):
+    """`!system effect <system> <team|active|corpse> <action> ...` (#624):
+    the effect grammar on one of the three look rules, written back as the
+    rule's JSON (`!system set` of it), so the system's matches refresh."""
+    if await return_help_if_not_enough_args(ctx, args, 4, "system", "effect"):
+        return
+    name, look = args[1], args[2].lower()
+    key = _SYSTEM_EFFECT_RULES.get(look)
+    if key is None:
+        raise VTTError(f"`{args[2]}` isn't a look: team, active or corpse.")
+    s = mgr.get_system(name)
+    raw = mgr.system_value(s, key)
+    try:
+        cur = json.loads(raw) if isinstance(raw, str) and raw.strip() else None
+    except ValueError:
+        cur = None
+    new, reply = edit_effects(
+        args[3:], cur, f"`{name}`.{key}",
+        effect_usage(f"!system effect <system> {look}"))
+    if new is _UNCHANGED:
+        return await ctx.send(reply)
+    value = _coerce_rule_value(key, json.dumps(new if new is not None
+                                               else {}, ensure_ascii=False))
+    s.set(key, value)
+    notes: List[str] = []
+    refreshed = mgr.refresh_match_rules(name, notes)
+    suffix = (f" (refreshed {refreshed} live match"
+              f"{'es' if refreshed != 1 else ''})" if refreshed else "")
+    return await ctx.send("\n".join([reply + suffix]
+                                     + [f"⚠️ {n}" for n in notes]))
+
+
 def _usage_tails(usage: str, root: str) -> List[str]:
     """The forms of a usage string with the leading `!root` removed:
     `!map cell <x> <y> | !map pan <dir> [n]` gives two."""
@@ -4374,6 +4550,10 @@ def _priority_text(p) -> str:
     xt = getattr(p, "extra_turns", None)
     if xt is not None:
         out += f" extra_turns {'on' if xt else 'off'}"
+    fx = getattr(p, "sprite_effects", None)
+    if fx is not None:
+        names = [k or "1" for k, _r in sprite_effect_items(fx)]
+        out += f" sprite effects {', '.join(names) or 'none'}"
     return out
 
 
@@ -11942,6 +12122,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_steps(ctx, args, mgr, sub)
     if sub in ("defpassive", "defvar", "clamp"):
         return await _system_defaults(ctx, args, mgr, sub)
+    if sub == "effect":
+        return await _system_effect(ctx, args, mgr)
     if sub == "export":
         return await _system_export(ctx, args, mgr)
     if sub == "import":
@@ -13893,6 +14075,18 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "system", "effect",
+    usage=" | ".join(effect_usage(f"!system effect <system> {look}")
+                     for look in ("team", "active", "corpse")),
+    desc=("#624: edit one of the engine's sprite-effect looks with the "
+          "`!ent effect` grammar: `team` (team_sprite_effects: every unit "
+          "drawn as a picture; an outline in its colour by default), "
+          "`active` (active_unit_sprite_effects: the acting unit, with "
+          "active_unit_highlight on) or `corpse` (corpse_sprite_effects: a "
+          "corpse drawn with its living sprite). The rule's JSON is "
+          "rewritten and the system's matches refresh. `!help effects`."),
+)
+registry.annotate_sub(
     "system", "labels",
     usage=_SYSTEM_LABELS_USAGE,
     desc=(
@@ -14744,6 +14938,30 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                    else "nothing (it was empty)")
                 + "; the container stays, empty.")
         return await ctx.send("\n".join([head] + log))
+
+    if sub == "effect":
+        # #624: the unit's own sprite effects (the var sprite_effects_var
+        # names), drawn in images.
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent",
+                                                "effect"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{args[1]}' not found.")
+        e = m.entities[eid]
+        key = str(m.rules.get("sprite_effects_var", SPRITE_EFFECTS_KEY)) \
+            or SPRITE_EFFECTS_KEY
+        new, reply = edit_effects(
+            args[2:], e.vars.get(key), f"`{eid}`",
+            effect_usage("!ent effect <id>"))
+        log: List[str] = []
+        if new is not _UNCHANGED:
+            if new is None:
+                if key in e.vars:
+                    log = e.remove_var(key)
+            else:
+                log = e.write_var(key, new)
+        return await ctx.send("\n".join([reply] + log))
 
     if sub in ("var_move", "var_copy"):
         if await return_help_if_not_enough_args(ctx, args, 5, "ent", sub):
@@ -15880,6 +16098,19 @@ registry.annotate_sub(
         "on (W18, hit_location): the side it strikes and each part's "
         "hit_weights decide; `aim=` raises a part's odds, `mode=` weighted "
         "or uniform. Changes nothing but the dice."
+    ),
+)
+registry.annotate_sub(
+    "ent", "effect",
+    usage=effect_usage("!ent effect <id>"),
+    desc=(
+        "A unit's own sprite effects (#624, `!help effects`), drawn in "
+        "images: `add glow glow color=gold width=6` (a colour is a name, "
+        "#rrggbb or r,g,b; `condition=\"<expression>\"` draws it only "
+        "while true, self = the unit), `remove`, `list`, `clear`. They "
+        "live in the var the sprite_effects_var rule names, so a passive "
+        "or an action can write them too. Its statuses, equipped items, "
+        "team data and passives add theirs."
     ),
 )
 registry.annotate_sub(
@@ -18492,11 +18723,16 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for a in sub:
             if a.lower().startswith("hide="):
                 scene_hidden |= {x.strip() for x in a[5:].lower().split(",") if x.strip()}
-        scene = m.render_scene(
-            pov_team=pov,
-            hidden_layers=(m.hidden_layers_of(mp) | scene_hidden)
-            if scene_hidden else None,
-            legend=_legend_flag(m, sub), mp=mp)
+        fx_problems: List[str] = []
+        fx_tok = EFFECT_PROBLEMS.set(fx_problems)
+        try:
+            scene = m.render_scene(
+                pov_team=pov,
+                hidden_layers=(m.hidden_layers_of(mp) | scene_hidden)
+                if scene_hidden else None,
+                legend=_legend_flag(m, sub), mp=mp)
+        finally:
+            EFFECT_PROBLEMS.reset(fx_tok)
         if scene.get("blank"):
             # A map the view hasn't seen: a blank board in both renderers.
             return await ctx.send(f"Scene: blank board — {scene['blank']}")
@@ -18522,9 +18758,11 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             + f"background={bg['sprite'] if bg else 'none'}, "
             f"borders={'on' if scene['borders']['show'] else 'off'}, "
             f"coords={'on' if scene.get('coords') else 'off'}, "
-            f"unit outline {scene['unit_style']['outline_width']}px at "
-            f"{scene['unit_style']['outline_opacity']}%, "
-            f"unit tint {scene['unit_style']['tint_opacity']}%"
+            + "team look: " + (", ".join(
+                sprite_effect_text(r, source=False)
+                for r in m.settle_effects(m._read_effects(
+                    m._rule_effect_items("team_sprite_effects"), None,
+                    {"pov_team": pov}))) or "none")
             + (f", legend: {len(scene['legend'])} entr"
                f"{'y' if len(scene['legend']) == 1 else 'ies'}"
                if "legend" in scene else "") + "."]
@@ -18547,11 +18785,25 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                              + p["label"].replace("\n", " / ")
                              + f"' ({p.get('label_color')} on "
                                f"{p.get('label_bg')})")
-                us = scene["unit_style"]
-                act = (", acting" if p.get("active") and us.get("active_on")
-                       else "")
+                act = ", acting" if p.get("active") else ""
+                # The team look (team_sprite_effects) is named once, in the
+                # header, not on every unit.
+                fx = [r for r in (p.get("effects") or [])
+                      if not str(r.get("source", "")).startswith(
+                          "rule team_sprite_effects")]
+                if p.get("glyph_effects") and not fx:
+                    fx = p["glyph_effects"]
+                    what += " (its glyph:"
+                    tail = ")"
+                else:
+                    tail = ""
+                if fx:
+                    what += ("; effects: " if not tail else " ") + ", ".join(
+                        sprite_effect_text(r) for r in fx) + tail
                 lines.append(f"• {p['kind']} `{p['ref']}` at ({p['x']},{p['y']})"
                              f"{size} — {what} (layer {p['layer']}{act})")
+            for pr in dict.fromkeys(fx_problems):
+                lines.append(f"⚠️ effect left out: {pr}")
             for e in scene.get("legend") or []:
                 look = ", ".join(f"{label} {e[key]}" for label, key in
                                  (("sprite", "sprite"), ("glyph", "glyph"),
@@ -22613,6 +22865,25 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Passive `{eid}.{p.id}` now has priority "
                               f"{p.priority} (higher runs first).")
 
+    if sub == "effect":
+        # #624: sprite effects drawn on the unit while the passive is on it.
+        if await return_help_if_not_enough_args(ctx, args, 4, "passive",
+                                                "effect"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        p = m.entities[eid].passives.get(args[2])
+        if p is None:
+            raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
+        new, reply = edit_effects(
+            args[3:], p.sprite_effects, f"passive `{eid}.{p.id}`",
+            effect_usage("!passive effect <entity_id> <passive_id>"))
+        if new is not _UNCHANGED:
+            p.sprite_effects = new
+            m.entities[eid].mark_changed()
+        return await ctx.send(reply)
+
     if sub == "extra_turns":
         if await return_help_if_not_enough_args(ctx, args, 4, "passive", "extra_turns"):
             return
@@ -22723,6 +22994,16 @@ registry.annotate_sub(
           + (" Reaches entities created from now on." if "passive" == "defpassive" else "")),
 )
 registry.annotate_sub(
+    "passive", "effect",
+    usage=effect_usage("!passive effect <entity_id> <passive_id>"),
+    desc=("#624: sprite effects (`!help effects`) drawn in images on "
+          "every unit the passive is on while it is there"
+          + {"gpassive": " (a global passive: every unit)",
+              "defpassive": " (copied with it onto every unit)"}.get("passive", "")
+          + ". Same grammar as `!ent effect`; a condition reads with self "
+            "= the unit."),
+)
+registry.annotate_sub(
     "passive", "priority",
     usage="!passive priority <entity_id> <passive_id> <n>",
     desc=("Set a passive's priority. Within one hook firing, passives run "
@@ -22818,6 +23099,21 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Global passive `{p.id}` now has priority "
                               f"{p.priority} (higher runs first).")
 
+    if sub == "effect":
+        # #624: sprite effects drawn on every unit while it exists.
+        if await return_help_if_not_enough_args(ctx, args, 3, "gpassive",
+                                                "effect"):
+            return
+        p = m.global_passives.get(args[1])
+        if p is None:
+            raise NotFound(f"Global passive '{args[1]}' not found.")
+        new, reply = edit_effects(
+            args[2:], p.sprite_effects, f"global passive `{p.id}`",
+            effect_usage("!gpassive effect <passive_id>"))
+        if new is not _UNCHANGED:
+            p.sprite_effects = new
+        return await ctx.send(reply)
+
     if sub == "extra_turns":
         if await return_help_if_not_enough_args(ctx, args, 3, "gpassive", "extra_turns"):
             return
@@ -22892,6 +23188,16 @@ registry.annotate_sub(
     usage="!gpassive extra_turns <passive_id> <on|off|default>",
     desc=("Whether this passive fires on an extra turn's on_turn_start / on_turn_end (#224): on, off, or default (the extra_turn_passives rule decides)."
           + (" Reaches entities created from now on." if "gpassive" == "defpassive" else "")),
+)
+registry.annotate_sub(
+    "gpassive", "effect",
+    usage=effect_usage("!gpassive effect <passive_id>"),
+    desc=("#624: sprite effects (`!help effects`) drawn in images on "
+          "every unit the passive is on while it is there"
+          + {"gpassive": " (a global passive: every unit)",
+              "defpassive": " (copied with it onto every unit)"}.get("gpassive", "")
+          + ". Same grammar as `!ent effect`; a condition reads with self "
+            "= the unit."),
 )
 registry.annotate_sub(
     "gpassive", "priority",
@@ -23308,6 +23614,37 @@ async def _defpassive_on(ctx: ReplyContext, mgr: MatchManager,
             f"match{'es' if refreshed != 1 else ''}]." + _reach()
         )
 
+    if sub == "effect":
+        # #624: sprite effects of a default passive (on every unit it is
+        # copied onto).
+        if await return_help_if_not_enough_args(ctx, args, 3, "defpassive",
+                                                "effect"):
+            return
+        pid = args[1]
+        existing = _read_specs()
+        idx = next((i for i, sp in enumerate(existing)
+                    if isinstance(sp, dict) and sp.get("id") == pid), None)
+        if idx is None:
+            raise NotFound(
+                f"No default passive '{pid}' in system '{sys_name}'.")
+        spec = dict(existing[idx])
+        new, reply = edit_effects(
+            args[2:], spec.get("sprite_effects"),
+            f"default passive `{pid}` of system `{sys_name}`",
+            effect_usage("!defpassive effect <passive_id>"))
+        if new is _UNCHANGED:
+            return await ctx.send(reply)
+        if new is None:
+            spec.pop("sprite_effects", None)
+        else:
+            spec["sprite_effects"] = new
+        new_list = list(existing)
+        new_list[idx] = spec
+        refreshed = _write_specs(new_list)
+        return await ctx.send(
+            f"{reply.rstrip('.')} [refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]." + _reach())
+
     if sub == "priority":
         if await return_help_if_not_enough_args(ctx, args, 3, "defpassive", "priority"):
             return
@@ -23418,6 +23755,16 @@ registry.annotate_sub(
     usage="!defpassive extra_turns <id> <on|off|default>",
     desc=("Whether this passive fires on an extra turn's on_turn_start / on_turn_end (#224): on, off, or default (the extra_turn_passives rule decides)."
           + " Reaches the copies already on units that still equal the default (default_passives_existing_units), and units created from now on."),
+)
+registry.annotate_sub(
+    "defpassive", "effect",
+    usage=effect_usage("!defpassive effect <passive_id>"),
+    desc=("#624: sprite effects (`!help effects`) drawn in images on "
+          "every unit the passive is on while it is there"
+          + {"gpassive": " (a global passive: every unit)",
+              "defpassive": " (copied with it onto every unit)"}.get("defpassive", "")
+          + ". Same grammar as `!ent effect`; a condition reads with self "
+            "= the unit."),
 )
 registry.annotate_sub(
     "defpassive", "priority",
@@ -24082,6 +24429,33 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"{what.capitalize()} {n} tile(s)"
                               f"{_on_map(m, mp)}.")
 
+    # ---- effect <x> <y> ... ----  (#624: the tile's own sprite effects)
+    if sub == "effect":
+        if await return_help_if_not_enough_args(ctx, args, 4, "tile",
+                                                "effect"):
+            return
+        x, y = _parse_xy(args)
+        if not mp.in_bounds(x, y):
+            raise OutOfBounds(f"({x},{y}) {mp.off_text(x, y)}")
+        cur = (mp.tiles.get((x, y)) or {}).get(SPRITE_EFFECTS_KEY)
+        new, reply = edit_effects(args[3:], cur,
+                                  f"tile ({x},{y}){_on_map(m, mp)}",
+                                  effect_usage("!tile effect <x> <y>", True),
+                                  inherits=True)
+        tsrc = m._tile_look_sources(x, y, mp)
+        if new is _UNCHANGED and len(tsrc) > 1 \
+                and tsrc[1].get(SPRITE_EFFECTS_KEY) is not None:
+            reply += "\n" + effects_list_text(
+                tsrc[1][SPRITE_EFFECTS_KEY],
+                f"its template `{tsrc[0].get('_template')}` (merged by name)")
+        if new is not _UNCHANGED:
+            if new is None:
+                if cur is not None:
+                    mp.tile_del_path(x, y, SPRITE_EFFECTS_KEY)
+            else:
+                mp.tile_set_path(x, y, SPRITE_EFFECTS_KEY, new)
+        return await ctx.send(reply)
+
     # ---- tags <x> <y> <tag ...|-> ----  (the tile's own tags)
     if sub == "tags":
         if await return_help_if_not_enough_args(ctx, args, 4, "tile", "tags"):
@@ -24341,6 +24715,27 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             _template_data_set(name, m.tile_templates[name].data, path, value)
             return await ctx.send(f"template `{name}`.{path} = {value!r}"
                                   + _cell_formula_warning(m, path, value))
+
+        if dsub == "effect":
+            # !tile def effect <name> ...  (#624): sprite effects every tile
+            # of the template draws (a tile's own records of the same name
+            # replace them).
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile",
+                                                    "def"):
+                return
+            name = args[2]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            data = m.tile_templates[name].data
+            new, reply = edit_effects(args[3:], data.get(SPRITE_EFFECTS_KEY),
+                                      f"tile template `{name}`",
+                                      effect_usage("!tile def effect <name>"))
+            if new is not _UNCHANGED:
+                if new is None:
+                    data.pop(SPRITE_EFFECTS_KEY, None)
+                else:
+                    data[SPRITE_EFFECTS_KEY] = new
+            return await ctx.send(reply)
 
         if dsub == "face":
             # !tile def face <name> <dir|->  (#257): the template's facing
@@ -24884,6 +25279,16 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 registry.annotate_sub(
+    "tile", "effect",
+    usage=effect_usage("!tile effect <x> <y>", True) + " [map=<map>]",
+    desc=("#624: the tile's own sprite effects in images (`!help "
+          "effects`), merged with its template's by name: a record of the "
+          "same name replaces the template's, `hide <name>` takes one of "
+          "the template's away on this tile. `!tile def effect <template> "
+          "...` gives every tile of a template its effects. A condition "
+          "reads with tile_x / tile_y bound."),
+)
+registry.annotate_sub(
     "tile", "tags",
     usage="!tile tags <x> <y> <tag ...> [map=<map>]",
     desc=("Set a tile's own tags (its `tags` data; `-` clears them). A "
@@ -24975,6 +25380,7 @@ registry.annotate_sub(
         "!tile def copy <name> <new_name> | "
         "!tile def rename <name> <new_name> | "
         "!tile def tags <name> <tag ...> | "
+        + effect_usage("!tile def effect <name>") + " | "
         "!tile def face <name> <dir|-> | "
         "!tile def reapply <name> [reset] [map=<map>]"
     ),
@@ -25580,6 +25986,35 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             [f"Moved zone `{name}` by ({dx},{dy})."] + list(log)))
 
     # ---- glyph <name> <char|-> ----  (map rendering)
+    if sub == "effect":
+        # #624: the zone's own sprite effects, merged over its definition's.
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone",
+                                                "effect"):
+            return
+        name = args[1]
+        z = m.find_zone(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        new, reply = edit_effects(args[2:], z.get(SPRITE_EFFECTS_KEY),
+                                  f"zone `{name}`",
+                                  effect_usage("!zone effect <name>", True),
+                                  inherits=True)
+        zdef = m.zone_def_dict(z)
+        if new is _UNCHANGED and zdef is not None \
+                and zdef.get(SPRITE_EFFECTS_KEY) is not None:
+            reply += "\n" + effects_list_text(
+                zdef[SPRITE_EFFECTS_KEY],
+                f"its definition `{z.get('def')}` (merged by name)")
+        if new is not _UNCHANGED:
+            if new is None:
+                z.pop(SPRITE_EFFECTS_KEY, None)
+            else:
+                z[SPRITE_EFFECTS_KEY] = new
+            mp_z = m.zone_map(name)
+            if mp_z is not None:
+                mp_z.zone_changed(name)
+        return await ctx.send(reply)
+
     if sub == "glyph":
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "glyph"):
             return
@@ -25990,6 +26425,7 @@ def _draw_layer_arg(raw: str) -> int:
 # words `!zone def` needs (action included).
 _ZONE_DEF_SUBS = {"new": 2, "data": 4, "del-data": 3, "hook": 4,
                   "del-hook": 3, "glyph": 3, "color": 3, "sprite": 3,
+                  "effect": 3,
                   "face": 3, "reapply": 2, "layer": 3,
                   "legend": 3, "tags": 2, "rename": 3, "copy": 3,
                   **_GRANT_SUBS}
@@ -26103,6 +26539,19 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         return (f"zone definition `{name}` draws at layer "
                 f"{d['sprite_layer']} (zones of it without their own read "
                 f"it).")
+    if sub == "effect":
+        # #624: sprite effects every zone of the definition draws (a
+        # zone's own records of the same name replace them).
+        new, reply = edit_effects(
+            args[2:], d.get(SPRITE_EFFECTS_KEY),
+            f"zone definition `{name}`",
+            effect_usage(prefix.format(sub="effect") + " <name>"))
+        if new is not _UNCHANGED:
+            if new is None:
+                d.pop(SPRITE_EFFECTS_KEY, None)
+            else:
+                d[SPRITE_EFFECTS_KEY] = new
+        return reply
     if sub in ("glyph", "sprite"):
         _check_tail(args, 4, (), prefix.format(sub=sub)
                     + f" <name> <{'char' if sub == 'glyph' else 'key'}|-> "
@@ -26347,6 +26796,23 @@ registry.annotate_sub(
           "status gained first). `-` clears."),
 )
 registry.annotate_sub(
+    "status", "effect",
+    usage=effect_usage("!status effect <name>"),
+    desc=("#624: sprite effects the status draws on its bearer in images "
+          "while the view sees it (`!help effects`): `!status effect "
+          "frozen add ice tint color=cyan strength=60`, `remove`, `list`, "
+          "`clear`. A level entry adds or replaces records by name "
+          "(`!status level frozen 3+ sprite_effects add ...`); an instance's "
+          "own `sprite_effects` key replaces the definition's."),
+)
+registry.annotate_sub(
+    "status", "overlay_effect",
+    usage=effect_usage("!status overlay_effect <name>"),
+    desc=("#624: sprite effects on the status's overlay sprite (`!status "
+          "sprite`), with the same grammar as `!status effect`: a flame "
+          "overlay flipped, a shield overlay at half opacity."),
+)
+registry.annotate_sub(
     "status", "duration_mode",
     usage="!status duration_mode <name> <manual|auto|->",
     desc=("#233: who counts the status's duration down. `manual`: the "
@@ -26491,6 +26957,7 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     "on_transform": 3, "if_source_lost": 3,
                     "duration_mode": 3, "duration_when": 3,
                     "glyph": 3, "color": 3, "display_priority": 3,
+                    "effect": 3, "overlay_effect": 3,
                     "removed_on_damage": 3,
                     "break_at_damage": 3, "damage_filter": 2,
                     "tick_priority": 3}
@@ -26511,6 +26978,8 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "duration_when": "duration_when",
                      "glyph": "glyph", "color": "color",
                      "display_priority": "display_priority",
+                     SPRITE_EFFECTS_KEY: "effect",
+                     OVERLAY_EFFECTS_KEY: "overlay_effect",
                      "removed_on_damage": "removed_on_damage",
                      "break_at_damage": "break_at_damage",
                      "damage_filter": "damage_filter",
@@ -26927,6 +27396,26 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         return (
             f"Set overlay sprite `{val}` for status `{name}` (drawn over "
             f"afflicted entities on the graphics surface).{extra}")
+
+    if sub in ("effect", "overlay_effect"):
+        # #624: the sprite effects a status draws on its bearer (effect)
+        # or on its overlay sprite (overlay_effect).
+        name = args[1]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        sdef = m.status_definitions[name]
+        key = SPRITE_EFFECTS_KEY if sub == "effect" else OVERLAY_EFFECTS_KEY
+        what = (f"status `{name}`" if sub == "effect"
+                else f"status `{name}`'s overlay")
+        new, reply = edit_effects(
+            args[2:], sdef.get(key), what,
+            effect_usage(prefix.format(sub=sub) + " <name>"))
+        if new is not _UNCHANGED:
+            if new is None:
+                sdef.pop(key, None)
+            else:
+                sdef[key] = new
+        return reply
 
     if sub in ("removed_on_damage", "break_at_damage", "damage_filter"):
         # #235: statuses that break on damage (damage.py _break_statuses).
@@ -28192,7 +28681,8 @@ _ZONE_DEF_USAGE = (
     "!zone def rename <name> <new_name> | !zone def copy <name> <new_name> | "
     "!zone def del <name> [confirm] | !zone def drop <name> [confirm] | "
     "!zone def delete <name> [confirm] | !zone def remove <name> [confirm] | "
-    "!zone def rm <name> [confirm] | !zone def list | !zone def info <name>")
+    "!zone def rm <name> [confirm] | !zone def list | !zone def info <name>"
+    " | " + effect_usage("!zone def effect <name>"))
 registry.annotate_sub(
     "zone", "def",
     usage=_ZONE_DEF_USAGE,
@@ -28223,9 +28713,19 @@ registry.annotate_sub(
         "`grant_condition` / `grant_bodies` give every zone of it status "
         "grants (`!help zone grant`), read live: a zone's own grant of a "
         "status replaces the definition's, its own condition and bodies "
-        "setting win."
+        "setting win. `effect` gives every zone of it sprite effects "
+        "(#624, `!help effects`), merged with a zone's own by name."
         + _TILES_OR_ZONES_POINTER
     ),
+)
+registry.annotate_sub(
+    "zone", "effect",
+    usage=effect_usage("!zone effect <name>", True),
+    desc=("#624: the zone's own sprite effects in images (`!help "
+          "effects`), merged with its definition's by name: a record of "
+          "the same name replaces the definition's, `hide <name>` takes "
+          "one of the definition's away on this zone. A condition reads "
+          "with zone_name bound (self = an aura's anchor)."),
 )
 registry.annotate_sub(
     "zone", "drop",
@@ -30700,7 +31200,7 @@ for _subs, _usage in (
         (('get',), '!team get <team> <path>'),
         (('list',), '!team list [team]'),
         (('clear',), '!team clear <team> [path]'),
-        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n> | extra_turns <team> <pid> <on|off|default>>')):
+        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n> | extra_turns <team> <pid> <on|off|default> | effect <team> <pid> <add <name> <effect> [<field>=<value> ...] | remove <name> | list | clear>>')):
     registry.annotate_sub('team', *_subs, usage=_usage)
 
 
@@ -30841,6 +31341,20 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             p.priority = checked_priority(args[4], "priority")
             return await ctx.send(f"Team passive `{team}.{pid}` now has "
                                   f"priority {p.priority} (higher runs first).")
+        if psub == "effect":
+            # #624: sprite effects on every unit of the team.
+            if await return_help_if_not_enough_args(ctx, args, 5, "team", "passive"):
+                return
+            team, pid = args[2], args[3]
+            p = m.team_passives.get(team, {}).get(pid)
+            if p is None:
+                return await ctx.send(f"❌ team `{team}` has no passive `{pid}`.")
+            new, reply = edit_effects(
+                args[4:], p.sprite_effects, f"team passive `{team}.{pid}`",
+                effect_usage("!team passive effect <team> <passive_id>"))
+            if new is not _UNCHANGED:
+                p.sprite_effects = new
+            return await ctx.send(reply)
         if psub == "extra_turns":
             if await return_help_if_not_enough_args(ctx, args, 5, "team", "passive"):
                 return
@@ -33523,7 +34037,7 @@ def _help_functions(kind: Optional[str]) -> str:
     return "\n".join(out)
 
 
-@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help tag [<tag>] | !help size [<unit>|<number>] | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help tag [tag]` shows a tag's description from the tag vocabulary of this channel's game system (`!system tags`), or lists the declared tags. `!help size` shows this match's size categories with their ranges, `!help size <unit>` a unit's own and total size and what makes up the total, `!help size <number>` the category of a number. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
+@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help tag [<tag>] | !help size [<unit>|<number>] | !help effects | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help tag [tag]` shows a tag's description from the tag vocabulary of this channel's game system (`!system tags`), or lists the declared tags. `!help size` shows this match's size categories with their ranges, `!help size <unit>` a unit's own and total size and what makes up the total, `!help size <number>` the category of a number. `!help effects` lists the sprite effects (#624) and their fields. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "find":
         return await ctx.send(_help_find(ctx, mgr, args[1:]))
@@ -33545,12 +34059,48 @@ async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         _check_tail(args, 2, (), "!help size [<unit>|<number>]")
         return await ctx.send(_help_size(ctx, mgr, args[1] if len(args) > 1
                                          else None))
+    if args and args[0].lower() in ("effects", "effect"):
+        _check_tail(args, 1, (), "!help effects")
+        return await ctx.send(_help_effects())
     if args and args[0].lower() == "tag":
         _check_tail(args, 2, (), "!help tag [<tag>]")
         return await ctx.send(_help_tag(ctx, mgr, args[1] if len(args) > 1
                                         else None))
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
+
+
+def _help_effects() -> str:
+    """`!help effects` (#624): every sprite effect and its fields."""
+    out = ["**Sprite effects** (images only): records that change how a "
+           "picture is drawn, `{effect: <type>, <fields>, priority, group, "
+           "condition}`. Colours: a name, #rrggbb, r,g,b (an [r, g, b] list) "
+           "or `team` / `team_light` (the unit's colour; `fallback=` when it "
+           "has none). They apply highest `priority` first; of the records "
+           "sharing a `group` only the first applies; a `condition` "
+           "(expression, self = the unit) draws it only while true. "
+           "`outline` and `glow` ring the finished picture, each ring "
+           "outside the ones before it."]
+    for eff, fields in SPRITE_EFFECT_FIELDS.items():
+        parts = []
+        for k, spec in fields.items():
+            if spec[0] == "num":
+                req = "" if spec[3] is not None else " (needed)"
+                dflt = f", default {spec[3]}" if spec[3] is not None else ""
+                parts.append(f"{k} {spec[1]}..{spec[2]}{dflt}{req}")
+            elif spec[0] == "color":
+                parts.append(f"{k} (colour{', needed' if spec[1] else ''})")
+            else:
+                parts.append(f"{k} {'/'.join(spec[1])}, default {spec[2]}")
+        out.append(f"• `{eff}`: " + "; ".join(parts))
+    out.append("Holders: `!ent effect`, `!status effect` / `overlay_effect`, "
+               "`!passive` / `!gpassive` / `!team passive` / `!defpassive "
+               "effect`, `!zone effect`, `!zone def effect`, `!tile effect`, "
+               "`!tile def effect`, `!system effect <system> team|active|"
+               "corpse`; containers under the sprite_effect_sources roots "
+               "and team data hold a `sprite_effects` key. `!map scene list` "
+               "shows what each placement gets.")
+    return "\n".join(out)
 
 
 def _size_scale_lines(scale, decimals: bool) -> List[str]:

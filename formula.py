@@ -3776,6 +3776,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "has_action", "entity_actions", "use_action",
     "action_tags_of", "action_forbidden_by", "immune_to_action",
     "unit_tags", "unit_has_tag", "units_with_tag", "corpse_tags",
+    # sprite_effects_of(eid) -> the sprite effects (#624) drawn on the unit
+    "sprite_effects_of",
     "container_tags", "container_has_tag", "containers_with_tag",
     "team_tags", "team_has_tag", "map_tags", "map_has_tag", "maps_with_tag",
     # Summon / despawn family. A template is an entity-shaped dict in
@@ -4108,6 +4110,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    "sprite_effects_of",
     "reactions_used",
     "teams", "group_names", "entities_in_cells", "own_turns", "fits_at",
     "free_cells_near", "corpse_cell", "corpses_within",
@@ -4444,7 +4447,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entity_actions",
     # An action's tags, and the statuses forbidding / blocking one.
     "action_tags_of", "action_forbidden_by", "immune_to_action",
-    "unit_tags", "units_with_tag", "corpse_tags",
+    "unit_tags", "units_with_tag", "corpse_tags", "sprite_effects_of",
     "container_tags", "containers_with_tag", "team_tags", "map_tags",
     "maps_with_tag",
     # Corpse introspection — returns a list of corpse ids, loopable.
@@ -9130,6 +9133,16 @@ class FormulaEngine:
             _id, e = _resolve_entity(eid_t, "unit_tags")
             return match.unit_tags(e)
 
+        def _sprite_effects_of(eid_t: Any) -> list:
+            """sprite_effects_of(eid): the sprite effects (#624) drawn on
+            the unit in images, in the order they apply: each a record
+            {effect, its fields, priority, source, ...}, from its statuses,
+            effects var, equipped containers, team data, passives and the
+            team_sprite_effects rule (the acting unit's mark left out).
+            Conditions are read now. Loopable."""
+            _id, e = _resolve_entity(eid_t, "sprite_effects_of")
+            return [dict(r) for r in match.entity_sprite_effects(e)]
+
         def _unit_has_tag(eid_t: Any, filt: Any) -> bool:
             """unit_has_tag(eid, filter): whether the unit's tags match the
             tag filter (a tag, a list = any of them, or an expression such
@@ -9262,6 +9275,7 @@ class FormulaEngine:
         ns["map_has_tag"] = _map_has_tag
         ns["maps_with_tag"] = _maps_with_tag
         ns["unit_tags"] = _unit_tags
+        ns["sprite_effects_of"] = _sprite_effects_of
         ns["unit_has_tag"] = _unit_has_tag
         ns["units_with_tag"] = _units_with_tag
         ns["corpse_tags"] = _corpse_tags

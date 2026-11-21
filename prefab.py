@@ -525,6 +525,10 @@ def check_prefab(raw: Any, name: str) -> Dict[str, Any]:
                 logic.check_zone_def_name(ename)
                 _check_grant_condition(
                     entry, f"Prefab `{name}`: zone definition `{ename}`")
+                logic.check_sprite_effects(
+                    entry.get(logic.SPRITE_EFFECTS_KEY),
+                    f"Prefab `{name}`: zone definition `{ename}`: "
+                    f"`{logic.SPRITE_EFFECTS_KEY}`")
                 entries[ename] = logic.normalize_zone_def(entry)
     return d
 
@@ -607,6 +611,8 @@ def _check_tile_template(entry: Dict[str, Any], name: str,
     unknown = sorted(k for k in hooks if k not in logic.TILE_HOOK_NAMES)
     if unknown:
         raise VTTError(f"{who}: unknown hook(s) {', '.join(unknown)}.")
+    logic.check_sprite_effects(data.get(logic.SPRITE_EFFECTS_KEY),
+                               f"{who}: `{logic.SPRITE_EFFECTS_KEY}`")
     try:
         data = logic._own_value(data)
         if logic.FACING_FIELD in data:
@@ -691,6 +697,8 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
     if dp is not None and (isinstance(dp, bool)
                            or not isinstance(dp, (int, float))):
         raise VTTError(f"{who}: `display_priority` must be a number.")
+    for k in (logic.SPRITE_EFFECTS_KEY, logic.OVERLAY_EFFECTS_KEY):
+        logic.check_sprite_effects(entry.get(k), f"{who}: `{k}`")
     for k, choices in (("resist_affects", logic.RESIST_AFFECTS),
                        ("resist_rounding", logic.RESIST_ROUNDINGS),
                        ("on_transform", logic.TRANSFORM_STATUS_FLAGS),
