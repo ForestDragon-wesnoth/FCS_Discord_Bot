@@ -21651,7 +21651,7 @@ SCENARIO 750 — History, macro and usage replies say what happened
 ?? `repeat` count `-1` is -1; it can't be negative.
 !assert "entity[a].hp == 19"
 !map mode pdf
-?? ❌ Usage: `!map mode text|image`.
+?? ❌ Usage: `!map mode text|image|default`.
 
 Expected: HARNESS-ALLOWS-ERRORS. `!history save` under a name already used
 says it replaced the old save (it said "Saved" either way). `!history
