@@ -4635,6 +4635,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # holds where it came from (`unit`, `equipped.ring`, `status:poison`,
     # `team:red`); None elsewhere. Bound in its condition and effect.
     "watcher_name", "watcher_source",
+    # Held passives (#411, #208): where a passive a status or an item holds
+    # lives (`status:<name>` or the container's path, `equipped.ring`) and
+    # the status it belongs to (None for an item's).
+    "passive_source", "passive_status",
     # Extra turns (#224): True while the turn under way is an extra turn
     # (`!turn grant`, grant_turn), in every formula (its on_turn_*
     # passives, status ticks, tile / zone turn hooks, action bodies); False
@@ -7602,7 +7606,8 @@ class FormulaEngine:
 
         def _status_held_by(eid_t: Any, name: Any) -> List[str]:
             """status_held_by(eid, name): what holds status `name` on `eid`:
-            the zones granting it (by name) and the items or class granting
+            the zones granting it (by name), the tiles granting it
+            (`tile:<map>:<x>,<y>`, #290) and the items or class granting
             it (`item:<path>`, W21); [] for a status the unit got otherwise
             or lacks. A cleanse skips the held ones with
             `if not status_held_by(u, s)`."""

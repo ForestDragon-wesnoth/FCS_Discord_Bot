@@ -48584,3 +48584,373 @@ show only to views its visibility condition lets see it (the curse shows
 to red alone). Effects held under a var private to the reader don't draw:
 with sprite_effects team-private, red's board leaves out the blue guard's
 mark while blue's own board shows it.
+
+
+SCENARIO 1298 — Passives a status holds: !status passive, level entries, the bindings, !passive list / remove (#411)
+-----------------------------------------------------------------------------------------------------------------
+
+!match new sp Thorns 8 6
+!match use sp
+!ent add hero Hero 30 2 2 5 team=blue
+!ent add orc Orc 30 3 2 4 team=red
+!status def thorns
+!status passive thorns add spike on_damage_taken "deal_damage(attacker, status_level(self, passive_status)); say(f'{passive_source} bites back')"
+?? Added passive `spike` (on_damage_taken) on status `thorns`.
+!status level thorns 3+ passives add burn on_turn_start "entity[self].hp -= 1"
+?? At level `3+`: Added passive `burn` (on_turn_start) on status `thorns`.
+!status passive thorns list
+?? - `spike` (on_damage_taken)
+!eval "status_apply('hero', 'thorns', 2, 3)"
+!ent damage hero 4 from=orc
+?? status:thorns bites back
+?? ⚙️ passive `spike` of `hero` (status:thorns) fired on `hero` (on_damage_taken)
+!assert "entity[orc].hp == 28"
+!passive list hero
+?? — held by `status:thorns`
+?! burn
+!passive info hero spike
+?? **Passive `hero.spike`** (held by `status:thorns`)
+!passive remove hero spike
+?? ❌ Passive `spike` of `hero` is held by `status:thorns`: it goes when the unit loses that status, or edit it there (`!status passive thorns remove spike`).
+!status passive thorns add bad on_turn_start "x = nosuchfn(1)"
+?? ❌ Invalid passive formula
+!status passive thorns add bad2 on_nothing "1"
+?? ❌ Unknown passive hook 'on_nothing'
+!eval "status_set('hero', 'thorns', 'level', 3)"
+!passive list hero
+?? - `burn` (on_turn_start): `entity[self].hp -= 1` — held by `status:thorns`
+!turn set hero
+?? ⚙️ passive `burn` of `hero` (status:thorns) fired on `hero` (on_turn_start)
+!assert "entity[hero].hp == 25"
+!status dispel hero thorns
+!ent damage hero 4 from=orc
+?! bites back
+!assert "entity[orc].hp == 28"
+!status passive thorns remove spike
+?? Removed passive `spike` from status `thorns`.
+!status passive thorns list
+?? No passives on status `thorns`.
+
+Expected: a status's `passives` fire as its bearer's own while it holds
+the status. Thorns' `spike` answers the orc's 4 damage with damage equal
+to the status's level (2), reading `passive_status` (the status) and
+printing `passive_source` (`status:thorns`); its fired line names where
+the passive lives. `!passive list` lists it under the status, `!passive
+info` says who holds it, and `!passive remove` refuses, pointing at
+`!status passive`. A broken formula and an unknown hook are refused when
+added. The `3+` level entry's `burn` joins once the status reaches level
+3 and fires at the hero's turn start (25 hp). Dispelled, the status takes
+its passives along: the next hit gets no answer. Removing the definition's
+passive empties the list.
+
+
+SCENARIO 1299 — Passives an item holds: passive_sources, passive_source, priority, write checks, a broken entry (#208)
+--------------------------------------------------------------------------------------------------------------
+
+!match new ip Rings 8 6
+!match use ip
+!ent add hero Hero 30 2 2 5
+!ent hp hero 20
+!ent set_var hero equipped.ring.charges 2
+!ent set_var hero equipped.ring.passives.regen.when on_turn_start
+!ent set_var hero equipped.ring.passives.regen.formula "entity[self].hp += 2; var_add(self, passive_source + '.charges', -1)"
+!ent set_var hero equipped.ring.passives.regen.priority 5
+!passive add hero own on_turn_start "say(f'own after {entity[self].hp}')"
+!turn set hero
+?? ⚙️ passive `regen` of `hero` (equipped.ring) fired on `hero` (on_turn_start)
+?? own after 22
+!assert "entity[hero].hp == 22 and entity[hero].equipped.ring.charges == 1"
+!ent set_var hero equipped.ring.passives.bad.when on_turn_nope
+?? ❌ Writing 'equipped.ring.passives.bad.when' on `hero`: passive `bad`: Unknown passive hook 'on_turn_nope'
+!ent set_var hero equipped.ring.passives.bad.formula "x = nosuchfn(1)"
+?? passive `bad`: its formula doesn't parse
+!ent set_var hero equipped.ring.passives.bad.scope sideways
+?? passive `bad`: unknown scope `sideways`
+!ent get hero equipped.ring.passives
+?! bad
+!ent var_move hero equipped.ring hero inventory.ring
+!turn set hero
+?! passive `regen`
+!assert "entity[hero].hp == 22"
+!passive list hero
+?! regen
+!eval "entity[hero].__passive_sources_add = ['inventory']"
+!passive list hero
+?? - `regen` (on_turn_start pri 5): `entity[self].hp += 2; var_add(self, passive_source + '.charges', -1)` — held by `inventory.ring`
+!turn set hero
+?? own after 24
+!assert "entity[hero].hp == 24 and entity[hero].inventory.ring.charges == 0"
+!ent set_var hero inventory.junk.passives.loose "not a record"
+!passive list hero
+?? - `loose` (inventory.junk) ⚠️ can't run: isn't a dict {when, formula, ...}
+
+Expected: a ring under `equipped` (the passive_sources rule's default
+root) holding `passives.regen` fires it as the hero's own: +2 hp at turn
+start, and `passive_source` names the ring's path, so the passive spends
+the ring's own charge. Its priority 5 runs it before the unit's own
+passive (which reads 22). A raw write that would store a passive that
+can't run is refused: an unknown hook, a formula calling an unknown
+function, a scope no passive takes; nothing is stored. Moved into
+`inventory`, the ring holds nothing: no regen, and `!passive list` leaves
+it out. `__passive_sources_add` adds `inventory` for this unit, and the
+ring fires from there (24 hp, its last charge spent). A `passives` entry
+that isn't a record is listed as one that can't run.
+
+
+SCENARIO 1300 — Held passives on a body: a part's item, a hidden status in listings, a passive that kills its holder (#411, #208)
+----------------------------------------------------------------------------------------------------------------------
+
+!match new hb Bodies 8 6
+!match use hb
+!ent add ogre Ogre 40 2 2 5 team=red footprint_w=2 footprint_h=2
+!part add ogre oarm arm 20 20
+!ent add hero Hero 30 6 2 4 team=blue
+!ent set_var oarm equipped.bracer.passives.ward.when on_damage_taken
+!ent set_var oarm equipped.bracer.passives.ward.formula "say(f'{self} wards ({passive_source})')"
+!ent damage oarm 2
+?? oarm wards (equipped.bracer)
+!ent damage ogre 2
+?! wards
+!status def doom
+!status passive doom add end on_turn_start priority=10 "kill(self)"
+!status def berserk
+!status passive berserk add howl on_turn_start "say('howl')"
+!status visibility berserk "pov_team == 'red'"
+!eval "status_apply('ogre', 'berserk', 1, 3)"
+!match bind pov=blue
+!passive list ogre
+?? `ogre` has no passives.
+!match bind pov=red
+!passive list ogre
+?? - `howl` (on_turn_start): `say('howl')` — held by `status:berserk`
+!match unbind
+!match use hb
+!eval "status_apply('ogre', 'doom', 1, 3)"
+!turn set ogre
+?? ⚙️ passive `end` of `ogre` (status:doom) fired on `ogre` (on_turn_start)
+?? 💀 **Ogre** (`ogre`) died.
+?! howl
+!assert "not is_alive('ogre')"
+
+Expected: a 2x2 ogre's located arm holds a bracer under its own
+`equipped`, and the bracer's passive fires on the arm (self = `oarm`,
+`passive_source` its path) when the arm takes damage, not when the
+ogre's body does. A status hidden from blue by its visibility condition
+keeps its passives out of blue's `!passive list` (an empty list, as for a
+unit without passives); red, who sees berserk, lists `howl` under it. At
+the ogre's turn start doom's priority-10 passive kills it; berserk's
+`howl`, the next passive of that hook, doesn't run on the dead ogre.
+
+
+SCENARIO 1301 — Actions a status grants: !status action, source = the instance, action_tags, level entries, a hidden status (#412)
+---------------------------------------------------------------------------------------------------------------------
+
+!match new sa Rage 8 6
+!match use sa
+!ent add ogre Ogre 30 2 2 5 team=red
+!ent add hero Hero 30 3 2 4 team=blue
+!status def rage
+!status data rage charges 2
+!status action rage frenzy target entity
+!status action rage frenzy body "deal_damage(target, 6); source.charges -= 1; say(f'{source.charges} left')"
+!status action_tags rage melee
+!status action rage list
+?? - `frenzy` (target entity)
+!action ogre frenzy hero
+?? ❌ no action `frenzy` on `ogre`.
+!eval "status_apply('ogre', 'rage', 1, 3)"
+!action list ogre
+?? - `frenzy` (target: `entity`, at `status:rage`, tags: melee)
+!action info ogre frenzy
+?? Path:        `status:rage.actions.frenzy`
+?? Tags:        `melee` (from `status:rage`)
+!action ogre frenzy hero
+?? 1 left
+!assert "entity[hero].hp == 24 and status_get('ogre', 'rage', 'charges') == 1"
+!status def calm
+!status forbids_actions_with_tag calm melee
+!eval "status_apply('ogre', 'calm', 1, 1)"
+!action ogre frenzy hero
+?? calm on `ogre` forbids `melee` actions.
+!status dispel ogre calm
+!status level rage 2+ actions roar target none
+!status level rage 2+ actions roar body "say('ROAR')"
+!action ogre roar
+?? ❌ no action `roar` on `ogre`.
+!eval "status_set('ogre', 'rage', 'level', 2)"
+!action ogre roar
+?? ROAR
+!status visibility rage "pov_team == 'red'"
+!match bind pov=blue
+!action list ogre
+?! frenzy
+!match bind pov=red
+!action list ogre
+?? - `roar` (target: `none`, at `status:rage`, tags: melee)
+!match unbind
+!match use sa
+!status dispel ogre rage
+!action ogre frenzy hero
+?? ❌ no action `frenzy` on `ogre`.
+
+Expected: a status's `actions` are its bearer's while it holds the
+status. Before rage the ogre has no `frenzy`; with it, `!action list`
+shows `frenzy` at `status:rage` carrying the status's `action_tags`
+(`melee`), and `!action info` gives its path. Its body writes `source`,
+the status instance (`source.charges -= 1`): 6 damage, one charge left.
+calm, which forbids `melee` actions (#234), forbids the status's action
+like any other. A `2+` level entry adds `roar`, usable once rage reaches
+level 2. With rage hidden from blue by its visibility condition, blue's
+`!action list` shows none of its actions (they would name the status);
+red lists both. Dispelled, rage takes its actions along.
+
+
+SCENARIO 1302 — A reaction a status grants: offered while held, its before half writing the instance (#412)
+--------------------------------------------------------------------------------------------------------
+
+!match new sr Guard 8 8
+!match use sr
+!ent add orc Orc 30 1 1 5
+!ent add hero Hero 30 2 1 3 footprint_w=2 footprint_h=2
+!ent set_var orc actions.cleave.target entity
+!ent set_var orc actions.cleave.tags melee
+!ent set_var orc actions.cleave.prepare "damage = 10"
+!ent set_var orc actions.cleave.body "entity[target].hp = entity[target].hp - damage"
+!status def guard
+!status data guard blocks 1
+!status action guard block reacts_to melee
+!status action guard block before "incoming.damage = incoming.damage - 6; source.blocks -= 1"
+!action orc cleave hero
+?! can react
+!assert "entity[hero].hp == 20"
+!eval "status_apply('hero', 'guard', 1, 3)"
+!action orc cleave hero
+?? - Hero can react: `!react hero block` — or `!react hero pass`.
+!react hero block
+?? ↪ Hero reacts: `block`.
+!assert "entity[hero].hp == 16 and status_get('hero', 'guard', 'blocks') == 0"
+!status dispel hero guard
+!action orc cleave hero
+?! can react
+!assert "entity[hero].hp == 6"
+
+Expected: without guard the orc's cleave resolves at once (no unit holds
+a reaction): 10 damage to the 2x2 hero. With guard the hero is offered
+the status's `block`; its before half takes 6 off the incoming damage and
+spends one of the instance's `blocks` through `source` (4 damage, 0
+blocks left). Dispelled, the status takes the reaction along: the next
+cleave resolves without a window.
+
+
+SCENARIO 1303 — Status-granting tiles: a template's grant, a tile's own, beside a zone, a condition, removed_by tile (#290)
+----------------------------------------------------------------------------------------------------------------
+
+!match new tg Forest 8 6
+!match use tg
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 30 5 3 4 footprint_w=2 footprint_h=2
+!status def cover
+!status def burning
+!gpassive add why on_status_removed "say(f'{self} loses {status_name} ({removed_by})')"
+!tile def new forest
+!tile def grant forest cover level=1
+!tile place forest 2 1
+!tile place forest 3 1
+!tile place forest 6 4
+?? Ogre gains cover.
+!zone new grove
+!zone add grove 3 1
+!zone grant grove cover level=3
+!ent status ogre list
+?? - `cover` (__zone_grant=['tile:main:6,4']
+!ent move hero 1 right
+?? Hero gains cover.
+!ent status hero list
+?? - `cover` (__zone_grant=['tile:main:2,1']
+!ent move hero 1 right
+?? Hero's cover is now level 3 (was 1).
+!ent status hero list
+?? - `cover` (__zone_grant=['grove', 'tile:main:3,1']
+!eval "status_held_by('hero', 'cover')"
+?? = `['grove', 'tile:main:3,1']`
+!ent move hero 1 right
+?? hero loses cover (grant)
+!tile grant 1 1 cover level=4
+?? tile (1,1) grants `cover` (level 4) to the units standing on it.
+!ent tp hero 1 1
+!assert "status_level('hero', 'cover') == 4"
+!tile def grant_condition forest "entity[self].hp > 20"
+?? (self = the unit, tile_x, tile_y, tile_map bound)
+!ent hp ogre 10
+?? ogre loses cover (tile)
+!ent status ogre list
+?? `ogre` status: (none)
+!tile def info forest
+?? "grant_condition": "entity[self].hp > 20"
+!tile ungrant 1 1 cover
+?? hero loses cover (tile)
+
+Expected: the forest template's grant reaches every tile placed from it,
+read live: placing a forest under the 2x2 ogre's lower-right cell gives
+the ogre (the body root, under the default grant_bodies) cover level 1.
+The hero walking onto a forest gains cover 1; onto the forest the grove
+zone also covers, level 3 (the highest of the tile's and the zone's),
+held by both (status_held_by names the zone and `tile:main:3,1`). Off
+them it loses cover with removed_by `grant` (tile and zone held it). A
+tile's own grant (level 4 at (1,1)) works without a template. The
+template's grant_condition reads the unit with tile_x / tile_y / tile_map
+bound: at 10 hp the ogre fails it and loses cover with removed_by `tile`
+(only tiles held it). `!tile def info` shows the template's grants and
+condition; ungranting the own tile takes cover off the hero (`tile`).
+
+
+SCENARIO 1304 — Tile grants from a system, on a body with a part, lingering, a status rename, a resize, a prefab stamp (#290)
+-------------------------------------------------------------------------------------------------------------------
+
+!system tile new default marsh
+!system tile grant default marsh slowed level=2 linger=1
+?? `default` tile template `marsh` grants `slowed` (level 2, linger 1 turn(s)) to the units standing on its tiles.
+!system tile grant_bodies default marsh all
+!system tile info default marsh
+?? "grant_bodies": "all"
+!match new tm Marsh 8 6
+!match use tm
+!status def slowed
+!ent add hero Hero 30 1 1 5
+!ent add beast Beast 30 4 4 4 footprint_w=2 footprint_h=2
+!part add beast bhead head 10 10
+!tile place marsh 2 1
+!tile place marsh 5 5
+?? Beast gains slowed level 2.
+?? head gains slowed level 2.
+!ent move hero 1 right
+?? Hero gains slowed level 2.
+!ent move hero 1 right
+!ent status hero list
+?? - `slowed` (__zone_lingering=True, duration=1, level=2)
+!status rename slowed mired
+!tile def info marsh
+?? "mired": {
+!ent status beast list
+?? - `mired` (__zone_grant=['tile:main:5,5']
+!map resize 9 6 right
+!ent status beast list
+?? - `mired` (__zone_grant=['tile:main:6,5']
+!prefab save bog 4 4 6 6
+!match new tm2 Bog 8 8
+!match use tm2
+!prefab stamp bog 1 1
+?? ⚠️ The match already has its own tile template `marsh`, which differ from the prefab's; the match's are kept.
+?? Beast gains slowed level 2.
+!assert "status_held_by('beast', 'slowed') == ['tile:main:3,2']"
+
+Expected: a system's tile template carries its grants (`!system tile
+grant`, grant_bodies `all`) into new matches. Placing a marsh under the
+2x2 beast grants slowed to the beast and to its glued head (every unit
+with a cell on it). The hero gains slowed stepping on a marsh and, off
+it, keeps it lingering one turn. Renaming the status renames the
+template's grant and the instances. A resize shifts the tiles, and the
+beast's grant follows its tile's new cell (`tile:main:6,5`). Stamping a
+prefab of the beast's corner into a new match keeps the new match's own
+marsh (from the system, still granting slowed), which grants it to the
+stamped beast on arrival.

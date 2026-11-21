@@ -14,7 +14,7 @@ full (everything its entry asks for or assumes), its number moves to
 part keeps its entry, trimmed to what is still open. When the user strikes
 or rejects one, it moves to "Off the list".
 
-**Shipped:** #624 (sprite effects: a layer of image effects from statuses, unit vars, equipment, team data, passives, tiles, zones and the engine's team / acting / corpse looks), #233, #114 (statuses: automatic durations with `duration_mode` / `duration_when`, a status's glyph and colour on the map), #387, #388, #390, #386, #489 (hooks: on_kill, on_part_destroyed, move_kind, unit-side zone and tile hooks, one passive on several hooks), #116, #267, #310, #309, #389 (statuses: `max_duration`, `if_source_lost`, ticks on the applier's clock, gain / loss / level lines, blocked applications), #349, #350, #351, #352, #353, #324, #431, #354 (the formula language: `-=`, unpacking, read subscripts, f-strings, type tests, `return`, `:=`, line numbers), #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
+**Shipped:** #411, #208, #412, #290 (behaviour a status, an item or a tile carries: status and item passives, status actions, tile grants), #624 (sprite effects: a layer of image effects from statuses, unit vars, equipment, team data, passives, tiles, zones and the engine's team / acting / corpse looks), #233, #114 (statuses: automatic durations with `duration_mode` / `duration_when`, a status's glyph and colour on the map), #387, #388, #390, #386, #489 (hooks: on_kill, on_part_destroyed, move_kind, unit-side zone and tile hooks, one passive on several hooks), #116, #267, #310, #309, #389 (statuses: `max_duration`, `if_source_lost`, ticks on the applier's clock, gain / loss / level lines, blocked applications), #349, #350, #351, #352, #353, #324, #431, #354 (the formula language: `-=`, unpacking, read subscripts, f-strings, type tests, `return`, `:=`, line numbers), #25 (the damage pipeline, with #235, #56 and #227's `source`), #235, #56, #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
 #75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #136, #205, #206, #216-#218, #222, #234, #232, #257, #258, #259, #230 (`!simulate`), #149 (with held, system and formula watchers), #90, #108 (with map-wide bundles), #242 (sizes, with body totals), #261 (the entity description: `!ent info` for players, `short` for the card), #70 (private vars, with team-private ones and private containers), #131 and #27 (the turn forecast, `!turn forecast` and `next_turns`, round mode and ATB), #224 (extra turns, `!turn grant` and `grant_turn`), #122 (`transform_keep_vars`, default the ATB bar), #215 (`say` / `print`, `say_to`, private lines, action `say_format`, `hook_output_lines`), #135 (`pending_request_expiry_seconds`), #221 (`default_passives_existing_units`, on by default), #89, #326, #269, #270, #271, #325 (formula helpers: `chance`, `exists` / `is_alive`, cell sets, `cell_toward` / `cell_behind`, `roll_dice`, dict helpers), #123, #134, #328, #266, #111, #282, #275, #59 and #124 (`!turn roll`, `initiative_reroll_each_round`), #395, #457, #460, #539, #540, #522, #396 (formula helpers: `teams` / `group_names`, `entities_in_cells`, `plural` / `ordinal` / `list_text`, `own_turns`, `fits_at`, `free_cells_near`, `corpse_cell` / `corpses_within`), #587, #590, #605, #610, #600, #434, #538, #453, #456 (destroyed parts marked, `!ent clone` without coordinates, `!zone copy`, table roll counts and `!roll <table>`, `!mount list` for the match, `!ent add` with vars, the empty turn order explained, `!find` aggregates, `!template list has=`), #535, #268, #329, #454 (corpses: read with `!ent info` / `get`, written and looted, dragged, swept with `!find dead` / `!foreach dead`), #104, #361, #253, #459, #362, #520 (dice pools, rerolls, Fate dice and d%; `roll_odds` / `roll_mean`; table roll adjustments, ranks and best / worst; sub-tables and dice in entries; `!table odds`; the action dice line), #154 (spatial indexes: units, zones and corpses by cell), #260 (tags, see
 `docs/tags_design.md`), #40 and #164 (multiple and nested maps, see
@@ -482,12 +482,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#194 Formula-aware Tab completion.** Inside a quoted formula (`!eval "...`, passive bodies, `!func def`) it completes function names, `entity[` ids and var paths.
 - **#195 Revive from a template** (§8). `revive(eid, template=...)` regrows lost parts and restores stats from a template.
 - **#196 Deep-illusion disguise** (§8). Today a disguise changes only what outsiders see. This one also fools their targeting and queries (relation filters, `!find`, `nearest_entity`).
-- **#208 Item-borne passives.**
-  - Passive records inside item data (`equipped.ring.passives.regen = {when, formula, target?, scope?}`) fire as the unit's own passives while the item sits under a `passive_sources` root (default `equipped`; per-unit replace / add vars in the shape of `modifier_sources`). `source` is bound to the item's container, as in an item's action.
-  - Equipping means moving the item into `equipped`, and unequipping ends it. No `!passive add` / `remove` bookkeeping, and a looted or transferred item takes its passive along.
-  - Today modifiers (`modifier_sources`) and actions (`discover_actions` containers) are found in item data, while passives have to be copied onto the unit and taken off again. That breaks "what X does is stored in X" for items.
-  - The game need: FCS1 Paladin Armor ("grants lvl2 regeneration status while worn") and Tournament Armor ("grants lvl2 resistance status while worn").
-  - To settle: var-hook passives inside items (are `target` paths relative to the item?), partial templates (an `axe_common` partial carrying its passive), whether `equipped` stays one root shared with modifiers.
 - **#209 Tracked unit references.**
   - A rule `unit_ref_paths` (var paths, `*` for any key: `pet, grappling, summoner, minions.*`) names vars that hold unit ids. The engine treats them like its own link fields:
     - removing the named unit clears the ref, and a list drops the entry;
@@ -546,7 +540,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - `!match export defs` prints a match's definitions (status definitions, global and team passives, functions, tables, tile templates, watchers, macros, aliases) as one JSON block. `!match import defs <json>` loads them into another match, on any server, through the same checks as each command.
   - This is how `!template import` already moves units between servers, and a step toward #162 system packs without the packaging.
 
-- **#290 Status-granting tiles.** `grants` on a tile template, settled by the zone-grant machinery. Terrain bonuses as in Wesnoth: a forest tile gives a status carrying a defence modifier while a unit stands on it. Today ground needs enter / exit hooks that every teleport, death and revive has to keep in step.
 - **#291 Typed action arguments.** Builds on #228: `args: {dest: {type: location}, ally: {type: entity}}`, parsed, coerced and view-checked like the main target. For "throw an ally to a cell" and "swap two units". Today a second target is raw text with no existence or view check.
 - **#292 Action area preview.** `!action <eid> <name> <target> preview` marks the cells and lists the units the action's `affects` gives for that target; nothing runs and no dice roll. Complements #238, which reports refusals.
 - **#293 Timed entries in the turn order.** `!turn event add <name> <initiative> <formula> [once]`: a named entry that fires when the order reaches it, then the order moves on. For lair actions, "at initiative 10 the lava rises", reinforcement waves. It appears in the forecast; today the GM parks an invisible unit somewhere.
@@ -581,8 +574,6 @@ capabilities `!server perms` and per-role `!host access ... role=`).
 - **#380 Reply snapshots.** `run_scenarios.py --snapshot` writes every scenario's full replies; `--diff` lists the replies a change altered. It catches drift no `??` asserts, and a PR can state "these 14 replies changed".
 - **#381 Record a session as a scenario.** CLI `!as record <file>` writes the typed commands in scenario format with `??` lines taken from the observed replies. A bug found while testing after a merge becomes a scenario in one step.
 - **#382 Parallel scenario runs.** `-j N`; scenarios already run in separate temp folders, and the suite runs twice per change (plain and under `FCS_SPATIAL_CHECK=1`).
-- **#411 Status-borne passives.** Passive records in a status definition (`passives: {thorns: {when: on_damage_taken, formula: ...}}`) fire as the bearer's own while it holds the status, level entries included. A definition today has a tick and three lifecycle hooks, so Thorns, a counter stance or "heal on kill" need a global passive that tests `status_has` on every unit. The twin of #208.
-- **#412 Status-granted actions.** A status's actions are offered while it is held: Rage adds Frenzy, Grappled adds Break Free. Discovery reads unit vars and mount slots today.
 - **#413 Restore one unit.** `!history restore <save> unit=<eid>` and `!undo command N unit=<eid>` put one unit's body back from a snapshot and leave the rest of the match alone. For a mistake noticed five commands late.
 - **#414 Parameter sweeps in `!simulate`.** `vary=hero.str:10..20` runs n times per value and prints one row per value, for balance curves.
 - **#415 Dormant maps.** A map var marks a map inactive: its units leave the turn order and their ticks and schedules pause until it wakes. The hold of a ship while the fight is on deck.
@@ -781,7 +772,7 @@ From the combat-systems review (docs/combat_systems_fit.md):
 - **Status bundle for the three systems:** #233, #234, #232, #227, #150, #222
 - **After the battle:** #239 → #240, #241; #158 with #251
 - **Discord table comfort:** #247, #248, #254, #255, #244, #245
-- **Behaviour kept in its data:** #200, #208, #201
+- **Behaviour kept in its data:** #200, #201
 - **GM tooling:** #202, #203, #207, #211, #204, #231, #249, #250
 - **Formula ergonomics:** #89, #194, #205, #210, #216, #217, #219, #228
 - **Integrity of GM data:** #209, #210, #223
@@ -795,7 +786,7 @@ From the #264-#348 reviews:
 - **Targeting:** #269, #270, #275, #286, #287, #291, #292, #311, #312, #313, #314
 - **Objects as zones:** #311, #338, #339
 - **Action limits:** #307, #308, #24
-- **Status order and lifetime:** #266, #290, #296, #340, #344
+- **Status order and lifetime:** #266, #296, #340, #344
 - **Private information:** #342, #343
 - **Formula ergonomics (review):** #324, #325, #326, #272
 - **Engine upkeep:** #346, #347, #348
@@ -819,7 +810,6 @@ From the #386-#418 review:
 - **Formula twins of commands:** #391, #392, #393, #394, #395, #396, #397
 - **Approvals and players:** #398, #399, #400, #401
 - **Looks and reads:** #402, #403, #404, #405, #406, #407, #408
-- **Statuses that carry behaviour:** #411, #412
 - **Prefabs:** #409, #416
 - **GM tooling:** #413, #414, #415
 - **Scaling and upkeep:** #417, #418

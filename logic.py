@@ -3,6 +3,7 @@
 # logic.py
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
+import dataclasses
 from typing import Literal, Any, Callable, Dict, Iterable, List, Optional, Tuple, Set
 import os
 import uuid
@@ -2549,6 +2550,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entries) and its team data's `watchers` are always read on top. "
             "Per-unit override: `__watcher_sources` (replaces this list) and "
             "/ or `__watcher_sources_add` (extends it)."
+        ),
+    },
+    "passive_sources": {
+        "default": "equipped",
+        "schema": {"type": "str", "var_roots": True},
+        "desc": (
+            "Comma-separated vars roots walked for the `passives` a unit's "
+            "items hold (#208): a container under one of these roots holding "
+            "`passives: {<id>: {when, formula, priority, target, scope, "
+            "extra_turns}}` fires those passives as the unit's own while it "
+            "is there (`equipped.ring`; the same ring in `inventory` "
+            "doesn't), with `passive_source` = the container's path "
+            "(`item_consume(self, passive_source)`). A status's `passives` "
+            "(its instance, definition and level entries, #411) fire the "
+            "same way while the unit holds it, `passive_source` = "
+            "`status:<name>`, `passive_status` = the status. Per-unit "
+            "override: `__passive_sources` (replaces this list) and / or "
+            "`__passive_sources_add` (extends it)."
         ),
     },
     "status_grant_sources": {
@@ -9367,6 +9386,15 @@ def _run_passive_line(engine, p: "Passive", ctx, *, target_id: str,
     from formula import FormulaError
     given = label
     label = f"global passive `{p.id}`" if is_global else f"passive `{target_id}.{p.id}`"
+    held = getattr(p, "held", None)
+    if held is not None:
+        # A passive a status or an item holds (#411, #208): named by where
+        # it lives, with passive_source / passive_status bound.
+        src, sname = held
+        label = f"passive `{p.id}` of `{target_id}` ({src})"
+        ctx = dataclasses.replace(ctx, extras={
+            **(getattr(ctx, "extras", None) or {}),
+            "passive_source": src, "passive_status": sname})
     if given is not None:
         label = given
     elif is_global:
@@ -9750,6 +9778,13 @@ def check_tag_filter(raw: Any) -> Any:
 # The key a watcher bundle sits under: a unit's own var, a container under
 # its watcher_sources roots, a status, team data (Match.held_watchers).
 WATCHERS_KEY = "watchers"
+# Passives held in data (#411, #208): a `passives` dict (id -> {when,
+# formula, priority, target, scope, extra_turns}) in a status (instance,
+# definition, level entries) or in a container under the unit's
+# passive_sources roots fires as the unit's own passives while it is there.
+PASSIVES_KEY = "passives"
+HELD_PASSIVE_FIELDS = ("when", "formula", "target", "scope", "priority",
+                       "extra_turns")
 
 
 # The fields that define a match watcher (the rest is its edge state).
@@ -9791,6 +9826,94 @@ def watcher_spec_problem(spec: Any) -> Optional[str]:
         return "`effect` isn't a formula text"
     if not isinstance(spec.get("once", False), bool):
         return "`once` isn't true / false"
+    return None
+
+
+def held_passive_spec(pid: str, spec: Any) -> Tuple[Optional["Passive"],
+                                                     Optional[str]]:
+    """A held passive record (#411, #208) as (Passive, None), or (None, why
+    it can't be read): a dict with a `when` (one hook or several joined by
+    commas) and a `formula`, optional `priority`, `target`, `scope` and
+    `extra_turns`. Keys it doesn't know are left alone (a GM's notes)."""
+    if not isinstance(spec, dict):
+        return None, "isn't a dict {when, formula, ...}"
+    if not isinstance(spec.get("when"), str) or not spec["when"].strip():
+        return None, "has no `when`"
+    if not isinstance(spec.get("formula"), str):
+        return None, "has no `formula`"
+    try:
+        p = Passive(id=str(pid), when=spec["when"], formula=spec["formula"],
+                    target=spec.get("target", ""),
+                    scope=spec.get("scope", "deep"),
+                    priority=spec.get("priority", 0),
+                    extra_turns=spec.get("extra_turns"))
+    except VTTError as ex:
+        return None, str(ex)
+    return p, None
+
+
+def held_passive_write_problem(path: str, value: Any, roots: List[str],
+                               known_funcs: Any = frozenset()
+                               ) -> Optional[str]:
+    """Why a raw var write at `path` (on a unit whose passive_sources roots
+    are `roots`) would store a held passive that can't run (#208): an
+    unknown hook in a `when`, a `formula` that doesn't parse, a `scope` or
+    `priority` no passive takes. A record still missing a field passes, so
+    one can be built a field at a time. None = fine."""
+    segs = path.split(".") if path else []
+    if not any(path == r or path.startswith(r + ".") or r.startswith(path + ".")
+               or not path for r in roots):
+        return None
+    records: List[Tuple[str, Any]] = []
+    if PASSIVES_KEY in segs:
+        i = len(segs) - 1 - segs[::-1].index(PASSIVES_KEY)
+        rest = segs[i + 1:]
+        base = ".".join(segs[:i])
+        if not any(base == r or base.startswith(r + ".") for r in roots):
+            return None
+        if not rest:
+            if isinstance(value, dict):
+                records = list(value.items())
+        elif len(rest) == 1:
+            records = [(rest[0], value)]
+        elif len(rest) == 2:
+            records = [(rest[0], {rest[1]: value})]
+    elif isinstance(value, dict):
+        def walk(node: Any, depth: int = 0) -> None:
+            if not isinstance(node, dict) or depth > STORE_DEPTH_LIMIT:
+                return
+            b = node.get(PASSIVES_KEY)
+            if isinstance(b, dict):
+                records.extend(b.items())
+            for k, v in node.items():
+                if k != PASSIVES_KEY:
+                    walk(v, depth + 1)
+        walk(value)
+    for pid, rec in records:
+        if not isinstance(rec, dict):
+            continue
+        when = rec.get("when")
+        try:
+            if when is not None:
+                passive_hooks(when)
+            if "scope" in rec and rec["scope"] not in PASSIVE_SCOPES:
+                return (f"passive `{pid}`: unknown scope `{rec['scope']}` "
+                        f"(allowed: {', '.join(sorted(PASSIVE_SCOPES))}).")
+            if "priority" in rec:
+                checked_priority(rec["priority"], f"passive `{pid}` priority")
+            if "extra_turns" in rec and \
+                    not isinstance(rec["extra_turns"], bool):
+                return (f"passive `{pid}`: extra_turns must be true or "
+                        f"false.")
+        except VTTError as ex:
+            return f"passive `{pid}`: {ex}"
+        f = rec.get("formula")
+        if isinstance(f, str) and f.strip():
+            from formula import validate_program, FormulaError
+            try:
+                validate_program(f, known_funcs=frozenset(known_funcs))
+            except FormulaError as ex:
+                return f"passive `{pid}`: its formula doesn't parse: {ex}"
     return None
 
 
@@ -9870,6 +9993,11 @@ class SpecialTileTemplate:
     # A template field (outside `data`, so placing a tile doesn't copy it):
     # a placed tile's tags are these, read live, plus its own `tags` data.
     tags: List[str] = field(default_factory=list)
+    # Status grants (#290), read live like a zone definition's: status ->
+    # {level, data, linger}, and the grant_condition / grant_bodies
+    # settings (a placed tile's own data keys of those names win).
+    grants: Dict[str, Any] = field(default_factory=dict)
+    grant_settings: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -9879,6 +10007,10 @@ class SpecialTileTemplate:
         }
         if self.tags:
             out["tags"] = list(self.tags)
+        if self.grants:
+            out["grants"] = copy.deepcopy(self.grants)
+        for k, v in self.grant_settings.items():
+            out[k] = v
         return out
 
     @staticmethod
@@ -9896,6 +10028,11 @@ class SpecialTileTemplate:
                 if isinstance(v, str)
             },
             tags=normalize_tags(d.get("tags")),
+            grants=(copy.deepcopy(d["grants"])
+                    if isinstance(d.get("grants"), dict) else {}),
+            grant_settings={k: d[k] for k in ("grant_condition",
+                                              "grant_bodies")
+                            if isinstance(d.get(k), str) and d[k]},
         )
 
 
@@ -11894,6 +12031,11 @@ class Entity:
                 path, value, str(self._match.rules.get(
                     "sprite_effects_var", SPRITE_EFFECTS_KEY)),
                 f"Writing '{path}' on `{self.id}`")
+            bad = held_passive_write_problem(
+                path, value, self._match._effective_passive_sources(self),
+                self._match.formula_functions.keys())
+            if bad:
+                raise VTTError(f"Writing '{path}' on `{self.id}`: {bad}")
         if self._match is not None:
             # A container whose marker was measured inside another
             # container (copied out of it) is re-measured on its own.
@@ -12894,6 +13036,9 @@ class Map:
     # hook_cells' index (None = built on its next use).
     _hook_ix: Optional[Dict[Tuple[int, int], Any]] = field(
         default=None, repr=False, compare=False)
+    # grant_cells' memo: (the granting templates, the cells) until the hook
+    # index changes (#290).
+    _grant_cells_memo: Any = field(default=None, repr=False, compare=False)
     # zone_hook_names' index: zone -> the hook names its own data holds
     # (None = built on its next use; kept by ZoneTable.also).
     _zhook_ix: Optional[Dict[str, frozenset]] = field(
@@ -12982,6 +13127,7 @@ class Map:
                 if rec is not None:
                     ix[c] = rec
             object.__setattr__(self, "_hook_ix", ix)
+            object.__setattr__(self, "_grant_cells_memo", None)
             t.also = set()
         elif t.also:
             for c in t.also:
@@ -12991,6 +13137,7 @@ class Map:
                 else:
                     ix[c] = rec
             t.also = set()
+            object.__setattr__(self, "_grant_cells_memo", None)
         if SPATIAL_CHECK:
             want = {c: r for c, d in t.items()
                     for r in [_tile_hook_rec(d)] if r is not None}
@@ -12999,6 +13146,19 @@ class Map:
                     f"map `{self.name}`: the tile hook index differs from "
                     f"the tiles")
         return ix
+
+    def grant_cells(self, granting: frozenset) -> Set[Tuple[int, int]]:
+        """The cells whose tile grants statuses (#290): its own `grants`
+        data, or a template among `granting` (the templates holding
+        grants). Read from the hook index, remembered until it changes."""
+        ix = self.hook_cells()
+        memo = getattr(self, "_grant_cells_memo", None)
+        if memo is not None and memo[0] == granting:
+            return memo[1]
+        cells = {c for c, (_own, tpl, g) in ix.items()
+                 if g or (tpl is not None and tpl in granting)}
+        object.__setattr__(self, "_grant_cells_memo", (granting, cells))
+        return cells
 
     def runs_changed(self, kind: str) -> None:
         """`explored`, `fog_reveals` or `voids` changed in place."""
@@ -13874,9 +14034,10 @@ def _zone_hook_rec(z: Any) -> frozenset:
         if isinstance(hooks, dict) else frozenset()
 
 
-def _tile_hook_rec(d: Any) -> Optional[Tuple[frozenset, Any]]:
+def _tile_hook_rec(d: Any) -> Optional[Tuple[frozenset, Any, bool]]:
     """A tile's entry in the hook index: (its own hook names, its
-    template's name), None when it has neither."""
+    template's name, whether its own data holds status `grants`, #290),
+    None when it has none of them."""
     if not isinstance(d, dict):
         return None
     hooks = d.get("hooks")
@@ -13884,9 +14045,10 @@ def _tile_hook_rec(d: Any) -> Optional[Tuple[frozenset, Any]]:
         if isinstance(hooks, dict) else frozenset()
     tpl = d.get("_template")
     tpl = tpl if isinstance(tpl, str) else None
-    if not own and tpl is None:
+    grants = bool(d.get(HELD_GRANTS_KEY))
+    if not own and tpl is None and not grants:
         return None
-    return own, tpl
+    return own, tpl, grants
 
 
 class TileDict(ChangeDict):
@@ -14205,6 +14367,9 @@ class UnitFlags:
     # The unit's own data holds a modifier record's `applies_to` (W21):
     # it may give its team records.
     TEAM_RECORDS = 16
+    # A container under the unit's passive_sources roots holds `passives`
+    # (#208; a status's are read through its few statuses, #411).
+    HELD_PASSIVES = 32
 
     def __init__(self) -> None:
         self.flags: Dict[str, int] = {}
@@ -14212,7 +14377,8 @@ class UnitFlags:
                                              self.ZONE_GRANT: set(),
                                              self.REACTIONS: set(),
                                              self.HELD_GRANTS: set(),
-                                             self.TEAM_RECORDS: set()}
+                                             self.TEAM_RECORDS: set(),
+                                             self.HELD_PASSIVES: set()}
         self.changed: Set[str] = set()
         self.ctx: Any = None
 
@@ -14242,6 +14408,13 @@ class UnitFlags:
                 _holds_key(i, MODIFIER_APPLIES_KEY)
                 for i in e.status.values()):
             f |= self.TEAM_RECORDS
+        for root in match._effective_passive_sources(e):
+            node = e.vars
+            for seg in root.split("."):
+                node = node.get(seg) if isinstance(node, dict) else None
+            if node is not None and _holds_key(node, PASSIVES_KEY):
+                f |= self.HELD_PASSIVES
+                break
         return f
 
     def _set(self, eid: str, f: int) -> None:
@@ -14259,7 +14432,8 @@ class UnitFlags:
             match._spatial.listeners.append(self.changed)
             self.ctx = None
         ctx = (id(match.entities), match.rules.get("watcher_sources"),
-               match.rules.get("status_grant_sources"))
+               match.rules.get("status_grant_sources"),
+               match.rules.get("passive_sources"))
         if ctx != self.ctx:
             self.ctx = ctx
             self.flags.clear()
@@ -14303,6 +14477,8 @@ HELD_GRANTS_KEY = "grants"
 # A held grant's source in a status's ZONE_GRANT_KEY list: `item:<path>`
 # (zone names take id characters, so no zone reads as one).
 HELD_GRANT_PREFIX = "item:"
+# A status-granting tile's source label (#290): `tile:<map>:<x>,<y>`.
+TILE_GRANT_PREFIX = "tile:"
 
 
 def _holds_key(node: Any, key: str) -> bool:
@@ -14757,6 +14933,10 @@ class Match:
     # asked for while it ran.
     _grant_syncing: bool = field(default=False, repr=False)
     _grant_dirty: bool = field(default=False, repr=False)
+    # Held passives (#411, #208) parsed once: (source, id, record fields)
+    # -> Passive. Runtime only; a record's text is its key.
+    _held_passive_cache: Dict[Any, Any] = field(default_factory=dict,
+                                                repr=False)
     # Counts the changes syncs made (the command layer tells from it whether
     # its end-of-command sync changed the match).
     _grant_changes: int = field(default=0, repr=False)
@@ -15503,6 +15683,129 @@ class Match:
                         out[sname] = entry
         return out
 
+    def _granting_tile_templates(self) -> frozenset:
+        return frozenset(n for n, t in self.tile_templates.items()
+                         if getattr(t, "grants", None))
+
+    def tile_grants_of(self, mp: "Map", x: int, y: int) -> Dict[str, Any]:
+        """Status -> grant entry the tile at (x, y) gives (#290): its
+        template's `grants` (read live), its own `grants` data replacing
+        a status's entry. {} without any."""
+        tile = mp.tiles.get((x, y))
+        if not isinstance(tile, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        tpl = self.tile_templates.get(tile.get("_template")) \
+            if isinstance(tile.get("_template"), str) else None
+        if tpl is not None and isinstance(tpl.grants, dict):
+            out.update({k: v for k, v in tpl.grants.items()
+                        if isinstance(v, dict)})
+        own = tile.get(HELD_GRANTS_KEY)
+        if isinstance(own, dict):
+            out.update({k: v for k, v in own.items() if isinstance(v, dict)})
+        return out
+
+    def tile_grant_setting(self, mp: "Map", x: int, y: int, key: str) -> Any:
+        """The tile's `grant_condition` (None when unset) or `grant_bodies`
+        (else the zone_status_grant_bodies rule): its own data, else its
+        template's (#290)."""
+        tile = mp.tiles.get((x, y))
+        srcs: List[Any] = []
+        if isinstance(tile, dict):
+            srcs.append(tile)
+            tpl = self.tile_templates.get(tile.get("_template")) \
+                if isinstance(tile.get("_template"), str) else None
+            if tpl is not None:
+                srcs.append(tpl.grant_settings)
+        return self._grant_setting_from(srcs, key)
+
+    def _grant_setting_from(self, srcs: List[Any], key: str) -> Any:
+        for src in srcs:
+            v = src.get(key) if isinstance(src, dict) else None
+            if key == "grant_bodies" and v in ZONE_GRANT_BODIES:
+                return v
+            if key == "grant_condition" and isinstance(v, str) and v.strip():
+                return v
+        if key == "grant_bodies":
+            v = self.rules.get("zone_status_grant_bodies", "root")
+            return v if v in ZONE_GRANT_BODIES else "root"
+        return None
+
+    @staticmethod
+    def tile_grant_source(mp: "Map", x: int, y: int) -> str:
+        """The grant source label of a tile (#290): `tile:<map>:<x>,<y>`."""
+        return f"{TILE_GRANT_PREFIX}{mp.name}:{x},{y}"
+
+    def _parse_tile_source(self, src: str) -> Optional[Tuple["Map", int,
+                                                             int]]:
+        body = src[len(TILE_GRANT_PREFIX):]
+        mname, _, xy = body.rpartition(":")
+        mp = self.maps.get(mname)
+        try:
+            x, y = (int(v) for v in xy.split(","))
+        except ValueError:
+            return None
+        return (mp, x, y) if mp is not None else None
+
+    def _desired_tile_grants(self, want: Dict[str, Dict[str, List[str]]],
+                             errors: Dict[str, Any],
+                             scope: Optional[Set[str]]) -> None:
+        """Add to `want` what status-granting tiles give the units standing
+        on them (#290): per tile its grant_bodies (root: the body root once
+        any cell of the body is on it; all: every unit with a cell on it,
+        glued parts following their unit) and grant_condition (self = the
+        unit, tile_x / tile_y / tile_map bound)."""
+        granting = self._granting_tile_templates()
+        for mp in self.maps.values():
+            gcells = mp.grant_cells(granting)
+            if not gcells:
+                continue
+            hits: Dict[str, Set[Tuple[int, int]]] = {}
+            units = [e for e in self.entities.values() if e.map == mp.name
+                     and (scope is None or e.id in scope)]
+            for e in units:
+                if e.is_glued_part or not self._grant_eligible(e):
+                    continue
+                for c in self.entity_cells(e):
+                    if c not in gcells:
+                        continue
+                    if self.tile_grant_setting(mp, c[0], c[1],
+                                               "grant_bodies") == "root":
+                        r = self.body_root(e)
+                        if self._grant_eligible(r):
+                            hits.setdefault(r.id, set()).add(c)
+                    else:
+                        hits.setdefault(e.id, set()).add(c)
+            for e in units:
+                if not e.is_glued_part or not self._grant_eligible(e):
+                    continue
+                p, seen = e, {e.id}
+                while p.is_glued_part and p.part_of in self.entities \
+                        and p.part_of not in seen:
+                    p = self.entities[p.part_of]
+                    seen.add(p.id)
+                for c in hits.get(p.id, ()):
+                    if self.tile_grant_setting(mp, c[0], c[1],
+                                               "grant_bodies") == "all":
+                        hits.setdefault(e.id, set()).add(c)
+            for eid in sorted(hits):
+                if scope is not None and eid not in scope:
+                    continue
+                for (x, y) in sorted(hits[eid], key=lambda c: (c[1], c[0])):
+                    src = self.tile_grant_source(mp, x, y)
+                    cond = self.tile_grant_setting(mp, x, y,
+                                                   "grant_condition")
+                    if cond is not None and not self._grant_condition_holds(
+                            cond, eid, src, mp, errors,
+                            extras={"tile_x": x, "tile_y": y,
+                                    "tile_map": mp.name}):
+                        continue
+                    per = want.setdefault(eid, {})
+                    for sname in self.tile_grants_of(mp, x, y):
+                        lst = per.setdefault(sname, [])
+                        if src not in lst:
+                            lst.append(src)
+
     def zone_grant_setting(self, z: Any, key: str) -> Any:
         """Zone dict `z`'s `grant_condition` (None when unset) or
         `grant_bodies` (else the zone_status_grant_bodies rule): its own,
@@ -15559,7 +15862,9 @@ class Match:
         return sorted(hit)
 
     def _grant_condition_holds(self, cond: str, eid: str, zname: str,
-                               mp: "Map", errors: Dict[str, Any]) -> bool:
+                               mp: "Map", errors: Dict[str, Any],
+                               extras: Optional[Dict[str, Any]] = None
+                               ) -> bool:
         """Grant condition `cond` for unit `eid` and zone `zname` (self =
         the unit; zone_name and zone_map bound). One that fails reads as
         not met; `errors` keeps, per zone, its first error and the units
@@ -15570,7 +15875,8 @@ class Match:
             return fast
         from formula import FormulaEngine, EvalCtx, FormulaError
         ctx = EvalCtx(this=self.current_entity_id(), target=eid,
-                      extras={"zone_name": zname, "zone_map": mp.name})
+                      extras=extras if extras is not None else
+                      {"zone_name": zname, "zone_map": mp.name})
         engine = errors.get(None)
         if engine is None:
             engine = errors[None] = FormulaEngine(self)
@@ -15606,6 +15912,8 @@ class Match:
                     per = want.setdefault(eid, {})
                     for sname in grants:
                         per.setdefault(sname, []).append(zname)
+        # What the tiles units stand on grant (#290).
+        self._desired_tile_grants(want, errors, scope)
         # What the units' items and class hold (W21): alive units, hidden
         # riders included (the item travels with its unit).
         for eid in sorted(self._uflags.holders_of(self,
@@ -15735,7 +16043,10 @@ class Match:
                 # Hidden formula text leaves the error out (V15).
                 why = ("" if FORMULA_TEXT_HIDDEN.get()
                        else f" ({first})")
-                line = (f"⚠️ zone `{zname}`: its grant_condition failed for "
+                what = (f"tile ({zname.rpartition(':')[2]})"
+                        if str(zname).startswith(TILE_GRANT_PREFIX)
+                        else f"zone `{zname}`")
+                line = (f"⚠️ {what}: its grant_condition failed for "
                         + ", ".join(f"`{u}`" for u in sorted(units))
                         + f"{why}; no grant.")
                 if line not in self._grant_warned[1]:
@@ -15759,6 +16070,9 @@ class Match:
                 found = True
                 break
         if not found:
+            gt = self._granting_tile_templates()
+            found = any(mp.grant_cells(gt) for mp in self.maps.values())
+        if not found:
             found = bool(self._uflags.holders_of(self, UnitFlags.ZONE_GRANT)
                          or self._uflags.holders_of(self,
                                                     UnitFlags.HELD_GRANTS))
@@ -15768,7 +16082,9 @@ class Match:
                 isinstance(inst, dict) and ZONE_GRANT_KEY in inst
                 for e in self.entities.values()
                 for inst in e.status.values()) or any(
-                self._holds_held_grants(e) for e in self.entities.values())
+                self._holds_held_grants(e) for e in self.entities.values()
+            ) or any(self.tile_grants_of(mp, x, y)
+                     for mp in self.maps.values() for (x, y) in mp.tiles)
             if want != found:
                 raise SpatialCheckError(f"grant index: _grants_present = "
                                         f"{found}, scan {want}")
@@ -15842,11 +16158,13 @@ class Match:
                                               copy.deepcopy(after))
             else:
                 del e.status[sname]
-                held = any(str(z).startswith(HELD_GRANT_PREFIX)
-                           for z in (before.get(ZONE_GRANT_KEY) or ()))
+                srcs = [str(z) for z in (before.get(ZONE_GRANT_KEY) or ())]
+                tiles = [z for z in srcs if z.startswith(TILE_GRANT_PREFIX)]
+                items = [z for z in srcs if z.startswith(HELD_GRANT_PREFIX)]
+                why = ("tile" if tiles and len(tiles) == len(srcs) else
+                       "zone" if not tiles and not items else "grant")
                 log += self._emit_status_diff(
-                    eid, sname, before, None,
-                    removed_by="grant" if held else "zone")
+                    eid, sname, before, None, removed_by=why)
         # What a covering zone grants and the unit lacks.
         for sname in sorted(per):
             e = self.entities.get(eid)
@@ -19501,6 +19819,11 @@ class Match:
             g = node.get(HELD_GRANTS_KEY) if isinstance(node, dict) else None
             g = g.get(sname) if isinstance(g, dict) else None
             return g if isinstance(g, dict) else {}
+        if src.startswith(TILE_GRANT_PREFIX):
+            where = self._parse_tile_source(src)
+            if where is None:
+                return {}
+            return self.tile_grants_of(*where).get(sname) or {}
         return self.zone_grants_of(self.find_zone(src)).get(sname) or {}
 
     def _effective_watcher_sources(self, e: "Entity") -> List[str]:
@@ -19562,6 +19885,132 @@ class Match:
             td = self.team_data.get(str(e.team))
             if isinstance(td, dict) and WATCHERS_KEY in td:
                 _bundle(td[WATCHERS_KEY], f"team:{e.team}")
+        return out
+
+    def _effective_passive_sources(self, e: "Entity") -> List[str]:
+        """The vars roots walked for item passives on `e` (#208): the
+        per-unit `__passive_sources` var (replaces the rule) or the
+        passive_sources rule, plus `__passive_sources_add`."""
+        override = e.vars.get("__passive_sources")
+        if isinstance(override, list):
+            roots = [str(r) for r in override]
+        else:
+            roots = [r.strip() for r in
+                     str(self.rules.get("passive_sources", "equipped")
+                         ).split(",") if r.strip()]
+        add = e.vars.get("__passive_sources_add")
+        if isinstance(add, list):
+            roots = roots + [str(r) for r in add]
+        return roots
+
+    def status_holds_key(self, inst: Any, sname: str, key: str) -> bool:
+        """Whether status `sname` (this instance) can carry `key`
+        (`passives` #411, `actions` #412): the instance's own key, or its
+        definition or a level entry holding one (cheap: no view built)."""
+        if isinstance(inst, dict) and key in inst:
+            return True
+        d = self.status_definitions.get(sname)
+        if not isinstance(d, dict):
+            return False
+        return key in d or any(
+            isinstance(v, dict) and key in v
+            for v in (d.get(STATUS_LEVELS_FIELD) or {}).values())
+
+    def _status_holds_passives(self, inst: Any, sname: str) -> bool:
+        return self.status_holds_key(inst, sname, PASSIVES_KEY)
+
+    def held_passive_entries(self, e: "Entity", vars_: Any = None,
+                             statuses: Any = None
+                             ) -> List[Tuple[str, str, Any, Optional[str],
+                                             Optional[str]]]:
+        """Every passive `e` holds in data (#411, #208) as (source, id,
+        spec, problem, status): each status's `passives` (instance,
+        definition, level entries; source `status:<name>`) in the order
+        the unit gained them, then each `passives` dict under its
+        passive_sources roots (source = the container's path) in var order.
+        `problem` names why an entry can't run (None = usable). `vars_` /
+        `statuses` read another view of the unit (a reader's, for a
+        listing)."""
+        out: List[Tuple[str, str, Any, Optional[str], Optional[str]]] = []
+        listing = vars_ is not None or statuses is not None
+        if vars_ is None:
+            vars_ = e.vars
+        if statuses is None:
+            statuses = e.status
+
+        def _bundle(node: Any, src: str, sname: Optional[str]) -> None:
+            if not isinstance(node, dict):
+                out.append((src, "", node, "`passives` isn't a dict of "
+                            "id -> {when, formula, ...}", sname))
+                return
+            for k, spec in node.items():
+                out.append((src, str(k), spec,
+                            held_passive_spec(str(k), spec)[1], sname))
+
+        def _walk(node: Any, base: str, depth: int = 0) -> None:
+            if not isinstance(node, dict) or depth > STORE_DEPTH_LIMIT:
+                return
+            if PASSIVES_KEY in node:
+                _bundle(node[PASSIVES_KEY], base, None)
+            for k, v in node.items():
+                if k == PASSIVES_KEY or str(k).startswith("__") \
+                        or k == "actions":
+                    continue
+                _walk(v, f"{base}.{k}" if base else str(k), depth + 1)
+
+        for sname, inst in statuses.items():
+            if self._status_holds_passives(inst, sname):
+                b = self.status_field(inst, sname, PASSIVES_KEY)
+                if b is not None:
+                    _bundle(b, f"status:{sname}", sname)
+        if listing or self._uflags_has(e, UnitFlags.HELD_PASSIVES):
+            seen: Set[str] = set()
+            for root in self._effective_passive_sources(e):
+                if root in seen:
+                    continue
+                seen.add(root)
+                node: Any = vars_
+                for seg in root.split("."):
+                    node = node.get(seg) if isinstance(node, dict) else None
+                if node is not None:
+                    _walk(node, root)
+        return out
+
+    def _uflags_has(self, e: "Entity", bit: int) -> bool:
+        """Whether UnitFlags marks `e` with `bit` (FCS_SPATIAL_CHECK
+        compares it with a fresh reading)."""
+        got = e.id in self._uflags.holders_of(self, bit)
+        if SPATIAL_CHECK:
+            fresh = bool(self._uflags._compute(self, e) & bit)
+            if fresh != got and e._match is self:
+                raise SpatialCheckError(
+                    f"unit flags: {e.id} bit {bit} cached {got}, now {fresh}")
+        return got
+
+    def held_passives(self, e: "Entity") -> List["Passive"]:
+        """The usable passives `e` holds in data, in held_passive_entries'
+        order, as Passive objects (cached per source and record) carrying
+        `held` = (source, status or None) for the bindings."""
+        if not e.status and not self._uflags_has(e, UnitFlags.HELD_PASSIVES):
+            return []
+        out: List["Passive"] = []
+        cache = self._held_passive_cache
+        for src, pid, spec, problem, sname in self.held_passive_entries(e):
+            if problem is not None:
+                continue
+            key = (src, pid) + tuple(
+                json.dumps(spec.get(k), sort_keys=True, default=str)
+                for k in HELD_PASSIVE_FIELDS)
+            p = cache.get(key)
+            if p is None:
+                p = held_passive_spec(pid, spec)[0]
+                if p is None:
+                    continue
+                p.held = (src, sname)
+                if len(cache) > 4096:
+                    cache.clear()
+                cache[key] = p
+            out.append(p)
         return out
 
     def has_watchers(self) -> bool:
@@ -24314,6 +24763,20 @@ class Match:
             if isinstance(g, dict) and old in g and new not in g:
                 z["grants"] = rename_key(g)
                 counts["zone grants"] += 1
+        # The tile templates and tiles granting it (#290).
+        counts["tile grants"] = 0
+        for tpl in self.tile_templates.values():
+            g = tpl.grants
+            if isinstance(g, dict) and old in g and new not in g:
+                tpl.grants = rename_key(g)
+                counts["tile grants"] += 1
+        for mp in self.maps.values():
+            for (x, y), tile in list(mp.tiles.items()):
+                g = tile.get(HELD_GRANTS_KEY) if isinstance(tile, dict) \
+                    else None
+                if isinstance(g, dict) and old in g and new not in g:
+                    mp.tile_set_path(x, y, HELD_GRANTS_KEY, rename_key(g))
+                    counts["tile grants"] += 1
         for mp in self.maps.values():
             mp.zones.changed = None
         return counts
@@ -30055,7 +30518,7 @@ class Match:
             mp = self.maps.get(mname)
             if mp is None:
                 continue
-            cells = sorted(c for c, (own, tpl) in mp.hook_cells().items()
+            cells = sorted(c for c, (own, tpl, _g) in mp.hook_cells().items()
                            if when in own or tpl in tpls)
             for (x, y) in cells:
                 # Skip tiles cleared mid-iteration (e.g. by a previous
@@ -30069,14 +30532,19 @@ class Match:
 
     def _ordered_passives(self, target_eid: Optional[str], pred, *,
                           globals_: bool = True, team: bool = True,
-                          own: bool = True) -> List[Tuple["Passive", str]]:
+                          own: bool = True, held: Optional[bool] = None
+                          ) -> List[Tuple["Passive", str]]:
         """The passives a hook on `target_eid` fires whose `pred` holds, as
-        (passive, kind) pairs, kind `global`, `team` or `own`. Highest
-        `priority` first (the engine-wide rule, as modifiers fold and shield
-        pools drain); ties keep the order they had before priorities: the
-        match's globals, the target's team passives, then its own, each in
-        insertion order. Fire sites skip an `own` passive once the target is
-        gone (ghost firing)."""
+        (passive, kind) pairs, kind `global`, `team`, `own` or `held` (the
+        passives its statuses and items hold, #411 / #208; `held` defaults
+        to `own`). Highest `priority` first (the engine-wide rule, as
+        modifiers fold and shield pools drain); ties keep the order they had
+        before priorities: the match's globals, the target's team passives,
+        its own, then its held ones, each in insertion order. Fire sites
+        skip an `own` or `held` passive once the target is gone (ghost
+        firing)."""
+        if held is None:
+            held = own
         out: List[Tuple["Passive", str]] = []
         if globals_:
             out += [(p, "global") for p in list(self.global_passives.values())
@@ -30089,6 +30557,9 @@ class Match:
                         if pred(p)]
             if own:
                 out += [(p, "own") for p in list(e.passives.values())
+                        if pred(p)]
+            if held:
+                out += [(p, "held") for p in self.held_passives(e)
                         if pred(p)]
         out.sort(key=lambda t: -t[0].priority)
         return out
@@ -30103,13 +30574,14 @@ class Match:
         reaches its global and team passives."""
         present = target_eid in self.entities
         for p, kind in self._ordered_passives(target_eid, pred, **kinds):
-            if target_eid not in self.entities and (present or kind == "own"):
+            if target_eid not in self.entities and (
+                    present or kind in ("own", "held")):
                 if present:
                     break
                 continue
             log.extend(_run_passive_safely(
                 engine, p, ctx, target_id=target_eid,
-                is_global=kind != "own"))
+                is_global=kind not in ("own", "held")))
 
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None,
                   own_only_targets: Optional[List[str]] = None,
@@ -30218,7 +30690,7 @@ class Match:
             # removed the target stops its own handlers afterward.
             for p, kind in self._ordered_passives(
                     target, lambda p: p.fires_on(when)):
-                if kind == "own" and target not in self.entities:
+                if kind in ("own", "held") and target not in self.entities:
                     continue
                 if kind == "global":
                     log.extend(_run_passive_safely(
@@ -31562,6 +32034,14 @@ class Match:
         'used' those the holder has used in this match."""
         if pov_team is None:
             return True
+        if path.startswith("status:"):
+            # An action a status grants (#412) shows only to a view that
+            # sees the status: listing it would name the status.
+            sname = path[len("status:"):].split(".actions.", 1)[0]
+            h = holder or e
+            if not self.status_visible_to(sname, h.status.get(sname),
+                                          pov_team, eid=h.id):
+                return False
         mode = str(self.rules.get("entity_description_action_visibility",
                                   "all"))
         if mode == "all" or self.body_team(e) == str(pov_team):
@@ -32396,7 +32876,8 @@ class Match:
                         tdata.get(SPRITE_EFFECTS_KEY), f"team {e.team}")
             kinds = {}
         for p, kind in self._ordered_passives(
-                e.id, lambda p: p.sprite_effects is not None, **kinds):
+                e.id, lambda p: p.sprite_effects is not None, held=False,
+                **kinds):
             items += self._bundle_effect_items(
                 p.sprite_effects, f"{kind} passive {p.id}")
         return items

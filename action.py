@@ -117,6 +117,9 @@ class _BufferCtx:
 # dictionary. A container with a key named "actions" whose value is a
 # dict has each child of that dict treated as an Action definition.
 ACTIONS_KEY = "actions"
+# The container path of an action a status grants (#412): `status:<name>`
+# (no var path holds a `:`), so `source` reads and writes the instance.
+STATUS_SOURCE_PREFIX = "status:"
 
 # Action tags (#234). An action's own `tags` stay with it; a container's
 # `action_tags` (any dict above an action: the vars root, an item, an
@@ -883,6 +886,26 @@ def discover_actions(
             top_val, base_path=top_key, out=out,
             chain=root_chain, problems=problems,
         )
+    # Actions a status grants while the unit holds it (#412): its
+    # `actions` (instance, definition, level entries) at
+    # `status:<name>.actions.<action>`, the status's `action_tags`
+    # reaching them as a container's do.
+    m = getattr(entity, "_match", None)
+    if m is not None and entity.status:
+        for sname, inst in list(entity.status.items()):
+            if not m.status_holds_key(inst, sname, ACTIONS_KEY):
+                continue
+            acts = m.status_field(inst, sname, ACTIONS_KEY)
+            if not isinstance(acts, dict):
+                continue
+            base = f"{STATUS_SOURCE_PREFIX}{sname}"
+            probs: List[str] = []
+            holder_dict = {k: m.status_field(inst, sname, k)
+                           for k in (ACTION_TAGS_KEY, ACTION_TAG_EXCLUDE_KEY)}
+            holder_dict = {k: v for k, v in holder_dict.items()
+                           if v is not None}
+            chain = _inherit_tags([], holder_dict, base, probs)
+            _add_actions(acts, base, chain, probs, out)
     holder = getattr(entity, "id", None)
     for acts in out.values():
         for act in acts:
@@ -1079,6 +1102,73 @@ class SourceProxy:
         m = getattr(self._entity, "_match", None)
         if m is not None:
             m.surface_log(log)
+
+
+class StatusSourceProxy:
+    """`source` of an action a status grants (#412): its status instance
+    on the holder. `source.charges` reads the instance's field, else the
+    definition's at its level (as status_get); `source.charges -= 1`
+    writes the instance as status_set does (max_level holds, the status
+    hooks and lines fire)."""
+
+    __slots__ = ("_entity", "_status")
+
+    def __init__(self, entity: "Entity", sname: str):
+        object.__setattr__(self, "_entity", entity)
+        object.__setattr__(self, "_status", sname)
+
+    def _inst(self) -> Dict[str, Any]:
+        inst = self._entity.status.get(self._status)
+        if not isinstance(inst, dict):
+            raise AttributeError(
+                f"`{self._entity.id}` no longer holds status "
+                f"`{self._status}` (via source).")
+        return inst
+
+    def __getattr__(self, attr: str) -> Any:
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        inst = self._inst()
+        if attr in inst:
+            return copy.deepcopy(inst[attr])
+        m = self._entity._match
+        view = m.status_def_view(self._status, m.status_level(inst)) \
+            if m is not None else {}
+        if attr not in view:
+            raise AttributeError(
+                f"status `{self._entity.id}.{self._status}` has no value "
+                f"at '{attr}' (via source).")
+        return copy.deepcopy(view[attr])
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        if attr.startswith("_"):
+            object.__setattr__(self, attr, value)
+            return
+        from logic import (check_store_path, checked_status_value,
+                           check_status_self_grant, _own_value)
+        e = self._entity
+        m = e._match
+        inst = self._inst()
+        where = f"status '{e.id}.{self._status}'"
+        check_store_path(attr, "status path")
+        value = checked_status_value(attr, value, where)
+        check_status_self_grant(self._status, attr, value)
+        owned = _own_value(value)
+        before = copy.deepcopy(inst)
+        inst[attr] = owned
+        if m is not None:
+            m.surface_log(m._emit_status_diff(
+                e.id, self._status, before, copy.deepcopy(inst)))
+
+
+def make_source(entity: "Entity", container_path: str) -> Any:
+    """`source` for an action at `container_path` on `entity`: its var
+    container (SourceProxy), or its status instance for an action a status
+    grants (#412)."""
+    if container_path.startswith(STATUS_SOURCE_PREFIX):
+        return StatusSourceProxy(entity,
+                                 container_path[len(STATUS_SOURCE_PREFIX):])
+    return SourceProxy(entity, container_path)
 
 
 def _count_word(tok: str) -> bool:
@@ -1638,7 +1728,7 @@ async def run_action(
     # Build the action's eval bindings. SourceProxy/ArgsProxy
     # implement the body-side magic; cmd/fail are closure-built so
     # they can see this runner's match + buffer + allowlist.
-    source = SourceProxy(actor, action.container_path)
+    source = make_source(actor, action.container_path)
     args_proxy = ArgsProxy(args)
     cmd_allowlist = parse_cmd_allowlist(match.rules)
     # The other matches as they were before this level's first cmd() line
@@ -2387,7 +2477,7 @@ def action_condition_ok(action: Action, actor_id: str, match: "Match", *,
             action.condition,
             EvalCtx(this=match.current_entity_id(), target=actor_id,
                     extras=extras),
-            attr_bindings={"source": SourceProxy(actor,
+            attr_bindings={"source": make_source(actor,
                                                  action.container_path),
                            "args": ArgsProxy(dict(args or {}))})
         return bool(ok), ""
@@ -2662,6 +2752,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_status_event_depth", "_status_event_warned",
         "_damage_hook_depth", "_damage_hook_warned",
         "_grant_syncing", "_grant_dirty", "_grant_changes",
+        "_held_passive_cache",
         "_grant_warned",
         "_action_depth", "_runtime_buffer",
         # The mid-body choice queue + cursor must survive an action's

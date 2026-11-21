@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from logic import (COMMAND_USER, APPROVED_BY, VTTError, UnitFlags, jcopy, _own_value,
                    tag_filter_matches, ACTION_IMMUNE_FIELDS,
@@ -252,10 +252,39 @@ def _window_limit(m: Any, e: Any) -> int:
         return 1
 
 
+def _status_reaction_holders(m: Any) -> Set[str]:
+    """Units holding a status that grants a reaction (#412): one whose
+    definition or a level entry has an action with a `before` / `after`
+    half, or whose instance holds its own `actions`. Read live: few
+    definitions, and nothing when none grants one."""
+    def _reacts(acts: Any) -> bool:
+        return isinstance(acts, dict) and any(
+            isinstance(a, dict) and ("before" in a or "after" in a)
+            for a in acts.values())
+    defs = set()
+    for n, d in m.status_definitions.items():
+        if not isinstance(d, dict):
+            continue
+        if _reacts(d.get("actions")) or any(
+                isinstance(v, dict) and _reacts(v.get("actions"))
+                for v in (d.get("levels") or {}).values()):
+            defs.add(n)
+    out: Set[str] = set()
+    for eid, e in m.entities.items():
+        for sn, inst in e.status.items():
+            if sn in defs or (isinstance(inst, dict)
+                              and _reacts(inst.get("actions"))):
+                out.add(eid)
+                break
+    return out
+
+
 def _candidates(m: Any) -> List[str]:
     """Living units that may hold a reaction: those whose vars hold one,
-    and the riders of a unit holding one (a seat's reactions)."""
-    holders = m._uflags.holders_of(m, UnitFlags.REACTIONS)
+    those a status grants one (#412), and the riders of a unit holding
+    one (a seat's reactions)."""
+    holders = set(m._uflags.holders_of(m, UnitFlags.REACTIONS)) \
+        | _status_reaction_holders(m)
     out: List[str] = []
     for eid in holders:
         e = m.entities.get(eid)
@@ -392,12 +421,12 @@ def _condition_bindings(m: Any, uid: str, act: Any,
     """`source` for a reaction's condition and auto_when: its container,
     read-only (an expression can't assign), as its halves bind it (Y7: a
     condition reading `source.<path>` failed on the attribute rule)."""
-    from action import SourceProxy
+    from action import make_source
     eff, _extra, ract = mount_routing(m, uid, act, via)
     e = m.entities.get(eff)
     if e is None:
         return {}
-    return {"source": SourceProxy(e, ract.container_path)}
+    return {"source": make_source(e, ract.container_path)}
 
 
 _CONDITIONED_TARGETS = ("entity", "entity_list", "location", "location_list")
@@ -1032,7 +1061,8 @@ def _ordered(m: Any, ex: Dict[str, Any], picks: List[Dict[str, Any]],
 # ----------------------------------------------------------------------
 
 def has_holders(m: Any) -> bool:
-    return bool(m._uflags.holders_of(m, UnitFlags.REACTIONS))
+    return bool(m._uflags.holders_of(m, UnitFlags.REACTIONS)) \
+        or bool(_status_reaction_holders(m))
 
 
 class _Env:
