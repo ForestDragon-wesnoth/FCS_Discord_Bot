@@ -270,6 +270,29 @@ def name_text_lines(text: Any) -> List[str]:
     return [ln for ln in lines if ln]
 
 
+def name_text_split(lines: List[str], after: int, min_len: int = 0,
+                    scale: int = 1) -> List[str]:
+    """Name sprite lines with each one-word line longer than `min_len`
+    characters cut every `after` characters (both times `scale`, a
+    stretched body's width); `after` 0 cuts nothing. A line holding a
+    space (a hand-written break) stays whole."""
+    try:
+        after, min_len, scale = int(after), int(min_len), max(1, int(scale))
+    except (TypeError, ValueError):
+        return list(lines)
+    if after <= 0:
+        return list(lines)
+    after *= scale
+    min_len *= scale
+    out: List[str] = []
+    for ln in lines:
+        if " " in ln or len(ln) <= max(after, min_len):
+            out.append(ln)
+            continue
+        out.extend(ln[i:i + after] for i in range(0, len(ln), after))
+    return out
+
+
 # Sprite effects (#624, user design): records that change how a picture is
 # drawn in images (units, corpses, overlays, tiles, zones). A record is
 # {effect: <type>, <its fields>, priority, group, condition}; a bundle is a
@@ -5259,6 +5282,54 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Images only: the text colour of a name sprite "
             "(entity_sprite_fallback name_text): a palette name or #rrggbb. "
             "A unit's `sprite_label_color` var overrides it."
+        ),
+    },
+    "name_text_per_line_size": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Images only: how a name sprite (entity_sprite_fallback "
+            "name_text) sizes its lines. Off (default): every line takes "
+            "one size, the largest at which every line fits, so a short "
+            "word beside a long one is as small as the long one. On: each "
+            "line takes its own size. The lines too wide to grow fill the "
+            "width first, and the others share the height left over, each "
+            "as large as its width allows (\"Rare\" over \"Replicator\" "
+            "draws \"Rare\" larger)."
+        ),
+    },
+    "name_text_split_after": {
+        "default": 0,
+        "schema": {"type": "int", "min": 0, "max": 100},
+        "desc": (
+            "Images only: a name sprite's word longer than "
+            "name_text_split_min_length characters is cut into lines of this "
+            "many characters (0, the default: words are never cut). With 5 "
+            "and a minimum of 8, \"Rare Replicator\" is drawn as rare / "
+            "repli / cator, while \"Ranger\" stays whole. A line holding "
+            "spaces (a hand-written line break) isn't cut. "
+            "name_text_split_scales_with_width multiplies both numbers by a "
+            "stretched body's width."
+        ),
+    },
+    "name_text_split_min_length": {
+        "default": 0,
+        "schema": {"type": "int", "min": 0, "max": 1000},
+        "desc": (
+            "Images only: name_text_split_after cuts only words longer than "
+            "this many characters (default 0: every word longer than "
+            "name_text_split_after)."
+        ),
+    },
+    "name_text_split_scales_with_width": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Images only: on (default), name_text_split_after and "
+            "name_text_split_min_length are multiplied by the width in cells "
+            "of a multi-tile body whose name sprite is stretched across it "
+            "(sprite_mode stretch), so a 2-wide body cuts its words twice as "
+            "late. Off: the numbers apply as set."
         ),
     },
     "name_text_background_color": {
@@ -32089,6 +32160,25 @@ class Match:
                 "label_color": str(color).strip(),
                 "label_bg": str(bg).strip()}
 
+    def _name_text_fit(self, label: Optional[Dict[str, Any]], w: int,
+                       mode: str) -> Dict[str, Any]:
+        """A placement's name sprite keys: `label` with its words cut per
+        name_text_split_after (the numbers times the body's width when
+        it is stretched across it and name_text_split_scales_with_width
+        is on) and `label_fit` per_line under name_text_per_line_size."""
+        if not label:
+            return {}
+        out = dict(label)
+        r = self.rules
+        scale = (w if mode == "stretch" and
+                 r.get("name_text_split_scales_with_width", True) else 1)
+        out["label"] = "\n".join(name_text_split(
+            out["label"].split("\n"), r.get("name_text_split_after", 0),
+            r.get("name_text_split_min_length", 0), scale)) or out["label"]
+        if r.get("name_text_per_line_size", False):
+            out["label_fit"] = "per_line"
+        return out
+
     def entity_name_text(self, e: "Entity", pov_team: Optional[str] = None
                          ) -> Optional[Dict[str, Any]]:
         """The name sprite drawn for `e` in images (entity_sprite_fallback
@@ -33162,7 +33252,7 @@ class Match:
 
     _LEGEND_LOOK = ("kind", "sprite", "glyph", "tint", "opacity",
                     "glyph_tint", "glyph_opacity", "flip_h", "flip_v",
-                    "label", "label_color", "label_bg")
+                    "label", "label_color", "label_bg", "label_fit")
 
     def _scene_legend(self, scene: Dict[str, Any], pov_team: Optional[str],
                       mp: "Map") -> List[Dict[str, Any]]:
@@ -33267,7 +33357,7 @@ class Match:
                 "tint": tint, "opacity": 100,
                 "flip_h": fh, "flip_v": fv, "layer": eff_layer,
                 "effects": effects,
-                **(label or {}),
+                **self._name_text_fit(label, w, mode),
             })
             # Overlay sprites (status FX + overlay var), drawn over the entity
             # at their own layer (default 150). Footprint + mode follow the
@@ -33422,7 +33512,7 @@ class Match:
                     # always takes the corpse effects, so it reads as a body.
                     "glyph_effects": c_fx,
                     "flip_h": False, "flip_v": False, "layer": corpse_layer,
-                    **(label or {})})
+                    **self._name_text_fit(label, cw, c_mode)})
 
         if "entities" not in hidden:
             # Entity main pass (30): not glued/region/mounted.

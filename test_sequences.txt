@@ -48231,7 +48231,47 @@ while red's reads "Archmage / Vor". A dead unit lies as its name, greyed
 like any living sprite on a corpse. The legend lists each look with the
 name sprite's text.
 
-SCENARIO 1292 — Sprite effects on a unit: !ent effect, checks, order, group, a condition (#624)
+SCENARIO 1292 — Name sprite lines: words cut by length, a size per line, the width multiplier (name_text_split_after)
+---------------------------------------------------------------------------------------------------------------------
+
+!match new ns Ns 7 4
+!match use ns
+!system set default entity_sprite_fallback name_text
+!ent add rep "Rare Replicator" 10 1 1 5
+!ent add ran "Medic Ranger" 10 2 1 5
+!ent add drg "Ancient Dragonlord" 10 3 1 5 footprint_w=2 footprint_h=2
+!ent add ogr Ogre 10 6 1 5
+!ent set_var ogr sprite_label "Big Bad\nBrute"
+!map scene list
+?? name text 'Rare / Replicator' (white on black)
+!system set default name_text_split_after 5
+!system set default name_text_split_min_length 8
+!map scene list
+?? entity `rep` at (1,1) — glyph >, name text 'Rare / Repli / cator' (white on black)
+?? name text 'Medic / Ranger' (white on black)
+?? name text 'Ancient / Dragonlord' (white on black)
+?? name text 'Big Bad / Brute' (white on black)
+!system set default name_text_split_scales_with_width false
+!map scene list
+?? name text 'Ancient / Drago / nlord' (white on black)
+!system set default name_text_per_line_size true
+!map scene list
+?? name text 'Rare / Repli / cator' (white on black, a size per line)
+!system set default name_text_split_after -1
+?? ❌
+!assert "rule_get('name_text_split_after') == 5"
+
+Expected: with the rules off a name sprite has one word a line, as before.
+name_text_split_after 5 with name_text_split_min_length 8 cuts a word
+longer than 8 characters every 5: "Replicator" becomes "Repli" and "cator",
+while "Ranger" (6) stays whole. The 2-wide stretched dragon cuts its words
+at 10 past 16 under name_text_split_scales_with_width (on by default), so
+"Dragonlord" (10) stays whole; with the multiplier off it is cut like the
+rest. A hand-written line holding a space ("Big Bad") is never cut. With
+name_text_per_line_size on the scene marks the sprite "a size per line"
+(the renderer sizes each line on its own). A negative length is refused.
+
+SCENARIO 1293 — Sprite effects on a unit: !ent effect, checks, order, group, a condition (#624)
 ------------------------------------------------------------------------------------------------
 
 !match new fx1 Effects 8 5
@@ -48303,7 +48343,7 @@ with a field out of range (the record may be built one field at a time).
 A condition that fails to read leaves its record out, named under the
 scene list. `clear` drops the var.
 
-SCENARIO 1293 — Sprite effects from statuses, overlays, equipment, team data and passives (#624)
+SCENARIO 1294 — Sprite effects from statuses, overlays, equipment, team data and passives (#624)
 ---------------------------------------------------------------------------------------------------
 
 !match new fx2 Sources 8 5
@@ -48366,7 +48406,7 @@ priority (`!gpassive` / `!team passive` / `!passive effect`). A status's
 colour (a hex or r,g,b gives any colour). `!passive list` names a
 passive's effects, and they survive a restart.
 
-SCENARIO 1294 — The engine's looks as effects: team, acting unit, corpse; !system effect (#624)
+SCENARIO 1295 — The engine's looks as effects: team, acting unit, corpse; !system effect (#624)
 -------------------------------------------------------------------------------------------------
 
 !match new fx3 Looks 8 5
@@ -48428,7 +48468,7 @@ then holds one record, as the acting mark is left out of it). A rule's
 record may carry a condition too. A corpse with its own corpse sprite is
 drawn as it is; its glyph takes the corpse effects.
 
-SCENARIO 1295 — Sprite effects on tiles and zones: templates, definitions, merging by name, hide (#624)
+SCENARIO 1296 — Sprite effects on tiles and zones: templates, definitions, merging by name, hide (#624)
 ---------------------------------------------------------------------------------------------------------
 
 !match new fx4 Ground 8 5
@@ -48479,7 +48519,7 @@ data, effects included, into the tile, as it copies any data. A zone reads
 its definition's the same way (`!zone def effect` / `!zone effect`). A
 condition reads with tile_x / tile_y (zone_name for a zone) bound.
 
-SCENARIO 1296 — Sprite effects to a view: a disguise, a hidden status, a private var (#624)
+SCENARIO 1297 — Sprite effects to a view: a disguise, a hidden status, a private var (#624)
 ---------------------------------------------------------------------------------------------
 
 !match new fx5 Views 8 5

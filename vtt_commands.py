@@ -18784,7 +18784,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     what += (f", name text '"
                              + p["label"].replace("\n", " / ")
                              + f"' ({p.get('label_color')} on "
-                               f"{p.get('label_bg')})")
+                               f"{p.get('label_bg')}"
+                             + (", a size per line"
+                                if p.get("label_fit") == "per_line" else "")
+                             + ")")
                 act = ", acting" if p.get("active") else ""
                 # The team look (team_sprite_effects) is named once, in the
                 # header, not on every unit.

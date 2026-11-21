@@ -580,10 +580,12 @@ class SceneRenderer:
                 img = self.name_text_image(label, p.get("label_color"),
                                            p.get("label_bg"),
                                            max(1, round(bw * k)),
-                                           max(1, round(bh * k)))
+                                           max(1, round(bh * k)),
+                                           fit=p.get("label_fit"))
             else:
                 img = self.name_text_image(label, p.get("label_color"),
-                                           p.get("label_bg"), cell, cell)
+                                           p.get("label_bg"), cell, cell,
+                                           fit=p.get("label_fit"))
         opacity = int(p.get("opacity", 100))
         glyph = p.get("glyph")
         has_glyph = isinstance(glyph, str) and bool(glyph)
@@ -878,14 +880,17 @@ class SceneRenderer:
         return out
 
     def name_text_image(self, text: str, color: Any, bg: Any,
-                        pw: int, ph: int) -> "Image.Image":
+                        pw: int, ph: int, fit: Any = None) -> "Image.Image":
         """A pw x ph name sprite: `bg` filling it, the lines of `text` (one
         per line break) centred in `color` at the largest size at which
         every line fits. A line too wide even at the smallest size
         (_NAME_TEXT_MIN of the short side) is cut with "...", and lines
         that don't fit below each other are dropped, the last kept one
-        ending with "..."."""
-        ck = (text, str(color), str(bg), pw, ph)
+        ending with "...". With `fit` per_line (name_text_per_line_size)
+        each line takes its own size: as large as its width allows, the
+        lines whose width stops them keeping that size and the others
+        sharing the height left over (`_per_line_sizes`)."""
+        ck = (text, str(color), str(bg), pw, ph, fit)
         got = _NAME_TEXT_CACHE.get(ck)
         if got is not None:
             return got
@@ -917,6 +922,23 @@ class SceneRenderer:
         lo = max(6, round(min(pw, ph) * _NAME_TEXT_MIN))
         hi = max(lo, ah)
         size = lo
+        if fit == "per_line" and len(lines) > 1:
+            sizes = self._per_line_sizes(lines, src, lo, hi, aw, ah,
+                                         width, line_h)
+            if sizes is not None:
+                fonts = [_load_font(src, z) for z in sizes]
+                hs = [line_h(f) for f in fonts]
+                top = (ph - sum(hs)) // 2
+                for ln, f, lh in zip(lines, fonts, hs):
+                    b = d.textbbox((0, 0), ln, font=f)
+                    x = (pw - (b[2] - b[0])) // 2 - b[0]
+                    d.text((x, top), ln, font=f,
+                           fill=tuple(fg[:3]) + (255,))
+                    top += lh
+                if len(_NAME_TEXT_CACHE) >= 512:
+                    _NAME_TEXT_CACHE.clear()
+                _NAME_TEXT_CACHE[ck] = img
+                return img
         if fits(lo):
             while lo < hi:
                 mid = (lo + hi + 1) // 2
@@ -949,6 +971,34 @@ class SceneRenderer:
             _NAME_TEXT_CACHE.clear()
         _NAME_TEXT_CACHE[ck] = img
         return img
+
+    @staticmethod
+    def _per_line_sizes(lines, src, lo, hi, aw, ah, width, line_h):
+        """Per-line font sizes for a name sprite, or None when the lines
+        don't fit below each other even at the smallest size `lo` (the
+        uniform path then cuts them). Each line's cap is the largest size
+        at which it fits the width `aw`; a common ceiling c, the largest
+        whose capped sizes min(cap, c) stack within the height `ah`, then
+        limits the lines whose width would let them grow past it, so the
+        widest lines keep their size and the others share what is left."""
+        def largest(ok, a, b):
+            # The largest size in [a, b] passing `ok` (a passes or is a).
+            while a < b:
+                mid = (a + b + 1) // 2
+                if ok(mid):
+                    a = mid
+                else:
+                    b = mid - 1
+            return a
+        caps = [largest(lambda z, ln=ln: width(ln, _load_font(src, z)) <= aw,
+                        lo, hi) for ln in lines]
+
+        def stack(c):
+            return sum(line_h(_load_font(src, min(cap, c))) for cap in caps)
+        if stack(lo) > ah:
+            return None
+        c = largest(lambda z: stack(z) <= ah, lo, max(caps))
+        return [min(cap, c) for cap in caps]
 
     def _fill_glyph(self, glyph, bw, bh, tint, opacity, box=None):
         """The glyph fallback of a stretch-mode body: on a bw x bh body, the
