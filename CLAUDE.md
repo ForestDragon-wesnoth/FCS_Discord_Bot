@@ -2212,7 +2212,8 @@ hardcodes**.
   the image scene (a glyph-drawn unit, the outline) and the GUI agree;
   `legend_label_entity` appends the statuses ("Ogre (stun, burn)").
   `entity_has_custom_glyph` ignores it (a region part doesn't start
-  drawing over its parent). Sprite effects from statuses are idea #624.
+  drawing over its parent). A status's sprite effects (#624, `!status
+  effect`) are in §7.15.
 - **Visibility** (user request, 1246): which team views see a status is
   its own `visibility_condition` (`logic.STATUS_VISIBILITY_FIELD`,
   `status_field`: instance key, definition, level entries; `!status
@@ -3575,9 +3576,9 @@ hardcodes**.
   `show_borders`; per-tile overrides), `sprite_mode` (stretch default / single /
   tile), z-layers (`sprite_layer_*`, per-item `sprite_layer`), overlays
   (status definition / instance `sprite`, the `overlays` var), corpse look
-  (`corpse_sprite(s)` > `corpse_default_sprite` > the living sprite greyed by
-  `corpse_sprite_tint` / `_opacity`), team colour as an outline
-  (`team_outline_width/opacity`, `team_tint_opacity`), colour-only cells
+  (`corpse_sprite(s)` > `corpse_default_sprite` > the living sprite drawn
+  with `corpse_sprite_effects`), team colour as an outline (the
+  `team_sprite_effects` rule), sprite effects (below), colour-only cells
   (`tint_fill_opacity`), legend, rulers, highlights (`preview_color` /
   `preview_opacity`). `sprite_render.SceneRenderer` draws it; glyphs outside
   ASCII use a font that has them (`fonts/` folders, then system fonts). A
@@ -3649,11 +3650,58 @@ hardcodes**.
   902). ASCII
   makes its shown cells bold (`1;` in the ANSI run code) or, without
   colour, adds `active_unit_line_format` under the map; the scene marks its
-  placements `active` and `SceneRenderer` outlines them while
-  `active_unit_image_highlight` is on, in place of the team outline: the
-  team colour brightened halfway to white, or `active_unit_outline_color`
-  (white) without a team colour, `active_unit_outline_width` thick, sprites
-  and glyphs alike; `!map scene list` names the acting placement (895).
+  placements `active` and adds the `active_unit_sprite_effects` records to
+  them (default an outline in `team_light`, white without a team colour,
+  ringed around the team outline; `{}` = images mark nothing), sprites and
+  glyphs alike; `!map scene list` names the acting placement (895, 1294).
+- **Sprite effects** (#624, user design, 1292-1296): records that change
+  how a picture is drawn in images (`logic.SPRITE_EFFECT_FIELDS`: tint,
+  blend (multiply / screen / overlay / add / subtract / difference /
+  lighten / darken), hue, saturation, greyscale, brightness, contrast,
+  invert, opacity, flip, rotate, scale, outline, glow), each `{effect,
+  <fields>, priority, group, condition}`; a bundle is a list or a dict of
+  named records (one record alone too). Colours: a palette name, `#rrggbb`,
+  an [r, g, b] list, or `team` / `team_light` (the placement's colour,
+  `fallback` when it has none; the renderer resolves them).
+  `check_sprite_effect` checks a record (`partial` for a raw var write
+  building one field at a time, `check_effect_write` in write_var).
+  Sources of a unit (`Match.entity_effect_items`, in order): its statuses'
+  `sprite_effects` (`status_field`, so level entries merge by name; status
+  visibility applies), its effects var (`sprite_effects_var`, a
+  VAR_NAME_RULES entry), `sprite_effects` bundles under the
+  `sprite_effect_sources` roots (`__sprite_effect_sources` / `_add`), its
+  team data's, then the passives on it (`Passive.sprite_effects`, saved;
+  global / team / own / default by priority); under a disguise fooling the
+  view only the disguise's own key and the global passives'. Vars read
+  through the command's reader, so a private path doesn't draw.
+  `entity_sprite_effects` adds the `team_sprite_effects` rule's records
+  (`picture_only`: a glyph-drawn unit skips them) and, for the acting
+  placement, `active_unit_sprite_effects`; `corpse_sprite_effects` gives a
+  corpse drawn with its living sprite its `effects` and any corpse's glyph
+  its `glyph_effects`; tiles and zones merge their template's /
+  definition's bundle with their own by name (`merged_effect_bundle`; a
+  name set to null hides an inherited one); a status's `overlay_effects`
+  and an `overlays` var record's `effects` act on that overlay. The three
+  look rules hold JSON text (`_check_effects_rule`). `_read_effects` reads
+  each condition (expression; self = the unit, `pov_team`, tile_x / tile_y
+  / zone_name / corpse_id bound; failing = left out, named through
+  `EFFECT_PROBLEMS` under `!map scene list`; `EFFECT_READING` stops a
+  condition reading effects from reading conditions again) and
+  `settle_effects` orders them: highest priority first, ties as gathered,
+  one record per `group`. `SceneRenderer._apply_effects` applies the
+  picture effects in order to the source picture (sprite, name sprite, a
+  glyph cell, or a stretch body's whole glyph drawn first), then
+  `_edge_rings` draws outline / glow rings around the built body, each
+  outside the ones before it (inward from the body's border where the
+  shape fills it); a glow's outer halo goes under the picture. The legend
+  swatch draws a placement's effects but the acting mark. Commands: the
+  `effect` grammar (`edit_effects`, `effect_usage`: add / remove / list /
+  clear, `hide` on a tile or zone) on `!ent`, `!status` (and `level ...
+  sprite_effects`, `overlay_effect`), `!passive` / `!gpassive` / `!team
+  passive` / `!defpassive`, `!zone`, `!zone def`, `!tile`, `!tile def`,
+  `!system effect <system> team|active|corpse`; `!help effects`;
+  `sprite_effects_of(eid)` (read, loopable; the acting mark left out).
+  Prefabs and system imports check carried bundles.
 - **Name sprites** (user design, 1290-1291): `entity_sprite_fallback`
   (glyph default / `name_text`; a unit's `sprite_fallback` var wins)
   draws a unit without a sprite of its own as its name in images: the
@@ -3686,7 +3734,8 @@ hardcodes**.
   the image legend lists every look in the window (ASCII only top-layer
   glyphs); a unit under `entity_sprite_fallback name_text` is its name in
   images and its glyph in ASCII; layer order follows `sprite_layer_*`; the acting unit is bold
-  (or named under a plain map) in ASCII and outlined in images; a void
+  (or named under a plain map) in ASCII and outlined in images; sprite
+  effects are images only; a void
   cell is `void_glyph` (a space) in ASCII and nothing in images (no
   ground, border or fog; `void_sprite` when set), and under
   `void_under_fog fog` a void the view can't see is fog in both (the

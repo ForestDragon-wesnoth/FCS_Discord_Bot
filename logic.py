@@ -270,6 +270,282 @@ def name_text_lines(text: Any) -> List[str]:
     return [ln for ln in lines if ln]
 
 
+# Sprite effects (#624, user design): records that change how a picture is
+# drawn in images (units, corpses, overlays, tiles, zones). A record is
+# {effect: <type>, <its fields>, priority, group, condition}; a bundle is a
+# list of records or a dict of named ones (one record alone counts too).
+# Units collect them from statuses, their effects var, containers under the
+# sprite_effect_sources roots, team data, passives and the engine rules
+# (team / active / corpse looks); tiles and zones from their own data and
+# their template's / definition's. Graphics only: text maps ignore them.
+SPRITE_EFFECTS_KEY = "sprite_effects"
+OVERLAY_EFFECTS_KEY = "overlay_effects"
+SPRITE_BLEND_MODES = ("multiply", "screen", "overlay", "add", "subtract",
+                      "difference", "lighten", "darken")
+# Colour words resolved per placement: the unit's colour (its `color` var,
+# a status colour, else its team colour) and that colour brightened halfway
+# to white. A record whose colour word has nothing to resolve to uses its
+# `fallback`, else it is skipped.
+SPRITE_TEAM_COLORS = ("team", "team_light")
+# Per type: field -> (kind, ...). ("num", lo, hi, default) with default None
+# = required; ("color", required) ; ("word", choices, default).
+SPRITE_EFFECT_FIELDS: Dict[str, Dict[str, Tuple[Any, ...]]] = {
+    "tint": {"color": ("color", True), "fallback": ("color", False),
+             "strength": ("num", 0, 100, 100)},
+    "blend": {"color": ("color", True), "fallback": ("color", False),
+              "mode": ("word", SPRITE_BLEND_MODES, "multiply"),
+              "strength": ("num", 0, 100, 100)},
+    "hue": {"degrees": ("num", -360, 360, None)},
+    "saturation": {"amount": ("num", 0, 1000, None)},
+    "greyscale": {"strength": ("num", 0, 100, 100)},
+    "brightness": {"amount": ("num", 0, 1000, None)},
+    "contrast": {"amount": ("num", 0, 1000, None)},
+    "invert": {"strength": ("num", 0, 100, 100)},
+    "opacity": {"amount": ("num", 0, 100, None)},
+    "flip": {"axis": ("word", ("h", "v", "both"), "h")},
+    "rotate": {"degrees": ("num", -360, 360, None)},
+    "scale": {"percent": ("num", 1, 1000, None)},
+    "outline": {"color": ("color", True), "fallback": ("color", False),
+                "width": ("num", 1, 32, 3), "opacity": ("num", 0, 100, 100)},
+    "glow": {"color": ("color", True), "fallback": ("color", False),
+             "width": ("num", 1, 64, 8), "opacity": ("num", 0, 100, 100)},
+}
+SPRITE_EFFECT_ALIASES = {"grayscale": "greyscale", "gray": "greyscale",
+                         "grey": "greyscale"}
+SPRITE_EFFECT_COMMON = ("effect", "priority", "group", "condition")
+# Drawn around the finished picture (after every other effect), each ring
+# outside the ones before it.
+SPRITE_EDGE_EFFECTS = ("outline", "glow")
+_HEX_RGB_RE = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})\Z")
+
+
+def sprite_effect_color_ok(v: Any) -> bool:
+    """Whether `v` is a colour an effect takes: a palette name, `#rrggbb`
+    (or `#rgb`), an [r, g, b] list of whole numbers 0-255, or `team` /
+    `team_light`."""
+    if isinstance(v, str):
+        t = v.strip().lower()
+        return t in TEXT_COLORS or t in SPRITE_TEAM_COLORS \
+            or bool(_HEX_RGB_RE.match(t))
+    if isinstance(v, (list, tuple)) and len(v) == 3:
+        return all(isinstance(c, int) and not isinstance(c, bool)
+                   and 0 <= c <= 255 for c in v)
+    return False
+
+
+def _effect_color_text(v: Any) -> str:
+    return (f"[{', '.join(str(c) for c in v)}]" if isinstance(v, list)
+            else str(v))
+
+
+def check_sprite_effect(rec: Any, partial: bool = False) -> Dict[str, Any]:
+    """One sprite effect record, checked: a JSON object whose `effect`
+    names a type of SPRITE_EFFECT_FIELDS (or an alias), each field in
+    range, no field the type lacks, `priority` a number, `group` text,
+    `condition` text (an expression, read when drawn). Returns the record
+    with the alias resolved and every default filled in. `partial` (a raw
+    var write building a record one field at a time) lets required fields,
+    and the type itself, be missing, and fills nothing in."""
+    if not isinstance(rec, dict):
+        raise VTTError(f"an effect is an object such as "
+                       f"{{\"effect\": \"tint\", \"color\": \"red\"}}, "
+                       f"got {rec!r}.")
+    eff = rec.get("effect")
+    if eff is None and partial:
+        fields: Dict[str, Tuple[Any, ...]] = {}
+        for spec in SPRITE_EFFECT_FIELDS.values():
+            fields.update(spec)
+    else:
+        if not isinstance(eff, str):
+            raise VTTError(f"an effect needs `effect`, one of: "
+                           f"{', '.join(SPRITE_EFFECT_FIELDS)}.")
+        eff = SPRITE_EFFECT_ALIASES.get(eff.strip().lower(),
+                                        eff.strip().lower())
+        if eff not in SPRITE_EFFECT_FIELDS:
+            raise VTTError(f"`{rec.get('effect')}` isn't an effect; the "
+                           f"effects are {', '.join(SPRITE_EFFECT_FIELDS)}.")
+        fields = SPRITE_EFFECT_FIELDS[eff]
+    out: Dict[str, Any] = {} if partial else {"effect": eff}
+    if eff is not None:
+        out["effect"] = eff
+    for k, v in rec.items():
+        if k == "effect":
+            continue
+        if k == "priority":
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                raise VTTError(f"an effect's `priority` is a number, "
+                               f"got {v!r}.")
+            out[k] = v
+            continue
+        if k in ("group", "condition"):
+            if not isinstance(v, str):
+                raise VTTError(f"an effect's `{k}` is text, got {v!r}.")
+            out[k] = v
+            continue
+        spec = fields.get(k)
+        if spec is None:
+            known = [f for f in SPRITE_EFFECT_COMMON[1:]] + list(fields)
+            raise VTTError(f"`{k}` isn't a field of "
+                           f"{('a `' + eff + '` effect') if eff else 'an effect'}"
+                           f" (fields: {', '.join(known)}).")
+        kind = spec[0]
+        if kind == "num":
+            lo, hi = spec[1], spec[2]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v) or not lo <= v <= hi:
+                raise VTTError(f"an effect's `{k}` is a number from {lo} to "
+                               f"{hi}, got {v!r}.")
+            out[k] = int(v) if float(v).is_integer() else v
+        elif kind == "color":
+            if not sprite_effect_color_ok(v):
+                raise VTTError(
+                    f"an effect's `{k}` is a colour name, #rrggbb, an "
+                    f"[r, g, b] list (0-255) or team / team_light, got "
+                    f"{_effect_color_text(v)!s}.")
+            out[k] = list(v) if isinstance(v, (list, tuple)) \
+                else v.strip().lower()
+        elif kind == "word":
+            w = v.strip().lower() if isinstance(v, str) else v
+            if w not in spec[1]:
+                raise VTTError(f"an effect's `{k}` is one of "
+                               f"{', '.join(spec[1])}, got {v!r}.")
+            out[k] = w
+    if not partial:
+        for k, spec in fields.items():
+            if k in out:
+                continue
+            if spec[0] == "num":
+                if spec[3] is None:
+                    raise VTTError(f"a `{eff}` effect needs `{k}` (a number "
+                                   f"from {spec[1]} to {spec[2]}).")
+                out[k] = spec[3]
+            elif spec[0] == "color" and spec[1]:
+                raise VTTError(f"a `{eff}` effect needs `color`.")
+            elif spec[0] == "word":
+                out[k] = spec[2]
+        out.setdefault("priority", 0)
+    return out
+
+
+def sprite_effect_items(bundle: Any) -> List[Tuple[str, Any]]:
+    """(key, record) per record of an effects bundle: a list (keys are the
+    indexes), a dict of named records, or one record alone (a dict holding
+    `effect` as text; key "")."""
+    if isinstance(bundle, list):
+        return [(str(i), r) for i, r in enumerate(bundle)]
+    if isinstance(bundle, dict):
+        if isinstance(bundle.get("effect"), str):
+            return [("", bundle)]
+        return [(str(k), r) for k, r in bundle.items()]
+    return []
+
+
+def check_sprite_effects(bundle: Any, what: str,
+                         partial: bool = False) -> None:
+    """Every record of an effects bundle checked (check_sprite_effect),
+    refused naming `what` and the record. A bundle is a list or a dict
+    (None / absent = none)."""
+    if bundle is None:
+        return
+    if not isinstance(bundle, (list, dict)):
+        raise VTTError(f"{what} is a list of effects or an object of named "
+                       f"ones, got {bundle!r}.")
+    for key, rec in sprite_effect_items(bundle):
+        if rec is None and isinstance(bundle, dict):
+            continue  # a dict entry set to null takes an inherited one away
+        try:
+            check_sprite_effect(rec, partial=partial)
+        except VTTError as ex:
+            name = f" `{key}`" if key else ""
+            raise VTTError(f"{what}{name}: {ex}")
+
+
+def sprite_effect_text(rec: Dict[str, Any], source: bool = True) -> str:
+    """One effect record for a reader: its type and fields in order, then
+    its priority / group when set and, with `source`, where it comes from
+    (`hue -40 [status frozen]`)."""
+    eff = rec.get("effect")
+    parts = [str(eff)]
+    for k, spec in SPRITE_EFFECT_FIELDS.get(eff, {}).items():
+        if k in rec and rec[k] not in (None, ""):
+            v = rec[k]
+            if spec[0] in ("num", "word") and v == spec[-1]:
+                continue          # the default
+            parts.append(f"{k}={_effect_color_text(v) if isinstance(v, list) else v}")
+    if rec.get("priority"):
+        parts.append(f"priority={rec['priority']}")
+    if rec.get("group"):
+        parts.append(f"group={rec['group']}")
+    if rec.get("condition"):
+        parts.append("(conditional)")
+    if rec.get("picture_only"):
+        parts.append("(on a picture only)")
+    text = " ".join(parts)
+    if source and rec.get("source"):
+        text += f" [{rec['source']}]"
+    return text
+
+
+# Lines naming the malformed records and failing conditions met while a
+# scene is built (`!map scene list` prints them); None outside one.
+EFFECT_PROBLEMS: "contextvars.ContextVar[Optional[List[str]]]" = (
+    contextvars.ContextVar("EFFECT_PROBLEMS", default=None))
+
+
+def check_effect_write(path: str, value: Any, key: str, where: str) -> None:
+    """A unit var write at or under the effects var `key` (#624), checked
+    loosely (a record may be built one field at a time): the bundle, a
+    record or a field must be one an effect can hold."""
+    segs = path.split(".") if path else []
+    if not segs or segs[0] != key:
+        if not segs and isinstance(value, dict) and key in value:
+            check_sprite_effects(value[key], f"{where}: `{key}`",
+                                 partial=True)
+        return
+    if len(segs) == 1:
+        check_sprite_effects(value, f"{where}: `{key}`", partial=True)
+    elif len(segs) == 2:
+        if value is not None:
+            try:
+                check_sprite_effect(value, partial=True)
+            except VTTError as ex:
+                raise VTTError(f"{where}: `{path}`: {ex}")
+    elif len(segs) == 3:
+        try:
+            check_sprite_effect({segs[2]: value}, partial=True)
+        except VTTError as ex:
+            raise VTTError(f"{where}: `{path}`: {ex}")
+    elif segs[2] not in ("color", "fallback"):
+        raise VTTError(f"{where}: `{path}`: an effect's fields hold one "
+                       f"value each.")
+
+
+# Set while a unit's effect conditions are read, so a condition reading
+# sprite_effects_of() doesn't read conditions again without end.
+EFFECT_READING: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "EFFECT_READING", default=False)
+
+
+def merged_effect_bundle(*bundles: Any) -> List[Tuple[str, Any]]:
+    """Effects bundles merged base first (a template's, then a tile's own):
+    named records replace the same name, a name set to null takes it away;
+    list items and lone records always add."""
+    named: Dict[str, Any] = {}
+    plain: List[Tuple[str, Any]] = []
+    for i, b in enumerate(bundles):
+        if isinstance(b, dict) and not isinstance(b.get("effect"), str):
+            for k, r in b.items():
+                if r is None:
+                    named.pop(str(k), None)
+                else:
+                    named[str(k)] = r
+        else:
+            plain += [(f"{i}.{k}" if k else str(i), r)
+                      for k, r in sprite_effect_items(b)]
+    return list(named.items()) + plain
+
+
 # Transforms and statuses: a status that arrived with a form records the
 # stash path of that transform here, so reverting it takes the status back;
 # a stash records the flavor of the transform that made it (`merge` for
@@ -5049,36 +5325,59 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "haze. Only used by render_scene (fog_glyph drives text fog)."
         ),
     },
-    "team_outline_width": {
-        "default": 3,
-        "schema": {"type": "int", "min": 0, "max": 50},
+    "team_sprite_effects": {
+        "default": '{"team_outline": {"effect": "outline", "color": "team", '
+                   '"width": 3}}',
+        "schema": {"type": "str"},
         "desc": (
-            "Graphics only: thickness of the outline drawn in a unit's colour "
-            "(its `color` var, else its team colour) around the edge of its "
-            "sprite, in pixels at sprite_cell_size cells (it scales with the "
-            "cell, so zoom and image size don't change how it looks). Where "
-            "the sprite fills its cells to the border, the outline runs just "
-            "inside the cell edges. 0 = no outline. Units drawn as a glyph "
-            "keep their coloured glyph instead."
+            "Graphics only: the sprite effects (#624, `!help effects`) every "
+            "unit drawn as a picture (its sprite or a name sprite; a glyph "
+            "is already drawn in its colour) gets, as JSON: a list of "
+            "effect records or an object of named ones. The colour words "
+            "`team` / `team_light` read the unit's colour (its `color` var, "
+            "a status colour, else its team colour); a unit without one "
+            "skips such a record unless it holds a `fallback` colour. "
+            "Default: an outline 3 pixels wide in the unit's colour. Add a "
+            "`tint` record for a tinted sprite; `{}` = nothing. Edit with "
+            "`!system effect <system> team ...` or `!system set`."
         ),
     },
-    "team_outline_opacity": {
-        "default": 100,
-        "schema": {"type": "int", "min": 0, "max": 100},
+    "corpse_sprite_effects": {
+        "default": '{"corpse_grey": {"effect": "greyscale"}, '
+                   '"corpse_fade": {"effect": "opacity", "amount": 50}}',
+        "schema": {"type": "str"},
         "desc": (
-            "Graphics only: opacity (0-100 percent) of the team_outline_width "
-            "outline."
+            "Graphics only: the sprite effects (#624, `!help effects`) of a "
+            "corpse drawn with the dead unit's LIVING sprite (no corpse "
+            "sprite of its own and corpse_default_sprite empty), as JSON, "
+            "so the body reads as dead; also its glyph when its picture "
+            "can't be loaded. Default greyscale at half opacity; `{}` = "
+            "drawn as it was alive. A corpse sprite (the unit's "
+            "`corpse_sprite` var or corpse_default_sprite) is drawn as it "
+            "is. Edit with `!system effect <system> corpse ...`."
         ),
     },
-    "team_tint_opacity": {
-        "default": 0,
-        "schema": {"type": "int", "min": 0, "max": 100},
+    "sprite_effects_var": {
+        "default": "sprite_effects",
+        "schema": {"type": "str"},
         "desc": (
-            "Graphics only: how strongly a unit's sprite is tinted with its "
-            "colour (its `color` var, else its team colour), 0-100 percent. "
-            "100 = the sprite multiplied by the colour (pure red wipes out "
-            "greens and blues); 0 (default) = no tint, the outline "
-            "(team_outline_width) marks the team instead."
+            "The unit var holding its own sprite effects (#624, `!help "
+            "effects`): a list of effect records or an object of named "
+            "ones, drawn in images on the unit (`!ent effect` edits it). A "
+            "disguise's own key of this name stands in for the unit's "
+            "effects to the views it fools. Graphics only."
+        ),
+    },
+    "sprite_effect_sources": {
+        "default": "equipped",
+        "schema": {"type": "str", "var_roots": True},
+        "desc": (
+            "Comma list of var roots whose containers lend their holder "
+            "sprite effects (#624): every `sprite_effects` bundle found "
+            "under them is drawn on the unit (a glowing sword glows its "
+            "wielder). Per unit, a `__sprite_effect_sources` list replaces "
+            "this and `__sprite_effect_sources_add` extends it. Empty = no "
+            "container lends any."
         ),
     },
     "tint_fill_opacity": {
@@ -5205,28 +5504,6 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`entity[self].overlays.flame.sprite = \"flame\"`)."
         ),
     },
-    "corpse_sprite_tint": {
-        "default": "gray",
-        "schema": {"type": "str"},
-        "desc": (
-            "Tint the surface applies to a corpse drawn with the dead unit's "
-            "LIVING sprite (it has no corpse sprite of its own and "
-            "corpse_default_sprite is empty), so the body reads as dead — "
-            "default 'gray' (desaturate). Empty = no tint. Also used for a "
-            "corpse's glyph when its picture can't be loaded."
-        ),
-    },
-    "corpse_sprite_opacity": {
-        "default": 50,
-        "schema": {"type": "int", "min": 0, "max": 100},
-        "desc": (
-            "Opacity (0-100 percent) of a corpse drawn with the dead unit's "
-            "living sprite, and of a corpse's glyph. Default 50 (a "
-            "semi-transparent body). Combined with corpse_sprite_tint. A "
-            "corpse sprite (the unit's `corpse_sprite` var or "
-            "corpse_default_sprite) is drawn as-is."
-        ),
-    },
     "corpse_default_sprite": {
         "default": "",
         "schema": {"type": "str"},
@@ -5234,8 +5511,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Sprite KEY every corpse uses when its unit has no corpse sprite "
             "of its own (the `corpse_sprites.<facing>` / `corpse_sprite` "
             "vars), drawn as-is (a pile of bones, a blood stain). Empty = such "
-            "a corpse shows the unit's living sprite, greyed and faded by "
-            "corpse_sprite_tint / corpse_sprite_opacity. Graphics only."
+            "a corpse shows the unit's living sprite drawn with "
+            "corpse_sprite_effects (greyed and faded). Graphics only."
         ),
     },
     "sprite_cell_size": {
@@ -6357,8 +6634,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Mark the unit whose turn it is on maps (off by default): its "
             "glyph is bold on surfaces with ANSI colour, a plain-text map "
-            "ends with active_unit_line_format, and images outline it "
-            "(active_unit_image_highlight). A glued part's or a hidden "
+            "ends with active_unit_line_format, and images draw it with "
+            "active_unit_sprite_effects (an outline by default). A glued part's or a hidden "
             "rider's turn marks the body / vehicle drawn for it; nothing is "
             "marked before the first turn or where the channel's view can't "
             "see it."
@@ -6374,32 +6651,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "viewers outside its team). Empty = no line."
         ),
     },
-    "active_unit_image_highlight": {
-        "default": True,
-        "schema": {"type": "bool"},
+    "active_unit_sprite_effects": {
+        "default": '{"acting": {"effect": "outline", "color": "team_light", '
+                   '"fallback": "white", "width": 3}}',
+        "schema": {"type": "str"},
         "desc": (
-            "Graphics, with active_unit_highlight on: outline the unit whose "
-            "turn it is, around its sprite or glyph and in place of its "
-            "team outline: its team colour brightened toward white, or "
-            "active_unit_outline_color when it has no team colour. False = "
-            "images mark nothing."
-        ),
-    },
-    "active_unit_outline_color": {
-        "default": "white",
-        "schema": {"type": "str", "color": True},
-        "desc": (
-            "Graphics: the active unit's outline colour for a unit without "
-            "a team colour (a colour name or #rrggbb)."
-        ),
-    },
-    "active_unit_outline_width": {
-        "default": 3,
-        "schema": {"type": "int", "min": 1, "max": 32},
-        "desc": (
-            "Graphics: thickness of the active unit's outline at "
-            "sprite_cell_size cells (scaled with the cell size, like "
-            "team_outline_width)."
+            "Graphics, with active_unit_highlight on: the sprite effects "
+            "(#624, `!help effects`) of the unit drawn for the one whose "
+            "turn it is, as JSON (a list of effect records or an object of "
+            "named ones), on its sprite or glyph alike. Default: an outline "
+            "in its colour brightened toward white (white without a "
+            "colour), drawn around its team outline. `{}` = images mark "
+            "nothing. Edit with `!system effect <system> active ...`."
         ),
     },
     "reminder_message_format": {
@@ -7162,7 +7425,25 @@ def _check_label_color_rule(key: str, raw: str) -> str:
     return v.lower() if v.lower() in TEXT_COLORS else v
 
 
+def _check_effects_rule(key: str, raw: str) -> str:
+    """A rule holding sprite effects as JSON (#624): a list of records or an
+    object of named ones, each checked; empty text = none."""
+    text = raw.strip()
+    if not text:
+        return "{}"
+    try:
+        val = json.loads(text)
+    except ValueError as ex:
+        raise VTTError(f"Setting '{key}' takes JSON: a list of effects or an "
+                       f"object of named ones ({ex}).")
+    check_sprite_effects(val, f"Setting '{key}'")
+    return json.dumps(val, ensure_ascii=False)
+
+
 _FORMAT_RULE_CHECKS = {
+    "team_sprite_effects": _check_effects_rule,
+    "corpse_sprite_effects": _check_effects_rule,
+    "active_unit_sprite_effects": _check_effects_rule,
     "name_text_color": _check_label_color_rule,
     "name_text_background_color": _check_label_color_rule,
     "preview_glyph": _check_glyph_rule,
@@ -7278,14 +7559,6 @@ def _coerce_rule_value(key: str, raw_value: str):
                                f"roots (`equipped,worn`): no empty word, "
                                f"spaces, empty path segment or `__` name.")
             return ",".join(got) if raw_value.strip() else ""
-        if spec.get("color"):
-            v = raw_value.strip()
-            if v.lower() not in TEXT_COLORS and not re.fullmatch(
-                    r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", v):
-                raise VTTError(f"Setting '{key}' takes a colour name ("
-                               f"{', '.join(sorted(TEXT_COLORS))}) or "
-                               f"#rrggbb, got `{raw_value}`.")
-            return v
         if key in _FORMAT_RULE_CHECKS:
             # Rules holding a small format: a typo used to be stored and
             # then read as nothing (`hp::l5` dropped the cap, L25).
@@ -8408,10 +8681,17 @@ class Passive:
     # Extra turns (#224): whether this passive fires on an extra turn's
     # on_turn_start / on_turn_end. None = the extra_turn_passives rule.
     extra_turns: Optional[bool] = None
+    # Sprite effects (#624) drawn on every unit this passive is on (a
+    # global one: every unit; a team one: the team's) while it is there.
+    # A bundle (list or object of named records), None = none.
+    sprite_effects: Any = None
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not self.id.strip():
             raise VTTError("Passive id must be a non-empty string.")
+        if self.sprite_effects is not None:
+            check_sprite_effects(self.sprite_effects,
+                                 f"Passive `{self.id}` sprite_effects")
         self.priority = checked_priority(self.priority, "Passive priority")
         if self.extra_turns is not None and \
                 not isinstance(self.extra_turns, bool):
@@ -8480,6 +8760,8 @@ class Passive:
             d["priority"] = self.priority
         if self.extra_turns is not None:
             d["extra_turns"] = self.extra_turns
+        if self.sprite_effects is not None:
+            d["sprite_effects"] = jcopy(self.sprite_effects)
         return d
 
     @staticmethod
@@ -8496,6 +8778,7 @@ class Passive:
             priority=d.get("priority", 0),
             extra_turns=(d.get("extra_turns")
                          if isinstance(d.get("extra_turns"), bool) else None),
+            sprite_effects=jcopy(d.get("sprite_effects")),
         )
 
 
@@ -9633,6 +9916,8 @@ def normalize_zone_def(raw: Any) -> Dict[str, Any]:
     for key in ZONE_LOOK_FIELDS:
         if zone_look_value(key, raw.get(key)):
             out[key] = copy.deepcopy(raw[key])
+    if isinstance(raw.get(SPRITE_EFFECTS_KEY), (list, dict)):
+        out[SPRITE_EFFECTS_KEY] = copy.deepcopy(raw[SPRITE_EFFECTS_KEY])
     out.update(zone_grant_fields(raw))
     return out
 
@@ -11529,6 +11814,10 @@ class Entity:
             checked_glyph_write(
                 path, value, f"Writing '{path}' on `{self.id}`",
                 ("", str(self._match.rules.get("disguise_var", "disguise"))))
+            check_effect_write(
+                path, value, str(self._match.rules.get(
+                    "sprite_effects_var", SPRITE_EFFECTS_KEY)),
+                f"Writing '{path}' on `{self.id}`")
         if self._match is not None:
             # A container whose marker was measured inside another
             # container (copied out of it) is re-measured on its own.
@@ -31847,6 +32136,232 @@ class Match:
             val = str(self.rules.get("sprite_mode", "stretch"))
         return val if val in ("single", "stretch", "tile") else "stretch"
 
+    # ---- sprite effects (#624) ----
+    def _effect_scan_roots(self, vars_: Dict[str, Any]) -> List[str]:
+        """The vars roots whose containers lend their holder sprite
+        effects: the `__sprite_effect_sources` var (replaces the rule) or
+        the sprite_effect_sources rule, plus `__sprite_effect_sources_add`."""
+        override = vars_.get("__sprite_effect_sources")
+        if isinstance(override, list):
+            roots = [str(r) for r in override]
+        else:
+            roots = [r.strip() for r in str(self.rules.get(
+                "sprite_effect_sources", "equipped")).split(",") if r.strip()]
+        add = vars_.get("__sprite_effect_sources_add")
+        if isinstance(add, list):
+            roots = roots + [str(r) for r in add]
+        return roots
+
+    @staticmethod
+    def _bundle_effect_items(bundle: Any, source: str
+                             ) -> List[Tuple[Any, str]]:
+        """(record, source) per record of an effects bundle, the source
+        naming the record's key."""
+        return [(r, f"{source}.{k}" if k else source)
+                for k, r in sprite_effect_items(bundle)
+                if r is not None]
+
+    def _rule_effect_items(self, key: str) -> List[Tuple[Any, str]]:
+        """(record, source) of a rule holding effects as JSON text; an
+        unreadable value reads as none."""
+        raw = self.rules.get(key)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw) if raw.strip() else None
+            except ValueError:
+                raw = None
+        return self._bundle_effect_items(raw, f"rule {key}")
+
+    def _read_effects(self, items: List[Tuple[Any, str]],
+                      target: Optional[str], extras: Dict[str, Any],
+                      problems: Optional[List[str]] = None,
+                      **flags: Any) -> List[Dict[str, Any]]:
+        """The usable records of `items`, each checked (a malformed one is
+        skipped and named in `problems`), its `condition` read (self =
+        `target`, `extras` bound; false or failing = left out) and tagged
+        with its `source` (plus `flags`)."""
+        out: List[Dict[str, Any]] = []
+        engine = None
+        if problems is None:
+            problems = EFFECT_PROBLEMS.get()
+        for raw, src in items:
+            try:
+                rec = check_sprite_effect(raw)
+            except VTTError as ex:
+                if problems is not None:
+                    problems.append(f"{src}: {ex}")
+                continue
+            cond = rec.get("condition")
+            if isinstance(cond, str) and cond.strip():
+                if EFFECT_READING.get():
+                    # A condition reading effects (sprite_effects_of)
+                    # reads the records that hold none.
+                    continue
+                from formula import FormulaEngine, EvalCtx, FormulaError
+                engine = engine or FormulaEngine(self)
+                tok = EFFECT_READING.set(True)
+                try:
+                    ok = bool(engine.eval_expression(cond, EvalCtx(
+                        this=self.current_entity_id(), target=target,
+                        extras=dict(extras))))
+                except (FormulaError, VTTError) as ex:
+                    if problems is not None:
+                        problems.append(f"{src}: condition: {ex}")
+                    continue
+                finally:
+                    EFFECT_READING.reset(tok)
+                if not ok:
+                    continue
+            rec["source"] = src
+            rec.update(flags)
+            out.append(rec)
+        return out
+
+    @staticmethod
+    def settle_effects(recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Effects in the order they apply: highest `priority` first, ties
+        in the order they were gathered; of the records naming one `group`
+        only the first in that order stays."""
+        order = sorted(recs, key=lambda r: -float(r.get("priority") or 0))
+        seen: "set[str]" = set()
+        out: List[Dict[str, Any]] = []
+        for r in order:
+            g = r.get("group")
+            if isinstance(g, str) and g:
+                if g in seen:
+                    continue
+                seen.add(g)
+            out.append(r)
+        return out
+
+    def entity_effect_items(self, e: "Entity", pov_team: Optional[str] = None
+                            ) -> List[Tuple[Any, str]]:
+        """(record, source) of every sprite effect `e` holds, gathered in
+        order: its statuses' (as the view sees them), its effects var, the
+        bundles under its sprite_effect_sources roots, its team data's, then
+        the passives on it (global, team, own, by priority). Under a
+        disguise fooling the view only the disguise's own key and the
+        global passives' records speak. Vars are read through the command's
+        reader, so a record under a private path doesn't draw."""
+        key = str(self.rules.get("sprite_effects_var", SPRITE_EFFECTS_KEY)) \
+            or SPRITE_EFFECTS_KEY
+        items: List[Tuple[Any, str]] = []
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            items += self._bundle_effect_items(dis.get(key), "disguise")
+            kinds = {"globals_": True, "team": False, "own": False}
+        else:
+            vars_ = (self.reader_vars(e, pov_team)
+                     if VAR_READER.get() is not None else e.vars)
+            statuses = self.visible_statuses(e.status, pov_team, e.id)
+            for sname in statuses:
+                items += self._bundle_effect_items(
+                    self.status_field(statuses[sname], sname,
+                                      SPRITE_EFFECTS_KEY),
+                    f"status {sname}")
+            items += self._bundle_effect_items(vars_.get(key), key)
+
+            def walk(node: Any, path: str) -> None:
+                if not isinstance(node, dict):
+                    return
+                if SPRITE_EFFECTS_KEY in node:
+                    items.extend(self._bundle_effect_items(
+                        node[SPRITE_EFFECTS_KEY],
+                        f"{path}.{SPRITE_EFFECTS_KEY}"))
+                for k, v in node.items():
+                    if k != SPRITE_EFFECTS_KEY and isinstance(v, dict):
+                        walk(v, f"{path}.{k}")
+            for root in self._effect_scan_roots(vars_):
+                found, node = _rel_get(vars_, root)
+                if found:
+                    walk(node, root)
+            if e.team is not None:
+                tdata = self.team_data.get(e.team)
+                if isinstance(tdata, dict):
+                    items += self._bundle_effect_items(
+                        tdata.get(SPRITE_EFFECTS_KEY), f"team {e.team}")
+            kinds = {}
+        for p, kind in self._ordered_passives(
+                e.id, lambda p: p.sprite_effects is not None, **kinds):
+            items += self._bundle_effect_items(
+                p.sprite_effects, f"{kind} passive {p.id}")
+        return items
+
+    def entity_sprite_effects(self, e: "Entity",
+                              pov_team: Optional[str] = None,
+                              active: bool = False,
+                              problems: Optional[List[str]] = None
+                              ) -> List[Dict[str, Any]]:
+        """The sprite effects drawn on `e` in images, in the order they
+        apply (settle_effects): what it holds (entity_effect_items), the
+        team_sprite_effects rule's (marked `picture_only`: a glyph is
+        drawn in the unit's colour already) and, for the unit drawn for
+        the one whose turn it is, active_unit_sprite_effects. Conditions
+        read with self = the unit and `pov_team` bound."""
+        extras = {"pov_team": pov_team}
+        recs = self._read_effects(self.entity_effect_items(e, pov_team),
+                                  e.id, extras, problems)
+        recs += self._read_effects(
+            self._rule_effect_items("team_sprite_effects"), e.id, extras,
+            problems, picture_only=True)
+        if active:
+            recs += self.active_effects(e.id, pov_team, problems)
+        return self.settle_effects(recs)
+
+    def active_effects(self, eid: Optional[str], pov_team: Optional[str],
+                       problems: Optional[List[str]] = None
+                       ) -> List[Dict[str, Any]]:
+        """active_unit_sprite_effects' records for the acting unit."""
+        return self._read_effects(
+            self._rule_effect_items("active_unit_sprite_effects"), eid,
+            {"pov_team": pov_team}, problems)
+
+    def corpse_sprite_effects(self, cid: str, pov_team: Optional[str],
+                              problems: Optional[List[str]] = None
+                              ) -> List[Dict[str, Any]]:
+        """corpse_sprite_effects' records (a corpse drawn with its living
+        sprite, or its glyph), conditions read with corpse_id bound."""
+        return self.settle_effects(self._read_effects(
+            self._rule_effect_items("corpse_sprite_effects"), None,
+            {"pov_team": pov_team, "corpse_id": cid}, problems))
+
+    def tile_sprite_effects(self, x: int, y: int, mp: "Map",
+                            pov_team: Optional[str] = None,
+                            problems: Optional[List[str]] = None
+                            ) -> List[Dict[str, Any]]:
+        """A tile's sprite effects: its template's `sprite_effects` data
+        merged with its own (a name of its own replaces the template's, a
+        name set to null takes it away; merged_effect_bundle), conditions
+        read with tile_x / tile_y / tile_map bound."""
+        src = self._tile_look_sources(x, y, mp)
+        if not src:
+            return []
+        bundles = [d.get(SPRITE_EFFECTS_KEY) for d in reversed(src)]
+        if all(b is None for b in bundles):
+            return []
+        items = [(r, f"{SPRITE_EFFECTS_KEY}.{k}")
+                 for k, r in merged_effect_bundle(*bundles)]
+        return self.settle_effects(self._read_effects(
+            items, None, {"pov_team": pov_team, "tile_x": x, "tile_y": y,
+                          "tile_map": mp.name}, problems))
+
+    def zone_sprite_effects(self, zname: str, z: Any,
+                            pov_team: Optional[str] = None,
+                            problems: Optional[List[str]] = None
+                            ) -> List[Dict[str, Any]]:
+        """A zone's sprite effects: its definition's merged with its own
+        (as tile_sprite_effects), conditions read with zone_name bound."""
+        src = self._zone_look_sources(z)
+        bundles = [d.get(SPRITE_EFFECTS_KEY) for d in reversed(src)]
+        if all(b is None for b in bundles):
+            return []
+        items = [(r, f"{SPRITE_EFFECTS_KEY}.{k}")
+                 for k, r in merged_effect_bundle(*bundles)]
+        anchor = z.get("anchor") if isinstance(z, dict) else None
+        return self.settle_effects(self._read_effects(
+            items, anchor if isinstance(anchor, str) else None,
+            {"pov_team": pov_team, "zone_name": zname}, problems))
+
     # ---- overlay sprites (status FX + entity overlay var) ----
     @staticmethod
     def _overlay_num(v: Any) -> Optional[int]:
@@ -31914,6 +32429,10 @@ class Match:
                 pick("sprite"), pick("sprite_opacity"),
                 pick("sprite_tint"), pick("sprite_layer"), default_layer)
             if rec:
+                rec["effects"] = self.settle_effects(self._read_effects(
+                    self._bundle_effect_items(
+                        pick(OVERLAY_EFFECTS_KEY), f"status {sname} overlay"),
+                    e.id, {"pov_team": pov_team}))
                 out.append(rec)
         ovar = str(self.rules.get("overlay_var", "overlays")) or "overlays"
         bag = e.vars.get(ovar)
@@ -31921,6 +32440,12 @@ class Match:
             for k in sorted(bag):
                 rec = self._overlay_from_record(bag.get(k), default_layer)
                 if rec:
+                    raw = bag.get(k)
+                    rec["effects"] = self.settle_effects(self._read_effects(
+                        self._bundle_effect_items(
+                            raw.get("effects") if isinstance(raw, dict)
+                            else None, f"{ovar}.{k}.effects"),
+                        e.id, {"pov_team": pov_team}))
                     out.append(rec)
         return out
 
@@ -32685,11 +33210,19 @@ class Match:
                 continue
             if label is None:
                 continue                # left out of the legend
-            look = tuple(p.get(k) for k in self._LEGEND_LOOK)
+            # The sprite effects a swatch draws (#624), the acting unit's
+            # mark left out: the legend says what things are.
+            fx = {k: [r for r in (p.get(k) or [])
+                      if not str(r.get("source", "")).startswith(
+                          "rule active_unit_sprite_effects")]
+                  for k in ("effects", "glyph_effects")}
+            look = tuple(p.get(k) for k in self._LEGEND_LOOK) + tuple(
+                json.dumps(fx[k], sort_keys=True) for k in fx)
             ent = entries.get(look)
             if ent is None:
                 ent = entries[look] = {k: p.get(k) for k in self._LEGEND_LOOK
                                        if p.get(k) is not None}
+                ent.update({k: v for k, v in fx.items() if v})
                 ent["labels"] = []
                 ent["_at"] = (py0, px0)
             ent["_at"] = min(ent["_at"], (py0, px0))
@@ -32721,6 +33254,7 @@ class Match:
         glyph = self.entity_glyph(e, pov_team)
         tint = self.entity_color(e, pov_team)
         overlays = self.entity_overlays(e, pov_team)
+        effects = self.entity_sprite_effects(e, pov_team)
         # One placement per rectangle of the cells the unit covers: its body
         # for a plain unit, or a region part's region (a non-rectangular
         # region, from a diagonal facing, is drawn cell by cell).
@@ -32732,6 +33266,7 @@ class Match:
                 "sprite": key, "glyph": glyph,
                 "tint": tint, "opacity": 100,
                 "flip_h": fh, "flip_v": fv, "layer": eff_layer,
+                "effects": effects,
                 **(label or {}),
             })
             # Overlay sprites (status FX + overlay var), drawn over the entity
@@ -32744,6 +33279,7 @@ class Match:
                     "sprite": ov["sprite"], "glyph": None,
                     "tint": ov["tint"], "opacity": ov["opacity"],
                     "flip_h": False, "flip_v": False, "layer": ov["layer"],
+                    "effects": ov.get("effects") or [],
                 })
 
     @staticmethod
@@ -32818,6 +33354,7 @@ class Match:
             if spr is None and g is None and tint is None:
                 continue
             z_layer = self.zone_draw_layer(z)
+            z_fx = self.zone_sprite_effects(zname, z, pov_team)
             for (zx, zy) in z.get("cells", ()):
                 if not mp.in_bounds(zx, zy):
                     continue
@@ -32825,7 +33362,8 @@ class Match:
                     "kind": "zone", "ref": zname, "x": zx, "y": zy,
                     "w": 1, "h": 1, "mode": "single", "sprite": spr,
                     "glyph": g, "tint": tint, "opacity": 100,
-                    "flip_h": fh, "flip_v": fv, "layer": z_layer})
+                    "flip_h": fh, "flip_v": fv, "layer": z_layer,
+                    "effects": z_fx})
 
         # Tile layer (20).
         for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
@@ -32844,19 +33382,15 @@ class Match:
                 "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
                 "glyph": g, "tint": tint, "opacity": 100,
-                "flip_h": fh, "flip_v": fv, "layer": t_layer})
+                "flip_h": fh, "flip_v": fv, "layer": t_layer,
+                "effects": self.tile_sprite_effects(tx, ty, mp, pov_team)})
 
-        # Corpse layer (25): the dead entity's stored sprite, tinted +
-        # semi-transparent (corpse_sprite_tint / corpse_sprite_opacity).
-        # Fog-gated like everything else; only drawn when it has a sprite (or
-        # a stored glyph for the text fallback). Rides the entity-layer toggle.
+        # Corpse layer (25): the dead entity's stored sprite, drawn with
+        # corpse_sprite_effects (greyed and faded by default) when it is
+        # the living one. Fog-gated like everything else; only drawn when it
+        # has a sprite (or a stored glyph for the text fallback). Rides the
+        # entity-layer toggle.
         if "entities" not in hidden:
-            c_tint = str(self.rules.get("corpse_sprite_tint", "gray")).strip() or None
-            try:
-                c_op = int(self.rules.get("corpse_sprite_opacity", 50))
-            except (TypeError, ValueError):
-                c_op = 50
-            c_op = max(0, min(100, c_op))
             for (cx, cy, cid, corpse) in self.all_corpses(mp):
                 if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team, mp):
                     continue
@@ -32869,11 +33403,12 @@ class Match:
                 # corpse_default_sprite is set); a sprite whose PNG is missing
                 # falls back to its glyph (as a living unit's does), greyed
                 # and faded. A corpse picture is drawn as-is; the unit's
-                # living sprite takes the corpse tint and opacity.
+                # living sprite takes corpse_sprite_effects.
                 if spr is None and label is None and \
                         self.corpse_glyph(corpse, custom_only=True) is None:
                     continue
                 gl = self.corpse_glyph(corpse)
+                c_fx = self.corpse_sprite_effects(cid, pov_team)
                 cw, ch = self._corpse_footprint(corpse, mp)
                 c_mode = (self._sprite_mode_of(
                               (corpse.get("entity") or {}).get("vars") or {})
@@ -32881,12 +33416,11 @@ class Match:
                 placements.append({
                     "kind": "corpse", "ref": cid, "x": cx, "y": cy,
                     "w": cw, "h": ch, "mode": c_mode, "sprite": spr,
-                    "glyph": gl,
-                    "tint": None if own else c_tint,
-                    "opacity": 100 if own else c_op,
-                    # The glyph drawn when the picture can't be loaded is
-                    # always greyed and faded, so it reads as a body.
-                    "glyph_tint": c_tint, "glyph_opacity": c_op,
+                    "glyph": gl, "tint": None, "opacity": 100,
+                    "effects": [] if own else c_fx,
+                    # The glyph drawn when the picture can't be loaded
+                    # always takes the corpse effects, so it reads as a body.
+                    "glyph_effects": c_fx,
                     "flip_h": False, "flip_v": False, "layer": corpse_layer,
                     **(label or {})})
 
@@ -32961,9 +33495,14 @@ class Match:
         actor = (self.active_display_unit(mp, pov_team)
                  if "entities" not in hidden else None)
         if actor is not None:
+            act_fx = None
             for p in placements:
                 if p.get("kind") == "entity" and p.get("ref") == actor:
                     p["active"] = True
+                    if act_fx is None:
+                        act_fx = self.active_effects(actor, pov_team)
+                    p["effects"] = self.settle_effects(
+                        list(p.get("effects") or []) + act_fx)
         vp = None
         if viewport is not None:
             vx, vy, vw, vh = viewport
@@ -32978,19 +33517,6 @@ class Match:
             "borders": self._scene_borders(mp),
             "coords": self.coords_on(),
             "sprite_cell_size": self._layer_rule("sprite_cell_size", 100),
-            "unit_style": {
-                "outline_width": max(0, self._layer_rule("team_outline_width", 3)),
-                "outline_opacity": max(0, min(100, self._layer_rule(
-                    "team_outline_opacity", 100))),
-                "tint_opacity": max(0, min(100, self._layer_rule(
-                    "team_tint_opacity", 0))),
-                "active_on": bool(self.rules.get(
-                    "active_unit_image_highlight", True)),
-                "active_color": str(self.rules.get(
-                    "active_unit_outline_color", "white")),
-                "active_width": max(1, self._layer_rule(
-                    "active_unit_outline_width", 3)),
-            },
             "tint_fill_opacity": max(0, min(100, self._layer_rule(
                 "tint_fill_opacity", 40))),
         }
@@ -34654,7 +35180,7 @@ VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "overlay_var", "map_vehicle_death_effect_var",
                   "map_vehicle_wreck_var", "mount_death_effect_var",
                   "tags_var", "size_num_var", "size_text_var",
-                  "size_total_var")
+                  "size_total_var", "sprite_effects_var")
 
 
 # Map-var-name rules: rule -> (the setting it names, the rule giving the

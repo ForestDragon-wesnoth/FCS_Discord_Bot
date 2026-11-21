@@ -19870,14 +19870,14 @@ SCENARIO 714 — Graphics: a corpse whose sprite is missing shows its glyph, fad
 !ent add plain Plain 1 5 3 5
 !ent kill plain
 !map scene list
-?? • corpse `slain` at (3,3) — sprite slain_sprite, glyph v, color gray (layer 75)
+?? • corpse `slain` at (3,3) — sprite slain_sprite, glyph v; effects: greyscale [rule corpse_sprite_effects.corpse_grey], opacity amount=50 [rule corpse_sprite_effects.corpse_fade] (layer 75)
 ?! corpse `plain`
 
-Expected: The corpse is drawn as the dead unit's sprite, tinted grey and at
-50% opacity (corpse_sprite_tint / corpse_sprite_opacity). When the PNG is
-missing, gui.py and Discord images draw its glyph instead, as for a living
-unit: glyphs.<facing> > glyph > the facing arrow (`v`), in that grey at that
-opacity. Before, the grey tint was painted as a translucent square over the
+Expected: The corpse is drawn as the dead unit's sprite with the
+corpse_sprite_effects rule's effects (#624): greyscale, then 50% opacity.
+When the PNG is missing, gui.py and Discord images draw its glyph instead,
+as for a living unit: glyphs.<facing> > glyph > the facing arrow (`v`),
+with the same effects. Before, the grey tint was painted as a translucent square over the
 whole cell, which looked like fog. A corpse whose unit had neither a sprite
 nor a custom glyph (`plain`) is not drawn, as before.
 
@@ -19903,56 +19903,63 @@ SCENARIO 715 — Graphics: corpse sprites per unit and a default corpse sprite
 !ent add plain Plain 1 2 4 5
 !ent kill plain
 !map scene list
-?? • corpse `slain` at (2,2) — sprite slain_sprite, glyph v, color gray (layer 75)
-?? • corpse `skel` at (4,2) — sprite bones, glyph ^ (layer 75)
-?? • corpse `orc` at (6,2) — sprite orc_body_left, glyph < (layer 75)
+?? • corpse `slain` at (2,2) — sprite slain_sprite, glyph v; effects: greyscale [rule corpse_sprite_effects.corpse_grey], opacity amount=50 [rule corpse_sprite_effects.corpse_fade] (layer 75)
+?? • corpse `skel` at (4,2) — sprite bones, glyph ^ (its glyph: greyscale [rule corpse_sprite_effects.corpse_grey], opacity amount=50 [rule corpse_sprite_effects.corpse_fade]) (layer 75)
+?? • corpse `orc` at (6,2) — sprite orc_body_left, glyph < (its glyph: greyscale [rule corpse_sprite_effects.corpse_grey], opacity amount=50 [rule corpse_sprite_effects.corpse_fade]) (layer 75)
 ?! corpse `plain`
 !system set default corpse_default_sprite blood
 !map scene list
-?? • corpse `slain` at (2,2) — sprite blood, glyph v (layer 75)
-?? • corpse `plain` at (2,4) — sprite blood, glyph ^ (layer 75)
-?? • corpse `skel` at (4,2) — sprite bones, glyph ^ (layer 75)
+?? • corpse `slain` at (2,2) — sprite blood, glyph v (its glyph:
+?? • corpse `plain` at (2,4) — sprite blood, glyph ^ (its glyph:
+?? • corpse `skel` at (4,2) — sprite bones, glyph ^ (its glyph:
 
 Expected: A unit's own corpse picture is its `corpse_sprites.<facing>` var,
 else its `corpse_sprite` var (the orc, facing left, uses orc_body_left), and
-is drawn as-is: no colour on the placement, full opacity. With neither, the
+is drawn as-is: no effects on the picture. With neither, the
 corpse_default_sprite rule is used, also as-is; while that rule is empty the
-corpse shows the unit's living sprite greyed and faded (`color gray`, 50%)
-as before (`slain`), and a unit with no sprite and no custom glyph has no
-corpse drawing (`plain`). Once the rule names `blood`, every corpse without a
+corpse shows the unit's living sprite with corpse_sprite_effects (greyed and
+faded, `slain`), and a unit with no sprite and no custom glyph has no corpse
+drawing (`plain`). Once the rule names `blood`, every corpse without a
 picture of its own uses it, `plain` included. The glyph listed is what is
-drawn when the PNG can't be loaded; it stays greyed and faded either way.
+drawn when the PNG can't be loaded; it takes the corpse effects either way
+(`its glyph: ...`).
 
-SCENARIO 716 — Graphics: team colour as a sprite outline, tint off by default
-------------------------------------------------------------------------------
+SCENARIO 716 — Graphics: team colour as a sprite outline (team_sprite_effects), a tint added
+--------------------------------------------------------------------------------------------
 
 !match new m716 Teams 6 4
 !match use m716
 !ent add a A 10 2 2 5
 !ent set_var a team red
 !ent set_var a sprite knight
-!map scene
-?? unit outline 3px at 100%, unit tint 0%
 !map scene list
+?? team look: outline color=team.
 ?? • entity `a` at (2,2) — sprite knight, glyph >, color red (layer 100)
-!system set default team_outline_width 0
-!system set default team_tint_opacity 60
-!system set default team_outline_opacity 40
-!map scene
-?? unit outline 0px at 40%, unit tint 60%
-!system set default team_tint_opacity 101
-?? ❌
-!system set default team_outline_width -1
-?? ❌
+!system effect default team add wash tint color=team strength=60
+!system effect default team add team_outline outline color=team opacity=40
+!map scene list
+?? team look: outline color=team opacity=40, tint color=team strength=60.
+!eval "map_with(sprite_effects_of('a'), lambda r: r['effect'])"
+?? ['outline', 'tint']
+!system effect default team clear
+!map scene list
+?? team look: none
+!system set default team_sprite_effects '{"x": {"effect": "tint", "strength": 101, "color": "red"}}'
+?? ❌ Setting 'team_sprite_effects' `x`: an effect's `strength` is a number from 0 to 100, got 101.
+!system set default team_sprite_effects 'not json'
+?? takes JSON
 
 Expected: A unit's colour (its `color` var, else its team colour; team `red`
-is red) is drawn in graphics as an outline around its sprite's shape,
-team_outline_width pixels at sprite_cell_size cells (3 by default, scaled
-with the cell) at team_outline_opacity, and the sprite itself is no longer
-multiplied by the colour unless team_tint_opacity is above 0 (it blends that
-share of the tinted sprite in). A unit drawn as a glyph keeps its coloured
-glyph. Tiles, zones and overlays keep their own tint. The rules are bounded:
-opacities 0-100, width 0-50. HARNESS-ALLOWS-ERRORS
+is red) is drawn in graphics through the team_sprite_effects rule (#624):
+by default an outline in that colour around its sprite's shape, 3 pixels at
+sprite_cell_size cells (scaled with the cell); `!map scene list` names this
+"team look" once in its header. The rule's records apply on a picture only:
+a unit drawn as a glyph keeps its coloured glyph and gets none of them.
+sprite_effects_of() lists them with the unit's own. `!system effect default team ...` edits the rule's JSON
+with the effect grammar: `team_outline` replaced at 40% opacity and a 60%
+tint in the team colour added (`color=team`), then cleared (`{}`), which
+draws no outline. A value that isn't JSON, or a record out of range, is
+refused. Tiles, zones and overlays keep their own tint. HARNESS-ALLOWS-ERRORS
 
 SCENARIO 717 — Graphics: the image legend
 ------------------------------------------
@@ -28635,9 +28642,12 @@ SCENARIO 895 — The acting unit (opt-in rule): bold glyph, a "now acting" line,
 !turn next
 !map
 ?? ▶ now acting: Dragon
-!system set default active_unit_image_highlight false
 !map scene list
-?! acting
+?? outline color=team_light fallback=white [rule active_unit_sprite_effects.acting] (layer 100, acting)
+!system effect default active clear
+!map scene list
+?? (layer 100, acting)
+?! active_unit_sprite_effects
 !map
 ?? ▶ now acting: Dragon
 !system set default active_unit_line_format "Acting: {name}!"
@@ -28659,9 +28669,11 @@ SCENARIO 895 — The acting unit (opt-in rule): bold glyph, a "now acting" line,
 
 Expected: active_unit_highlight (off by default) marks the unit whose turn
 it is once a turn has started: bold where ANSI colour works, else a line
-under the plain-text map (active_unit_line_format), and in images an
-outline around it (its team colour brightened, white without a team
-colour; active_unit_image_highlight false drops the image outline only).
+under the plain-text map (active_unit_line_format), and in images the
+active_unit_sprite_effects rule's effects (#624): by default an outline
+around it in its team colour brightened (`team_light`, white without a team
+colour). `!system effect default active clear` empties the rule, so images
+mark nothing while the placement stays the acting one (bold text).
 The head's own turn marks the dragon's 2x2 body that draws it (`!map scene
 list` names the acting placement). A team view that can't see the actor
 (red can't see the fogged blue scout) gets no line.
@@ -28987,7 +28999,7 @@ SCENARIO 902 — The acting unit: a team sees its own hidden rider's turn on its
 ?? ▶ now acting: Pilot
 !assert "footprint_width('tank') == 2 and footprint_height('tank') == 2"
 !map scene list
-?? entity `tank` at (2,2) 2x2 stretch — glyph v, color red (layer 100, acting)
+?? entity `tank` at (2,2) 2x2 stretch — glyph v, color red; effects: outline color=team_light fallback=white [rule active_unit_sprite_effects.acting] (layer 100, acting)
 !match bind pov=red
 !map
 ?? ▶ now acting: Pilot
@@ -31424,9 +31436,9 @@ SCENARIO 945 — Smaller items: locals before assignment, rolls, priorities, rul
 ?? comma list of var roots
 !system set default modifier_sources __engine
 ?? comma list of var roots
-!system set default active_unit_outline_color notacolor
-?? takes a colour name
-!system set default active_unit_outline_color #ff8800
+!system set default name_text_color notacolor
+?? is a palette name
+!system set default name_text_color #ff8800
 ?? '#ff8800'
 !ent set_var a actions.hit.body 1
 !action list a
@@ -31452,7 +31464,7 @@ so and names entity['b'] for the unit (P3); `entity[a]` after `a = 'b'`
 reads the local. A repeated roll lists each roll's dice only while the
 reply fits one message (L16). A priority too big to print whole stays
 1e+308. unit_tag_sources / modifier_sources (and the other source lists)
-take var roots, active_unit_outline_color a palette name or #rrggbb
+take var roots, name_text_color a palette name or #rrggbb
 (L19). An action whose body isn't text is named in `!action list`.
 `--trace` works after `--as <eid>` (L18). `!undo command` right after
 `!turn next` says it takes the turn back too (L20). Zone names take id
@@ -48197,9 +48209,9 @@ SCENARIO 1291 — Name sprites to a view: a disguise, a private sprite_label, a 
 !map scene list legend=on
 ?? entity `spy` at (1,1) — glyph >, name text 'Peasant'
 ?? entity `mage` at (3,1) — glyph v, color red, name text 'Mage'
-?? corpse `rat` at (5,1) — glyph v, color gray, name text 'Big / Rat'
+?? corpse `rat` at (5,1) — glyph v, name text 'Big / Rat'
 ?? Legend: glyph >, name text 'Peasant' = Peasant
-?? Legend: glyph v, color gray, name text 'Big / Rat' = corpse: Big Rat
+?? Legend: glyph v, name text 'Big / Rat' = corpse: Big Rat
 !match bind pov=red
 !map scene list
 ?? entity `spy` at (1,1) — glyph >, color red, name text 'Spy'
@@ -48218,3 +48230,298 @@ its team under team_private_vars, so blue's view reads its name ("Mage")
 while red's reads "Archmage / Vor". A dead unit lies as its name, greyed
 like any living sprite on a corpse. The legend lists each look with the
 name sprite's text.
+
+SCENARIO 1292 — Sprite effects on a unit: !ent effect, checks, order, group, a condition (#624)
+------------------------------------------------------------------------------------------------
+
+!match new fx1 Effects 8 5
+!match use fx1
+!ent add ogre Ogre 20 2 2 5 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent effect ogre add tilt rotate degrees=30
+!ent effect ogre add ice tint color=0,200,255 strength=70 priority=5
+!ent effect ogre add blush tint color=#ff8080 group=skin priority=1
+!ent effect ogre add pale greyscale group=skin
+!ent effect ogre add hurt outline color=red width=4 condition="entity[self].hp < 10"
+?? Added the effect `hurt` on `ogre`: outline color=red width=4 (conditional).
+!ent effect ogre list
+?? • `ice`: tint color=[0, 200, 255] strength=70 priority=5
+?? • `hurt`: outline color=red width=4 when entity[self].hp < 10
+!map scene list
+?? • entity `ogre` at (2,2) 2x2 stretch — glyph >, color red; effects: tint color=[0, 200, 255] strength=70 priority=5 [sprite_effects.ice], tint color=#ff8080 priority=1 group=skin [sprite_effects.blush], rotate degrees=30 [sprite_effects.tilt] (layer 100)
+?! sprite_effects.pale
+?! sprite_effects.hurt
+!ent hp ogre 5
+!map scene list
+?? rotate degrees=30 [sprite_effects.tilt], outline color=red width=4 (conditional) [sprite_effects.hurt] (layer 100)
+!assert "len(sprite_effects_of('ogre')) == 5"
+!assert "get(get(sprite_effects_of('ogre'), 0), 'source') == 'sprite_effects.ice'"
+!ent effect ogre add ice tint color=blue
+?? Replaced the effect `ice` on `ogre`: tint color=blue.
+!ent effect ogre remove blush
+!ent effect ogre remove nothere
+?? ❌
+!ent effect ogre add bad tint
+?? a `tint` effect needs `color`
+!ent effect ogre add bad tint color=plaid
+?? an effect's `color` is a colour name, #rrggbb, an [r, g, b] list (0-255) or team / team_light, got plaid
+!ent effect ogre add bad tint color=300,0,0
+?? got [300, 0, 0]
+!ent effect ogre add bad wobble
+?? `wobble` isn't an effect
+!ent effect ogre add bad rotate degrees=10 speed=3
+?? `speed` isn't a field of a `rotate` effect
+!ent effect ogre add bad flip axis=diagonal
+?? an effect's `axis` is one of h, v, both
+!ent effect ogre add a.b invert
+?? can't name an effect
+!ent set_var ogre sprite_effects.wip.effect glow
+!ent set_var ogre sprite_effects.wip.width 99
+?? an effect's `width` is a number from 1 to 64, got 99
+!ent set_var ogre sprite_effects.wip.color yellow
+!map scene list
+?? glow color=yellow [sprite_effects.wip]
+!ent effect ogre add broken hue degrees=10 condition="nosuchfn(1)"
+!map scene list
+?? ⚠️ effect left out: sprite_effects.broken: condition:
+!ent effect ogre clear
+!ent effect ogre list
+?? `ogre` has no sprite effects.
+!ent get ogre sprite_effects
+?? has no var at `sprite_effects`
+
+Expected: HARNESS-ALLOWS-ERRORS. A unit's own sprite effects (#624) live
+in its effects var (sprite_effects_var) and are edited with `!ent effect`:
+`add <name> <effect> [<field>=<value> ...]` (a colour as a name, #rrggbb or
+r,g,b), `remove`, `list`, `clear`. They apply highest `priority` first, in
+the order gathered on a tie: `ice` (5) before `blush` (1) before `tilt`
+(0). Of the two `skin` records only `blush` (priority 1) applies. `hurt`'s
+condition (self = the unit) draws it only once the ogre's hp is below 10.
+The 2x2 body's one stretch placement carries them. A bad type, field,
+colour or range is refused, and so is a raw var write building a record
+with a field out of range (the record may be built one field at a time).
+A condition that fails to read leaves its record out, named under the
+scene list. `clear` drops the var.
+
+SCENARIO 1293 — Sprite effects from statuses, overlays, equipment, team data and passives (#624)
+---------------------------------------------------------------------------------------------------
+
+!match new fx2 Sources 8 5
+!match use fx2
+!ent add hero Hero 20 2 2 5 team=red
+!status def frozen
+!status effect frozen add ice tint color=cyan
+!status level frozen 3+ sprite_effects add ice tint color=blue
+?? At level `3+`: Added the effect `ice` on status `frozen`: tint color=blue.
+!status sprite frozen shards
+!status overlay_effect frozen add spin rotate degrees=90
+!status apply hero frozen 1
+!map scene list
+?? tint color=cyan [status frozen.ice]
+?? • overlay `hero` at (2,2) — sprite shards; effects: rotate degrees=90 [status frozen overlay.spin] (layer 150)
+!status apply hero frozen 3
+!map scene list
+?? tint color=blue [status frozen.ice]
+!ent set_var hero equipped.sword.sprite_effects.shine.effect glow
+!ent set_var hero equipped.sword.sprite_effects.shine.color white
+!ent set_var hero bag.lamp.sprite_effects.lit.effect brightness
+!ent set_var hero bag.lamp.sprite_effects.lit.amount 150
+!map scene list
+?? glow color=white [equipped.sword.sprite_effects.shine]
+?! bag.lamp
+!eval "entity[hero].__sprite_effect_sources_add = ['bag']"
+!map scene list
+?? brightness amount=150 [bag.lamp.sprite_effects.lit]
+!team set red sprite_effects.warm.effect hue
+!team set red sprite_effects.warm.degrees 20
+!passive add hero aura on_turn_start "1"
+!passive effect hero aura add halo outline color=gold
+?? ❌
+!passive effect hero aura add halo outline color=yellow
+!gpassive add night on_round_start "1"
+!gpassive effect night add dark brightness amount=60
+!team passive add red banner on_turn_start "1"
+!team passive effect red banner add flag saturation amount=150
+!passive list hero
+?? sprite effects halo
+!map scene list
+?? hue degrees=20 [team red.warm], brightness amount=60 [global passive night.dark], saturation amount=150 [team passive banner.flag], outline color=yellow [own passive aura.halo]
+!as restart
+!match use fx2
+!map scene list
+?? outline color=yellow [own passive aura.halo]
+?? tint color=blue [status frozen.ice]
+!passive effect hero aura clear
+!gpassive effect night list
+?? • `dark`: brightness amount=60
+
+Expected: HARNESS-ALLOWS-ERRORS. Effects gather from every holder a unit
+has, in order: its statuses (`!status effect`, a level entry adding or
+replacing a record by name: `frozen` at level 3 swaps cyan for blue), its
+own var, containers under the sprite_effect_sources roots (`equipped` by
+default; `__sprite_effect_sources_add` adds `bag`), its team data's
+`sprite_effects`, then the passives on it, global, team and own, by
+priority (`!gpassive` / `!team passive` / `!passive effect`). A status's
+`overlay_effect` acts on its overlay sprite alone. `gold` isn't a palette
+colour (a hex or r,g,b gives any colour). `!passive list` names a
+passive's effects, and they survive a restart.
+
+SCENARIO 1294 — The engine's looks as effects: team, acting unit, corpse; !system effect (#624)
+-------------------------------------------------------------------------------------------------
+
+!match new fx3 Looks 8 5
+!match use fx3
+!system set default death_result corpse
+!ent add a Ann 10 2 2 5 team=red
+!ent add b Bob 10 5 2 3
+!ent set_var b sprite bob_png
+!ent set_var b corpse_sprite bones
+!system set default active_unit_highlight true
+!turn next
+!map scene list
+?? team look: outline color=team.
+?? • entity `a` at (2,2) — glyph >, color red; effects: outline color=team_light fallback=white [rule active_unit_sprite_effects.acting] (layer 100, acting)
+!system effect default team add team_outline outline color=team group=ring
+!system effect default active add acting outline color=team_light fallback=white group=ring priority=1
+!map scene list
+?? effects: outline color=team_light fallback=white priority=1 group=ring [rule active_unit_sprite_effects.acting] (layer 100, acting)
+!eval "len(sprite_effects_of('a'))"
+?? = `1`
+!system effect default active add pulse glow color=yellow condition="round_number() >= 2"
+!map scene list
+?! pulse
+!turn next
+!turn next
+!map scene list
+?? glow color=yellow (conditional) [rule active_unit_sprite_effects.pulse]
+!system effect default corpse list
+?? • `corpse_grey`: greyscale
+?? • `corpse_fade`: opacity amount=50
+!ent kill b
+!map scene list
+?? • corpse `b` at (5,2) — sprite bones, glyph v (its glyph: greyscale [rule corpse_sprite_effects.corpse_grey], opacity amount=50 [rule corpse_sprite_effects.corpse_fade]) (layer 75)
+!system effect default corpse add corpse_fade opacity amount=20
+!system effect default corpse remove corpse_grey
+!system effect default corpse add tint tint color=red strength=30
+!system info default
+?? corpse_sprite_effects
+!system effect default shiny list
+?? isn't a look: team, active or corpse
+!system effect default team add x tint
+?? a `tint` effect needs `color`
+!system effect default active clear
+!system effect default active list
+?? has no sprite effects
+!system set default corpse_sprite_effects '[{"effect": "invert"}]'
+!system effect default corpse list
+?? • `0`: invert
+
+Expected: HARNESS-ALLOWS-ERRORS. The engine's three looks are effect
+rules (#624) holding JSON, edited with `!system effect <system> team |
+active | corpse ...` or `!system set`: team_sprite_effects (every unit
+drawn as a picture; listed once as the scene header's "team look"),
+active_unit_sprite_effects (the acting unit, with active_unit_highlight on)
+and corpse_sprite_effects (a corpse drawn with its living sprite, and any
+corpse's glyph). Giving the team outline and the acting outline one
+`group` lets the higher priority one replace the other (sprite_effects_of
+then holds one record, as the acting mark is left out of it). A rule's
+record may carry a condition too. A corpse with its own corpse sprite is
+drawn as it is; its glyph takes the corpse effects.
+
+SCENARIO 1295 — Sprite effects on tiles and zones: templates, definitions, merging by name, hide (#624)
+---------------------------------------------------------------------------------------------------------
+
+!match new fx4 Ground 8 5
+!match use fx4
+!tile def new lava
+!tile def data lava sprite lava_png
+!tile def effect lava add warm hue degrees=40
+!tile def effect lava add hot brightness amount=130
+!tile place lava 1 4
+!tile place lava 2 4
+!tile set 3 4 _template lava
+!tile set 3 4 sprite lava_png
+!tile effect 3 4 hide warm
+!tile effect 3 4 add hot brightness amount=90
+!tile effect 3 4 list
+?? • `warm`: hidden (an inherited one is taken away)
+?? Sprite effects of its template `lava` (merged by name):
+!map scene list
+?? • tile `1,4` at (1,4) — sprite lava_png; effects: hue degrees=40 [sprite_effects.warm], brightness amount=130 [sprite_effects.hot] (layer 50)
+?? • tile `3,4` at (3,4) — sprite lava_png; effects: brightness amount=90 [sprite_effects.hot] (layer 50)
+!tile effect 4 4 add spot invert condition="tile_x == 4"
+!tile set 4 4 glyph o
+!map scene list
+?? • tile `4,4` at (4,4) — glyph o; effects: invert (conditional) [sprite_effects.spot] (layer 50)
+!zone def new trap
+!zone def glyph trap x
+!zone def effect trap add small scale percent=50
+!zone place trap 6 4
+!zone place trap 7 4 name=bigtrap
+!zone effect bigtrap add small scale percent=150
+!zone effect bigtrap add red tint color=red
+!zone effect bigtrap list
+?? Sprite effects of its definition `trap` (merged by name):
+!map scene list
+?? • zone `trap` at (6,4) — glyph x; effects: scale percent=50 [sprite_effects.small] (layer 25)
+?? • zone `bigtrap` at (7,4) — glyph x; effects: scale percent=150 [sprite_effects.small], tint color=red [sprite_effects.red] (layer 25)
+!zone effect bigtrap hide small
+!map scene list
+?? • zone `bigtrap` at (7,4) — glyph x; effects: tint color=red [sprite_effects.red] (layer 25)
+!ent effect nobody list
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. A tile reads its template's effects and
+its own, merged by name (#624): a name of its own replaces the template's
+(`hot` at 90 on (3,4)), `hide <name>` takes one away on that tile
+(`warm`), and `list` shows both layers. A placement copies the template's
+data, effects included, into the tile, as it copies any data. A zone reads
+its definition's the same way (`!zone def effect` / `!zone effect`). A
+condition reads with tile_x / tile_y (zone_name for a zone) bound.
+
+SCENARIO 1296 — Sprite effects to a view: a disguise, a hidden status, a private var (#624)
+---------------------------------------------------------------------------------------------
+
+!match new fx5 Views 8 5
+!match use fx5
+!ent add spy Spy 10 2 2 5 team=red
+!ent add guard Guard 10 5 2 3 team=blue
+!ent effect spy add cloak opacity amount=40
+!ent set_var spy disguise.name Peasant
+!ent set_var spy disguise.sprite_effects.mud.effect saturation
+!ent set_var spy disguise.sprite_effects.mud.amount 30
+!gpassive add night on_round_start "1"
+!gpassive effect night add dark brightness amount=70
+!status def cursed
+!status effect cursed add murk hue degrees=-90
+!status visibility cursed "pov_team == entity[self].team"
+!status apply spy cursed 1
+!map scene list
+?? opacity amount=40 [sprite_effects.cloak]
+?? hue degrees=-90 [status cursed.murk]
+!match bind pov=blue
+!map scene list
+?? • entity `spy` at (2,2) — glyph >; effects: saturation amount=30 [disguise.mud], brightness amount=70 [global passive night.dark] (layer 100)
+!match bind pov=red
+!map scene list
+?? opacity amount=40 [sprite_effects.cloak]
+?? hue degrees=-90 [status cursed.murk]
+!match unbind
+!match use fx5
+!ent effect guard add mark outline color=red
+!system set default team_private_vars sprite_effects
+!match bind pov=red
+!map scene list
+?! sprite_effects.mark
+!match bind pov=blue
+!map scene list
+?? outline color=red [sprite_effects.mark]
+
+Expected: HARNESS-ALLOWS-ERRORS. Effects follow what a view may see (#624).
+A disguise fooling the view shows only its own `sprite_effects` (blue sees
+the spy's muddy decoy look, not its cloak or its curse); the global
+passive's darkness reaches everyone, disguised or not. A status's effects
+show only to views its visibility condition lets see it (the curse shows
+to red alone). Effects held under a var private to the reader don't draw:
+with sprite_effects team-private, red's board leaves out the blue guard's
+mark while blue's own board shows it.
