@@ -611,6 +611,22 @@ def _check_tile_template(entry: Dict[str, Any], name: str,
     unknown = sorted(k for k in hooks if k not in logic.TILE_HOOK_NAMES)
     if unknown:
         raise VTTError(f"{who}: unknown hook(s) {', '.join(unknown)}.")
+    # Status grants (#290), checked as `!tile def grant` stores them.
+    grants = entry.get("grants")
+    if grants is not None:
+        if not isinstance(grants, dict):
+            raise VTTError(f"{who}: `grants` maps statuses to "
+                           f"{{level, data, linger}}.")
+        try:
+            for st, g in grants.items():
+                logic.check_zone_grant(st, g)
+        except VTTError as ex:
+            raise VTTError(f"{who}: {ex}")
+    if entry.get("grant_bodies") not in (None, *logic.ZONE_GRANT_BODIES):
+        raise VTTError(f"{who}: grant_bodies is root or all.")
+    if entry.get("grant_condition") is not None and \
+            not isinstance(entry["grant_condition"], str):
+        raise VTTError(f"{who}: grant_condition must be text.")
     logic.check_sprite_effects(data.get(logic.SPRITE_EFFECTS_KEY),
                                f"{who}: `{logic.SPRITE_EFFECTS_KEY}`")
     try:
@@ -699,6 +715,16 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
         raise VTTError(f"{who}: `display_priority` must be a number.")
     for k in (logic.SPRITE_EFFECTS_KEY, logic.OVERLAY_EFFECTS_KEY):
         logic.check_sprite_effects(entry.get(k), f"{who}: `{k}`")
+    # Passives (#411) and actions (#412) the status holds.
+    held = entry.get(logic.PASSIVES_KEY)
+    if held is not None:
+        if not isinstance(held, dict):
+            raise VTTError(f"{who}: `passives` must be an object of "
+                           f"id -> {{when, formula, ...}}.")
+        for pid, rec in held.items():
+            problem = logic.held_passive_spec(str(pid), rec)[1]
+            if problem:
+                raise VTTError(f"{who}: passive `{pid}` {problem}.")
     for k, choices in (("resist_affects", logic.RESIST_AFFECTS),
                        ("resist_rounding", logic.RESIST_ROUNDINGS),
                        ("on_transform", logic.TRANSFORM_STATUS_FLAGS),

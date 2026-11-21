@@ -1547,6 +1547,34 @@ hardcodes**.
   (REVIVING) and a transfer (`TEMPLATE_QUIET`) fire nothing, nor do a
   death, a despawn and a detach (user calls). Corpses fire nothing (on
   hold, idea #623). They share var_hook_recursion_limit.
+- **Held passives** (#411, #208, user design, 1298-1300): passive
+  records kept in data, `passives: {<id>: {when, formula, priority,
+  target, scope, extra_turns}}` (`logic.PASSIVES_KEY`,
+  `held_passive_spec`), fire as the bearer's own while it holds them: a
+  status's (`status_field`, so instance key, definition, level entries
+  merged by id; fired whatever the status's visibility) and an item's
+  (`passives` under the `passive_sources` roots, default `equipped`,
+  per-unit `__passive_sources` / `_add`; the vars root never counts).
+  `Match.held_passive_entries` lists them (source `status:<name>` in
+  gain order, then item container paths in var order, each with the
+  problem that keeps a broken one from running), `held_passives` gives
+  Passive objects cached in `_held_passive_cache` (runtime, rollback
+  preserve list) carrying `held = (source, status)`;
+  `_ordered_passives` takes them as kind `held` after own (ties: global,
+  team, own, status, item), skipped once the unit is gone. Bindings
+  `passive_source` (the status name or the container path) and
+  `passive_status` (the status name, else None); `status_name` /
+  `status_level` were taken by a hook binding and a function.
+  `UnitFlags.HELD_PASSIVES` marks units whose sources hold `passives`.
+  Reading is lenient; a raw write is refused only for a value that can't
+  run (`held_passive_write_problem` in write_var: an unknown hook, a
+  formula that doesn't parse, a bad scope / priority), so a record can
+  be built a field at a time. `!status passive <name> add | remove |
+  list | clear` (and `!status level <n> passives ...`, `!system status
+  passive`); `!passive list` shows held passives under their source
+  through the channel's view (`_held_passive_entries_seen`), `!passive
+  remove` refuses one, naming where it lives; lint and prefab checks
+  read them.
 - **Default passives** (`default_entity_passives`, `!defpassive`): copied
   onto every unit at `Entity.spawn` (`_apply_default_passives`). With
   `default_passives_existing_units` on (default; #221, user call, 1091-1092)
@@ -2156,6 +2184,15 @@ hardcodes**.
   one read path, level entries included).
   Innate or equipment restrictions are a permanent status. Checked in
   `run_action` (§7.6); `!system lint` covers the formulas.
+- **Statuses that carry behaviour** (#411, #412, 1298-1302): a
+  definition's (instance's, level entry's) `passives` fire as the
+  bearer's own (§7.2 "Held passives") and its `actions` are the
+  bearer's while it holds the status (§7.6 "Status actions"); its
+  `action_tags` reach those actions. `!status passive`, `!status action
+  <name> list | remove <a> | <a> <field> <value ...>` (formula fields
+  taken whole, `_ACTION_FORMULA_FIELDS`; a record that can't be read as
+  an action yet is stored with a ⚠️), `!status action_tags`; all three
+  as level fields (`_LEVEL_FIELD_SUBS`).
 - **Per-level data** (#259, 965-967): a definition's `levels` dict holds
   entries keyed `3` (that level) or `3+` (that level and up), read LIVE
   (user call, "for now") at the instance's level (`Match.status_level`,
@@ -2374,6 +2411,18 @@ hardcodes**.
 - **Rider actions:** a rider gets its slot's actions plus the vehicle's
   actions whose `allowed_slots` list its slot; `mount_action_actor` decides
   who is `source`; `vehicle` / `rider` / `slot` are always bound.
+- **Status actions** (#412, 1301-1302): `discover_actions` adds each
+  held status's `actions` (`status_field`, level entries included) with
+  container `status:<name>` and path `status:<name>.actions.<a>`
+  (`STATUS_SOURCE_PREFIX`), so `!action <eid> <a>` and `use_action` find
+  them by name; reactions included (`reactions._status_reaction_holders`
+  adds their holders to the candidates). `source` is a
+  `StatusSourceProxy` (`action.make_source`): reads the instance's
+  field, else the definition view at its level; a write goes through
+  `_emit_status_diff` like status_set (max_level, hooks, lines). The
+  status's `action_tags` reach them as a container's. Under a team
+  view a status action shows only where the status does
+  (`Match.action_visible` through `status_visible_to`).
 - **Composed patterns** (no engine feature needed): channeled actions break on
   move / damage through passives (442); charge-up attacks count turns in a
   var (443); armor-limited penetration loops `entities_on_los` with an
@@ -3361,6 +3410,19 @@ hardcodes**.
   leave them out (`without_zone_grants`); `!zone rename` and `!status
   rename` follow. When to use one over enter / exit hooks is in `!help
   zone grant`.
+  **Tile grants** (#290, user design, 1303-1304): a tile template's
+  `grants` / `grant_condition` / `grant_bodies` (`SpecialTileTemplate.
+  grants`, `grant_settings`; read live) and a tile's own data of those
+  names (a status's own entry replacing the template's) grant statuses
+  to the units standing on the tile through the same machinery:
+  `_desired_tile_grants` per granting cell (`Map.grant_cells`, memoized
+  in `_grant_cells_memo` beside the tile hook index), source
+  `tile:<map>:<x>,<y>` (`TILE_GRANT_PREFIX`, `tile_grant_source`), the
+  condition binding tile_x / tile_y / tile_map; the highest level among
+  zones, items and tiles wins; removed_by `tile` when only tiles held it.
+  `!tile grant | ungrant | grant_condition | grant_bodies <x> <y> ...`,
+  the same under `!tile def` and `!system tile`; `!status rename` renames
+  tile and template grants; lint and prefab checks read them.
 
 ### 7.13 Vision, fog and line of sight
 

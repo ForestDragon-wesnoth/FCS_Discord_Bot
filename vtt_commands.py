@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import (SPRITE_EFFECTS_KEY, OVERLAY_EFFECTS_KEY, SPRITE_EFFECT_FIELDS,
+from logic import (SPRITE_EFFECTS_KEY, OVERLAY_EFFECTS_KEY, PASSIVES_KEY, held_passive_spec, SPRITE_EFFECT_FIELDS,
                    check_sprite_effect, check_sprite_effects, sprite_effect_items,
                    sprite_effect_text, EFFECT_PROBLEMS)
 from logic import STATUS_DURATION_MODES, STATUS_TICK_WHENS, STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
@@ -2803,6 +2803,138 @@ def effects_list_text(bundle: Any, what: str) -> str:
 
 
 _UNCHANGED = object()
+
+
+HELD_PASSIVE_USAGE = ('add <passive_id> <when> [target=PATH] '
+                      '[scope=exact|children|deep] [priority=<n>] '
+                      '[extra_turns=on|off] "<formula>" | remove <passive_id> '
+                      '| list | clear')
+
+
+def edit_held_passives(words: List[str], bundle: Any, what: str,
+                       usage: str, known_funcs: Any) -> Tuple[Any, str]:
+    """One `passive` subcommand on a status's `passives` (#411): `words` =
+    [action, ...]. Returns (the new bundle, None when it becomes empty, or
+    _UNCHANGED for `list`) and the reply."""
+    if not words:
+        raise VTTError(f"Usage: `{usage}`.")
+    act = words[0].lower()
+    cur = dict(bundle) if isinstance(bundle, dict) else {}
+    if act == "list":
+        _check_tail(words, 1, (), usage)
+        if not cur:
+            return _UNCHANGED, f"No passives on {what}."
+        lines = [f"**Passives on {what}:**"]
+        for pid, rec in cur.items():
+            p, problem = held_passive_spec(pid, rec)
+            if p is None:
+                lines.append(f"- `{pid}` ⚠️ can't run: {problem}")
+                continue
+            extra = ""
+            if p.priority:
+                extra += f", priority {p.priority:g}"
+            if p.var_hooks:
+                extra += f", target `{p.target or '(root)'}` scope {p.scope}"
+            if p.extra_turns is not None:
+                extra += (f", extra turns "
+                          f"{_extra_turns_text(p.extra_turns)}")
+            lines.append(f"- `{pid}` ({p.when}{extra}): "
+                         f"`{formula_text(p.formula)}`")
+        return _UNCHANGED, "\n".join(lines)
+    if act == "clear":
+        _check_tail(words, 1, (), usage)
+        return None, f"Cleared every passive on {what}."
+    if act == "remove":
+        if len(words) < 2:
+            raise VTTError(f"Usage: `{usage}`.")
+        _check_tail(words, 2, (), usage)
+        if words[1] not in cur:
+            raise NotFound(f"No passive `{words[1]}` on {what}.")
+        cur.pop(words[1])
+        return (cur or None), f"Removed passive `{words[1]}` from {what}."
+    if act != "add":
+        raise VTTError(f"`{words[0]}` isn't a passive action — usage: "
+                       f"`{usage}`.")
+    if len(words) < 4:
+        raise VTTError(f"Usage: `{usage}`.")
+    pid, when = words[1], ",".join(passive_hooks(words[2].lower()))
+    target, scope, prio, xturns, rest = _passive_opts(words[3:])
+    formula = normalize_body_source(" ".join(rest).strip())
+    if not formula:
+        raise VTTError("Passive formula cannot be empty.")
+    try:
+        validate_program(formula, known_funcs=frozenset(known_funcs))
+    except FormulaError as ex:
+        raise VTTError(f"Invalid passive formula: {ex}")
+    rec: Dict[str, Any] = {"when": when, "formula": formula}
+    if target:
+        rec["target"] = target
+    if scope != "deep":
+        rec["scope"] = scope
+    if prio:
+        rec["priority"] = prio
+    if xturns is not None:
+        rec["extra_turns"] = xturns
+    _p, problem = held_passive_spec(pid, rec)
+    if problem:
+        raise VTTError(f"Passive `{pid}`: {problem}")
+    verb = "Replaced" if pid in cur else "Added"
+    cur[pid] = rec
+    return cur, f"{verb} passive `{pid}` ({when}) on {what}."
+
+
+STATUS_ACTION_USAGE = ("list | remove <action> | <action> <field> "
+                       "<value ...>")
+# Action fields holding formula text, taken whole (spaces kept).
+_ACTION_FORMULA_FIELDS = frozenset({
+    "body", "prepare", "cost", "condition", "affects", "target_condition",
+    "before", "after", "auto_when", "description", "say_format",
+    "condition_message"})
+
+
+def _status_action_note(aname: str, rec: Any, sname: str = "x") -> str:
+    """` ⚠️ not usable yet: ...` when a status's action record (#412)
+    can't be read as an action, else ""."""
+    from action import Action, ActionValidationError
+    try:
+        Action.from_dict(aname, rec, container_path=f"status:{sname}",
+                         full_path=f"status:{sname}.actions.{aname}")
+    except ActionValidationError as ex:
+        return f" ⚠️ not usable yet: {ex}"
+    except VTTError as ex:
+        return f" ⚠️ not usable yet: {ex}"
+    return ""
+
+
+def _held_passive_entries_seen(ctx: Any, m: Match, e: Entity) -> List[Any]:
+    """The held passives of `e` (#411, #208) as the channel's view reads
+    them: only the statuses it sees, and items read through the command's
+    var reader (a private container lists nothing)."""
+    pov = _query_pov(ctx, m)
+    vars_ = (m.reader_vars(e, pov) if VAR_READER.get() is not None
+             else None)
+    statuses = (m.visible_statuses(e.status, pov, e.id)
+                if pov is not None else None)
+    if vars_ is None and statuses is None:
+        return m.held_passive_entries(e)
+    return m.held_passive_entries(
+        e, vars_=vars_ if vars_ is not None else e.vars,
+        statuses=statuses if statuses is not None else e.status)
+
+
+def _held_passive_lines(ctx: Any, m: Match, e: Entity,
+                        prefix: str = "") -> List[str]:
+    """`!passive list` lines for the passives `e`'s statuses and items hold
+    (#411, #208), each named with where it lives."""
+    out = []
+    for src, pid, spec, problem, _sn in _held_passive_entries_seen(ctx, m, e):
+        if problem:
+            out.append(f"- `{prefix}{pid}` ({src}) ⚠️ can't run: {problem}")
+            continue
+        p = held_passive_spec(pid, spec)[0]
+        out.append(_format_passive_line(f"{prefix}{pid}", p)
+                   + f" — held by `{src}`")
+    return out
 
 
 def edit_effects(words: List[str], bundle: Any, what: str, usage: str,
@@ -12364,6 +12496,29 @@ def _status_watchers(sdef: Any) -> List[Tuple[str, Any]]:
     return out
 
 
+def _status_passive_slots(sname: str, sdef: Any):
+    """Lint slots of the passives a status definition holds (#411): its
+    own `passives`, its `data`'s (copied into instances) and its level
+    entries'."""
+    if not isinstance(sdef, dict):
+        return
+    places = [("", sdef.get(PASSIVES_KEY))]
+    data = sdef.get("data")
+    if isinstance(data, dict):
+        places.append(("data ", data.get(PASSIVES_KEY)))
+    levels = sdef.get(STATUS_LEVELS_FIELD)
+    for spec_key, entry in sorted((levels if isinstance(levels, dict)
+                                   else {}).items()):
+        if isinstance(entry, dict):
+            places.append((f"level {spec_key} ", entry.get(PASSIVES_KEY)))
+    for where, bundle in places:
+        for pid, rec in sorted((bundle if isinstance(bundle, dict)
+                                else {}).items()):
+            f = rec.get("formula") if isinstance(rec, dict) else None
+            yield (f"status `{sname}` {where}passive `{pid}`", f, "exec",
+                   frozenset(), False)
+
+
 def _action_slots(where: str, act: Any):
     """Lint slots of one action: its programs (the body starts with its
     `prepare`'s locals) and, for a reaction (#36), its halves and
@@ -12441,6 +12596,13 @@ def _match_formula_slots(m: Match):
     for sname, sdef in sorted(m.status_definitions.items()):
         for where, spec in _status_watchers(sdef):
             yield from _watcher_slots(f"status `{sname}` {where}", spec)
+        yield from _status_passive_slots(sname, sdef)
+    # Passives units' items hold (#208).
+    for eid, e in sorted(m.entities.items()):
+        for src, pid, spec, problem, sname in m.held_passive_entries(e):
+            if sname is None and isinstance(spec, dict):
+                yield (f"`{eid}` passive `{pid}` (`{src}`)",
+                       spec.get("formula"), "exec", frozenset(), False)
     for sname, sdef in sorted(m.status_definitions.items()):
         yield f"status `{sname}` tick", sdef.get("tick"), "exec", frozenset(), False
         hooks = sdef.get("hooks")
@@ -12460,6 +12622,9 @@ def _match_formula_slots(m: Match):
         for key in ("block", "opaque"):
             yield (f"tile template `{tname}` {key}", tpl.data.get(key), "eval",
                    frozenset(), False)
+        yield (f"tile template `{tname}` grant_condition",
+               tpl.grant_settings.get("grant_condition"), "eval",
+               frozenset(), False)
     many = len(m.maps) > 1
     for mp in m.maps.values():
         on = f" on `{mp.name}`" if many else ""
@@ -12469,7 +12634,7 @@ def _match_formula_slots(m: Match):
             for when, src in sorted((tile.get("hooks") or {}).items()):
                 yield (f"tile ({x},{y}){on} hook `{when}`", src, "exec",
                        frozenset(), False)
-            for key in ("block", "opaque"):
+            for key in ("block", "opaque", "grant_condition"):
                 yield (f"tile ({x},{y}){on} {key}", tile.get(key), "eval",
                        frozenset(), False)
     for zname in m.zone_names():
@@ -12605,6 +12770,7 @@ def _system_formula_slots(rule_value: Callable[[str], Any],
         for where, src, mode in _status_level_formulas(sdef):
             yield (f"status `{sname}` {where}", src, mode, frozenset(),
                    False)
+        yield from _status_passive_slots(sname, sdef)
     watch = [(f"watcher `{wname}`", w) for wname, w in sorted(
         _dict(library("watchers")).items())]
     for sname, sdef in statuses:
@@ -12886,7 +13052,7 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
     need = {"new": 4, "data": 6, "del-data": 5, "hook": 6, "del-hook": 5,
             "del": 4, "delete": 4, "remove": 4, "rm": 4, "info": 4,
             "promote": 4, "list": 3, "rename": 5, "copy": 5, "tags": 5,
-            "face": 5}
+            "face": 5, **{k: v + 2 for k, v in _GRANT_SUBS.items()}}
     if action not in need:
         return await _help_fallback(ctx, ["system", "tile"], args[1])
     if await return_help_if_not_enough_args(ctx, args, need[action],
@@ -12950,10 +13116,23 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
         return await ctx.send(f"Renamed tile template `{name}` to `{new}` on "
                               f"`{sys_name}` (matches made from now on get "
                               f"`{new}`; live ones keep their own).")
+    if action in _GRANT_SUBS:
+        reply = _tile_template_grant_edit(
+            tpl, [action, *args[3:]],
+            f"`{sys_name}` tile template `{name}`",
+            "!system tile {sub} " + sys_name,
+            lambda body, what, mode="exec": _system_formula_warning(
+                mgr, s, body, mode, f"Invalid {what}", "it fails"))
+        lib[name] = tpl.to_dict()
+        mgr.system_library_write(s, "tile_templates", lib)
+        return await ctx.send(reply)
     if action == "info":
         view = {"data": tpl.data, "hooks": tpl.hooks}
         if tpl.tags:
             view["tags"] = tpl.tags
+        if tpl.grants:
+            view["grants"] = tpl.grants
+        view.update(tpl.grant_settings)
         body = json.dumps(view, indent=2, default=str)
         src = "" if name in s.tile_templates else " (inherited)"
         return await ctx.send(f"**tile template `{name}`** on "
@@ -13816,6 +13995,10 @@ registry.annotate_sub(
         "hook <system> <name> <when> <formula ...> | "
         "del-hook <system> <name> <when> | tags <system> <name> <tag ...> | "
         "face <system> <name> <dir|-> | "
+        "grant <system> <name> <status> [level=<n>] [linger=<n>] "
+        "[<key>=<value> ...] | ungrant <system> <name> <status> | "
+        "grant_condition <system> <name> [<formula ...> | -] | "
+        "grant_bodies <system> <name> <root|all|-> | "
         "rename <system> <name> <new_name> | copy <system> <name> <new_name> | "
         "del <system> <name> | "
         "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
@@ -22912,6 +23095,18 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         pid = args[2]
         e = m.entities[eid]
         if pid not in e.passives:
+            held = [src for src, hid, *_ in m.held_passive_entries(e)
+                    if hid == pid]
+            if held:
+                src = held[0]
+                where = (f"`!status passive {src[7:]} remove {pid}`"
+                         if src.startswith("status:") else
+                         f"`!ent delete_var {eid} {src}.passives.{pid}`")
+                raise VTTError(
+                    f"Passive `{pid}` of `{eid}` is held by `{src}`: it "
+                    f"goes when the unit loses that "
+                    f"{'status' if src.startswith('status:') else 'item'}, "
+                    f"or edit it there ({where}).")
             raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
         del e.passives[pid]
         e.mark_changed()
@@ -22922,22 +23117,28 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if len(args) >= 2:
             eid = _query_eid(ctx, m, args[1])
             e = m.entities[eid]
-            if not e.passives:
+            held = _held_passive_lines(ctx, m, e)
+            if not e.passives and not held:
                 return await ctx.send(f"`{eid}` has no passives.")
             lines = [f"**Passives on `{eid}`:**"]
             for pid, p in e.passives.items():
                 lines.append(_format_passive_line(pid, p))
+            lines += held
             return await ctx.send("\n".join(lines))
         # All entities
         lines = ["**All entity passives in this match:**"]
         any_found = False
         pov = _query_pov(ctx, m)
         for eid, e in m.entities.items():
-            if not e.passives or _pov_hides(m, pov, eid):
+            if _pov_hides(m, pov, eid):
+                continue
+            held = _held_passive_lines(ctx, m, e, prefix=f"{eid}.")
+            if not e.passives and not held:
                 continue
             any_found = True
             for pid, p in e.passives.items():
                 lines.append(_format_passive_line(f"{eid}.{pid}", p))
+            lines += held
         if not any_found:
             return await ctx.send("No entity passives in this match.")
         return await ctx.send("\n".join(lines))
@@ -22949,8 +23150,21 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         pid = args[2]
         e = m.entities[eid]
         if pid not in e.passives:
-            raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
-        p = e.passives[pid]
+            src = None
+            for hsrc, hid, spec, problem, _sn in _held_passive_entries_seen(
+                    ctx, m, e):
+                if hid == pid:
+                    if problem:
+                        return await ctx.send(
+                            f"⚠️ Passive `{pid}` of `{eid}` ({hsrc}) can't "
+                            f"run: {problem}")
+                    src, p = hsrc, held_passive_spec(pid, spec)[0]
+                    break
+            if src is None:
+                raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
+        else:
+            src = None
+            p = e.passives[pid]
         scope_block = ""
         if p.var_hooks:
             scope_block = (
@@ -22958,7 +23172,8 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Scope: `{p.scope}`\n"
             )
         return await ctx.send(
-            f"**Passive `{eid}.{pid}`**\n"
+            f"**Passive `{eid}.{pid}`**"
+            + (f" (held by `{src}`)" if src else "") + "\n"
             f"{_hooks_label(p)}\n"
             + (f"Priority: {p.priority}\n" if p.priority else "")
             + (f"On extra turns: {_extra_turns_text(p.extra_turns)}\n"
@@ -24459,6 +24674,31 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 mp.tile_set_path(x, y, SPRITE_EFFECTS_KEY, new)
         return await ctx.send(reply)
 
+    # ---- grant / ungrant / grant_condition / grant_bodies <x> <y> ----
+    # (#290: the tile's own status grants; its template's are read live)
+    if sub in _GRANT_SUBS:
+        if await return_help_if_not_enough_args(
+                ctx, args, _GRANT_SUBS[sub] + 1, "tile", sub):
+            return
+        x, y = _parse_xy(args)
+        if not mp.in_bounds(x, y):
+            raise OutOfBounds(f"({x},{y}) {mp.off_text(x, y)}")
+        tile = mp.tiles.get((x, y)) or {}
+        keys = ("grants", "grant_condition", "grant_bodies")
+        target = {k: jcopy(tile[k]) for k in keys if k in tile}
+        reply = _grant_edit(target, [sub, f"{x},{y}", *args[3:]],
+                            f"tile ({x},{y}){_on_map(m, mp)}",
+                            "!tile {sub}", _match_program_check(m),
+                            name_word="<x> <y>",
+                            inside="standing on it")
+        for k in keys:
+            if k in target:
+                if not same_value(target[k], tile.get(k)):
+                    mp.tile_set_path(x, y, k, target[k])
+            elif k in tile:
+                mp.tile_del_path(x, y, k)
+        return await ctx.send(reply)
+
     # ---- tags <x> <y> <tag ...|-> ----  (the tile's own tags)
     if sub == "tags":
         if await return_help_if_not_enough_args(ctx, args, 4, "tile", "tags"):
@@ -24691,6 +24931,18 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             title, body = registry.help_for(["tile", "def"])
             return await ctx.send(f"**{title}**\n{body}")
         dsub = args[1].lower()
+
+        if dsub in _GRANT_SUBS:
+            # !tile def grant <name> <status> ... (#290)
+            if await return_help_if_not_enough_args(
+                    ctx, args, _GRANT_SUBS[dsub] + 1, "tile", "def"):
+                return
+            tpl = m.tile_templates.get(args[2])
+            if tpl is None:
+                raise NotFound(f"No tile template `{args[2]}`.")
+            return await ctx.send(_tile_template_grant_edit(
+                tpl, args[1:], f"tile template `{args[2]}`",
+                "!tile def {sub}", _match_program_check(m)))
 
         if dsub == "new":
             # !tile def new <name>
@@ -24939,6 +25191,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             view = {"data": tpl.data, "hooks": tpl.hooks}
             if tpl.tags:
                 view["tags"] = tpl.tags
+            if tpl.grants:
+                view["grants"] = tpl.grants
+            view.update(tpl.grant_settings)
             body = _json.dumps(_hide_formula_fields(view), indent=2,
                                default=str)
             return await ctx.send(
@@ -25282,6 +25537,39 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 registry.annotate_sub(
+    "tile", "grant",
+    usage=("!tile grant <x> <y> <status> [level=<n>] [linger=<n>] "
+           "[<key>=<value> ...] [map=<map>]"),
+    desc=("#290: the tile grants a status to the units standing on it, "
+          "through the zone grants' machinery (`!help zone grant`): it "
+          "goes on when a body steps on, comes off (or lingers) when the "
+          "last granting tile, zone or item lets go (removed_by `tile` "
+          "when only tiles held it), the highest level among them wins. A "
+          "tile template's grants (`!tile def grant`) reach every tile "
+          "placed from it, read live; the tile's own grant of a status "
+          "replaces its template's. Terrain bonuses: a forest gives cover."),
+)
+registry.annotate_sub(
+    "tile", "ungrant",
+    usage="!tile ungrant <x> <y> <status> [map=<map>]",
+    desc="#290: the tile stops granting a status of its own.",
+)
+registry.annotate_sub(
+    "tile", "grant_condition",
+    usage="!tile grant_condition <x> <y> [<formula ...> | -] [map=<map>]",
+    desc=("#290: an expression a unit must meet for the tile's grants "
+          "(self = the unit; tile_x, tile_y, tile_map bound); a failing "
+          "one reads as not met. Its own, else its template's."),
+)
+registry.annotate_sub(
+    "tile", "grant_bodies",
+    usage="!tile grant_bodies <x> <y> <root|all|-> [map=<map>]",
+    desc=("#290: who standing on the tile gets its grants: `root` (the "
+          "body root once, when any cell of the body is on it), `all` "
+          "(every unit with a cell on it), `-` (its template's, else the "
+          "zone_status_grant_bodies rule)."),
+)
+registry.annotate_sub(
     "tile", "effect",
     usage=effect_usage("!tile effect <x> <y>", True) + " [map=<map>]",
     desc=("#624: the tile's own sprite effects in images (`!help "
@@ -25385,7 +25673,11 @@ registry.annotate_sub(
         "!tile def tags <name> <tag ...> | "
         + effect_usage("!tile def effect <name>") + " | "
         "!tile def face <name> <dir|-> | "
-        "!tile def reapply <name> [reset] [map=<map>]"
+        "!tile def reapply <name> [reset] [map=<map>] | "
+        "!tile def grant <name> <status> [level=<n>] [linger=<n>] "
+        "[<key>=<value> ...] | !tile def ungrant <name> <status> | "
+        "!tile def grant_condition <name> [<formula ...> | -] | "
+        "!tile def grant_bodies <name> <root|all|->"
     ),
     desc=(
         "Manage reusable tile templates. A template defines a kind of "
@@ -26320,6 +26612,23 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["zone"], args[0] if args else None)
 
 
+def _tile_template_grant_edit(tpl: Any, args: List[str], label: str,
+                              usage: str, check) -> str:
+    """A grant subcommand (#290) on tile template `tpl` (SpecialTileTemplate):
+    its `grants` and grant_condition / grant_bodies settings, read live by
+    the tiles placed from it."""
+    target: Dict[str, Any] = dict(tpl.grant_settings)
+    if tpl.grants:
+        target["grants"] = jcopy(tpl.grants)
+    reply = _grant_edit(target, args, label, usage, check,
+                        inside="standing on its tiles")
+    tpl.grants = target.get("grants") or {}
+    tpl.grant_settings = {k: target[k] for k in ("grant_condition",
+                                                 "grant_bodies")
+                          if k in target}
+    return reply
+
+
 # Status-granting zones (#136): the subcommands shared by `!zone`, `!zone
 # def` and `!system zone`, each by the words it needs (action included).
 _GRANT_SUBS = {"grant": 3, "ungrant": 3, "grant_condition": 2,
@@ -26327,7 +26636,8 @@ _GRANT_SUBS = {"grant": 3, "ungrant": 3, "grant_condition": 2,
 
 
 def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
-                usage: str, check) -> str:
+                usage: str, check, name_word: str = "<name>",
+                inside: str = "inside it") -> str:
     """Run grant subcommand `args[0]` (args = <sub> <name> ...) on zone or
     zone definition dict `target`, named `label` in the reply; `usage` is
     the command the hints name (a format string over `sub`), `check(body,
@@ -26341,7 +26651,7 @@ def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
             k, eq, v = tok.partition("=")
             if not eq or not k:
                 raise VTTError(
-                    f"`{tok}` — usage: `{usage.format(sub='grant')} <name> "
+                    f"`{tok}` — usage: `{usage.format(sub='grant')} " + name_word + " "
                     f"<status> [level=<n>] [linger=<n>] [<key>=<value> "
                     f"...]`.")
             val = _parse_scalar(v)
@@ -26365,10 +26675,10 @@ def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
         bits = [b for b in bits if b]
         return (f"{label} grants `{status}`"
                 + (f" ({', '.join(bits)})" if bits else "")
-                + " to the units inside it.")
+                + f" to the units {inside}.")
     if sub == "ungrant":
         _check_tail(args, 3, (), usage.format(sub="ungrant")
-                    + " <name> <status>")
+                    + " " + name_word + " <status>")
         grants = target.get("grants") or {}
         if args[2] not in grants:
             raise NotFound(f"{label} has no `{args[2]}` grant of its own.")
@@ -26379,7 +26689,7 @@ def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
                 f"lose it).")
     if sub == "grant_bodies":
         _check_tail(args, 3, (), usage.format(sub="grant_bodies")
-                    + " <name> <root|all|->")
+                    + " " + name_word + " <root|all|->")
         v = args[2].lower()
         if v in ("-", "default", "clear"):
             target.pop("grant_bodies", None)
@@ -26387,11 +26697,11 @@ def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
                     f"zone_status_grant_bodies rule again.")
         if v not in ZONE_GRANT_BODIES:
             raise VTTError("grant_bodies is `root` (a body's root unit, "
-                           "once), `all` (every unit with a cell inside) or "
+                           f"once), `all` (every unit with a cell {inside}) or "
                            "`-` (the default).")
         target["grant_bodies"] = v
         return f"{label} grants to " + (
-            "body roots." if v == "root" else "every unit with a cell inside.")
+            "body roots." if v == "root" else f"every unit with a cell {inside}.")
     # grant_condition [<formula> | -]
     body = normalize_body_source(" ".join(args[2:]).strip())
     if not body:
@@ -26405,7 +26715,10 @@ def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
     warn = check(body, "grant_condition", mode="eval")
     target["grant_condition"] = body
     return (f"{label} grants only to units for which `{body}` holds (self = "
-            f"the unit, zone_name bound)." + (f"\n{warn}" if warn else ""))
+            f"the unit, "
+            + ("zone_name" if inside == "inside it"
+               else "tile_x, tile_y, tile_map")
+            + " bound)." + (f"\n{warn}" if warn else ""))
 
 
 def _grant_view(z: Dict[str, Any]) -> Dict[str, Any]:
@@ -26809,6 +27122,41 @@ registry.annotate_sub(
           "own `sprite_effects` key replaces the definition's."),
 )
 registry.annotate_sub(
+    "status", "action",
+    usage="!status action <name> " + STATUS_ACTION_USAGE,
+    desc=("#412: actions the status grants. While a unit holds it they are "
+          "the unit's actions (`!action ogre frenzy`), listed at "
+          "`status:<name>.actions.<action>`, with `source` = the status "
+          "instance (`source.charges -= 1` writes it as status_set does). "
+          "A field takes the rest of the line (`body`, `prepare`, `before`, "
+          "... whole; a JSON list or object for `tags`; else one value): "
+          "`!status action rage frenzy target entity`, `!status action rage "
+          "frenzy body \"deal_damage(target, 6)\"`. Reactions count "
+          "(`before` / `after`). A team view that can't see the status "
+          "doesn't list its actions. Level entries add or replace actions by "
+          "name (`!status level rage 3+ actions frenzy body ...`)."),
+)
+registry.annotate_sub(
+    "status", "action_tags",
+    usage="!status action_tags <name> [<tag ...> | -]",
+    desc=("#412: tags every action the status grants carries, as a "
+          "container's `action_tags` reach its actions (a status's own "
+          "`tags` don't)."),
+)
+registry.annotate_sub(
+    "status", "passive",
+    usage="!status passive <name> " + HELD_PASSIVE_USAGE,
+    desc=("#411: passives the status holds. While a unit holds the status "
+          "they fire as the unit's own (self = the bearer, globals / team / "
+          "own / held by priority), with `passive_source` = "
+          "`status:<name>` and `passive_status` = the status bound: "
+          "`!status passive thorns add spike on_damage_taken \"deal_damage("
+          "attacker, 2)\"`. A level entry adds or replaces passives by id "
+          "(`!status level thorns 3+ passives add ...`); an instance's own "
+          "`passives` key replaces the definition's. `!passive list <unit>` "
+          "lists them under the status."),
+)
+registry.annotate_sub(
     "status", "overlay_effect",
     usage=effect_usage("!status overlay_effect <name>"),
     desc=("#624: sprite effects on the status's overlay sprite (`!status "
@@ -26960,7 +27308,8 @@ _STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
                     "on_transform": 3, "if_source_lost": 3,
                     "duration_mode": 3, "duration_when": 3,
                     "glyph": 3, "color": 3, "display_priority": 3,
-                    "effect": 3, "overlay_effect": 3,
+                    "effect": 3, "overlay_effect": 3, "passive": 3,
+                    "action": 3, "action_tags": 2,
                     "removed_on_damage": 3,
                     "break_at_damage": 3, "damage_filter": 2,
                     "tick_priority": 3}
@@ -26983,6 +27332,8 @@ _LEVEL_FIELD_SUBS = {"tick": "tick", "tick_when": "when", "when": "when",
                      "display_priority": "display_priority",
                      SPRITE_EFFECTS_KEY: "effect",
                      OVERLAY_EFFECTS_KEY: "overlay_effect",
+                     PASSIVES_KEY: "passive",
+                     "actions": "action", "action_tags": "action_tags",
                      "removed_on_damage": "removed_on_damage",
                      "break_at_damage": "break_at_damage",
                      "damage_filter": "damage_filter",
@@ -27418,6 +27769,99 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                 sdef.pop(key, None)
             else:
                 sdef[key] = new
+        return reply
+
+    if sub == "action":
+        # #412: actions the status grants its bearer while held.
+        name = args[1]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        sdef = m.status_definitions[name]
+        usage = prefix.format(sub=sub) + " <name> " + STATUS_ACTION_USAGE
+        acts = dict(sdef.get("actions") or {}) \
+            if isinstance(sdef.get("actions"), dict) else {}
+        words = args[2:]
+        act = words[0].lower() if words else ""
+        if act == "list":
+            _check_tail(words, 1, (), usage)
+            if not acts:
+                return f"Status `{name}` grants no actions."
+            lines = [f"**Actions status `{name}` grants:**"]
+            for an, rec in acts.items():
+                tgt = rec.get("target", "none") if isinstance(rec, dict) \
+                    else "?"
+                lines.append(f"- `{an}` (target {tgt})"
+                             + _status_action_note(an, rec, name))
+            return "\n".join(lines)
+        if act == "remove":
+            if len(words) != 2:
+                raise VTTError(f"Usage: `{usage}`.")
+            if words[1] not in acts:
+                return f"❌ Status `{name}` grants no action `{words[1]}`."
+            acts.pop(words[1])
+            if acts:
+                sdef["actions"] = acts
+            else:
+                sdef.pop("actions", None)
+            return f"Status `{name}` no longer grants `{words[1]}`."
+        if len(words) < 3:
+            raise VTTError(f"Usage: `{usage}`.")
+        aname, field = words[0], words[1]
+        check_store_path(field, "action field")
+        raw = " ".join(words[2:])
+        if field in _ACTION_FORMULA_FIELDS:
+            value: Any = normalize_body_source(raw)
+        elif raw[:1] in ("[", "{"):
+            try:
+                value = json.loads(raw)
+            except ValueError as ex:
+                raise VTTError(f"`{field}`: not valid JSON ({ex}).")
+        else:
+            value = _parse_scalar(raw) if len(words) == 3 else raw
+        rec = dict(acts.get(aname) or {}) \
+            if isinstance(acts.get(aname), dict) else {}
+        try:
+            _set_path(rec, field, _own_value(value))
+        except (KeyError, TypeError) as ex:
+            raise VTTError(str(ex))
+        acts[aname] = rec
+        sdef["actions"] = acts
+        return (f"Status `{name}` action `{aname}`.{field} set."
+                + _status_action_note(aname, rec, name))
+
+    if sub == "action_tags":
+        # #412: tags reaching every action the status grants (its
+        # `action_tags`, as a container's).
+        name = args[1]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        sdef = m.status_definitions[name]
+        raw = " ".join(args[2:]).strip()
+        if raw in ("", "-"):
+            sdef.pop("action_tags", None)
+            return f"Cleared `{name}` action_tags."
+        tags = normalize_tags(raw)
+        for t in tags:
+            check_tag(t)
+        sdef["action_tags"] = tags
+        return (f"Every action status `{name}` grants carries "
+                f"{', '.join(f'`{t}`' for t in tags)}.")
+
+    if sub == "passive":
+        # #411: passives the status holds, firing as its bearer's own.
+        name = args[1]
+        if name not in m.status_definitions:
+            return f"❌ No status definition `{name}`."
+        sdef = m.status_definitions[name]
+        new, reply = edit_held_passives(
+            args[2:], sdef.get(PASSIVES_KEY), f"status `{name}`",
+            prefix.format(sub=sub) + " <name> " + HELD_PASSIVE_USAGE,
+            (getattr(m, "formula_functions", None) or {}).keys())
+        if new is not _UNCHANGED:
+            if new is None:
+                sdef.pop(PASSIVES_KEY, None)
+            else:
+                sdef[PASSIVES_KEY] = new
         return reply
 
     if sub in ("removed_on_damage", "break_at_damage", "damage_filter"):
