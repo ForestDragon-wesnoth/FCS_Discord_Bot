@@ -9753,7 +9753,7 @@ async def prefab_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         mid = mgr.get_active_for_channel(ctx.channel_key)
         cm = mgr.matches.get(mid) if mid else None
         image = how == "image" or (how is None and cm is not None and
-                                   getattr(cm, "render_mode", "text") == "image")
+                                   cm.map_render_mode_now() == "image")
         hook = getattr(ctx, "post_scene_image", None)
         if image and hook is not None:
             await ctx.send("\n".join(lines))
@@ -17614,7 +17614,7 @@ async def _show_marked_map(ctx, m, pov, cells, head: str, who: str,
     if show is not None:                       # gui.py draws it on its canvas
         show(highlights, mp)
         return await ctx.send(f"{head}\n{who}")
-    if getattr(m, "render_mode", "text") == "image":
+    if m.map_render_mode_now() == "image":
         hook = getattr(ctx, "post_scene_image", None)
         if hook is not None:                   # Discord image mode
             await ctx.send(f"{head}\n{who}")
@@ -17988,7 +17988,7 @@ for _sub, _usage in (
         ("background", "!map background <key|clear> [stretch|tile|center] [map=<map>]"),
         ("border", "!map border <on | off | clear | color <name> | opacity <0-100>> [map=<map>]"),
         ("unseen", "!map unseen [show | blank_named | blank_unnamed | hidden | default] [map=<map>]"),
-        ("mode", "!map mode <text|image>"),
+        ("mode", "!map mode [text|image|default]"),
         ("scene", "!map scene [full] [list] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off] [map=<map>]"),
         ("image", "!map image [full] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off] [map=<map>]"),
         ("color", "!map color <on|off>"),
@@ -18449,13 +18449,21 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # graphics-capable surface (Discord + Pillow); text-only surfaces fall
         # back to ASCII.
         if len(args) < 2:
+            src = ("this match's own setting" if m.render_mode
+                   else "the map_render_mode rule")
             return await ctx.send(
-                f"Render mode for **{m.name}**: `{m.render_mode}`. "
-                f"Set: `!map mode text|image` (image needs the Discord "
+                f"Render mode for **{m.name}**: `{m.map_render_mode_now()}` "
+                f"({src}). Set: `!map mode text|image`, or `!map mode "
+                f"default` to follow the rule (image needs the Discord "
                 f"graphics surface; text surfaces fall back to ASCII).")
         mode = args[1].lower()
-        if mode not in ("text", "image"):
-            return await ctx.send("❌ Usage: `!map mode text|image`.")
+        if mode not in ("text", "image", "default"):
+            return await ctx.send("❌ Usage: `!map mode text|image|default`.")
+        if mode == "default":
+            m.render_mode = ""
+            mode = m.map_render_mode_now()
+            return await ctx.send(
+                f"Render mode follows the map_render_mode rule: `{mode}`.")
         m.render_mode = mode
         extra = ("" if mode == "text" else
                  " — a plain `!map` and the auto-update board now post a "
@@ -18799,7 +18807,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # of the ASCII block. Text-only surfaces (CLI / harness) fall through to
     # ASCII. (`!map image` forces graphics regardless of mode; this is the
     # implicit path for a plain `!map` when mode=image.)
-    if getattr(m, "render_mode", "text") == "image":
+    if m.map_render_mode_now() == "image":
         hook = getattr(ctx, "post_scene_image", None)
         if hook is not None:
             pov = _view_pov(ctx, m, args)

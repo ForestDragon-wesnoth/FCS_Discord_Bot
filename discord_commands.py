@@ -429,7 +429,7 @@ class DiscordCtxWrapper:
         engaged = False
         # Image board when the match's render mode is `image` (and Pillow is
         # available); otherwise the ASCII board. Falls back to text on failure.
-        if getattr(m, "render_mode", "text") == "image":
+        if m.map_render_mode_now() == "image":
             try:
                 header, data, engaged = await _board_image(m, self.channel_key, self._mgr)
                 view = _board_view(m, self.channel_key, self._mgr, engaged)
@@ -448,7 +448,7 @@ class DiscordCtxWrapper:
                 msg = await self._ctx.send(text)
         _boards[self.channel_key] = {"message": msg, "match_id": m.id,
                                      "workspace": getattr(self._mgr, "guild_key", None)}
-        kind = "image" if getattr(m, "render_mode", "text") == "image" else "map"
+        kind = "image" if m.map_render_mode_now() == "image" else "map"
         return (f"🗺️ Auto-update {kind} board ON — this message refreshes on "
                 "every change" + (" (use the arrows to pan)." if engaged else "."))
 
@@ -1285,7 +1285,7 @@ async def _apply_board(message, m, channel_key: str, mgr: MatchManager,
 async def _apply_board_as_reader(message, m, channel_key: str,
                                  mgr: MatchManager, io,
                                  kind: str = "map") -> bool:
-    if getattr(m, "render_mode", "text") == "image":
+    if m.map_render_mode_now() == "image":
         try:
             header, data, engaged = await _board_image(m, channel_key, mgr,
                                                        kind)
