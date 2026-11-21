@@ -13837,19 +13837,40 @@ SCENARIO 534 — Render mode toggle: text vs image (graphics surface gating)
 !match use rm
 !ent add hero Hero 30 3 3 5
 !map mode
+?? `text` (the map_render_mode rule)
 !map mode image
 !map
 !map mode text
 !map mode bogus
+!system set default map_render_mode image
+!map mode
+?? `text` (this match's own setting)
+!map mode default
+?? follows the map_render_mode rule: `image`
+!system set default map_render_mode text
+!map mode
+?? `text` (the map_render_mode rule)
+!system set default map_render_mode image
+!match new rm2 Second 5 5
+!match use rm2
+!map mode
+?? `image` (the map_render_mode rule)
+!as restart
+!map mode
+?? `image` (the map_render_mode rule)
 
-Expected: HARNESS-ALLOWS-ERRORS. `!map mode` shows the current per-match render mode (default `text`).
+Expected: HARNESS-ALLOWS-ERRORS. `!map mode` shows the current per-match render mode (default `text`, from the map_render_mode rule).
 `!map mode image` sets it (host-gated, serialized via Match.render_mode). On a
 graphics-capable surface (Discord with Pillow) a plain `!map` then posts a
 rendered PNG instead of the ASCII block, and `!map autoupdate` makes a self-
 refreshing IMAGE board; on a text-only surface (the harness/CLI) a plain `!map`
 in image mode FALLS BACK to the ASCII render (the third command here still
 prints the ascii map). `!map mode text` restores ASCII; `!map mode bogus` is
-rejected with a usage hint. The Discord image-board lifecycle (post + edit
+rejected with a usage hint. A game system sets the mode for its matches
+with the map_render_mode rule: a match's own `!map mode` wins over it,
+`!map mode default` follows the rule again (and then a rule change), and a
+new match follows it from the start, also after a restart. The Discord
+image-board lifecycle (post + edit
 attachments in place, pan buttons re-rendering the image) is verified with
 stubbed Discord objects, not the scenario harness.
 

@@ -3588,8 +3588,11 @@ hardcodes**.
   halving; the legend widens a map narrower than one column.
   `SpriteLoader` re-reads a sprite whose file appeared or changed (path +
   mtime) and keeps PNGs at most `_SPRITE_MAX_SIDE` px.
-- **Surfaces:** `!map image`, `!map mode text|image` (plain `!map` posts an
-  image), `!map autoupdate` boards (Discord, runtime-only), roster
+- **Surfaces:** `!map image`, `!map mode text|image|default` (plain `!map`
+  and the map board post an image; `Match.render_mode` "" follows the rule
+  `map_render_mode`, so a system sets it for its matches,
+  `Match.map_render_mode_now`; a match saved by an older build carries an
+  explicit `text`), `!map autoupdate` boards (Discord, runtime-only), roster
   boards (below), `!map scene [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI;
   the map, the log and the input are panes of one vertical `PanedWindow`
   (`GuiApp._panes`): dragging the bar between two resizes them, and a

@@ -4939,6 +4939,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "override: the `sprite_mirror` var."
         ),
     },
+    "map_render_mode": {
+        "default": "text",
+        "schema": {"type": "enum", "choices": ["text", "image"]},
+        "desc": (
+            "How a plain `!map` and the map auto-update board draw a match "
+            "of this system: 'text' (default, the ASCII map) or 'image' (a "
+            "rendered PNG, on a surface that can post one: Discord with "
+            "Pillow; the CLI and the harness stay ASCII). A match's own "
+            "`!map mode text|image` overrides it; `!map mode default` "
+            "follows the rule again. `!map image` posts one image either "
+            "way."
+        ),
+    },
     "entity_sprite_fallback": {
         "default": "glyph",
         "schema": {"type": "enum", "choices": ["glyph", "name_text"]},
@@ -14307,8 +14320,10 @@ class Match:
     # "text" (ASCII, the default) or "image" (graphical PNG). On a graphics-
     # capable surface (Discord with Pillow), `image` makes a plain `!map` and
     # the auto-update board render graphically; text-only surfaces (CLI /
-    # harness) always fall back to ASCII. Set via `!map mode`. Serialized.
-    render_mode: str = "text"
+    # harness) always fall back to ASCII. Set via `!map mode`; "" (the
+    # default) follows the map_render_mode rule, so a game system sets it
+    # for its matches (map_render_mode_now). Serialized.
+    render_mode: str = ""
 
     # ---- match outcome / victory (100) ----
     # None until a winner is declared (manually via `!match win` or from a
@@ -30990,7 +31005,7 @@ class Match:
         mc = d.get("map_coords")
         m.map_coords = mc if isinstance(mc, bool) else None
         rm = d.get("render_mode")
-        m.render_mode = rm if rm in ("text", "image") else "text"
+        m.render_mode = rm if rm in ("text", "image") else ""
         pz = d.get("paused")
         m.paused = copy.deepcopy(pz) if isinstance(pz, dict) else None
         if m.paused is not None:
@@ -31032,6 +31047,15 @@ class Match:
         if e.team is not None and str(e.team) == str(pov_team):
             return None
         return d
+
+    def map_render_mode_now(self) -> str:
+        """How a plain `!map` and the map board draw this match: its own
+        `!map mode` (render_mode), else the map_render_mode rule (text /
+        image)."""
+        if self.render_mode in ("text", "image"):
+            return self.render_mode
+        v = self.rules.get("map_render_mode", "text")
+        return v if v in ("text", "image") else "text"
 
     def status_look(self, e: "Entity", pov_team: Optional[str] = None
                     ) -> Dict[str, Tuple[str, str]]:
