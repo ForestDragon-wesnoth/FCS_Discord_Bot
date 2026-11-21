@@ -593,6 +593,10 @@ class Action:
     # from the acting unit's anchor that way. Off unless the action holds
     # `direction_target: true`.
     direction_target: bool = False
+    # The arg key the words typed after the target without `=` fill
+    # (user design): `default_arg: path` lets `!action hero sprint 2 right
+    # up` give args.path = "2 right up". None = such words are refused.
+    default_arg: Optional[str] = None
     # Set when the action is a reaction (it holds a `before` and / or
     # `after` half).
     reaction: Optional["ReactionSpec"] = None
@@ -714,10 +718,13 @@ class Action:
                                 f"a `location` target only; this action's "
                                 f"is `{target_type}`.")
                 direction_target = False
+        default_arg = _default_arg_field(raw, target_type, full_path,
+                                         problems)
         return Action(
             name=name, body=body, description=description,
             target_type=target_type,
             direction_target=direction_target,
+            default_arg=default_arg,
             container_path=container_path, full_path=full_path,
             allowed_slots=allowed_slots,
             tags=tags, tag_sources=sources, tag_problems=problems,
@@ -729,6 +736,45 @@ class Action:
             cancelled_action_cost=cancel_cost, reaction=reaction,
             condition=condition, condition_message=condition_message,
         )
+
+
+# Words no default_arg can name: `answer=` feeds choose(), and `map=`
+# names a location target's map, so for those targets the command line
+# never hands them to args.
+_DEFAULT_ARG_RESERVED = frozenset({"answer"})
+_LOCATION_TARGETS = frozenset({"location", "location_list"})
+_ARG_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _default_arg_field(raw: Dict[str, Any], target_type: str, path: str,
+                       problems: List[str]) -> Optional[str]:
+    """The action's `default_arg` (the key bare words after the target
+    fill), or None, noting in `problems` a value that can't be one: not a
+    plain key, a word the command line keeps for itself, or a list target
+    that takes every bare word as a target."""
+    v = raw.get("default_arg")
+    if v is None or v == "":
+        return None
+    if not isinstance(v, str) or not _ARG_KEY_RE.match(v.strip()) \
+            or v.strip().startswith("__"):
+        problems.append(f"`{path}.default_arg` is an arg key (letters, "
+                        f"digits and `_`, as `args.<key>` reads it), not "
+                        f"{v!r}; bare words aren't taken.")
+        return None
+    v = v.strip()
+    if v in _DEFAULT_ARG_RESERVED or (v == "map"
+                                      and target_type in _LOCATION_TARGETS):
+        problems.append(f"`{path}.default_arg` can't be `{v}`: `{v}=` "
+                        f"is read by the command itself; bare words "
+                        f"aren't taken.")
+        return None
+    if target_type in ("entity_list", "corpse_list"):
+        problems.append(f"`{path}.default_arg` can't take words after an "
+                        f"`{target_type}` target, which takes every word "
+                        f"without `=` as a target; bare words aren't "
+                        f"taken.")
+        return None
+    return v
 
 
 def _tag_field(d: Dict[str, Any], key: str, path: str,
@@ -1327,12 +1373,24 @@ def coerce_args_token(value: str) -> Any:
     return value
 
 
-def parse_args_tokens(tokens: List[str]) -> Dict[str, Any]:
+def parse_args_tokens(tokens: List[str],
+                      default_arg: Optional[str] = None) -> Dict[str, Any]:
     """Parse `key=value` tokens into the args dict. Tokens without `=`
     are rejected so a typo doesn't silently become an empty-named
-    key. Duplicate keys: last write wins (matches shell convention).
+    key, unless the action names a `default_arg`: then they are joined
+    with spaces, in order, into that key (one word converted as a
+    `key=value` value is, several kept as text). Duplicate keys: last
+    write wins (matches shell convention); a default_arg given both ways
+    is refused.
     """
     out: Dict[str, Any] = {}
+    bare = [t for t in tokens if "=" not in t]
+    if bare and default_arg is not None:
+        tokens = [t for t in tokens if "=" in t]
+        if any(t.partition("=")[0] == default_arg for t in tokens):
+            raise VTTError(
+                f"`{default_arg}` is given twice: as `{default_arg}=` and "
+                f"as the words `{' '.join(bare)}`.")
     for tok in tokens:
         if "=" not in tok:
             raise VTTError(
@@ -1344,6 +1402,9 @@ def parse_args_tokens(tokens: List[str]) -> Dict[str, Any]:
                 f"action arg `{tok}` has an empty key."
             )
         out[k] = coerce_args_token(v)
+    if bare and default_arg is not None:
+        out[default_arg] = (coerce_args_token(bare[0]) if len(bare) == 1
+                            else " ".join(bare))
     return out
 
 

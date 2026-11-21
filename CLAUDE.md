@@ -2329,7 +2329,20 @@ hardcodes**.
   acting unit's ANCHOR, for a multi-tile body where its anchor shifts to
   (`action._direction_cell`; diagonals per allow_diagonal_movement; a
   reaction counts from the reacting unit); without the field a direction
-  word is refused naming it (1251). A successful
+  word is refused naming it (1251). An action holding `default_arg:
+  <key>` (user design, 1305-1307) takes the words after its target
+  that hold no `=` as that arg (`action.parse_args_tokens(tokens,
+  default_arg)`, from `!action` and `!react`): joined with spaces in
+  order, one word converted like a `key=value` value; the key given
+  both ways is refused. `_default_arg_field` names in `!action info` a
+  key that isn't a plain identifier, `answer`, `map` on a location
+  target, or any key on an `entity_list` / `corpse_list` target (which
+  takes every bare word); such an action refuses bare words as before.
+  `parse_moves(text)` (pure, list-charged, capped at
+  formula_size_limit) reads the `!ent move` grammar into one full
+  direction name per step (`logic.parse_move_words`, the parser both
+  `!ent move` forms use), so a sprint is `!action hero sprint 2 right
+  up` walked with `move_step`. A successful
   `!action` (and a resolved exchange) ends with the
   `action_used_message_format` line (`Match.action_used_line`: {actor},
   {action}, {target} as the checks left it, a cell as (x,y), lists joined;

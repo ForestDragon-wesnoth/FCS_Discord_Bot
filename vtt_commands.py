@@ -11,7 +11,7 @@ from prefab import capture_prefab, check_prefab, check_prefab_name, stamp_prefab
 from logic import (
     DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY,
     CARDINAL_DIRECTIONS, DIAGONAL_DIRECTIONS, DIRECTION_VECTORS,
-    normalize_direction, rotate_direction,
+    normalize_direction, rotate_direction, parse_move_words,
     EVENT_LOG_DEFAULT_FORMATS,
 )
 
@@ -14426,26 +14426,10 @@ async def _ent_move_group(ctx, args, mgr, m):
     if not tokens:
         title, body = registry.help_for(["ent", "move"])
         return await ctx.send(f"**{title}**\n{body}")
-    moves: list[tuple[str, int]] = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if normalize_direction(t) is not None:
-            moves.append((t, 1)); i += 1
-        else:
-            try:
-                n = int(t)
-            except ValueError:
-                return await ctx.send(f"❌ Unexpected token '{t}'.")
-            if n < 1:
-                return await ctx.send(
-                    f"❌ A step count must be at least 1, got {n}.")
-            if i + 1 >= len(tokens):
-                return await ctx.send("❌ Count must be followed by a direction.")
-            d = tokens[i + 1]
-            if normalize_direction(d) is None:
-                return await ctx.send(f"❌ '{d}' is not a direction.")
-            moves.append((d, n)); i += 2
+    try:
+        moves = parse_move_words(" ".join(tokens))
+    except VTTError as ex:
+        return await ctx.send(f"❌ {ex}")
     try:
         count, steps, hook_log = m.move_group_dirs(group_name, moves)
     except VTTError as ex:
@@ -15344,25 +15328,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # diagonal rule check lives in Entity.move_dirs — we just need
         # to recognize tokens here. A token is a direction if it
         # normalizes; otherwise it's a count to be followed by one.
-        moves: list[tuple[str,int]] = []
-        i = 0
-        while i < len(tokens):
-            t = tokens[i]
-            if normalize_direction(t) is not None:
-                moves.append((t, 1)); i += 1
-            else:
-                try: n = int(t)
-                except ValueError:
-                    return await ctx.send(f"❌ Unexpected token '{t}'.")
-                if n < 1:
-                    # The walk ran max(1, n) steps: `0 right` moved one.
-                    return await ctx.send(
-                        f"❌ A step count must be at least 1, got {n}.")
-                if i + 1 >= len(tokens): return await ctx.send("❌ Count must be followed by a direction.")
-                d = tokens[i+1]
-                if normalize_direction(d) is None:
-                    return await ctx.send(f"❌ '{d}' is not a direction.")
-                moves.append((d, n)); i += 2
+        try:
+            moves = parse_move_words(" ".join(tokens))
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
 
         total_steps = sum(max(1, int(n)) for _, n in moves)
         pre_map = m.entities[eid].map
@@ -20655,6 +20624,8 @@ def _action_args_hint(action: Any, actor_id: str,
     past the target names no argument, so the refusal lists the
     `args.<key>` its programs read and points at `!action info`."""
     if not words or "=" in words[0]:
+        return ""
+    if getattr(action, "default_arg", None):
         return ""
     keys: List[str] = []
     for prog in (getattr(action, "prepare", ""), getattr(action, "cost", ""),
@@ -33977,6 +33948,11 @@ async def _action_info(
         f"Target type: `{act.target_type}`"
         + (" (or a direction from the actor's anchor: `left`, `right 2`)"
            if act.direction_target else ""),
+    ]
+    if act.default_arg:
+        lines.append(f"Bare words:  fill `{act.default_arg}=` "
+                     f"(`!action {actor_id} {act.name} <words ...>`)")
+    lines += [
         f"Tags:        {_action_tags_text(act, m if private else None)}",
         f"Description: {desc}",
     ]
@@ -34172,7 +34148,7 @@ async def _run_action_dispatch(
             directions=action.direction_target,
         )
         try:
-            args_dict = parse_args_tokens(remaining)
+            args_dict = parse_args_tokens(remaining, action.default_arg)
         except VTTError as ex:
             raise VTTError(str(ex).rstrip(".")
                            + _action_args_hint(action, actor_id, remaining))
