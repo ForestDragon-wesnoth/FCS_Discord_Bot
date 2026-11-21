@@ -3738,7 +3738,12 @@ hardcodes**.
   the largest size its width allows, then one ceiling, the largest whose
   capped sizes stack within the height, limits the lines that could grow
   past it (the widest keep their size, the short ones share what is
-  left). Zones and tiles: idea #626.
+  left). A unit's `sprite_label_per_line_size`, `sprite_label_split_after`
+  (0 = never cut), `sprite_label_split_min_length` and
+  `sprite_label_split_scales_with_width` vars override each rule for it
+  (read with `sprite_label`: the disguise's to a view it fools, through
+  the reader; a value of the wrong kind is ignored). Zones and tiles: idea
+  #626.
 - **Intended ASCII / graphics differences:** corpses and overlays are
   graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
   are a translucent fill; a unit's colour is an outline around its sprite;

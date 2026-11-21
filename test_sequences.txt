@@ -48231,7 +48231,7 @@ while red's reads "Archmage / Vor". A dead unit lies as its name, greyed
 like any living sprite on a corpse. The legend lists each look with the
 name sprite's text.
 
-SCENARIO 1292 — Name sprite lines: words cut by length, a size per line, the width multiplier (name_text_split_after)
+SCENARIO 1292 — Name sprite lines: words cut by length, a size per line, the width multiplier, per-unit overrides (name_text_split_after)
 ---------------------------------------------------------------------------------------------------------------------
 
 !match new ns Ns 7 4
@@ -48260,6 +48260,18 @@ SCENARIO 1292 — Name sprite lines: words cut by length, a size per line, the w
 !system set default name_text_split_after -1
 ?? ❌
 !assert "rule_get('name_text_split_after') == 5"
+!ent set_var rep sprite_label_split_after 0
+!ent set_var rep sprite_label_per_line_size false
+!ent set_var ran sprite_label_split_after 3
+!ent set_var ran sprite_label_split_min_length 5
+!ent set_var ogr sprite_label_split_after banana
+!map scene list
+?? entity `rep` at (1,1) — glyph >, name text 'Rare / Replicator' (white on black) (layer 100)
+?? name text 'Medic / Ran / ger' (white on black, a size per line)
+?? name text 'Big Bad / Brute' (white on black, a size per line)
+!ent set_var drg sprite_label_split_scales_with_width true
+!map scene list
+?? name text 'Ancient / Dragonlord' (white on black, a size per line)
 
 Expected: with the rules off a name sprite has one word a line, as before.
 name_text_split_after 5 with name_text_split_min_length 8 cuts a word
@@ -48270,6 +48282,13 @@ at 10 past 16 under name_text_split_scales_with_width (on by default), so
 rest. A hand-written line holding a space ("Big Bad") is never cut. With
 name_text_per_line_size on the scene marks the sprite "a size per line"
 (the renderer sizes each line on its own). A negative length is refused.
+A unit's own `sprite_label_<setting>` vars override each rule for it:
+`sprite_label_split_after 0` keeps the replicator's words whole and
+`sprite_label_per_line_size false` gives it one size again; the medic cuts
+at 3 past 5 ("Ran / ger", "Medic" is 5 and stays); the dragon's
+`sprite_label_split_scales_with_width true` puts the multiplier back on for
+it alone. A value of the wrong kind (the ogre's "banana") is ignored, and
+the rule applies.
 
 SCENARIO 1293 — Sprite effects on a unit: !ent effect, checks, order, group, a condition (#624)
 ------------------------------------------------------------------------------------------------

@@ -5295,7 +5295,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "line takes its own size. The lines too wide to grow fill the "
             "width first, and the others share the height left over, each "
             "as large as its width allows (\"Rare\" over \"Replicator\" "
-            "draws \"Rare\" larger)."
+            "draws \"Rare\" larger). A unit's `sprite_label_per_line_size` "
+            "var (true / false) overrides it for that unit."
         ),
     },
     "name_text_split_after": {
@@ -5309,7 +5310,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "repli / cator, while \"Ranger\" stays whole. A line holding "
             "spaces (a hand-written line break) isn't cut. "
             "name_text_split_scales_with_width multiplies both numbers by a "
-            "stretched body's width."
+            "stretched body's width. A unit's `sprite_label_split_after` var "
+            "(a whole number, 0 = never cut) overrides it for that unit."
         ),
     },
     "name_text_split_min_length": {
@@ -5318,7 +5320,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Images only: name_text_split_after cuts only words longer than "
             "this many characters (default 0: every word longer than "
-            "name_text_split_after)."
+            "name_text_split_after). A unit's `sprite_label_split_min_length` "
+            "var overrides it for that unit."
         ),
     },
     "name_text_split_scales_with_width": {
@@ -5329,7 +5332,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "name_text_split_min_length are multiplied by the width in cells "
             "of a multi-tile body whose name sprite is stretched across it "
             "(sprite_mode stretch), so a 2-wide body cuts its words twice as "
-            "late. Off: the numbers apply as set."
+            "late. Off: the numbers apply as set. A unit's "
+            "`sprite_label_split_scales_with_width` var (true / false) "
+            "overrides it for that unit."
         ),
     },
     "name_text_background_color": {
@@ -32156,9 +32161,23 @@ class Match:
             "name_text_color", "white")
         bg = pick("sprite_label_background_color", label_color_ok) or \
             self.rules.get("name_text_background_color", "black")
+        # Per-unit overrides of the line-shaping rules (a bad value falls
+        # back to the rule): carried under `_fit`, read and dropped by
+        # _name_text_fit.
+        fit: Dict[str, Any] = {}
+        for key in ("per_line_size", "split_scales_with_width"):
+            v = pick("sprite_label_" + key, lambda v: isinstance(v, bool))
+            if v is not None:
+                fit[key] = v
+        for key in ("split_after", "split_min_length"):
+            v = pick("sprite_label_" + key,
+                     lambda v: isinstance(v, int) and not isinstance(v, bool)
+                     and 0 <= v <= 1000)
+            if v is not None:
+                fit[key] = v
         return {"label": "\n".join(name_text_lines(text)) or str(name),
                 "label_color": str(color).strip(),
-                "label_bg": str(bg).strip()}
+                "label_bg": str(bg).strip(), "_fit": fit}
 
     def _name_text_fit(self, label: Optional[Dict[str, Any]], w: int,
                        mode: str) -> Dict[str, Any]:
@@ -32169,13 +32188,18 @@ class Match:
         if not label:
             return {}
         out = dict(label)
-        r = self.rules
+        own = out.pop("_fit", None) or {}
+
+        def rule(key: str, default: Any) -> Any:
+            # The unit's sprite_label_<key> var, else the name_text_ rule.
+            return own[key] if key in own else self.rules.get(
+                "name_text_" + key, default)
         scale = (w if mode == "stretch" and
-                 r.get("name_text_split_scales_with_width", True) else 1)
+                 rule("split_scales_with_width", True) else 1)
         out["label"] = "\n".join(name_text_split(
-            out["label"].split("\n"), r.get("name_text_split_after", 0),
-            r.get("name_text_split_min_length", 0), scale)) or out["label"]
-        if r.get("name_text_per_line_size", False):
+            out["label"].split("\n"), rule("split_after", 0),
+            rule("split_min_length", 0), scale)) or out["label"]
+        if rule("per_line_size", False):
             out["label_fit"] = "per_line"
         return out
 
