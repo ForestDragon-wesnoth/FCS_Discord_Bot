@@ -3651,11 +3651,38 @@ hardcodes**.
   team colour brightened halfway to white, or `active_unit_outline_color`
   (white) without a team colour, `active_unit_outline_width` thick, sprites
   and glyphs alike; `!map scene list` names the acting placement (895).
+- **Name sprites** (user design, 1290-1291): `entity_sprite_fallback`
+  (glyph default / `name_text`; a unit's `sprite_fallback` var wins)
+  draws a unit without a sprite of its own as its name in images: the
+  order is its own sprite (a disguise's first), the name sprite,
+  `fallback_sprite`, the glyph (`Match.entity_sprite(fallback=False)`,
+  `_emit_entity_placement`). `Match.entity_name_text` gives the scene
+  placement `label` / `label_color` / `label_bg`: the `sprite_label` var
+  else the display name (a disguise fooling the view: its own
+  `sprite_label`, else its name; a private `sprite_label` reads as unset
+  through the reader), each word a line, a hand-written `\n` (a newline
+  or the two characters) breaking there only (`logic.name_text_lines`),
+  cut to `NAME_TEXT_MAX`; colours from `sprite_label_color` /
+  `sprite_label_background_color` else the rules `name_text_color`
+  (white) / `name_text_background_color` (black), a palette name or
+  `#rrggbb` (`label_color_ok`; a bad var falls back to the rule, a bad
+  rule value is refused). A corpse lies as its name (`corpse_name_text`,
+  its frozen vars), greyed. `SceneRenderer.name_text_image` makes the
+  picture (the largest font every line fits, at least `_NAME_TEXT_MIN`
+  of the short side, then cut with "..."; cached in `_NAME_TEXT_CACHE`)
+  when the placement has no loaded sprite, at the body's shape for a
+  stretch body (capped at `_GLYPH_DRAW_MAX`), and it is drawn as a
+  sprite: tint, outline, opacity, the legend swatch (`_LEGEND_LOOK`
+  carries the label). A region part draws over its parent only with its
+  own sprite or glyph, as before. `!map scene list` prints `name text
+  '<lines / joined>' (<colour> on <background>)`. Zones and tiles: idea
+  #626.
 - **Intended ASCII / graphics differences:** corpses and overlays are
   graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
   are a translucent fill; a unit's colour is an outline around its sprite;
   the image legend lists every look in the window (ASCII only top-layer
-  glyphs); layer order follows `sprite_layer_*`; the acting unit is bold
+  glyphs); a unit under `entity_sprite_fallback name_text` is its name in
+  images and its glyph in ASCII; layer order follows `sprite_layer_*`; the acting unit is bold
   (or named under a plain map) in ASCII and outlined in images; a void
   cell is `void_glyph` (a space) in ASCII and nothing in images (no
   ground, border or fog; `void_sprite` when set), and under

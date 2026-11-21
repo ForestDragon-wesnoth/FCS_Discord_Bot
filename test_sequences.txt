@@ -48103,3 +48103,97 @@ condition, the curse's `c`. A glyph two columns wide, a colour outside the
 palette and a priority that isn't a number are refused; `-` is a glyph
 (only `clear` clears). A prefab carrying a status definition with a bad
 glyph or colour is refused at import.
+
+
+SCENARIO 1290 — Name sprites: the rule, a unit's override, sprite_label and line breaks, colours, a 3x2 body, the order (name_text)
+------------------------------------------------------------------------------------------------------------------------------------
+
+!match new ns Ns 7 5
+!match use ns
+!ent add pal "Legendary Paladin" 30 1 1 5 team=red
+!ent add ogre Ogre 30 3 1 4 team=blue
+!ent set_vars ogre footprint_w=3 footprint_h=2
+!ent add gob Goblin 5 1 3 3
+!ent add rat Rat 5 5 4 1
+!map scene list
+?? entity `pal` at (1,1) — glyph >, color red (layer 100)
+?! name text
+!system set default entity_sprite_fallback name_text
+!map scene list
+?? color red, name text 'Legendary / Paladin' (white on black)
+?? entity `ogre` at (3,1) 3x2 stretch — glyph v, color blue, name text 'Ogre' (white on black)
+!ent set_var gob sprite_label "Gob\nKing"
+!ent set_var gob sprite_label_color yellow
+!ent set_var gob sprite_label_background_color #303080
+!ent set_var rat sprite_fallback glyph
+!map scene list
+?? name text 'Gob / King' (yellow on #303080)
+?? entity `rat` at (5,4) — glyph ^ (layer 100)
+!ent set_var rat sprite "rat_png"
+!ent set_var rat sprite_fallback name_text
+!ent set_var gob sprite_label_color plaid
+!system set default fallback_sprite unknown_png
+!map scene list
+?? entity `rat` at (5,4) — sprite rat_png, glyph ^ (layer 100)
+?? name text 'Gob / King' (white on #303080)
+!system set default entity_sprite_fallback glyph
+!map scene list
+?? entity `pal` at (1,1) — sprite unknown_png, glyph >, color red (layer 100)
+!system set default name_text_color plaid
+?? is a palette name
+!system set default name_text_background_color #12ab3
+?? is a palette name
+!system set default name_text_background_color #12AB34
+?? #12AB34
+
+Expected: with entity_sprite_fallback at its default `glyph` no unit gets a
+name sprite; set to `name_text`, every unit without a sprite of its own is
+drawn as its name: "Legendary Paladin" one word per line, white on black,
+the 3x2 ogre's spanning its body in stretch mode. A `sprite_label` with a
+hand-written \n breaks there and only there ("Gob / King"), and the unit's
+`sprite_label_color` / `sprite_label_background_color` override the rules;
+a unit's `sprite_fallback glyph` keeps it a glyph under the rule. A unit's
+own sprite comes first (the rat's `rat_png` despite name_text); a colour
+that isn't a palette name or #rrggbb falls back to the rule (the goblin's
+text white). Back on `glyph`, fallback_sprite stands in again. The colour
+rules refuse anything but a palette name or #rrggbb.
+
+
+SCENARIO 1291 — Name sprites to a view: a disguise, a private sprite_label, a corpse, the legend (name_text)
+--------------------------------------------------------------------------------------------------------------
+
+!match new nv Nv 7 5
+!match use nv
+!system set default entity_sprite_fallback name_text
+!ent add spy Spy 10 1 1 5 team=red
+!ent set_var spy disguise.name Peasant
+!ent add mage Mage 10 3 1 4 team=red
+!ent set_var mage sprite_label "Archmage\nVor"
+!ent add rat "Big Rat" 5 5 1 3 team=blue
+!ent kill rat
+!system set default team_private_vars sprite_label
+!match bind pov=blue
+!map scene list legend=on
+?? entity `spy` at (1,1) — glyph >, name text 'Peasant'
+?? entity `mage` at (3,1) — glyph v, color red, name text 'Mage'
+?? corpse `rat` at (5,1) — glyph v, color gray, name text 'Big / Rat'
+?? Legend: glyph >, name text 'Peasant' = Peasant
+?? Legend: glyph v, color gray, name text 'Big / Rat' = corpse: Big Rat
+!match bind pov=red
+!map scene list
+?? entity `spy` at (1,1) — glyph >, color red, name text 'Spy'
+?? name text 'Archmage / Vor'
+!ent set_var spy disguise.sprite_label Farmer
+!match bind pov=blue
+!map scene list
+?? name text 'Farmer'
+
+Expected: a name sprite reads as the view sees the unit. To blue, which the
+red spy's disguise fools, the spy is drawn as "Peasant" (the disguise's
+name), then as "Farmer" once the disguise holds its own `sprite_label`;
+red, its own team, sees "Spy" in its team colour (the disguise, with no
+colour of its own, shows none). The mage's `sprite_label` is private to
+its team under team_private_vars, so blue's view reads its name ("Mage")
+while red's reads "Archmage / Vor". A dead unit lies as its name, greyed
+like any living sprite on a corpse. The legend lists each look with the
+name sprite's text.

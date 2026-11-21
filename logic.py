@@ -240,6 +240,36 @@ STATUS_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end",
 # status_default_duration_mode rule. `auto` = the engine counts its
 # duration down by one at its `duration_when` (default: when it ticks).
 STATUS_DURATION_MODES = ("manual", "auto")
+# What draws a unit without a sprite of its own in images: its glyph, or a
+# sprite made of its name (`name_text`), per the entity_sprite_fallback
+# rule and a unit's own `sprite_fallback` var.
+SPRITE_FALLBACKS = ("glyph", "name_text")
+# A name sprite's text is cut to this many characters (the renderer shrinks
+# and cuts it to the cell anyway; this bounds the work per placement).
+NAME_TEXT_MAX = 100
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def label_color_ok(v: Any) -> bool:
+    """Whether `v` names a colour a name sprite can take: a palette name
+    (TEXT_COLORS) or `#rrggbb`."""
+    return isinstance(v, str) and (v.strip().lower() in TEXT_COLORS
+                                   or bool(_HEX_COLOR_RE.match(v.strip())))
+
+
+def name_text_lines(text: Any) -> List[str]:
+    """A name sprite's lines: a hand-written line break (a newline, or the
+    two characters backslash n as chat types them) splits it there and
+    only there; otherwise every word is its own line ("Legendary
+    Paladin" is two lines)."""
+    t = str(text).replace("\\n", "\n").strip()
+    if "\n" in t:
+        lines = [ln.strip() for ln in t.split("\n")]
+    else:
+        lines = t.split()
+    return [ln for ln in lines if ln]
+
+
 # Transforms and statuses: a status that arrived with a form records the
 # stash path of that transform here, so reverting it takes the status back;
 # a stash records the flavor of the transform that made it (`merge` for
@@ -3580,7 +3610,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
                     "*.exclude_inherited_action_tags, *.inner_tags, "
                     "*.exclude_inherited_tags, *.glyph, *.glyphs, *.color, "
                     "*.sprite, *.sprites, *.sprite_mirror, *.sprite_layer, "
-                    "*.legend, *.allowed_slots"),
+                    "*.legend, *.allowed_slots, *.sprite_label, "
+                    "*.sprite_fallback, *.sprite_label_color, "
+                    "*.sprite_label_background_color"),
         "schema": {"type": "str"},
         "desc": (
             "A blacklist for the description's data section, comma-"
@@ -4905,6 +4937,49 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "to the base `sprite`). The model emits the chosen key plus "
             "flip_h/flip_v flags for the surface to apply. Per-entity "
             "override: the `sprite_mirror` var."
+        ),
+    },
+    "entity_sprite_fallback": {
+        "default": "glyph",
+        "schema": {"type": "enum", "choices": ["glyph", "name_text"]},
+        "desc": (
+            "Images only: how a unit without a sprite of its own is drawn. "
+            "'glyph' (default): its map glyph as text (or the "
+            "fallback_sprite when that is set). 'name_text': a sprite made "
+            "of its name, drawn in name_text_color on "
+            "name_text_background_color, each word on a line of its own "
+            "(\"Legendary Paladin\" becomes two lines; a hand-written \\n in "
+            "the text breaks there and only there), at the largest size that "
+            "fits the cell, a word too long cut with ... . It is then drawn "
+            "like any sprite: the team tint and outline, sprite_mode on a "
+            "multi-tile body (stretch draws it at the body's shape), a "
+            "corpse greyed, overlays on top, the legend swatch. Its text is "
+            "the unit's `sprite_label` var, else its name (a disguise's "
+            "`sprite_label`, else its name, to a view it fools); a unit's "
+            "`sprite_label_color` / `sprite_label_background_color` vars "
+            "override the colours. A unit's `sprite_fallback` var (glyph / "
+            "name_text) overrides this rule for it. Order: the unit's own "
+            "sprite, then the name sprite, then fallback_sprite, then the "
+            "glyph. The text map keeps the glyph."
+        ),
+    },
+    "name_text_color": {
+        "default": "white",
+        "schema": {"type": "str"},
+        "desc": (
+            "Images only: the text colour of a name sprite "
+            "(entity_sprite_fallback name_text): a palette name or #rrggbb. "
+            "A unit's `sprite_label_color` var overrides it."
+        ),
+    },
+    "name_text_background_color": {
+        "default": "black",
+        "schema": {"type": "str"},
+        "desc": (
+            "Images only: the background colour of a name sprite "
+            "(entity_sprite_fallback name_text), filling its cell: a palette "
+            "name or #rrggbb. A unit's `sprite_label_background_color` var "
+            "overrides it."
         ),
     },
     "fallback_sprite": {
@@ -7063,7 +7138,20 @@ def _check_glyph_rule(key: str, raw: str) -> str:
     return raw
 
 
+def _check_label_color_rule(key: str, raw: str) -> str:
+    """name_text_color / name_text_background_color: a palette name or
+    #rrggbb."""
+    v = raw.strip()
+    if not label_color_ok(v):
+        raise VTTError(f"Setting '{key}' is a palette name "
+                       f"({', '.join(sorted(TEXT_COLORS))}) or #rrggbb, "
+                       f"not `{raw}`.")
+    return v.lower() if v.lower() in TEXT_COLORS else v
+
+
 _FORMAT_RULE_CHECKS = {
+    "name_text_color": _check_label_color_rule,
+    "name_text_background_color": _check_label_color_rule,
     "preview_glyph": _check_glyph_rule,
     "fog_glyph": _check_glyph_rule,
     "void_glyph": _check_glyph_rule,
@@ -31623,7 +31711,8 @@ class Match:
                 return g
         return None
 
-    def entity_sprite(self, e: "Entity", pov_team: Optional[str] = None
+    def entity_sprite(self, e: "Entity", pov_team: Optional[str] = None,
+                      fallback: bool = True
                       ) -> Optional[Tuple[str, bool, bool]]:
         """The sprite for `e` as (key, flip_h, flip_v), or None when nothing
         resolves (the surface then renders the glyph as text). Resolution
@@ -31648,8 +31737,78 @@ class Match:
             k = src.get("sprite")
             if isinstance(k, str) and k:
                 return (k, False, False)
+        if not fallback:
+            return None
         fb = str(self.rules.get("fallback_sprite", "")).strip()
         return (fb, False, False) if fb else None
+
+    def _name_text_wanted(self, *sources: Any) -> bool:
+        """Whether a name sprite stands in for a missing sprite: the first
+        source's `sprite_fallback` var that names one of SPRITE_FALLBACKS,
+        else the entity_sprite_fallback rule."""
+        for src in sources:
+            v = src.get("sprite_fallback") if isinstance(src, dict) else None
+            if v in SPRITE_FALLBACKS:
+                return v == "name_text"
+        return self.rules.get("entity_sprite_fallback", "glyph") == "name_text"
+
+    def _name_text_look(self, sources: List[Dict[str, Any]],
+                        name: str) -> Dict[str, Any]:
+        """A name sprite's text and colours from the first source holding
+        each (`sprite_label`, `sprite_label_color`,
+        `sprite_label_background_color`), else `name` and the rules."""
+        def pick(key: str, ok: Any) -> Any:
+            for src in sources:
+                v = src.get(key) if isinstance(src, dict) else None
+                if ok(v):
+                    return v
+            return None
+        text = pick("sprite_label",
+                    lambda v: (isinstance(v, str) and v.strip())
+                    or (isinstance(v, (int, float))
+                        and not isinstance(v, bool)))
+        text = str(text if text is not None else name)[:NAME_TEXT_MAX]
+        color = pick("sprite_label_color", label_color_ok) or self.rules.get(
+            "name_text_color", "white")
+        bg = pick("sprite_label_background_color", label_color_ok) or \
+            self.rules.get("name_text_background_color", "black")
+        return {"label": "\n".join(name_text_lines(text)) or str(name),
+                "label_color": str(color).strip(),
+                "label_bg": str(bg).strip()}
+
+    def entity_name_text(self, e: "Entity", pov_team: Optional[str] = None
+                         ) -> Optional[Dict[str, Any]]:
+        """The name sprite drawn for `e` in images (entity_sprite_fallback
+        name_text, else its `sprite_fallback` var): {label, label_color,
+        label_bg}, or None when its glyph (or fallback_sprite) draws it.
+        Under a disguise fooling the view the disguise's keys and name
+        speak; a private `sprite_label` reads as unset (the name stands in,
+        as for the legend)."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            if not self._name_text_wanted(dis, e.vars):
+                return None
+            return self._name_text_look(
+                [dis], self.entity_display_name(e, pov_team))
+        if not self._name_text_wanted(e.vars):
+            return None
+        vars_ = (self.reader_vars(e, pov_team)
+                 if VAR_READER.get() is not None else e.vars)
+        return self._name_text_look([vars_], self.entity_display_name(e))
+
+    def corpse_name_text(self, corpse: Dict[str, Any], cid: str
+                         ) -> Optional[Dict[str, Any]]:
+        """A corpse's name sprite, from its frozen vars, as a living unit's
+        (entity_name_text), or None."""
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if not isinstance(ent, dict):
+            return None
+        vars_ = ent.get("vars") or {}
+        if not self._name_text_wanted(vars_):
+            return None
+        if VAR_READER.get() is not None:
+            vars_ = self.corpse_reader_vars(corpse)
+        return self._name_text_look([vars_], ent.get("name") or cid)
 
     def entity_sprite_mode(self, e: "Entity") -> str:
         """How a multi-tile entity's sprite fills its footprint: the
@@ -32453,7 +32612,8 @@ class Match:
             self._layer_rule("sprite_layer_tile", 50))
 
     _LEGEND_LOOK = ("kind", "sprite", "glyph", "tint", "opacity",
-                    "glyph_tint", "glyph_opacity", "flip_h", "flip_v")
+                    "glyph_tint", "glyph_opacity", "flip_h", "flip_v",
+                    "label", "label_color", "label_bg")
 
     def _scene_legend(self, scene: Dict[str, Any], pov_team: Optional[str],
                       mp: "Map") -> List[Dict[str, Any]]:
@@ -32524,7 +32684,12 @@ class Match:
                                pov_team: Optional[str], layer: int,
                                mp: "Map") -> None:
         rects = self._cell_rects(self.entity_cells(e), mp)
-        spr = self.entity_sprite(e, pov_team)
+        # Its own sprite, then a name sprite (entity_sprite_fallback
+        # name_text), then fallback_sprite, then the glyph.
+        spr = self.entity_sprite(e, pov_team, fallback=False)
+        label = self.entity_name_text(e, pov_team) if spr is None else None
+        if spr is None and label is None:
+            spr = self.entity_sprite(e, pov_team)
         key, fh, fv = spr if spr is not None else (None, False, False)
         body_mode = self.entity_sprite_mode(e)
         # Per-entity override: a `sprite_layer` var wins over the pass default.
@@ -32543,6 +32708,7 @@ class Match:
                 "sprite": key, "glyph": glyph,
                 "tint": tint, "opacity": 100,
                 "flip_h": fh, "flip_v": fv, "layer": eff_layer,
+                **(label or {}),
             })
             # Overlay sprites (status FX + overlay var), drawn over the entity
             # at their own layer (default 150). Footprint + mode follow the
@@ -32671,12 +32837,17 @@ class Match:
                 if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team, mp):
                     continue
                 spr, own = self.corpse_sprite_info(corpse)
+                # A unit drawn as its name (entity_sprite_fallback name_text)
+                # lies there as its name, greyed like a living sprite.
+                label = (self.corpse_name_text(corpse, cid)
+                         if spr is None else None)
                 # Drawn when the dead unit had a sprite or a custom glyph (or
                 # corpse_default_sprite is set); a sprite whose PNG is missing
                 # falls back to its glyph (as a living unit's does), greyed
                 # and faded. A corpse picture is drawn as-is; the unit's
                 # living sprite takes the corpse tint and opacity.
-                if spr is None and self.corpse_glyph(corpse, custom_only=True) is None:
+                if spr is None and label is None and \
+                        self.corpse_glyph(corpse, custom_only=True) is None:
                     continue
                 gl = self.corpse_glyph(corpse)
                 cw, ch = self._corpse_footprint(corpse, mp)
@@ -32692,7 +32863,8 @@ class Match:
                     # The glyph drawn when the picture can't be loaded is
                     # always greyed and faded, so it reads as a body.
                     "glyph_tint": c_tint, "glyph_opacity": c_op,
-                    "flip_h": False, "flip_v": False, "layer": corpse_layer})
+                    "flip_h": False, "flip_v": False, "layer": corpse_layer,
+                    **(label or {})})
 
         if "entities" not in hidden:
             # Entity main pass (30): not glued/region/mounted.
