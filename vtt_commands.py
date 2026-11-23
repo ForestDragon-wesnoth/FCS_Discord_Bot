@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import (SPRITE_EFFECTS_KEY, OVERLAY_EFFECTS_KEY, PASSIVES_KEY, held_passive_spec, SPRITE_EFFECT_FIELDS,
+from logic import (TEMPLATE_GIVE_PATH_KEY, TEMPLATE_ARGS_KEY, TEMPLATE_ON_GIVE_KEY, SPRITE_EFFECTS_KEY, OVERLAY_EFFECTS_KEY, PASSIVES_KEY, held_passive_spec, SPRITE_EFFECT_FIELDS,
                    check_sprite_effect, check_sprite_effects, sprite_effect_items,
                    sprite_effect_text, EFFECT_PROBLEMS)
 from logic import STATUS_DURATION_MODES, STATUS_TICK_WHENS, STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
@@ -503,7 +503,7 @@ _LIBRARY_EDITS = {
     "template": ("templates", frozenset({
         "save", "import", "set", "unset", "part", "rename", "copy",
         "delete", "restore", "private", "tags", "notes", "move",
-        "folder"})),
+        "folder", "path", "arg", "on_give"})),
     "prefab": ("prefabs", frozenset({
         "save", "import", "rename", "copy", "delete", "restore", "tags",
         "move", "folder"})),
@@ -4375,7 +4375,9 @@ _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "grant_condition",
                                  "death_effect", "__death_condition",
                                  "__map_vehicle_death_effect",
-                                 "__mount_death_effect"})
+                                 "__mount_death_effect",
+                                 # A partial's give code.
+                                 "on_give"})
 
 
 def _hide_formula_at(path: str, value: Any, root: Any = None) -> Any:
@@ -8695,7 +8697,7 @@ _TEMPLATE_DIFF_ROWS = 40
 
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|notes|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
+    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|notes|path|arg|on_give|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
     desc=(
         "This server's library of saved templates, shared by all its matches "
         "and kept on disk (even when the CLI / GUI don't keep matches). An "
@@ -8706,7 +8708,8 @@ _TEMPLATE_DIFF_ROWS = 40
         "`axe_common` item, an `orc_base` statblock) that units and templates "
         "reference: a unit holds a full copy plus a record of what it changed, "
         "and saving the unit stores only those changes. `save <unit> [name] "
-        "[path=<var.path>]`, `spawn`, `give <partial> <unit> <path>`, `list`, "
+        "[path=<var.path>]`, `spawn`, `give <partial> <unit> [path] "
+        "[key=value ...]`, `path` / `arg` / `on_give` (what a give does), `list`, "
         "`show <name> [path] [compact] [expanded] [part=]`, `import <name> "
         "<json>`, `set` / `unset`, `tags`, `part remove`, `rename`, `copy`, `delete`, "
         "`trash` / `restore`, `resync <unit> [path]`, `detach <unit> [path]`, "
@@ -8935,6 +8938,12 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if isinstance(old, dict) and _is_partial(old) and old.get("tags"):
                 # A re-save keeps the partial's library tags.
                 data["tags"] = list(old["tags"])
+            if isinstance(old, dict) and _is_partial(old):
+                # And what a give of it does (its path, args and code).
+                for k in (TEMPLATE_GIVE_PATH_KEY, TEMPLATE_ARGS_KEY,
+                          TEMPLATE_ON_GIVE_KEY):
+                    if k in old:
+                        data[k] = copy.deepcopy(old[k])
         else:
             name = check_template_name(words[1] if len(words) > 1 else e.id)
             data = m.capture_template(e, notes=notes)
@@ -9573,23 +9582,175 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("\n".join(lines))
 
     if sub == "give":
-        if await return_help_if_not_enough_args(ctx, args, 4, "template", "give"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "template", "give"):
             return
-        _check_tail(args, 4, (), "!template give <partial> <unit> <path>")
+        usage = "!template give <partial> <unit> [path] [key=value ...]"
         m = active_match(mgr, ctx)
         name = check_template_name(args[1])
         e = m.entities.get(_resolve_eid(m, args[2]))
         if e is None:
             raise NotFound(f"Entity '{args[2]}' not found.")
-        if args[3] in ("", "."):
-            raise VTTError("A partial is given into a var path (`inventory.axe`"
-                           "); a whole unit is built from one through an "
-                           "entity template whose vars reference it.")
+        words = [a for a in args[3:] if "=" not in a]
+        if len(words) > 1:
+            raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
+                           f"`{usage}`. Quote a value that contains "
+                           f"spaces.")
+        from action import (coerce_args_token, template_give, current_giver)
+        give_args: Dict[str, Any] = {}
+        for a in args[3:]:
+            if "=" not in a:
+                continue
+            k, _, v = a.partition("=")
+            if not k:
+                raise VTTError(f"`{a}` has an empty key — usage: "
+                               f"`{usage}`.")
+            give_args[k] = coerce_args_token(v)
+        path = words[0] if words else None
         if name in mgr.templates:
             _usable_template(ctx, mgr, name, "give")
-        log = m.give_partial(e, args[3], name)
-        return await ctx.send("\n".join(
-            [f"🎁 Gave `{e.id}` a `{name}` at `{args[3]}`."] + [str(x) for x in log]))
+        tpl = m._template_library().get(name)
+        for k, spec in ((tpl or {}).get(TEMPLATE_ARGS_KEY) or {}).items():
+            if spec.get("type") == "unit" and k in give_args:
+                # A unit arg names a unit the channel's view can see.
+                give_args[k] = _resolve_eid(m, str(give_args[k]))
+                if give_args[k] not in m.entities:
+                    raise NotFound(f"Entity '{give_args[k]}' not found.")
+        ok, why, log, path = await template_give(
+            m, mgr, ctx, e, name, path, give_args, giver=current_giver())
+        if not ok:
+            msg = why[1] if isinstance(why, tuple) else why
+            return await ctx.send(f"❌ `{name}` refused the give: {msg}")
+        coded = bool((tpl or {}).get(TEMPLATE_ON_GIVE_KEY))
+        head = (f"🎁 Gave `{e.id}` `{name}` at `{path}` (its on_give ran)."
+                if coded else f"🎁 Gave `{e.id}` a `{name}` at `{path}`.")
+        return await ctx.send("\n".join([head] + [str(x) for x in log]))
+
+    if sub in ("path", "on_give"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "template",
+                                                sub):
+            return
+        name, tpl = _readable_template(ctx, mgr, args[1])
+        if not _is_partial(tpl):
+            raise VTTError(f"`{name}` is an entity template; a give's "
+                           f"path and code belong to a partial template.")
+        key = TEMPLATE_GIVE_PATH_KEY if sub == "path" else TEMPLATE_ON_GIVE_KEY
+        have = tpl.get(key)
+        rest = args[2:]
+        if not rest:
+            what = "default path" if sub == "path" else "on_give code"
+            if not have:
+                return await ctx.send(
+                    f"Template `{name}` has no {what}. `!template {sub} "
+                    f"{name} <{'path' if sub == 'path' else 'formula'}>` "
+                    f"sets it.")
+            shown = (f"`{have}`" if sub == "path"
+                     else f"```\n{formula_text(have)}\n```")
+            return await ctx.send(f"Template `{name}` {what}: {shown}")
+        _require_saver(ctx, name, tpl, "edit")
+        new = copy.deepcopy(tpl)
+        if rest == ["-"]:
+            if not have:
+                return await ctx.send(f"Template `{name}` has none to "
+                                      f"clear.")
+            new.pop(key, None)
+        elif sub == "path":
+            if len(rest) > 1:
+                raise VTTError(f"Unexpected `{' '.join(rest[1:])}` — usage: "
+                               f"`!template path <name> [<path> | -]`.")
+            new[key] = rest[0]
+        else:
+            from formula import normalize_body_source
+            new[key] = normalize_body_source(" ".join(rest))
+        new, _ = check_template(new, name, mgr.templates)
+        _verb, notes = _store_template(
+            ctx, mgr, name, new,
+            saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
+        if rest == ["-"]:
+            msg = f"✏️ Template `{name}`: cleared its {sub}."
+        elif sub == "path":
+            msg = (f"✏️ Template `{name}` is given at `{new[key]}` unless a "
+                   f"give names a path.")
+        else:
+            msg = (f"✏️ Template `{name}`: its on_give runs every direct "
+                   f"give (`!template give`, give_template), and builds "
+                   f"the container with give_template(self, template_path, "
+                   f"template_name).")
+        return await ctx.send("\n".join([msg] + notes))
+
+    if sub == "arg":
+        usage = ("!template arg <name> list | add <arg> [default=<value>] "
+                 "[type=<number|text|bool|unit|any>] [description=<text>] | "
+                 "remove <arg>")
+        if await return_help_if_not_enough_args(ctx, args, 2, "template",
+                                                "arg"):
+            return
+        name, tpl = _readable_template(ctx, mgr, args[1])
+        if not _is_partial(tpl):
+            raise VTTError(f"`{name}` is an entity template; give args "
+                           f"belong to a partial template.")
+        decl = tpl.get(TEMPLATE_ARGS_KEY) or {}
+        action_word = args[2].lower() if len(args) > 2 else "list"
+        if action_word == "list":
+            _check_tail(args, 3, (), usage)
+            if not decl:
+                return await ctx.send(f"Template `{name}` takes no args. "
+                                      f"`!template arg {name} add <arg>` "
+                                      f"declares one.")
+            lines = [f"**Args of `{name}`** (`!template give {name} <unit> "
+                     f"key=value`):"]
+            for k, spec in decl.items():
+                bits = [spec.get("type", "any")]
+                bits.append(f"default {json.dumps(spec['default'])}"
+                            if "default" in spec else "required")
+                line = f"- `{k}` ({', '.join(bits)})"
+                if spec.get("description"):
+                    line += f": {spec['description']}"
+                lines.append(line)
+            return await ctx.send("\n".join(lines))
+        if action_word not in ("add", "remove") or len(args) < 4:
+            raise VTTError(f"Usage: `{usage}`.")
+        _require_saver(ctx, name, tpl, "edit")
+        arg = args[3]
+        new = copy.deepcopy(tpl)
+        nd = dict(new.get(TEMPLATE_ARGS_KEY) or {})
+        if action_word == "remove":
+            _check_tail(args, 4, (), usage)
+            if arg not in nd:
+                raise VTTError(f"Template `{name}` has no arg `{arg}`.")
+            del nd[arg]
+        else:
+            _check_options(args[4:], ("default", "type", "description"),
+                           "!template arg")
+            opts = {a.split("=", 1)[0].lower(): a.split("=", 1)[1]
+                    for a in args[4:] if "=" in a}
+            stray = [a for a in args[4:] if "=" not in a]
+            if stray:
+                raise VTTError(f"Unexpected `{' '.join(stray)}` — usage: "
+                               f"`{usage}`. Quote a value that contains "
+                               f"spaces.")
+            from action import coerce_args_token
+            spec: Dict[str, Any] = {}
+            if "type" in opts:
+                spec["type"] = opts["type"]
+            if "default" in opts:
+                spec["default"] = coerce_args_token(opts["default"])
+            if "description" in opts:
+                spec["description"] = opts["description"]
+            nd[arg] = spec
+        new[TEMPLATE_ARGS_KEY] = nd
+        new, _ = check_template(new, name, mgr.templates)
+        _verb, notes = _store_template(
+            ctx, mgr, name, new,
+            saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
+        if action_word == "remove":
+            msg = f"✏️ Template `{name}`: removed arg `{arg}`."
+        else:
+            s = (new.get(TEMPLATE_ARGS_KEY) or {}).get(arg, {})
+            msg = (f"✏️ Template `{name}` takes `{arg}=` ("
+                   f"{s.get('type', 'any')}, "
+                   + (f"default {json.dumps(s['default'])}" if "default" in s
+                      else "required") + ").")
+        return await ctx.send("\n".join([msg] + notes))
 
     if sub in ("resync", "detach"):
         if await return_help_if_not_enough_args(ctx, args, 2, "template", sub):
@@ -9679,9 +9840,36 @@ for _subs, _usage, _desc in (
          "taken. count= spawns that many on the free cells nearest the cell "
          "that fit their bodies (within near= if given): all or nothing, the "
          "reply says how many fit when they don't all."),
-        (("give",), "!template give <partial> <unit> <path>",
+        (("give",), "!template give <partial> <unit> [path] [key=value ...]",
          "Build a partial template into a unit's var path (replacing what is "
-         "there); the unit's own changes to it are recorded from then on."),
+         "there); the unit's own changes to it are recorded from then on. "
+         "The path defaults to the template's own (`!template path`); "
+         "key=value words are the args the template declares (`!template "
+         "arg`). A template with on_give code (`!template on_give`) runs it "
+         "for the give, one transaction a fail() refuses whole; the code "
+         "builds the container with give_template(self, template_path, "
+         "template_name), so it can add to a stack the unit holds."),
+        (("path",), "!template path <name> [<path> | -]",
+         "A partial template's default var path, where a give without a "
+         "path puts it (`ammo.frost`). No path shows it, `-` clears it. Its "
+         "saver or an administrator."),
+        (("arg",), "!template arg <name> list | add <arg> [default=<value>] [type=<number|text|bool|unit|any>] [description=<text>] | remove <arg>",
+         "The args a partial template's give takes (`!template give <name> "
+         "<unit> amount=4`), read by its on_give code as `args.<arg>`. An "
+         "arg without a default must be given; a give naming an arg the "
+         "template doesn't declare, or a value of the wrong type, is "
+         "refused. Its saver or an administrator."),
+        (("on_give",), "!template on_give <name> [<formula> | -]",
+         "The code a give of this partial template runs, like an action "
+         "body on the unit receiving it (one transaction, fail() refuses "
+         "and changes nothing): bindings self, args, template_path, "
+         "template_name and giver (the acting unit when an action gave it). "
+         "It builds the container itself with give_template(self, "
+         "template_path, template_name), which from inside its own code "
+         "builds it plainly. It runs for `!template give` and "
+         "give_template, never when the partial is built inside another "
+         "template, a spawn, a resync or a copy. No formula shows it, `-` "
+         "clears it."),
         (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [has=<var.path>] [folder=<folder>] [prefix]",
          "This server's saved templates; kind= keeps entity or partial "
          "templates, by= those a user saved, has= those whose vars (a "
@@ -12840,6 +13028,12 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             lambda kind: mgr.system_library(s, kind)):
         n += 1
         check(where, src, mode, sys_known, params, action_mode, soft=True)
+    for tname, tpl in sorted(mgr.templates.items()):
+        # A partial's give code (server-wide, read against this system).
+        if isinstance(tpl, dict) and tpl.get(TEMPLATE_ON_GIVE_KEY):
+            n += 1
+            check(f"template `{tname}` on_give", tpl[TEMPLATE_ON_GIVE_KEY],
+                  "exec", sys_known, frozenset(), True, soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:

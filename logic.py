@@ -34907,6 +34907,17 @@ TEMPLATE_NOTES_KEY = "template_notes"
 TEMPLATE_NOTES_MAX = 2000
 _TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,
                                                TEMPLATE_NOTES_KEY)
+# What a partial does when given (user design): its default var path, the
+# args a give takes, and the program that runs the give. Library
+# metadata, never copied into a unit.
+TEMPLATE_GIVE_PATH_KEY = "path"
+TEMPLATE_ARGS_KEY = "args"
+TEMPLATE_ON_GIVE_KEY = "on_give"
+TEMPLATE_GIVE_KEYS = (TEMPLATE_GIVE_PATH_KEY, TEMPLATE_ARGS_KEY,
+                      TEMPLATE_ON_GIVE_KEY)
+TEMPLATE_ARG_TYPES = ("number", "text", "bool", "unit", "any")
+_TEMPLATE_ARG_FIELDS = ("default", "type", "description")
+_TEMPLATE_ARG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # What a reader who may not read a private template sees in place of a
 # reference to it (V19).
 PRIVATE_REF_TEXT = "(private)"
@@ -35044,7 +35055,159 @@ def check_template_name(name: Any, legacy: bool = False) -> str:
 
 
 _PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name", "tags",
-                 "var_names", TEMPLATE_PRIVATE_KEY, TEMPLATE_NOTES_KEY)
+                 "var_names", TEMPLATE_PRIVATE_KEY,
+                 TEMPLATE_NOTES_KEY) + TEMPLATE_GIVE_KEYS
+
+
+def template_arg_value(arg: str, spec: Dict[str, Any], value: Any,
+                       where: str) -> Any:
+    """`value` for template arg `arg` checked against its declared type
+    (`spec["type"]`, default any): a number (not a bool), text (a number
+    becomes its text), a bool, a unit id (text) or any JSON value."""
+    kind = spec.get("type", "any")
+    if kind == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or value != value or value in (float("inf"), float("-inf")):
+            raise VTTError(f"{where}: `{arg}` is a number, got "
+                           f"{json.dumps(value, default=str)}.")
+        return value
+    if kind == "text":
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise VTTError(f"{where}: `{arg}` is text, got "
+                           f"{json.dumps(value, default=str)}.")
+        return value if isinstance(value, str) else str(value)
+    if kind == "bool":
+        if isinstance(value, str) and value.lower() in ("true", "false"):
+            return value.lower() == "true"
+        if not isinstance(value, bool):
+            raise VTTError(f"{where}: `{arg}` is true or false, got "
+                           f"{json.dumps(value, default=str)}.")
+        return value
+    if kind == "unit":
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise VTTError(f"{where}: `{arg}` is a unit id, got "
+                           f"{json.dumps(value, default=str)}.")
+        return str(value)
+    return _own_value(value)
+
+
+def checked_template_args(v: Any, where: str) -> Dict[str, Any]:
+    """A partial's `args` (name -> {default, type, description}): names
+    are plain keys, types from TEMPLATE_ARG_TYPES, a default of the
+    arg's type. An arg without a default must be given."""
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise VTTError(f"{where}: `args` is an object of arg name -> "
+                       f"{{default, type, description}}.")
+    out: Dict[str, Any] = {}
+    for name, spec in v.items():
+        name = str(name)
+        if not _TEMPLATE_ARG_RE.match(name) or name.startswith("__"):
+            raise VTTError(f"{where}: arg `{name}` isn't a plain key "
+                           f"(letters, digits and `_`, as `args.<key>` "
+                           f"reads it).")
+        if spec is None:
+            spec = {}
+        if not isinstance(spec, dict):
+            raise VTTError(f"{where}: arg `{name}` is an object "
+                           f"{{default, type, description}}.")
+        extra = sorted(k for k in spec if k not in _TEMPLATE_ARG_FIELDS)
+        if extra:
+            raise VTTError(f"{where}: arg `{name}` has "
+                           f"{', '.join(f'`{k}`' for k in extra)}; an arg "
+                           f"takes {', '.join(f'`{k}`' for k in _TEMPLATE_ARG_FIELDS)}.")
+        s: Dict[str, Any] = {}
+        kind = spec.get("type", "any")
+        if kind not in TEMPLATE_ARG_TYPES:
+            raise VTTError(f"{where}: arg `{name}`'s type is one of "
+                           f"{', '.join(TEMPLATE_ARG_TYPES)}, got {kind!r}.")
+        if kind != "any":
+            s["type"] = kind
+        if "default" in spec:
+            s["default"] = template_arg_value(name, s, spec["default"],
+                                              f"{where}: arg `{name}`'s default")
+        desc = spec.get("description")
+        if desc is not None:
+            if not isinstance(desc, str):
+                raise VTTError(f"{where}: arg `{name}`'s description is "
+                               f"text.")
+            if desc.strip():
+                s["description"] = desc.strip()
+        out[name] = s
+    return out
+
+
+def _check_template_give(d: Dict[str, Any], where: str) -> None:
+    """A partial's give fields, checked in place: `path` a var path,
+    `args` (checked_template_args), `on_give` a program (action mode)."""
+    if TEMPLATE_GIVE_PATH_KEY in d:
+        p = d[TEMPLATE_GIVE_PATH_KEY]
+        if p is None or p == "":
+            del d[TEMPLATE_GIVE_PATH_KEY]
+        else:
+            if not isinstance(p, str) or p.strip() in (".",):
+                raise VTTError(f"{where}: `path` is the var path the "
+                               f"partial is given at (`ammo.frost`).")
+            check_store_path(p.strip(), f"{where}: `path`")
+            d[TEMPLATE_GIVE_PATH_KEY] = p.strip()
+    if TEMPLATE_ARGS_KEY in d:
+        d[TEMPLATE_ARGS_KEY] = checked_template_args(d[TEMPLATE_ARGS_KEY],
+                                                     where)
+        if not d[TEMPLATE_ARGS_KEY]:
+            del d[TEMPLATE_ARGS_KEY]
+    if TEMPLATE_ON_GIVE_KEY in d:
+        src = d[TEMPLATE_ON_GIVE_KEY]
+        if src is None or (isinstance(src, str) and not src.strip()):
+            del d[TEMPLATE_ON_GIVE_KEY]
+        else:
+            if not isinstance(src, str):
+                raise VTTError(f"{where}: `on_give` is a formula program.")
+            from formula import (normalize_body_source as _nb,
+                                 validate_program as _vp,
+                                 FormulaError as _FE)
+            src = _nb(src).strip()
+            # A template is server-wide: a call to a `!func` the check
+            # can't see (a system's, a match's) is allowed; constructs the
+            # language bans are refused.
+            import ast as _ast
+            try:
+                called = frozenset(
+                    n.func.id for n in _ast.walk(_ast.parse(src))
+                    if isinstance(n, _ast.Call)
+                    and isinstance(n.func, _ast.Name))
+            except SyntaxError:
+                called = frozenset()
+            try:
+                _vp(src, called, action_mode=True)
+            except _FE as ex:
+                raise VTTError(f"{where}: `on_give`: {ex}")
+            d[TEMPLATE_ON_GIVE_KEY] = src
+
+
+def template_give_args(t: Dict[str, Any], given: Dict[str, Any], name: str,
+                       ) -> Dict[str, Any]:
+    """The args a give of partial `name` runs with: each given one checked
+    against its declaration, the rest from their defaults. An undeclared
+    arg, a value of the wrong type and a missing arg without a default are
+    refused."""
+    decl = t.get(TEMPLATE_ARGS_KEY) or {}
+    where = f"`{name}`"
+    unknown = [k for k in given if k not in decl]
+    if unknown:
+        takes = (", ".join(f"`{k}=`" for k in decl) if decl
+                 else "no args")
+        raise VTTError(f"{where} takes {takes}; "
+                       f"{', '.join(f'`{k}`' for k in unknown)} isn't one.")
+    out: Dict[str, Any] = {}
+    for k, spec in decl.items():
+        if k in given:
+            out[k] = template_arg_value(k, spec, given[k], where)
+        elif "default" in spec:
+            out[k] = _own_value(spec["default"])
+        else:
+            raise VTTError(f"{where} needs `{k}=` (it has no default).")
+    return out
 
 
 def checked_template_notes(v: Any, where: str) -> Optional[str]:
@@ -35350,7 +35513,8 @@ def check_template(data: Any, name: str,
         extra = sorted(k for k in data if k not in _PARTIAL_KEYS)
         notes = [f"Dropped {', '.join(f'`{k}`' for k in extra)}: a partial "
                  f"template is `kind`, `data`, `tags`, `var_names`, "
-                 f"`{TEMPLATE_NOTES_KEY}`."] if extra else []
+                 f"`{TEMPLATE_NOTES_KEY}`, `path`, `args`, `on_give`."
+                 ] if extra else []
         if not isinstance(d.get("data"), dict):
             raise VTTError(f"Partial template `{name}` needs `data`: an object "
                            f"(the container it describes).")
@@ -35372,6 +35536,7 @@ def check_template(data: Any, name: str,
                 d[k] = str(d[k])
         _check_template_private(d, f"Partial template `{name}`")
         _check_template_notes(d, f"Partial template `{name}`")
+        _check_template_give(d, f"Partial template `{name}`")
         if library is not None:
             check_template_refs(name, d, library)
         json_text(d)

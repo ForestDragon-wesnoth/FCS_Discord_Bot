@@ -4553,6 +4553,8 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # unit holding it (None for match / map / team data)
     "template_name",    # on_template_applied / _removed (W22): the partial
     "template_path",    # the container's path ('' = the vars root)
+    "giver",            # a partial's on_give: the acting unit when an
+                        # action body gave it, else None
     "applied_by",       # give, spawn, summon, clone, copy, move, stamp,
                         # write, resync, transform, replace, revert
     "transform_kind",   # on_transformed: transform, replace or revert;
@@ -9676,28 +9678,57 @@ class FormulaEngine:
             Loopable."""
             return sorted(_readable_templates())
 
-        def _give_template(eid_t: Any, path: Any, name: Any) -> bool:
-            """give_template(eid, path, name): build partial template `name`
-            at the unit's var `path` (replacing what is there), marked so
-            the unit's own changes to it are recorded (`!template give`).
-            Returns True."""
+        def _give_template(eid_t: Any, path: Any, name: Any,
+                           args: Any = None) -> bool:
+            """give_template(eid, path, name, args=None): give partial
+            template `name` to the unit at var `path` (None = the
+            template's default path), marked so the unit's own changes to
+            it are recorded (`!template give`). `args` is a dict of the
+            args the template declares. A template with `on_give` runs that
+            code for the give (from inside its own code this builds the
+            container plainly). Returns True, or False when the code
+            refused with fail()."""
             _, e = _resolve_entity(eid_t, "give_template")
-            if not isinstance(path, str) or not path or path == ".":
+            if path is not None and (not isinstance(path, str)
+                                     or path == "."):
                 raise FormulaError("give_template: path must be a var path "
-                                   "(`inventory.axe`).")
+                                   "(`inventory.axe`), or None for the "
+                                   "template's default path.")
             if not isinstance(name, str):
                 raise FormulaError("give_template: the template name must "
                                    "be text.")
+            if args is not None and not isinstance(args, dict):
+                raise FormulaError("give_template: args must be a dict "
+                                   "({'amount': 4}).")
             key = name.strip().lower()
             if _usable("give_template", key, _workspace_templates().get(
                     key)) is None and key in _workspace_templates():
                 raise FormulaError(f"give_template: There is no partial "
                                    f"template `{key}`.")
+            from logic import COMMAND_CTX
+            from reactions import _sync
+            import action as _action
+            mgr_local = getattr(match, "_runtime_mgr", None) \
+                or CURRENT_WORKSPACE.get()
+            ctx_local = getattr(match, "_runtime_ctx", None) \
+                or COMMAND_CTX.get()
+            buf = (ctx_local if hasattr(ctx_local, "out")
+                   else _action._BufferCtx.for_ctx(ctx_local))
+            top = match._action_depth == 0
             try:
-                match.surface_log(match.give_partial(
-                    e, path, name.strip().lower()))
+                ok, why, log, _p = _sync(_action.template_give(
+                    match, mgr_local, buf, e, key, path or None,
+                    dict(args or {}), giver=_action.current_giver()))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(f"give_template: {ex}")
+            if top and buf is not ctx_local and getattr(buf, "out", None):
+                match.surface_log(list(buf.out))
+            if log:
+                match.surface_log(log)
+            if not ok:
+                msg = why[1] if isinstance(why, tuple) else why
+                match.surface_log([f"❌ give `{key}`: {msg}"])
+                return False
             engine._note_affected(e.id)
             return True
 

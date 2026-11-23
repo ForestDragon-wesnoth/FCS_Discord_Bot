@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #626). #264-#615 come from review passes by
+(the highest so far is #627). #264-#615 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -661,6 +661,7 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Optional: an action field `noise` (an expression, the action's loudness, emitted after a successful body), keeping the loudness on the weapon ("what X does is stored in X").
   - Open question: whether a team hears its own units' noise (probably yes for allies' positions, no marker for its own).
 - **#626 Name sprites for zones and tiles** (user, at the name sprites: out of that PR's scope). A zone or a tile without a sprite drawn in images as its name (a chest, a trap: a zone definition's or a tile template's name, or a `sprite_label`), as `entity_sprite_fallback name_text` draws units, with its own switch and colours. Today they keep their glyphs.
+- **#627 Spawn args for entity templates** (small; user, at partial give args: "bundled as a small feature"). `!template spawn orc 3 3 level=2` and `summon_template(..., args=)` pass args an entity template declares (`args`, as a partial's give args: default, type, description; undeclared or mistyped refused) to an `on_spawn` program run on the new unit after it exists (one transaction with the spawn, fail() refuses it). Today an entity template spawns as saved, and a varied spawn is a spawn plus `set_var` lines. The partial give machinery (`logic.template_give_args`, `action.template_give`) is the shape to reuse.
 
 ## Large (arcs of several PRs)
 

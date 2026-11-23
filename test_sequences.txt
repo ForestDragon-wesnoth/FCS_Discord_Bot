@@ -49096,3 +49096,148 @@ bare words as before. After an entity target the words after the unit
 fill the key (`zap orc fire and ice`), and after a direction target the
 words after the direction and its count (`hop down 2 quietly`) or after
 the coordinates.
+
+SCENARIO 1308 — A partial template's give args, default path and on_give code: a stack of arrows that grows with each give
+-------------------------------------------------------------------------------------------------------------------------
+
+!match new gv Gives 8 8
+!match use gv
+!ent add ranger Ranger 20 1 1 5
+!template import frost_arrows {"kind": "partial", "data": {"amount": 1, "damage": 3}}
+!template give frost_arrows ranger
+?? has no default path; name one
+!template path frost_arrows ammo.frost
+?? is given at `ammo.frost` unless a give names a path
+!template arg frost_arrows add amount default=1 type=number description="arrows in the stack"
+?? takes `amount=` (number, default 1)
+!template on_give frost_arrows "if var_has(self, template_path):\n    var_add(self, template_path + '.amount', args.amount)\nelse:\n    give_template(self, template_path, template_name)\n    var_set(self, template_path + '.amount', args.amount)\nsay('{u} gets ' + str(args.amount) + ' frost arrows.', u=self)"
+!template arg frost_arrows list
+?? - `amount` (number, default 1): arrows in the stack
+!template give frost_arrows ranger amount=4
+?? Ranger gets 4 frost arrows.
+?? (its on_give ran)
+!assert "entity[ranger].ammo.frost.amount == 4 and entity[ranger].ammo.frost.damage == 3"
+!assert "template_of('ranger', 'ammo.frost') == 'frost_arrows'"
+!template give frost_arrows ranger amount=3
+!assert "entity[ranger].ammo.frost.amount == 7"
+!template give frost_arrows ranger
+?? Ranger gets 1 frost arrows.
+!assert "entity[ranger].ammo.frost.amount == 8"
+!template give frost_arrows ranger quiver.frost amount=2
+?? at `quiver.frost`
+!assert "entity[ranger].quiver.frost.amount == 2 and entity[ranger].ammo.frost.amount == 8"
+!undo command
+!assert "not var_has('ranger', 'quiver') and entity[ranger].ammo.frost.amount == 8"
+!template refs ranger
+?? - `ammo.frost` ← `frost_arrows`: changed `amount`
+!template save ranger frost_arrows path=ammo.frost
+!template path frost_arrows
+?? default path: `ammo.frost`
+!template arg frost_arrows list
+?? `amount` (number, default 1)
+!template on_give frost_arrows
+?? var_add(self, template_path + '.amount', args.amount)
+
+Expected: `frost_arrows` (a partial holding amount 1 and damage 3) has
+no default path at first, so a give without one is refused. `!template
+path` gives it `ammo.frost`, `!template arg` declares `amount` (a
+number, default 1) and `!template on_give` stores the code that runs
+each give: it adds to the stack when the ranger holds one, else builds
+the container with give_template (which inside its own code builds it
+plainly) and sets the count. `amount=4` then `amount=3` make 7, a give
+with no args adds the default 1 (8). A typed path gives a second stack
+at `quiver.frost`; `!undo command` takes that give back whole. The
+stack stays tracked against the partial (`!template refs`), and saving
+over the partial from the ranger keeps its path, args and code.
+
+SCENARIO 1309 — give_template from an action with args and a giver, a refusing on_give, a kit partial, the template hook, a body part
+-------------------------------------------------------------------------------------------------------------------------------------
+
+!match new gv2 Loot 8 8
+!match use gv2
+!ent add ogre Ogre 40 1 1 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre ogre_hand hand 10 10
+!ent add scout Scout 20 5 5 4
+!template import potion {"kind": "partial", "data": {"amount": 0, "heal": 5}, "path": "bag.potion", "args": {"amount": {"type": "number"}}, "on_give": "if args.amount > 3:\n    fail('a bag holds at most 3 potions')\ngive_template(self, template_path, template_name)\nvar_set(self, template_path + '.amount', args.amount)\nvar_set(self, template_path + '.from', giver)"}
+!template give potion ogre_hand
+?? `potion` needs `amount=` (it has no default)
+!template give potion ogre_hand amount=5
+?? ❌ `potion` refused the give: a bag holds at most 3 potions
+!assert "not var_has('ogre_hand', 'bag')"
+!template give potion ogre_hand amount=2
+!assert "entity[ogre_hand].bag.potion.amount == 2 and entity[ogre_hand].bag.potion.heal == 5 and entity[ogre_hand].bag.potion['from'] == None"
+!ent set_var scout actions.toss.target entity
+!ent set_var scout actions.toss.body "if not give_template(target, None, 'potion', {'amount': args.n}):\n    fail('the toss missed')"
+!action scout toss ogre n=1
+!assert "entity[ogre].bag.potion.amount == 1 and entity[ogre].bag.potion['from'] == 'scout'"
+!action scout toss ogre n=9
+?? ❌ action `toss`: the toss missed
+!assert "entity[ogre].bag.potion.amount == 1"
+!passive add ogre seen on_template_applied "say('{u} holds ' + template_name + ' at ' + template_path, u=self)"
+!template import kit {"kind": "partial", "data": {"potion": {"__template": "potion", "amount": 3}}}
+!template give kit ogre pack
+?? Ogre holds kit at pack
+?? Ogre holds potion at pack.potion
+!assert "entity[ogre].pack.potion.amount == 3 and not var_has('ogre', 'pack.potion.from')"
+!eval "give_template('ogre', None, 'potion', {'amount': 'lots'})"
+?? `amount` is a number, got "lots"
+
+Expected: `potion` declares `amount` with no default, so a give without
+it is refused, and its code refuses more than 3 (fail() changes
+nothing). A give onto the ogre's hand (a body part of a 2x2 ogre) puts
+the potion in the hand's own vars, with no giver. The scout's `toss`
+action gives one with give_template and a dict of args: `giver` is the
+scout, and a refused give answers False, so the action fails and rolls
+back (the action decides what its own refusal says). A kit partial holding a potion builds it as written (amount 3, no
+`from`): the potion's code runs only for a direct give. The template
+hook fires for the kit and for the potion inside it. A value of the
+wrong type in give_template's args is refused.
+
+SCENARIO 1310 — Give fields: refusals, entity templates, unit args, code hidden from players, a code that gives its own template
+-----------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+
+!match new gv3 Rules 8 8
+!match use gv3
+!ent add hero Hero 20 1 1 5
+!ent add imp Imp 10 3 3 3
+!template save hero hero_t
+!template path hero_t gear
+?? is an entity template; a give's path and code belong to a partial template
+!template import mark {"kind": "partial", "data": {"by": ""}, "path": "marks.m", "args": {"who": {"type": "unit"}, "loud": {"type": "bool", "default": false}}, "on_give": "give_template(self, template_path, template_name)\nvar_set(self, template_path + '.by', args.who)\nif args.loud:\n    say('{u} is marked by {w}.', u=self, w=args.who)"}
+!template give mark hero who=imp loud=true
+?? Hero is marked by Imp.
+!assert "entity[hero].marks.m.by == 'imp'"
+!template give mark hero who=ghost
+?? not found
+!template import bad {"kind": "partial", "data": {}, "args": {"x": {"type": "colour"}}}
+?? type is one of number, text, bool, unit, any
+!template import bad2 {"kind": "partial", "data": {}, "on_give": "while true:\n    pass"}
+?? `on_give`
+!template import good2 {"kind": "partial", "data": {}, "on_give": "my_system_fn(self)"}
+?? Saved template `good2`
+!system lint default
+?? ⚠️ template `good2` on_give: calls `my_system_fn`
+!template arg mark add sides type=number default=many
+?? `sides` is a number
+!template give mark hero extra words who=imp
+?? Unexpected `words`
+!system set default formula_text_visibility host
+!as player bob
+!template show mark
+?? "on_give": "(hidden)"
+?! give_template(self, template_path
+!as owner
+!template show mark
+?? give_template(self, template_path, template_name)
+
+Expected: path, args and on_give belong to partial templates (an entity
+template refuses them). A `unit` arg names an existing unit (`who=imp`;
+a missing one is refused like any unit lookup) and a `bool` arg takes
+true / false. An unknown arg type, code that doesn't parse, and a
+default of the wrong type are refused (a call to a function the
+check can't see is allowed: a system or match `!func`, and `!system
+lint` names it as a ⚠️ when the system lacks it); a second bare
+word after the path is a stray word. Under formula_text_visibility host a player
+reads the template with its code hidden; a host reads it whole.
