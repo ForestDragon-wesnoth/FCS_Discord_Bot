@@ -484,15 +484,22 @@ def _run_step(m: Any, kind: str, name: str, step: Dict[str, Any],
 
 
 def _step_incoming(m: Any, target: str) -> Any:
-    """A step's `incoming`: the defender's copy of the exchange whose body
-    is running (read-only), else None."""
+    """A step's `incoming`: the packet target's own copy of the exchange
+    whose body is running (a body part's the action affects reaching its
+    body, reactions_cover_parts; read-only), else None. A bystander's
+    packet (a splash beside the target) reads none (#6: it read the
+    target's, and a block on the target took from the splash too)."""
     cur = PACKET_EXCHANGE.get()
     if cur is None or cur[0] != m.id:
         return None
-    from reactions import IncomingProxy, _ex
-    if _ex(m, cur[1]) is None:
+    from reactions import IncomingProxy, _ex, copy_key
+    ex = _ex(m, cur[1])
+    if ex is None:
         return None
-    return IncomingProxy(m, cur[1], "", False, uid=target)
+    key = copy_key(m, ex, target, bystander=False)
+    if not key:
+        return None
+    return IncomingProxy(m, cur[1], key, False)
 
 
 def _record_forecast(m: Any, kind: str, target: str,

@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #627). #264-#615 come from review passes by
+(the highest so far is #628). #264-#615 come from review passes by
 another model; #264-#348 share their numbers with the GitHub issues filed for them. Items marked (§8) come from CLAUDE.md's deferred
 list. #200-#255 come from the audit fork's review of three tabletop combat
 systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
@@ -662,6 +662,12 @@ capabilities `!server perms` and per-role `!host access ... role=`).
   - Open question: whether a team hears its own units' noise (probably yes for allies' positions, no marker for its own).
 - **#626 Name sprites for zones and tiles** (user, at the name sprites: out of that PR's scope). A zone or a tile without a sprite drawn in images as its name (a chest, a trap: a zone definition's or a tile template's name, or a `sprite_label`), as `entity_sprite_fallback name_text` draws units, with its own switch and colours. Today they keep their glyphs.
 - **#627 Spawn args for entity templates** (small; user, at partial give args: "bundled as a small feature"). `!template spawn orc 3 3 level=2` and `summon_template(..., args=)` pass args an entity template declares (`args`, as a partial's give args: default, type, description; undeclared or mistyped refused) to an `on_spawn` program run on the new unit after it exists (one transaction with the spawn, fail() refuses it). Today an entity template spawns as saved, and a varied spawn is a spawn plus `set_var` lines. The partial give machinery (`logic.template_give_args`, `action.template_give`) is the shape to reuse.
+- **#628 Rows and columns inserted inside a map** (medium; FCS1's joke unit the E: "add 2 rows or columns anywhere (between existing rows/columns)"; user: skipped for now, the questions below open). `!map insert <rows|columns> <after> <n>` shifts every unit, tile, corpse, zone cell, fog-memory cell, reveal, camera view and snake trail var past that line by n; `!map remove <rows|columns> <from> <n>` cuts lines, with `map_resize_shrink_mode` (block / kill) for what stood there; formula twins (`map_insert(axis, after, n, map=None)` / `map_remove(axis, from, n, map=None)`, mutating, banned in `$()`), so an action body needs no `map` on action_cmd_allowlist. Today `!map resize` grows or cuts only at the edges its anchor names. Open questions, with the proposed answers:
+  1. A multi-tile unit straddling the line on an insert: it moves with the side holding its anchor, its body covering new empty lines (proposed), or the insert is refused.
+  2. On a remove, a unit whose anchor survives but whose body reaches into the removed lines would land on the cells pulled in from the far side: treated like a shrink (block refuses naming it, kill kills it; proposed).
+  3. A zone spanning the line: it covers the new cells too, keeping its shape (proposed), or keeps only its old cells and splits with a gap. Auras re-stamp around their anchor either way.
+  4. The new cells: ordinary ground, no tile data, never void, unexplored (as `!map resize` grows; proposed).
+  5. The formula signatures above (proposed).
 
 ## Large (arcs of several PRs)
 

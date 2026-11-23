@@ -31,7 +31,7 @@ from logic import reserved_var_path_error, file_refs, _check_template_passives_c
 from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem, STATUS_VISIBILITY_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows, ODDS_BUDGET, QUERY_HIDDEN
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows, ODDS_BUDGET, QUERY_HIDDEN, READ_ONLY_EVAL
 
 import os
 import difflib
@@ -863,7 +863,15 @@ class CommandRegistry:
         _note_other_match(mgr, mid)
         vtoken = _TYPED_UNIT_VIEW.set(_typed_unit_view(ctx, mgr, mid))
         try:
-            result = await h(ctx, args, mgr)
+            # A read runs the GM's formulas with their writes refused
+            # (#4): a condition calling a writing `!func` used to change
+            # the match from a player's `!action list`.
+            read_token = READ_ONLY_EVAL.set(
+                name.lower() if _guarded_read(name, args) else "")
+            try:
+                result = await h(ctx, args, mgr)
+            finally:
+                READ_ONLY_EVAL.reset(read_token)
             await _close_unanswered_window(ctx, mgr, name, args)
         except VTTError as e:
             # Inside a batch / macro / sweep / action nobody can be asked:
@@ -1509,7 +1517,15 @@ class CommandRegistry:
             if rm is not None and rm.reaction_exchange is not None:
                 import reactions
                 await reactions.settle_expiry(ctx, mgr, rm)
-            result = await h(ctx, args, mgr)
+            # A read runs the GM's formulas with their writes refused
+            # (#4): a condition calling a writing `!func` used to change
+            # the match from a player's `!action list`.
+            read_token = READ_ONLY_EVAL.set(
+                name.lower() if _guarded_read(name, args) else "")
+            try:
+                result = await h(ctx, args, mgr)
+            finally:
+                READ_ONLY_EVAL.reset(read_token)
             await _close_unanswered_window(ctx, mgr, name, args)
         except VTTError as e:
             await _refuse_with_suggestions(ctx, mgr, name, args, e,
@@ -2026,16 +2042,20 @@ def _check_formula_rule(mgr: MatchManager, system: Any, key: str,
     mode = (RULES_REGISTRY.get(key, {}).get("schema") or {}).get("formula")
     if not mode or not isinstance(value, str) or not value.strip():
         return None
+    from formula import RULE_ATTR_ROOTS
     return _system_formula_warning(
         mgr, system, value, "eval" if mode == "expression" else "exec",
-        f"`{key}` must be a valid formula {mode}", "the rule fails")
+        f"`{key}` must be a valid formula {mode}", "the rule fails",
+        attr_roots=RULE_ATTR_ROOTS.get(key, frozenset()))
 
 
 def _system_formula_warning(mgr: MatchManager, system: Any, src: str,
                             mode: str, refusal: str, fails: str,
                             known_params: frozenset = frozenset(),
                             extra_funcs: frozenset = frozenset(),
-                            with_matches: bool = True) -> Optional[str]:
+                            with_matches: bool = True,
+                            attr_roots: frozenset = frozenset(),
+                            ) -> Optional[str]:
     """Validate a formula a GameSystem stores (a rule, a library tile hook
     or function body; `mode` eval / exec). A syntax error or a disallowed
     construct raises VTTError(`refusal: <why>`). A call to a function that
@@ -2051,7 +2071,7 @@ def _system_formula_warning(mgr: MatchManager, system: Any, src: str,
             known.update(m.formula_functions)
     try:
         validate_formula(src, mode=mode, known_funcs=frozenset(known),
-                         known_params=known_params)
+                         known_params=known_params, attr_roots=attr_roots)
     except FormulaError as ex:
         msg = str(ex)
         # The validator may add a "Did you mean" suggestion after the dot.
@@ -2177,6 +2197,35 @@ def _settles_nothing(name: str, args: List[str]) -> bool:
     return sub is not None and (
         sub in READ_ONLY_SUBCOMMANDS.get(root, ())
         or sub in (_HOST_READS.get(root) or ()))
+
+
+# Player-available roots whose every form but an elevated word is a read.
+_READ_ROOTS = frozenset({"list", "state", "map", "dist", "find", "whoami",
+                         "log"})
+# Reads that run the GM's writing formulas on purpose and put everything
+# back: a damage / healing forecast runs the steps and rolls them back.
+_UNGUARDED_READS = frozenset({("damage", "explain"), ("healing", "explain")})
+
+
+def _guarded_read(name: str, args: List[str]) -> bool:
+    """Whether a typed command is a read, whose formulas run with their
+    writes refused (READ_ONLY_EVAL): the reads _settles_nothing names
+    (`!dry` and `!simulate` aside: they run commands and restore), and the
+    player reads `!map`, `!list`, `!state`, `!find`, ... unless an elevated
+    word (`!map resize`, `!log add`) makes the command a change."""
+    root = name.lower()
+    if root in ("dry", "simulate") or (
+            args and (root, str(args[0]).lower()) in _UNGUARDED_READS):
+        return False
+    if root in _READ_ROOTS:
+        words = [str(a).lower() for a in args if not _OPTION_WORD.match(a)]
+        if words and words[0] in ELEVATED_ARGS.get(root, ()) \
+                and words[0] not in (_HOST_READS.get(root) or ()) \
+                and not (len(words) >= 2 and (root, words[0], words[1])
+                         in _ELEVATED_READ_FORMS):
+            return False
+        return True
+    return _settles_nothing(name, args)
 
 
 def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
@@ -2889,7 +2938,7 @@ STATUS_ACTION_USAGE = ("list | remove <action> | <action> <field> "
 _ACTION_FORMULA_FIELDS = frozenset({
     "body", "prepare", "cost", "condition", "affects", "target_condition",
     "before", "after", "auto_when", "description", "say_format",
-    "condition_message"})
+    "condition_message", "target_condition_message", "list_note"})
 
 
 def _status_action_note(aname: str, rec: Any, sname: str = "x") -> str:
@@ -4377,7 +4426,7 @@ _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "__map_vehicle_death_effect",
                                  "__mount_death_effect",
                                  # A partial's give code.
-                                 "on_give"})
+                                 "on_give", "list_note"})
 
 
 def _hide_formula_at(path: str, value: Any, root: Any = None) -> Any:
@@ -7391,7 +7440,7 @@ def split_command_args(root: str, tail: str) -> List[str]:
                 out.append(";")
             piece = piece.strip()
             if i == 0 and low == "foreach":
-                out += shlex.split(_straight_quotes(piece))
+                out += _split_words(piece)
                 continue
             if i == 0 and low == "batch" and re.match(r"strict(\s|$)", piece):
                 out.append("strict")
@@ -7419,7 +7468,77 @@ def split_command_args(root: str, tail: str) -> List[str]:
             elif len(raw) >= 2 and raw[0] == raw[-1] == "'":
                 raw = raw[1:-1]
             return [m.group(1), m.group(2).strip("'\""), raw]
-    return shlex.split(_straight_quotes(tail))
+    return _split_words(tail)
+
+
+def _split_words(text: str) -> List[str]:
+    """shlex words of `text`, except that an inline `$(...)` outside quotes
+    keeps its inner text as typed (#11: `$(len('abc'))` lost its quotes
+    and read `abc` as a name)."""
+    text = _straight_quotes(text)
+    kept: List[str] = []
+    out: List[str] = []
+    i, n = 0, len(text)
+    quote: Optional[str] = None
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                out.append(text[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch in "'\"":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if text.startswith("$(", i):
+            end = _dollar_end(text, i + 2)
+            if end is not None:
+                kept.append(text[i:end + 1])
+                out.append(f"\x00{len(kept) - 1}\x00")
+                i = end + 1
+                continue
+        out.append(ch)
+        i += 1
+    words = shlex.split("".join(out))
+    if not kept:
+        return words
+    return [re.sub("\x00(\\d+)\x00", lambda mt: kept[int(mt.group(1))], w)
+            for w in words]
+
+
+def _dollar_end(text: str, i: int) -> Optional[int]:
+    """The index of the `)` closing a `$(` whose inner text starts at `i`
+    (quotes inside skipped), or None when it never closes."""
+    depth, quote = 1, None
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
 
 
 def _straight_quotes(text: str) -> str:
@@ -12918,9 +13037,12 @@ def _system_formula_slots(rule_value: Callable[[str], Any],
     for k in sorted(RULES_REGISTRY):
         mode = (RULES_REGISTRY[k].get("schema") or {}).get("formula")
         if mode:
+            # A rule read with attribute roots (the action list note's
+            # `source`) lints as an action's program does.
+            from formula import RULE_ATTR_ROOTS
             yield (f"rule `{k}`", rule_value(k),
-                   "eval" if mode == "expression" else "exec", frozenset(),
-                   False)
+                   "exec" if mode != "expression" or k in RULE_ATTR_ROOTS
+                   else "eval", frozenset(), k in RULE_ATTR_ROOTS)
     for spec in rule_value("default_entity_passives") or []:
         if isinstance(spec, dict):
             yield (f"default passive `{spec.get('id')}`", spec.get("formula"),
@@ -13007,11 +13129,12 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         else:
             bad.append(f"❌ {where}: {err}")
 
-    def check_name(where: str, fname: str, params: List[Any]) -> None:
+    def check_name(where: str, fname: str, params: List[Any],
+                   defaults: Optional[Dict[str, Any]] = None) -> None:
         # A name stored before the reserved names were refused (an older
         # save) would shadow an engine helper or never be called.
         try:
-            check_formula_function(fname, list(params))
+            check_formula_function(fname, list(params), defaults)
         except VTTError as ex:
             bad.append(f"❌ {where}: {ex}")
 
@@ -13022,7 +13145,7 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             bad.append(f"❌ function `{fname}`: isn't a function (a name, "
                        f"a list of parameters and a body)")
             continue
-        check_name(f"function `{fname}`", fname, fn.params)
+        check_name(f"function `{fname}`", fname, fn.params, fn.defaults)
     for where, src, mode, params, action_mode in _system_formula_slots(
             lambda k: mgr.system_value(s, k),
             lambda kind: mgr.system_library(s, kind)):
@@ -13402,12 +13525,12 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
     return await ctx.send(reply + (f"\n{warn}" if warn else ""))
 
 
-def _func_params(token: str) -> List[str]:
+def _func_params(token: str) -> Tuple[List[str], Dict[str, Any]]:
     """The parameter list of `!func def` / `!system func def`: one token of
-    comma-separated names, or "", "-" or "none" for none."""
-    if token.strip().lower() in ("", "-", "none"):
-        return []
-    return [p.strip() for p in token.split(",") if p.strip()]
+    comma-separated names, each with an optional default (`a,b=0`), or "",
+    "-" or "none" for none. Returns (names, defaults)."""
+    from logic import parse_func_params
+    return parse_func_params(token)
 
 
 async def _system_func(ctx: ReplyContext, args: List[str],
@@ -13442,17 +13565,18 @@ async def _system_func(ctx: ReplyContext, args: List[str],
         return await ctx.send("\n".join(lines))
     name = args[3]
     if action == "def":
-        params = _func_params(args[4])
+        params, defaults = _func_params(args[4])
         body = normalize_body_source(" ".join(args[5:]).strip())
         if not body:
             raise VTTError("function body cannot be empty. Usage: `!system "
                            "func def <system> <name> <params> <body>`.")
-        check_formula_function(name, params)
+        check_formula_function(name, params, defaults)
         warn = _system_formula_warning(
             mgr, s, body, "exec", "invalid function body", "it fails",
             known_params=frozenset(params), extra_funcs=frozenset({name}))
         prior = lib.get(name)
-        fn = FormulaFunction(name=name, params=params, body=body)
+        fn = FormulaFunction(name=name, params=params, body=body,
+                             defaults=defaults)
         lib[name] = fn.to_dict()
         mgr.system_library_write(s, "formula_functions", lib)
         if prior is not None:
@@ -29106,7 +29230,10 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "❌ function body cannot be empty. Usage: "
                 "`!func def <name> <params> <body>`."
             )
-        params = _func_params(params_token)
+        try:
+            params, defaults = _func_params(params_token)
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
         # Validate the body BEFORE storing — known_funcs is the current
         # registry plus the name being defined (so a recursive function
         # validates), and known_params is this function's parameters.
@@ -29130,7 +29257,8 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         prior = m.formula_functions.get(name)
         _check_owner(m, "func", name, ctx)
         try:
-            fn = m.define_formula_function(name, params, body)
+            fn = m.define_formula_function(name, params, body,
+                                           defaults=defaults)
         except (VTTError, DuplicateId) as ex:
             return await ctx.send(f"❌ {ex}")
         _set_author(m, "func", name, ctx)
@@ -33359,6 +33487,9 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
         dis = m._effective_disguise(actor, pov)
         dvars = dis.get("vars") if isinstance(dis, dict) and isinstance(
             dis.get("vars"), dict) else {}
+    # The list notes (W23): never on a disguised unit, to other teams'
+    # views per action_list_note_visibility.
+    notes_shown = not disguised and _action_note_shown(m, actor, pov)
     for name in sorted(actions.keys()):
         for act in actions[name]:
             container = act.container_path or "(entity root)"
@@ -33371,9 +33502,12 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
             if not disguised:
                 forbid = "; ".join(x for x in (forbid, _action_condition_note(
                     m, actor_id, act)) if x)
+            note = (_action_list_note(m, actor_id, act) if notes_shown
+                    else "")
             lines.append(
                 f"- `{act.name}` (target: `{act.target_type}`, at "
                 f"`{container}`{tags}){desc}"
+                + (f" {note}" if note else "")
                 + (f" 🚫 {forbid}" if forbid else "")
             )
     if mount_actions:
@@ -33390,9 +33524,12 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
                 where = (_private_text(m) if _path_private(
                     m, m.entities.get(actor.mounted_on or ""),
                     act.full_path) else act.full_path)
+                note = (_action_list_note(m, actor_id, act, actor.mounted_on)
+                        if notes_shown else "")
                 lines.append(
                     f"- `{act.name}` (target: `{act.target_type}`, at "
                     f"`{where}`{tags}){desc}"
+                    + (f" {note}" if note else "")
                     + (f" 🚫 {forbid}" if forbid else "")
                 )
     await ctx.send("\n".join(lines + notes))
@@ -34056,15 +34193,12 @@ async def _system_defaults(ctx: ReplyContext, args: List[str],
     return await _gclamp_on(ctx, mgr, inner, sys_name)
 
 
-def _action_condition_note(m: Match, actor_id: str, act: Any,
-                           vehicle: Optional[str] = None) -> str:
-    """"condition not met" when the action's precondition (Y4) reads false
-    for `actor_id` now (no target, no args), "its condition failed" when
-    the formula fails; "" otherwise. A seat action is judged as `!action`
-    runs it (mount_action_actor)."""
-    if not getattr(act, "condition", ""):
-        return ""
-    from action import action_condition_ok
+def _action_eval_actor(m: Match, actor_id: str, act: Any,
+                       vehicle: Optional[str] = None,
+                       ) -> Tuple[str, Any, Optional[Dict[str, Any]]]:
+    """(acting unit, action, extras) a seat action is judged with, as
+    `!action` runs it (mount_action_actor): the vehicle or the rider, with
+    `vehicle` / `rider` / `slot`; the unit's own action as it is."""
     eff, extra = actor_id, None
     if vehicle:
         import dataclasses
@@ -34078,10 +34212,51 @@ def _action_condition_note(m: Match, actor_id: str, act: Any,
             eff = vehicle
         else:
             act = dataclasses.replace(act, container_path="")
+    return eff, act, extra
+
+
+def _action_condition_note(m: Match, actor_id: str, act: Any,
+                           vehicle: Optional[str] = None) -> str:
+    """The action's refusal, filled as `!action` would print it ({target}
+    empty), when its precondition (Y4) reads false for `actor_id` now (no
+    target, no args); "its condition failed" when the formula fails; ""
+    otherwise. A seat action is judged as `!action` runs it
+    (mount_action_actor)."""
+    if not getattr(act, "condition", ""):
+        return ""
+    from action import action_condition_ok, action_condition_text
+    eff, act, extra = _action_eval_actor(m, actor_id, act, vehicle)
     ok, err = action_condition_ok(act, eff, m, extra=extra)
     if ok:
         return ""
-    return "its condition failed" if err else "condition not met"
+    if err:
+        return "its condition failed"
+    return action_condition_text(act, eff, m)
+
+
+def _action_note_shown(m: Match, e: Entity, pov: Optional[str]) -> bool:
+    """Whether the channel's reader sees the list notes of `e`'s actions
+    (action_list_note_visibility): `all`, else a view of the unit's team,
+    or a host in a channel without a team view."""
+    if str(m.rules.get("action_list_note_visibility", "own")) == "all":
+        return True
+    if pov is not None:
+        return m.body_team(e) == str(pov)
+    return VAR_READER.get() is None
+
+
+def _action_list_note(m: Match, actor_id: str, act: Any,
+                      vehicle: Optional[str] = None) -> str:
+    """The action's list note (W23) as shown: its text, "(note failed)"
+    (with the error for a host in a channel without a team view), or ""."""
+    from action import action_list_note
+    eff, act, extra = _action_eval_actor(m, actor_id, act, vehicle)
+    text, err = action_list_note(act, eff, m, extra=extra)
+    if err:
+        if VAR_READER.get() is None:
+            return f"(note failed: {formula_text(err)})"
+        return "(note failed)"
+    return text or ""
 
 
 async def _action_info(
@@ -34160,6 +34335,28 @@ async def _action_info(
     if act.say_format.strip():
         lines.append(f"Says:        {act.say_format}")
     lines += _reaction_info_lines(m, act, private)
+    if act.condition:
+        # The refusal as `!action` prints it now, and whether the condition
+        # is met now (a disguise's decoy reads no real value).
+        from action import action_condition_ok, action_condition_text
+        if disguised:
+            if act.condition_message:
+                lines.append(f"Refusal:     {act.condition_message}")
+        else:
+            ok, err = action_condition_ok(act, actor_id, m)
+            lines.append("Refusal:     "
+                         + action_condition_text(act, actor_id, m))
+            lines.append("Met now:     " + (
+                "yes" if ok else "no" if not err
+                else "its condition failed" + (
+                    f" ({formula_text(err)})"
+                    if VAR_READER.get() is None else "")))
+    if act.target_condition_message:
+        lines.append(f"Target refusal: {act.target_condition_message}")
+    if not disguised and _action_note_shown(m, actor, pov):
+        note = _action_list_note(m, actor_id, act)
+        if note:
+            lines.append(f"Now:         {note}")
     lines += [f"⚠️ {p}" for p in act.tag_problems]
     forbid = "" if disguised else _action_forbid_note(m, actor_id, act)
     if forbid:
@@ -34198,8 +34395,6 @@ def _reaction_info_lines(m: Match, act: Any, private: bool) -> List[str]:
         out.append(f"Affects:     `{ftext(act.affects)}`")
     if act.condition:
         out.append(f"Condition:   `{ftext(act.condition)}`")
-    if act.condition_message:
-        out.append(f"Refusal:     {act.condition_message}")
     if act.target_condition:
         out.append(f"Target condition: `{ftext(act.target_condition)}`")
     if act.cancelled_action_cost:

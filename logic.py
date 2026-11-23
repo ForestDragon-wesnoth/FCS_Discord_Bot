@@ -5990,6 +5990,38 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Empty = the default text."
         ),
     },
+    "action_list_note": {
+        "default": "",
+        "schema": {"type": "str", "formula": "expression"},
+        "desc": (
+            "A note the game system computes for each action `!action list` "
+            "and `!action info` show (cooldowns left, uses left this turn, "
+            "loaded ammo, `not your turn`): an expression read with self = "
+            "the acting unit (for a seat action the unit mount_action_actor "
+            "names, with `vehicle` / `rider` / `slot`), `source` the "
+            "action's container, `action_name`, `action_tags`, "
+            "`action_path`; `target` is None and `args` empty. Its value "
+            "is a text or a list of texts (joined with ` · `); None, \"\" "
+            "or [] shows nothing; it is cut at 200 characters. Shown at the "
+            "end of the action's line and as `Now:` in `!action info`. It "
+            "only reads: a function that changes the match is refused here, "
+            "and any write it reaches while read fails it, shown as `(note "
+            "failed)` (the error to a host in a channel without a team "
+            "view). An action's own `list_note` replaces it (\"\" = no "
+            "note). Never shown on a disguised unit; to other teams' views "
+            "per action_list_note_visibility. Empty = no notes."
+        ),
+    },
+    "action_list_note_visibility": {
+        "default": "own",
+        "schema": {"type": "enum", "choices": ["own", "all"]},
+        "desc": (
+            "Who reads an action's list note (action_list_note, an "
+            "action's `list_note`): own = a channel whose view is the "
+            "unit's team, and a host in a channel without a team view; "
+            "all = every view that sees the action."
+        ),
+    },
     "action_choice_limit": {
         "default": 20,
         "schema": {"type": "int", "min": 0, "max": 100, "ceiling": True},
@@ -7568,7 +7600,18 @@ def _check_effects_rule(key: str, raw: str) -> str:
     return json.dumps(val, ensure_ascii=False)
 
 
+def _check_read_only_note(key: str, raw_value: str) -> str:
+    """action_list_note only reads: a call to a function that changes the
+    match is refused when it is set (a `!func`'s writes fail when read)."""
+    from formula import note_write_problem
+    why = note_write_problem(raw_value)
+    if why:
+        raise VTTError(f"Setting '{key}' {why}")
+    return raw_value
+
+
 _FORMAT_RULE_CHECKS = {
+    "action_list_note": _check_read_only_note,
     "team_sprite_effects": _check_effects_rule,
     "corpse_sprite_effects": _check_effects_rule,
     "active_unit_sprite_effects": _check_effects_rule,
@@ -10340,25 +10383,119 @@ class FormulaFunction:
     # two functions with the same source are still equal, and from
     # to_dict so it never leaks into save files.
     _compiled: Any = field(default=None, compare=False, repr=False)
+    # Default values of the trailing parameters (`b=0`): a parameter with
+    # one may be left out of a call, or given by name. JSON values.
+    defaults: Dict[str, Any] = field(default_factory=dict)
 
     def signature(self) -> str:
-        """Human-readable `name(p1, p2)` for listings and errors."""
-        return f"{self.name}({', '.join(self.params)})"
+        """Human-readable `name(p1, p2=0)` for listings and errors."""
+        return f"{self.name}({func_params_text(self.params, self.defaults)})"
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "name": self.name,
             "params": list(self.params),
             "body": self.body,
         }
+        if self.defaults:
+            out["defaults"] = _own_value(self.defaults)
+        return out
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "FormulaFunction":
+        params = [str(p) for p in (d.get("params", []) or [])]
+        raw = d.get("defaults")
+        defaults = ({str(k): _own_value(v) for k, v in raw.items()
+                     if str(k) in params}
+                    if isinstance(raw, dict) else {})
         return FormulaFunction(
             name=str(d["name"]),
-            params=[str(p) for p in (d.get("params", []) or [])],
+            params=params,
             body=str(d.get("body", "")),
+            defaults=defaults,
         )
+
+
+def _default_text(v: Any) -> str:
+    """A parameter default as a formula writes it."""
+    return repr(v)
+
+
+def func_params_text(params: List[str], defaults: Dict[str, Any]) -> str:
+    """`a, b=0, c='x'`: a function's parameters with their defaults."""
+    return ", ".join(p + (f"={_default_text(defaults[p])}"
+                          if p in defaults else "") for p in params)
+
+
+def _default_literal(node: Any, where: str) -> Any:
+    """A parameter default's value: a number, a text (a plain word is
+    text), true / false / none, or a list / dict of those (`-1`
+    included)."""
+    import ast as _ast
+    if isinstance(node, _ast.Constant) and (
+            node.value is None or isinstance(node.value,
+                                             (bool, int, float, str))):
+        return node.value
+    if isinstance(node, _ast.UnaryOp) and isinstance(
+            node.op, (_ast.USub, _ast.UAdd)) and isinstance(
+            node.operand, _ast.Constant) and isinstance(
+            node.operand.value, (int, float)) and not isinstance(
+            node.operand.value, bool):
+        v = node.operand.value
+        return -v if isinstance(node.op, _ast.USub) else v
+    if isinstance(node, _ast.Name):
+        # A plain word is text (a typed `c='x'` reaches here as `c=x`
+        # once the command line drops the quotes).
+        low = node.id.lower()
+        if low in ("true", "false", "none"):
+            return {"true": True, "false": False, "none": None}[low]
+        return node.id
+    if isinstance(node, (_ast.List, _ast.Tuple)):
+        return [_default_literal(e, where) for e in node.elts]
+    if isinstance(node, _ast.Dict) and all(k is not None for k in node.keys):
+        out = {}
+        for k, v in zip(node.keys, node.values):
+            key = _default_literal(k, where)
+            if not isinstance(key, str):
+                raise VTTError(f"{where}: a dict default's keys are text.")
+            out[key] = _default_literal(v, where)
+        return out
+    raise VTTError(f"{where}: a default is a value (a number, a text, true "
+                   f"/ false / none, or a list or dict of those), not a "
+                   f"formula.")
+
+
+def parse_func_params(token: str) -> Tuple[List[str], Dict[str, Any]]:
+    """The parameter list of `!func def` / `!system func def`: one word of
+    comma-separated names, each with an optional default (`a,b=0,c='x'`),
+    or "", "-" or "none" for none. Returns (names, defaults)."""
+    import ast as _ast
+    text = (token or "").strip()
+    if text.lower() in ("", "-", "none"):
+        return [], {}
+    if "=" not in text:
+        return [p.strip() for p in text.split(",") if p.strip()], {}
+    try:
+        tree = _ast.parse(f"lambda {text}: 0", mode="eval")
+    except SyntaxError as ex:
+        if "follows parameter with default" in str(ex.msg) \
+                or "non-default argument" in str(ex.msg):
+            raise VTTError(f"parameters `{text}`: a parameter without a "
+                           f"default can't follow one with a default.")
+        raise VTTError(f"parameters `{text}` don't parse: names separated "
+                       f"by commas, each with an optional default "
+                       f"(`a,b=0,c='x'`).")
+    lam = tree.body
+    a = lam.args
+    if a.vararg or a.kwarg or a.kwonlyargs or getattr(a, "posonlyargs", []):
+        raise VTTError(f"parameters `{text}`: only names, each with an "
+                       f"optional default (`a,b=0`).")
+    names = [x.arg for x in a.args]
+    first = len(names) - len(a.defaults)
+    defaults = {names[first + i]: _default_literal(d, f"parameter "
+                                                    f"`{names[first + i]}`")
+                for i, d in enumerate(a.defaults)}
+    return names, defaults
 
 
 # Action built-ins and bindings a `!func` name would never reach.
@@ -10366,7 +10503,8 @@ _FORMULA_RESERVED_NAMES = frozenset({"cmd", "fail", "choose", "choose_number",
                                      "source", "args"})
 
 
-def check_formula_function(name: Any, params: List[Any]) -> None:
+def check_formula_function(name: Any, params: List[Any],
+                           defaults: Optional[Dict[str, Any]] = None) -> None:
     """Refuse a formula function name or parameter list that can't work:
     names must be identifiers that don't shadow a built-in, parameters
     unique identifiers that aren't built-ins, `entity` or `__`-prefixed.
@@ -10421,6 +10559,25 @@ def check_formula_function(name: Any, params: List[Any]) -> None:
                 f"parameter name '{p}' is reserved; pick a different "
                 f"name."
             )
+    if defaults:
+        if not isinstance(defaults, dict):
+            raise VTTError("`defaults` must map parameter names to values.")
+        for k in defaults:
+            if k not in params:
+                raise VTTError(f"a default names `{k}`, which isn't a "
+                               f"parameter.")
+        seen_default = False
+        for p in params:
+            if p in defaults:
+                seen_default = True
+            elif seen_default:
+                raise VTTError(f"parameter `{p}` has no default and follows "
+                               f"one with a default.")
+        for k, v in defaults.items():
+            try:
+                _own_value(v)
+            except VTTError as ex:
+                raise VTTError(f"parameter `{k}`'s default: {ex}")
 
 
 # -------------------------
@@ -11523,16 +11680,25 @@ class Entity:
         # Its body's size total and category (#242), before the spawn
         # hooks read them.
         size_log = match.sync_body_size(self)
+        # The statuses its items hold (W21) settle before the spawn's hooks
+        # read them, as a give settles them before its template hooks (#8).
+        grant_log: List[str] = []
+        if match.held_status_grants(self):
+            grant_log = match.sync_zone_grants({self.id})
+        # The partials it arrives holding, before a spawn hook gives it
+        # more (a hook's give reports its own, #7).
+        arrived = {(p, n) for p, n, _c in template_marker_list(self.vars)}
         with _outside_derivation():
             spawn_log = match.fire_hook("on_entity_spawned",
                                         target_ids=[self.id])
-        log = rename_notes + size_log + spawn_log
+        log = rename_notes + size_log + grant_log + spawn_log
         # Template hooks (W22): the partials it arrives holding (a revive
         # and a transfer bring nothing new: the unit already had them).
         route = TEMPLATE_ROUTE.get()
         if (not REVIVING.get() and route != TEMPLATE_QUIET
                 and self.id in match.entities):
-            news = template_marker_list(self.vars)
+            news = [t for t in template_marker_list(self.vars)
+                    if (t[0], t[1]) in arrived]
             if news:
                 log += match.template_change(self, [], news,
                                              route or "spawn")
@@ -21683,6 +21849,7 @@ class Match:
     def define_formula_function(
         self, name: str, params: List[str], body: str,
         *, overwrite: bool = True,
+        defaults: Optional[Dict[str, Any]] = None,
     ) -> "FormulaFunction":
         """Create or replace a formula function. Validates that the name
         and every parameter is a legal identifier, parameters are
@@ -21696,10 +21863,11 @@ class Match:
         formula workflow); pass overwrite=False to raise DuplicateId on
         an existing name instead.
         """
-        check_formula_function(name, params)
+        check_formula_function(name, params, defaults)
         if not overwrite and name in self.formula_functions:
             raise DuplicateId(f"formula function '{name}' already exists.")
-        fn = FormulaFunction(name=name, params=list(params), body=body)
+        fn = FormulaFunction(name=name, params=list(params), body=body,
+                             defaults=dict(defaults or {}))
         self.formula_functions[name] = fn
         return fn
 
@@ -26473,10 +26641,12 @@ class Match:
                            name=self._entity_name(entity_id),
                            status=status_name)
             log = self.status_line("gained", entity_id, status_name, after)
-            log += self.fire_status_event(
+            mark = self._surface_mark() if log else None
+            hook_log = self.fire_status_event(
                 "on_status_added", entity_id, status_name,
                 old_value=None, new_value=after,
             )
+            log += self._take_surfaced(mark) + hook_log
         elif before is not None and after is None:
             self.log_event("status_removed", entity=entity_id,
                            name=self._entity_name(entity_id),
@@ -26487,19 +26657,23 @@ class Match:
             log = ([] if removed_by == "transform" else self.status_line(
                 "lost", entity_id, status_name, before,
                 {"removed_by": removed_by}))
-            log += self.fire_status_event(
+            mark = self._surface_mark() if log else None
+            hook_log = self.fire_status_event(
                 "on_status_removed", entity_id, status_name,
                 old_value=before, new_value=None, removed_by=removed_by,
             )
+            log += self._take_surfaced(mark) + hook_log
         elif not same_value(before, after):
             old_lv = self.status_level(before)
             log = ([] if same_value(old_lv, self.status_level(after))
                    else self.status_line("changed", entity_id, status_name,
                                          after, {"old_level": old_lv}))
-            log += self.fire_status_event(
+            mark = self._surface_mark() if log else None
+            hook_log = self.fire_status_event(
                 "on_status_changed", entity_id, status_name,
                 old_value=before, new_value=after,
             )
+            log += self._take_surfaced(mark) + hook_log
         # Death-check chokepoint for status mutations. Death conditions
         # can reference statuses (status_has / status_get) — without
         # this, adding a 'doomed' status wouldn't trigger the death
@@ -34567,6 +34741,30 @@ class Match:
                 ))
         total_steps = sum(max(1, int(n)) for _, n in moves)
         return len(members), total_steps, log
+
+    def _surface_mark(self) -> Tuple[Optional[List[str]], int]:
+        """Where surface_log puts lines now (the action buffer, else the
+        command's sink) and how many it holds, for _take_surfaced."""
+        buf = self._runtime_buffer
+        if buf is not None:
+            return buf.out, len(buf.out)
+        sink = FORMULA_LOG_SINK.get()
+        return (sink, len(sink)) if sink is not None else (None, 0)
+
+    def _take_surfaced(self, mark: Optional[Tuple[Optional[List[str]], int]]
+                       ) -> List[str]:
+        """The lines surfaced since `mark` (_surface_mark), taken out of the
+        buffer / sink: a status's hooks print what they change after the
+        status's own line, which the caller passes on (#9: `A gains calm.`
+        from fear's on_removed read before `A loses fear.`)."""
+        if mark is None:
+            return []
+        lst, n = mark
+        if lst is None or len(lst) <= n:
+            return []
+        out = lst[n:]
+        del lst[n:]
+        return out
 
     def _pull_surfaced(self, log: List[str]) -> None:
         """Move the lines surfaced so far in this command (deaths, ...) into

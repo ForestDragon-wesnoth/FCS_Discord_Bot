@@ -44447,12 +44447,13 @@ SCENARIO 1216 — An action's `condition` is a precondition judged before its pr
 ?? (its condition formula failed: Function 'nope' is not allowed.)
 !action list a
 ?? - `bad` (target: `none`, at `kit`) 🚫 its condition failed
-?? - `pow` (target: `none`, at `kit`) 🚫 condition not met
-?? - `zap` (target: `entity`, at `kit`) 🚫 condition not met
+?? - `pow` (target: `none`, at `kit`) 🚫 Ana is too weak for pow (50 hp).
+?? - `zap` (target: `entity`, at `kit`) 🚫 `a` can't use `zap` now.
 !action info a zap
 ?? Condition:   `source.charges > 0`
 !action info a pow
-?? Refusal:     {name} is too weak for {action} ({hp} hp).
+?? Refusal:     Ana is too weak for pow (50 hp).
+?? Met now:     no
 !eval "use_action('a', 'zap', 'b')"
 ?? ↳ use_action `zap`: `a` can't use `zap` now.
 !system lint default
@@ -44482,8 +44483,9 @@ reaction is judged before its prepare and body, self = the acting unit,
 action_condition_message_format rule, and pow's own `condition_message`
 replaces it with the unit's placeholders. A condition whose formula fails
 refuses too and says why. `!action list` marks each action whose
-condition is unmet now, `!action info` shows the condition and the
-refusal text, use_action reports the refusal, and `!system lint` checks
+condition is unmet now with its refusal filled as `!action` prints it
+(W23), `!action info` shows the condition, the filled refusal and
+whether it is met now, use_action reports the refusal, and `!system lint` checks
 the condition (reading `source.charges` as an action does). With a charge
 the zap prepares, Bo's reaction window opens, and the zap lands and spends
 the charge; the next try is refused again, in the rule's new wording.
@@ -49241,3 +49243,345 @@ check can't see is allowed: a system or match `!func`, and `!system
 lint` names it as a ⚠️ when the system lacks it); a second bare
 word after the path is a stray word. Under formula_text_visibility host a player
 reads the template with its code hidden; a host reads it whole.
+
+SCENARIO 1311 — !action list notes: a system rule on a 2x2 unit, an action's own note, a list of texts, the filled refusal in the list and in !action info
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new an An 8 8
+!match use an
+!ent add a Ogre 30 1 1 9 cd=2 ammo=3
+!ent set_vars a footprint_w=2 footprint_h=2
+!ent set_var a actions.hit.body "say('hit')"
+!ent set_var a actions.hit.condition "var_get(self, 'cd', 0) <= 0"
+!ent set_var a actions.hit.condition_message "{name} has {cd} turns of cooldown left."
+!ent set_var a actions.hit.description "a big swing"
+!ent set_var a bow.ammo 3
+!ent set_var a bow.actions.shoot.body "source.ammo -= 1"
+!ent set_var a actions.rest.body "say('rest')"
+!ent set_var a actions.rest.list_note "''"
+!system set default action_list_note "f'{var_get(self, \"cd\", 0)} turns of cooldown' if var_get(self, 'cd', 0) > 0 else (['loaded', str(source.ammo) + ' arrows'] if action_name == 'shoot' else '')"
+!action list a
+?? - `hit` (target: `none`, at `(entity root)`) — a big swing 2 turns of cooldown 🚫 Ogre has 2 turns of cooldown left.
+?? - `shoot` (target: `none`, at `bow`) 2 turns of cooldown
+?! - `rest` (target: `none`, at `(entity root)`) 2
+!action info a hit
+?? Refusal:     Ogre has 2 turns of cooldown left.
+?? Met now:     no
+?? Now:         2 turns of cooldown
+!action a hit
+?? Ogre has 2 turns of cooldown left.
+!ent set_var a cd 0
+!action list a
+?? - `shoot` (target: `none`, at `bow`) loaded · 3 arrows
+?! 🚫
+!action info a hit
+?? Met now:     yes
+?! Now:
+!ent set_var a bow.actions.shoot.list_note "'x' * 300"
+!action list a
+?? - `shoot` (target: `none`, at `bow`) xxxxxxxx
+?? x…
+!assert "len(var_get('a', 'bow.actions.shoot.list_note')) == 9"
+!action a shoot
+!assert "entity[a].bow.ammo == 2"
+!history list command
+?! before '!action list a'
+?! before '!action info a hit'
+
+Expected: the system's action_list_note gives each action of the 2x2
+ogre a note at the end of its line, after its description and before
+the 🚫: the cooldown left while `cd` is above 0, then for `shoot` a list
+of texts joined with ` · ` (it reads `source.ammo`, the bow's), and
+nothing for the others (""). `rest`'s own `list_note` of '' replaces
+the rule with no note. The list prints the refusal filled as `!action`
+prints it (`Ogre has 2 turns of cooldown left.`), and `!action info`
+prints the filled refusal, whether the condition is met now and the
+note as `Now:`. A note past 200 characters is cut with "…". The reads
+make no undo step.
+
+SCENARIO 1312 — List notes on a seat action and a reaction; a failing note; a note that would write; a read never writes (#4)
+-------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new an2 An2 10 8
+!match use an2
+!ent add tank Tank 40 3 3 0 fuel=7
+!ent set_var tank footprint_w 2
+!ent set_var tank slots.gunner.capacity 1
+!ent set_var tank slots.gunner.region back
+!ent set_var tank slots.gunner.actions.shoot.target entity
+!ent set_var tank slots.gunner.actions.shoot.body "say('bang')"
+!ent set_var tank slots.gunner.actions.shoot.list_note "f'fuel {entity[vehicle].fuel}, seat {slot}, by {rider}'"
+!ent add gun Gunner 10 6 1 5
+!mount gun tank gunner
+!action list gun
+?? - `shoot` (target: `entity`, at `slots.gunner.actions.shoot`) fuel 7, seat gunner, by gun
+!ent add wiz Wizard 20 5 5 1 mana=4 team=red
+!ent set_var wiz actions.counterspell.reacts_on any
+!ent set_var wiz actions.counterspell.condition true
+!ent set_var wiz actions.counterspell.before "incoming.cancel = True"
+!ent set_var wiz actions.counterspell.list_note "f'{entity[self].mana} mana'"
+!action list wiz
+?? - `counterspell` (target: `none`, at `(entity root)`) 4 mana
+!ent set_var wiz actions.counterspell.list_note "nope(self)"
+!action list wiz
+?? (note failed: Function 'nope' is not allowed.)
+!as view red
+!as player bob
+!action list wiz
+?? (note failed)
+?! nope
+!as owner
+!as view omniscient
+!system set default action_list_note "var_set(self, 'x', 1)"
+?? ❌ Setting 'action_list_note' only reads, and var_set() changes the match.
+!func def bump u "var_set(u, 'count', var_get(u, 'count', 0) + 1)\nTrue"
+!system set default action_list_note "bump(self)"
+!ent set_var wiz actions.counterspell.list_note "var_del(self, 'mana')"
+!action info wiz counterspell
+?? ⚠️ `actions.counterspell.list_note` only reads, and var_del() changes the match.
+!ent set_var wiz actions.zap.body "say('zap')"
+!ent set_var wiz actions.zap.condition "bump(self)"
+!as player bob
+!action list wiz
+?? - `zap` (target: `none`, at `(entity root)`) 🚫 its condition failed
+!action list wiz
+!ent info wiz
+!as owner
+!action list wiz
+?? (note failed: var_set() changes the match, and this formula runs inside a read (`!action`), which changes nothing.
+!assert "var_get('wiz', 'count', 0) == 0 and entity[wiz].mana == 4"
+!history list command
+?! before '!action list wiz'
+?! before '!ent info wiz'
+
+Expected: a seat action's note reads `vehicle`, `slot` and `rider` as
+its condition would (the gunner's list); a reaction shows its note. A
+note calling a function that doesn't exist shows `(note failed)`, with
+the error only for a host in a channel without a team view (a red
+player reads the red wizard's note as failed, without the error). A note that
+calls a writing function is refused when set as the rule, and named as
+a ⚠️ on the action when set as a field; a note or condition calling a
+`!func` that writes fails when read: a read runs every formula with its
+writes refused (#4), so the player's two `!action list` calls and the
+`!ent info` leave `count` at 0, `mana` at 4 and make no undo step.
+
+SCENARIO 1313 — Who reads list notes: own team, other teams under both visibility settings, a disguised unit
+-----------------------------------------------------------------------------------------------------------
+!match new an3 An3 8 8
+!match use an3
+!system set default action_list_note "f'{var_get(self, \"cd\", 0)} cd'"
+!ent add rk Red 20 1 1 5 team=red cd=1
+!ent set_var rk actions.hit.body "say('hit')"
+!ent add bk Blue 20 5 5 4 team=blue cd=2
+!ent set_var bk actions.hit.body "say('hit')"
+!ent add spy Spy 20 3 3 3 team=red cd=3
+!ent set_var spy actions.stab.body "say('stab')"
+!ent set_var spy disguise.name Villager
+!ent set_var spy disguise.vars.actions.wave.body "say('hi')"
+!as view red
+!as player bob
+!action list rk
+?? 1 cd
+!action list bk
+?! 2 cd
+!action info bk hit
+?! Now:
+!as owner
+!as view blue
+!as player bob
+!action list spy
+?? `wave`
+?! 3 cd
+!as owner
+!system set default action_list_note_visibility all
+!as view red
+!as player bob
+!action list bk
+?? 2 cd
+!as owner
+!as view blue
+!as player bob
+!action list spy
+?! cd
+!as owner
+!as view omniscient
+!action list spy
+?? 3 cd
+
+Expected: under the default `own`, a red view reads the notes of red
+units and not of blue ones (list and `!action info`); a host in a
+channel without a team view reads every note. Under `all` the red view
+reads the blue unit's note too. A disguised unit shows no note to a
+view its disguise fools (the decoy `wave` lists bare), under either
+setting.
+
+SCENARIO 1314 — !func parameters with defaults and keyword calls
+----------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new fd Fd 8 8
+!match use fd
+!ent add hero Hero 20 1 1 5
+!func def up u,health=0,stamina=0,note='ok' "var_add(u, 'up.health', health)\nvar_add(u, 'up.stamina', stamina)\nnote"
+?? Defined formula function `up(u, health=0, stamina=0, note='ok')`.
+!ent set_vars hero up.health=0 up.stamina=0
+!eval "up('hero', stamina=2)"
+?? = `'ok'`
+!eval "up('hero', health=3, stamina=2, note='done')"
+?? = `'done'`
+!assert "entity[hero].up.health == 3 and entity[hero].up.stamina == 4"
+!eval "up('hero', mana=2)"
+?? has no parameter `mana`
+!eval "up('hero', 1, health=2)"
+?? got `health` twice
+!eval "up()"
+?? needs `u` (no default)
+!eval "up('hero', 1, 2, 3, 4)"
+?? takes at most 4 argument(s), got 5
+!func def bad a=1,b "a"
+?? a parameter without a default can't follow one with a default
+!func def bad2 a=foo() "a"
+?? a default is a value
+!func def lists a=[1,-2],b=none,c={'k':true} "[a, b, c]"
+!eval "lists()"
+?? = `[[1, -2], None, {'k': True}]`
+!eval "lists(c=5)"
+?? = `[[1, -2], None, 5]`
+!system func def default twice x,n=2 "x * n"
+?? `twice(x, n=2)`
+!match new fd2 Fd2 8 8
+!match use fd2
+!eval "twice(4) + twice(4, n=3)"
+?? = `20`
+!as restart
+!match use fd
+!eval "up('hero', health=1)"
+!assert "entity[hero].up.health == 4"
+!func list
+?? `up(u, health=0, stamina=0, note='ok')`
+
+Expected: a parameter may carry a default (a value: a number, a text, a
+plain word read as text, true / false / none, a list or dict of those);
+a call may leave it out or name it. A keyword the function lacks, a
+parameter given twice, a missing parameter without a default and too
+many arguments are refused cleanly; so are a parameter without a
+default after one with a default, and a default that is a formula. A
+system function's defaults reach a new match, and every function's
+defaults survive a restart.
+
+SCENARIO 1315 — affects reads args (#5); a damage step's incoming for a bystander's splash (#6)
+-----------------------------------------------------------------------------------------------
+!match new ab Ab 10 10
+!match use ab
+!ent add hex Hexer 20 1 1 9
+!ent add gob Goblin 20 5 5 3
+!ent add ogre Ogre 30 7 7 2
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var hex actions.mark.target none
+!ent set_var hex actions.mark.default_arg at
+!ent set_var hex actions.mark.affects "[args.at]"
+!ent set_var hex actions.mark.body "for u in affected:\n    entity[u].hp -= 3"
+!action hex mark gob
+!assert "entity[gob].hp == 17"
+!ent set_var hex actions.mark.affects "[get(args, 'at', '')]"
+!action hex mark ogre
+!assert "entity[ogre].hp == 27"
+!ent add orc Orc 30 4 4 8
+!ent set_var orc actions.blast.target entity
+!ent set_var orc actions.blast.prepare "block = 4"
+!ent set_var orc actions.blast.body "deal_damage(target, 10)\ndeal_damage('ogre', 6)"
+!damage step add shield side=defender "if incoming != None and incoming.block:\n    step_reduce(incoming.block)"
+!action orc blast gob
+!assert "entity[gob].hp == 11 and entity[ogre].hp == 21"
+
+Expected: a targetless `mark` names its unit in an argument (default_arg
+`at`), and `affects` reads it both ways, `args.at` and `get(args,
+'at', '')`; the body hits the unit `affected` names (Goblin 20 → 17,
+the 2x2 Ogre 30 → 27). The orc's `blast` has a prepare, so it opens an
+exchange whose `incoming` copy for the goblin holds block 4; the
+defender step takes the block off the goblin's packet (10 → 6) and the
+splash on the ogre, which the action doesn't affect, reads no
+`incoming` and takes its full 6.
+
+SCENARIO 1316 — Spawn order: held grants settle before the hooks (#8), a hook's give reported once (#7), a status line before its hook's lines (#9)
+-------------------------------------------------------------------------------------------------------------------------------------------------
+!match new so So 10 10
+!match use so
+!status def tough
+!status def calm
+!status def fear
+!status hook fear on_removed "status_apply(self, 'calm')"
+!template import brute {"kind":"partial","data":{"name":"Brute","grants":{"tough":{"level":1}}}}
+!template import badge {"kind":"partial","data":{"name":"Badge"}}
+!gpassive add seen on_template_applied "say('{n} {p} via {b}, tough={t}', n=template_name, p=template_path, b=applied_by, t=status_has(self, 'tough'))"
+!ent add hero Hero 30 1 1 5
+!template give brute hero equipped.cls
+?? brute equipped.cls via give, tough=True
+!template save hero hero_t
+!template spawn hero_t 4 4
+?? brute equipped.cls via spawn, tough=True
+?! tough=False
+!gpassive add tag on_entity_spawned "give_template(self, 'equipped.badge', 'badge')"
+!ent add pup Pup 10 6 6 1
+?? badge equipped.badge via give
+?! via spawn
+!ent add a Ann 10 8 8 1
+!eval "status_apply('a', 'fear')"
+!eval "status_remove('a', 'fear')"
+?? Ann loses fear.
+?? Ann gains calm.
+
+Expected: a spawned unit holding the brute partial (a class whose
+`grants` gives tough) settles its held grants before its hooks run, so
+the template hook reads tough=True after a spawn as after a give (it
+read False, the gains line printing after it). A unit an
+on_entity_spawned passive gives a badge reports the badge once, as the
+give (route `give`); the spawn's own report covers only the partials
+the unit arrived with. Removing fear prints `Ann loses fear.` before
+the `Ann gains calm.` its on_removed hook causes.
+
+SCENARIO 1317 — A reaction's target_condition_message (#10); quotes inside an unquoted $() argument (#11)
+---------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new tm Tm 10 10
+!match use tm
+!ent add ogre Ogre 40 4 4 5
+!ent add hunter Hunter 30 7 4 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var ogre actions.claws.target entity
+!ent set_var ogre actions.claws.tags melee
+!ent set_var ogre actions.claws.body "entity[target].hp -= 5"
+!ent set_var hunter actions.dodge.reacts_to melee
+!ent set_var hunter actions.dodge.target location
+!ent set_var hunter actions.dodge.direction_target true
+!ent set_var hunter actions.dodge.target_condition "reaction_target.x > entity[self].x"
+!ent set_var hunter actions.dodge.target_condition_message "{name} can only dodge away, not to {target}."
+!ent set_var hunter actions.dodge.before "move_entity(self, reaction_target)"
+!action ogre claws hunter
+!react hunter dodge left
+?? ❌ `hunter` can't pick `dodge` there: Hunter can only dodge away, not to (6,4).
+!react hunter dodge right
+?? Hunter picks `dodge`
+!react skip
+!ent set_var ogre actions.leap.target location
+!ent set_var ogre actions.leap.target_condition "fits_at(self, target)"
+!ent set_var ogre actions.leap.target_condition_message "{name} has no room at {target}"
+!ent set_var ogre actions.leap.body "move_entity(self, target)"
+!ent add rock Rock 50 2 2 0
+!action ogre leap 1 1
+?? Ogre has no room at (1,1).
+!action info ogre leap
+?? Target refusal: {name} has no room at {target}
+!ent hp hunter $(len('abcd'))
+!assert "entity[hunter].hp == 4"
+!match var set lvl.n 7
+!ent hp hunter $(match_var_get('lvl.n'))
+!assert "entity[hunter].hp == 7"
+!ent set_var hunter tag $(upper("a b"))
+!assert "entity[hunter].tag == 'A B'"
+
+Expected: a reaction's `target_condition_message` words the refusal of
+a target its target_condition turns down, filled with the reacting
+unit's placeholders and `{target}` (`(6,4)`); an action's does the same
+for its own target (the 2x2 ogre's leap onto the rock), and `!action
+info` shows it. An inline `$(...)` argument left unquoted keeps its
+inner text as typed: `$(len('abcd'))` is 4, `$(match_var_get('lvl.n'))`
+reads 7, and `$(upper("a b"))` keeps its quoted space.
