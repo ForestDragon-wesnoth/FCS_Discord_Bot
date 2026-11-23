@@ -2866,6 +2866,10 @@ def _get(container: Any, key: Any, default: Any = _GET_MISSING) -> Any:
             f"get(container, key): key must be text or a whole number, got "
             f"{'None' if key is None else type(key).__name__}.")
     if not isinstance(container, (dict, list, tuple)):
+        from action import ArgsProxy      # an action's `args` reads too
+        if isinstance(container, ArgsProxy):
+            container = dict(object.__getattribute__(container, "_data"))
+    if not isinstance(container, (dict, list, tuple)):
         raise FormulaError(
             f"get(container, key): container must be a list or dict, got "
             f"{'None' if container is None else type(container).__name__}.")
@@ -4226,6 +4230,59 @@ assert not _arg_unknown_mutating, (
 # live in _ALLOWED_FUNCS.) User-defined !func functions are NOT included — they
 # can't be verified read-only, so they're banned from args.
 ARG_SAFE_FUNC_NAMES: "frozenset[str]" = frozenset(_ALLOWED_FUNCS) | ARG_SAFE_MATCH_FUNCS
+
+# A read (#4 of the Solis / FCS1 requests): while a read command runs
+# (`!action list`, `!ent info`, `!map`, ...) every formula it evaluates (an
+# action's condition, a list note, a visibility condition, a colour) has its
+# writes refused at run time, so a player's read never changes the match.
+# Set by the command runner to the command's name; "" = no guard.
+READ_ONLY_EVAL: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "READ_ONLY_EVAL", default="")
+# Mutating only through what they call (a `!func`, a lambda), and those
+# calls are guarded themselves.
+_READ_GUARD_FREE = frozenset({"map_with", "filter_with", "sort_by"})
+
+
+def note_write_problem(src: Any) -> str:
+    """Why an expression meant only to read (an action's list note) can't
+    be stored: it doesn't parse, or it calls a function that changes the
+    match (checked as `$()` arguments are). "" = fine. A `!func` it calls
+    is judged when read: its writes fail then (READ_ONLY_EVAL)."""
+    text = normalize_body_source(str(src or "")).strip()
+    if not text:
+        return ""
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as e:
+        return f"doesn't parse: {e.msg}."
+    bad = sorted({n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id in ARG_MUTATING_MATCH_FUNCS})
+    if bad:
+        return ("only reads, and " + ", ".join(f"{b}()" for b in bad)
+                + " changes the match.")
+    return ""
+
+
+def _read_only_namespace(ns: Dict[str, Any], why: str) -> None:
+    """Replace every function of `ns` that changes the match, and the
+    entity / match var writers, with one refusing the call (READ_ONLY_EVAL)."""
+    def refusing(name: str, fn: Any = None) -> Any:
+        def _refused(*_a: Any, **_k: Any) -> Any:
+            raise FormulaError(
+                f"{name} changes the match, and this formula runs inside a "
+                f"read (`!{why}`), which changes nothing.")
+        _refused.__name__ = getattr(fn, "__name__", name)
+        if fn is not None:
+            _refused.__doc__ = getattr(fn, "__doc__", None)
+            _refused.__wrapped__ = getattr(fn, "__wrapped__", fn)
+        return _refused
+    for n in ARG_MUTATING_MATCH_FUNCS - _READ_GUARD_FREE:
+        if n in ns:
+            ns[n] = refusing(f"{n}()", ns[n])
+    ns["__write"] = refusing("a var write")
+    ns["__write_match"] = refusing("a match var write")
+
 
 # Built-in functions whose results _namespace passes through _listify (see
 # there): every match function and pure helper.
@@ -5672,10 +5729,18 @@ def _set_path(d: Dict[str, Any], path: str, value: Any) -> None:
     cur[keys[-1]] = value
 
 
+# Formula rules whose formulas read names by attribute (`source.ammo`), as
+# an action's own formulas do: the action list note (W23).
+RULE_ATTR_ROOTS: Dict[str, "frozenset[str]"] = {
+    "action_list_note": frozenset({"source", "args"}),
+}
+
+
 def validate_formula(
     src: str, *, mode: str = "exec",
     known_funcs: "frozenset[str]" = frozenset(),
     known_params: "frozenset[str]" = frozenset(),
+    attr_roots: "frozenset[str]" = frozenset(),
 ) -> None:
     """Parse, transform, and validate a formula source string.
 
@@ -5691,7 +5756,8 @@ def validate_formula(
           when validating that function's body.
     """
     FormulaEngine._prepare(src, mode, known_funcs=known_funcs,
-                           known_params=known_params)
+                           known_params=known_params | attr_roots,
+                           attr_roots=attr_roots)
 
 
 # --- engine ------------------------------------------------------------------
@@ -13066,14 +13132,42 @@ class FormulaEngine:
             limit = int(match.rules.get(
                 "formula_function_recursion_limit", 64))
 
-            def _make_callable(fdef):
-                def _call(*args):
-                    if len(args) != len(fdef.params):
+            def _bind(fdef, args, kwargs) -> Dict[str, Any]:
+                """The call's parameter values: positional ones in order,
+                then the named ones, then the defaults (#2: `f(1, b=2)`)."""
+                params = fdef.params
+                defaults = getattr(fdef, "defaults", None) or {}
+                if len(args) > len(params):
+                    most = (f"at most {len(params)}" if defaults
+                            else f"{len(params)}")
+                    raise FormulaError(
+                        f"{fdef.signature()} takes {most} argument(s), got "
+                        f"{len(args)}.")
+                bound = dict(zip(params, args))
+                for k, v in kwargs.items():
+                    if k not in params:
                         raise FormulaError(
-                            f"{fdef.signature()} takes "
-                            f"{len(fdef.params)} argument(s), got "
-                            f"{len(args)}."
-                        )
+                            f"{fdef.signature()} has no parameter `{k}`.")
+                    if k in bound:
+                        raise FormulaError(
+                            f"{fdef.signature()} got `{k}` twice (by "
+                            f"position and by name).")
+                    bound[k] = v
+                missing = [p for p in params
+                           if p not in bound and p not in defaults]
+                if missing:
+                    raise FormulaError(
+                        f"{fdef.signature()} needs "
+                        + ", ".join(f"`{p}`" for p in missing)
+                        + " (no default).")
+                for p in params:
+                    if p not in bound:
+                        bound[p] = _own_value(defaults[p])
+                return bound
+
+            def _make_callable(fdef):
+                def _call(*args, **kwargs):
+                    bound = _bind(fdef, args, kwargs)
                     if self._fn_depth >= limit:
                         raise FormulaError(
                             f"formula function recursion limit "
@@ -13086,8 +13180,7 @@ class FormulaEngine:
                     # one call don't leak into siblings. Inherits all the
                     # builtins / match funcs / sibling functions from ns.
                     call_ns = dict(ns)
-                    for pname, pval in zip(fdef.params, args):
-                        call_ns[pname] = pval
+                    call_ns.update(bound)
                     self._fn_depth += 1
                     try:
                         # One dict as globals and locals (see _namespace).
@@ -13270,6 +13363,9 @@ class FormulaEngine:
             ns[fname] = _coord_lists(
                 fname, ns[fname], params, xs,
                 "map" in params or fname in _MAP_ARG_FUNCS)
+        why = READ_ONLY_EVAL.get()
+        if why:
+            _read_only_namespace(ns, why)
         return ns
 
     def _compile_function_body(self, fdef):

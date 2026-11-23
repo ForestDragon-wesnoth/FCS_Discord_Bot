@@ -416,6 +416,26 @@ def _formula_field(raw: Dict[str, Any], key: str, full_path: str,
     return normalize_body_source(v)
 
 
+def _list_note_field(raw: Dict[str, Any], full_path: str,
+                     problems: List[str]) -> Optional[str]:
+    """An action's `list_note` (W23): None when absent (the rule applies),
+    "" for no note, else the expression; one that calls a function that
+    changes the match is named in `problems` (it fails when read)."""
+    from formula import normalize_body_source, note_write_problem
+    if raw.get("list_note") is None:
+        return None
+    v = raw["list_note"]
+    if not isinstance(v, str):
+        problems.append(f"`{full_path}.list_note` isn't formula text "
+                        f"({type(v).__name__}); the rule applies.")
+        return None
+    v = normalize_body_source(v).strip()
+    why = note_write_problem(v)
+    if why:
+        problems.append(f"`{full_path}.list_note` {why}")
+    return v
+
+
 def _expression_field(raw: Dict[str, Any], key: str, full_path: str,
                       problems: List[str]) -> str:
     """An expression field that may also hold a bool: `!ent set_var u
@@ -588,6 +608,14 @@ class Action:
     # (ReactionSpec.condition).
     condition: str = ""
     condition_message: str = ""
+    # The refusal of a target its `target_condition` turns down (#10 of
+    # the Solis / FCS1 requests), filled like condition_message plus
+    # {target}; "" = the engine's wording.
+    target_condition_message: str = ""
+    # The note `!action list` / `!action info` show for the action (W23):
+    # an expression replacing the action_list_note rule; None = the rule,
+    # "" = no note.
+    list_note: Optional[str] = None
     # W17 (user design): a location target also takes a direction word
     # and an optional count (`left`, `right 2`): the cell that many steps
     # from the acting unit's anchor that way. Off unless the action holds
@@ -701,6 +729,15 @@ class Action:
                             f"({type(condition_message).__name__}); the "
                             f"rule's wording applies.")
             condition_message = ""
+        target_condition_message = raw.get("target_condition_message", "")
+        if target_condition_message is None:
+            target_condition_message = ""
+        if not isinstance(target_condition_message, str):
+            problems.append(f"`{full_path}.target_condition_message` isn't "
+                            f"text ({type(target_condition_message).__name__})"
+                            f"; the engine's wording applies.")
+            target_condition_message = ""
+        list_note = _list_note_field(raw, full_path, problems)
         direction_target = False
         dt = raw.get("direction_target")
         if dt is not None:
@@ -735,6 +772,8 @@ class Action:
             target_condition=target_condition,
             cancelled_action_cost=cancel_cost, reaction=reaction,
             condition=condition, condition_message=condition_message,
+            target_condition_message=target_condition_message,
+            list_note=list_note,
         )
 
 
@@ -2646,6 +2685,68 @@ def action_condition_ok(action: Action, actor_id: str, match: "Match", *,
         return False, str(ex)
 
 
+LIST_NOTE_MAX = 200
+
+
+def _list_note_text(v: Any) -> Optional[str]:
+    """A list note's value as shown: a text, or a list of texts joined with
+    ` · `; None / "" / [] = nothing; cut at LIST_NOTE_MAX characters."""
+    if v is None or v == "" or v == []:
+        return None
+    if isinstance(v, list):
+        parts = [str(x) for x in v if x is not None and str(x) != ""]
+        if not parts:
+            return None
+        text = " · ".join(parts)
+    elif isinstance(v, bool):
+        text = "yes" if v else "no"
+    else:
+        text = str(v)
+    text = " ".join(text.split("\n")).strip()
+    if not text:
+        return None
+    if len(text) > LIST_NOTE_MAX:
+        text = text[:LIST_NOTE_MAX - 1] + "…"
+    return text
+
+
+def action_list_note(action: Action, actor_id: str, match: "Match", *,
+                     extra: Optional[Dict[str, Any]] = None,
+                     ) -> Tuple[Optional[str], str]:
+    """The note `!action list` / `!action info` show for the action (W23):
+    its `list_note`, else the action_list_note rule, read with self =
+    `actor_id`, `source` its container, action_name / action_tags /
+    action_path, `target` None and `args` empty, with every write refused
+    (READ_ONLY_EVAL). Returns (text or None, the error when it failed)."""
+    from formula import FormulaEngine, EvalCtx, READ_ONLY_EVAL
+    src = (action.list_note if action.list_note is not None
+           else str(match.rules.get("action_list_note") or ""))
+    if not src.strip():
+        return None, ""
+    actor = match.entities.get(actor_id)
+    if actor is None:
+        return None, f"`{actor_id}` isn't in the match"
+    extras: Dict[str, Any] = {k: v for k, v in (extra or {}).items()
+                              if k in ("vehicle", "rider", "slot")}
+    extras.update({"target": None, "actor": actor_id,
+                   "action_name": action.name,
+                   "action_tags": list(action.tags),
+                   "action_path": action.full_path})
+    token = READ_ONLY_EVAL.set(READ_ONLY_EVAL.get() or "action list")
+    try:
+        val = FormulaEngine(match).eval_expression(
+            src, EvalCtx(this=match.current_entity_id(), target=actor_id,
+                         extras=extras),
+            attr_bindings={"source": make_source(actor,
+                                                 action.container_path),
+                           "args": ArgsProxy({})})
+    except Exception as ex:      # noqa: BLE001 - shown as (note failed)
+        return None, str(ex) or type(ex).__name__
+    finally:
+        READ_ONLY_EVAL.reset(token)
+    return _list_note_text(val), ""
+
+
 def action_condition_text(action: Action, actor_id: str, match: "Match",
                           target: Any = None, err: str = "") -> str:
     """The refusal of an action whose precondition isn't met: its own
@@ -2691,6 +2792,32 @@ def target_condition_ok(action: Action, actor_id: str, tid: Any,
         return False, str(ex)
 
 
+def target_condition_text(action: Action, actor_id: str, match: "Match",
+                          tid: Any, err: str = "",
+                          failed: str = "", shown: str = "") -> str:
+    """Why target `tid` is refused by the action's target_condition, with
+    no final period: the action's `target_condition_message` filled as
+    condition_message is (the acting unit's placeholders, {actor},
+    {action}, {target}), else "`x` doesn't meet `a`'s target condition";
+    a formula that failed is named after either (`failed` words it, else
+    "its formula failed: <err>")."""
+    tgt = _log_target_str(tid) if tid is not None else ""
+    fmt = action.target_condition_message
+    actor = match.entities.get(actor_id)
+    if fmt and actor is not None:
+        text = match.render_unit_message(
+            fmt, actor_id, actor.name, actor.x, actor.y, actor.vars,
+            actor.part_of or "",
+            extra={"actor": actor_id, "action": action.name,
+                   "target": tgt}).rstrip().rstrip(".")
+    else:
+        text = (f"{shown or f'`{tid}`'} doesn't meet `{action.name}`'s "
+                f"target condition")
+    if err:
+        text += f" ({failed or 'its formula failed: ' + err})"
+    return text
+
+
 def _target_condition_refusal(action: Action, actor_id: str, target: Any,
                               match: "Match",
                               ) -> Optional[Tuple[str, str, Any, List[str]]]:
@@ -2704,8 +2831,8 @@ def _target_condition_refusal(action: Action, actor_id: str, target: Any,
         return None
 
     def line(tid: Any, err: str) -> str:
-        return (f"`{tid}` doesn't meet `{action.name}`'s target condition"
-                + (f" (its formula failed: {err})" if err else "") + ".")
+        return target_condition_text(action, actor_id, match, tid,
+                                     err) + "."
     if action.target_type in ("entity", "location") \
             and not isinstance(target, list):
         ok, err = target_condition_ok(action, actor_id, target, match)

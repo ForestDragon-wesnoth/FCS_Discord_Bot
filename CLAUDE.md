@@ -892,7 +892,22 @@ a local lives until the formula ends and is never stored (a `!func` call
 runs in its own namespace copy), and can't take the name of a function
 (built-in or the match's `!func`s), a hook / action binding, an entity
 token, `match`, `entity` or a `__` name (886). A rule's schema says which
-(`"formula": "expression"|"program"`), and `!system set` validates it.
+(`"formula": "expression"|"program"`), and `!system set` validates it
+(a rule in `formula.RULE_ATTR_ROOTS`, the action list note, reads
+`source.x` / `args.x` as an action does).
+
+**Reads change nothing** (#4 of the Solis / FCS1 requests, 1312): while
+a read command runs (`vtt_commands._guarded_read`: what `_settles_nothing`
+calls a read, plus `!map` / `!list` / `!state` / `!find` / `!dist` /
+`!log` / `!whoami` without an elevated word; never `!dry`, `!simulate`
+or a damage / healing `explain`, which run writes and put them back),
+`formula.READ_ONLY_EVAL` holds its root and the namespace builder
+replaces every ARG_MUTATING function (map_with / filter_with / sort_by
+aside: what they call is guarded) and the var writers with a refusal
+(`_read_only_namespace`, keeping docstrings for `!help`). A condition,
+visibility formula or note that writes fails as a formula error there:
+a player's `!action list` once ran a writing `!func` and made undo steps
+and journal entries in their name.
 
 **Identifier surfaces** resolved at runtime: `_ALLOWED_FUNCS` (pure helpers),
 `_MATCH_FUNC_NAMES` (match-bound), `HOOK_CONTEXT_NAMES` (bindings a fire site
@@ -1543,7 +1558,10 @@ hardcodes**.
   the source), stamp, write (removed_by replace), delete, resync (both,
   for every marker; its own writes quiet), transform / replace / revert
   (the two forms compared once the new body stands, the stash left out).
-  `Entity.spawn` fires applied for what a new unit holds; a revive
+  `Entity.spawn` fires applied for the partials the unit arrived with
+  (taken before on_entity_spawned: a hook's give reports itself once,
+  #7), after its held grants settle (#8: the hooks read the statuses an
+  item or class holds, as after a give; 1316); a revive
   (REVIVING) and a transfer (`TEMPLATE_QUIET`) fire nothing, nor do a
   death, a despawn and a detach (user calls). Corpses fire nothing (on
   hold, idea #623). They share var_hook_recursion_limit.
@@ -2157,7 +2175,10 @@ hardcodes**.
   dispel, transfer) and `!ent status` report their change in their reply,
   so the lines of the (unit, status) they act on stay quiet
   (`STATUS_LINES_SKIP`, `vtt_commands._quiet_status_lines`; user call);
-  what their hooks change elsewhere still prints.
+  what their hooks change elsewhere still prints. A status's line comes
+  before what its own hooks surface (`_surface_mark` /
+  `_take_surfaced` move those lines after it, #9, 1316: `A gains calm.`
+  from fear's on_removed read before `A loses fear.`).
 - **Blocked applications** (#389, 1263): `apply_status` reports a refusal
   through `Match.status_blocked` (the blocked line, then on_status_blocked
   passives and a definition's `on_blocked` hook, bound `block_reason`
@@ -2397,7 +2418,28 @@ hardcodes**.
   the target's tags, a corpse's included (reason `target_tags`,
   `action_target_tags_message_format`, list targets drop the misfits the
   same way; a filter that doesn't parse refuses every target and `!action
-  info` names it).
+  info` names it). A target its `target_condition` turns down is refused
+  in the action's `target_condition_message` when it has one (filled as
+  condition_message plus {target}, `action.target_condition_text`; a
+  reaction's pick and halves too, #10, 1317).
+- **List notes and refusals** (W23, the Solis / FCS1 request, 1311-1313):
+  the rule `action_list_note` (an expression; empty = none) or an
+  action's `list_note` (replacing it; "" = no note) gives a note at the
+  end of each action's `!action list` line (after the description,
+  before 🚫) and as `Now:` in `!action info`: `action.action_list_note`,
+  self = the acting unit (a seat action's per mount_action_actor, with
+  vehicle / rider / slot), `source`, action_name / action_tags /
+  action_path, `target` None, `args` empty; a text or a list joined with
+  ` · `, cut at `LIST_NOTE_MAX` (200). It only reads: a call to a
+  mutating function is refused when the rule is set and named as an
+  action problem in the field (`formula.note_write_problem`), and
+  READ_ONLY_EVAL fails any write while it runs ("(note failed)", the
+  error for a host without a team view). Shown where the action shows,
+  never on a disguise fooling the view, to other teams' views per
+  `action_list_note_visibility` (own: the unit's team's view and a host
+  without one; all). The list prints an unmet condition's refusal
+  filled (`action_condition_text`, {target} empty), `!action info` it
+  and `Met now:`.
 - **Choices:** `choose(prompt, options)` / `choose_number(prompt, lo, hi)`
   replay the body: on an unanswered choice the attempt rolls back and re-runs
   with answers replayed in order (`answer=` tokens, else the surface's
@@ -2448,7 +2490,10 @@ hardcodes**.
   run, foreach, macro, ent — resolve their own). `validate_arg_safe` allows
   only `ARG_SAFE_FUNC_NAMES` (no mutators, no `!func`s); a result with spaces
   stays one argument. `inline_args_access` = host refuses players' `$()`
-  (fog matches: formulas see everything) (539-543, 549-550).
+  (fog matches: formulas see everything) (539-543, 549-550). The command
+  line splitter keeps an unquoted `$(...)`'s inner text as typed
+  (`_split_words` / `_dollar_end`: `$(len('abc'))` lost its quotes to
+  shlex, #11, 1317).
 - **`!batch a ; b ; ...`** = one undo step; `!batch strict` stops at the first
   ❌ and undoes the lines before it (every match restored in place, created
   matches removed, deleted ones restored as the original object even when
@@ -2603,7 +2648,13 @@ hardcodes**.
   (`formula_function_recursion_limit`; the value is the trailing
   expression, and a body ending on an if / elif / else returns the
   trailing value of the branch that ran: `_branch_results` stores it in
-  `_FN_RESULT` after the checks, Y5, 1217). `!eval [--as eid]` runs a formula,
+  `_FN_RESULT` after the checks, Y5, 1217); parameters may carry
+  defaults (`!func def g a,b=0,c='x' ...`, `logic.parse_func_params`:
+  values only, a plain word read as text since the command line drops
+  quotes, none after a parameter without one; `FormulaFunction.defaults`,
+  saved only when set) and calls may name them (`g(1, c='y')`; an
+  unknown keyword, a parameter given twice, a missing one or too many
+  arguments refused cleanly; #2, 1314). `!eval [--as eid]` runs a formula,
   all or nothing like an action (user call): refused part-way, its writes
   are taken back, other matches too (`_eval_all_or_nothing`, 247, 960;
   a program `formula.program_is_read_only` passes, the `$()` test over
@@ -4976,7 +5027,8 @@ lists what isn't built; 1093-1122).
   `cancelled_action_cost` (refund / pay). A body run without the
   exchange (no unit holds a reaction, no prepare) still reads `affected`
   (`run_action` evaluates `_affects` when a program names it; a failing
-  `affects` refuses with reason `affects`; R4, 1243). `run_action(steps=,
+  `affects` refuses with reason `affects`; R4, 1243); `affects` reads its
+  `args` as `args.at` or `get(args, 'at')` (#5, 1315). `run_action(steps=,
   preset_locals=, prepare_out=, body_out=, finish=, skip_checks=,
   extra_bindings=, fail_out=, target_out=)` runs any of the programs as
   one transaction. `fail(...)` takes the word `refund` (`REFUND`, a
@@ -5245,8 +5297,10 @@ in full: 1123-1139).
   `reactions.IncomingDict` reads keys as attributes) and keeps
   `forecast_rng`; `_body_phase` sets the RNG there before the body (the
   dice rewind) and after it never leaves it behind where it was. A step's
-  `incoming` is the defender's copy of the exchange whose body runs
-  (`damage.PACKET_EXCHANGE`), else None.
+  `incoming` is the packet target's own copy of the exchange whose body
+  runs (`damage.PACKET_EXCHANGE`; a body part's the action affects
+  reaching its body), else None (`copy_key(bystander=False)`: a splash
+  beside the target read the target's copy, #6, 1315).
 - **Defaults** (formula.py `_packet_defaults`): a status tick (`status:<n>`),
   a zone hook, a tile hook, else `action.ACTION_ORIGIN` (set by run_action
   around its programs: the actor and `action:<path>`; a reaction's half is

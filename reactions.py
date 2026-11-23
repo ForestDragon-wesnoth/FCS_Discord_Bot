@@ -349,12 +349,14 @@ def _ancestors(m: Any, eid: str) -> List[str]:
     return out
 
 
-def copy_key(m: Any, ex: Dict[str, Any], uid: str) -> str:
+def copy_key(m: Any, ex: Dict[str, Any], uid: str,
+             bystander: bool = True) -> str:
     """Whose `incoming` copy unit `uid` reads: its own, else the copy of a
     body part of it the action affects (reactions_cover_parts), else (a
     bystander) the copy of the action's one affected unit when it affects
     exactly one (user call: a bystander halving a single-target attack
-    reaches the body), else the action's shared copy."""
+    reaches the body), else the action's shared copy. `bystander=False`
+    (a damage step's packet target, #6) skips the last two: ""."""
     copies = ex.get("incoming") or {}
     if uid in copies:
         return uid
@@ -362,6 +364,8 @@ def copy_key(m: Any, ex: Dict[str, Any], uid: str) -> str:
         for key in copies:
             if key and uid in _ancestors(m, key):
                 return key
+    if not bystander:
+        return ""
     affected = [a for a in ex.get("affected") or [] if a in copies]
     if len(affected) == 1:
         return affected[0]
@@ -483,7 +487,16 @@ def _target_text(tid: Any) -> str:
     return f"({tid.x},{tid.y})" if hasattr(tid, "x") else f"`{tid}`"
 
 
-def _refused_text(act: Any, refused: List[Tuple[Any, str]]) -> str:
+def _refused_text(act: Any, refused: List[Tuple[Any, str]],
+                  m: Any = None, uid: Optional[str] = None) -> str:
+    """Why each refused target fails the reaction's target_condition: its
+    `target_condition_message` filled with the reacting unit's values (#10),
+    else the engine's wording."""
+    if m is not None and uid is not None:
+        from action import target_condition_text
+        return "; ".join(target_condition_text(act, uid, m, t, e, failed=e,
+                                               shown=_target_text(t))
+                         for t, e in refused)
     return "; ".join(f"{_target_text(t)} doesn't meet `{act.name}`'s "
                      f"target condition" + (f" ({e})" if e else "")
                      for t, e in refused)
@@ -963,7 +976,7 @@ def _affects(m: Any, act: Any, actor: str, target: Any,
         out = unit_targets(act.target_type, target_to_json(
             act.target_type, target))
         return [u for u in out if u in m.entities]
-    from action import Coord
+    from action import Coord, ArgsProxy
     # A location target reads as its cell, [x, y] (or [x, y, map]), which
     # the area functions take whole.
     if isinstance(target, Coord):
@@ -977,7 +990,9 @@ def _affects(m: Any, act: Any, actor: str, target: Any,
                                  extras={"actor": actor, "target": target,
                                          "args": dict(args),
                                          "action_name": act.name,
-                                         "action_tags": list(act.tags)}))
+                                         "action_tags": list(act.tags)}),
+            # `args.at` reads as in the action's programs (#5).
+            attr_bindings={"args": ArgsProxy(dict(args))})
     except Exception as err:      # noqa: BLE001
         raise VTTError(f"`{act.name}`'s `affects` "
                        f"{_formula_error(err)}.")
@@ -1200,11 +1215,11 @@ async def _half(env: _Env, seq: int, n: int, half: str, pays: bool) -> str:
     if refused and (not isinstance(own_target, list) or not kept):
         env.out.append(m.unit_tag(uid) + f"❌ {_name(m, uid)}'s "
                        f"`{pick['name']}` failed: [target_condition] "
-                       + _refused_text(act, refused) + ".")
+                       + _refused_text(act, refused, m, uid) + ".")
         return "fail"
     if refused:
-        env.out.append(m.unit_tag(uid) + "⚠️ " + _refused_text(act, refused)
-                       + ": left out.")
+        env.out.append(m.unit_tag(uid) + "⚠️ "
+                       + _refused_text(act, refused, m, uid) + ": left out.")
         own_target = kept
     writable = half == "before"
     extra_ctx = {
@@ -2161,7 +2176,7 @@ async def react_pick(ctx: Any, mgr: Any, m: Any, uid: str, requested: str,
         # Refused whole, list targets too: the pick records nothing and
         # the window stays open for another try.
         raise VTTError(f"`{uid}` can't pick `{act.name}` there: "
-                       + _refused_text(act, refused) + ".")
+                       + _refused_text(act, refused, m, uid) + ".")
     _pick(m, ex, uid, act, via, phase, target=target, args=args,
           answers=answers)
     _refresh_done(m, ex)

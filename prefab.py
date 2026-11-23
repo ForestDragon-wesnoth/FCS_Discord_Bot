@@ -659,11 +659,18 @@ def _check_formula_function(entry: Dict[str, Any], name: str,
     body = entry.get("body")
     if not isinstance(body, str) or not body.strip():
         raise VTTError(f"{who}: `body` must be formula text.")
+    defaults = entry.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        raise VTTError(f"{who}: `defaults` must map parameter names to "
+                       f"values.")
     try:
-        logic.check_formula_function(fname, params)
+        logic.check_formula_function(fname, params, defaults)
     except VTTError as ex:
         raise VTTError(f"{who}: {ex}")
-    return {"name": fname, "params": list(params), "body": body}
+    out = {"name": fname, "params": list(params), "body": body}
+    if defaults:
+        out["defaults"] = logic._own_value(defaults)
+    return out
 
 
 # The values a status definition's fields take (`!status stack|when|...`).
