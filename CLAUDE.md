@@ -4532,6 +4532,30 @@ same library and namespace as entity templates: `{"kind": "partial",
   two layers don't combine. Formulas: `give_template(eid, path, name)`
   (mutating), `template_of(eid, path='')` (read-only); `var_keys` hides `__`
   keys, `!ent dump` shows them.
+- **Give args and code** (user design, 1308-1310): a partial's library
+  metadata `path` (its default var path), `args` (name -> {default,
+  type number / text / bool / unit / any, description}; no default =
+  required; `logic.checked_template_args`) and `on_give` (a program,
+  checked in action mode with calls to unseen `!func`s allowed;
+  `_check_template_give`), never copied into a unit, kept by a re-save.
+  `!template give <partial> <unit> [path] [key=value ...]` and
+  `give_template(eid, path, name, args=None)` (path None = the default)
+  go through `action.template_give`: `template_give_prepare` resolves
+  the path and checks the args (`logic.template_give_args`: undeclared,
+  mistyped or missing refused; a unit arg names a unit), then a template
+  with `on_give` runs it through `run_action` (a synthetic Action on the
+  receiving unit, finish=False, skip_checks, `quiet_fail`: no
+  on_action_failed or log entry) with bindings `args`, `template_path`
+  (the name the template hooks use; `path` would have taken a common
+  local's name), `template_name` and `giver` (HOOK_CONTEXT;
+  `action.current_giver`: the acting unit of an action body, inside an
+  on_give its give's giver). The code builds the container with
+  give_template(self, template_path, template_name): a template in
+  `GIVING_TEMPLATES` (its own code running) builds plainly with no arg
+  check. Without on_give a give builds plainly. A partial built inside
+  another template, a spawn, a resync or a copy runs no code. `!template
+  path | arg | on_give` edit them (library edits), `!system lint` reads
+  the code against the system's functions (#627: spawn args, open).
 - **Pinning** (`template_pinning`, default off): `Match.template_pins`
   (`{name: {data, turn}}`, serialized, in undo snapshots, kept by `!match
   clone`; a transferred unit resolves against its new match) —

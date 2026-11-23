@@ -1217,6 +1217,101 @@ def make_source(entity: "Entity", container_path: str) -> Any:
     return SourceProxy(entity, container_path)
 
 
+# The partial templates whose on_give is running: a give of one of them
+# from inside its own code builds the container plainly (user design).
+GIVING_TEMPLATES: "contextvars.ContextVar[frozenset]" = contextvars.ContextVar(
+    "GIVING_TEMPLATES", default=frozenset())
+# The `giver` of the give whose on_give is running, for a give its code
+# makes (a kit's code giving another partial passes it on).
+GIVE_GIVER: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "GIVE_GIVER", default=None)
+
+
+def current_giver() -> Optional[str]:
+    """The giver of a give made now: inside a template's on_give the
+    giver of that give, inside an action body its acting unit, else
+    None."""
+    if GIVING_TEMPLATES.get():
+        return GIVE_GIVER.get()
+    origin = ACTION_ORIGIN.get()
+    return origin[0] if origin else None
+
+
+def template_give_prepare(match: Any, name: str, path: Optional[str],
+                          args: Dict[str, Any], check_args: bool = True
+                          ) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
+    """(template, path, args) for a give of partial `name`: the path typed
+    or else the template's default, the args checked against its
+    declarations with the defaults filled (logic.template_give_args)."""
+    from logic import (TEMPLATE_GIVE_PATH_KEY, template_give_args,
+                       check_store_path)
+    t = match._template_library().get(name)
+    if not isinstance(t, dict):
+        t = (match.template_pins.get(name) or {}) if name in \
+            getattr(match, "template_pins", {}) else {}
+    if not path:
+        path = t.get(TEMPLATE_GIVE_PATH_KEY) if isinstance(t, dict) else None
+        if not path:
+            raise VTTError(f"`{name}` has no default path; name one "
+                           f"(`!template give {name} <unit> <path>`, or "
+                           f"`!template path {name} <path>`).")
+    if path in ("", "."):
+        raise VTTError("A partial is given into a var path (`inventory.axe`"
+                       "); a whole unit is built from one through an entity "
+                       "template whose vars reference it.")
+    check_store_path(path, "Var path")
+    if not check_args:
+        return t, path, {}
+    filled = template_give_args(t if isinstance(t, dict) else {},
+                                dict(args or {}), name)
+    for k, spec in ((t or {}).get("args") or {}).items():
+        if spec.get("type") == "unit" and filled.get(k) is not None \
+                and filled[k] not in match.entities:
+            raise NotFound(f"`{name}`: `{k}` names no unit "
+                           f"(`{filled[k]}`).")
+    return t, path, filled
+
+
+async def template_give(match: Any, mgr: Any, ctx: Any, e: Any, name: str,
+                        path: Optional[str], args: Dict[str, Any],
+                        giver: Optional[str] = None
+                        ) -> Tuple[bool, Optional[Any], List[str], str]:
+    """Give partial `name` to unit `e` (user design): (ok, why, log, path).
+    A template holding `on_give` hands the give to that program, run like
+    an action body on `e` (one transaction, fail() refuses and changes
+    nothing; bindings self, args, template_path, template_name, giver),
+    which builds the container itself with give_template(self,
+    template_path, template_name); a give of the same template from
+    inside its own code, and a template without one, builds it plainly
+    (Match.give_partial)."""
+    from logic import TEMPLATE_ON_GIVE_KEY
+    if name in GIVING_TEMPLATES.get():
+        # Its own code building the container: plainly, args unread.
+        _t, path, _f = template_give_prepare(match, name, path, {},
+                                             check_args=False)
+        return True, None, match.give_partial(e, path, name), path
+    t, path, filled = template_give_prepare(match, name, path, args)
+    code = t.get(TEMPLATE_ON_GIVE_KEY) if isinstance(t, dict) else None
+    if not code:
+        return True, None, match.give_partial(e, path, name), path
+    act = Action(name=f"{name}.on_give", body=code, description="",
+                 target_type="none", container_path="",
+                 full_path=f"template:{name}.on_give")
+    token = GIVING_TEMPLATES.set(GIVING_TEMPLATES.get() | {name})
+    gtoken = GIVE_GIVER.set(giver)
+    try:
+        ok, why = await run_action(
+            act, actor_id=e.id, target=None, args=filled, match=match,
+            mgr=mgr, ctx=ctx, finish=False, skip_checks=True,
+            quiet_fail=True,
+            extra_bindings={"template_path": path, "template_name": name,
+                            "giver": giver})
+    finally:
+        GIVE_GIVER.reset(gtoken)
+        GIVING_TEMPLATES.reset(token)
+    return ok, why, [], path
+
+
 def _count_word(tok: str) -> bool:
     """A direction's count: a whole number word (`2`), no `=`."""
     return tok.isdigit()
@@ -1721,6 +1816,7 @@ async def run_action(
     extra_bindings: Optional[Dict[str, Any]] = None,
     fail_out: Optional[Dict[str, Any]] = None,
     target_out: Optional[Dict[str, Any]] = None,
+    quiet_fail: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """Execute an action body transactionally.
 
@@ -2018,6 +2114,10 @@ async def run_action(
         match._action_depth = pre_action_depth
         if is_top_level:
             match._runtime_buffer = None
+        if quiet_fail:
+            # A program that isn't an action (a template's on_give): its
+            # fail() refuses with no on_action_failed and no log entry.
+            return False, (af.reason, af.message)
         match.fire_action_failed(
             action_tags=action.tags,
             actor_id=actor_id,
