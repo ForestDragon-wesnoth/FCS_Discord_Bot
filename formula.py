@@ -3940,8 +3940,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Extra turns (#224): grant_turn / clear_extra_turns change the queue,
     # extra_turn_queue reads it.
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
-    # Reactions (#36): how many reactions a unit used since a point.
-    "reactions_used",
+    # Reactions (#36): how many reactions a unit used since a point, and
+    # how many it picked in the window open now (W25).
+    "reactions_used", "reactions_picked",
     # The damage pipeline (#25, damage.py): packets through the steps, the
     # forecasts, the saved last packets and the step_ helpers (only inside
     # a damage or healing step).
@@ -4141,7 +4142,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "sprite_effects_of",
-    "reactions_used",
+    "reactions_used", "reactions_picked",
     "teams", "group_names", "entities_in_cells", "own_turns", "fits_at",
     "free_cells_near", "corpse_cell", "corpses_within",
     "exists", "is_alive", "cell_behind",
@@ -9627,7 +9628,8 @@ class FormulaEngine:
             return tpl
 
         def _template_spawn(fn: str, name: Any, x: Any, y: Any,
-                            radius: Any, mv: Any = None) -> str:
+                            radius: Any, mv: Any = None,
+                            want_id: Any = None) -> str:
             if not isinstance(name, str):
                 raise FormulaError(f"{fn}: the template name must be text.")
             for v, what in ((x, "x"), (y, "y")):
@@ -9640,25 +9642,30 @@ class FormulaEngine:
                                    f"`{name}` (see `!template list`).")
             mp = _place_map(fn, mv)
             try:
+                if want_id is not None and not isinstance(want_id, str):
+                    raise FormulaError(f"{fn}: id= must be text.")
                 new_id, _log = match.spawn_template(key, tpl, x, y,
-                                                    near_radius=radius, mp=mp)
+                                                    near_radius=radius, mp=mp,
+                                                    exact_id=want_id)
                 match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(f"{fn}: {ex}")
             engine._note_affected(new_id)
             return new_id
 
-        def _summon_template(name: Any, x: Any, y: Any, map: Any = None) -> str:
-            """summon_template(name, x, y, map=None): spawn the server's saved
-            template `name` (`!template save`) at exactly (x, y), with its
-            body parts.
+        def _summon_template(name: Any, x: Any, y: Any, map: Any = None,
+                             id: Any = None) -> str:
+            """summon_template(name, x, y, map=None, id=None): spawn the
+            server's saved template `name` (`!template save`) at exactly
+            (x, y), with its body parts.
             Its id is the template name (`guardsman`, then `guardsman2`,
-            ...). Returns the new id."""
-            return _template_spawn("summon_template", name, x, y, None, map)
+            ...), or `id` (refused when taken). Returns the new id."""
+            return _template_spawn("summon_template", name, x, y, None, map,
+                                   id)
 
         def _summon_template_near(name: Any, x: Any, y: Any, radius: Any,
-                                  map: Any = None) -> str:
-            """summon_template_near(name, x, y, radius, map=None):
+                                  map: Any = None, id: Any = None) -> str:
+            """summon_template_near(name, x, y, radius, map=None, id=None):
             summon_template, but at the nearest free cell within `radius`
             (Chebyshev rings)."""
             if not isinstance(radius, int) or isinstance(radius, bool) \
@@ -9666,7 +9673,7 @@ class FormulaEngine:
                 raise FormulaError("summon_template_near: radius must be a "
                                    "whole number >= 0.")
             return _template_spawn("summon_template_near", name, x, y, radius,
-                                   map)
+                                   map, id)
 
         def _has_template(name: Any) -> bool:
             """has_template(name): True when this server has a saved template
@@ -11190,6 +11197,23 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(str(ex))
         ns["reactions_used"] = _reactions_used
+
+        def _reactions_picked(eid_t: Any, tag: Any = None) -> int:
+            """reactions_picked(eid, tag=None): how many reactions unit
+            `eid` has picked for the action whose windows are open now
+            (W25; before and after windows, refunded and dropped picks left
+            out), `tag` a tag filter on the reactions' tags. While the
+            action resolves, a pick being judged again counts only the
+            picks that ran before it, so a one-per-attack limit is
+            `reactions_picked(self, tag='limited') == 0` in each limited
+            reaction's condition. 0 with no window open."""
+            import reactions
+            eid, _e = _resolve_entity(eid_t, "reactions_picked")
+            try:
+                return reactions.reactions_picked(match, eid, tag)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+        ns["reactions_picked"] = _reactions_picked
 
         # ---- the damage pipeline (#25, damage.py) ----
         _UNSET = object()

@@ -21081,7 +21081,7 @@ SCENARIO 738 — Tab completion: commands, subcommands, literal words and option
 ?tab "!ent rm h"
 ?? healer  hero
 ?tab "!template spawn guard 1 1 "
-?? candidates: count=  map=  near=
+?? candidates: count=  id=  map=  near=
 ?tab "!map pan "
 ?? up_left
 ?! as=
@@ -21109,7 +21109,7 @@ follow the command's usage strings: `!ent` subcommands, unit ids for
 `<id>` (`!ent rm` is an alias spelling of `remove`), the literal words a
 form allows (`max` for `!ent hp`, `cw`/`ccw`/`toward` and the directions
 for `!ent face`, the `!undo` kinds, `!help`'s subcommands of `ent`), and
-`key=` options where the form allows one (`count=`, `map=` and `near=` after a template spawn's
+`key=` options where the form allows one (`count=`, `id=`, `map=` and `near=` after a template spawn's
 coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
@@ -49585,3 +49585,116 @@ for its own target (the 2x2 ogre's leap onto the rock), and `!action
 info` shows it. An inline `$(...)` argument left unquoted keeps its
 inner text as typed: `$(len('abcd'))` is 4, `$(match_var_get('lvl.n'))`
 reads 7, and `$(upper("a b"))` keeps its quoted space.
+
+SCENARIO 1318 — One limited reaction per attack with reactions_picked (W25); `pass` in a refused pick's choices and a reaction named pass (W26)
+--------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new rk Rk 10 10
+!match use rk
+!system set default reactions_per_window -1
+!ent add a Orc 30 1 1 9
+!ent add b Hero 30 2 1 3
+!ent set_vars b footprint_w=2 footprint_h=2
+!ent set_var a actions.hit.target entity
+!ent set_var a actions.hit.body "entity[target].hp -= 10"
+!ent set_var b actions.parry.tags lim
+!ent set_var b actions.parry.condition "reactions_picked(self, tag='lim') == 0"
+!ent set_var b actions.parry.before "say('parry')"
+!ent set_var b actions.duck.tags lim
+!ent set_var b actions.duck.condition "reactions_picked(self, tag='lim') == 0"
+!ent set_var b actions.duck.before "say('duck')"
+!ent set_var b actions.shout.before "say('shout')"
+!action a hit b
+?? `!react b parry`, `!react b duck`
+!eval "reactions_picked('b')"
+?? = `0`
+!react b parry
+?? Hero picks `parry`.
+?! `!react b duck`
+!eval "[reactions_picked('b'), reactions_picked('b', tag='lim'), reactions_picked('b', tag='other')]"
+?? = `[1, 1, 0]`
+!react b duck
+?? can't pick `duck` now. It can pick: `shout` — or `pass`.
+!react b pass.
+?? It can pick: `shout` — or `pass`.
+?pick pass
+?? parry
+?! duck
+!assert "entity[b].hp == 20 and reactions_used('b', 'ever', tag='lim') == 1"
+!eval "reactions_picked('b')"
+?? = `0`
+!ent set_var b actions.pass.before "say('x')"
+!action info b pass
+?? ⚠️ `actions.pass` is never offered: `pass` is the word `!react <eid> pass` reads before any reaction's name
+!action a hit b
+?! `!react b pass`, 
+!react b pass
+?? passes
+
+Expected: the hero (a 2x2 body) holds two reactions tagged `lim`, each
+with the condition `reactions_picked(self, tag='lim') == 0`, and a third
+without the tag. Once parry is picked, duck is no longer offered and a
+pick of it is refused, the refusal naming `shout` and `pass`; a typed
+`pass.` is offered `pass` as a did-you-mean, and picking it passes, so
+the window resolves: parry runs (it counts no pick that ran before it),
+the hit lands (30 → 20). reactions_picked counts the open window's picks
+(0 with none open), filtered by tag. A reaction named `pass` is never
+offered, and `!action info` says why.
+
+SCENARIO 1319 — A chosen id for a template spawn: !template spawn ... id=, summon_template(..., id=), refusals (W24)
+------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new sp Sp 12 12
+!match use sp
+!ent add human Human 20 1 1 5
+!ent set_vars human footprint_w=2 footprint_h=2
+!part add human human_arm Arm 5 5
+!template save human
+!template spawn human 5 5 id=dauwn_berserker
+?? ✨ Spawned `dauwn_berserker` from template `human` at (5,5) with 1 body part(s).
+!assert "exists('dauwn_berserker') and part_of('dauwn_berserker_arm') == 'dauwn_berserker'"
+!assert "footprint_width('dauwn_berserker') == 2"
+!template spawn human 9 9 id=dauwn_berserker
+?? The id `dauwn_berserker` is taken
+!template spawn human 9 9 id=self
+?? can't be a unit id
+!template spawn human 9 9 id=bad.id
+?? isn't a unit id
+!template spawn human 9 9 count=2 id=twins
+?? id= names one unit
+!eval "summon_template('human', 9, 1, id='scout')"
+?? = `'scout'`
+!eval "summon_template_near('human', 9, 1, 2, id='scout')"
+?? The id `scout` is taken
+!ent kill scout
+!eval "summon_template('human', 1, 9, id='scout')"
+?? The id `scout` is taken
+!eval "summon_template('human', 1, 9)"
+?? = `'human2'`
+
+Expected: `id=` gives a spawned unit (a 2x2 body with an arm) the id
+asked for, and its part's id follows it (`dauwn_berserker_arm`). An id
+already taken, by a unit or a corpse, is refused, as are a reserved word,
+a malformed id and `id=` beside `count=`. summon_template and
+summon_template_near take `id=` the same way; without it the id is the
+template's name, numbered.
+
+SCENARIO 1320 — A give inside a spawn hook: the held status's line before the template hook's lines (L59)
+---------------------------------------------------------------------------------------------------------
+!match new sh Sh 10 10
+!match use sh
+!status def weak
+!template import cls {"kind":"partial","data":{"name":"Class","grants":{"weak":{"level":1}}}}
+!gpassive add seen on_template_applied "say('hook sees weak={w} by {b}', w=status_has(self, 'weak'), b=applied_by)"
+!ent add kid Kid 10 1 1 1
+!template save kid
+!ent remove kid
+!gpassive add tag on_entity_spawned "give_template(self, 'equipped.cls', 'cls')"
+!template spawn kid 4 4
+?? Kid gains weak.
+?? hook sees weak=True by give
+
+Expected: an on_entity_spawned passive gives the class partial, whose
+`grants` gives weak; the template hook sees weak, and the line saying the
+unit gained it prints before the hook's line, as a give at the top level
+prints them.

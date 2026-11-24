@@ -480,8 +480,14 @@ def _number_field(raw: Dict[str, Any], key: str, full_path: str,
     return int(v) if float(v).is_integer() else float(v)
 
 
+# Words `!react <eid> <word>` reads before any reaction's name (W26): a
+# reaction so named could never be picked.
+REACTION_RESERVED_NAMES = frozenset({"pass"})
+
+
 def _parse_reaction(raw: Dict[str, Any], full_path: str,
-                    problems: List[str]) -> Optional[ReactionSpec]:
+                    problems: List[str], name: str = ""
+                    ) -> Optional[ReactionSpec]:
     """The reaction fields of an action dict, or None for an action that
     has neither half."""
     if raw.get("before") is None and raw.get("after") is None:
@@ -527,6 +533,10 @@ def _parse_reaction(raw: Dict[str, Any], full_path: str,
     elif spec.reacts_on == "any" and not spec.condition:
         spec.disabled = ("a `reacts_on: any` reaction needs a `condition` "
                          "(`condition: true` answers every action)")
+    elif name.strip().lower() in REACTION_RESERVED_NAMES:
+        spec.disabled = (f"`{name}` is the word `!react <eid> {name}` reads "
+                         f"before any reaction's name, so it couldn't be "
+                         f"picked; rename it")
     if spec.disabled:
         problems.append(f"`{full_path}` is never offered: {spec.disabled}.")
     return spec
@@ -718,7 +728,7 @@ class Action:
                                           full_path, problems)
         cancel_cost = _word_field(raw, "cancelled_action_cost", CANCEL_COST,
                                   None, full_path, problems)
-        reaction = _parse_reaction(raw, full_path, problems)
+        reaction = _parse_reaction(raw, full_path, problems, name)
         condition = "" if reaction is not None else _expression_field(
             raw, "condition", full_path, problems)
         condition_message = raw.get("condition_message", "")

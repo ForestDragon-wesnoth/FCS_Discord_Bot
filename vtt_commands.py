@@ -9655,9 +9655,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "spawn":
         if await return_help_if_not_enough_args(ctx, args, 4, "template", "spawn"):
             return
-        _check_tail(args, 4, ("near", "count", "map"),
+        _check_tail(args, 4, ("near", "count", "map", "id"),
                     "!template spawn <name> <x> <y> [near=<radius>] "
-                    "[count=<n>] [map=<map>]")
+                    "[count=<n>] [map=<map>] [id=<id>]")
         m = active_match(mgr, ctx)
         args, mapspec = _pop_map_opt(args)
         smp = _one_map(ctx, m, mapspec, strict=True)
@@ -9672,8 +9672,12 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise VTTError("x and y must be whole numbers.")
         near = None
         count = 1
+        want_id: Optional[str] = None
         for t in args[4:]:
             key, _, raw = t.partition("=")
+            if key.lower() == "id":
+                want_id = raw
+                continue
             try:
                 val = int(raw)
             except ValueError:
@@ -9687,10 +9691,13 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     raise VTTError("count= must be a whole number >= 1.")
                 count = val
         if count > 1:
+            if want_id is not None:
+                raise VTTError("id= names one unit; count= spawns several, "
+                               "each numbered from the template's name.")
             return await ctx.send(_spawn_many(m, name, tpl, x, y, near, count,
                                               smp))
         new_id, log = m.spawn_template(name, tpl, x, y, near_radius=near,
-                                       mp=smp)
+                                       mp=smp, exact_id=want_id)
         e = m.entities.get(new_id)
         where = (f" at ({e.x},{e.y}){_on_map(m, smp)}" if e is not None
                  else "")
@@ -9953,10 +9960,11 @@ for _subs, _usage, _desc in (
          "(`monsters/undead`; made if new); a name is unique across "
          "folders, so naming another folder than the one it is in is "
          "refused (`!template move`)."),
-        (("spawn",), "!template spawn <name> <x> <y> [near=<radius>] [count=<n>] [map=<map>]",
+        (("spawn",), "!template spawn <name> <x> <y> [near=<radius>] [count=<n>] [map=<map>] [id=<id>]",
          "Spawn an entity template at a cell (near=: the nearest free cell "
          "within the radius). Its id is the template name, numbered when "
-         "taken. count= spawns that many on the free cells nearest the cell "
+         "taken, or the id= given (refused when taken; its parts' ids "
+         "follow it). count= spawns that many on the free cells nearest the cell "
          "that fit their bodies (within near= if given): all or nothing, the "
          "reply says how many fit when they don't all."),
         (("give",), "!template give <partial> <unit> [path] [key=value ...]",
