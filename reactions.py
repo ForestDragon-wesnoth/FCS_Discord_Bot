@@ -35,6 +35,7 @@ Not built yet (design §13): reacting to a reaction's half itself, a
 """
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -564,6 +565,17 @@ def _reaction_open(m: Any, ex: Dict[str, Any], uid: str, act: Any,
     return True
 
 
+def _reopen(m: Any, ex: Dict[str, Any], seq: int, uid: str, act: Any,
+            phase: str, notes: List[str], via: Optional[str]) -> bool:
+    """_reaction_open as the action resolves: reactions_picked counts the
+    picks that ran before this one (W25)."""
+    token = PICKS_RESOLVING.set(seq)
+    try:
+        return _reaction_open(m, ex, uid, act, phase, notes, via)
+    finally:
+        PICKS_RESOLVING.reset(token)
+
+
 def _unseen_by_side(m: Any, ex: Dict[str, Any], uid: str) -> bool:
     """Whether the acting unit's side (its body team) can't see `uid`
     now; a teamless or departed actor sees everything."""
@@ -655,7 +667,7 @@ def _pick(m: Any, ex: Dict[str, Any], uid: str, act: Any,
         "target": target_to_json(act.target_type, target),
         "target_type": act.target_type,
         "args": dict(args or {}), "answers": list(answers or []),
-        "auto": auto,
+        "auto": auto, "tags": list(act.tags),
     })
     st = ex.setdefault("units", {}).setdefault(uid, {"done": False,
                                                        "picked": 0})
@@ -1401,8 +1413,8 @@ async def _advance(env: _Env, seq: int) -> str:
                                    f"action was cancelled.")
                     continue
             notes: List[str] = []
-            if not _reaction_open(m, ex, cur["unit"], r_act, "before", notes,
-                                  cur.get("via")):
+            if not _reopen(m, ex, seq, cur["unit"], r_act, "before", notes,
+                           cur.get("via")):
                 env.out += notes
                 cur["skipped"] = True
                 env.out.append(m.unit_tag(cur["unit"]) + f"- "
@@ -1684,8 +1696,8 @@ async def _after_run(env: _Env, seq: int) -> str:
         if cur.get("phase") == "after":
             r_act = _find_action(m, cur["unit"], cur["path"], cur.get("via"))
             notes: List[str] = []
-            if r_act is None or not _reaction_open(
-                    m, ex, cur["unit"], r_act, "after", notes,
+            if r_act is None or not _reopen(
+                    m, ex, seq, cur["unit"], r_act, "after", notes,
                     cur.get("via")):
                 env.out += notes
                 cur["skipped"] = True
@@ -2150,10 +2162,14 @@ async def react_pick(ctx: Any, mgr: Any, m: Any, uid: str, requested: str,
                                for k, v in by_name.items()},
                               requested, m.rules)
         if not found:
-            names = ", ".join(f"`{n}`" for n in by_name) or "none"
+            # `pass` is always open to a unit still answering (W26: a typed
+            # `pass.` listed the reactions without it).
+            names = ", ".join(f"`{n}`" for n in by_name)
+            choices = (f"{names} — or `pass`" if names else "`pass`")
             from logic import DidYouMean
             raise DidYouMean(f"`{uid}` can't pick `{requested}` now. It can "
-                             f"pick: {names}.", requested, list(by_name))
+                             f"pick: {choices}.", requested,
+                             list(by_name) + ["pass"])
         if len(found) > 1:
             raise VTTError(f"`{uid}` has {len(found)} reactions named "
                            f"`{requested}`: name one by its path ("
@@ -2324,6 +2340,50 @@ def unoffered_note(m: Any, act: Any, actor: str, target: Any,
             return (f"ℹ️ `{act.name}` ran from a reaction that isn't "
                     f"reactable, so reactions to it weren't offered.")
     return None
+
+
+# The exchange whose picks are judged again at resolution (W25): while
+# set, reactions_picked counts only the picks that already ran.
+PICKS_RESOLVING: "contextvars.ContextVar[Optional[int]]" = \
+    contextvars.ContextVar("PICKS_RESOLVING", default=None)
+
+
+def reactions_picked_list(m: Any, eid: str, tag: Any = None,
+                          fname: str = "reactions_picked_list") -> List[str]:
+    """The names of the reactions `eid` picked for the action whose windows
+    are open (the top of the stack, or the exchange resolving now), in pick
+    order: every pick while windows are answered, the picks that already
+    ran while the action resolves; refunded, skipped and failed ones left
+    out. A reaction picked twice is listed twice."""
+    seq = PICKS_RESOLVING.get()
+    ex = _ex(m, seq) if seq is not None else m.reaction_exchange
+    if ex is None:
+        return []
+    out: List[str] = []
+    for p in ex.get("picks") or []:
+        if p.get("unit") != eid or any(
+                p.get(k) for k in ("refunded", "skipped", "failed")):
+            continue
+        if seq is not None and not p.get("ran"):
+            continue
+        if tag is not None:
+            tags = p.get("tags")
+            if tags is None:
+                act = _find_action(m, eid, p.get("path"), p.get("via"))
+                tags = list(act.tags) if act is not None else []
+            try:
+                if not tag_filter_matches(tags, tag):
+                    continue
+            except VTTError as err:
+                raise VTTError(f"{fname}(tag=): {err}")
+        out.append(str(p.get("name") or ""))
+    return out
+
+
+def reactions_picked(m: Any, eid: str, tag: Any = None) -> int:
+    """How many reactions `eid` picked for the action whose windows are
+    open (`reactions_picked_list`'s count)."""
+    return len(reactions_picked_list(m, eid, tag, "reactions_picked"))
 
 
 def reactions_used(m: Any, eid: str, since: str = "own_turn",

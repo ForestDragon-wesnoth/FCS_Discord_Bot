@@ -7824,6 +7824,22 @@ def check_status_name(name: Any) -> None:
                        f"reads `tag:...` as a tag and a comma as a list.")
 
 
+def checked_new_unit_id(match: Any, eid: Any) -> str:
+    """A chosen id for a new unit (W24: `!template spawn ... id=`): an id
+    word a unit can take, and free in the match (a corpse's id and the ids
+    of the parts it holds are taken too)."""
+    if not isinstance(eid, str) or not ID_RE.fullmatch(eid.strip()):
+        raise VTTError(f"`{eid}` isn't a unit id (letters, digits, `_` and "
+                       f"`-`, at most 40).")
+    eid = eid.strip()
+    if eid in RESERVED_IDS or unreachable_id(eid):
+        raise ReservedId(f"`{eid}` can't be a unit id: formulas read that "
+                         f"word as something else.")
+    if match.id_taken(eid):
+        raise DuplicateId(f"The id `{eid}` is taken in this match.")
+    return eid
+
+
 def unreachable_id(eid: Any) -> bool:
     """Whether `entity[<eid>]` would read something else than the unit with
     that id: a hook / action binding (`target`, `actor`, `slot`, ...), a
@@ -12385,10 +12401,12 @@ class Entity:
                         f"({value}); {total} ({info['category']}).")))
         # Statuses its items hold (W21) settle at once, so a template hook
         # recalculating stats reads them.
+        grant_lines: List[str] = []
         if (self._match is not None and self.id in self._match.entities
                 and self._match.held_grant_write(self, path, old_post_attempt,
                                                  value)):
-            combined += self._match.sync_zone_grants({self.id})
+            grant_lines = self._match.sync_zone_grants({self.id})
+            combined += grant_lines
         # Template hooks (W22): a partial's marker written or replaced here.
         route = TEMPLATE_ROUTE.get()
         if (self._match is not None and route != TEMPLATE_QUIET
@@ -12396,10 +12414,15 @@ class Entity:
                 and (isinstance(old_post_attempt, dict)
                      or isinstance(value, dict))):
             stored = _path_resolve(self.vars, path)
-            combined += self._match.template_change(
+            # What the hooks surface reads after the grant's lines, which
+            # the caller passes on (L59: a give inside a spawn hook printed
+            # the hooks' lines before "gains").
+            mark = self._match._surface_mark() if grant_lines else None
+            hook_log = self._match.template_change(
                 self, template_marker_list(old_post_attempt, path),
                 template_marker_list(stored, path), route or "write",
                 "replace")
+            combined += self._match._take_surfaced(mark) + hook_log
         # verbosity 'detailed': annotate a DESTRUCTIVE write — one that
         # replaced an existing subtree, so `inventory = 5` over a populated
         # dict silently drops its keys. NOTE _diff_subtree collapses a
@@ -12572,14 +12595,20 @@ class Entity:
             log += self._match.sync_body_size(self)
         if (self._match is not None and self.id in self._match.entities
                 and self._match.held_grant_write(self, path, old, None)):
-            log += self._match.sync_zone_grants({self.id})
+            grant_lines = self._match.sync_zone_grants({self.id})
+            log += grant_lines
+        else:
+            grant_lines = []
         # Template hooks (W22): the partials' markers the deleted value held.
         route = TEMPLATE_ROUTE.get()
         if (self._match is not None and route != TEMPLATE_QUIET
                 and isinstance(old, dict) and self.id in self._match.entities):
-            log += self._match.template_change(
+            # The hooks' surfaced lines read after the grant's (L59).
+            mark = self._match._surface_mark() if grant_lines else None
+            hook_log = self._match.template_change(
                 self, template_marker_list(old, path), [],
                 route or "delete", "move" if route == "move" else "delete")
+            log += self._match._take_surfaced(mark) + hook_log
         # Removing the init or team var also dirties turn order — same
         # policy gate as write_var above. Initiative being removed means
         # the entity drops out of turn_order entirely (since
@@ -27218,7 +27247,9 @@ class Match:
     @template_routed("spawn")
     def spawn_template(self, name: str, template: Dict[str, Any], x: int, y: int,
                        near_radius: Optional[int] = None,
-                       mp: Optional["Map"] = None) -> Tuple[str, List[str]]:
+                       mp: Optional["Map"] = None,
+                       exact_id: Optional[str] = None,
+                       ) -> Tuple[str, List[str]]:
         """Spawn a saved template at (x, y) (or the nearest free cell within
         `near_radius`): the unit through summon_entity — id minted from the
         template name (`guardsman`, `guardsman2`, ...), summon budget,
@@ -27237,7 +27268,8 @@ class Match:
             root["name"] = name
         try:
             new_id, log = self.summon_entity(root, x, y, id_prefix=name,
-                                             near_radius=near_radius, mp=mp)
+                                             near_radius=near_radius, mp=mp,
+                                             exact_id=exact_id)
             e = self.entities.get(new_id)
             if e is not None and template.get("facing") \
                     and template.get("facing") != e.facing:
@@ -27993,6 +28025,7 @@ class Match:
         id_prefix: Optional[str] = None,
         near_radius: Optional[int] = None,
         mp: Optional["Map"] = None,
+        exact_id: Optional[str] = None,
     ) -> Tuple[str, List[str]]:
         """Instantiate a live entity from a template dict and place it on
         map `mp` (None = the only map).
@@ -28047,7 +28080,11 @@ class Match:
         # checked (they used to fail as raw "Runtime error: 'id'").
         check_unit_form(d, "summon")
         prefix = id_prefix or template.get("name") or template.get("id") or "summon"
-        new_id = self.mint_entity_id(prefix)
+        if exact_id is not None:
+            # A chosen id (W24): refused when taken, never numbered.
+            new_id = checked_new_unit_id(self, exact_id)
+        else:
+            new_id = self.mint_entity_id(prefix)
         # A dict naming a parent / vehicle (an old snapshot, a hand-built
         # one) must not attach the new unit to it: parts come through the
         # `parts` key, mounting through mount().
@@ -35103,8 +35140,16 @@ TEMPLATE_CREATOR_ONLY = "creator"
 # metadata on both kinds, never copied into a unit.
 TEMPLATE_NOTES_KEY = "template_notes"
 TEMPLATE_NOTES_MAX = 2000
+# What an entity template does when spawned (#627): the args a spawn
+# takes and the program run on the new unit. Library metadata, never
+# copied into a unit.
+TEMPLATE_ON_SPAWN_KEY = "on_spawn"
+TEMPLATE_SPAWN_KEYS = ("args", TEMPLATE_ON_SPAWN_KEY)
+# The words `!template spawn` takes itself, which no spawn arg can take.
+TEMPLATE_SPAWN_WORDS = ("near", "count", "map", "id")
 _TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,
-                                               TEMPLATE_NOTES_KEY)
+                                               TEMPLATE_NOTES_KEY) \
+    + TEMPLATE_SPAWN_KEYS
 # What a partial does when given (user design): its default var path, the
 # args a give takes, and the program that runs the give. Library
 # metadata, never copied into a unit.
@@ -35289,10 +35334,12 @@ def template_arg_value(arg: str, spec: Dict[str, Any], value: Any,
     return _own_value(value)
 
 
-def checked_template_args(v: Any, where: str) -> Dict[str, Any]:
-    """A partial's `args` (name -> {default, type, description}): names
-    are plain keys, types from TEMPLATE_ARG_TYPES, a default of the
-    arg's type. An arg without a default must be given."""
+def checked_template_args(v: Any, where: str,
+                          reserved: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """A template's `args` (name -> {default, type, description}): names
+    are plain keys (none of `reserved`, the words its command takes
+    itself), types from TEMPLATE_ARG_TYPES, a default of the arg's type.
+    An arg without a default must be given."""
     if v is None:
         return {}
     if not isinstance(v, dict):
@@ -35305,6 +35352,10 @@ def checked_template_args(v: Any, where: str) -> Dict[str, Any]:
             raise VTTError(f"{where}: arg `{name}` isn't a plain key "
                            f"(letters, digits and `_`, as `args.<key>` "
                            f"reads it).")
+        if name.lower() in reserved:
+            raise VTTError(f"{where}: `{name}=` is the command's own word "
+                           f"({', '.join(f'`{w}=`' for w in reserved)}), "
+                           f"so no arg can take it.")
         if spec is None:
             spec = {}
         if not isinstance(spec, dict):
@@ -35354,13 +35405,19 @@ def _check_template_give(d: Dict[str, Any], where: str) -> None:
                                                      where)
         if not d[TEMPLATE_ARGS_KEY]:
             del d[TEMPLATE_ARGS_KEY]
-    if TEMPLATE_ON_GIVE_KEY in d:
-        src = d[TEMPLATE_ON_GIVE_KEY]
+    _check_template_code(d, TEMPLATE_ON_GIVE_KEY, where)
+
+
+def _check_template_code(d: Dict[str, Any], key: str, where: str) -> None:
+    """A template's code field `key` (on_give, on_spawn), checked in
+    place: a program in action mode; empty drops it."""
+    if key in d:
+        src = d[key]
         if src is None or (isinstance(src, str) and not src.strip()):
-            del d[TEMPLATE_ON_GIVE_KEY]
+            del d[key]
         else:
             if not isinstance(src, str):
-                raise VTTError(f"{where}: `on_give` is a formula program.")
+                raise VTTError(f"{where}: `{key}` is a formula program.")
             from formula import (normalize_body_source as _nb,
                                  validate_program as _vp,
                                  FormulaError as _FE)
@@ -35379,16 +35436,28 @@ def _check_template_give(d: Dict[str, Any], where: str) -> None:
             try:
                 _vp(src, called, action_mode=True)
             except _FE as ex:
-                raise VTTError(f"{where}: `on_give`: {ex}")
-            d[TEMPLATE_ON_GIVE_KEY] = src
+                raise VTTError(f"{where}: `{key}`: {ex}")
+            d[key] = src
+
+
+def _check_template_spawn(d: Dict[str, Any], where: str) -> None:
+    """An entity template's spawn fields (#627), checked in place: `args`
+    (checked_template_args, none named after a `!template spawn` word)
+    and `on_spawn` a program (action mode)."""
+    if TEMPLATE_ARGS_KEY in d:
+        d[TEMPLATE_ARGS_KEY] = checked_template_args(
+            d[TEMPLATE_ARGS_KEY], where, TEMPLATE_SPAWN_WORDS)
+        if not d[TEMPLATE_ARGS_KEY]:
+            del d[TEMPLATE_ARGS_KEY]
+    _check_template_code(d, TEMPLATE_ON_SPAWN_KEY, where)
 
 
 def template_give_args(t: Dict[str, Any], given: Dict[str, Any], name: str,
                        ) -> Dict[str, Any]:
-    """The args a give of partial `name` runs with: each given one checked
-    against its declaration, the rest from their defaults. An undeclared
-    arg, a value of the wrong type and a missing arg without a default are
-    refused."""
+    """The args a give of partial `name` (or a spawn of entity template
+    `name`, #627) runs with: each given one checked against its
+    declaration, the rest from their defaults. An undeclared arg, a value
+    of the wrong type and a missing arg without a default are refused."""
     decl = t.get(TEMPLATE_ARGS_KEY) or {}
     where = f"`{name}`"
     unknown = [k for k in given if k not in decl]
@@ -35760,12 +35829,14 @@ def check_template(data: Any, name: str,
                      f"entity template is "
                      f"{', '.join(f'`{k}`' for k in _ENTITY_TEMPLATE_KEYS)} "
                      f"(a unit's statuses are `status`; notes for its users "
-                     f"go in `{TEMPLATE_NOTES_KEY}`).")
+                     f"go in `{TEMPLATE_NOTES_KEY}`; what a spawn takes and "
+                     f"runs in `args` and `on_spawn`).")
     for k in _TEMPLATE_META_KEYS:
         if k in d and d[k] is not None and not isinstance(d[k], str):
             d[k] = str(d[k])
     _check_template_private(d, f"Template `{name}`")
     _check_template_notes(d, f"Template `{name}`")
+    _check_template_spawn(d, f"Template `{name}`")
 
     def probe(spec: Dict[str, Any], what: str) -> None:
         check_unit_form(spec, what)

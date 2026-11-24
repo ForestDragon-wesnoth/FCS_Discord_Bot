@@ -1561,7 +1561,9 @@ hardcodes**.
   `Entity.spawn` fires applied for the partials the unit arrived with
   (taken before on_entity_spawned: a hook's give reports itself once,
   #7), after its held grants settle (#8: the hooks read the statuses an
-  item or class holds, as after a give; 1316); a revive
+  item or class holds, as after a give; 1316). A write or delete that
+  settles held grants passes on their lines before what its template
+  hooks surface (`_surface_mark` / `_take_surfaced`, L59, 1323); a revive
   (REVIVING) and a transfer (`TEMPLATE_QUIET`) fire nothing, nor do a
   death, a despawn and a detach (user calls). Corpses fire nothing (on
   hold, idea #623). They share var_hook_recursion_limit.
@@ -4355,7 +4357,11 @@ hardcodes**.
   `{role: part}` dict is accepted, each a direct part named
   `<unit>_<role>` at its x / y offset like a listed one.
 - **Name = id prefix** (user call, "for now"): template `guardsman` spawns
-  `guardsman`, `guardsman2`, ... with parts `guardsman2_head`.
+  `guardsman`, `guardsman2`, ... with parts `guardsman2_head`. A chosen
+  id (W24, 1319): `!template spawn ... id=<id>`, `summon_template(...,
+  id=)` / `summon_template_near(..., id=)` (`summon_entity(exact_id=)`,
+  `logic.checked_new_unit_id`: an id word, not reserved, not taken by a
+  unit or a corpse; refused beside `count=`); its parts' ids follow it.
 - **Spawn** (`Match.spawn_template`): summon_entity, saved facing restored,
   parts through `_apply_statblock_parts` (which also keeps each part's
   stored facing); all-or-nothing.
@@ -4490,6 +4496,24 @@ hardcodes**.
   (`import_unfinished`, shared with the CLI). Discord groups a message's
   lines like the GUI (`discord_commands._command_lines`), so an import
   anywhere in a pasted batch keeps its JSON lines.
+- **Spawn args and code** (#627, 1320-1322): an entity template's
+  library metadata `args` (as a partial's give args; no arg may take
+  `!template spawn`'s own words, `logic.TEMPLATE_SPAWN_WORDS`) and
+  `on_spawn` (a program, `_check_template_code`, shared with on_give;
+  `_check_template_spawn`), both in `_TEMPLATE_LIBRARY_KEYS`, so no
+  unit holds them; kept by a re-save over the template. `!template spawn
+  ... [key=value ...]` (words other than near / count / map / id) and
+  `summon_template*(..., args=)` go through `action.template_spawn`: the
+  args checked first (`template_args_filled`, shared with the give),
+  then `place()` spawns (one unit, or `_spawn_many`'s count), then each
+  new unit runs on_spawn through `run_action` (self = the unit, `args`,
+  `template_name`; finish=False, skip_checks, quiet_fail); a fail() or
+  an error rolls the whole spawn back (`_rollback_match` + history
+  rewind). The formula returns None on a fail() and surfaces `❌ spawn
+  ...`. A transform, prefab stamp or part runs no code. `!template arg`
+  edits either kind's args, `!template on_spawn` the code; lint reads
+  it; Tab offers a template's declared args after `!template spawn|give
+  <name>`.
 - **Formulas:** `summon_template` / `summon_template_near` (mutating),
   `has_template` / `template_names` / `template_data(name, path='')`
   (read-only; the template resolved through `Match.expand_template`, the
@@ -4606,7 +4630,7 @@ same library and namespace as entity templates: `{"kind": "partial",
   check. Without on_give a give builds plainly. A partial built inside
   another template, a spawn, a resync or a copy runs no code. `!template
   path | arg | on_give` edit them (library edits), `!system lint` reads
-  the code against the system's functions (#627: spawn args, open).
+  the code against the system's functions.
 - **Pinning** (`template_pinning`, default off): `Match.template_pins`
   (`{name: {data, turn}}`, serialized, in undo snapshots, kept by `!match
   clone`; a transferred unit resolves against its new match) —
@@ -5185,7 +5209,20 @@ lists what isn't built; 1093-1122).
   every `!react skip` ran the broken formula again (1171).
 - **`reactions_used(eid, since='own_turn', tag=None)`** (ARG_SAFE):
   own_turn / round (refused under ATB) / turn / action (`reaction_seq`) /
-  ever.
+  ever. **`reactions_picked(eid, tag=None)`** (ARG_SAFE, W25, 1318): the
+  unit's picks for the action whose windows are open (before and after,
+  refunded / skipped / failed left out; a pick records its reaction's
+  `tags`); while the action resolves, a pick's condition judged again
+  counts only the picks that ran before it (`reactions.PICKS_RESOLVING`,
+  set by `_reopen`), so `reactions_picked(self, tag='lim') == 0` in each
+  limited reaction's condition is a one-per-attack limit the offers, the
+  picks and the resolution all keep. `reactions_picked_list(eid,
+  tag=None)` (ARG_SAFE, loopable) gives the same picks' reaction names
+  in pick order (`reactions_picked` is its length).
+- **`pass`** (W26, 1318): a refused `!react` pick names `pass` among its
+  choices and offers it as a did-you-mean (`pass.`); a reaction named
+  `pass` (`action.REACTION_RESERVED_NAMES`) is never offered, its
+  problem named in `!action info`.
 
 ### 7.24 The damage pipeline
 
