@@ -16,7 +16,7 @@ from logic import (
 )
 
 # Passive system
-from logic import (TEMPLATE_GIVE_PATH_KEY, TEMPLATE_ARGS_KEY, TEMPLATE_ON_GIVE_KEY, SPRITE_EFFECTS_KEY, OVERLAY_EFFECTS_KEY, PASSIVES_KEY, held_passive_spec, SPRITE_EFFECT_FIELDS,
+from logic import (TEMPLATE_GIVE_PATH_KEY, TEMPLATE_ARGS_KEY, TEMPLATE_ON_GIVE_KEY, TEMPLATE_ON_SPAWN_KEY, SPRITE_EFFECTS_KEY, OVERLAY_EFFECTS_KEY, PASSIVES_KEY, held_passive_spec, SPRITE_EFFECT_FIELDS,
                    check_sprite_effect, check_sprite_effects, sprite_effect_items,
                    sprite_effect_text, EFFECT_PROBLEMS)
 from logic import STATUS_DURATION_MODES, STATUS_TICK_WHENS, STATUS_LAYERS_KEY, status_layers_of, TRANSFORM_STATUS_FLAGS, STATUS_SOURCE_LOST_MODES, SOURCE_TICK_WHENS, TRANSFORM_MODE_KEY, glyph_problem
@@ -503,7 +503,7 @@ _LIBRARY_EDITS = {
     "template": ("templates", frozenset({
         "save", "import", "set", "unset", "part", "rename", "copy",
         "delete", "restore", "private", "tags", "notes", "move",
-        "folder", "path", "arg", "on_give"})),
+        "folder", "path", "arg", "on_give", "on_spawn"})),
     "prefab": ("prefabs", frozenset({
         "save", "import", "rename", "copy", "delete", "restore", "tags",
         "move", "folder"})),
@@ -4425,8 +4425,9 @@ _FORMULA_FIELD_KEYS = frozenset({"block", "opaque", "tick", "formula", "body",
                                  "death_effect", "__death_condition",
                                  "__map_vehicle_death_effect",
                                  "__mount_death_effect",
-                                 # A partial's give code.
-                                 "on_give", "list_note"})
+                                 # A partial's give code, an entity
+                                 # template's spawn code (#627).
+                                 "on_give", "on_spawn", "list_note"})
 
 
 def _hide_formula_at(path: str, value: Any, root: Any = None) -> Any:
@@ -8754,10 +8755,11 @@ def _clone_spot(m: Match, src: Entity, mp: "Map",
 
 
 def _spawn_many(m: Match, name: str, tpl: Dict[str, Any], x: int, y: int,
-                near: Optional[int], count: int, mp: "Map") -> str:
+                near: Optional[int], count: int, mp: "Map"
+                ) -> Tuple[List[str], List[str]]:
     """`!template spawn ... count=N`: N copies on the free cells nearest
     (x, y) that fit their bodies (within `near` if given, else anywhere on
-    the map). All or nothing: if one doesn't fit, none stay."""
+    the map): (ids, log). All or nothing: if one doesn't fit, none stay."""
     from action import _rollback_match
     radius = near if near is not None else max(mp.grid_width, mp.grid_height)
     pre = m.to_dict(include_history=False)
@@ -8774,10 +8776,7 @@ def _spawn_many(m: Match, name: str, tpl: Dict[str, Any], x: int, y: int,
         raise VTTError(f"Only {len(ids)} of {count} `{name}` fit"
                        + (f" within {near} of ({x},{y})" if near is not None
                           else "") + f"; spawned none ({ex}).")
-    spots = ", ".join(f"`{i}` ({m.entities[i].x},{m.entities[i].y})"
-                      for i in ids if i in m.entities)
-    return "\n".join([f"✨ Spawned {count} from template `{name}`"
-                      f"{_on_map(m, mp)}: {spots}."] + log)
+    return ids, log
 
 
 def _template_diff_lines(a: Any, b: Any, la: str, lb: str) -> List[str]:
@@ -8816,7 +8815,7 @@ _TEMPLATE_DIFF_ROWS = 40
 
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|notes|path|arg|on_give|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
+    usage="!template <save|spawn|give|list|diff|show|import|set|unset|tags|private|notes|path|arg|on_give|on_spawn|part|rename|copy|delete|trash|restore|resync|detach|refs|move|folders|folder> ...",
     desc=(
         "This server's library of saved templates, shared by all its matches "
         "and kept on disk (even when the CLI / GUI don't keep matches). An "
@@ -8828,7 +8827,8 @@ _TEMPLATE_DIFF_ROWS = 40
         "reference: a unit holds a full copy plus a record of what it changed, "
         "and saving the unit stores only those changes. `save <unit> [name] "
         "[path=<var.path>]`, `spawn`, `give <partial> <unit> [path] "
-        "[key=value ...]`, `path` / `arg` / `on_give` (what a give does), `list`, "
+        "[key=value ...]`, `path` / `arg` / `on_give` (what a give does), "
+        "`arg` / `on_spawn` (what a spawn does), `list`, "
         "`show <name> [path] [compact] [expanded] [part=]`, `import <name> "
         "<json>`, `set` / `unset`, `tags`, `part remove`, `rename`, `copy`, `delete`, "
         "`trash` / `restore`, `resync <unit> [path]`, `detach <unit> [path]`, "
@@ -9066,6 +9066,12 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             name = check_template_name(words[1] if len(words) > 1 else e.id)
             data = m.capture_template(e, notes=notes)
+            old = mgr.templates.get(name)
+            if isinstance(old, dict) and not _is_partial(old):
+                # A re-save keeps what a spawn of it takes and runs (#627).
+                for k in (TEMPLATE_ARGS_KEY, TEMPLATE_ON_SPAWN_KEY):
+                    if k in old:
+                        data[k] = copy.deepcopy(old[k])
         old = mgr.templates.get(name)
         if isinstance(old, dict) and old.get(TEMPLATE_PRIVATE_KEY):
             # A re-save keeps a private template private, at its level.
@@ -9655,9 +9661,13 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "spawn":
         if await return_help_if_not_enough_args(ctx, args, 4, "template", "spawn"):
             return
-        _check_tail(args, 4, ("near", "count", "map", "id"),
-                    "!template spawn <name> <x> <y> [near=<radius>] "
-                    "[count=<n>] [map=<map>] [id=<id>]")
+        usage = ("!template spawn <name> <x> <y> [near=<radius>] "
+                 "[count=<n>] [map=<map>] [id=<id>] [key=value ...]")
+        stray = [a for a in args[4:] if "=" not in a]
+        if stray:
+            raise VTTError(f"Unexpected `{' '.join(stray)}` — usage: "
+                           f"`{usage}`. Quote a value that contains "
+                           f"spaces.")
         m = active_match(mgr, ctx)
         args, mapspec = _pop_map_opt(args)
         smp = _one_map(ctx, m, mapspec, strict=True)
@@ -9673,10 +9683,19 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         near = None
         count = 1
         want_id: Optional[str] = None
+        from action import coerce_args_token, template_spawn
+        spawn_args: Dict[str, Any] = {}
         for t in args[4:]:
             key, _, raw = t.partition("=")
+            if not key:
+                raise VTTError(f"`{t}` has an empty key — usage: "
+                               f"`{usage}`.")
             if key.lower() == "id":
                 want_id = raw
+                continue
+            if key.lower() not in ("near", "count"):
+                # The template's own spawn args (#627).
+                spawn_args[key] = coerce_args_token(raw)
                 continue
             try:
                 val = int(raw)
@@ -9690,20 +9709,44 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if val < 1:
                     raise VTTError("count= must be a whole number >= 1.")
                 count = val
+        if count > 1 and want_id is not None:
+            raise VTTError("id= names one unit; count= spawns several, "
+                           "each numbered from the template's name.")
+        for k, spec in (tpl.get(TEMPLATE_ARGS_KEY) or {}).items():
+            if spec.get("type") == "unit" and k in spawn_args:
+                # A unit arg names a unit the channel's view can see.
+                spawn_args[k] = _resolve_eid(m, str(spawn_args[k]))
+                if spawn_args[k] not in m.entities:
+                    raise NotFound(f"Entity '{spawn_args[k]}' not found.")
+
+        def place() -> Tuple[List[str], List[str]]:
+            if count > 1:
+                return _spawn_many(m, name, tpl, x, y, near, count, smp)
+            new_id, more = m.spawn_template(name, tpl, x, y,
+                                            near_radius=near, mp=smp,
+                                            exact_id=want_id)
+            return [new_id], [str(v) for v in more]
+        ok, why, ids, log = await template_spawn(m, mgr, ctx, name, tpl,
+                                                 spawn_args, place)
+        if not ok:
+            msg = why[1] if isinstance(why, tuple) else why
+            return await ctx.send(f"❌ `{name}` refused the spawn: {msg}")
+        ran = (" (its on_spawn ran" + (" for each" if count > 1 else "")
+               + ")") if tpl.get(TEMPLATE_ON_SPAWN_KEY) else ""
         if count > 1:
-            if want_id is not None:
-                raise VTTError("id= names one unit; count= spawns several, "
-                               "each numbered from the template's name.")
-            return await ctx.send(_spawn_many(m, name, tpl, x, y, near, count,
-                                              smp))
-        new_id, log = m.spawn_template(name, tpl, x, y, near_radius=near,
-                                       mp=smp, exact_id=want_id)
+            spots = ", ".join(f"`{i}` ({m.entities[i].x},{m.entities[i].y})"
+                              for i in ids if i in m.entities)
+            return await ctx.send("\n".join(
+                [f"✨ Spawned {count} from template `{name}`"
+                 f"{_on_map(m, smp)}: {spots}{ran}."] + log))
+        new_id = ids[0]
         e = m.entities.get(new_id)
         where = (f" at ({e.x},{e.y}){_on_map(m, smp)}" if e is not None
                  else "")
         parts = m.entity_part_subtree(new_id) if e is not None else []
         lines = [f"✨ Spawned `{new_id}` from template `{name}`{where}"
-                 + (f" with {len(parts)} body part(s)" if parts else "") + "."]
+                 + (f" with {len(parts)} body part(s)" if parts else "")
+                 + f"{ran}."]
         lines += [str(x) for x in log]
         return await ctx.send("\n".join(lines))
 
@@ -9751,19 +9794,26 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if coded else f"🎁 Gave `{e.id}` a `{name}` at `{path}`.")
         return await ctx.send("\n".join([head] + [str(x) for x in log]))
 
-    if sub in ("path", "on_give"):
+    if sub in ("path", "on_give", "on_spawn"):
         if await return_help_if_not_enough_args(ctx, args, 2, "template",
                                                 sub):
             return
         name, tpl = _readable_template(ctx, mgr, args[1])
-        if not _is_partial(tpl):
+        if sub == "on_spawn" and _is_partial(tpl):
+            raise VTTError(f"`{name}` is a partial template; spawn code "
+                           f"belongs to an entity template (a partial's "
+                           f"give runs `on_give`).")
+        if sub != "on_spawn" and not _is_partial(tpl):
             raise VTTError(f"`{name}` is an entity template; a give's "
-                           f"path and code belong to a partial template.")
-        key = TEMPLATE_GIVE_PATH_KEY if sub == "path" else TEMPLATE_ON_GIVE_KEY
+                           f"path and code belong to a partial template"
+                           f" (an entity template's spawn runs "
+                           f"`on_spawn`).")
+        key = {"path": TEMPLATE_GIVE_PATH_KEY, "on_give": TEMPLATE_ON_GIVE_KEY,
+               "on_spawn": TEMPLATE_ON_SPAWN_KEY}[sub]
         have = tpl.get(key)
         rest = args[2:]
         if not rest:
-            what = "default path" if sub == "path" else "on_give code"
+            what = "default path" if sub == "path" else f"{sub} code"
             if not have:
                 return await ctx.send(
                     f"Template `{name}` has no {what}. `!template {sub} "
@@ -9796,6 +9846,11 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         elif sub == "path":
             msg = (f"✏️ Template `{name}` is given at `{new[key]}` unless a "
                    f"give names a path.")
+        elif sub == "on_spawn":
+            msg = (f"✏️ Template `{name}`: its on_spawn runs on each unit "
+                   f"a spawn of it makes (`!template spawn`, "
+                   f"summon_template), self = the new unit, after it "
+                   f"exists; fail() takes the spawn back.")
         else:
             msg = (f"✏️ Template `{name}`: its on_give runs every direct "
                    f"give (`!template give`, give_template), and builds "
@@ -9811,9 +9866,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                                 "arg"):
             return
         name, tpl = _readable_template(ctx, mgr, args[1])
-        if not _is_partial(tpl):
-            raise VTTError(f"`{name}` is an entity template; give args "
-                           f"belong to a partial template.")
+        # A partial's args go to its gives, an entity template's to its
+        # spawns (#627).
+        partial = _is_partial(tpl)
         decl = tpl.get(TEMPLATE_ARGS_KEY) or {}
         action_word = args[2].lower() if len(args) > 2 else "list"
         if action_word == "list":
@@ -9823,6 +9878,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                       f"`!template arg {name} add <arg>` "
                                       f"declares one.")
             lines = [f"**Args of `{name}`** (`!template give {name} <unit> "
+                     f"key=value`):" if partial else
+                     f"**Args of `{name}`** (`!template spawn {name} <x> <y> "
                      f"key=value`):"]
             for k, spec in decl.items():
                 bits = [spec.get("type", "any")]
@@ -9960,13 +10017,17 @@ for _subs, _usage, _desc in (
          "(`monsters/undead`; made if new); a name is unique across "
          "folders, so naming another folder than the one it is in is "
          "refused (`!template move`)."),
-        (("spawn",), "!template spawn <name> <x> <y> [near=<radius>] [count=<n>] [map=<map>] [id=<id>]",
+        (("spawn",), "!template spawn <name> <x> <y> [near=<radius>] [count=<n>] [map=<map>] [id=<id>] [key=value ...]",
          "Spawn an entity template at a cell (near=: the nearest free cell "
          "within the radius). Its id is the template name, numbered when "
          "taken, or the id= given (refused when taken; its parts' ids "
          "follow it). count= spawns that many on the free cells nearest the cell "
          "that fit their bodies (within near= if given): all or nothing, the "
-         "reply says how many fit when they don't all."),
+         "reply says how many fit when they don't all. Other key=value words "
+         "are the args the template declares (`!template arg`); a template "
+         "with on_spawn code (`!template on_spawn`) runs it on each new "
+         "unit, one transaction with the spawn that a fail() refuses "
+         "whole."),
         (("give",), "!template give <partial> <unit> [path] [key=value ...]",
          "Build a partial template into a unit's var path (replacing what is "
          "there); the unit's own changes to it are recorded from then on. "
@@ -9982,8 +10043,11 @@ for _subs, _usage, _desc in (
          "saver or an administrator."),
         (("arg",), "!template arg <name> list | add <arg> [default=<value>] [type=<number|text|bool|unit|any>] [description=<text>] | remove <arg>",
          "The args a partial template's give takes (`!template give <name> "
-         "<unit> amount=4`), read by its on_give code as `args.<arg>`. An "
-         "arg without a default must be given; a give naming an arg the "
+         "<unit> amount=4`), read by its on_give code as `args.<arg>`, or "
+         "an entity template's spawn (`!template spawn <name> <x> <y> "
+         "level=2`, summon_template(..., args=)), read by its on_spawn "
+         "code; a spawn arg can't take near / count / map / id. An "
+         "arg without a default must be given; naming an arg the "
          "template doesn't declare, or a value of the wrong type, is "
          "refused. Its saver or an administrator."),
         (("on_give",), "!template on_give <name> [<formula> | -]",
@@ -9997,6 +10061,15 @@ for _subs, _usage, _desc in (
          "give_template, never when the partial is built inside another "
          "template, a spawn, a resync or a copy. No formula shows it, `-` "
          "clears it."),
+        (("on_spawn",), "!template on_spawn <name> [<formula> | -]",
+         "The code a spawn of this entity template runs on each new unit, "
+         "after it stands on the map, like an action body on it (self = "
+         "the new unit; bindings args and template_name). One transaction "
+         "with the spawn: a fail() or an error takes every unit of the "
+         "spawn back (count= too). It runs for `!template spawn`, "
+         "summon_template and summon_template_near, never for a transform, "
+         "a prefab stamp or a body part. No formula shows it, `-` clears "
+         "it."),
         (("list",), "!template list [kind=<entity|partial>] [by=<user>] [tag=<filter>] [has=<var.path>] [folder=<folder>] [prefix]",
          "This server's saved templates; kind= keeps entity or partial "
          "templates, by= those a user saved, has= those whose vars (a "
@@ -13160,11 +13233,13 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         n += 1
         check(where, src, mode, sys_known, params, action_mode, soft=True)
     for tname, tpl in sorted(mgr.templates.items()):
-        # A partial's give code (server-wide, read against this system).
-        if isinstance(tpl, dict) and tpl.get(TEMPLATE_ON_GIVE_KEY):
-            n += 1
-            check(f"template `{tname}` on_give", tpl[TEMPLATE_ON_GIVE_KEY],
-                  "exec", sys_known, frozenset(), True, soft=True)
+        # A partial's give code and an entity template's spawn code
+        # (server-wide, read against this system).
+        for ckey in (TEMPLATE_ON_GIVE_KEY, TEMPLATE_ON_SPAWN_KEY):
+            if isinstance(tpl, dict) and tpl.get(ckey):
+                n += 1
+                check(f"template `{tname}` {ckey}", tpl[ckey],
+                      "exec", sys_known, frozenset(), True, soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:

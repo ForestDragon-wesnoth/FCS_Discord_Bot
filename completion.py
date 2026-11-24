@@ -683,7 +683,16 @@ def _command_candidates(words: List[str], word: str, mgr, ctx) -> List[str]:
     if root == "map" and not args and m is not None:
         out |= set(_map_names(m, ctx))   # `!map <name>` renders that map
     if "=" not in word:
-        out |= {f"{k}=" for k in walk.keys}
+        # `[key=value ...]` names no option: the args a template declares
+        # stand in for it on a spawn or a give (#627).
+        out |= {f"{k}=" for k in walk.keys if k != "key"}
+        if "key" in walk.keys and root == "template" \
+                and sub in ("spawn", "give") and len(args) > 1:
+            name = args[1].lower()
+            if name in _readable_template_names(mgr, ctx):
+                tpl = (getattr(mgr, "templates", {}) or {}).get(name)
+                decl = tpl.get("args") if isinstance(tpl, dict) else None
+                out |= {f"{k}=" for k in (decl or {})}
     elif (word.lower().startswith("map=") and "map" in walk.keys
           and m is not None):
         out |= {f"map={n}" for n in _map_names(m, ctx)}

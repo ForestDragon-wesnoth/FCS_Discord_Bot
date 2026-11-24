@@ -35140,8 +35140,16 @@ TEMPLATE_CREATOR_ONLY = "creator"
 # metadata on both kinds, never copied into a unit.
 TEMPLATE_NOTES_KEY = "template_notes"
 TEMPLATE_NOTES_MAX = 2000
+# What an entity template does when spawned (#627): the args a spawn
+# takes and the program run on the new unit. Library metadata, never
+# copied into a unit.
+TEMPLATE_ON_SPAWN_KEY = "on_spawn"
+TEMPLATE_SPAWN_KEYS = ("args", TEMPLATE_ON_SPAWN_KEY)
+# The words `!template spawn` takes itself, which no spawn arg can take.
+TEMPLATE_SPAWN_WORDS = ("near", "count", "map", "id")
 _TEMPLATE_LIBRARY_KEYS = _TEMPLATE_META_KEYS + (TEMPLATE_PRIVATE_KEY,
-                                               TEMPLATE_NOTES_KEY)
+                                               TEMPLATE_NOTES_KEY) \
+    + TEMPLATE_SPAWN_KEYS
 # What a partial does when given (user design): its default var path, the
 # args a give takes, and the program that runs the give. Library
 # metadata, never copied into a unit.
@@ -35326,10 +35334,12 @@ def template_arg_value(arg: str, spec: Dict[str, Any], value: Any,
     return _own_value(value)
 
 
-def checked_template_args(v: Any, where: str) -> Dict[str, Any]:
-    """A partial's `args` (name -> {default, type, description}): names
-    are plain keys, types from TEMPLATE_ARG_TYPES, a default of the
-    arg's type. An arg without a default must be given."""
+def checked_template_args(v: Any, where: str,
+                          reserved: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """A template's `args` (name -> {default, type, description}): names
+    are plain keys (none of `reserved`, the words its command takes
+    itself), types from TEMPLATE_ARG_TYPES, a default of the arg's type.
+    An arg without a default must be given."""
     if v is None:
         return {}
     if not isinstance(v, dict):
@@ -35342,6 +35352,10 @@ def checked_template_args(v: Any, where: str) -> Dict[str, Any]:
             raise VTTError(f"{where}: arg `{name}` isn't a plain key "
                            f"(letters, digits and `_`, as `args.<key>` "
                            f"reads it).")
+        if name.lower() in reserved:
+            raise VTTError(f"{where}: `{name}=` is the command's own word "
+                           f"({', '.join(f'`{w}=`' for w in reserved)}), "
+                           f"so no arg can take it.")
         if spec is None:
             spec = {}
         if not isinstance(spec, dict):
@@ -35391,13 +35405,19 @@ def _check_template_give(d: Dict[str, Any], where: str) -> None:
                                                      where)
         if not d[TEMPLATE_ARGS_KEY]:
             del d[TEMPLATE_ARGS_KEY]
-    if TEMPLATE_ON_GIVE_KEY in d:
-        src = d[TEMPLATE_ON_GIVE_KEY]
+    _check_template_code(d, TEMPLATE_ON_GIVE_KEY, where)
+
+
+def _check_template_code(d: Dict[str, Any], key: str, where: str) -> None:
+    """A template's code field `key` (on_give, on_spawn), checked in
+    place: a program in action mode; empty drops it."""
+    if key in d:
+        src = d[key]
         if src is None or (isinstance(src, str) and not src.strip()):
-            del d[TEMPLATE_ON_GIVE_KEY]
+            del d[key]
         else:
             if not isinstance(src, str):
-                raise VTTError(f"{where}: `on_give` is a formula program.")
+                raise VTTError(f"{where}: `{key}` is a formula program.")
             from formula import (normalize_body_source as _nb,
                                  validate_program as _vp,
                                  FormulaError as _FE)
@@ -35416,16 +35436,28 @@ def _check_template_give(d: Dict[str, Any], where: str) -> None:
             try:
                 _vp(src, called, action_mode=True)
             except _FE as ex:
-                raise VTTError(f"{where}: `on_give`: {ex}")
-            d[TEMPLATE_ON_GIVE_KEY] = src
+                raise VTTError(f"{where}: `{key}`: {ex}")
+            d[key] = src
+
+
+def _check_template_spawn(d: Dict[str, Any], where: str) -> None:
+    """An entity template's spawn fields (#627), checked in place: `args`
+    (checked_template_args, none named after a `!template spawn` word)
+    and `on_spawn` a program (action mode)."""
+    if TEMPLATE_ARGS_KEY in d:
+        d[TEMPLATE_ARGS_KEY] = checked_template_args(
+            d[TEMPLATE_ARGS_KEY], where, TEMPLATE_SPAWN_WORDS)
+        if not d[TEMPLATE_ARGS_KEY]:
+            del d[TEMPLATE_ARGS_KEY]
+    _check_template_code(d, TEMPLATE_ON_SPAWN_KEY, where)
 
 
 def template_give_args(t: Dict[str, Any], given: Dict[str, Any], name: str,
                        ) -> Dict[str, Any]:
-    """The args a give of partial `name` runs with: each given one checked
-    against its declaration, the rest from their defaults. An undeclared
-    arg, a value of the wrong type and a missing arg without a default are
-    refused."""
+    """The args a give of partial `name` (or a spawn of entity template
+    `name`, #627) runs with: each given one checked against its
+    declaration, the rest from their defaults. An undeclared arg, a value
+    of the wrong type and a missing arg without a default are refused."""
     decl = t.get(TEMPLATE_ARGS_KEY) or {}
     where = f"`{name}`"
     unknown = [k for k in given if k not in decl]
@@ -35797,12 +35829,14 @@ def check_template(data: Any, name: str,
                      f"entity template is "
                      f"{', '.join(f'`{k}`' for k in _ENTITY_TEMPLATE_KEYS)} "
                      f"(a unit's statuses are `status`; notes for its users "
-                     f"go in `{TEMPLATE_NOTES_KEY}`).")
+                     f"go in `{TEMPLATE_NOTES_KEY}`; what a spawn takes and "
+                     f"runs in `args` and `on_spawn`).")
     for k in _TEMPLATE_META_KEYS:
         if k in d and d[k] is not None and not isinstance(d[k], str):
             d[k] = str(d[k])
     _check_template_private(d, f"Template `{name}`")
     _check_template_notes(d, f"Template `{name}`")
+    _check_template_spawn(d, f"Template `{name}`")
 
     def probe(spec: Dict[str, Any], what: str) -> None:
         check_unit_form(spec, what)

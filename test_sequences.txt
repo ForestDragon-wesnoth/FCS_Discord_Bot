@@ -43961,7 +43961,7 @@ SCENARIO 1205 — A default passive calling a !func reaches units created after 
 ?? regen
 !template import brute {"name": "Brute", "vars": {"hp": 9}, "statuses": {"stun": {"level": 1}}}
 ?? Dropped `statuses`: an entity template is
-?? (a unit's statuses are `status`; notes for its users go in `template_notes`)
+?? (a unit's statuses are `status`; notes for its users go in `template_notes`;
 !template show brute
 ?! statuses
 !template spawn brute 5 5
@@ -49234,8 +49234,8 @@ HARNESS-ALLOWS-ERRORS
 !template show mark
 ?? give_template(self, template_path, template_name)
 
-Expected: path, args and on_give belong to partial templates (an entity
-template refuses them). A `unit` arg names an existing unit (`who=imp`;
+Expected: path and on_give belong to partial templates (an entity
+template refuses them; its args are its spawn's, 1320). A `unit` arg names an existing unit (`who=imp`;
 a missing one is refused like any unit lookup) and a `bool` arg takes
 true / false. An unknown arg type, code that doesn't parse, and a
 default of the wrong type are refused (a call to a function the
@@ -49613,6 +49613,10 @@ HARNESS-ALLOWS-ERRORS
 ?! `!react b duck`
 !eval "[reactions_picked('b'), reactions_picked('b', tag='lim'), reactions_picked('b', tag='other')]"
 ?? = `[1, 1, 0]`
+!eval "[reactions_picked_list('b'), reactions_picked_list('b', tag='lim'), reactions_picked_list('b', tag='other'), reactions_picked_list('a')]"
+?? = `[['parry'], ['parry'], [], []]`
+!eval "n = ''\nfor r in reactions_picked_list('b'):\n    n = n + r\nn"
+?? = `'parry'`
 !react b duck
 ?? can't pick `duck` now. It can pick: `shout` — or `pass`.
 !react b pass.
@@ -49638,7 +49642,8 @@ pick of it is refused, the refusal naming `shout` and `pass`; a typed
 `pass.` is offered `pass` as a did-you-mean, and picking it passes, so
 the window resolves: parry runs (it counts no pick that ran before it),
 the hit lands (30 → 20). reactions_picked counts the open window's picks
-(0 with none open), filtered by tag. A reaction named `pass` is never
+(0 with none open), filtered by tag; reactions_picked_list gives the
+names (a list a loop can walk). A reaction named `pass` is never
 offered, and `!action info` says why.
 
 SCENARIO 1319 — A chosen id for a template spawn: !template spawn ... id=, summon_template(..., id=), refusals (W24)
@@ -49679,7 +49684,156 @@ a malformed id and `id=` beside `count=`. summon_template and
 summon_template_near take `id=` the same way; without it the id is the
 template's name, numbered.
 
-SCENARIO 1320 — A give inside a spawn hook: the held status's line before the template hook's lines (L59)
+SCENARIO 1320 — Spawn args and on_spawn on an entity template: a 2x2 body with a part, count=, args listed, a re-save keeps them (#627)
+----------------------------------------------------------------------------------------------------------------------------------------
+!match new sa Sa 12 12
+!match use sa
+!ent add orc Orc 10 1 1 5
+!ent set_vars orc footprint_w=2 footprint_h=2
+!part add orc orc_arm Arm 4 4
+!template save orc
+!ent remove orc
+!template arg orc add level type=number default=1 description="power level"
+?? `orc` takes `level=` (number, default 1)
+!template arg orc add clan type=text
+?? `orc` takes `clan=` (text, required)
+!template on_spawn orc "entity[self].max_hp = 10 * args.level\nentity[self].hp = entity[self].max_hp\nentity[self].clan = args.clan\nsay('{u} of {c} rises at level {l}.', u=self, c=args.clan, l=args.level)"
+?? its on_spawn runs on each unit a spawn of it makes
+!template arg orc list
+?? - `level` (number, default 1): power level
+?? - `clan` (text, required)
+!template on_spawn orc
+?? entity[self].max_hp = 10 * args.level
+?tab "!template spawn orc 3 3 "
+?? candidates: clan=  count=  id=  level=  map=  near=
+!template spawn orc 3 3 level=3 clan=red
+?? ✨ Spawned `orc` from template `orc` at (3,3) with 1 body part(s) (its on_spawn ran).
+?? Orc of red rises at level 3.
+!assert "entity[orc].hp == 30 and entity[orc].max_hp == 30 and entity[orc].clan == 'red'"
+!assert "footprint_width('orc') == 2 and part_of('orc_arm') == 'orc'"
+!assert "not var_has('orc', 'args') and not var_has('orc', 'on_spawn')"
+!template spawn orc 8 8 count=2 clan=blue
+?? Spawned 2 from template `orc`
+?? (its on_spawn ran for each)
+!assert "entity[orc2].hp == 10 and entity[orc3].hp == 10 and entity[orc3].clan == 'blue'"
+!template save orc orc
+!template show orc
+?? "on_spawn": "entity[self].max_hp = 10 * args.level
+?? "level": {
+!template spawn orc 1 10 id=chief level=5 clan=gold
+?? Spawned `chief`
+!assert "entity[chief].hp == 50"
+
+Expected: an entity template (a 2x2 orc with an arm) declares spawn args
+(`level`, a number with a default; `clan`, required text) and on_spawn
+code, which runs on the new unit after it stands on the map: its hp
+follows the level, it records its clan and says a line. The args and the
+code stay library metadata (no unit var holds them). count=2 runs the
+code on each copy. A re-save of a spawned unit over the template keeps
+its args and code, and id= still works beside the args. Tab after the
+coordinates offers the template's declared args beside the spawn's own
+words.
+
+SCENARIO 1321 — Spawn args refused; a fail() in on_spawn takes the spawn back, count= included; the spawn words; on_spawn on a partial
+---------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new sr Sr 12 12
+!match use sr
+!ent add gob Gob 10 1 1 5
+!template save gob
+!ent remove gob
+!template import gob {"name": "Gob", "vars": {"hp": 10, "max_hp": 10, "initiative": 5}, "args": {"n": {"type": "number"}}, "on_spawn": "entity[self].n = args.n\nif args.n > 5:\n    fail('too strong')"}
+?? template `gob` from JSON
+!template spawn gob 2 2
+?? `gob` needs `n=` (it has no default)
+!template spawn gob 2 2 n=many
+?? `n` is a number
+!template spawn gob 2 2 n=1 colour=red
+?? `gob` takes `n=`; `colour` isn't one
+!template spawn gob 2 2 n=9
+?? ❌ `gob` refused the spawn: too strong
+!assert "not exists('gob') and len(units_with_tag('')) == 0"
+!template spawn gob 2 2 n=2
+?? Spawned `gob`
+!assert "entity[gob].n == 2"
+!template import pack {"name": "Pack", "vars": {"hp": 10, "max_hp": 10, "initiative": 5}, "on_spawn": "if entity[self].y < 6:\n    fail('off the edge')\nentity[self].ok = true"}
+!template spawn pack 6 6 count=3
+?? ❌ `pack` refused the spawn: off the edge
+!assert "not exists('pack') and not exists('pack2')"
+!template spawn pack 1 10 count=2
+?? Spawned 2 from template `pack`
+!assert "entity[pack].ok and entity[pack2].ok"
+!template import bad {"name": "Bad", "vars": {"hp": 1, "max_hp": 1}, "args": {"count": {"type": "number"}}}
+?? `count=` is the command's own word
+!template import bad {"name": "Bad", "vars": {"hp": 1, "max_hp": 1}, "on_spawn": "while true:\n    pass"}
+?? `on_spawn`
+!template import kit {"kind": "partial", "data": {"a": 1}}
+!template on_spawn kit "say('x')"
+?? is a partial template; spawn code belongs to an entity template
+!template on_give gob "say('x')"
+?? is an entity template; a give's path and code belong to a partial template
+!template import err {"name": "Err", "vars": {"hp": 1, "max_hp": 1}, "on_spawn": "entity[self].x2 = 1 / 0"}
+!template spawn err 3 3
+?? division by zero
+!assert "not exists('err')"
+
+Expected: a spawn missing a required arg, giving one of the wrong type
+or one the template doesn't declare is refused before anything spawns.
+A fail() in on_spawn refuses the spawn and leaves no unit; with count=3
+the second copy's fail (it landed above row 6) takes back the first, and an error in the code
+refuses it the same way. A spawn arg can't take one of `!template
+spawn`'s own words (`count`), code that doesn't parse is refused, a
+partial takes no on_spawn and an entity template no on_give.
+
+SCENARIO 1322 — summon_template with args= from an action: a unit arg, the defaults, a refused spawn returning None; lint reads on_spawn
+---------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new sf Sf 12 12
+!match use sf
+!ent add imp Imp 5 1 1 3
+!template save imp
+!ent remove imp
+!template import imp {"name": "Imp", "vars": {"hp": 5, "max_hp": 5, "initiative": 3}, "args": {"master": {"type": "unit"}, "bonus": {"type": "number", "default": 2}}, "on_spawn": "entity[self].master = args.master\nentity[self].max_hp = 5 + args.bonus\nentity[self].hp = entity[self].max_hp\nif args.bonus > 9:\n    fail('the pact refuses')"}
+!ent add mage Mage 20 5 5 9
+!ent set_vars mage footprint_w=2 footprint_h=2
+!ent set_var mage power 4
+!ent set_var mage actions.call.target none
+!ent set_var mage actions.call.body "i = summon_template_near('imp', entity[self].x, entity[self].y, 3, args={'master': self, 'bonus': entity[self].power})\nif i == None:\n    fail('no imp')\nsay('{m} calls {i}.', m=self, i=i)"
+!action mage call
+?? Mage calls Imp.
+!assert "entity[imp].master == 'mage' and entity[imp].hp == 9"
+!eval "summon_template('imp', 1, 12, args={'master': 'mage'})"
+?? = `'imp2'`
+!assert "entity[imp2].hp == 7"
+!eval "summon_template('imp', 2, 12, args={'master': 'ghost'})"
+?? `master` names no unit
+!eval "summon_template('imp', 2, 12, args={'master': 'mage', 'size': 3})"
+?? `imp` takes `master=`, `bonus=`; `size` isn't one
+!eval "summon_template('imp', 2, 12, args=5)"
+?? args must be a dict
+!ent set_var mage power 20
+!action mage call
+?? ❌ action `call`: no imp
+!assert "not exists('imp3')"
+!eval "summon_template('imp', 3, 12, args={'master': 'mage', 'bonus': 12})"
+?? ❌ spawn `imp`: the pact refuses
+?? = `None`
+!assert "not exists('imp3')"
+!template import imp4 {"name": "Imp", "vars": {"hp": 5, "max_hp": 5}, "on_spawn": "imp_setup(self)"}
+!system lint default
+?? ⚠️ template `imp4` on_spawn: calls `imp_setup`
+
+Expected: an action body summons an imp next to the 2x2 mage with
+`args=`: the unit arg names its master, the bonus follows the mage's
+power. A call without `bonus` takes its default. A unit arg naming no
+unit, an undeclared arg and args that aren't a dict are refused. When the
+code fails (the bonus too high), summon_template_near returns None, the
+action fails on that and nothing stays; outside an action the refusal
+prints as a line and the call returns None. `!system
+lint` reads on_spawn code and names a call to a function the system
+lacks.
+
+SCENARIO 1323 — A give inside a spawn hook: the held status's line before the template hook's lines (L59)
 ---------------------------------------------------------------------------------------------------------
 !match new sh Sh 10 10
 !match use sh

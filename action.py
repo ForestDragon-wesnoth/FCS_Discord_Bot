@@ -1292,8 +1292,7 @@ def template_give_prepare(match: Any, name: str, path: Optional[str],
     """(template, path, args) for a give of partial `name`: the path typed
     or else the template's default, the args checked against its
     declarations with the defaults filled (logic.template_give_args)."""
-    from logic import (TEMPLATE_GIVE_PATH_KEY, template_give_args,
-                       check_store_path)
+    from logic import TEMPLATE_GIVE_PATH_KEY, check_store_path
     t = match._template_library().get(name)
     if not isinstance(t, dict):
         t = (match.template_pins.get(name) or {}) if name in \
@@ -1311,6 +1310,15 @@ def template_give_prepare(match: Any, name: str, path: Optional[str],
     check_store_path(path, "Var path")
     if not check_args:
         return t, path, {}
+    return t, path, template_args_filled(match, t, args, name)
+
+
+def template_args_filled(match: Any, t: Any, args: Optional[Dict[str, Any]],
+                         name: str) -> Dict[str, Any]:
+    """The args a give or a spawn of template `name` runs with: checked
+    against its declarations with the defaults filled
+    (logic.template_give_args); a unit arg must name a unit."""
+    from logic import template_give_args
     filled = template_give_args(t if isinstance(t, dict) else {},
                                 dict(args or {}), name)
     for k, spec in ((t or {}).get("args") or {}).items():
@@ -1318,7 +1326,7 @@ def template_give_prepare(match: Any, name: str, path: Optional[str],
                 and filled[k] not in match.entities:
             raise NotFound(f"`{name}`: `{k}` names no unit "
                            f"(`{filled[k]}`).")
-    return t, path, filled
+    return filled
 
 
 async def template_give(match: Any, mgr: Any, ctx: Any, e: Any, name: str,
@@ -1359,6 +1367,53 @@ async def template_give(match: Any, mgr: Any, ctx: Any, e: Any, name: str,
         GIVE_GIVER.reset(gtoken)
         GIVING_TEMPLATES.reset(token)
     return ok, why, [], path
+
+
+async def template_spawn(match: Any, mgr: Any, ctx: Any, name: str,
+                         tpl: Dict[str, Any], args: Dict[str, Any],
+                         place: Any) -> Tuple[bool, Optional[Any], List[str],
+                                              List[str]]:
+    """Spawn entity template `name` (#627): (ok, why, ids, log). The args
+    are checked against the template's `args` first (undeclared,
+    mistyped or missing refused, before anything spawns); `place()` makes
+    the units (a list of new ids and the spawn's log lines). A template
+    holding `on_spawn` then runs it on each new unit in turn, like an
+    action body (self = the unit; bindings args, template_name), all in
+    one transaction with the spawn: a fail() or an error takes every unit
+    of the spawn back and the match is as it was. Without code, the spawn
+    is `place()` alone."""
+    from logic import TEMPLATE_ON_SPAWN_KEY
+    filled = template_args_filled(match, tpl, args, name)
+    code = tpl.get(TEMPLATE_ON_SPAWN_KEY) if isinstance(tpl, dict) else None
+    if not code:
+        ids, log = place()
+        return True, None, ids, log
+    pre = match.to_dict(include_history=False)
+    hist = match.history.mark()
+    ids, log = place()
+    act = Action(name=f"{name}.on_spawn", body=code, description="",
+                 target_type="none", container_path="",
+                 full_path=f"template:{name}.on_spawn")
+    for eid in ids:
+        if eid not in match.entities:
+            continue
+        try:
+            ok, why = await run_action(
+                act, actor_id=eid, target=None, args=dict(filled),
+                match=match, mgr=mgr, ctx=ctx, finish=False,
+                skip_checks=True, quiet_fail=True,
+                extra_bindings={"template_name": name})
+        except BaseException:
+            # A formula error in the code (run_action rolled its own body
+            # back): the units the spawn made go too.
+            _rollback_match(match, mgr, pre)
+            match.history.rewind(hist)
+            raise
+        if not ok:
+            _rollback_match(match, mgr, pre)
+            match.history.rewind(hist)
+            return False, why, [], []
+    return True, None, ids, log
 
 
 def _count_word(tok: str) -> bool:

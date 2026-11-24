@@ -3942,7 +3942,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "grant_turn", "clear_extra_turns", "extra_turn_queue",
     # Reactions (#36): how many reactions a unit used since a point, and
     # how many it picked in the window open now (W25).
-    "reactions_used", "reactions_picked",
+    "reactions_used", "reactions_picked", "reactions_picked_list",
     # The damage pipeline (#25, damage.py): packets through the steps, the
     # forecasts, the saved last packets and the step_ helpers (only inside
     # a damage or healing step).
@@ -4142,7 +4142,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "sprite_effects_of",
-    "reactions_used", "reactions_picked",
+    "reactions_used", "reactions_picked", "reactions_picked_list",
     "teams", "group_names", "entities_in_cells", "own_turns", "fits_at",
     "free_cells_near", "corpse_cell", "corpses_within",
     "exists", "is_alive", "cell_behind",
@@ -4486,7 +4486,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "prefab_names", "size_categories", "next_turns", "extra_turn_queue",
     "void_cells", "status_layers",
     "teams", "group_names", "entities_in_cells", "free_cells_near",
-    "corpses_within",
+    "corpses_within", "reactions_picked_list",
     "range",
     "each",
     "keys",
@@ -9629,7 +9629,8 @@ class FormulaEngine:
 
         def _template_spawn(fn: str, name: Any, x: Any, y: Any,
                             radius: Any, mv: Any = None,
-                            want_id: Any = None) -> str:
+                            want_id: Any = None, args: Any = None
+                            ) -> Optional[str]:
             if not isinstance(name, str):
                 raise FormulaError(f"{fn}: the template name must be text.")
             for v, what in ((x, "x"), (y, "y")):
@@ -9641,39 +9642,78 @@ class FormulaEngine:
                 raise FormulaError(f"{fn}: this server has no template "
                                    f"`{name}` (see `!template list`).")
             mp = _place_map(fn, mv)
+            if want_id is not None and not isinstance(want_id, str):
+                raise FormulaError(f"{fn}: id= must be text.")
+            if args is not None and not isinstance(args, dict):
+                raise FormulaError(f"{fn}: args must be a dict "
+                                   "({'level': 2}).")
+            from logic import COMMAND_CTX, TEMPLATE_ON_SPAWN_KEY
+            from reactions import _sync
+            import action as _action
+
+            def place() -> Tuple[List[str], List[str]]:
+                nid, more = match.spawn_template(key, tpl, x, y,
+                                                 near_radius=radius, mp=mp,
+                                                 exact_id=want_id)
+                return [nid], list(more)
             try:
-                if want_id is not None and not isinstance(want_id, str):
-                    raise FormulaError(f"{fn}: id= must be text.")
-                new_id, _log = match.spawn_template(key, tpl, x, y,
-                                                    near_radius=radius, mp=mp,
-                                                    exact_id=want_id)
-                match.surface_log(_log)
+                if not tpl.get(TEMPLATE_ON_SPAWN_KEY):
+                    # No code: the args are checked, then the spawn.
+                    _action.template_args_filled(match, tpl,
+                                                 dict(args or {}), key)
+                    ids, _log = place()
+                    ok, why = True, None
+                else:
+                    mgr_local = getattr(match, "_runtime_mgr", None) \
+                        or CURRENT_WORKSPACE.get()
+                    ctx_local = getattr(match, "_runtime_ctx", None) \
+                        or COMMAND_CTX.get()
+                    buf = (ctx_local if hasattr(ctx_local, "out")
+                           else _action._BufferCtx.for_ctx(ctx_local))
+                    top = match._action_depth == 0
+                    ok, why, ids, _log = _sync(_action.template_spawn(
+                        match, mgr_local, buf, key, tpl, dict(args or {}),
+                        place))
+                    if top and buf is not ctx_local \
+                            and getattr(buf, "out", None):
+                        match.surface_log(list(buf.out))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(f"{fn}: {ex}")
-            engine._note_affected(new_id)
-            return new_id
+            if not ok:
+                msg = why[1] if isinstance(why, tuple) else why
+                match.surface_log([f"❌ spawn `{key}`: {msg}"])
+                return None
+            match.surface_log(_log)
+            engine._note_affected(ids[0])
+            return ids[0]
 
         def _summon_template(name: Any, x: Any, y: Any, map: Any = None,
-                             id: Any = None) -> str:
-            """summon_template(name, x, y, map=None, id=None): spawn the
-            server's saved template `name` (`!template save`) at exactly
-            (x, y), with its body parts.
+                             id: Any = None, args: Any = None
+                             ) -> Optional[str]:
+            """summon_template(name, x, y, map=None, id=None, args=None):
+            spawn the server's saved template `name` (`!template save`) at
+            exactly (x, y), with its body parts.
             Its id is the template name (`guardsman`, then `guardsman2`,
-            ...), or `id` (refused when taken). Returns the new id."""
+            ...), or `id` (refused when taken). `args` is a dict of the
+            spawn args the template declares (`!template arg`); a template
+            with on_spawn code runs it on the new unit, and a fail() there
+            takes the spawn back. Returns the new id, or None when the code
+            refused."""
             return _template_spawn("summon_template", name, x, y, None, map,
-                                   id)
+                                   id, args)
 
         def _summon_template_near(name: Any, x: Any, y: Any, radius: Any,
-                                  map: Any = None, id: Any = None) -> str:
-            """summon_template_near(name, x, y, radius, map=None, id=None):
-            summon_template, but at the nearest free cell within `radius`
-            (Chebyshev rings)."""
+                                  map: Any = None, id: Any = None,
+                                  args: Any = None) -> Optional[str]:
+            """summon_template_near(name, x, y, radius, map=None, id=None,
+            args=None): summon_template, but at the nearest free cell within
+            `radius` (Chebyshev rings)."""
             if not isinstance(radius, int) or isinstance(radius, bool) \
                     or radius < 0:
                 raise FormulaError("summon_template_near: radius must be a "
                                    "whole number >= 0.")
             return _template_spawn("summon_template_near", name, x, y, radius,
-                                   map, id)
+                                   map, id, args)
 
         def _has_template(name: Any) -> bool:
             """has_template(name): True when this server has a saved template
@@ -11214,6 +11254,22 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(str(ex))
         ns["reactions_picked"] = _reactions_picked
+
+        def _reactions_picked_list(eid_t: Any, tag: Any = None) -> List[str]:
+            """reactions_picked_list(eid, tag=None): the names of the
+            reactions unit `eid` has picked for the action whose windows
+            are open now, in pick order (a reaction picked twice is listed
+            twice), filtered as reactions_picked counts them: before and
+            after windows, refunded and dropped picks left out, `tag` a tag
+            filter, while the action resolves only the picks that ran
+            before. [] with no window open."""
+            import reactions
+            eid, _e = _resolve_entity(eid_t, "reactions_picked_list")
+            try:
+                return reactions.reactions_picked_list(match, eid, tag)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+        ns["reactions_picked_list"] = _reactions_picked_list
 
         # ---- the damage pipeline (#25, damage.py) ----
         _UNSET = object()

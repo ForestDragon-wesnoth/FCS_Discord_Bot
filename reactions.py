@@ -2348,16 +2348,18 @@ PICKS_RESOLVING: "contextvars.ContextVar[Optional[int]]" = \
     contextvars.ContextVar("PICKS_RESOLVING", default=None)
 
 
-def reactions_picked(m: Any, eid: str, tag: Any = None) -> int:
-    """How many reactions `eid` picked for the action whose windows are
-    open (the top of the stack, or the exchange resolving now): every pick
-    while windows are answered, the picks that already ran while the
-    action resolves; refunded, skipped and failed ones left out."""
+def reactions_picked_list(m: Any, eid: str, tag: Any = None,
+                          fname: str = "reactions_picked_list") -> List[str]:
+    """The names of the reactions `eid` picked for the action whose windows
+    are open (the top of the stack, or the exchange resolving now), in pick
+    order: every pick while windows are answered, the picks that already
+    ran while the action resolves; refunded, skipped and failed ones left
+    out. A reaction picked twice is listed twice."""
     seq = PICKS_RESOLVING.get()
     ex = _ex(m, seq) if seq is not None else m.reaction_exchange
     if ex is None:
-        return 0
-    n = 0
+        return []
+    out: List[str] = []
     for p in ex.get("picks") or []:
         if p.get("unit") != eid or any(
                 p.get(k) for k in ("refunded", "skipped", "failed")):
@@ -2373,9 +2375,15 @@ def reactions_picked(m: Any, eid: str, tag: Any = None) -> int:
                 if not tag_filter_matches(tags, tag):
                     continue
             except VTTError as err:
-                raise VTTError(f"reactions_picked(tag=): {err}")
-        n += 1
-    return n
+                raise VTTError(f"{fname}(tag=): {err}")
+        out.append(str(p.get("name") or ""))
+    return out
+
+
+def reactions_picked(m: Any, eid: str, tag: Any = None) -> int:
+    """How many reactions `eid` picked for the action whose windows are
+    open (`reactions_picked_list`'s count)."""
+    return len(reactions_picked_list(m, eid, tag, "reactions_picked"))
 
 
 def reactions_used(m: Any, eid: str, since: str = "own_turn",
