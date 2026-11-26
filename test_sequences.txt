@@ -49833,7 +49833,42 @@ prints as a line and the call returns None. `!system
 lint` reads on_spawn code and names a call to a function the system
 lacks.
 
-SCENARIO 1323 — A give inside a spawn hook: the held status's line before the template hook's lines (L59)
+SCENARIO 1323 — A spawn taken back drops the lines its spawn hooks printed: an on_spawn fail(), a code error, a count= that doesn't fit (L60)
+------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new sl Sl 3 3
+!match use sl
+!gpassive add seen on_entity_spawned "say('{u} spawned.', u=self)"
+!template import orc {"name": "Orc", "vars": {"hp": 5, "max_hp": 5, "initiative": 2}, "on_spawn": "say('{u} rises.', u=self)\nentity[self].mark = 1\nfail('not today')"}
+!template spawn orc 2 2
+?? ❌ `orc` refused the spawn: not today
+?! Orc spawned.
+?! Orc rises.
+!assert "not exists('orc')"
+!eval "summon_template('orc', 2, 2)"
+?? ❌ spawn `orc`: not today
+?! Orc spawned.
+!template import bad {"name": "Bad", "vars": {"hp": 5, "max_hp": 5}, "on_spawn": "entity[self].x2 = 1 / 0"}
+!template spawn bad 2 2
+?? division by zero
+?! Bad spawned.
+!template import gob {"name": "Gob", "vars": {"hp": 5, "max_hp": 5, "initiative": 2, "footprint_w": 2, "footprint_h": 2}}
+!template spawn gob 1 1 count=2
+?? spawned none
+?! Gob spawned.
+!assert "not exists('gob')"
+!template spawn gob 1 1
+?? Gob spawned.
+!assert "footprint_width('gob') == 2"
+
+Expected: a global on_entity_spawned passive says a line for each new
+unit. When on_spawn refuses the spawn (through the command and through
+summon_template), when its code errors, and when count=2 of a 2x2 body
+on a 3x3 map can't place the second copy, the spawn is taken back and
+so are the lines its spawn hooks printed: no line describes a unit
+that isn't there. A spawn that stands keeps its line.
+
+SCENARIO 1324 — A give inside a spawn hook: the held status's line before the template hook's lines (L59)
 ---------------------------------------------------------------------------------------------------------
 !match new sh Sh 10 10
 !match use sh
@@ -49852,3 +49887,82 @@ Expected: an on_entity_spawned passive gives the class partial, whose
 `grants` gives weak; the template hook sees weak, and the line saying the
 unit gained it prints before the hook's line, as a give at the top level
 prints them.
+
+SCENARIO 1325 — A reaction kills the acting unit mid-action: the body's next line errors and the action ends there as a success; a fail() still takes it all back (L61)
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new rk2 Rk2 10 10
+!match use rk2
+!ent add at Attacker 100 1 1 9
+!ent set_vars at footprint_w=2 footprint_h=2
+!ent add de Defender 300 4 1 3
+!ent set_var at actions.hit.target entity
+!ent set_var at actions.hit.body "entity[target].hp -= 20"
+!ent set_var at actions.claw2.target entity
+!ent set_var at actions.claw2.body "use_action(self, 'hit', target)\nuse_action(self, 'hit', target)"
+!ent set_var de actions.revenge.after "deal_damage(actor, 200)"
+!action at claw2 de
+?? reactions to it are offered
+!react de revenge
+?? Attacker's `claw2` ends: Attacker died.
+?! unknown entity id
+!react skip
+!assert "not exists('at') and has_corpse('at') and entity[de].hp == 280"
+!ent revive at
+!ent hp at 100
+!ent set_var at actions.claw3.target entity
+!ent set_var at actions.claw3.body "use_action(self, 'hit', target)\nfail('called off')"
+!action at claw3 de
+!react de revenge
+?? called off
+?! ends: Attacker died
+!assert "exists('at') and entity[at].hp == 100 and entity[de].hp == 280"
+!ent set_var at actions.typo.target entity
+!ent set_var at actions.typo.body "entity[target].hp -= 5\nx = 1 / 0"
+!action at typo de
+?? division by zero
+!assert "entity[de].hp == 280"
+
+Expected: claw2 hits the defender twice through use_action. The
+defender's after reaction to the first hit deals 200 to the 2x2
+attacker (100 hp), which dies. The body's second use_action then names
+a unit that is gone and errors; since the attacker was alive when the
+body began and is dead now, the action ends there as a success: the
+first hit's 20 damage and the death stay, and the line
+action_actor_gone_message_format gives says why it stopped (then
+claw2's own after window opens, which a host closes). claw3 ends
+on a fail() after the same lethal reaction: a fail() takes everything
+back (the attacker alive at 100, the defender at 280). A body that
+errors while its unit lives is rolled back as before.
+
+SCENARIO 1326 — A sprint onto a lethal tile: the walk's next step errors on the dead walker and the steps taken stay; the rule's line, empty to silence it (L61)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new lv Lv 8 3
+!match use lv
+!tile hook add 3 1 on_enter "kill(self)"
+!ent add run Runner 10 1 1 5
+!ent add foe Foe 10 6 3 2
+!ent set_var run actions.sprint.target none
+!ent set_var run actions.sprint.body "move_step(self, 'right')\nmove_step(self, 'right')\nmove_step(self, 'right')"
+!action run sprint
+?? Runner's `sprint` ends: Runner died.
+!assert "not exists('run') and corpse_cell('run') == [3, 1]"
+!system set default action_actor_gone_message_format "{actor_name} fell during {action} ({reason}): {error}"
+!ent revive run
+!ent tp run 1 1
+!action run sprint
+?? Runner fell during sprint (died): 
+!system set default action_actor_gone_message_format ""
+!ent revive run
+!ent tp run 1 1
+!action run sprint
+?! ends:
+?! fell during
+!assert "corpse_cell('run') == [3, 1]"
+
+Expected: the runner's sprint walks three steps right; the tile at
+(3,1) kills whoever enters it, so the third step names a unit that is
+gone and errors. The two steps taken and the death stay, and the
+action ends with the rule's line (its placeholders {reason} and
+{error} shown by a custom format); with the rule empty no line prints.

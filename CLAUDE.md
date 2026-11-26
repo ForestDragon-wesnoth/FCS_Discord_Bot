@@ -1563,7 +1563,7 @@ hardcodes**.
   #7), after its held grants settle (#8: the hooks read the statuses an
   item or class holds, as after a give; 1316). A write or delete that
   settles held grants passes on their lines before what its template
-  hooks surface (`_surface_mark` / `_take_surfaced`, L59, 1323); a revive
+  hooks surface (`_surface_mark` / `_take_surfaced`, L59, 1324); a revive
   (REVIVING) and a transfer (`TEMPLATE_QUIET`) fire nothing, nor do a
   death, a despawn and a detach (user calls). Corpses fire nothing (on
   hold, idea #623). They share var_hook_recursion_limit.
@@ -2378,7 +2378,14 @@ hardcodes**.
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo
   history preserved). A failing NESTED action rolls back only its own
-  effects (check `use_action`'s result to abort the outer one).
+  effects (check `use_action`'s result to abort the outer one). An
+  exception after the acting unit died or left since the body began (a
+  reaction it provoked killed it, a tile it walked onto; L61, user
+  call, 1325-1326) ends the action there as a SUCCESS: nothing rolls
+  back, the `action_actor_gone_message_format` line says why it stopped
+  (tagged with the unit's cell at the start), no say_format line, and
+  on_action_used fires only while the unit is still in the match; a
+  fail() still rolls everything back.
   `action_recursion_limit`. `cmd('...')` dispatches commands on
   `action_cmd_allowlist` (default `ent`) through `_BufferCtx`, which carries
   the channel and identity of the command that ran the action
@@ -4509,7 +4516,9 @@ hardcodes**.
   new unit runs on_spawn through `run_action` (self = the unit, `args`,
   `template_name`; finish=False, skip_checks, quiet_fail); a fail() or
   an error rolls the whole spawn back (`_rollback_match` + history
-  rewind). The formula returns None on a fail() and surfaces `❌ spawn
+  rewind), and the lines its spawn hooks surfaced go with it, as do
+  those of a `count=` placement that doesn't fit (`_surface_mark` /
+  `_take_surfaced`, L60, 1323). The formula returns None on a fail() and surfaces `❌ spawn
   ...`. A transform, prefab stamp or part runs no code. `!template arg`
   edits either kind's args, `!template on_spawn` the code; lint reads
   it; Tab offers a template's declared args after `!template spawn|give

@@ -5935,6 +5935,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "target. Empty = no line."
         ),
     },
+    "action_actor_gone_message_format": {
+        # L61 (user's choice, option a).
+        "default": "{actor_name}'s `{action}` ends: {actor_name} {reason}.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line an action ends with when its body errors after its "
+            "acting unit died or left the match since the body began (a "
+            "reaction it provoked killed it, a tile it walked onto, ...): "
+            "the action ends there as a success, nothing it did is taken "
+            "back, and this line says why it stopped. A deliberate fail() "
+            "still takes everything back. Placeholders: {actor} (the "
+            "unit's id), {actor_name} (its name as the channel's view "
+            "sees it), {action}, {reason} (`died`, or `left the match`), "
+            "{error} (the error the body stopped on). Empty = no line."
+        ),
+    },
     "action_forbidden_message_format": {
         "default": ("`{actor}` can't use `{action}`: {status} on `{unit}` "
                     "forbids {matched}."),
@@ -34853,6 +34869,32 @@ class Match:
             name = ent.get("name", eid) if isinstance(ent, dict) else eid
         name = str(name).replace(UNIT_LINE_TAG, "")
         return f"{UNIT_LINE_TAG}#{self.id}|{eid}|{name}{UNIT_LINE_TAG}"
+
+    def action_actor_gone_line(self, actor_id: str, action_name: str,
+                               name_then: str, error: str) -> str:
+        """The action_actor_gone_message_format line for an action whose
+        body stopped on an error after `actor_id` died or left the match
+        (L61); "" when the rule is empty. `name_then` names a unit that
+        left no corpse."""
+        fmt = str(self.rules.get("action_actor_gone_message_format", "")
+                  or "")
+        if not fmt.strip():
+            return ""
+        e = self.entities.get(actor_id)
+        # Still in the match (a destroyed body part) or lying as a corpse:
+        # it died; neither: it left.
+        present = e is not None or self.find_corpse(actor_id) is not None
+        reason = "died" if present else "left the match"
+        extra = {"actor": actor_id, "action": action_name,
+                 "actor_name": (self.say_name(actor_id) if present
+                                else name_then),
+                 "reason": reason, "error": error}
+        if e is None:
+            return self.render_unit_message(fmt, actor_id, name_then, "", "",
+                                            {}, extra=extra)
+        return self.render_unit_message(fmt, actor_id, e.name, e.x, e.y,
+                                        e.vars, part_of=e.part_of or "",
+                                        extra=extra)
 
     def action_used_line(self, actor_id: str, action_name: str,
                          target: Any) -> str:

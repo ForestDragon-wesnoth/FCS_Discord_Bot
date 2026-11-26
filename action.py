@@ -1385,12 +1385,21 @@ async def template_spawn(match: Any, mgr: Any, ctx: Any, name: str,
     from logic import TEMPLATE_ON_SPAWN_KEY
     filled = template_args_filled(match, tpl, args, name)
     code = tpl.get(TEMPLATE_ON_SPAWN_KEY) if isinstance(tpl, dict) else None
-    if not code:
+    pre = match.to_dict(include_history=False) if code else None
+    hist = match.history.mark() if code else None
+    # What the spawn's hooks surface (an on_entity_spawned passive's say())
+    # goes to the command's sink or the action buffer at once; a spawn taken
+    # back (its code refused it, or a copy didn't fit and the placement
+    # rolled back) drops it, as a rolled-back action drops its buffered
+    # lines (L60).
+    mark = match._surface_mark()
+    try:
         ids, log = place()
+    except BaseException:
+        match._take_surfaced(mark)
+        raise
+    if not code:
         return True, None, ids, log
-    pre = match.to_dict(include_history=False)
-    hist = match.history.mark()
-    ids, log = place()
     act = Action(name=f"{name}.on_spawn", body=code, description="",
                  target_type="none", container_path="",
                  full_path=f"template:{name}.on_spawn")
@@ -1408,10 +1417,12 @@ async def template_spawn(match: Any, mgr: Any, ctx: Any, name: str,
             # back): the units the spawn made go too.
             _rollback_match(match, mgr, pre)
             match.history.rewind(hist)
+            match._take_surfaced(mark)
             raise
         if not ok:
             _rollback_match(match, mgr, pre)
             match.history.rewind(hist)
+            match._take_surfaced(mark)
             return False, why, [], []
     return True, None, ids, log
 
@@ -2328,6 +2339,14 @@ async def run_action(
             # restore the start value here explicitly for the replay case.
             summon_at_start = match._summon_count
             choice_limit = int(match.rules.get("action_choice_limit", 20))
+        # L61: whether the acting unit is alive as the body begins, its
+        # name and where it stands, for a body that errors after it died.
+        _actor0 = match.entities.get(actor_id)
+        actor_alive_at_start = _actor_alive(_actor0)
+        actor_name_at_start = _actor0.name if _actor0 is not None \
+            else actor_id
+        actor_tag_at_start = match.unit_tag(actor_id)
+        actor_gone_stop = False
         while True:
             if is_top_level:
                 match._choice_cursor = 0
@@ -2431,7 +2450,24 @@ async def run_action(
                 if is_top_level:
                     match._runtime_buffer = None
                 raise
-            except Exception:
+            except Exception as err:
+                if actor_alive_at_start and not _actor_alive(
+                        match.entities.get(actor_id)):
+                    # L61 (user's choice): the body went on after its unit
+                    # died or left (a reaction it provoked killed it) and
+                    # stopped on that. The action ends here as a success:
+                    # what it did stays, the lines so far print, and one
+                    # line says why it stopped. A fail() still rolls back.
+                    line = match.action_actor_gone_line(
+                        actor_id, action.name, actor_name_at_start,
+                        str(err))
+                    if line:
+                        match.surface_log(match.tag_lines(
+                            actor_tag_at_start, [line]))
+                    actor_gone_stop = True
+                    if target_out is not None:
+                        target_out["answers_used"] = match._choice_cursor
+                    break
                 _rollback_all()
                 match._action_depth = pre_action_depth
                 if is_top_level:
@@ -2476,8 +2512,9 @@ async def run_action(
             if flush is not None and flush.out:
                 await ctx.send("\n".join(str(x) for x in flush.out))
         return True, None
-    # The action's say_format line (#215), about the actor.
-    if action.say_format.strip():
+    # The action's say_format line (#215), about the actor; an action that
+    # stopped part-way when its unit died (L61) didn't do what it says.
+    if action.say_format.strip() and not actor_gone_stop:
         match.say(say_format_text(match, action.say_format, actor_id, target,
                                   dict(args), body_locals),
                   about=actor_id if (actor_id in match.entities or
@@ -2502,14 +2539,17 @@ async def run_action(
     # Successful completion. Fire the on_action_used hook AFTER the
     # body's writes have settled (so a passive observing this hook
     # sees post-action state).
-    match.fire_action_used(
-        action_tags=action.tags,
-        actor_id=actor_id,
-        action_name=action.name,
-        action_path=action.full_path,
-        target=target,
-        args=dict(args),
-    )
+    if not (actor_gone_stop and actor_id not in match.entities):
+        # A unit gone from the match fires no hooks of its own (L61, ghost
+        # firing).
+        match.fire_action_used(
+            action_tags=action.tags,
+            actor_id=actor_id,
+            action_name=action.name,
+            action_path=action.full_path,
+            target=target,
+            args=dict(args),
+        )
     match.log_event(
         "action_used", actor=actor_id,
         actor_name=match._entity_name(actor_id),
@@ -3066,6 +3106,17 @@ def _restore_other_matches(mgr: Any, match: "Match",
             mgr.apply_system_rules(m)
     mgr.active_by_channel.clear()
     mgr.active_by_channel.update(snap["active"])
+
+
+def _actor_alive(e: Any) -> bool:
+    """Whether unit `e` (None: not in the match) is alive by the match's
+    alive_condition, for L61's test of an acting unit lost mid-body."""
+    if e is None:
+        return False
+    try:
+        return bool(e.is_alive)
+    except Exception:      # noqa: BLE001 - a broken condition: not judged
+        return True
 
 
 def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None:
