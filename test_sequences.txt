@@ -10408,14 +10408,15 @@ SCENARIO 403 — Renderer: color guide + invalid-color warning
 !ent add e E 10 2 2 9
 !map colors
 !ent set_var e color purple
+?? the text map shows it as magenta
 !ent set_var e color red
 !map teamcolor orcs notacolor
 
 Expected: `!map colors` lists the supported color names (all of them render
 on Discord ansi blocks and ANSI terminals — there's no terminal-only set).
-Setting an entity `color` var to an UNrecognized name (`purple`) still
-writes the var but appends a ⚠ advisory that it renders uncolored, plus the
-guide; a recognized name (`red`) writes cleanly with no warning. `!map
+Setting an entity `color` var to a CSS name (`purple`, W27) writes it
+with a note that images draw it as it is and the text map as magenta, the
+nearest text colour; a text colour name (`red`) writes with no note. `!map
 teamcolor orcs notacolor` rejects the unknown color outright, also citing
 the guide.
 
@@ -10437,8 +10438,8 @@ SCENARIO 404 — Renderer: colored tiles & zones (glyph, fill, formula, warnings
 
 Expected: tile (2,1) shows glyph `T` (rendered red on a color-capable
 surface; the harness is plain, so glyphs show without color). tile (4,1)
-has a color but NO glyph, so it tints its `.` cell — and `purple` triggers
-a ⚠ advisory since it's not a palette name. The `gas` zone fills
+has a color but NO glyph, so it tints its `.` cell — `purple`, a CSS
+name, notes that the text map shows it as magenta (W27). The `gas` zone fills
 (1,2)-(3,2) with glyph `~`, colored by a FORMULA (`zone_get(zone_name,
 'tint')` → green, resolved per render). Layering is unchanged: a tile or
 entity sitting on a zone cell owns that cell's glyph and color. The plain
@@ -31437,7 +31438,7 @@ SCENARIO 945 — Smaller items: locals before assignment, rolls, priorities, rul
 !system set default modifier_sources __engine
 ?? comma list of var roots
 !system set default name_text_color notacolor
-?? is a palette name
+?? a CSS colour name (orange, teal, ...), #rrggbb / #rgb or [r, g, b], not `notacolor`
 !system set default name_text_color #ff8800
 ?? '#ff8800'
 !ent set_var a actions.hit.body 1
@@ -31464,7 +31465,7 @@ so and names entity['b'] for the unit (P3); `entity[a]` after `a = 'b'`
 reads the local. A repeated roll lists each roll's dice only while the
 reply fits one message (L16). A priority too big to print whole stays
 1e+308. unit_tag_sources / modifier_sources (and the other source lists)
-take var roots, name_text_color a palette name or #rrggbb
+take var roots, name_text_color a colour (W27: a CSS name too)
 (L19). An action whose body isn't text is named in `!action list`.
 `--trace` works after `--as <eid>` (L18). `!undo command` right after
 `!turn next` says it takes the turn back too (L20). Zone names take id
@@ -31936,7 +31937,7 @@ SCENARIO 956 — Optional words, the help index, stored values in replies
 !system set default modifier_stat_caps hp::l5
 ?? takes `stat:lo:hi` entries
 !system set default preview_color "a b"
-?? takes `r,g,b`
+?? (`r,g,b` too), got `a b`
 
 Expected: HARNESS-ALLOWS-ERRORS. A typo in `!tile def reapply`'s
 `reset` slot is refused (it used to reset every tile, dropping the
@@ -48120,7 +48121,7 @@ SCENARIO 1289 — Status looks follow the view: visibility, disguise; refusals a
 !status glyph stun 😀
 ?? two columns wide
 !status color stun plaid
-?? color must be a palette name
+?? ❌ `plaid` isn't a colour.
 !status display_priority stun high
 ?? display_priority must be a number
 !status glyph stun -
@@ -48128,7 +48129,7 @@ SCENARIO 1289 — Status looks follow the view: visibility, disguise; refusals a
 !prefab import pz {"kind": "prefab", "width": 1, "height": 1, "system": "default", "definitions": {"status_definitions": {"daze": {"glyph": "ab"}}}}
 ?? `glyph`: a glyph is exactly one character
 !prefab import pz {"kind": "prefab", "width": 1, "height": 1, "system": "default", "definitions": {"status_definitions": {"daze": {"color": "plaid"}}}}
-?? `color` must be a palette name
+?? `color` must be a colour: a text colour name
 
 Expected: a status look follows the channel's view (#114): to blue the
 disguised orc is its disguise (`R`, "Rock"), its stun hidden as overlays
@@ -48175,9 +48176,9 @@ SCENARIO 1290 — Name sprites: the rule, a unit's override, sprite_label and li
 !map scene list
 ?? entity `pal` at (1,1) — sprite unknown_png, glyph >, color red (layer 100)
 !system set default name_text_color plaid
-?? is a palette name
+?? or [r, g, b], not `plaid`
 !system set default name_text_background_color #12ab3
-?? is a palette name
+?? or [r, g, b], not `#12ab3`
 !system set default name_text_background_color #12AB34
 ?? #12AB34
 
@@ -48189,9 +48190,10 @@ hand-written \n breaks there and only there ("Gob / King"), and the unit's
 `sprite_label_color` / `sprite_label_background_color` override the rules;
 a unit's `sprite_fallback glyph` keeps it a glyph under the rule. A unit's
 own sprite comes first (the rat's `rat_png` despite name_text); a colour
-that isn't a palette name or #rrggbb falls back to the rule (the goblin's
-text white). Back on `glyph`, fallback_sprite stands in again. The colour
-rules refuse anything but a palette name or #rrggbb.
+that isn't a colour falls back to the rule (the goblin's text white).
+Back on `glyph`, fallback_sprite stands in again. The colour rules refuse
+anything but a colour (W27: a text or CSS colour name, #rrggbb / #rgb,
+[r, g, b]).
 
 
 SCENARIO 1291 — Name sprites to a view: a disguise, a private sprite_label, a corpse, the legend (name_text)
@@ -48325,7 +48327,7 @@ SCENARIO 1293 — Sprite effects on a unit: !ent effect, checks, order, group, a
 !ent effect ogre add bad tint
 ?? a `tint` effect needs `color`
 !ent effect ogre add bad tint color=plaid
-?? an effect's `color` is a colour name, #rrggbb, an [r, g, b] list (0-255) or team / team_light, got plaid
+?? a CSS colour name (orange, teal, ...), #rrggbb / #rgb or [r, g, b], or team / team_light, got plaid
 !ent effect ogre add bad tint color=300,0,0
 ?? got [300, 0, 0]
 !ent effect ogre add bad wobble
@@ -48396,7 +48398,7 @@ SCENARIO 1294 — Sprite effects from statuses, overlays, equipment, team data a
 !team set red sprite_effects.warm.effect hue
 !team set red sprite_effects.warm.degrees 20
 !passive add hero aura on_turn_start "1"
-!passive effect hero aura add halo outline color=gold
+!passive effect hero aura add halo outline color=gould
 ?? ❌
 !passive effect hero aura add halo outline color=yellow
 !gpassive add night on_round_start "1"
@@ -49966,3 +49968,183 @@ Expected: the runner's sprint walks three steps right; the tile at
 gone and errors. The two steps taken and the death stay, and the
 action ends with the rule's line (its placeholders {reason} and
 {error} shown by a custom format); with the rule empty no line prints.
+
+SCENARIO 1327 — Colours in images: CSS names, #rgb, [r, g, b] on units, a team, a status, a zone and a tile, drawn as given; the text map's nearest colour (W27)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new cw Cw 8 4
+!match use cw
+!ent add a Ann 10 1 1 5
+!ent add b Bob 10 3 1 4
+!ent add ogre Ogre 30 5 2 3
+!ent set_vars ogre footprint_w=2 footprint_h=2 team=red
+!ent set_var a color orange
+?? the text map shows it as yellow, the nearest text colour
+!ent set_var b color #3a7
+?? the text map shows it as cyan
+!map teamcolor red [200,30,30]
+?? Team `red` renders in [200, 30, 30]. Images draw it as it is; the text map shows it as red
+!map teamcolor list
+?? `red` → [200, 30, 30]
+!zone new pool
+!zone fill pool 1 3 3 4
+!zone color pool #1e90ff
+?? Zone `pool` color set to `#1e90ff`.
+!tile set 8 1 color [255,215,0]
+?? the text map shows it as yellow
+!status def calm
+!status color calm teal
+?? `calm` colours its bearer teal on the map
+!status apply b calm
+!map scene list
+?? entity `a` at (1,1) — glyph >, color #ffa500
+?? entity `b` at (3,1) — glyph v, color #008080
+?? entity `ogre` at (5,2) 2x2 stretch — glyph ^, color #c81e1e
+?? zone `pool`
+?? #1e90ff
+?? #ffd700
+!as color on
+!map
+?? `Ann` orange → yellow
+?? `Ogre` [200, 30, 30] → red
+?? `Bob` (calm) teal → cyan
+?? zone `pool` #1e90ff → cyan
+?? the ascii_color_warnings rule turns this off
+!as color off
+!map
+?! The text map shows colours
+
+Expected: a unit takes a CSS name (orange) and a #rgb hex (#3a7), a
+team an [r, g, b] list, a zone a hex, a tile an [r, g, b] list, a
+status a CSS name (teal over Bob's own colour). The scene draws each
+as its #rrggbb, the 2x2 ogre outlined in its team's [200, 30, 30]. A
+text map in colour shows each through the nearest text colour by hue
+(Ann yellow, the ogre red, Bob's calm cyan, the pool cyan) and ends with
+one warning line naming them; a map without colour prints no warning.
+
+SCENARIO 1328 — ascii_color picks the text colour beside an image colour, everywhere a colour stands; the ascii_color_warnings rule (W27)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new ca Ca 8 4
+!match use ca
+!ent add a Ann 10 1 1 5
+!ent add ogre Ogre 30 3 1 3
+!ent set_vars ogre footprint_w=2 footprint_h=2 team=red
+!ent set_var a color orange
+!ent set_var a ascii_color red
+!map teamcolor red [200,30,30] ascii=magenta
+?? The text map shows it as magenta (its ascii_color)
+!map teamcolor list
+?? `red` → [200, 30, 30] (text map: magenta)
+!zone new pool
+!zone fill pool 1 3 2 4
+!zone color pool #1e90ff ascii=cyan
+?? The text map shows it as cyan (its ascii_color)
+!zone def new slime
+!zone def color slime olive ascii=green
+?? The text map shows it as green (its ascii_color)
+!zone place slime 7 4
+!tile set 8 1 color [255,215,0]
+!tile set 8 1 ascii_color white
+!status def calm
+!status color calm teal ascii=bright_blue
+?? The text map shows it as bright_blue (its ascii_color)
+!as color on
+!map
+?! The text map shows colours
+!ent delete_var a ascii_color
+!map
+?? `Ann` orange → yellow
+!system set default ascii_color_warnings false
+!map
+?! The text map shows colours
+!map scene list
+?? entity `a` at (1,1) — glyph >, color #ffa500
+?? #808000
+!system zone new default moss
+!system zone color default moss darkgreen ascii=green
+?? The text map shows it as green (its ascii_color)
+!system zone effect default moss add g glow color=gold
+?? Added the effect `g`
+!system status def default glow
+!system status color default glow gold ascii=yellow
+?? The text map shows it as yellow (its ascii_color)
+!system status glyph default glow *
+!system status display_priority default glow 5
+!system status duration_mode default glow auto
+!system status effect default glow add o outline color=gold
+?? Added the effect `o`
+!system status info default glow
+?? "ascii_color": "yellow"
+?? "color": "gold"
+!assert "entity[a].color == 'orange' and entity[ogre].team == 'red'"
+!match new cb Cb 6 3
+!match use cb
+!ent add big Big 30 1 1 3
+!ent set_vars big footprint_w=2 footprint_h=2
+!status apply big glow
+!map scene list
+?? entity `big` at (1,1) 2x2 stretch — glyph *, color #ffd700
+!system set default ascii_color_warnings true
+!map
+?? [33m* *
+?! The text map shows colours
+?tab "!status color calm teal as"
+?? ascii=
+
+Expected: each colour carries a text colour of its own: a unit's
+`ascii_color` var, `ascii=` on `!map teamcolor` (stored as {color,
+ascii}), `!zone color`, `!zone def color` and `!status color`, a
+tile's `ascii_color` data. With every one set the coloured text map
+prints no warning; deleting Ann's brings back the nearest colour and
+the warning line, and the ascii_color_warnings rule off removes the
+line. Images keep the full colours (Ann #ffa500, the slime's olive
+#808000). A system's zone and status definitions take the same `ascii=`
+(and `!system status` now takes every definition subcommand of
+`!status`: glyph, color, display_priority, duration_mode, effect, ...;
+`!system zone` takes `effect`): a new match's 2x2 unit holding the
+system's `glow` is gold in images and yellow on the text map, with no
+warning since `glow` names its text colour.
+
+SCENARIO 1329 — Colour refusals and notes: a word that isn't a colour, ascii= that isn't a text colour, a bad [r, g, b], a prefab status's colour (W27)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new cr Cr 6 3
+!match use cr
+!ent add a Ann 10 1 1 5
+!map teamcolor red orang
+?? ❌ unknown color `orang`.
+!map teamcolor red [300,0,0]
+?? ❌ unknown color `[300,0,0]`.
+!map teamcolor red orange ascii=orange
+?? ❌ ascii= is a text colour name, got `orange`.
+!map teamcolor red orange ascii=red extra
+?? ❌
+!status def calm
+!status color calm notacolour
+?? ❌ `notacolour` isn't a colour.
+!status color calm teal ascii=teal
+?? ❌ ascii= is a text colour name
+!status color calm teal
+!status color calm -
+?? `calm` color cleared.
+!ent set_var a color orang
+?? isn't a colour; it renders uncoloured unless it's a valid colour formula
+!ent set_var a ascii_color orange
+?? isn't a text colour name, so the text map ignores it
+!map border color nope
+?? ❌ `nope` isn't a colour.
+!map border color #abc
+?? Grid border color set to `#abc`.
+!zone new pool
+!zone fill pool 1 2 2 3
+!zone color pool "'#ff' + '8800'"
+?? Zone `pool` color formula set to
+!map scene list
+?? #ff8800
+
+Expected: `!map teamcolor`, `!status color` and `!map border color`
+refuse a word that isn't a colour (a typo, an [r, g, b] out of 0-255),
+and `ascii=` refuses a name the text map lacks (orange, teal: only the
+text colour names); a stray word after the option is refused. A unit's
+`color` / `ascii_color` var takes any value with a warning. A zone's
+colour may be a formula whose result is a colour of the grammar (here
+built hex text), drawn as #ff8800.

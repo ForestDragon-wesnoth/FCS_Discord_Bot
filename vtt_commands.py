@@ -6234,7 +6234,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as channel <key> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] [roles=<role,...>] | !as view <team|omniscient|clear> | !as channel <key> | !as color <on|off> | !as server [<key>|local] | !as servername <name ...> | !as restart | !as idle <hours> | !as wait <seconds> | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -6301,6 +6301,14 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             "🔄 Reloaded every server from the data folder, as after a "
             "restart." + ("\n" + "\n".join(notes) if notes else ""))
+    if role == "color":
+        # A test hook (W27): colour the text map in this context, as a
+        # terminal or Discord's ansi blocks would.
+        _check_tail(args, 2, (), "!as color <on|off>")
+        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+            raise VTTError("Usage: `!as color <on|off>`.")
+        ctx.supports_color = args[1].lower() == "on"
+        return await ctx.send(f"Text maps {'in colour' if ctx.supports_color else 'without colour'} here.")
     if role == "channel":
         # A test hook (R5): type into another channel, as on Discord, to
         # see what a channel bound to a team's view receives.
@@ -14445,8 +14453,11 @@ registry.annotate_sub(
         "hook <system> <name> <when> <formula ...> | "
         "del-hook <system> <name> <when> | "
         "glyph <system> <name> <char|-> [<facing>] | "
-        "color <system> <name> <color|-> | "
+        "color <system> <name> <color|-> [ascii=<name>] | "
         "sprite <system> <name> <key|-> [<facing>] | "
+        + " | ".join(f"effect <system> <name> {f}" for f in (
+            "add <name> <effect> [<field>=<value> ...]", "remove <name>",
+            "hide <name>", "list", "clear")) + " | "
         "face <system> <name> <dir|-> | layer <system> <name> <n|-> | "
         "legend <system> <name> <text ...> | tags <system> <name> <tag ...> | "
         "grant <system> <name> <status> [level=<n>] [linger=<n>] "
@@ -14508,6 +14519,21 @@ registry.annotate_sub(
         "immune_to_actions_with_name_unless <system> <name> [<formula ...>] | "
         "grants_unit_tags <system> <name> [<tag ...>] | "
         "cannot_affect_units_with_tag <system> <name> [<filter ...>] | "
+        "glyph <system> <name> <glyph|clear> | "
+        "color <system> <name> <colour|-> [ascii=<name>] | "
+        "display_priority <system> <name> <n|-> | "
+        "duration_mode <system> <name> <manual|auto|-> | "
+        "duration_when <system> <name> <turn_end|turn_start|round_start|"
+        "round_end|source_turn_start|source_turn_end|never|-> | "
+        + " | ".join(f"{k} <system> <name> {f}" for k, forms in (
+            ("effect", ("add <name> <effect> [<field>=<value> ...]",
+                        "remove <name>", "list", "clear")),
+            ("overlay_effect", ("add <name> <effect> [<field>=<value> ...]",
+                                "remove <name>", "list", "clear")),
+            ("action", tuple(STATUS_ACTION_USAGE.split(" | "))),
+            ("passive", tuple(HELD_PASSIVE_USAGE.split(" | "))))
+            for f in forms) + " | "
+        "action_tags <system> <name> [<tag ...> | -] | "
         "del <system> <name> | "
         "drop <system> <name> | delete <system> <name> | "
         "remove <system> <name> | rm <system> <name> | "
@@ -16227,6 +16253,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         key_path = args[2]                # dotted path: e.g., "parts.effects.slow.duration"
         raw_value = args[3]               # use quotes for spaces: "burning aura"
         value = _parse_scalar(raw_value)  # int → float → str
+        if key_path == "color" and isinstance(value, str):
+            value = _colour_word(value)   # an [r, g, b] list (W27)
 
         # Optional bypass_clamp named arg in any trailing position
         _check_tail(args, 4, {"bypass_clamp"},
@@ -16254,10 +16282,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # `color`; an unrecognized name renders uncolored, so flag a likely
         # typo while still honoring the write (the value may be intended for
         # the GM's own formulas, not rendering).
-        if key_path == "color" and isinstance(value, str) and value:
-            from logic import TEXT_COLORS
-            if value not in TEXT_COLORS:
-                ack += f"\n⚠ `{value}` isn't a recognized render color (renders uncolored). " + _color_guide()
+        if key_path == "color" and value not in (None, ""):
+            ack += _colour_note(value, e.vars.get("ascii_color"),
+                                formula_ok=True)
+        elif key_path == "ascii_color" and value not in (None, ""):
+            from logic import text_color_name
+            if text_color_name(value) is None:
+                ack += (f"\n⚠ `{value}` isn't a text colour name, so the "
+                        f"text map ignores it. " + _color_guide())
         ack += _engine_var_warning(key_path, value)
         if hook_log:
             ack += "\n" + "\n".join(hook_log)
@@ -18153,18 +18185,14 @@ _PREVIEW_USAGE = (
 
 
 def _preview_rgb(value: str) -> List[int]:
-    """Parse a preview colour: `r,g,b` (0-255 each) or `#rrggbb`."""
-    v = str(value).strip()
-    try:
-        if v.startswith("#") and len(v) == 7:
-            return [int(v[i:i + 2], 16) for i in (1, 3, 5)]
-        parts = [int(p) for p in v.split(",")]
-    except ValueError:
-        parts = []
-    if len(parts) == 3 and all(0 <= p <= 255 for p in parts):
-        return parts
-    raise VTTError(f"Preview colour `{value}` must be `r,g,b` (0-255 each) "
-                   f"or `#rrggbb`.")
+    """Parse a preview colour: any colour of the one grammar (W27), `r,g,b`
+    included."""
+    from logic import color_rgb, COLOR_GRAMMAR_TEXT
+    rgb = color_rgb(str(value).strip())
+    if rgb is None:
+        raise VTTError(f"Preview colour `{value}` must be "
+                       f"{COLOR_GRAMMAR_TEXT} (`r,g,b` too).")
+    return list(rgb)
 
 
 def _preview_point(ctx, m, toks: List[str], i: int, what: str,
@@ -18482,18 +18510,79 @@ async def _map_ent_sight(ctx, m, args: List[str]):
 
 
 def _color_guide() -> str:
-    """Human-readable list of the supported render color names. The palette
-    is deliberately the Discord-safe set (30-37 + bold), so every listed
-    name renders on Discord's ansi blocks AND ANSI terminals — there's no
-    'terminal-only' color to warn separately about."""
-    from logic import TEXT_COLORS
-    names = ", ".join(sorted(TEXT_COLORS))
+    """The colour grammar (W27): what a colour may be, and what the text
+    map does with one it has no name for."""
+    from logic import COLOR_GRAMMAR_TEXT
     return (
-        f"Supported colors: {names}. They all render in Discord ansi code "
-        f"blocks and ANSI terminals (the `bright_*` names are bold variants, "
-        f"since Discord's ansi has no separate bright range). An "
-        f"unrecognized name renders uncolored."
+        f"A colour is {COLOR_GRAMMAR_TEXT}. Images draw any of them; the "
+        f"text map (Discord ansi blocks, terminals) has only the text "
+        f"colour names (the `bright_*` ones are bold variants) and shows "
+        f"another colour as the nearest of them, or as the `ascii_color` "
+        f"given beside it."
     )
+
+
+def _colour_word(val: str) -> Any:
+    """A typed colour as stored (W27): `[255,128,0]` an [r, g, b] list, a
+    colour name lower-cased, anything else (a hex, `r,g,b`, a colour
+    formula) as typed."""
+    from logic import color_ok, TEXT_COLORS, CSS_COLORS
+    t = str(val).strip()
+    if t.startswith("[") and t.endswith("]"):
+        try:
+            v = json.loads(t)
+        except ValueError:
+            return t
+        return v if color_ok(v) else t
+    low = t.lower()
+    return low if (low in TEXT_COLORS or low in CSS_COLORS) else t
+
+
+def _ascii_option(args: List[str], start: int) -> Tuple[List[str], Any]:
+    """`args` without its `ascii=<name>` word (from `start` on) and that
+    word's value: a palette name, "-" (clear), or None (not given); a
+    name the text map lacks is refused (W27)."""
+    from logic import text_color_name
+    rest, got = list(args[:start]), None
+    for a in args[start:]:
+        if a.lower().startswith("ascii="):
+            v = a.split("=", 1)[1].strip().lower()
+            if v in ("-", "none", "clear"):
+                got = "-"
+                continue
+            name = text_color_name(v)
+            if name is None:
+                raise VTTError(f"ascii= is a text colour name, got `{v}`. "
+                               + _color_guide())
+            got = name
+            continue
+        rest.append(a)
+    return rest, got
+
+
+def _colour_note(value: Any, ascii_c: Any = None,
+                 formula_ok: bool = False) -> str:
+    """What a stored colour does (W27): nothing to say for a text colour
+    name; for another colour, the text colour it shows as; for a value
+    that isn't one, a warning (or, where a colour formula may stand,
+    that it is read as one)."""
+    from logic import (color_ok, color_rgb, text_color_name,
+                       nearest_text_color)
+    if color_ok(value):
+        if text_color_name(value) is not None:
+            return ""
+        a = text_color_name(ascii_c)
+        if a is not None:
+            return f" The text map shows it as {a} (its ascii_color)."
+        return (f" Images draw it as it is; the text map shows it as "
+                f"{nearest_text_color(color_rgb(value))}, the nearest text "
+                f"colour (`ascii=<name>` / an `ascii_color` picks one).")
+    if formula_ok and isinstance(value, str) and any(
+            c in value for c in "()[]. +-*/"):
+        return " (a colour formula, read at each render)"
+    return (f"\n⚠ `{value}` isn't a colour; it renders uncoloured"
+            + (" unless it's a valid colour formula" if formula_ok else "")
+            + f". {_color_guide()}")
 
 
 _VOID_USAGE = ("!map void <list | <add|remove> <x> <y> | <add|remove> "
@@ -18776,7 +18865,7 @@ for _sub, _usage in (
         ("scene", "!map scene [full] [list] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off] [map=<map>]"),
         ("image", "!map image [full] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off] [map=<map>]"),
         ("color", "!map color <on|off>"),
-        ("teamcolor", "!map teamcolor <list | clear <team> | <team> <color>>"),
+        ("teamcolor", "!map teamcolor <list | clear <team> | <team> <color> [ascii=<name>]>"),
         ("resize", "!map resize <w> <h> [anchor] [map=<map>]"),
         ("layer", "!map layer <list | <name> <on|off>> [map=<map>]"),
         ("autoupdate", "!map autoupdate [on|off]"),
@@ -19078,7 +19167,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                    f"del / list.")
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` (a point is `x y` or a unit's id, read at its aoe_origin cell; `burst from=<eid> <r>` measures from the unit's whole body, as unit distances do) shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out), and `dir=<dir>` judges it for a step entering the cell that way (the block conditions' move_dir / from_x / from_y: a one-way door). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map attach <map> <eid>` makes a unit carry a map (a map vehicle: a ship's deck, a building's interior), `!map detach <map>` frees it; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color> [ascii=<name>]|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` (a point is `x y` or a unit's id, read at its aoe_origin cell; `burst from=<eid> <r>` measures from the unit's whole body, as unit distances do) shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out), and `dir=<dir>` judges it for a step entering the cell that way (the block conditions' move_dir / from_x / from_y: a one-way door). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color> [ascii=<name>]` (clear/list) / `!map colors` control colors (a colour is a text or CSS colour name, #rrggbb / #rgb or [r, g, b]; images draw it as it is, the text map as its `ascii=` / `ascii_color` name or the nearest text colour). GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map attach <map> <eid>` makes a unit carry a map (a map vehicle: a ship's deck, a building's interior), `!map detach <map>` frees it; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     args, mapspec = _pop_map_opt(args)
@@ -19186,7 +19275,6 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # !map border [on|off] | color <name> | opacity <0-100> | clear
         # Per-match override of the show_borders/border_color/border_opacity
         # rules (grid lines drawn above the ground, below tiles/entities).
-        from logic import TEXT_COLORS
         if len(args) < 2:
             sb = m._scene_borders(mp)
             return await ctx.send(
@@ -19210,11 +19298,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if len(args) < 3:
                 return await ctx.send("❌ Usage: `!map border color <name|hex>`.")
             col = args[2]
+            from logic import color_ok as _cok
+            if not _cok(col):
+                return await ctx.send(f"❌ `{col}` isn't a colour. "
+                                      + _color_guide())
             m.set_map_setting(mp, "border_color", col)
-            note = "" if col.lower() in TEXT_COLORS or col.startswith("#") \
-                else " ⚠️ not a known palette name; stored as-is (a hex like " \
-                     "`#FFFFFF` also works)."
-            return await ctx.send(f"Grid border color set to `{col}`.{note}")
+            return await ctx.send(f"Grid border color set to `{col}`.")
         if op == "opacity":
             if len(args) < 3:
                 return await ctx.send("❌ Usage: `!map border opacity <0-100>`.")
@@ -19414,30 +19503,48 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**{m.name}** (applies on color-capable surfaces)."
         )
     if args and args[0].lower() == "teamcolor":
-        from logic import TEXT_COLORS
         if len(args) < 2:
             return await ctx.send(
-                "❌ Usage: `!map teamcolor <team> <color>` | `clear <team>` | `list`.")
+                "❌ Usage: `!map teamcolor <team> <color> [ascii=<name>]` | "
+                "`clear <team>` | `list`.")
         op = args[1].lower()
         if op == "list":
             if not m.team_colors:
                 return await ctx.send("No team colors set.")
+            def _tc(c: Any) -> str:
+                if isinstance(c, dict):
+                    return (f"{_tc(c.get('color'))} (text map: "
+                            f"{c.get('ascii')})")
+                return json.dumps(c) if isinstance(c, list) else str(c)
             lines = ["Team colors:"] + [
-                f"  `{t}` → {c}" for t, c in sorted(m.team_colors.items())]
+                f"  `{t}` → {_tc(c)}" for t, c in sorted(m.team_colors.items())]
             return await ctx.send("\n".join(lines))
         if op == "clear":
             if len(args) < 3:
                 return await ctx.send("❌ Usage: `!map teamcolor clear <team>`.")
             m.team_colors.pop(args[2], None)
             return await ctx.send(f"Cleared team color for `{args[2]}`.")
-        # set: !map teamcolor <team> <color>
-        if len(args) < 3:
-            return await ctx.send("❌ Usage: `!map teamcolor <team> <color>`.")
-        team, color = args[1], args[2].lower()
-        if color not in TEXT_COLORS:
-            return await ctx.send(f"❌ unknown color `{color}`. {_color_guide()}")
-        m.team_colors[team] = color
-        return await ctx.send(f"Team `{team}` renders in {color}.")
+        # set: !map teamcolor <team> <color> [ascii=<name>]
+        targs, ascii_c = _ascii_option(args, 3)
+        if len(targs) < 3:
+            return await ctx.send("❌ Usage: `!map teamcolor <team> <color> "
+                                  "[ascii=<name>]`.")
+        _check_tail(targs, 3, (), "!map teamcolor <team> <color> "
+                    "[ascii=<name>]")
+        from logic import color_ok as _cok
+        team, color = targs[1], _colour_word(targs[2])
+        if not _cok(color):
+            return await ctx.send(f"❌ unknown color `{targs[2]}`. "
+                                  f"{_color_guide()}")
+        old = m.team_colors.get(team)
+        if ascii_c is None and isinstance(old, dict):
+            ascii_c = old.get("ascii")
+        m.team_colors[team] = ({"color": color, "ascii": ascii_c}
+                               if ascii_c not in (None, "-") else color)
+        shown = json.dumps(color) if isinstance(color, list) else color
+        return await ctx.send(f"Team `{team}` renders in {shown}."
+                              + _colour_note(color, ascii_c
+                                             if ascii_c != "-" else None))
     if args and args[0].lower() == "resize":
         if len(args) < 3:
             return await ctx.send(
@@ -25097,7 +25204,10 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         x, y = _parse_xy(args)
         path = args[3]
-        value = m.tile_data_value(path, _parse_scalar(args[4]))
+        value = _parse_scalar(args[4])
+        if path == "color" and isinstance(value, str):
+            value = _colour_word(value)     # an [r, g, b] list (W27)
+        value = m.tile_data_value(path, value)
         mp.tile_set_path(x, y, path, value)
         ack = f"tile ({x},{y}).{path} = {value!r}" + _cell_formula_warning(m, path, value)
         if path in m.maps:
@@ -25109,12 +25219,13 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # set_var): the renderer reads the top-level `color` field, which may
         # be a palette name OR a color formula — so only nudge on a value
         # that's neither a known name nor formula-shaped.
-        if path == "color" and isinstance(value, str) and value:
-            from logic import TEXT_COLORS
-            if value not in TEXT_COLORS and not any(c in value for c in "()[]. +-*/"):
-                ack += (f"\n⚠ `{value}` isn't a recognized color (renders "
-                        f"uncolored unless it's a valid color formula). "
-                        + _color_guide())
+        if path == "color" and value not in (None, ""):
+            ack += _colour_note(value, formula_ok=True)
+        elif path == "ascii_color" and value not in (None, ""):
+            from logic import text_color_name
+            if text_color_name(value) is None:
+                ack += (f"\n⚠ `{value}` isn't a text colour name, so the "
+                        f"text map ignores it. " + _color_guide())
         return await ctx.send(ack)
 
     # ---- del <x> <y> [<path>] ----
@@ -26752,25 +26863,31 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         z = m.find_zone(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
-        val = args[2]
+        zargs, ascii_c = _ascii_option(args, 3)
+        _check_tail(zargs, 3, (), "!zone color <name> <color|formula|-> "
+                    "[ascii=<name>]")
+        val = zargs[2]
         if val in ("-", "none", "clear"):
             z.pop("color", None)
+            z.pop("ascii_color", None)
+            m.maps[m.zone_map(name)].zone_changed(name) \
+                if m.zone_map(name) in m.maps else None
             return await ctx.send(f"Cleared color for zone `{name}`.")
-        from logic import TEXT_COLORS
-        # A bare palette name is a literal; anything else is a color formula
-        # (resolved per render). Warn on a non-palette, non-formula-looking
-        # value the same way entity colors do, but still store it (it may be
-        # a formula). A clearly-bad literal (no formula chars) gets a nudge.
-        if val not in TEXT_COLORS and not any(c in val for c in "()[]. +-*/"):
-            z["color"] = val
-            return await ctx.send(
-                f"Zone `{name}` color set to `{val}`.\n⚠ `{val}` isn't a "
-                f"recognized color name (renders uncolored unless it's a "
-                f"valid color formula). {_color_guide()}"
-            )
+        from logic import color_ok as _cok
+        # A colour (W27: a palette or CSS name, hex, [r, g, b]) is a
+        # literal; anything else is a colour formula (resolved per render),
+        # stored with a note when it doesn't look like one.
+        val = _colour_word(val)
         z["color"] = val
-        kind = "color" if val in TEXT_COLORS else "color formula"
-        return await ctx.send(f"Zone `{name}` {kind} set to `{val}`.")
+        if ascii_c == "-":
+            z.pop("ascii_color", None)
+        elif ascii_c is not None:
+            z["ascii_color"] = ascii_c
+        kind = "color" if _cok(val) else "color formula"
+        shown = json.dumps(val) if isinstance(val, list) else val
+        return await ctx.send(f"Zone `{name}` {kind} set to `{shown}`."
+                              + _colour_note(val, z.get("ascii_color"),
+                                             formula_ok=True))
 
     # ---- cells <name> ----  (list the footprint)
     if sub == "cells":
@@ -27298,25 +27415,33 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
         return (f"zone definition `{name}` tags = {', '.join(d['tags'])} "
                 f"(every zone of it carries them).")
     # glyph / color / sprite / legend: the look fields, read live.
+    ascii_c = None
+    if sub == "color":
+        args, ascii_c = _ascii_option(args, 3)
     val = " ".join(args[2:]).strip() if sub == "legend" else args[2]
     if sub != "legend":
         _check_tail(args, 3, (), prefix.format(sub=sub)
-                    + f" <name> <{sub}|->")
+                    + f" <name> <{sub}|->"
+                    + (" [ascii=<name>]" if sub == "color" else ""))
     if val in ("-", "none", "clear"):
         d.pop(sub, None)
+        if sub == "color":
+            d.pop("ascii_color", None)
         return f"Cleared zone definition `{name}`'s {sub}."
     if sub == "legend" and val.lower() == "false":
         val = False
     elif sub == "glyph":
         _check_glyph_value(val)
+    elif sub == "color":
+        val = _colour_word(val)
+        if ascii_c == "-":
+            d.pop("ascii_color", None)
+        elif ascii_c is not None:
+            d["ascii_color"] = ascii_c
     d[sub] = val
     tail = ""
     if sub == "color":
-        from logic import TEXT_COLORS
-        if val not in TEXT_COLORS and not any(c in val for c in "()[]. +-*/"):
-            tail = (f"\n⚠ `{val}` isn't a recognized color name (renders "
-                    f"uncolored unless it's a valid color formula). "
-                    f"{_color_guide()}")
+        tail = _colour_note(val, d.get("ascii_color"), formula_ok=True)
     shown = "left out of the legend" if val is False else f"`{val}`"
     return (f"zone definition `{name}` {sub} = {shown} (zones of it without "
             f"their own {sub} show it)." + tail)
@@ -27469,12 +27594,13 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "status", "color",
-    usage="!status color <name> <colour|->",
-    desc=("#114: a palette colour for its bearer on the map while it holds "
-          "the status, over the unit's own `color` and its team's (in "
-          "images the unit's outline). Of several, the highest "
-          "`display_priority` shows; picked apart from the glyph. `-` "
-          "clears."),
+    usage="!status color <name> <colour|-> [ascii=<name>]",
+    desc=("#114: a colour (`!map colors`) for its bearer on the map while "
+          "it holds the status, over the unit's own `color` and its "
+          "team's (in images the unit's outline). `ascii=<name>` picks "
+          "the text map's colour (else the nearest text colour, W27). Of "
+          "several, the highest `display_priority` shows; picked apart "
+          "from the glyph. `-` clears both."),
 )
 registry.annotate_sub(
     "status", "display_priority",
@@ -28083,7 +28209,6 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         # The graphics overlay drawn over any entity carrying this status
         # (e.g. a burning overlay). Definition-level; an entity's status
         # INSTANCE can override the same fields. Graphics-only (no ASCII).
-        from logic import TEXT_COLORS
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "sprite"):
             return ""
         name = args[1]
@@ -28111,8 +28236,9 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                     notes.append("opacity must be 0-100")
             elif k == "tint":
                 sdef["sprite_tint"] = v
-                if v.lower() not in TEXT_COLORS and v.lower() not in ("gray", "grey"):
-                    notes.append(f"tint `{v}` is not a known palette name")
+                from logic import color_ok as _cok
+                if not _cok(v):
+                    notes.append(f"tint `{v}` isn't a colour")
             elif k == "layer":
                 try:
                     sdef["sprite_layer"] = int(v)
@@ -28353,15 +28479,21 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
         # #114: the bearer's map look while it holds the status.
         if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
             return ""
+        ascii_c = None
+        if sub == "color":
+            args, ascii_c = _ascii_option(args, 3)
         name, val = args[1], args[2]
         if name not in m.status_definitions:
             return f"❌ No status definition `{name}`."
-        _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->")
+        _check_tail(args, 3, (), prefix.format(sub=sub) + " <name> <value|->"
+                    + (" [ascii=<name>]" if sub == "color" else ""))
         sdef = m.status_definitions[name]
         # `-` is a glyph too (a unit lying down): only the words clear it.
         if val.lower() in (("clear", "none") if sub == "glyph"
                            else ("-", "clear", "none")):
             sdef.pop(sub, None)
+            if sub == "color":
+                sdef.pop("ascii_color", None)
             return f"`{name}` {sub} cleared."
         if sub == "glyph":
             prob = glyph_problem(val)
@@ -28372,14 +28504,20 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
                     f"the unit's own glyph; the status with the highest "
                     f"display_priority wins).")
         if sub == "color":
-            from logic import TEXT_COLORS
-            if val.lower() not in TEXT_COLORS:
-                return (f"❌ color must be a palette name: "
-                        f"{', '.join(sorted(TEXT_COLORS))}.")
-            sdef[sub] = val.lower()
-            return (f"`{name}` colours its bearer {val.lower()} on the map "
+            from logic import color_ok as _cok
+            col = _colour_word(val)
+            if not _cok(col):
+                return f"❌ `{val}` isn't a colour. {_color_guide()}"
+            sdef[sub] = col
+            if ascii_c == "-":
+                sdef.pop("ascii_color", None)
+            elif ascii_c is not None:
+                sdef["ascii_color"] = ascii_c
+            shown = json.dumps(col) if isinstance(col, list) else col
+            return (f"`{name}` colours its bearer {shown} on the map "
                     f"(over the unit's own colour; the status with the "
-                    f"highest display_priority wins).")
+                    f"highest display_priority wins)."
+                    + _colour_note(col, sdef.get("ascii_color")))
         try:
             n = float(val)
         except ValueError:
@@ -29491,7 +29629,7 @@ _ZONE_DEF_USAGE = (
     "!zone def hook <name> <when> <formula ...> | "
     "!zone def del-hook <name> <when> | "
     "!zone def glyph <name> <char|-> [<facing>] | "
-    "!zone def color <name> <color|-> | "
+    "!zone def color <name> <color|-> [ascii=<name>] | "
     "!zone def sprite <name> <key|-> [<facing>] | "
     "!zone def face <name> <dir|-> | !zone def reapply <name> [reset] | "
     "!zone def layer <name> <n|-> | "
@@ -29697,13 +29835,16 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "zone", "color",
-    usage="!zone color <name> <color|formula|->",
+    usage="!zone color <name> <color|formula|-> [ascii=<name>]",
     desc=(
-        "Set the zone's render color — a palette name (see `!map colors`) "
-        "OR a color formula resolved per render (bindings: zone_name; e.g. "
+        "Set the zone's render color — a colour (`!map colors`: a text "
+        "colour name, a CSS name, #rrggbb / #rgb or [r, g, b]) OR a color "
+        "formula resolved per render (bindings: zone_name; e.g. "
         "`zone_get(zone_name, 'tint')`). Colors the zone glyph, and tints "
-        "empty (glyph-less) zone cells. `-` / `none` clears it. Applies on "
-        "color-capable surfaces; a tile or entity on top owns its cell."
+        "empty (glyph-less) zone cells. `ascii=<name>` picks the text "
+        "map's colour (else the nearest text colour). `-` / `none` clears "
+        "both. Applies on color-capable surfaces; a tile or entity on top "
+        "owns its cell."
     ),
 )
 registry.annotate_sub(
