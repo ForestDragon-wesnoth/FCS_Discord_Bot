@@ -1563,7 +1563,7 @@ hardcodes**.
   #7), after its held grants settle (#8: the hooks read the statuses an
   item or class holds, as after a give; 1316). A write or delete that
   settles held grants passes on their lines before what its template
-  hooks surface (`_surface_mark` / `_take_surfaced`, L59, 1323); a revive
+  hooks surface (`_surface_mark` / `_take_surfaced`, L59, 1324); a revive
   (REVIVING) and a transfer (`TEMPLATE_QUIET`) fire nothing, nor do a
   death, a despawn and a detach (user calls). Corpses fire nothing (on
   hold, idea #623). They share var_hook_recursion_limit.
@@ -2261,7 +2261,8 @@ hardcodes**.
   multiplier): `{level_text}` is ` level 5`, the layers `level 3 for 2,
   then level 1 for 3 more`.
 - **Map look** (#114, user design, 1288-1289): a status's `glyph` (one
-  column, `glyph_problem`), `color` (a palette name) and
+  column, `glyph_problem`), `color` (a colour, §7.15 "Colours", with
+  its `ascii_color`) and
   `display_priority` (`status_field`; `!status glyph <name>
   <glyph|clear>` (`-` is a glyph), `!status color`, `!status
   display_priority`). `Match.status_look(e, pov)`: among the statuses the
@@ -2378,7 +2379,14 @@ hardcodes**.
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo
   history preserved). A failing NESTED action rolls back only its own
-  effects (check `use_action`'s result to abort the outer one).
+  effects (check `use_action`'s result to abort the outer one). An
+  exception after the acting unit died or left since the body began (a
+  reaction it provoked killed it, a tile it walked onto; L61, user
+  call, 1325-1326) ends the action there as a SUCCESS: nothing rolls
+  back, the `action_actor_gone_message_format` line says why it stopped
+  (tagged with the unit's cell at the start), no say_format line, and
+  on_action_used fires only while the unit is still in the match; a
+  fail() still rolls everything back.
   `action_recursion_limit`. `cmd('...')` dispatches commands on
   `action_cmd_allowlist` (default `ent`) through `_BufferCtx`, which carries
   the channel and identity of the command that ran the action
@@ -3659,8 +3667,8 @@ hardcodes**.
   tiles by draw layer (§7.12; by default zones under tiles) < units < fog; glyphs (`glyphs.<facing>` > `glyph` > facing arrow; one
   character one column wide, `logic.glyph_problem`: an emoji or a CJK
   character is two columns and is refused where a glyph is stored, Y8),
-  colours (`color` var — a palette name or a formula with
-  self = the unit, falling through when it fails or isn't a palette name,
+  colours (`color` var — a colour (below) or a formula with
+  self = the unit, falling through when it fails or gives no colour,
   shared by both renderers via `entity_color` (772) — > `team_colors` /
   a palette-named team;
   ANSI only when `ctx.supports_color`, one code per run), legend
@@ -3788,8 +3796,8 @@ hardcodes**.
   lighten / darken), hue, saturation, greyscale, brightness, contrast,
   invert, opacity, flip, rotate, scale, outline, glow), each `{effect,
   <fields>, priority, group, condition}`; a bundle is a list or a dict of
-  named records (one record alone too). Colours: a palette name, `#rrggbb`,
-  an [r, g, b] list, or `team` / `team_light` (the placement's colour,
+  named records (one record alone too). Colours: the grammar below, or
+  `team` / `team_light` (the placement's colour,
   `fallback` when it has none; the renderer resolves them).
   `check_sprite_effect` checks a record (`partial` for a raw var write
   building one field at a time, `check_effect_write` in write_var).
@@ -3843,8 +3851,8 @@ hardcodes**.
   or the two characters) breaking there only (`logic.name_text_lines`),
   cut to `NAME_TEXT_MAX`; colours from `sprite_label_color` /
   `sprite_label_background_color` else the rules `name_text_color`
-  (white) / `name_text_background_color` (black), a palette name or
-  `#rrggbb` (`label_color_ok`; a bad var falls back to the rule, a bad
+  (white) / `name_text_background_color` (black), a colour (below,
+  `color_ok`; a bad var falls back to the rule, a bad
   rule value is refused). A corpse lies as its name (`corpse_name_text`,
   its frozen vars), greyed. `SceneRenderer.name_text_image` makes the
   picture (the largest font every line fits, at least `_NAME_TEXT_MIN`
@@ -3872,6 +3880,30 @@ hardcodes**.
   (read with `sprite_label`: the disguise's to a view it fools, through
   the reader; a value of the wrong kind is ignored). Zones and tiles: idea
   #626.
+- **Colours** (W27, user design, 1327-1329): one grammar everywhere a
+  colour is stored (`logic.color_ok` / `color_rgb`, text
+  `COLOR_GRAMMAR_TEXT`): a text colour name (`TEXT_COLORS`, the 16 the
+  text map has), a CSS name (`CSS_COLORS`), `#rgb` / `#rrggbb` or an
+  [r, g, b] list (typed `[255,128,0]`, `vtt_commands._colour_word`).
+  Images draw it as given (`scene_color`: a text name stays, anything
+  else becomes `#rrggbb` in the scene; `sprite_render._rgb` reads lists
+  too). The text map shows the thing's `ascii_color` when that is a text
+  colour name, else the colour's own name, else the NEAREST text colour
+  (`nearest_text_color`: by hue, since RGB distance sent purple and teal
+  to gray; a grey by brightness to black / gray / white, a pale light
+  colour to its bright_* name; `logic.text_color_for`, user call: both). `ascii_color` stands beside each colour: a unit's var, a
+  disguise's key, a status's field (`!status color <name> <c>
+  ascii=<name>`), a tile's data or its template's, a zone's look field
+  (`!zone color ... ascii=`, `!zone def color ... ascii=`), a team's
+  `team_colors` value `{color, ascii}` (`!map teamcolor <team> <c>
+  ascii=<name>`). A coloured text render (`render_ascii` with colorize)
+  collects what it approximated in `TEXT_COLOR_NOTES` and ends with one
+  ⚠️ line naming them (`text_color_warning`, at most 8) while the rule
+  `ascii_color_warnings` (default on) holds; only what the view draws is
+  named, by the name the view reads. Outline and glow rings are drawn
+  after the picture effects (`_edge_rings` on the built body), so no
+  tint, greyscale, hue or invert reaches a team outline. `!as color
+  on|off` (CLI / harness) colours a context's text maps.
 - **Intended ASCII / graphics differences:** corpses and overlays are
   graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
   are a translucent fill; a unit's colour is an outline around its sprite;
@@ -4509,7 +4541,9 @@ hardcodes**.
   new unit runs on_spawn through `run_action` (self = the unit, `args`,
   `template_name`; finish=False, skip_checks, quiet_fail); a fail() or
   an error rolls the whole spawn back (`_rollback_match` + history
-  rewind). The formula returns None on a fail() and surfaces `❌ spawn
+  rewind), and the lines its spawn hooks surfaced go with it, as do
+  those of a `count=` placement that doesn't fit (`_surface_mark` /
+  `_take_surfaced`, L60, 1323). The formula returns None on a fail() and surfaces `❌ spawn
   ...`. A transform, prefab stamp or part runs no code. `!template arg`
   edits either kind's args, `!template on_spawn` the code; lint reads
   it; Tab offers a template's declared args after `!template spawn|give

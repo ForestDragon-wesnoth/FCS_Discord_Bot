@@ -714,8 +714,12 @@ def _check_status_definition(entry: Dict[str, Any], name: str,
         raise VTTError(f"{who}: `glyph`: "
                        f"{logic.glyph_problem(entry['glyph'])}.")
     if entry.get("color") not in (None, "") and \
-            entry["color"] not in logic.TEXT_COLORS:
-        raise VTTError(f"{who}: `color` must be a palette name.")
+            not logic.color_ok(entry["color"]):
+        raise VTTError(f"{who}: `color` must be a colour: "
+                       f"{logic.COLOR_GRAMMAR_TEXT}.")
+    if entry.get("ascii_color") not in (None, "") and \
+            logic.text_color_name(entry["ascii_color"]) is None:
+        raise VTTError(f"{who}: `ascii_color` must be a text colour name.")
     dp = entry.get("display_priority")
     if dp is not None and (isinstance(dp, bool)
                            or not isinstance(dp, (int, float))):

@@ -236,11 +236,21 @@ class SceneRenderer:
     # -- colour / alpha helpers ------------------------------------------
     @staticmethod
     def _rgb(name: Any) -> Optional[Tuple[int, int, int]]:
+        # W27: an [r, g, b] list and `r,g,b` text too (Pillow reads names
+        # and hex).
+        if isinstance(name, (list, tuple)) and len(name) == 3:
+            try:
+                return tuple(max(0, min(255, int(c))) for c in name)
+            except (TypeError, ValueError):
+                return None
         if not isinstance(name, str) or not name.strip():
             return None
         key = name.strip().lower()
         if key in _PALETTE_RGB:
             return _PALETTE_RGB[key]
+        parts = key.split(",")
+        if len(parts) == 3 and all(p.strip().isdigit() for p in parts):
+            return tuple(min(255, int(p)) for p in parts)
         try:
             return ImageColor.getrgb(name.strip())
         except (ValueError, Exception):

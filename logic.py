@@ -248,14 +248,12 @@ SPRITE_FALLBACKS = ("glyph", "name_text")
 # A name sprite's text is cut to this many characters (the renderer shrinks
 # and cuts it to the cell anyway; this bounds the work per placement).
 NAME_TEXT_MAX = 100
-_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 def label_color_ok(v: Any) -> bool:
-    """Whether `v` names a colour a name sprite can take: a palette name
-    (TEXT_COLORS) or `#rrggbb`."""
-    return isinstance(v, str) and (v.strip().lower() in TEXT_COLORS
-                                   or bool(_HEX_COLOR_RE.match(v.strip())))
+    """Whether `v` names a colour a name sprite can take: any colour of the
+    one grammar (color_ok, W27)."""
+    return color_ok(v)
 
 
 def name_text_lines(text: Any) -> List[str]:
@@ -344,17 +342,11 @@ _HEX_RGB_RE = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})\Z")
 
 
 def sprite_effect_color_ok(v: Any) -> bool:
-    """Whether `v` is a colour an effect takes: a palette name, `#rrggbb`
-    (or `#rgb`), an [r, g, b] list of whole numbers 0-255, or `team` /
-    `team_light`."""
-    if isinstance(v, str):
-        t = v.strip().lower()
-        return t in TEXT_COLORS or t in SPRITE_TEAM_COLORS \
-            or bool(_HEX_RGB_RE.match(t))
-    if isinstance(v, (list, tuple)) and len(v) == 3:
-        return all(isinstance(c, int) and not isinstance(c, bool)
-                   and 0 <= c <= 255 for c in v)
-    return False
+    """Whether `v` is a colour an effect takes: any colour of the one
+    grammar (color_ok, W27), or `team` / `team_light`."""
+    if isinstance(v, str) and v.strip().lower() in SPRITE_TEAM_COLORS:
+        return True
+    return color_ok(v)
 
 
 def _effect_color_text(v: Any) -> str:
@@ -424,9 +416,8 @@ def check_sprite_effect(rec: Any, partial: bool = False) -> Dict[str, Any]:
         elif kind == "color":
             if not sprite_effect_color_ok(v):
                 raise VTTError(
-                    f"an effect's `{k}` is a colour name, #rrggbb, an "
-                    f"[r, g, b] list (0-255) or team / team_light, got "
-                    f"{_effect_color_text(v)!s}.")
+                    f"an effect's `{k}` is {COLOR_GRAMMAR_TEXT}, or team / "
+                    f"team_light, got {_effect_color_text(v)!s}.")
             out[k] = list(v) if isinstance(v, (list, tuple)) \
                 else v.strip().lower()
         elif kind == "word":
@@ -1475,6 +1466,220 @@ TEXT_COLORS: Dict[str, str] = {
     "bright_blue": "1;34", "bright_magenta": "1;35", "bright_cyan": "1;36",
     "bright_white": "1;37",
 }
+
+# W27 (user design): the palette names above bind the text map only; images
+# take any colour. One grammar for every colour input (color_rgb): a palette
+# name, a CSS colour name (the names Pillow reads: `orange`, `teal`), `#rgb`
+# / `#rrggbb`, or [r, g, b] (whole numbers 0-255; `r,g,b` as text too).
+CSS_COLORS: Dict[str, Tuple[int, int, int]] = {
+    "aliceblue": (240, 248, 255), "antiquewhite": (250, 235, 215),
+    "aqua": (0, 255, 255), "aquamarine": (127, 255, 212),
+    "azure": (240, 255, 255), "beige": (245, 245, 220),
+    "bisque": (255, 228, 196), "black": (0, 0, 0),
+    "blanchedalmond": (255, 235, 205), "blue": (0, 0, 255),
+    "blueviolet": (138, 43, 226), "brown": (165, 42, 42),
+    "burlywood": (222, 184, 135), "cadetblue": (95, 158, 160),
+    "chartreuse": (127, 255, 0), "chocolate": (210, 105, 30),
+    "coral": (255, 127, 80), "cornflowerblue": (100, 149, 237),
+    "cornsilk": (255, 248, 220), "crimson": (220, 20, 60),
+    "cyan": (0, 255, 255), "darkblue": (0, 0, 139), "darkcyan": (0, 139, 139),
+    "darkgoldenrod": (184, 134, 11), "darkgray": (169, 169, 169),
+    "darkgreen": (0, 100, 0), "darkgrey": (169, 169, 169),
+    "darkkhaki": (189, 183, 107), "darkmagenta": (139, 0, 139),
+    "darkolivegreen": (85, 107, 47), "darkorange": (255, 140, 0),
+    "darkorchid": (153, 50, 204), "darkred": (139, 0, 0),
+    "darksalmon": (233, 150, 122), "darkseagreen": (143, 188, 143),
+    "darkslateblue": (72, 61, 139), "darkslategray": (47, 79, 79),
+    "darkslategrey": (47, 79, 79), "darkturquoise": (0, 206, 209),
+    "darkviolet": (148, 0, 211), "deeppink": (255, 20, 147),
+    "deepskyblue": (0, 191, 255), "dimgray": (105, 105, 105),
+    "dimgrey": (105, 105, 105), "dodgerblue": (30, 144, 255),
+    "firebrick": (178, 34, 34), "floralwhite": (255, 250, 240),
+    "forestgreen": (34, 139, 34), "fuchsia": (255, 0, 255),
+    "gainsboro": (220, 220, 220), "ghostwhite": (248, 248, 255),
+    "gold": (255, 215, 0), "goldenrod": (218, 165, 32),
+    "gray": (128, 128, 128), "green": (0, 128, 0),
+    "greenyellow": (173, 255, 47), "grey": (128, 128, 128),
+    "honeydew": (240, 255, 240), "hotpink": (255, 105, 180),
+    "indianred": (205, 92, 92), "indigo": (75, 0, 130),
+    "ivory": (255, 255, 240), "khaki": (240, 230, 140),
+    "lavender": (230, 230, 250), "lavenderblush": (255, 240, 245),
+    "lawngreen": (124, 252, 0), "lemonchiffon": (255, 250, 205),
+    "lightblue": (173, 216, 230), "lightcoral": (240, 128, 128),
+    "lightcyan": (224, 255, 255), "lightgoldenrodyellow": (250, 250, 210),
+    "lightgray": (211, 211, 211), "lightgreen": (144, 238, 144),
+    "lightgrey": (211, 211, 211), "lightpink": (255, 182, 193),
+    "lightsalmon": (255, 160, 122), "lightseagreen": (32, 178, 170),
+    "lightskyblue": (135, 206, 250), "lightslategray": (119, 136, 153),
+    "lightslategrey": (119, 136, 153), "lightsteelblue": (176, 196, 222),
+    "lightyellow": (255, 255, 224), "lime": (0, 255, 0),
+    "limegreen": (50, 205, 50), "linen": (250, 240, 230),
+    "magenta": (255, 0, 255), "maroon": (128, 0, 0),
+    "mediumaquamarine": (102, 205, 170), "mediumblue": (0, 0, 205),
+    "mediumorchid": (186, 85, 211), "mediumpurple": (147, 112, 219),
+    "mediumseagreen": (60, 179, 113), "mediumslateblue": (123, 104, 238),
+    "mediumspringgreen": (0, 250, 154), "mediumturquoise": (72, 209, 204),
+    "mediumvioletred": (199, 21, 133), "midnightblue": (25, 25, 112),
+    "mintcream": (245, 255, 250), "mistyrose": (255, 228, 225),
+    "moccasin": (255, 228, 181), "navajowhite": (255, 222, 173),
+    "navy": (0, 0, 128), "oldlace": (253, 245, 230), "olive": (128, 128, 0),
+    "olivedrab": (107, 142, 35), "orange": (255, 165, 0),
+    "orangered": (255, 69, 0), "orchid": (218, 112, 214),
+    "palegoldenrod": (238, 232, 170), "palegreen": (152, 251, 152),
+    "paleturquoise": (175, 238, 238), "palevioletred": (219, 112, 147),
+    "papayawhip": (255, 239, 213), "peachpuff": (255, 218, 185),
+    "peru": (205, 133, 63), "pink": (255, 192, 203), "plum": (221, 160, 221),
+    "powderblue": (176, 224, 230), "purple": (128, 0, 128),
+    "rebeccapurple": (102, 51, 153), "red": (255, 0, 0),
+    "rosybrown": (188, 143, 143), "royalblue": (65, 105, 225),
+    "saddlebrown": (139, 69, 19), "salmon": (250, 128, 114),
+    "sandybrown": (244, 164, 96), "seagreen": (46, 139, 87),
+    "seashell": (255, 245, 238), "sienna": (160, 82, 45),
+    "silver": (192, 192, 192), "skyblue": (135, 206, 235),
+    "slateblue": (106, 90, 205), "slategray": (112, 128, 144),
+    "slategrey": (112, 128, 144), "snow": (255, 250, 250),
+    "springgreen": (0, 255, 127), "steelblue": (70, 130, 180),
+    "tan": (210, 180, 140), "teal": (0, 128, 128), "thistle": (216, 191, 216),
+    "tomato": (255, 99, 71), "turquoise": (64, 224, 208),
+    "violet": (238, 130, 238), "wheat": (245, 222, 179),
+    "white": (255, 255, 255), "whitesmoke": (245, 245, 245),
+    "yellow": (255, 255, 0), "yellowgreen": (154, 205, 50),
+}
+# The RGB images draw each palette name in (sprite_render draws the same):
+# the base names are CSS colours, the bright ones the usual bright ANSI.
+PALETTE_RGB: Dict[str, Tuple[int, int, int]] = {
+    "black": (0, 0, 0), "red": (255, 0, 0), "green": (0, 128, 0),
+    "yellow": (255, 255, 0), "blue": (0, 0, 255), "magenta": (255, 0, 255),
+    "cyan": (0, 255, 255), "white": (255, 255, 255),
+    "gray": (128, 128, 128), "grey": (128, 128, 128),
+    "bright_red": (255, 85, 85), "bright_green": (85, 255, 85),
+    "bright_yellow": (255, 255, 85), "bright_blue": (85, 85, 255),
+    "bright_magenta": (255, 85, 255), "bright_cyan": (85, 255, 255),
+    "bright_white": (255, 255, 255),
+}
+# The names a colour that isn't one comes nearest to, in the order a tie
+# takes (`grey` is `gray`).
+_TEXT_COLOR_ORDER = ("black", "red", "green", "yellow", "blue", "magenta",
+                     "cyan", "white", "gray", "bright_red", "bright_green",
+                     "bright_yellow", "bright_blue", "bright_magenta",
+                     "bright_cyan", "bright_white")
+_RGB_TEXT_RE = re.compile(r"^\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*$")
+COLOR_GRAMMAR_TEXT = ("a text colour name ("
+                      + ", ".join(_TEXT_COLOR_ORDER)
+                      + "), a CSS colour name (orange, teal, ...), "
+                        "#rrggbb / #rgb or [r, g, b]")
+
+
+def color_rgb(v: Any) -> Optional[Tuple[int, int, int]]:
+    """The RGB of colour `v` in the one colour grammar (W27): a palette
+    name, a CSS name, `#rgb` / `#rrggbb`, an [r, g, b] list of whole numbers
+    0-255 (or `r,g,b` text); None for anything else."""
+    if isinstance(v, (list, tuple)):
+        if len(v) == 3 and all(isinstance(c, int) and not isinstance(c, bool)
+                               and 0 <= c <= 255 for c in v):
+            return (int(v[0]), int(v[1]), int(v[2]))
+        return None
+    if not isinstance(v, str):
+        return None
+    t = v.strip().lower()
+    if t in PALETTE_RGB:
+        return PALETTE_RGB[t]
+    if t in CSS_COLORS:
+        return CSS_COLORS[t]
+    if _HEX_RGB_RE.match(t):
+        h = t[1:]
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    m = _RGB_TEXT_RE.match(t)
+    if m and all(0 <= int(g) <= 255 for g in m.groups()):
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+
+def color_ok(v: Any) -> bool:
+    """Whether `v` is a colour of the one grammar (color_rgb)."""
+    return color_rgb(v) is not None
+
+
+def scene_color(v: Any) -> Optional[str]:
+    """Colour `v` as the image scene carries it: a palette name as itself
+    (the renderer draws the bright ones its own way), anything else of the
+    grammar as `#rrggbb`; None for no colour."""
+    if isinstance(v, str) and v.strip().lower() in TEXT_COLORS:
+        return v.strip().lower()
+    rgb = color_rgb(v)
+    return None if rgb is None else "#%02x%02x%02x" % rgb
+
+
+def nearest_text_color(rgb: Tuple[int, int, int]) -> str:
+    """The text colour name that reads most like `rgb` (W27). Plain RGB
+    distance sent dark saturated colours to gray (purple, teal), so the
+    match goes by hue: a colour with little saturation is black, gray or
+    white by its brightness; any other takes the nearest of the six hues
+    (a tie to the primary), its bright_* variant when it is pale and
+    light (the bright names are the pastel ones), black when it is
+    nearly black."""
+    import colorsys
+    r, g, b = (max(0, min(255, int(c))) / 255.0 for c in rgb[:3])
+    h, sat, val = colorsys.rgb_to_hsv(r, g, b)
+    if val < 0.15:
+        return "black"
+    if sat < 0.15:
+        return min((("black", 0.0), ("gray", 0.5), ("white", 1.0)),
+                   key=lambda nv: abs(val - nv[1]))[0]
+    deg = h * 360.0
+    best, best_d = "red", None
+    for name, hue in _TEXT_HUES:
+        d = abs(deg - hue) % 360.0
+        d = min(d, 360.0 - d)
+        if best_d is None or d < best_d:
+            best, best_d = name, d
+    return f"bright_{best}" if sat < 0.7 and val >= 0.75 else best
+
+
+# The six hues of the text colours, primaries first (a tie goes to them).
+_TEXT_HUES = (("red", 0.0), ("green", 120.0), ("blue", 240.0),
+              ("yellow", 60.0), ("cyan", 180.0), ("magenta", 300.0))
+
+
+def text_color_name(v: Any) -> Optional[str]:
+    """A palette name as the text map spells it (`grey` is `gray`), or
+    None when `v` isn't one."""
+    if not isinstance(v, str):
+        return None
+    t = v.strip().lower()
+    return ("gray" if t == "grey" else t) if t in TEXT_COLORS else None
+
+
+# The text-map colours a render approximated or couldn't read (W27): a list
+# of (what, value, shown as) the ASCII render collects while it runs, for
+# the ascii_color_warnings line under the map. None outside a render.
+TEXT_COLOR_NOTES: "contextvars.ContextVar[Optional[List[Tuple[str, str, Optional[str]]]]]" = \
+    contextvars.ContextVar("TEXT_COLOR_NOTES", default=None)
+
+
+def text_color_for(value: Any, explicit: Any, what: str) -> Optional[str]:
+    """The palette name the text map shows a thing in (W27): its own
+    `ascii_color` when that is a palette name; the colour itself when it is
+    one; else the nearest palette name to it, noted (TEXT_COLOR_NOTES) so the
+    render can say so. A value that isn't a colour shows none, noted too."""
+    a = text_color_name(explicit)
+    if a is not None:
+        return a
+    if value is None or value == "":
+        return None
+    n = text_color_name(value)
+    if n is not None:
+        return n
+    rgb = color_rgb(value)
+    shown = nearest_text_color(rgb) if rgb is not None else None
+    notes = TEXT_COLOR_NOTES.get()
+    if notes is not None:
+        txt = (f"[{', '.join(str(c) for c in value)}]"
+               if isinstance(value, (list, tuple)) else str(value))
+        notes.append((what, txt, shown))
+    return shown
 
 # !map resize anchors: name (+ aliases) -> (horizontal, vertical) kind.
 # horizontal in {left, center, right}; vertical in {top, middle, bottom}.
@@ -5332,7 +5537,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": (
             "Images only: the text colour of a name sprite "
-            "(entity_sprite_fallback name_text): a palette name or #rrggbb. "
+            "(entity_sprite_fallback name_text): a colour (a text or CSS "
+            "colour name, #rrggbb / #rgb, [r, g, b]). "
             "A unit's `sprite_label_color` var overrides it."
         ),
     },
@@ -5394,8 +5600,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": (
             "Images only: the background colour of a name sprite "
-            "(entity_sprite_fallback name_text), filling its cell: a palette "
-            "name or #rrggbb. A unit's `sprite_label_background_color` var "
+            "(entity_sprite_fallback name_text), filling its cell: a colour "
+            "(a text or CSS colour name, #rrggbb / #rgb, [r, g, b]). A unit's `sprite_label_background_color` var "
             "overrides it."
         ),
     },
@@ -5933,6 +6139,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "own placeholders ({name}, {x}, {y}, {team}, its vars). "
             "`{?target?}...{/?}` keeps its text only when there is a "
             "target. Empty = no line."
+        ),
+    },
+    "action_actor_gone_message_format": {
+        # L61 (user's choice, option a).
+        "default": "{actor_name}'s `{action}` ends: {actor_name} {reason}.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line an action ends with when its body errors after its "
+            "acting unit died or left the match since the body began (a "
+            "reaction it provoked killed it, a tile it walked onto, ...): "
+            "the action ends there as a success, nothing it did is taken "
+            "back, and this line says why it stopped. A deliberate fail() "
+            "still takes everything back. Placeholders: {actor} (the "
+            "unit's id), {actor_name} (its name as the channel's view "
+            "sees it), {action}, {reason} (`died`, or `left the match`), "
+            "{error} (the error the body stopped on). Empty = no line."
         ),
     },
     "action_forbidden_message_format": {
@@ -6801,6 +7023,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "see it."
         ),
     },
+    "ascii_color_warnings": {
+        # W27 (user call: default on).
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a coloured text map (Discord's ```ansi blocks, a colour "
+            "terminal) ends with a warning line naming each colour it showed "
+            "as the nearest of its 16 text colours (a hex, [r, g, b] or CSS "
+            "colour with no `ascii_color` beside it), or couldn't read (a "
+            "colour formula giving something that isn't a colour). Images "
+            "draw every colour as it is; the text map has only the palette "
+            "names. An `ascii_color` (a palette name) next to the colour "
+            "picks the text colour itself: a unit's `ascii_color` var, a "
+            "status's, a disguise's, a tile's data or its template's, a "
+            "zone's or its definition's, `!map teamcolor <team> <colour> "
+            "ascii=<name>`."
+        ),
+    },
     "active_unit_line_format": {
         "default": "▶ now acting: {name}",
         "schema": {"type": "str"},
@@ -7317,15 +7557,12 @@ def _check_resist_op_priority(key: str, raw: str) -> str:
 
 
 def _check_rgb_rule(key: str, raw: str) -> str:
+    """A colour rule (preview_color): any colour of the one grammar."""
     v = raw.strip()
-    if re.fullmatch(r"#[0-9a-fA-F]{6}", v):
-        return v
-    parts = v.split(",")
-    if len(parts) == 3 and all(p.strip().isdigit() and 0 <= int(p) <= 255
-                               for p in parts):
-        return ",".join(p.strip() for p in parts)
-    raise VTTError(f"Setting '{key}' takes `r,g,b` (0-255 each) or "
-                   f"#rrggbb, got `{raw}`.")
+    if color_ok(v):
+        return ",".join(p.strip() for p in v.split(",")) if "," in v else v
+    raise VTTError(f"Setting '{key}' takes {COLOR_GRAMMAR_TEXT} "
+                   f"(`r,g,b` too), got `{raw}`.")
 
 
 _PLAIN_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -7575,13 +7812,12 @@ def _check_glyph_rule(key: str, raw: str) -> str:
 
 
 def _check_label_color_rule(key: str, raw: str) -> str:
-    """name_text_color / name_text_background_color: a palette name or
-    #rrggbb."""
+    """name_text_color / name_text_background_color: any colour of the one
+    grammar (W27)."""
     v = raw.strip()
     if not label_color_ok(v):
-        raise VTTError(f"Setting '{key}' is a palette name "
-                       f"({', '.join(sorted(TEXT_COLORS))}) or #rrggbb, "
-                       f"not `{raw}`.")
+        raise VTTError(f"Setting '{key}' is {COLOR_GRAMMAR_TEXT}, not "
+                       f"`{raw}`.")
     return v.lower() if v.lower() in TEXT_COLORS else v
 
 
@@ -10140,7 +10376,7 @@ class SpecialTileTemplate:
 # shape normalize_zone_def gives.
 ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend",
                                      "facing", "glyphs", "sprites",
-                                     "sprite_layer")
+                                     "sprite_layer", "ascii_color")
 # The per-facing look fields (#257) and the plain field each stands in for:
 # `glyphs.<facing>` / `sprites.<facing>` on units, tiles (data, template
 # data), zones and zone definitions.
@@ -10193,6 +10429,11 @@ def zone_look_value(key: str, value: Any) -> bool:
     if key in FACING_LOOK_FIELDS:
         return isinstance(value, dict) and any(
             facing_look_entry(key, f, v) for f, v in value.items())
+    if key == "ascii_color":
+        # The text map's colour for the zone (W27): a palette name.
+        return text_color_name(value) is not None
+    if key == "color" and isinstance(value, list):
+        return color_ok(value)
     return isinstance(value, str) and bool(value)
 
 
@@ -32144,8 +32385,8 @@ class Match:
         status), "color": (colour, status)}, each from the status with the
         highest `display_priority` (instance, definition, level entries;
         default 0; a tie goes to the status gained first) among those
-        holding a usable `glyph` (one character) / `color` (a palette name),
-        read separately. Only statuses `pov_team`'s view sees count, and a
+        holding a usable `glyph` (one character) / `color` (any colour of
+        the grammar, W27), read separately. Only statuses `pov_team`'s view sees count, and a
         unit disguised to it shows none (as its overlays)."""
         if not e.status or \
                 self._effective_disguise(e, pov_team) is not None:
@@ -32159,8 +32400,7 @@ class Match:
             g = glyph_of(self.status_field(inst, sname, "glyph"))
             c = self.status_field(inst, sname, "color")
             for key, val, ok in (("glyph", g, glyph_ok(g)),
-                                 ("color", c, isinstance(c, str)
-                                  and c in TEXT_COLORS)):
+                                 ("color", c, color_ok(c))):
                 if ok and (key not in best or pr > best[key][0]):
                     best[key] = (pr, val, str(sname))
         return {k: (v[1], v[2]) for k, v in best.items()}
@@ -32213,49 +32453,76 @@ class Match:
         g = glyph_of(e.vars.get("glyph"))
         return glyph_ok(g)
 
-    def entity_color(self, e: "Entity",
-                     pov_team: Optional[str] = None) -> Optional[str]:
-        """The resolved color NAME for `e` (or None): its `color` var wins (a
-        palette name, or a formula expression with self = the unit whose
-        result is one; an unreadable one falls through), else its team's color — the match team_colors map, defaulting to
-        the team's own name when that name is itself a palette color (so a
-        team literally named 'red' renders red). Unknown names -> None. When
-        `e` is disguised to `pov_team` (116), only the disguise speaks: its
-        `color`, else the colour of the team its `vars` give, else none (the
-        real unit's colour would give it away). A status's colour (#114,
-        status_look) comes before the unit's own."""
+    def entity_color(self, e: "Entity", pov_team: Optional[str] = None,
+                     text: bool = False) -> Any:
+        """The resolved colour for `e` (or None): any colour of the grammar
+        (W27; images draw it as it is), or with `text` the palette name the
+        text map shows (text_color_for: the source's `ascii_color`, else
+        the colour itself when it is one, else the nearest).
+        A status's colour (#114, status_look, with its own `ascii_color`)
+        comes first. When `e` is disguised to `pov_team` (116), only the
+        disguise speaks: its `color` (and `ascii_color`), else the colour
+        of the team its `vars` give, else none (the real unit's colour
+        would give it away). Else its `color` var (a colour, or a formula
+        expression with self = the unit whose result is one; an unreadable
+        one falls through), else its team's colour (the match's team
+        colours, else the team's own name when it is a palette colour);
+        the unit's `ascii_color` var picks the text colour of either."""
+        what = f"`{self.entity_display_name(e, pov_team)}`" if text else ""
         if e.status:
             sc = self.status_look(e, pov_team).get("color")
             if sc is not None:
-                return sc[0]
+                if not text:
+                    return sc[0]
+                inst = e.status.get(sc[1])
+                return text_color_for(
+                    sc[0], self.status_field(inst, sc[1], "ascii_color"),
+                    f"{what} ({sc[1]})")
         dis = self._effective_disguise(e, pov_team)
         if dis is not None:
             dc = dis.get("color")
-            if isinstance(dc, str) and dc in TEXT_COLORS:
-                return dc
+            if color_ok(dc):
+                return text_color_for(dc, dis.get("ascii_color"), what) \
+                    if text else dc
             dvars = dis.get("vars")
             dteam = (dvars.get(e._team_var_name())
                      if isinstance(dvars, dict) else None)
-            return self._team_color(dteam)
+            return self._team_color(dteam, text=text)
+        own_ascii = e.vars.get("ascii_color")
         c = e.vars.get("color")
-        if isinstance(c, str) and c:
-            # A palette name, or a formula with self = the unit (and
-            # pov_team): red when wounded, green when poisoned.
+        if (isinstance(c, str) and c) or isinstance(c, list):
+            # A colour, or a formula with self = the unit (and pov_team):
+            # red when wounded, green when poisoned.
             got = self._resolve_color_value(c, {"pov_team": pov_team},
                                             target=e.id)
             if got is not None:
-                return got
-        return self._team_color(e.team)
+                return text_color_for(got, own_ascii, what) if text else got
+        if text and text_color_name(own_ascii) is not None \
+                and self._team_color(e.team) is not None:
+            return text_color_name(own_ascii)
+        return self._team_color(e.team, text=text,
+                                what=what or f"team `{e.team}`")
 
-    def _team_color(self, team: Any) -> Optional[str]:
-        """A team's colour: the match's team_colors entry, else the team's
-        own name when it is a palette colour; None for no team."""
+    def _team_color(self, team: Any, text: bool = False,
+                    what: str = "") -> Any:
+        """A team's colour: the match's team_colors entry (a colour, or
+        {"color", "ascii"} when `!map teamcolor ... ascii=` gave the text
+        map's colour), else the team's own name when it is a palette
+        colour; None for no team. With `text`, the palette name the text
+        map shows (text_color_for)."""
         if team is None or team == "":
             return None
         tc = self.team_colors.get(str(team))
-        if isinstance(tc, str) and tc in TEXT_COLORS:
-            return tc
-        return str(team) if str(team) in TEXT_COLORS else None
+        ascii_c = None
+        if isinstance(tc, dict):
+            ascii_c = tc.get("ascii")
+            tc = tc.get("color")
+        if color_ok(tc):
+            return text_color_for(tc, ascii_c, what or f"team `{team}`") \
+                if text else tc
+        name = text_color_name(str(team))
+        return name if name is not None and str(team) in TEXT_COLORS \
+            else None
 
     def body_team(self, e: "Entity") -> Optional[str]:
         """The team of `e`'s body root (a body part's is its root's), as
@@ -32684,19 +32951,20 @@ class Match:
         return self._legend_value(val, f"corpse: {name}")
 
     def _resolve_color_value(self, val: Any, extras: Dict[str, Any],
-                             target: Optional[str] = None) -> Optional[str]:
-        """Resolve a tile/zone `color` data value to a palette NAME or None.
-        A bare TEXT_COLORS name is a literal; anything else is treated as a
+                             target: Optional[str] = None) -> Any:
+        """Resolve a unit / tile / zone `color` value to a colour or None.
+        A colour of the grammar (W27: a palette or CSS name, #rgb /
+        #rrggbb, [r, g, b]) is a literal; anything else is treated as a
         formula EXPRESSION (evaluated with `extras` bound — tile_x/tile_y
-        for tiles, zone_name for zones) whose string result must itself be
-        a palette name. Malformed / non-palette results -> None (no color),
-        the same fail-safe stance as the visibility/block conditions."""
-        if val in (None, ""):
+        for tiles, zone_name for zones) whose result must itself be a
+        colour. Malformed / non-colour results -> None (no color), the same
+        fail-safe stance as the visibility/block conditions."""
+        if val is None or val == "":
             return None
-        if not isinstance(val, str):
-            val = str(val)
-        if val in TEXT_COLORS:
+        if color_ok(val):
             return val
+        if not isinstance(val, str):
+            return None
         from formula import FormulaEngine, EvalCtx, FormulaError
         try:
             res = FormulaEngine(self).eval_expression(
@@ -32704,36 +32972,52 @@ class Match:
                              extras=dict(extras)))
         except FormulaError:
             return None
-        res = str(res) if res is not None else ""
-        return res if res in TEXT_COLORS else None
+        if isinstance(res, tuple):
+            res = list(res)
+        return res if color_ok(res) else None
 
-    def tile_color(self, x: int, y: int, mp: "Map") -> Optional[str]:
-        """The resolved color name for the tile at (x, y) of map `mp`: its
+    def tile_color(self, x: int, y: int, mp: "Map",
+                   text: bool = False) -> Any:
+        """The resolved colour for the tile at (x, y) of map `mp`: its
         instance `color` data wins, else its template's `color`.
         Literal-or-formula (see _resolve_color_value). None when
-        unset/unresolved."""
+        unset/unresolved. With `text`, the palette name the text map shows
+        (its `ascii_color` data, else its template's, else the colour's
+        own or nearest name, W27)."""
         cell = mp.tiles.get((x, y))
         if not isinstance(cell, dict):
             return None
         val = cell.get("color")
-        if val in (None, ""):
-            tpl_name = cell.get("_template")
-            if isinstance(tpl_name, str):
-                tpl = self.tile_templates.get(tpl_name)
-                if tpl is not None:
-                    val = tpl.data.get("color")
-        return self._resolve_color_value(val, {"tile_x": x, "tile_y": y,
-                                                "tile_map": mp.name})
+        ascii_c = cell.get("ascii_color")
+        tpl_name = cell.get("_template")
+        tpl = self.tile_templates.get(tpl_name) \
+            if isinstance(tpl_name, str) else None
+        if val in (None, "") and tpl is not None:
+            val = tpl.data.get("color")
+        if text_color_name(ascii_c) is None and tpl is not None:
+            ascii_c = tpl.data.get("ascii_color")
+        got = self._resolve_color_value(val, {"tile_x": x, "tile_y": y,
+                                               "tile_map": mp.name})
+        if not text:
+            return got
+        return text_color_for(got, ascii_c, f"tile ({x},{y})") \
+            if got is not None else None
 
-    def zone_color(self, name: str, mp: "Map") -> Optional[str]:
-        """The resolved color name for zone `name` of map `mp` (its `color`
-        field, literal-or-formula), or None."""
+    def zone_color(self, name: str, mp: "Map", text: bool = False) -> Any:
+        """The resolved colour for zone `name` of map `mp` (its `color`
+        field, literal-or-formula), or None. With `text`, the palette name
+        the text map shows (its `ascii_color`, else the colour's own or
+        nearest name, W27)."""
         z = mp.zones.get(name)
         if not isinstance(z, dict):
             return None
-        return self._resolve_color_value(self.zone_look(z, "color"),
-                                         {"zone_name": name,
-                                          "zone_map": mp.name})
+        got = self._resolve_color_value(self.zone_look(z, "color"),
+                                        {"zone_name": name,
+                                         "zone_map": mp.name})
+        if not text:
+            return got
+        return text_color_for(got, self.zone_look(z, "ascii_color"),
+                              f"zone `{name}`") if got is not None else None
 
     # ---- sprite resolution (graphics render model) ------------------
     # Sprites are KEY strings stored in data, mirroring glyphs: a per-facing
@@ -32881,10 +33165,12 @@ class Match:
                     or (isinstance(v, (int, float))
                         and not isinstance(v, bool)))
         text = str(text if text is not None else name)[:NAME_TEXT_MAX]
-        color = pick("sprite_label_color", label_color_ok) or self.rules.get(
-            "name_text_color", "white")
-        bg = pick("sprite_label_background_color", label_color_ok) or \
-            self.rules.get("name_text_background_color", "black")
+        color = scene_color(pick("sprite_label_color", label_color_ok)
+                            or self.rules.get("name_text_color", "white"))
+        bg = scene_color(pick("sprite_label_background_color",
+                              label_color_ok)
+                         or self.rules.get("name_text_background_color",
+                                           "black"))
         # Per-unit overrides of the line-shaping rules (a bad value falls
         # back to the rule): carried under `_fit`, read and dropped by
         # _name_text_fit.
@@ -33569,14 +33855,42 @@ class Match:
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
+        # The colours this render shows as their nearest text colour, or
+        # can't read (W27), for the line under a coloured map.
+        notes: List[Tuple[str, str, Optional[str]]] = []
+        token = TEXT_COLOR_NOTES.set(notes)
         try:
-            return self._render_ascii_impl(pov_team, colorize, hidden,
-                                           viewport=viewport, legend=legend,
-                                           marks=marks, mark_glyph=mark_glyph,
-                                           coords=coords,
-                                           mp=mp or self.get_map())
+            out = self._render_ascii_impl(pov_team, colorize, hidden,
+                                          viewport=viewport, legend=legend,
+                                          marks=marks, mark_glyph=mark_glyph,
+                                          coords=coords,
+                                          mp=mp or self.get_map())
         finally:
+            TEXT_COLOR_NOTES.reset(token)
             self._vision_memo = prev
+        if colorize and notes and bool(self.rules.get(
+                "ascii_color_warnings", True)):
+            out += "\n" + self.text_color_warning(notes)
+        return out
+
+    def text_color_warning(self, notes: List[Tuple[str, str, Optional[str]]]
+                           ) -> str:
+        """The ascii_color_warnings line (W27): each colour the text map
+        showed as its nearest text colour, or couldn't read, once."""
+        seen: List[str] = []
+        for what, value, shown in notes:
+            part = (f"{what} {value} → {shown}" if shown is not None
+                    else f"{what} {value} (no colour)")
+            if part not in seen:
+                seen.append(part)
+        more = ""
+        if len(seen) > 8:
+            more = f", and {len(seen) - 8} more"
+            seen = seen[:8]
+        return ("⚠️ The text map shows colours it has no name for as the "
+                "nearest it has: " + "; ".join(seen) + more + ". An "
+                "`ascii_color` beside the colour picks the text colour "
+                "(the ascii_color_warnings rule turns this off).")
 
     def _render_ascii_impl(self, pov_team: Optional[str] = None,
                            colorize: bool = False,
@@ -33637,7 +33951,7 @@ class Match:
                 continue
             g = self.zone_glyph(zname, mp)
             has_glyph = g is not None
-            zc = self.zone_color(zname, mp)
+            zc = self.zone_color(zname, mp, text=True)
             if not has_glyph and zc is None:
                 continue
             lay = self.zone_draw_layer(z)
@@ -33663,7 +33977,7 @@ class Match:
                 continue
             glyph = self.tile_glyph(tx, ty, mp)
             has_glyph = glyph is not None
-            tc = self.tile_color(tx, ty, mp)
+            tc = self.tile_color(tx, ty, mp, text=True)
             if not has_glyph and tc is None:
                 continue
             lay = self.tile_draw_layer(data)
@@ -33702,7 +34016,7 @@ class Match:
             if not self.entity_visible_to(e.id, pov_team):
                 continue
             sym = self.entity_glyph(e, pov_team)
-            ecol = self.entity_color(e, pov_team)
+            ecol = self.entity_color(e, pov_team, text=True)
             for (cx, cy) in self.entity_cells(e):
                 if mp.in_bounds(cx, cy):
                     grid[cy][cx] = sym
@@ -33720,7 +34034,7 @@ class Match:
             if not self.entity_visible_to(e.id, pov_team):
                 continue
             sym = self.entity_glyph(e, pov_team)
-            ecol = self.entity_color(e, pov_team)
+            ecol = self.entity_color(e, pov_team, text=True)
             for (cx, cy) in self.entity_cells(e):
                 if mp.in_bounds(cx, cy):
                     grid[cy][cx] = sym
@@ -33742,7 +34056,7 @@ class Match:
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
                 sym = self.entity_glyph(e, pov_team)
-                ecol = self.entity_color(e, pov_team)
+                ecol = self.entity_color(e, pov_team, text=True)
                 for (cx, cy) in self.entity_cells(e):
                     if mp.in_bounds(cx, cy):
                         grid[cy][cx] = sym
@@ -34091,7 +34405,7 @@ class Match:
         # Per-entity override: a `sprite_layer` var wins over the pass default.
         eff_layer = self._coerce_layer(e.vars.get("sprite_layer"), layer)
         glyph = self.entity_glyph(e, pov_team)
-        tint = self.entity_color(e, pov_team)
+        tint = scene_color(self.entity_color(e, pov_team))
         overlays = self.entity_overlays(e, pov_team)
         effects = self.entity_sprite_effects(e, pov_team)
         # One placement per rectangle of the cells the unit covers: its body
@@ -34189,7 +34503,7 @@ class Match:
             sinfo = self.zone_sprite_info(zname, mp)
             spr, fh, fv = sinfo if sinfo else (None, False, False)
             g = self.zone_glyph(zname, mp)
-            tint = self.zone_color(zname, mp)
+            tint = scene_color(self.zone_color(zname, mp))
             if spr is None and g is None and tint is None:
                 continue
             z_layer = self.zone_draw_layer(z)
@@ -34212,7 +34526,7 @@ class Match:
             sinfo = self.tile_sprite_info(tx, ty, mp)
             spr, fh, fv = sinfo if sinfo else (None, False, False)
             g = self.tile_glyph(tx, ty, mp)
-            tint = self.tile_color(tx, ty, mp)
+            tint = scene_color(self.tile_color(tx, ty, mp))
             if spr is None and g is None and tint is None:
                 continue
             # Per-tile override: a `sprite_layer` data field wins over the rule.
@@ -34853,6 +35167,32 @@ class Match:
             name = ent.get("name", eid) if isinstance(ent, dict) else eid
         name = str(name).replace(UNIT_LINE_TAG, "")
         return f"{UNIT_LINE_TAG}#{self.id}|{eid}|{name}{UNIT_LINE_TAG}"
+
+    def action_actor_gone_line(self, actor_id: str, action_name: str,
+                               name_then: str, error: str) -> str:
+        """The action_actor_gone_message_format line for an action whose
+        body stopped on an error after `actor_id` died or left the match
+        (L61); "" when the rule is empty. `name_then` names a unit that
+        left no corpse."""
+        fmt = str(self.rules.get("action_actor_gone_message_format", "")
+                  or "")
+        if not fmt.strip():
+            return ""
+        e = self.entities.get(actor_id)
+        # Still in the match (a destroyed body part) or lying as a corpse:
+        # it died; neither: it left.
+        present = e is not None or self.find_corpse(actor_id) is not None
+        reason = "died" if present else "left the match"
+        extra = {"actor": actor_id, "action": action_name,
+                 "actor_name": (self.say_name(actor_id) if present
+                                else name_then),
+                 "reason": reason, "error": error}
+        if e is None:
+            return self.render_unit_message(fmt, actor_id, name_then, "", "",
+                                            {}, extra=extra)
+        return self.render_unit_message(fmt, actor_id, e.name, e.x, e.y,
+                                        e.vars, part_of=e.part_of or "",
+                                        extra=extra)
 
     def action_used_line(self, actor_id: str, action_name: str,
                          target: Any) -> str:
