@@ -3238,6 +3238,45 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "back; a transform keeps the unit, so it loses nothing."
         ),
     },
+    "status_definition_mode": {
+        "default": "warn",
+        "schema": {"type": "enum", "choices": ["off", "warn", "refuse"]},
+        "desc": (
+            "What applying a status that has no definition does (#534: "
+            "`!status apply hero brun` for burn applied a status with no "
+            "tick, hooks or modifiers, silently). 'warn' (default): it "
+            "applies and the command ends with one ⚠️ per status naming "
+            "it, with a close name from the match's definitions (the "
+            "suggestion_similarity rule). 'refuse': the application fails "
+            "(`!status apply` / `force`, status_apply / status_force); a "
+            "spawn, summon or give whose unit carries one is refused whole; "
+            "`!zone grant` / `!tile grant` (and their definition and system "
+            "forms) of one are refused, and a grant stored before is "
+            "skipped with a ⚠️. 'off': nothing is said. Raw edits (`!ent "
+            "status set`, status_set / status_add) aren't checked: statuses "
+            "without definitions stay a supported style."
+        ),
+    },
+    "data_warnings": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Warnings about engine-shaped data the engine can't use, each "
+            "a ⚠️ at the end of the command that wrote it, tagged as a line "
+            "about the unit (a team view that can't see it doesn't get "
+            "it): a `__` var whose name is a near miss of one the engine "
+            "reads (#483: `__reaction_mod` for `__reaction_mode`; the GM's "
+            "own `__` vars, hidden from players, aren't named); a value "
+            "under `actions`, `slots`, `modifiers` or `shields` the engine "
+            "can't read (#484: an unknown target type or reacts_on word, "
+            "an unknown modifier op, a seat capacity or shield amount that "
+            "isn't a number; a missing field is never named, since records "
+            "are built a field at a time); a unit arriving in a match (a "
+            "spawn, summon, give, `!ent copy` / `transfer`) whose actions, "
+            "passives or held records call `!func`s the match lacks "
+            "(#371). Off: none of them."
+        ),
+    },
     "status_default_duration_mode": {
         "default": "manual",
         "schema": {"type": "enum", "choices": ["manual", "auto"]},
@@ -9108,10 +9147,16 @@ class Passive:
     # global one: every unit; a team one: the team's) while it is there.
     # A bundle (list or object of named records), None = none.
     sprite_effects: Any = None
+    # #55: a disabled passive stays where it is (listed, saved, copied)
+    # and fires on nothing until enabled again; `fires_on`, which every
+    # fire site goes through, answers False for it.
+    enabled: bool = True
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not self.id.strip():
             raise VTTError("Passive id must be a non-empty string.")
+        if not isinstance(self.enabled, bool):
+            raise VTTError("Passive enabled must be true or false.")
         if self.sprite_effects is not None:
             check_sprite_effects(self.sprite_effects,
                                  f"Passive `{self.id}` sprite_effects")
@@ -9134,8 +9179,9 @@ class Passive:
             )
 
     def fires_on(self, hook: str) -> bool:
-        """Whether this passive listens to `hook` (one of its hooks)."""
-        return hook in self.hooks
+        """Whether this passive listens to `hook` (one of its hooks) and is
+        enabled (#55)."""
+        return self.enabled and hook in self.hooks
 
     @property
     def var_hooks(self) -> bool:
@@ -9185,6 +9231,8 @@ class Passive:
             d["extra_turns"] = self.extra_turns
         if self.sprite_effects is not None:
             d["sprite_effects"] = jcopy(self.sprite_effects)
+        if not self.enabled:
+            d["enabled"] = False
         return d
 
     @staticmethod
@@ -9202,6 +9250,7 @@ class Passive:
             extra_turns=(d.get("extra_turns")
                          if isinstance(d.get("extra_turns"), bool) else None),
             sprite_effects=jcopy(d.get("sprite_effects")),
+            enabled=d.get("enabled", True) is not False,
         )
 
 
@@ -9863,6 +9912,76 @@ _TAG_TOKEN_KEYS = frozenset({"removes", "blocked_by", "status_immune",
 # per the system whose vocabulary judges them (None = the command's own:
 # the channel's match's system, else the server's default). Set by
 # CommandRegistry._run_top only while a system of the server warns.
+# The `__` var names the engine reads on a unit (#483: a write of a near
+# miss of one is named; a GM's own `__` var, hidden from players, isn't).
+ENGINE_UNIT_VAR_KEYS: "frozenset[str]" = frozenset("__" + k for k in (
+    "follows", "part_located", "segment", "seg_last", "part_destroyed",
+    "seg_path", "part_region", "template", "removed", "status_redirect",
+    "status_immune", "size_total_mode", "size_parts_inherit",
+    "segment_removal_mode", "segment_follow", "segment_death_mode",
+    "segment_spacing", "segment_split_head_template",
+    "segment_self_collision", "death_condition", "death_mode",
+    "death_result", "reactions_while_hidden", "reaction_mode",
+    "reactions_per_window", "mount_on_vehicle_death", "mount_death_effect",
+    "map_vehicle_death_map", "map_vehicle_death_effect",
+    "map_vehicle_corpses", "map_vehicle_existing_corpses",
+    "cell_stackable", "watcher_sources", "watcher_sources_add",
+    "unit_tag_sources", "unit_tag_sources_add", "transform_mode",
+    "transform_keep_vars", "transform_form", "temp_hp_sources",
+    "team_private_vars", "private_vars", "private_container",
+    "status_resist_sources", "status_resist_sources_add",
+    "status_grant_sources", "status_grant_sources_add",
+    "sprite_effect_sources", "sprite_effect_sources_add",
+    "passive_sources", "passive_sources_add", "modifier_sources",
+    "modifier_sources_add", "roster_show", "source", "layers",
+    "zone_grant", "zone_linger", "zone_lingering", "zone_spec",
+    "delete_when_empty"))
+
+# The fields of an action record that hold formulas (#371 reads them).
+ACTION_FORMULA_KEYS: "frozenset[str]" = frozenset({
+    "body", "prepare", "cost", "condition", "affects", "target_condition",
+    "before", "after", "auto_when", "list_note"})
+
+# The warnings already given in the running top-level command (a ⚠️ said
+# once per command however often its cause repeats); None outside one.
+WARNED_ONCE: "contextvars.ContextVar[Optional[Set[Any]]]" = (
+    contextvars.ContextVar("vtt_warned_once", default=None))
+
+
+def warn_once(key: Any) -> bool:
+    """Whether a warning keyed `key` is still to be given in this command
+    (and mark it given). Always True outside a command."""
+    seen = WARNED_ONCE.get()
+    if seen is None:
+        return True
+    if key in seen:
+        return False
+    seen.add(key)
+    return True
+
+
+def near_names(token: str, pool: Any, threshold: int,
+               most: int = 3) -> List[str]:
+    """The names of `pool` at least `threshold`% similar to `token`
+    (difflib's ratio), closest first, at most `most`. Names that are
+    `token` apart from their digits (`hunter2` for `hunter3`) never count:
+    a typed digit is a choice, not a slip (user call)."""
+    import difflib as _dl
+    if threshold <= 0:
+        return []
+    low = str(token).lower()
+    bare = re.sub(r"\d", "", low)
+    scored = []
+    for name in dict.fromkeys(str(p) for p in pool):
+        nl = name.lower()
+        if nl == low or re.sub(r"\d", "", nl) == bare:
+            continue
+        r = _dl.SequenceMatcher(None, low, nl).ratio() * 100
+        if r >= threshold:
+            scored.append((-r, name))
+    return [n for _r, n in sorted(scored)[:most]]
+
+
 STORED_TAGS: "contextvars.ContextVar[Optional[Dict[Optional[str], Set[str]]]]" = (
     contextvars.ContextVar("vtt_stored_tags", default=None))
 
@@ -10154,6 +10273,8 @@ def watcher_spec_problem(spec: Any) -> Optional[str]:
         return "`effect` isn't a formula text"
     if not isinstance(spec.get("once", False), bool):
         return "`once` isn't true / false"
+    if not isinstance(spec.get("enabled", True), bool):
+        return "`enabled` isn't true / false"
     return None
 
 
@@ -10161,8 +10282,9 @@ def held_passive_spec(pid: str, spec: Any) -> Tuple[Optional["Passive"],
                                                      Optional[str]]:
     """A held passive record (#411, #208) as (Passive, None), or (None, why
     it can't be read): a dict with a `when` (one hook or several joined by
-    commas) and a `formula`, optional `priority`, `target`, `scope` and
-    `extra_turns`. Keys it doesn't know are left alone (a GM's notes)."""
+    commas) and a `formula`, optional `priority`, `target`, `scope`,
+    `extra_turns` and `enabled` (#55: false = held but silent). Keys it
+    doesn't know are left alone (a GM's notes)."""
     if not isinstance(spec, dict):
         return None, "isn't a dict {when, formula, ...}"
     if not isinstance(spec.get("when"), str) or not spec["when"].strip():
@@ -10174,7 +10296,8 @@ def held_passive_spec(pid: str, spec: Any) -> Tuple[Optional["Passive"],
                     target=spec.get("target", ""),
                     scope=spec.get("scope", "deep"),
                     priority=spec.get("priority", 0),
-                    extra_turns=spec.get("extra_turns"))
+                    extra_turns=spec.get("extra_turns"),
+                    enabled=spec.get("enabled", True))
     except VTTError as ex:
         return None, str(ex)
     return p, None
@@ -10233,6 +10356,8 @@ def held_passive_write_problem(path: str, value: Any, roots: List[str],
                     not isinstance(rec["extra_turns"], bool):
                 return (f"passive `{pid}`: extra_turns must be true or "
                         f"false.")
+            if "enabled" in rec and not isinstance(rec["enabled"], bool):
+                return f"passive `{pid}`: enabled must be true or false."
         except VTTError as ex:
             return f"passive `{pid}`: {ex}"
         f = rec.get("formula")
@@ -11891,6 +12016,13 @@ class Entity:
         # never gated by movement-block (mode=None), matching the
         # "spawn/summon are never block-gated" convention.
         match._validate_placement(self, x, y, None)
+        # #534: statuses no definition describes (refuse refuses the
+        # spawn; warn waits until the unit stands, to name it).
+        undefined = [] if REVIVING.get() else [
+            n for n in self.status if n not in match.status_definitions]
+        if undefined and str(match.rules.get(
+                "status_definition_mode", "warn")) == "refuse":
+            match.undefined_status(undefined[0])
 
         # --- Validate vital vars against game system ---
         hp_var = match.rules.get("hp_var", "hp")
@@ -11968,6 +12100,10 @@ class Entity:
                             x=self.x, y=self.y)
         # Fog memory: a freshly-spawned unit reveals cells for its team.
         match._record_vision(getattr(self, "team", None))
+        if not REVIVING.get() and self.id in match.entities:
+            for n in undefined:
+                match.undefined_status(n, self.id)
+            log += match.arrival_notes(self)
         return (self.id, log)
 
     def remove(self, *, despawn: bool = True,
@@ -12492,6 +12628,10 @@ class Entity:
                 self._match.formula_functions.keys())
             if bad:
                 raise VTTError(f"Writing '{path}' on `{self.id}`: {bad}")
+            # #483 / #484: engine-shaped data the engine can't use.
+            if self._match.rules.get("data_warnings", True):
+                self._match.surface_log(
+                    self._match.data_write_warnings(self, path, value))
         if self._match is not None:
             # A container whose marker was measured inside another
             # container (copied out of it) is re-measured on its own.
@@ -16400,6 +16540,149 @@ class Match:
                         per.append(src)
         return want
 
+    def grant_why(self, eid: str, sname: str) -> List[str]:
+        """#366: why unit `eid` holds status `sname` from a grant or not,
+        as lines: the instance now (its own, held by grants and which,
+        lingering), then every source that grants `sname` (zones on any
+        map, tiles under the body, items under its status_grant_sources
+        roots): whether it reaches the unit (the bodies rule, its
+        condition's result or error) and the level it gives; then, when
+        something grants it, what the application would meet (a part
+        redirect or immunity, immunity, blocked_by, full resistance)."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        out: List[str] = []
+        inst = e.status.get(sname)
+        if inst is None:
+            out.append(f"`{eid}` doesn't hold `{sname}`.")
+        else:
+            held = inst.get(ZONE_GRANT_KEY) if isinstance(inst, dict) \
+                else None
+            if inst.get(ZONE_LINGERING_KEY) if isinstance(inst, dict) \
+                    else False:
+                out.append(f"`{eid}` holds `{sname}`, lingering after its "
+                           f"grant ended (duration "
+                           f"{inst.get('duration')!r}).")
+            elif isinstance(held, list) and held:
+                out.append(f"`{eid}` holds `{sname}` from grants: "
+                           + ", ".join(f"`{h}`" for h in held) + ".")
+            else:
+                out.append(f"`{eid}` holds `{sname}` as its own status "
+                           f"(applied, not granted): grants never take it "
+                           f"over or remove it.")
+        errors: Dict[Any, Any] = {}
+        reach: List[str] = []
+        lines: List[str] = []
+        if not self._grant_eligible(e):
+            lines.append(f"- `{eid}` can't hold a grant now (dead, or a "
+                         f"rider hidden in its vehicle).")
+        # Zones, on every map.
+        for mp in self.maps.values():
+            for zname in sorted(mp.zones):
+                z = mp.zones.get(zname)
+                g = self.zone_grants_of(z).get(sname) if isinstance(
+                    z, dict) else None
+                if g is None:
+                    continue
+                lv = g.get("level", 1)
+                head = f"- zone `{zname}` (level {lv}"
+                if g.get("linger"):
+                    head += f", linger {g['linger']}"
+                head += ")"
+                if e.map != mp.name:
+                    lines.append(f"{head}: on map `{mp.name}`, not this "
+                                 f"unit's.")
+                    continue
+                bodies = self.zone_grant_setting(z, "grant_bodies")
+                targets = self._zone_grant_targets(
+                    mp, z.get("cells") or (), bodies)
+                if eid not in targets:
+                    lines.append(f"{head}: doesn't cover it (grant_bodies "
+                                 f"{bodies}"
+                                 + (": the body root holds it" if
+                                    bodies == "root" and e.part_of else "")
+                                 + ").")
+                    continue
+                cond = self.zone_grant_setting(z, "grant_condition")
+                if cond is not None:
+                    ok = self._grant_condition_holds(cond, eid, zname, mp,
+                                                     errors)
+                    err = errors.get(zname)
+                    if not ok:
+                        lines.append(
+                            f"{head}: covers it; grant_condition "
+                            f"`{formula_text(cond)}` "
+                            + (f"errors ({err[0]}): read as not met."
+                               if err else "is false."))
+                        continue
+                    lines.append(f"{head}: covers it and grant_condition "
+                                 f"`{formula_text(cond)}` holds.")
+                else:
+                    lines.append(f"{head}: covers it.")
+                reach.append(zname)
+        # Tiles under the body.
+        mp = self.maps.get(e.map)
+        if mp is not None:
+            for (x, y) in self.entity_cells(e):
+                g = self.tile_grants_of(mp, x, y).get(sname)
+                if g is None:
+                    continue
+                src = self.tile_grant_source(mp, x, y)
+                head = f"- tile ({x},{y}) (level {g.get('level', 1)})"
+                bodies = self.tile_grant_setting(mp, x, y, "grant_bodies")
+                if bodies == "root" and e.part_of:
+                    lines.append(f"{head}: grant_bodies root: the body root "
+                                 f"holds it.")
+                    continue
+                cond = self.tile_grant_setting(mp, x, y, "grant_condition")
+                if cond is not None and not self._grant_condition_holds(
+                        cond, eid, src, mp, errors,
+                        extras={"tile_x": x, "tile_y": y,
+                                "tile_map": mp.name}):
+                    err = errors.get(src)
+                    lines.append(f"{head}: under it; grant_condition "
+                                 f"`{formula_text(cond)}` "
+                                 + (f"errors ({err[0]})." if err
+                                    else "is false."))
+                    continue
+                lines.append(f"{head}: under it" + (
+                    " and its grant_condition holds." if cond is not None
+                    else "."))
+                reach.append(src)
+        # Items and class (status_grant_sources).
+        for path, entry in self.held_status_grants(e).get(sname, []):
+            lines.append(f"- item `{path}` (level {entry.get('level', 1)}): "
+                         f"held by it.")
+            reach.append(HELD_GRANT_PREFIX + path)
+        if not lines:
+            out.append(f"Nothing grants `{sname}` (no zone, tile under it "
+                       f"or item of `{eid}`).")
+            return out
+        out.append(f"Sources granting `{sname}`:")
+        out.extend(lines)
+        if not reach:
+            return out
+        if e.is_part and sname in self._part_status_names(
+                e, "__status_redirect", "part_status_redirect"):
+            out.append(f"A part redirects `{sname}` to its parent "
+                       f"(part_status_redirect): `{e.part_of}` gets it.")
+            return out
+        if e.is_part and sname in self._part_status_names(
+                e, "__status_immune", "part_status_immune"):
+            out.append(f"The part is immune to `{sname}` "
+                       f"(part_status_immune).")
+            return out
+        best = self._grant_source(reach, sname, eid)
+        lv = self._grant_entry(eid, best, sname).get("level") if best \
+            else None
+        lv = lv if isinstance(lv, int) and not isinstance(lv, bool) else None
+        block = self.status_apply_block_reason(eid, sname, lv)
+        out.append(f"The application is refused: {block}." if block else
+                   f"It applies (from `{best}`"
+                   + (f", level {lv}" if lv is not None else "") + ").")
+        return out
+
     def _grant_linger(self, zones: List[str], status: str,
                       eid: str = "") -> int:
         """The linger of the zone whose grant of `status` the unit holds
@@ -20132,6 +20415,26 @@ class Match:
     # read with self = the holder. A unit read for the first time records
     # its reading without firing, as `!watch add` does.
 
+    def set_watcher_enabled(self, name: str, on: bool) -> bool:
+        """#55: switch match watcher `name` off (kept, not read) or on
+        (armed again from the condition's value now, as add_watcher arms a
+        new one, so one already true fires only after turning false and
+        true again; units a `once_each` watcher spent stay spent). Returns
+        whether it changed; NotFound for a missing watcher."""
+        w = self.watchers.get(name)
+        if w is None:
+            raise NotFound(f"no watcher `{name}`.")
+        if (w.get("enabled") is not False) == on:
+            return False
+        if not on:
+            w["enabled"] = False
+            return True
+        spent = list(w.get("spent") or [])
+        self.add_watcher(name, **watcher_add_args(w))
+        if spent:
+            self.watchers[name]["spent"] = spent
+        return True
+
     def add_watcher(self, name: str, condition: str, effect: str, *,
                     once: bool = False, once_each: bool = False,
                     each: bool = False, tag: Any = None) -> bool:
@@ -20578,6 +20881,8 @@ class Match:
         # number of polls (X17).
         slots: List[Tuple[str, str, "Entity", Any]] = []
         for name, w in list(self.watchers.items()):
+            if w.get("enabled") is False:
+                continue            # #55: kept, not read
             cond = str(w.get("condition", "") or "")
             eff = str(w.get("effect", "") or "")
             if not w.get("each"):
@@ -20595,7 +20900,9 @@ class Match:
                 slots.append(("each", name, e, w))
         for e in alive:
             for src, wname, spec, problem in self.held_watchers(e):
-                if problem is None:
+                # A held watcher with `enabled: false` (#55) isn't read and
+                # keeps no state, so turned on again it is first seen.
+                if problem is None and spec.get("enabled", True) is not False:
                     slots.append(("held", json.dumps([e.id, src, wname]), e,
                                   (src, wname, spec)))
         n = len(slots)
@@ -23977,6 +24284,8 @@ class Match:
         self.turns_elapsed += 1
         self._note_actor()
         self._fire_reminders()
+        if any(s.get("kind") == "clock" for s in self.scheduled):
+            self.surface_log(self.fire_scheduled_clock())
         # The round's autosave comes with its first turn (T12): restoring it
         # shows that unit's turn under way, its turn-start effects run, as
         # the turn autosave of the same moment does. Taken before the turn
@@ -24500,6 +24809,123 @@ class Match:
             return str(cur)
         return self._ROUND_FMT_RE.sub(sub, fmt)
 
+    def turn_why(self, eid: str, shows: Any = None,
+                 read: Any = None) -> List[str]:
+        """#367: why `eid` sits where it does in the turn order, as lines:
+        out of the order (and why), its slot, whether it acted this round,
+        the initiative and the rules that sort it (direction, team grouping
+        with its team's score, the tiebreak var, the tiebreaker) and the
+        units it ties with, a deferred change waiting for the wrap, queued
+        extra turns and the statuses that skip its turns; under ATB its bar,
+        rate and threshold. `shows(unit_id)` says whether the reader may see
+        a unit (tied units it can't see are left out); `read(unit, path)`
+        gives a var's value as the reader may read it (privacy)."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        seen = shows or (lambda _u: True)
+
+        def rv(x: "Entity", path: str) -> Any:
+            if read is not None:
+                return read(x, path)
+            cur: Any = x.vars
+            for seg in path.split("."):
+                cur = cur.get(seg) if isinstance(cur, dict) else None
+            return cur
+        ivar = str(self.rules.get("turnorder_var", "initiative"))
+        out: List[str] = []
+        atb = bool(self.rules.get("atb_enabled"))
+        if eid not in self.turn_order:
+            why = ("it is dead" if not e.is_alive else
+                   f"it has no `{ivar}` (its initiative)"
+                   if e.initiative is None else
+                   "it rides another unit's clock (an attached part)"
+                   if e.part_of else "it isn't placed yet")
+            out.append(f"`{eid}` isn't in the turn order: {why}.")
+        else:
+            i = self.turn_order.index(eid)
+            cur = self.current_entity_id()
+            out.append(f"`{eid}` is turn slot {i + 1} of "
+                       f"{len(self.turn_order)}"
+                       + (" (its turn now)" if cur == eid else "") + ".")
+            if not atb and self.round_started and cur != eid:
+                out.append("It has had its turn this round."
+                           if eid in self.round_acted else
+                           "It hasn't had its turn this round yet.")
+        if atb:
+            out.append(
+                f"ATB: bar `{self.rules.get('atb_charge_var', 'atb_charge')}`"
+                f" = {self._atb_clean_num(self._atb_charge(e))}, rate "
+                f"{self._atb_clean_num(self._atb_charge_rate(e))} per tick "
+                f"(atb_charge_formula), threshold "
+                f"{self._atb_clean_num(self._atb_threshold_value())}: the "
+                f"bar that fills soonest acts (ties: higher rate, then id).")
+        elif e.initiative is not None:
+            direction = str(self.rules.get("turnorder_direction",
+                                           "highest_first"))
+            out.append(f"Initiative (`{ivar}`) {rv(e, ivar)}; "
+                       f"turnorder_direction {direction}.")
+            grouping = str(self.rules.get("turnorder_team_grouping", "none"))
+            if grouping != "none":
+                mates = [x for x in self.entities.values()
+                         if x.team == e.team and x.initiative is not None
+                         and x.is_alive]
+                if e.team in (None, "") or not mates:
+                    out.append(
+                        f"turnorder_team_grouping {grouping}: it has no team, "
+                        f"so turnorder_teamless_position "
+                        f"{self.rules.get('turnorder_teamless_position', 'interleaved')}"
+                        f" places it.")
+                else:
+                    inits = [x.initiative for x in mates]
+                    score = (sum(inits) / len(inits)
+                             if grouping == "average_per_team" else
+                             min(inits) if direction == "lowest_first"
+                             else max(inits))
+                    hidden = any(rv(x, ivar) != x.initiative for x in mates)
+                    out.append(f"turnorder_team_grouping {grouping}: team "
+                               f"`{e.team}` sorts as "
+                               + ("its members' initiative"
+                                  if hidden else f"{score:g}")
+                               + f" ({len(mates)} member(s)).")
+            ties = [x.id for x in self.entities.values()
+                    if x.id != eid and x.initiative == e.initiative
+                    and x.is_alive and x.id in self.turn_order and seen(x.id)
+                    # under team grouping the teams' slots order units of
+                    # other teams, so a tie decides only within a team
+                    and (grouping == "none" or x.team == e.team)]
+            tb_var = str(self.rules.get("turnorder_tiebreak_var", "") or "")
+            tiebreaker = str(self.rules.get("turnorder_tiebreaker", "name"))
+            if ties:
+                tb = ""
+                if tb_var:
+                    cur_v = rv(e, tb_var)
+                    tb = (f"turnorder_tiebreak_var `{tb_var}` = "
+                          f"{cur_v!r} ("
+                          f"{self.rules.get('turnorder_tiebreak_direction', 'highest_first')}"
+                          f"), then ")
+                out.append(f"It ties on initiative with "
+                           + ", ".join(f"`{t}`" for t in ties)
+                           + f": {tb}turnorder_tiebreaker {tiebreaker} "
+                             f"decides.")
+            policy = str(self.rules.get("turnorder_change_policy", "live"))
+            if self._turn_order_dirty:
+                out.append(f"turnorder_change_policy {policy}: a change "
+                           f"waits; the order re-sorts at the round's end.")
+            elif policy == "live" and not atb:
+                out.append("turnorder_change_policy live: the next turn is "
+                           "the first unit in this order that hasn't acted.")
+        queued = sum(1 for x in self.extra_turns if x == eid)
+        if queued:
+            out.append(f"{queued} extra turn(s) queued for it (they run "
+                       f"after the turn under way ends).")
+        skips = self._skipping_statuses(e)
+        if skips:
+            out.append("Its turns are skipped while it holds: "
+                       + ", ".join(f"`{n}`" for n in skips)
+                       + " (skips_turn).")
+        return out
+
     def _skipping_statuses(self, e: "Entity") -> List[str]:
         """Names of `e`'s statuses whose data dict carries
         `skips_turn: True`. Returns [] when no status causes a skip.
@@ -24594,6 +25020,66 @@ class Match:
                     self._advance_index(log)
             steps += 1
         return False
+
+    def clamp_why(self, eid: str, path: str) -> List[str]:
+        """#487: the clamp on `eid`'s `path`, as lines: which level holds
+        it (the unit's own, else the system's default_clamps; a unit clamp
+        shadows the system's), each bound's current value (a var path
+        that is missing or not a number is no bound), the value now and
+        whether a soft clamp is dormant (the value already past a bound:
+        writes there aren't pulled back until it returns)."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        err = derived_clamp_error(path, self.rules)
+        if err:
+            return [f"No clamp applies: {err}"]
+        own = e.clamps.get(path)
+        sysc = None
+        for spec in self.rules.get("default_clamps", []) or []:
+            if isinstance(spec, dict) and spec.get("path") == path:
+                try:
+                    sysc = ClampSpec.from_dict(spec)
+                except VTTError:
+                    pass
+                break
+        c = own or sysc
+        cur: Any = e.vars
+        for seg in path.split("."):
+            cur = cur.get(seg) if isinstance(cur, dict) else None
+        if c is None:
+            return [f"No clamp on `{eid}`.{path} (unit or system "
+                    f"default_clamps); it is {cur!r}."]
+        out = [f"`{eid}`.{path} = {cur!r}; clamped by "
+               + ("its own clamp (`!clamp`)"
+                  + (", which shadows the system's default" if sysc else "")
+                  if own else "the system's default_clamps (`!gclamp`)")
+               + f", mode {c.mode}."]
+        vals = {}
+        for side in ("max", "min"):
+            b = getattr(c, side)
+            if b is None:
+                continue
+            v = _resolve_clamp_bound(b, e.vars)
+            vals[side] = v
+            src = f"`{b}` = {v!r}" if isinstance(b, str) else f"{b!r}"
+            out.append(f"{side}: {src}"
+                       + (" (no bound: missing or not a number)"
+                          if v is None else ""))
+        if isinstance(cur, (int, float)) and not isinstance(cur, bool):
+            past = [side for side, v in vals.items() if v is not None and (
+                (side == "max" and cur > v) or (side == "min" and cur < v))]
+            if past:
+                out.append(("Dormant: the value is already past its "
+                            + " and ".join(past) + "; a soft clamp only "
+                            "engages on a write crossing from the legal "
+                            "side.") if c.mode == "soft" else
+                           ("Past its " + " and ".join(past) + " (set "
+                            "without a write: the next write clamps it)."))
+            else:
+                out.append("Within its bounds: a write past one is held "
+                           "there.")
+        return out
 
     def _effective_clamp(self, entity: "Entity", path: str) -> Optional["ClampSpec"]:
         """Return the clamp that applies to `path` on this entity, or None.
@@ -26107,6 +26593,171 @@ class Match:
         return (f"`{name}` can't affect units with tags {shown} "
                 f"(`{e.id}`: {', '.join(seen) or 'none'})")
 
+    def data_write_warnings(self, e: "Entity", path: str,
+                            value: Any) -> List[str]:
+        """The data_warnings lines for writing `value` at `path` on `e`:
+        a `__` key that is a near miss of one the engine reads (#483), a
+        value under `actions`, `slots`, `modifiers` or a shield root the
+        engine can't read (#484). Each said once per command, tagged as a
+        line about `e`. A missing field is never named (records are built
+        a field at a time)."""
+        from action import ALLOWED_TARGET_TYPES, REACTS_ON
+        leaves: List[Tuple[List[str], Any]] = []
+        keys: List[str] = [k for k in path.split(".") if k.startswith("__")]
+        budget = [2000]
+
+        def walk(segs: List[str], v: Any, depth: int) -> None:
+            if budget[0] <= 0 or depth > STORE_DEPTH_LIMIT:
+                return
+            budget[0] -= 1
+            if isinstance(v, dict) and isinstance(v.get("vars"), dict) \
+                    and "status" in v:
+                return      # a stored unit snapshot: checked when it arrives
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    if isinstance(k, str) and k.startswith("__"):
+                        keys.append(k)
+                    walk(segs + [str(k)], x, depth + 1)
+            else:
+                leaves.append((segs, v))
+
+        walk(path.split("."), value, 0)
+        out: List[str] = []
+        sim = self._similarity()
+        for k in dict.fromkeys(keys):
+            if k in ENGINE_UNIT_VAR_KEYS:
+                continue
+            near = near_names(k, ENGINE_UNIT_VAR_KEYS, sim, 1)
+            if near and warn_once(("dunder", self.id, e.id, k)):
+                out.append(f"⚠️ `{e.id}`: `{k}` isn't a var the engine "
+                           f"reads; did you mean `{near[0]}`? (data_warnings)")
+        ov = e.vars.get("__temp_hp_sources")
+        raw = ov if (isinstance(ov, str) and ov.strip()) \
+            else self.rules.get("temp_hp_sources", "shields")
+        shield_roots = {r.strip() for r in str(raw).split(",") if r.strip()}
+
+        def num(v: Any) -> bool:
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+        for segs, v in leaves:
+            field, where = segs[-1], ".".join(segs)
+            prob = None
+            if "actions" in segs:
+                i = len(segs) - 1 - segs[::-1].index("actions")
+                if len(segs) == i + 3:
+                    if field == "target" and v not in ALLOWED_TARGET_TYPES:
+                        prob = (f"`{v}` isn't a target type ("
+                                f"{', '.join(sorted(ALLOWED_TARGET_TYPES))})")
+                    elif field == "reacts_on" and v not in REACTS_ON:
+                        prob = (f"reacts_on is {' / '.join(REACTS_ON)}, "
+                                f"not `{v}`")
+            if prob is None and "modifiers" in segs and field == "op" \
+                    and v not in MODIFIER_OPS:
+                prob = (f"`{v}` isn't a modifier op "
+                        f"({', '.join(MODIFIER_OPS)}); it folds as add")
+            if prob is None and len(segs) == 3 and segs[0] == "slots" \
+                    and field == "capacity" and not num(v):
+                prob = "a seat's capacity is a number"
+            if prob is None and len(segs) == 3 and segs[0] in shield_roots \
+                    and field in ("amount", "priority") and not num(v):
+                prob = f"a shield's {field} is a number"
+            if prob and warn_once(("data", self.id, e.id, where)):
+                out.append(f"⚠️ `{e.id}`.{where}: {prob}; the engine "
+                           f"can't use it (data_warnings).")
+        tag = self.unit_tag(e.id)
+        return [tag + ln for ln in out]
+
+    def unit_formula_texts(self, e: "Entity") -> List[Tuple[str, str]]:
+        """(where, formula text) of every formula `e` carries in its own
+        data: its passives, the passives and watchers it holds, and the
+        actions in its vars (#371)."""
+        out: List[Tuple[str, str]] = []
+        for pid, p in e.passives.items():
+            out.append((f"passive {pid}", p.formula))
+        for src, pid, spec, _prob, _st in self.held_passive_entries(e):
+            if isinstance(spec, dict) and isinstance(spec.get("formula"), str):
+                out.append((f"{src} passive {pid}", spec["formula"]))
+        for src, wname, spec, _prob in self.held_watchers(e):
+            if isinstance(spec, dict):
+                for k in ("condition", "effect"):
+                    if isinstance(spec.get(k), str):
+                        out.append((f"{src} watcher {wname}", spec[k]))
+
+        def walk(node: Any, path: str, depth: int) -> None:
+            if not isinstance(node, dict) or depth > STORE_DEPTH_LIMIT:
+                return
+            acts = node.get("actions")
+            if isinstance(acts, dict):
+                for an, rec in acts.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    for k in ACTION_FORMULA_KEYS:
+                        if isinstance(rec.get(k), str):
+                            out.append((f"{path}actions.{an}.{k}", rec[k]))
+            for k, v in node.items():
+                if k != "actions" and isinstance(v, dict) \
+                        and not str(k).startswith("__"):
+                    walk(v, f"{path}{k}.", depth + 1)
+        walk(e.vars, "", 0)
+        return out
+
+    def arrival_notes(self, e: "Entity") -> List[str]:
+        """#371: a ⚠️ naming the `!func`s unit `e`'s formulas call that this
+        match lacks (data_warnings), tagged as a line about it."""
+        if not self.rules.get("data_warnings", True) or e.id not in \
+                self.entities:
+            return []
+        from formula import unknown_calls
+        known = frozenset(self.formula_functions)
+        missing: Dict[str, str] = {}
+        for where, src in self.unit_formula_texts(e):
+            for fn in unknown_calls(src, known):
+                missing.setdefault(fn, where)
+        if not missing or not warn_once(("arrival", self.id, e.id,
+                                         tuple(sorted(missing)))):
+            return []
+        return [self.unit_tag(e.id)
+                + f"⚠️ `{e.id}` calls function(s) this match has no `!func` "
+                  f"for: " + ", ".join(f"`{fn}` ({w})"
+                                       for fn, w in missing.items())
+                + "; those formulas fail until one is defined "
+                  "(data_warnings)."]
+
+    def _similarity(self) -> int:
+        try:
+            return max(0, min(100, int(self.rules.get(
+                "suggestion_similarity", 75))))
+        except (TypeError, ValueError):
+            return 75
+
+    def undefined_status(self, name: str, eid: Optional[str] = None,
+                         grant: bool = False) -> bool:
+        """#534: status `name` has no definition on this match. Under the
+        status_definition_mode rule: off, nothing; warn, one ⚠️ per status
+        per command (tagged as a line about unit `eid`), naming a close
+        definition; refuse, VTTError (a grant, `grant`, isn't refused at
+        its settle: it is skipped with the ⚠️). Returns whether the caller
+        should skip the application (a refused grant)."""
+        if name in self.status_definitions:
+            return False
+        mode = str(self.rules.get("status_definition_mode", "warn"))
+        if mode == "off":
+            return False
+        near = near_names(name, self.status_definitions, self._similarity())
+        hint = (" (did you mean " + " / ".join(f"`{n}`" for n in near)
+                + "?)") if near else ""
+        if mode == "refuse" and not grant:
+            raise VTTError(f"`{name}` has no status definition{hint}; "
+                           f"status_definition_mode refuse refuses it "
+                           f"(`!status def {name}` defines it).")
+        if warn_once(("status_def", name)):
+            what = ("a grant of it was skipped (status_definition_mode "
+                    "refuse)" if mode == "refuse" else "applied as it is")
+            on = f" (on `{eid}`)" if eid else ""
+            line = (f"⚠️ `{name}`{on} has no status definition{hint}: "
+                    f"{what} (status_definition_mode).")
+            self.surface_log([self.unit_tag(eid) + line if eid else line])
+        return mode == "refuse"
+
     def status_apply_block_reason(self, eid: str, name: str,
                                   level: Optional[int] = None,
                                   duration: Optional[int] = None,
@@ -26194,6 +26845,11 @@ class Match:
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
+        # #534: an application of a status no definition describes (a
+        # grant: report_block False).
+        if name not in self.status_definitions and self.undefined_status(
+                name, eid, grant=not report_block):
+            return []
         # Body-part status rules: a part can be immune to some statuses
         # (no-op) or redirect them to its parent (per-entity DoT). Raw
         # `!ent status` editing bypasses this — only the apply path honors it.
@@ -28054,7 +28710,9 @@ class Match:
                            f"spawn` it. Only partials are given to a unit.")
         value = self.template_materialize({TEMPLATE_MARKER: name})
         with template_route("give"):
-            return e.write_var(path, value)
+            log = e.write_var(path, value)
+        # #371: what the given container calls that the match lacks.
+        return log + self.arrival_notes(e)
 
     def template_containers(self, e: "Entity") -> List[Tuple[str, Dict[str, Any]]]:
         """(path, marker) of every marked container in e's vars, outermost
@@ -29191,6 +29849,71 @@ class Match:
         return killed, log
 
     # ---------- locational damage: routing + part death ----------
+    def alive_why(self, eid: str) -> List[str]:
+        """#408: why `eid` counts as alive or not and what would kill it,
+        as lines: the alive_condition rule (or the built-in test) and its
+        result, the vitals, the effective death condition (rule, a
+        per-unit `__death_condition` and the mode joining them) and its
+        result now, indestructibility and why, a body part's destroyed
+        latch, a death check held by a death under way, death_result."""
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        hp_var, mhp_var, _ = e._vital_var_names()
+
+        def ev(src: str) -> str:
+            try:
+                return repr(FormulaEngine(self).eval_expression(
+                    src, EvalCtx(this=self.current_entity_id(),
+                                 target=eid)))
+            except FormulaError as ex:
+                return f"error: {ex}"
+
+        out = [f"`{eid}` is {'alive' if e.is_alive else 'NOT alive'}; "
+               f"`{hp_var}` {e.vars.get(hp_var)!r} / `{mhp_var}` "
+               f"{e.vars.get(mhp_var)!r}."]
+        cond = str(self.rules.get("alive_condition", "") or "").strip()
+        if cond:
+            out.append(f"alive_condition `{formula_text(cond)}` → "
+                       f"{ev(cond)} (an error falls back to the built-in "
+                       f"test).")
+        else:
+            out.append(f"alive_condition is empty: the built-in test is "
+                       f"`{hp_var}` > 0, or indestructible.")
+        ind = self.is_indestructible(e)
+        if ind:
+            why = ("its `indestructible` var" if "indestructible" in e.vars
+                   else "part_indestructible_default"
+                   if self.rules.get("part_indestructible_default")
+                   else f"a body part with `{mhp_var}` 0 (a pass-through)")
+            out.append(f"Indestructible ({why}): the automatic death "
+                       f"check skips it; kill(), a cascade or a destroyed "
+                       f"limb's hit end it.")
+        dcond, mode = self._effective_death_condition(e)
+        own = e.vars.get("__death_condition")
+        src = ("the death_condition rule" if not (isinstance(own, str)
+                                                  and own.strip())
+               else f"the rule and its own `__death_condition` "
+                    f"({mode})")
+        out.append(f"Death condition ({src}): `{formula_text(dcond)}` → "
+                   f"{ev(dcond)}.")
+        if e.part_of:
+            out.append("Destroyed (body part latch `__part_destroyed`): "
+                       + ("yes; a heal above 0 clears it."
+                          if e.vars.get("__part_destroyed") else "no."))
+        if eid in self._dying_ids:
+            out.append("Its death is running now.")
+        elif eid in self._death_recheck:
+            out.append("A death check for it is held until the death under "
+                       "way finishes.")
+        elif eid in self._death_check_deferred_ids:
+            out.append("Its death check is deferred to the end of the write "
+                       "under way.")
+        out.append(f"On death it leaves: {self._effective_death_result(e)} "
+                   f"(death_result / `__death_result`).")
+        return out
+
     def is_indestructible(self, e: "Entity") -> bool:
         """True when `e` cannot die on its own: its `indestructible` var
         (default from part_indestructible_default), OR it's a body part
@@ -31577,7 +32300,7 @@ class Match:
             return out
         old, new = norm(old_specs), norm(new_specs)
         ids = sorted(set(old) | set(new))
-        counts = {pid: [0, 0] for pid in ids}    # [put on / replaced, taken off]
+        counts = {pid: [0, 0, 0] for pid in ids}  # [put on, taken off, updated]
 
         def changed(passives: Dict[str, Any], getd) -> bool:
             """Apply the diff to one passives dict (id -> Passive or dict)."""
@@ -31600,7 +32323,7 @@ class Match:
                     counts[pid][1] += 1
                 else:
                     passives[pid] = n
-                    counts[pid][0] += 1
+                    counts[pid][2] += 1
                 hit = True
             return hit
 
@@ -31628,10 +32351,14 @@ class Match:
                 mp.corpse_changed(cid)
         notes = []
         for pid in ids:
-            put, off = counts[pid]
+            put, off, upd = counts[pid]
             if put:
                 notes.append(f"default passive `{pid}` put on {put} "
                              f"unit(s) and corpse(s) already here")
+            if upd:
+                notes.append(f"default passive `{pid}` updated on {upd} "
+                             f"unit(s) and corpse(s) whose copy was the "
+                             f"default")
             if off:
                 notes.append(f"default passive `{pid}` taken off {off} "
                              f"unit(s) and corpse(s)")
@@ -31655,8 +32382,8 @@ class Match:
             raise VTTError("schedule: body cannot be empty.")
         try:
             validate_program(
-                src, known_funcs=frozenset(self.formula_functions.keys())
-            )
+                src, known_funcs=frozenset(self.formula_functions.keys()),
+                attr_roots=frozenset({"args"}))
         except FormulaError as ex:
             raise VTTError(f"schedule: invalid body: {ex}")
         return src
@@ -31672,43 +32399,128 @@ class Match:
             if nm not in taken:
                 return nm
 
+    @staticmethod
+    def _schedule_extras(fname: str, every: Any, times: Any,
+                         args: Any) -> Dict[str, Any]:
+        """The optional fields of a schedule entry: `every` (#458: fire
+        again that many rounds / turns after each firing, until cancelled),
+        `times` (how many firings in all; needs `every`) and `args` (a
+        dict of JSON values the body reads as `args.<key>`, captured now)."""
+        out: Dict[str, Any] = {}
+        for label, v in (("every", every), ("times", times)):
+            if v is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise VTTError(f"{fname}: {label} must be a whole number of "
+                               f"at least 1.")
+        if times is not None and every is None:
+            raise VTTError(f"{fname}: times= needs every= (a schedule fires "
+                           f"once without it).")
+        if every is not None:
+            out["every"] = int(every)
+            if times is not None:
+                out["times_left"] = int(times)
+        if args is not None:
+            if not isinstance(args, dict):
+                raise VTTError(f"{fname}: args must be a dict of values.")
+            out["args"] = _own_value(args)
+        return out
+
+    @staticmethod
+    def schedule_self_note(src: str, what: str) -> Optional[str]:
+        """A ⚠️ when a match-level schedule's body names `self`, which
+        nothing binds there (the unit whose turn begins is `current`; a
+        unit the body needs rides in `args`)."""
+        import ast as _ast
+        try:
+            tree = _ast.parse(src, mode="exec")
+        except SyntaxError:
+            return None
+        if any(isinstance(n, _ast.Name) and n.id == "self"
+               for n in _ast.walk(tree)):
+            return (f"⚠️ {what}: its body names `self`, which a match-level "
+                    f"schedule doesn't bind; use `current` (the unit whose "
+                    f"turn it is) or pass the unit in args= "
+                    f"(`entity[args.unit]`).")
+        return None
+
     def add_scheduled(self, delay: Any, body: Any,
-                      name: Optional[str] = None) -> str:
-        """Queue a MATCH-level effect to fire at on_round_start once
-        round_number has advanced by `delay` rounds (delay>=1; delay=1
-        fires at the start of the next round). The body runs with no
-        `self` bound (use explicit ids or `this`). Returns the schedule
+                      name: Optional[str] = None, *, every: Any = None,
+                      times: Any = None, args: Any = None,
+                      clock: str = "rounds") -> str:
+        """Queue a MATCH-level effect. clock `rounds`: it fires at
+        on_round_start once round_number has advanced by `delay` rounds
+        (delay>=1; delay=1 fires at the start of the next round). clock
+        `turns` (#491): it fires as a turn begins once `delay` turn
+        boundaries have passed (turns_elapsed; ATB too). The body runs with
+        no `self` bound (use explicit ids, `this` / `current`, or `args`).
+        `every` / `times` / `args`: _schedule_extras. Returns the schedule
         name (a generated one if `name` is falsy). Raises VTTError on a
         bad delay or body."""
+        if clock not in ("rounds", "turns"):
+            raise VTTError(f"schedule: clock is `rounds` or `turns`, got "
+                           f"`{clock}`.")
+        unit = "rounds" if clock == "rounds" else "turns"
         if not isinstance(delay, int) or isinstance(delay, bool) or delay < 1:
-            raise VTTError("schedule: delay must be a positive integer (rounds).")
+            raise VTTError(f"schedule: delay must be a positive integer "
+                           f"({unit}).")
+        extra = self._schedule_extras("schedule", every, times, args)
         src = self._validate_schedule_body(body)
         nm = name if (isinstance(name, str) and name) else self._mint_schedule_name()
-        self.scheduled.append({
-            "name": nm, "kind": "round", "body": src,
-            "eid": None, "fire_round": self.round_number + delay,
-        })
+        if clock == "rounds":
+            entry = {"name": nm, "kind": "round", "body": src,
+                     "eid": None, "fire_round": self.round_number + delay}
+        else:
+            entry = {"name": nm, "kind": "clock", "body": src,
+                     "eid": None, "fire_turn": self.turns_elapsed + delay}
+        entry.update(extra)
+        self.scheduled.append(entry)
         return nm
 
     def add_scheduled_on(self, eid: str, delay: Any, body: Any,
-                         name: Optional[str] = None) -> str:
+                         name: Optional[str] = None, *, every: Any = None,
+                         times: Any = None, args: Any = None) -> str:
         """Queue an ENTITY-attached effect to fire at `eid`'s
         on_turn_start once `delay` of its turns have started (delay>=1;
         delay=1 fires at its next turn). The body runs with `self`=eid.
         Auto-dropped if the entity is removed (death/despawn) before it
-        fires. Returns the schedule name. Raises VTTError/NotFound on a
-        bad delay, body, or unknown entity."""
+        fires. `every` / `times` / `args`: _schedule_extras. Returns the
+        schedule name. Raises VTTError/NotFound on a bad delay, body, or
+        unknown entity."""
         if eid not in self.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         if not isinstance(delay, int) or isinstance(delay, bool) or delay < 1:
             raise VTTError("schedule_on: delay must be a positive integer (turns).")
+        extra = self._schedule_extras("schedule_on", every, times, args)
         src = self._validate_schedule_body(body)
         nm = name if (isinstance(name, str) and name) else self._mint_schedule_name()
-        self.scheduled.append({
-            "name": nm, "kind": "turn", "body": src,
-            "eid": eid, "turns_left": delay,
-        })
+        entry = {"name": nm, "kind": "turn", "body": src,
+                 "eid": eid, "turns_left": delay}
+        entry.update(extra)
+        self.scheduled.append(entry)
         return nm
+
+    def _rearm_schedule(self, s: Dict[str, Any]) -> None:
+        """Put a repeating schedule (#458) back in the queue for its next
+        firing, before its body runs (so a body cancelling its own name
+        stops it); `times_left` counts down to the last firing."""
+        every = s.get("every")
+        if not every:
+            return
+        left = s.get("times_left")
+        if left is not None and int(left) <= 1:
+            return
+        nxt = copy.deepcopy(s)
+        if left is not None:
+            nxt["times_left"] = int(left) - 1
+        kind = s.get("kind")
+        if kind == "round":
+            nxt["fire_round"] = self.round_number + int(every)
+        elif kind == "clock":
+            nxt["fire_turn"] = self.turns_elapsed + int(every)
+        else:
+            nxt["turns_left"] = int(every)
+        self.scheduled.append(nxt)
 
     def cancel_scheduled(self, name: str) -> int:
         """Remove every pending schedule whose name == `name`. Returns
@@ -31736,7 +32548,14 @@ class Match:
         ctx = EvalCtx(this=self.current_entity_id(), target=eid)
         name = entry.get("name", "?")
         try:
-            engine.eval_program(entry.get("body", ""), ctx)
+            # `args` (a dict captured at scheduling): `args.unit` or
+            # get(args, 'unit'); a key nobody gave reads None.
+            from reactions import IncomingDict, _attr_view
+            got = entry.get("args")
+            pre = {"args": _attr_view(copy.deepcopy(got))
+                   if isinstance(got, dict) else IncomingDict()}
+            engine.eval_program(entry.get("body", ""), ctx, locals_in=pre,
+                                attr_roots=frozenset({"args"}))
         except FormulaError as ex:
             return [f"⚠️ scheduled effect `{name}` failed: {ex}"]
         return [f"⏰ scheduled effect `{name}` fired."]
@@ -31757,6 +32576,23 @@ class Match:
         self.scheduled = [s for s in self.scheduled if id(s) not in due_ids]
         log: List[str] = []
         for s in due:
+            self._rearm_schedule(s)
+            log.extend(self._run_scheduled_body(s, eid=None))
+        return log
+
+    def fire_scheduled_clock(self) -> List[str]:
+        """Fire (and remove, or re-arm) every due turn-clock schedule
+        (#491): fire_turn <= turns_elapsed. Called as each turn begins
+        (_begin_turn), under ATB too."""
+        due = [s for s in self.scheduled if s.get("kind") == "clock"
+               and int(s.get("fire_turn", 0)) <= self.turns_elapsed]
+        if not due:
+            return []
+        due_ids = {id(s) for s in due}
+        self.scheduled = [s for s in self.scheduled if id(s) not in due_ids]
+        log: List[str] = []
+        for s in due:
+            self._rearm_schedule(s)
             log.extend(self._run_scheduled_body(s, eid=None))
         return log
 
@@ -31776,7 +32612,10 @@ class Match:
         self.scheduled = [s for s in self.scheduled if id(s) not in fire_ids]
         log: List[str] = []
         for s in fire:
+            self._rearm_schedule(s)
             log.extend(self._run_scheduled_body(s, eid=eid))
+            if eid not in self.entities:
+                break
         return log
 
     # ---- event log (combat log) ----

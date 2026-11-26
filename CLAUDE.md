@@ -1376,7 +1376,10 @@ hardcodes**.
   bound is a number or a var path wherever a clamp arrives, `ClampSpec`): hard
   always clamps; soft engages only when a write crosses from the legal side
   and stays dormant past the bound; max applied before min. The default soft
-  clamp caps hp at max_hp.
+  clamp caps hp at max_hp. `!clamp why <eid> <path>` (host read,
+  `Match.clamp_why`, #487) names the clamp in force (the unit's own
+  shadowing the system's), each bound's value and whether the value is
+  within, dormant past a soft bound or past a hard one (1335).
 - **Aliveness:** `alive_condition` rule (empty = hp > 0 or indestructible);
   the death PIPELINE uses `death_condition` (+ per-unit `__death_condition`,
   `death_condition_mode`). A condition of the shape `entity[self].<path>
@@ -1387,7 +1390,24 @@ hardcodes**.
   number with leading zeros or leading whitespace, which the formula
   engine refuses (L42). `exists(eid)` is true for any unit in the match (a
   destroyed body part too; a corpse is `has_corpse`), `is_alive(eid)`
-  follows `alive_condition` (1172).
+  follows `alive_condition` (1172). `!ent why <id>` (host read,
+  `Match.alive_why`, #408; a corpse too) names the vitals, the aliveness
+  test, the death condition with its source and value, a part's destroyed
+  latch and the death result (1335).
+- **Data warnings** (#483, #484, #371; rule `data_warnings`, default on,
+  1337): `write_var` surfaces `Match.data_write_warnings`: a `__` key one
+  close name away from an engine var (`ENGINE_UNIT_VAR_KEYS`, through
+  `near_names`; a GM's own `__` key says nothing), and values the engine
+  can't use (an action's `target` / `reacts_on`, a modifier's `op`, a
+  seat's `capacity`, a shield's `amount` / `priority` under the
+  temp_hp_sources roots; malformed values only, never a missing field;
+  stored snapshots skipped). A unit arriving (`Entity.spawn`, a partial
+  given) with formulas calling a `!func` the match lacks is named with
+  each formula's path (`arrival_notes`, `unit_formula_texts`,
+  `formula.unknown_calls`). Each is tagged as a line about the unit, so a
+  team view that can't see it drops it, and said once per command
+  (`logic.WARNED_ONCE` / `warn_once(key)`, a set `_run_top` gives each
+  outer command).
 - **Commands:** `!ent` add / remove / rename / info / dump / diff / set_var /
   set_vars / delete_var / hp / init / tp / move / push / pull / swap / face /
   kill / revive / clone / copy / transfer / transform / revert / status /
@@ -1609,6 +1629,18 @@ hardcodes**.
   `_switch_systems`, a replayed `systems` entry, a crash rollback
   under a kept system edit), never by a load or an undo restore, whose
   units already followed the rules they rebuild.
+- **Switching passives off** (#55, 1330): `Passive.enabled` (saved only
+  when off); `fires_on` is False while off, so every fire site skips it.
+  `!passive | !gpassive | !team passive | !defpassive enable|disable <id
+  | all>` (a default passive's change reaches the copies still equal to
+  it, the sync reply counting them as updated), listings mark `(off)`; a
+  held passive's record takes `enabled: false` (switched in its record,
+  `!passive enable` refuses it naming where it lives). Formulas
+  `passive_enable(eid, id|'all', on=True)`, `gpassive_enable`,
+  `team_passive_enable`, and the twins `passive_add(eid, id, when,
+  formula, priority=, target=, scope=, extra_turns=)` / `passive_remove`,
+  `gpassive_add` / `_remove`, `team_passive_add` / `_remove` (#394,
+  mutating). A silencing status is two hooks calling passive_enable.
 - **Var hooks** (`on_var_*`, `on_var_written`, `on_var_write_attempt`): run
   bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
   extras carry changed_key / old_value / new_value / intended_value /
@@ -1667,7 +1699,15 @@ hardcodes**.
   loop; the rest of the chain waits for the next command that CHANGES the
   match, `_watcher_backlog`: a read doesn't run it, and `!match replay`
   doesn't poll); `once` removes after firing; `last` serialized; a malformed
-  condition reads as not met (427-428, 826). `Match.add_watcher` arms one
+  condition reads as not met (427-428, 826). Switching off (#55, 1331):
+  `!watch enable|disable <name|all>` / `watcher_enable(name, on=True)`
+  set a match watcher's `enabled` (`Match.set_watcher_enabled`; `!watch
+  list` shows off); off, the poll skips it, and on again it re-arms
+  (`add_watcher`, `spent` kept), so a condition already true waits for
+  the next false → true edge (user call). A held watcher's `enabled:
+  false` skips it and keeps no state (switched on, its unit is first seen
+  without firing); a value that isn't a bool is named by `!watch held`.
+  `Match.add_watcher` arms one
   (its condition read and recorded, so one already true fires next time).
   **Per-unit** (#149, `each`, 975-976): the condition is read for every
   living unit (body parts too; `tag=<filter>` narrows, checked before the
@@ -1751,9 +1791,27 @@ hardcodes**.
   `schedule_on(eid, ...)` (turn-based), `cancel_schedule`; a removed unit's
   schedules go with it. Read with `schedules_of(eid=None)` (names, loopable)
   and `schedule_left(name)` (turns / rounds left, None when gone) (766).
+  `every=<n>` repeats (re-armed before its body runs, so a body cancelling
+  its own name stops it; `_rearm_schedule`), `times=<n>` bounds the
+  firings (needs every=; `times_left`), on `schedule`, `schedule_on` and
+  `!schedule round|turn|turns` (#458). `clock='turns'` (#491; `!schedule
+  turns <delay> ...`) is a match-level schedule on the turn clock
+  (`turns_elapsed`, kind `clock`, `fire_turn`, fired in `_begin_turn` by
+  `fire_scheduled_clock`), working under ATB, where the round clock is
+  refused. `args={...}` (JSON, stored with the entry) reaches the body as
+  `args.<key>` / `get(args, k)` (a missing key reads None;
+  `eval_program(attr_roots=)`), so a match-level body names a unit with
+  `entity[args.unit]`; a match-level body naming `self` is stored with a
+  ⚠️ (`schedule_self_note`: it fails when it runs) (1332).
 
 ### 7.3 Turns, rounds and ATB
 
+- **`!turn why [<eid>]`** (#367, a player read through the view and the
+  var reader, 1334; `Match.turn_why`): a unit's slot, whether it acted
+  this round, its initiative and direction, its team's grouping score,
+  the units it ties with (within its team under grouping) and how the
+  tiebreak var and tiebreaker settle it, the change policy, queued extra
+  turns and skipping statuses; under ATB the bar, rate and threshold.
 - **Turn order:** sorted by `turnorder_var` per the `turnorder_*` rules
   (direction, `turnorder_tiebreak_var` / `_direction` (a GM var such as
   `dex` or `stats.agi`; a unit without a number there goes after), then
@@ -2010,6 +2068,21 @@ hardcodes**.
   again: `fire_status_event` counts the nesting (`_status_event_depth`)
   and past `status_hook_recursion_limit` (32) the rest of the chain fires
   no status hooks, with one ⚠️ (900).
+- **Undefined statuses** (#534, rule `status_definition_mode` off / warn
+  (default) / refuse, 1336): `Match.undefined_status` from `apply_status`,
+  `Entity.spawn` (a unit arriving with one; refused before placement) and
+  the grant editors (`_grant_edit` / `_tile_template_grant_edit` with
+  `_defined_statuses`): warn adds a ⚠️ once per status per command
+  naming a close defined name (`near_names`), tagged as a line about the
+  unit; refuse refuses the application, the spawn or the grant edit (a
+  live zone grant of an undefined status already stored is skipped).
+  Units already holding one are left alone.
+- **Explaining a status** (host reads, 1335): `!status view <eid> <name>`
+  (#486) lists each effective field with its origin (instance, a level
+  entry, the definition, the rule); `!status why <eid> <name>` (#366,
+  `Match.grant_why`) lists every zone, tile and item granting it, whether
+  each covers the unit, its condition's result, a part redirect /
+  immunity, and whether it applies.
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
   from the definition's `stack`, else `status_default_stack` (layered,
   the default / refresh / add_level / extend / replace / none; refresh
@@ -2328,7 +2401,8 @@ hardcodes**.
   <eid> <stat> [base] [tag ...]` (399-400, 406-408, 480) also lists records
   left out for an unreadable condition / value / priority. A non-finite base
   or folded result (stacked more% overflow) is refused with a warning naming
-  the records (user call).
+  the records (user call). `!mod list <eid>` (a player read, #425, 1334)
+  lists every record the unit gathers by stat with its source.
 
 ### 7.6 Actions and choices
 
@@ -2601,6 +2675,8 @@ hardcodes**.
 - **`!assert [--as eid] "<expr>" [msg]`**: read-only; a failure raises
   `AssertionStop`, and batch / run / foreach / macro stop on the `ASSERT_STOP`
   sentinel; in an action, `cmd('assert ...')` fails the action (601-603).
+  A false assert names the part that was false and the values it read
+  (`_assert_detail`, #426, 1334).
 - **`!dry <command ...>`** (hosts only) runs a command, shows its replies and
   the diff of the channel's match, then restores every match
   (`_snapshot_all_matches` / `_restore_all_matches`, the `!batch strict`
@@ -3058,7 +3134,9 @@ hardcodes**.
   revive restores it (displaced located parts go to the nearest free cell
   with ⚠️, dropped only when nothing fits). Removing a unit removes its
   subtree. Killing a part is limb destruction, never a corpse. Detach makes a
-  free unit. Parts share the parent's turn clock (§7.3).
+  free unit. Parts share the parent's turn clock (§7.3). Formula twins
+  (#393, mutating, 1333): `part_attach(part, parent)`, `part_detach(part)`
+  (returns the cell it stands on), `part_remove(part)`.
 - **Snake segments:** located parts with `__segment` + `__follows` (the one
   ahead); `snake_segments(head)`. Follow `segment_follow_mode` (trail /
   path + `segment_spacing`; head override `__segment_follow`); a teleport
@@ -3516,7 +3594,9 @@ hardcodes**.
   ...` adds reveals (`all`, `at`, `rect`, `around`, `cone <x> <y> <dir>
   <len> [half_angle]`, `line <x1> <y1> <x2> <y2>`: the cells_in_*
   builders), optionally temporary (`turns=N`, keyed to whichever clock
-  advances). Everything funnels through `_fog_team_sees`; renders
+  advances); formulas `reveal_cells(team, cells, turns=None, map=)` (a
+  cell list, `[x, y, map]` cells grouped per map) and `reveal_clear(team)`
+  (#392, mutating, 1333). Everything funnels through `_fog_team_sees`; renders
   memoize it for one pass (`_vision_memo`, `_team_vision_index`); without
   `fog_los`, a pass asking about more than `_VISION_STAMP_AFTER` (256)
   cells for one team stamps each member's sight area once into a cell set
