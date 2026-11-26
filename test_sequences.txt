@@ -38823,7 +38823,7 @@ SCENARIO 1091 — Default passives reach the units already in play (default_pass
 ?? passive `hero.regen` fired on `hero`
 !assert "entity[hero].hp == 31"
 !defpassive priority regen 5
-?? `dp`: default passive `regen` put on 4 unit(s) and corpse(s) already here
+?? `dp`: default passive `regen` updated on 4 unit(s) and corpse(s) whose copy was the default
 !passive list brute
 ?? on_turn_start pri 5
 !passive priority hero regen 7
@@ -50148,3 +50148,390 @@ text colour names); a stray word after the option is refused. A unit's
 `color` / `ascii_color` var takes any value with a warning. A zone's
 colour may be a formula whose result is a colour of the grammar (here
 built hex text), drawn as #ff8800.
+
+SCENARIO 1330 — Passives from formulas, switched off and on: a silencing status turns its bearer's passives off and back on (#394, #55)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new pf Pf 8 6
+!match use pf
+!ent add hero Hero 20 1 1 5 team=blue
+!ent add ogre Ogre 30 5 1 4 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!eval "passive_add('ogre', 'regen', 'on_turn_start', 'entity[self].hp += 2')"
+?? = `True`
+!eval "team_passive_add('red', 'howl', 'on_turn_start', 'entity[self].hp -= 1', priority=5)"
+!eval "gpassive_add('tally', 'on_turn_start', 'match_var_set(\"turns\", match_var_get(\"turns\", 0) + 1)')"
+!passive list ogre
+?? `regen`
+!team passive list red
+?? `howl`
+!status def silence
+!status hook silence on_added "passive_enable(self, 'all', False)"
+!status hook silence on_removed "passive_enable(self, 'all')"
+!status apply ogre silence 1 3
+!passive list ogre
+?? (off)
+!turn next
+!turn next
+!assert "entity[ogre].hp == 29"
+!status dispel ogre silence
+!passive list ogre
+?! (off)
+!turn next
+!turn next
+!assert "entity[ogre].hp == 30"
+!team passive disable red howl
+!gpassive disable tally
+!gpassive list
+?? (off)
+!turn next
+!turn next
+!assert "entity[ogre].hp == 30 and match.turns == 4"
+!defpassive add guard on_turn_start "entity[self].guard = 1"
+!defpassive disable guard
+?? updated on 2 unit(s)
+!ent add gob Goblin 5 1 5 3
+!passive list gob
+?? (off)
+!eval "[passive_remove('ogre', 'regen'), team_passive_remove('red', 'howl'), gpassive_remove('tally'), passive_remove('ogre', 'regen')]"
+?? `[True, True, True, False]`
+!eval "passive_add('ogre', 'regen', 'on_nothing', '1')"
+?? ❌
+!assert "entity[ogre].hp == 30"
+
+Expected: passive_add / team_passive_add / gpassive_add add a passive to a unit, a team and the match (True each); the listings name them. The silence status's on_added hook runs passive_enable(self, 'all', False), so while it holds `regen` is marked (off) and doesn't fire: over two turns only the team passive `howl` hits the ogre (30 → 29). Dispelling silence runs on_removed, which turns them back on: over the next two turns regen (+2) and howl (-1) leave the ogre at 30 (the soft clamp at max_hp). Disabling the team passive and the global `tally` (marked (off) in `!gpassive list`) stops both, while the global passive counted 4 turns in match var turns before it went off. A default passive disabled with `!defpassive disable` updates the copies on the units already in play (2 units) and arrives switched off on a unit added later. passive_remove gives True for each passive removed and False for one already gone; passive_add with an unknown hook is refused.
+
+SCENARIO 1331 — Watchers switched off keep their place; turned on they arm from the condition's value, so one already true waits for the next edge (#55)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new wf Wf 6 4
+!match use wf
+!ent add gob Goblin 10 1 1 3
+!ent add ogre Ogre 30 3 1 4
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!watch add low "entity[gob].hp < 5" "say('gob low')"
+!watch disable low
+!watch list
+?? off
+!ent hp gob 4
+?! gob low
+!watch enable low
+!ent hp gob 3
+?! gob low
+!ent hp gob 8
+!ent hp gob 2
+?? gob low
+!eval "watcher_enable('low', False)"
+!ent hp gob 8
+!ent hp gob 1
+?! gob low
+!watch disable all
+!watch enable all
+!ent hp gob 9
+!ent hp gob 4
+?? gob low
+!ent set_var ogre watchers.rage.condition "entity[self].hp < 20"
+!ent set_var ogre watchers.rage.effect "say('ogre rages')"
+!ent set_var ogre watchers.rage.enabled false
+!ent hp ogre 15
+?! ogre rages
+!ent set_var ogre watchers.rage.enabled true
+!ent hp ogre 14
+?! ogre rages
+!ent hp ogre 25
+!ent hp ogre 10
+?? ogre rages
+!watch held ogre
+?? rage
+!ent set_var ogre watchers.rage.enabled maybe
+!watch held ogre
+?? enabled
+
+Expected: A disabled watcher is listed as off and doesn't fire when gob drops to 4. Enabled again while gob is below 5, it arms from the condition's value (already true), so 3 fires nothing; it fires on the next false → true edge (8, then 2). watcher_enable('low', False) switches it off from a formula: 8 then 1 fires nothing. `!watch disable all` / `enable all` switch every watcher; the edge 9 → 4 fires. A held watcher with `enabled: false` (on the 2x2 ogre) keeps no state and doesn't fire at 15; switched on while its condition holds it is first seen at 14 (recorded without firing) and fires on the edge 25 → 10. `!watch held` lists it, and names an `enabled` value that isn't a bool as the problem keeping the entry from running.
+
+SCENARIO 1332 — Schedules that repeat, schedules on the turn clock, and args captured for the body (#458, #491)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new sc Sc 8 6
+!match use sc
+!ent add hero Hero 20 1 1 5
+!ent add ogre Ogre 30 5 1 4
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!eval "schedule(1, 'say(\"rain\")', name='rain', every=1, times=2)"
+?? = `'rain'`
+!eval "schedule(1, 'entity[args.unit].hp -= 3', name='bleed', clock='turns', every=1, times=3, args={'unit': 'ogre'})"
+?? = `'bleed'`
+!eval "schedule(2, 'entity[self].hp -= 1', clock='turns')"
+?? its body names `self`, which a match-level schedule doesn't bind
+!schedule turns 1 every=2 "say('tick')"
+?? then every 2
+!schedule turn hero 1 every=1 times=2 "entity[self].hp -= 1"
+?? 2 time(s) in all
+!schedule list
+?? `bleed` (match, turn clock) @ turn 1, every 1 turn(s), 3 firing(s) left, args unit="ogre"
+!turn next
+!turn next
+?? `sched_1` failed: 'self' is unbound
+!turn next
+!turn next
+!assert "entity[ogre].hp == 21 and entity[hero].hp == 18"
+!schedule list
+?? `rain` (match) @ round 3, every 1 round(s), 1 firing(s) left
+?! bleed
+?! sched_3
+!eval "cancel_schedule('sched_2')"
+?? = `1`
+!assert "schedule_left('bleed') == None and schedule_left('rain') == 1"
+!eval "schedule(1, 'say(1)', every=0)"
+?? ❌
+!schedule turns 1 times=2 "say(1)"
+?? ❌
+!system set default atb_enabled true
+!eval "schedule(1, 'say(\"atb\")')"
+?? ❌ schedule() is unavailable under ATB
+!eval "schedule(1, 'say(\"atb clock\")', clock='turns')"
+!turn next
+?? atb clock
+!schedule round 1 "say('x')"
+?? ❌ Rounds don't run under ATB
+
+Expected: `rain` repeats every round for 2 firings; `bleed` runs on the turn clock (every unit's turns, turns_elapsed) every turn for 3 firings and reads the unit from args (`args.unit`), so the 2x2 ogre loses 9 (30 → 21) over its three firings. A match-level body naming `self` is accepted with a ⚠️, and fails when it runs ('self' is unbound). `!schedule turns 1 every=2` repeats with no end; `!schedule turn hero 1 every=1 times=2` fires on two of the hero's turns (20 → 18). After four turns `bleed` and the hero's schedule are spent, `rain` has 1 firing left (schedule_left 1); `cancel_schedule` removes the endless tick. every=0, and times= without every=, are refused. Under ATB the round clock is refused (schedule() and `!schedule round`), while clock='turns' keeps working.
+
+SCENARIO 1333 — Reveals and body parts from formulas: a flare reveals cells to a team through fog; a 2x2 lizard drops, regrows and loses its tail (#392, #393)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new rv Rv 10 6
+!match use rv
+!ent add hero Hero 20 1 1 5 team=blue
+!ent set_var hero fog_vision_radius 2
+!ent add liz Lizard 30 7 3 4 team=red
+!ent set_vars liz footprint_w=2 footprint_h=2
+!part add liz tail Tail 5 5
+!match fog on
+!assert "not team_sees_entity('blue', 'liz')"
+!eval "reveal_cells('blue', cells_in_rect(6, 2, 9, 5), turns=2)"
+?? = `16`
+!reveal_fog list
+?? `blue`: 16 cell(s)
+!map as=blue
+?? 3 . . . ? ? . < < . ?
+!eval "reveal_clear('blue')"
+?? = `1`
+!reveal_fog list
+?? No active fog reveals.
+!eval "part_detach('tail')"
+?? = `[7, 2]`
+!assert "part_of('tail') == '' and entity[tail].x == 7 and entity[tail].y == 2"
+!part list liz
+?? has no body parts
+!eval "part_attach('tail', 'liz')"
+?? = `True`
+!assert "part_of('tail') == 'liz'"
+!eval "part_remove('tail')"
+?? = `True`
+!assert "not exists('tail') and exists('liz')"
+!eval "part_remove('hero')"
+?? ❌ part_remove: `hero` is not a body part
+!eval "reveal_cells('blue', [[1, 1, 'nowhere']])"
+?? ❌ reveal_cells: this match has no map named `nowhere`
+
+Expected: The 2x2 lizard is out of the blue team's sight. reveal_cells reveals a 4x4 rectangle around it for 2 turns (16 cells, listed in `!reveal_fog list`), so blue's view shows the whole lizard body; reveal_clear drops blue's reveals (1 reveal). part_detach makes the tail a free unit on the free cell nearest it, (7,2), and returns it; part_attach glues it back to the lizard; part_remove removes the part (the lizard stays). part_remove refuses a unit that isn't a body part, and reveal_cells refuses a cell on a map the match lacks.
+
+SCENARIO 1334 — The turn order explained, every modifier record listed, and a failed assert showing its values (#367, #425, #426)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ASSERT-FAIL
+!match new tw Tw 8 6
+!match use tw
+!ent add hero Hero 20 1 1 5 team=blue
+!ent add gob Goblin 10 5 5 5 team=red
+!ent add ogre Ogre 30 6 1 7 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2 dex=3
+!ent set_vars gob dex=4
+!ent set_vars hero dex=6
+!system set default turnorder_tiebreak_var dex
+!turn next
+!turn why
+?? `ogre` is turn slot 1 of 3 (its turn now).
+!turn why gob
+?? `gob` is turn slot 3 of 3.
+?? It ties on initiative with `hero`: turnorder_tiebreak_var `dex` = 4
+!status def stun
+!status data stun skips_turn true
+!status apply gob stun 1 1
+!turn grant hero
+!turn why hero
+?? 1 extra turn(s) queued for it
+!system set default turnorder_team_grouping highest_per_team
+!turn why gob
+?? `gob` is turn slot 2 of 3.
+?? team `red` sorts as 7 (2 member(s))
+?! ties on initiative
+?? Its turns are skipped while it holds: `stun` (skips_turn).
+!as player ann
+!turn why gob
+?? `gob` is turn slot 2 of 3.
+!as host
+!ent set_vars ogre modifiers.str_up.stat=str modifiers.str_up.op=add modifiers.str_up.value=2 equipped.axe.modifiers.m.stat=dmg equipped.axe.modifiers.m.op=inc% equipped.axe.modifiers.m.value=50
+!mod list ogre
+?? inc% 50 [equipped.axe.m]
+?? add 2 [modifiers.str_up]
+!mod list gob
+?? `gob` has no modifier records.
+!assert "entity[ogre].hp == 7 and entity[hero].hp > 5"
+?? (`entity[ogre].hp == 7`: `entity[ogre].hp` is 30)
+!assert "not (entity[gob].dex < 5)"
+?? (`entity[gob].dex` is 4)
+
+Expected: `!turn why` explains the current unit's slot; for the goblin it names its initiative, the tie with the hero and how the tiebreak var (dex 4 against 6) settles it, the change policy. A queued extra turn is named. Under team grouping the red team sorts by its highest member (7), so the goblin follows the 2x2 ogre and ties with no one (the hero's team slot orders it); its stun is named as skipping its turns. A player reads it too. `!mod list` lists every modifier record by stat with its source path; a unit without any says so. A failed `!assert` names the part of the formula that was false and the values it read.
+
+SCENARIO 1335 — Hosts' explain tools: aliveness, a clamp, a status field by field, and why a granted status is or isn't held (#408, #487, #486, #366)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new hx Hx 8 6
+!match use hx
+!ent add hero Hero 20 1 1 5 team=blue
+!ent add ogre Ogre 30 6 1 7 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre arm Arm 5 5
+!ent why hero
+?? Death condition (the death_condition rule): `entity[self].hp <= 0` → False.
+!ent set_var hero __death_condition "entity[self].hp <= 5"
+!ent why hero
+?? `(entity[self].hp <= 0) or (entity[self].hp <= 5)` → False
+!ent why arm
+?? Destroyed (body part latch `__part_destroyed`): no.
+!clamp why hero hp
+?? clamped by the system's default_clamps (`!gclamp`), mode soft
+!ent set_var hero hp 15
+!ent set_var hero max_hp 10
+!clamp why hero hp
+?? Dormant: the value is already past its max
+!clamp add hero hp max=12 mode=hard
+!clamp why hero hp
+?? clamped by its own clamp (`!clamp`), which shadows the system's default, mode hard
+?? Past its max (set without a write: the next write clamps it).
+!status def burn
+!status tick burn "entity[self].hp -= 1"
+!status level burn 2+ tick "entity[self].hp -= 3"
+!status apply ogre burn 2 3
+!status view ogre burn
+?? `tick` = "entity[self].hp -= 3" (level entry `2+`)
+?? `duration` = 3 (instance)
+?? `stack` (rule status_default_stack: 'layered')
+!status def chill
+!zone new fire
+!zone fill fire 6 1 7 2
+!zone grant fire chill level=2
+!zone new pond
+!zone fill pond 1 6 3 6
+!zone grant pond chill
+!status why ogre chill
+?? `ogre` holds `chill` from grants: `fire`.
+?? It applies (from `fire`, level 2).
+!status why hero chill
+?? `hero` doesn't hold `chill`.
+!zone grant_condition fire "entity[self].hp > 100"
+!status why ogre chill
+?? covers it; grant_condition `entity[self].hp > 100` is false.
+!as player ann
+!ent why hero
+?? needs host approval
+
+Expected: `!ent why` names the unit's vitals, the aliveness test, the death condition with its source and value (the unit's own `__death_condition` joined to the rule's), and for a body part its destroyed latch. `!clamp why` names where the clamp comes from (the system's default, then the unit's own shadowing it), its bounds with their values, and whether the value is within them, dormant past a soft bound, or past a hard one set without a write. `!status view` lists each field of a status on the 2x2 ogre with where it comes from: instance, level entry `2+`, definition, and the rules. `!status why` lists every zone granting the status: the ogre stands in `fire` (level 2), `pond` doesn't cover it; once fire's grant condition is false it says so and the ogre no longer holds it. A player's `!ent why` waits for a host (a host read).
+
+SCENARIO 1336 — Statuses without a definition: a warning with a close name, refused under refuse (applications, grants, spawns), silent under off (#534)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+HARNESS-ALLOWS-ERRORS
+!match new sd Sd 8 6
+!match use sd
+!ent add hero Hero 20 1 1 5 team=blue
+!ent add ogre Ogre 30 6 1 4 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!status def burn
+!status apply hero brun 2
+?? ⚠️ `brun` (on `hero`) has no status definition (did you mean `burn`?): applied as it is (status_definition_mode).
+!eval "status_apply('ogre', 'brun')"
+?? (did you mean `burn`?)
+!status apply ogre burn 1
+?! ⚠️
+!system set default status_definition_mode refuse
+!status apply hero zap 2
+?? ❌ `zap` has no status definition; status_definition_mode refuse refuses it
+!eval "status_apply('ogre', 'zap')"
+?? ❌
+!assert "not status_has('hero', 'zap') and not status_has('ogre', 'zap')"
+!zone new fire
+!zone fill fire 6 1 7 2
+!zone grant fire chill
+?? ❌ `chill` has no status definition; status_definition_mode refuse refuses a grant of it
+!zone def new swamp
+!zone def grant swamp chill
+?? ❌
+!ent store_entity_into_var hero hero snap
+!eval --as hero "summon_from('snap', 3, 3)"
+?? ❌ `brun` has no status definition
+!assert "not exists('hero2')"
+!system set default status_definition_mode warn
+!zone grant fire chill
+?? ⚠️ `chill` has no status definition (status_definition_mode).
+?? Ogre gains chill.
+!eval --as hero "summon_from('snap', 3, 3)"
+?? `brun` (on `hero2`) has no status definition
+!system set default status_definition_mode refuse
+!ent hp ogre 29
+?! ❌
+!system set default status_definition_mode off
+!status apply hero zap
+?! ⚠️
+!assert "status_has('hero', 'zap') and status_has('hero', 'brun') and status_has('ogre', 'chill')"
+
+Expected: Under warn (the default) an application of a status with no definition goes through with a ⚠️ naming a close defined name (`burn` for `brun`), from a command and from a formula; a defined status applies silently. Under refuse an application, a zone grant, a zone definition's grant and a spawn of a unit holding an undefined status are refused and change nothing. Back under warn the grant goes through with a ⚠️ and the 2x2 ogre in the zone gains chill; a unit arriving with `brun` is named. Under refuse a unit already holding an undefined status is still written to. Under off nothing is checked.
+
+SCENARIO 1337 — Engine-shaped data the engine can't use: a near-miss `__` var, bad values under actions / modifiers / slots / shields, functions an arriving unit calls; the data_warnings rule; a team view (#483, #484, #371)
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+!match new dw Dw 8 6
+!match use dw
+!ent add hero Hero 20 1 1 5 team=blue
+!ent add ogre Ogre 30 6 1 4 team=red
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var hero __reaction_mod auto
+?? did you mean `__reaction_mode`? (data_warnings)
+!ent set_var hero __my_secret 5
+?! ⚠️
+!ent set_var hero actions.slash.target enemy
+?? `enemy` isn't a target type
+!ent set_var hero actions.slash.body "heal_up(self)"
+?! ⚠️
+!ent set_var hero modifiers.m1.op plus
+?? `plus` isn't a modifier op
+!ent set_var ogre slots.seat.capacity lots
+?? a seat's capacity is a number
+!ent set_vars ogre shields.s1.amount=many shields.s1.priority=1
+?? a shield's amount is a number
+!ent set_var ogre shields.s1.amount 5
+?! ⚠️
+!ent store_entity_into_var hero hero snap
+!eval --as hero "summon_from('snap', 3, 3)"
+?? `hero2` calls function(s) this match has no `!func` for: `heal_up` (actions.slash.body)
+!func def heal_up who "entity[who].hp += 1"
+!eval --as hero "summon_from('snap', 3, 4)"
+?! ⚠️
+!template import kit {"kind": "partial", "data": {"actions": {"zap": {"target": "none", "body": "zap_all()"}}}}
+!template give kit ogre gear
+?? `ogre` calls function(s) this match has no `!func` for: `zap_all` (gear.actions.zap.body)
+!ent store_entity_into_var ogre ogre snap
+!match fog on
+!ent set_var hero fog_vision_radius 1
+!match bind pov=blue
+!ent set_var ogre __reaction_mod auto
+?! ⚠️
+!eval --as ogre "summon_from('snap', 7, 5)"
+?! ⚠️
+!eval --as ogre "summon_from('snap', 2, 1)"
+?? ⚠️ `ogre3` calls function(s)
+!match unbind
+!match use dw
+!system set default data_warnings false
+!ent set_var hero __reaction_mod auto
+?! ⚠️
+!ent set_var hero actions.slash.target enemy
+?! ⚠️
+!eval --as ogre "summon_from('snap', 4, 5)"
+?! ⚠️
+
+Expected: A `__` var one letter off an engine var (`__reaction_mod`) is named with the close name; a `__` var of the GM's own isn't. Values the engine can't use under an action's `target`, a modifier's `op`, a seat's `capacity` and a shield's `amount` (the 2x2 ogre's shield) are named as they are written; a usable value isn't. A unit arriving with formulas calling a `!func` the match lacks (a summoned snapshot, a partial template given) is named with the formula's path; once the function exists it isn't. In a channel with blue's view, a warning about the fogged ogre (its var, its copy summoned out of sight) is dropped, while a copy summoned beside the hero is named. With data_warnings off nothing is named.

@@ -3913,6 +3913,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Watchers (#149): watch_add / watch_remove change the match's
     # watchers; watch_exists and watchers_of (what a unit holds) read.
     "watch_add", "watch_remove", "watch_exists", "watchers_of",
+    # Passives, watchers, reveals and parts from formulas (#394, #55,
+    # #392, #393): the twins of their commands.
+    "passive_add", "passive_remove", "gpassive_add", "gpassive_remove", "team_passive_add", "team_passive_remove", "passive_enable", "gpassive_enable", "team_passive_enable", "watcher_enable", "reveal_cells", "reveal_clear", "part_attach", "part_detach", "part_remove",
     # Entity-anchored auras: bind a zone to an entity so its cells track
     # the entity's footprint (re-stamped on move). radius 0 = the
     # footprint itself.
@@ -4130,6 +4133,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "zone_anchor", "zone_unanchor", "zone_grant", "zone_ungrant",
     "zone_place", "zone_move", "zone_step",
     "watch_add", "watch_remove",
+    "passive_add", "passive_remove", "gpassive_add", "gpassive_remove", "team_passive_add", "team_passive_remove", "passive_enable", "gpassive_enable", "team_passive_enable", "watcher_enable", "reveal_cells", "reveal_clear", "part_attach", "part_detach", "part_remove",
     "mount", "dismount", "switch_slot",
     "damage_part", "damage_spread",
     "team_set", "team_add",
@@ -4318,6 +4322,7 @@ _GRANT_SETTLE_FUNCS: "frozenset[str]" = frozenset({
     "revive", "transform", "replace_form", "revert", "mount", "dismount",
     "switch_slot",
     "damage_part", "damage_spread", "void_add", "void_remove",
+    "part_attach", "part_detach", "part_remove",
 })
 _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
@@ -4330,6 +4335,7 @@ _MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
     "can_see", "can_see_rangeonly", "can_see_losonly", "has_los",
     "is_void", "void_add", "void_remove", "zone_place",
     "entities_in_cells", "corpses_within", "fits_at",
+    "reveal_cells", "reveal_clear",
 })
 assert _MAP_ARG_FUNCS <= _TUPLE_FREE_FUNCS, (
     _MAP_ARG_FUNCS - _TUPLE_FREE_FUNCS)
@@ -10268,35 +10274,57 @@ class FormulaEngine:
         ns["corpse_status_get"]   = _corpse_status_get
         ns["corpse_status_names"] = _corpse_status_names
 
-        def _schedule(delay: Any, body: Any, name: Any = None) -> str:
-            """schedule(delay, body, name=None): queue a MATCH-level
-            effect to run at on_round_start `delay` rounds from now
-            (delay>=1; delay=1 fires next round). The body string runs
-            with NO `self` bound — use explicit ids or `this`. Returns
-            the schedule name (generated if name is falsy); cancel via
-            cancel_schedule(name)."""
-            if match.rules.get("atb_enabled"):
+        def _schedule(delay: Any, body: Any, name: Any = None,
+                      every: Any = None, times: Any = None,
+                      args: Any = None, clock: Any = "rounds") -> str:
+            """schedule(delay, body, name=None, every=None, times=None,
+            args=None, clock='rounds'): queue a MATCH-level effect: with
+            clock 'rounds' at on_round_start `delay` rounds from now
+            (delay>=1; delay=1 fires next round; unavailable under ATB),
+            with clock 'turns' as a turn begins `delay` turns from now (any
+            unit's turn, ATB too; #491). `every=n` fires it again n rounds /
+            turns after each firing until cancelled, `times=k` stops it
+            after k firings (#458). The body runs with NO `self` bound
+            (a ⚠️ says so when it names self): use `current` (the unit
+            whose turn it is), explicit ids, or `args` (a dict captured now,
+            read as `args.<key>`, e.g. args={'unit': self} then
+            `entity[args.unit].hp -= 1`). Returns the schedule name
+            (generated if name is falsy); cancel via cancel_schedule(name)."""
+            clk = str(clock).lower() if isinstance(clock, str) else clock
+            if clk == "rounds" and match.rules.get("atb_enabled"):
                 raise FormulaError(
                     "schedule() is unavailable under ATB — rounds are "
-                    "disabled. Use schedule_on(eid, delay, ...) for "
-                    "turn-based scheduling.")
+                    "disabled. Use clock='turns', or schedule_on(eid, "
+                    "delay, ...) for a unit's turns.")
             nm = name if isinstance(name, str) and name else None
             try:
-                return match.add_scheduled(delay, body, nm)
+                got = match.add_scheduled(delay, body, nm, every=every,
+                                          times=times, args=args,
+                                          clock=str(clk))
             except VTTError as ex:
                 raise FormulaError(str(ex))
+            note = match.schedule_self_note(
+                match.scheduled[-1].get("body", ""), f"schedule `{got}`")
+            if note:
+                match.surface_log([note])
+            return got
 
         def _schedule_on(eid_t: Any, delay: Any, body: Any,
-                         name: Any = None) -> str:
-            """schedule_on(eid, delay, body, name=None): queue an
-            entity-attached effect to run at eid's on_turn_start after
-            `delay` of its turns (delay>=1; delay=1 fires its next turn).
-            The body runs with `self`=eid. Auto-dropped if the entity
-            dies/despawns before firing. Returns the schedule name."""
+                         name: Any = None, every: Any = None,
+                         times: Any = None, args: Any = None) -> str:
+            """schedule_on(eid, delay, body, name=None, every=None,
+            times=None, args=None): queue an entity-attached effect to run
+            at eid's on_turn_start after `delay` of its turns (delay>=1;
+            delay=1 fires its next turn). The body runs with `self`=eid.
+            `every` / `times` / `args` as for schedule(). Auto-dropped if
+            the entity dies/despawns before firing. Returns the schedule
+            name."""
             eid = _eid(eid_t)
             nm = name if isinstance(name, str) and name else None
             try:
-                return match.add_scheduled_on(eid, delay, body, nm)
+                return match.add_scheduled_on(eid, delay, body, nm,
+                                              every=every, times=times,
+                                              args=args)
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
@@ -10317,7 +10345,8 @@ class FormulaEngine:
 
         def _schedule_left(name: Any) -> Any:
             """schedule_left(name): how long until the schedule `name` fires:
-            its unit's turns for a schedule_on, rounds for a schedule (0 =
+            its unit's turns for a schedule_on, turns for a clock='turns'
+            schedule, rounds for a round schedule (0 =
             this round's start has passed it by), or None when no schedule
             has that name (the earliest one, if several share it)."""
             if not isinstance(name, str):
@@ -10327,6 +10356,9 @@ class FormulaEngine:
                     if x.get("kind") == "round":
                         return max(0, int(x.get("fire_round", 0))
                                    - int(match.round_number))
+                    if x.get("kind") == "clock":
+                        return max(0, int(x.get("fire_turn", 0))
+                                   - int(match.turns_elapsed))
                     return int(x.get("turns_left", 0))
             return None
 
@@ -11101,6 +11133,282 @@ class FormulaEngine:
         ns["tile_tags"]         = _tile_tags
         ns["tile_has_tag"]      = _tile_has_tag
         ns["tiles_with_tag"]    = _tiles_with_tag
+
+        # ---- passives, watchers, reveals and parts from formulas (#394,
+        # #55, #392, #393): the twins of their commands. ----
+        def _new_passive(fname: str, pid: Any, when: Any, formula: Any,
+                         priority: Any, target: Any, scope: Any,
+                         extra_turns: Any) -> Any:
+            from logic import Passive, VTTError as _VE
+            if not isinstance(pid, str) or not pid.strip():
+                raise FormulaError(f"{fname}: the passive id is a text.")
+            if not isinstance(when, str) or not isinstance(formula, str):
+                raise FormulaError(f"{fname}: `when` and `formula` are "
+                                   f"texts.")
+            if not formula.strip():
+                raise FormulaError(f"{fname}: the formula is empty.")
+            try:
+                validate_program(formula, known_funcs=frozenset(
+                    match.formula_functions.keys()))
+            except FormulaError as ex:
+                raise FormulaError(f"{fname}: the formula doesn't parse: "
+                                   f"{ex}")
+            if extra_turns is not None and not isinstance(extra_turns, bool):
+                raise FormulaError(f"{fname}: extra_turns is True, False "
+                                   f"or None.")
+            try:
+                return Passive(id=pid, when=when.lower(), formula=formula,
+                               target="" if target is None else str(target),
+                               scope=str(scope), priority=priority,
+                               extra_turns=extra_turns)
+            except _VE as ex:
+                raise FormulaError(f"{fname}: {ex}")
+
+        def _passive_owner(fname: str, eid_t: Any) -> Any:
+            e = match.entities.get(_eid(eid_t))
+            if e is None:
+                raise FormulaError(f"{fname}: unknown entity '{eid_t}'.")
+            return e
+
+        def _passive_add(eid_t: Any, pid: Any, when: Any, formula: Any,
+                         priority: Any = 0, target: Any = "",
+                         scope: Any = "deep", extra_turns: Any = None
+                         ) -> bool:
+            """passive_add(eid, id, when, formula, priority=0, target='',
+            scope='deep', extra_turns=None): give the unit its own passive,
+            as `!passive add` (an ability learned mid-fight). `when` is a
+            hook or several joined by commas. Refused when the unit already
+            has a passive of that id. Returns True."""
+            e = _passive_owner("passive_add", eid_t)
+            p = _new_passive("passive_add", pid, when, formula, priority,
+                             target, scope, extra_turns)
+            if p.id in e.passives:
+                raise FormulaError(f"passive_add: `{e.id}` already has a "
+                                   f"passive `{p.id}`.")
+            e.passives[p.id] = p
+            e.mark_changed()
+            return True
+
+        def _passive_remove(eid_t: Any, pid: Any) -> bool:
+            """passive_remove(eid, id): take the unit's own passive `id`
+            away. Returns True iff it had one (a status's or item's held
+            passive goes with its holder, not here)."""
+            e = _passive_owner("passive_remove", eid_t)
+            if e.passives.pop(str(pid), None) is None:
+                return False
+            e.mark_changed()
+            return True
+
+        def _gpassive_add(pid: Any, when: Any, formula: Any,
+                          priority: Any = 0, target: Any = "",
+                          scope: Any = "deep", extra_turns: Any = None
+                          ) -> bool:
+            """gpassive_add(id, when, formula, priority=0, target='',
+            scope='deep', extra_turns=None): a global passive, as
+            `!gpassive add` (it fires for every unit). Refused when the
+            match has one of that id. Returns True."""
+            p = _new_passive("gpassive_add", pid, when, formula, priority,
+                             target, scope, extra_turns)
+            if p.id in match.global_passives:
+                raise FormulaError(f"gpassive_add: the match already has a "
+                                   f"global passive `{p.id}`.")
+            match.global_passives[p.id] = p
+            return True
+
+        def _gpassive_remove(pid: Any) -> bool:
+            """gpassive_remove(id): remove the global passive `id`. Returns
+            True iff there was one."""
+            return match.global_passives.pop(str(pid), None) is not None
+
+        def _team_key(fname: str, team: Any) -> str:
+            from logic import team_text as _tt, VTTError as _VE
+            try:
+                t = _tt(team)
+            except _VE as ex:
+                raise FormulaError(f"{fname}: {ex}")
+            if t in (None, ""):
+                raise FormulaError(f"{fname}: name a team.")
+            return t
+
+        def _team_passive_add(team: Any, pid: Any, when: Any, formula: Any,
+                              priority: Any = 0, target: Any = "",
+                              scope: Any = "deep", extra_turns: Any = None
+                              ) -> bool:
+            """team_passive_add(team, id, when, formula, priority=0,
+            target='', scope='deep', extra_turns=None): a passive on every
+            unit of `team`, as `!team passive add` (an aura spell buffing a
+            side). Refused when the team has one of that id. Returns
+            True."""
+            t = _team_key("team_passive_add", team)
+            p = _new_passive("team_passive_add", pid, when, formula,
+                             priority, target, scope, extra_turns)
+            bucket = match.team_passives.setdefault(t, {})
+            if p.id in bucket:
+                raise FormulaError(f"team_passive_add: team `{t}` already "
+                                   f"has a passive `{p.id}`.")
+            bucket[p.id] = p
+            return True
+
+        def _team_passive_remove(team: Any, pid: Any) -> bool:
+            """team_passive_remove(team, id): remove the team passive
+            `id`. Returns True iff there was one."""
+            t = _team_key("team_passive_remove", team)
+            bucket = match.team_passives.get(t) or {}
+            if bucket.pop(str(pid), None) is None:
+                return False
+            if not bucket:
+                match.team_passives.pop(t, None)
+            return True
+
+        def _toggle(fname: str, bucket: Dict[str, Any], pid: Any,
+                    on: Any) -> int:
+            if not isinstance(on, bool):
+                raise FormulaError(f"{fname}: `on` is True or False.")
+            if str(pid).lower() in ("all", "*"):
+                ps = list(bucket.values())
+            elif str(pid) in bucket:
+                ps = [bucket[str(pid)]]
+            else:
+                raise FormulaError(f"{fname}: no passive `{pid}` there.")
+            n = 0
+            for p in ps:
+                if p.enabled != on:
+                    p.enabled = on
+                    n += 1
+            return n
+
+        def _passive_enable(eid_t: Any, pid: Any, on: Any = True) -> int:
+            """passive_enable(eid, id, on=True): switch the unit's own
+            passive `id` (or `all`) on or off (#55). A disabled passive stays
+            on the unit, listed `(off)`, and fires on nothing; a silencing
+            status's on_added hook can turn passives off and its on_removed
+            on again. A status's or item's held passive takes `enabled` in
+            its record instead. Returns how many changed."""
+            e = _passive_owner("passive_enable", eid_t)
+            n = _toggle("passive_enable", e.passives, pid, on)
+            if n:
+                e.mark_changed()
+            return n
+
+        def _gpassive_enable(pid: Any, on: Any = True) -> int:
+            """gpassive_enable(id, on=True): switch the global passive `id`
+            (or `all`) on or off (#55). Returns how many changed."""
+            return _toggle("gpassive_enable", match.global_passives, pid, on)
+
+        def _team_passive_enable(team: Any, pid: Any, on: Any = True) -> int:
+            """team_passive_enable(team, id, on=True): switch the team
+            passive `id` (or `all`) on or off (#55). Returns how many
+            changed."""
+            t = _team_key("team_passive_enable", team)
+            return _toggle("team_passive_enable",
+                           match.team_passives.get(t) or {}, pid, on)
+
+        def _watcher_enable(name: Any, on: Any = True) -> bool:
+            """watcher_enable(name, on=True): switch the match watcher
+            `name` off (kept, not read) or on (#55; armed again from its
+            condition's value now, so one already true fires only after it
+            turns false and true again). A held watcher takes `enabled` in
+            its record. Returns whether it changed."""
+            from logic import NotFound as _NF
+            if not isinstance(on, bool):
+                raise FormulaError("watcher_enable: `on` is True or False.")
+            try:
+                return match.set_watcher_enabled(str(name), on)
+            except _NF as ex:
+                raise FormulaError(f"watcher_enable: {ex}")
+
+        def _reveal_cells(team: Any, cells: Any, turns: Any = None) -> int:
+            """reveal_cells(team, cells, turns=None): reveal a list of cells
+            to `team` through fog, as `!reveal_fog` (a flare, a scouting
+            skill): it sees their terrain and the units on them. `turns`
+            makes it last that many rounds (turns under ATB), None for good.
+            A cell [x, y, map] is on that map, [x, y] on the formula's (or
+            map=). Returns the cells revealed (off-map ones dropped)."""
+            t = _team_key("reveal_cells", team)
+            dur = None
+            if turns is not None:
+                if isinstance(turns, bool) or not isinstance(turns, int) \
+                        or turns < 1:
+                    raise FormulaError("reveal_cells: turns is a whole "
+                                       "number of at least 1, or None.")
+                dur = turns
+            keys = [_cell_key(c, "reveal_cells")
+                    for c in _list_arg(cells, "reveal_cells")]
+            _cell_budget(len(keys), "reveal_cells", cell_limit)
+            here = _cur_map().name
+            per: Dict[str, set] = {}
+            for k in keys:
+                mname = k[2] if len(k) == 3 else here
+                if mname not in match.maps:
+                    raise FormulaError(f"reveal_cells: this match has no "
+                                       f"map named `{mname}`.")
+                per.setdefault(mname, set()).add((int(k[0]), int(k[1])))
+            return sum(match.reveal_cells(t, c, dur, match.maps[mn])
+                       for mn, c in per.items())
+
+        def _reveal_clear(team: Any) -> int:
+            """reveal_clear(team): drop every reveal `team` has on the
+            formula's map (or map=), as `!reveal_fog <team> clear`. Fog
+            memory stays. Returns the reveal records dropped."""
+            t = _team_key("reveal_clear", team)
+            return match.clear_reveals(t, _cur_map())
+
+        def _part_attach(part_t: Any, parent_t: Any) -> bool:
+            """part_attach(part, parent): make the unit `part` a glued body
+            part of `parent`, as `!part attach` (a grafted limb, a captured
+            unit strapped on): it moves onto the parent with its own auras,
+            riders and parts. Refused for a loop, another map, a map
+            carrier, a snake segment or a mounted rider. Returns True."""
+            from logic import VTTError as _VE
+            part, parent = _eid(part_t), _eid(parent_t)
+            try:
+                match.attach_part(parent, part)
+            except _VE as ex:
+                raise FormulaError(f"part_attach: {ex}")
+            return True
+
+        def _part_detach(part_t: Any) -> list:
+            """part_detach(part): unlink a body part, as `!part detach` (a
+            lizard dropping its tail, a severed limb): it becomes a free
+            unit keeping its state; a living one that sat on its body steps
+            to the nearest free cell. Returns its cell."""
+            from logic import VTTError as _VE
+            try:
+                p = match.detach_part(_eid(part_t))
+            except _VE as ex:
+                raise FormulaError(f"part_detach: {ex}")
+            return [p.x, p.y]
+
+        def _part_remove(part_t: Any) -> bool:
+            """part_remove(part): remove a body part from the match with its
+            own parts, as `!part remove` (no corpse; killing it destroys the
+            limb instead). Refused for a unit that isn't a body part
+            (remove_entity removes a unit). Returns True."""
+            pid = _eid(part_t)
+            e = match.entities.get(pid)
+            if e is None:
+                raise FormulaError(f"part_remove: unknown entity '{part_t}'.")
+            if not e.part_of:
+                raise FormulaError(f"part_remove: `{pid}` is not a body part "
+                                   f"(remove_entity removes a unit).")
+            match.surface_log(match.despawn_entity(e))
+            return True
+
+        ns["passive_add"]          = _passive_add
+        ns["passive_remove"]       = _passive_remove
+        ns["gpassive_add"]         = _gpassive_add
+        ns["gpassive_remove"]      = _gpassive_remove
+        ns["team_passive_add"]     = _team_passive_add
+        ns["team_passive_remove"]  = _team_passive_remove
+        ns["passive_enable"]       = _passive_enable
+        ns["gpassive_enable"]      = _gpassive_enable
+        ns["team_passive_enable"]  = _team_passive_enable
+        ns["watcher_enable"]       = _watcher_enable
+        ns["reveal_cells"]         = _reveal_cells
+        ns["reveal_clear"]         = _reveal_clear
+        ns["part_attach"]          = _part_attach
+        ns["part_detach"]          = _part_detach
+        ns["part_remove"]          = _part_remove
 
         def _rule_get(name: Any) -> Any:
             """rule_get(name): the effective value of a system rule on
@@ -13624,7 +13932,8 @@ class FormulaEngine:
                      *, action_mode: bool = False,
                      action_bindings: Optional[Dict[str, Any]] = None,
                      locals_out: Optional[Dict[str, Any]] = None,
-                     locals_in: Optional[Dict[str, Any]] = None) -> Any:
+                     locals_in: Optional[Dict[str, Any]] = None,
+                     attr_roots: "frozenset[str]" = frozenset()) -> Any:
         """Run statements; if the source ends with an expression, return its value.
 
         locals_out       filled with the program's locals once its
@@ -13672,6 +13981,7 @@ class FormulaEngine:
 
         full = _EntityAccessTransformer(
             full_locals, action_mode=action_mode, locals_ok=True,
+            attr_roots=attr_roots,
         ).visit(full)
         ast.fix_missing_locations(full)
         _validate_tree(
@@ -13702,7 +14012,7 @@ class FormulaEngine:
                 return None
             expr_tree = ast.Expression(body=trailing_expr)
             expr_tree = _EntityAccessTransformer(
-                full_locals, action_mode=action_mode,
+                full_locals, action_mode=action_mode, attr_roots=attr_roots,
             ).visit(expr_tree)
             ast.fix_missing_locations(expr_tree)
             _validate_tree(
@@ -13840,6 +14150,7 @@ def validate_program(
     known_funcs: "frozenset[str]" = frozenset(),
     *, action_mode: bool = False,
     known_params: "frozenset[str]" = frozenset(),
+    attr_roots: "frozenset[str]" = frozenset(),
 ) -> None:
     """
     Parse and validate a formula in program mode (statements + optional
@@ -13859,7 +14170,7 @@ def validate_program(
     """
     FormulaEngine._prepare(
         src, "exec", known_funcs=known_funcs, action_mode=action_mode,
-        known_params=known_params,
+        known_params=known_params | attr_roots, attr_roots=attr_roots,
     )
 
 
@@ -13913,6 +14224,28 @@ def _doc_call_forms(name: str, doc: str) -> Optional[str]:
             return None
         i = j + 1 + len(sep)
     return None
+
+
+def unknown_calls(src: Any, known_funcs: Any = ()) -> List[str]:
+    """The names a formula calls that are neither built-in functions (any
+    mode, action builtins included) nor in `known_funcs` (the match's
+    `!func`s), in order of first call (#371). [] for text that doesn't
+    parse (a broken formula is named where it runs)."""
+    if not isinstance(src, str) or not src.strip():
+        return []
+    try:
+        tree = ast.parse(normalize_body_source(src), mode="exec")
+    except SyntaxError:
+        return []
+    builtin = (set(_MATCH_FUNC_NAMES) | set(_ALLOWED_FUNCS)
+               | _ACTION_BUILTINS | set(_ENGINE_HELPER_NAMES)
+               | set(known_funcs or ()))
+    out: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id not in builtin and node.func.id not in out:
+            out.append(node.func.id)
+    return out
 
 
 def function_reference() -> Dict[str, Dict[str, Any]]:

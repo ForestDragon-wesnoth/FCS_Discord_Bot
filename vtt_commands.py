@@ -28,7 +28,7 @@ from logic import STATUS_LINES_SKIP, STATUS_HIDE_RE, STATUS_HIDE_SEP, STATUS_LIN
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT, prefab_reads as journal_prefab_reads, replay_prefabs as journal_replay_prefabs, entry_state as journal_entry_state
 from logic import reserved_var_path_error, file_refs, _check_template_passives_clamps
-from logic import jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem, STATUS_VISIBILITY_FIELD
+from logic import WARNED_ONCE, warn_once, near_names, jcopy, STORE_DEPTH_LIMIT, same_value, same_entry, CROSS_MATCH_GUARD, check_id, check_zone_name, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS, ZONE_HOOK_NAMES, ZONE_LOOK_FIELDS, check_zone_def_name, normalize_tags, check_tag, normalize_zone_def, ACTION_RESTRICTION_FIELDS, ACTION_FORBID_FIELDS, UNLESS_SUFFIX, check_tag_filter, tag_filter_matches, tag_filter_empty, checked_tag_list, GRANTS_UNIT_TAGS, STATUS_UNIT_TAG_BLOCK, note_stored_tags, tag_words, STORED_TAGS, TAG_FIELD_KEYS, ENGINE_TAGS, checked_facing_data, FACING_FIELD, merge_layer, STATUS_LEVELS_FIELD, STATUS_LEVEL_EXCLUDED, check_level_spec, matching_level_entries, ZONE_GRANT_FIELDS, ZONE_GRANT_BODIES, check_zone_grant, RESIST_ROUNDINGS, RESIST_AFFECTS, check_status_self_grant, watcher_definition, watcher_add_args, watcher_spec_problem, STATUS_VISIBILITY_FIELD
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference, check_table_text, split_table_rank, table_text, table_entries, table_order, table_adjustments, roll_named_table, table_odds_rows, ODDS_BUDGET, QUERY_HIDDEN, READ_ONLY_EVAL
@@ -304,7 +304,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "tile":       frozenset({"list", "info"}),
     "watch":      frozenset({"list"}),
     "zone":       frozenset({"list", "info", "cells"}),
-    "turn":       frozenset({"forecast"}),
+    "turn":       frozenset({"forecast", "why"}),
 }
 # `dump` is intentionally NOT in the set above: `!ent dump` reveals an
 # entity's full var tree (including GM-hidden data), so it stays host-
@@ -1225,6 +1225,8 @@ class CommandRegistry:
         # about tags its vocabulary lacks (tag_vocabulary_mode).
         tags_token = (STORED_TAGS.set({}) if outer and _vocabulary_warns(mgr)
                       else None)
+        # A ⚠️ said once per command (logic.warn_once).
+        warned_token = WARNED_ONCE.set(set()) if outer else None
         pre_text = mgr.server_state_text() if outer else ""
         srv_token = _SERVER_PRE_TEXT.set(pre_text) if outer else None
         pre_matches = ({mid: m.system_name for mid, m in mgr.matches.items()}
@@ -1256,6 +1258,8 @@ class CommandRegistry:
                     await ctx.send(warn)
             return result
         finally:
+            if warned_token is not None:
+                WARNED_ONCE.reset(warned_token)
             if srv_token is not None:
                 _SERVER_PRE_TEXT.reset(srv_token)
             if tags_token is not None:
@@ -2324,23 +2328,8 @@ def _suggestion_threshold(ctx: ReplyContext, mgr: MatchManager) -> int:
 
 def _near_names(token: str, pool: Iterable[str], threshold: int
                 ) -> List[str]:
-    """The names of `pool` at least `threshold`% similar to `token`
-    (difflib's ratio), closest first, at most _SUGGEST_MAX. Names that
-    are `token` apart from their digits (`hunter2` for `hunter3`) never
-    count: a typed digit is a choice, not a slip (user call)."""
-    if threshold <= 0:
-        return []
-    low = token.lower()
-    bare = re.sub(r"\d", "", low)
-    scored = []
-    for name in dict.fromkeys(str(p) for p in pool):
-        nl = name.lower()
-        if nl == low or re.sub(r"\d", "", nl) == bare:
-            continue
-        r = difflib.SequenceMatcher(None, low, nl).ratio() * 100
-        if r >= threshold:
-            scored.append((-r, name))
-    return [n for _r, n in sorted(scored)[:_SUGGEST_MAX]]
+    """logic.near_names, at most _SUGGEST_MAX."""
+    return near_names(token, pool, threshold, _SUGGEST_MAX)
 
 
 def _visible_unit_names(ctx: ReplyContext, mgr: MatchManager) -> List[str]:
@@ -3229,7 +3218,9 @@ _HOST_ONLY_SUBS = frozenset({("match", "rng"), ("match", "journal")})
 
 _HOST_READS: Dict[str, Optional[frozenset]] = {
     "assert": None, "pending": None,
-    "ent": frozenset({"dump", "diff"}),
+    "ent": frozenset({"dump", "diff", "why"}),
+    "clamp": frozenset({"why"}),
+    "status": frozenset({"view", "why"}),
     "template": frozenset({"refs"}),
     "match": frozenset({"list", "info", "channels", "hosts", "outcome",
                         "journal", "links"}),
@@ -4756,12 +4747,40 @@ def _format_passive_line(label: str, p) -> str:
     a glance what each passive watches.
     """
     # Late import to avoid module-level coupling with logic's hook sets
+    off = "" if getattr(p, "enabled", True) else " (off)"
     if p.var_hooks:
-        return (f"- `{label}` ({p.when} on `{p.target or '(root)'}` "
+        return (f"- `{label}`{off} ({p.when} on `{p.target or '(root)'}` "
                 f"scope=`{p.scope}`{_priority_text(p)}): "
                 f"`{formula_text(p.formula)}`")
-    return (f"- `{label}` ({p.when}{_priority_text(p)}): "
+    return (f"- `{label}`{off} ({p.when}{_priority_text(p)}): "
             f"`{formula_text(p.formula)}`")
+
+
+def _toggle_passives(bucket: Dict[str, Any], pid: str, on: bool,
+                     what: str) -> str:
+    """#55: switch passive `pid` of `bucket` (or every one, `all`) on or
+    off; the reply. A disabled passive stays listed and saved, marked
+    (off), and fires on nothing."""
+    word = "enabled" if on else "disabled"
+    if pid.lower() in ("all", "*"):
+        ps = list(bucket.values())
+        if not ps:
+            raise NotFound(f"No passives on {what}.")
+        changed = [p for p in ps if p.enabled != on]
+        for p in changed:
+            p.enabled = on
+        return (f"{len(changed)} passive(s) on {what} {word}"
+                + (f" ({len(ps) - len(changed)} already were)."
+                   if len(changed) < len(ps) else "."))
+    p = bucket.get(pid)
+    if p is None:
+        raise NotFound(f"No passive `{pid}` on {what}.")
+    if p.enabled == on:
+        return f"Passive `{pid}` on {what} is already {word}."
+    p.enabled = on
+    return (f"Passive `{pid}` on {what} {word}"
+            + ("." if on else ": it stays listed and fires on nothing until "
+               "enabled again."))
 
 
 def _parse_clamp_bound(raw: str) -> Any:
@@ -13530,7 +13549,8 @@ async def _system_tile(ctx: ReplyContext, args: List[str],
             f"`{sys_name}` tile template `{name}`",
             "!system tile {sub} " + sys_name,
             lambda body, what, mode="exec": _system_formula_warning(
-                mgr, s, body, mode, f"Invalid {what}", "it fails"))
+                mgr, s, body, mode, f"Invalid {what}", "it fails"),
+            defined=_defined_statuses(mgr=mgr, s=s))
         lib[name] = tpl.to_dict()
         mgr.system_library_write(s, "tile_templates", lib)
         return await ctx.send(reply)
@@ -14656,6 +14676,7 @@ registry.annotate_sub(
            "[scope=exact|children|deep] [priority=<n>] "
            "[extra_turns=on|off] <formula ...> | remove <system> <id> | "
            "extra_turns <system> <id> <on|off|default> | "
+           "enable <system> <id|all> | disable <system> <id|all> | "
            "priority <system> <id> <n> | list <system> | hooks <system>>"),
     desc=(
         "A system's default passives (default_entity_passives) by name, "
@@ -15612,6 +15633,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("\n".join(
             [f"{verb} {who(src_id, src_cid)} vars.{src_path} to "
              f"{who(dest_id, dest_cid)} vars.{dest_path}."] + log))
+
+    if sub == "why":
+        # #408: a host read (_HOST_READS), as `!ent dump`.
+        if await return_help_if_not_enough_args(ctx, args, 2, "ent", "why"):
+            return
+        _check_tail(args, 2, (), "!ent why <id>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            if m.find_corpse(eid) is not None:
+                return await ctx.send(
+                    f"`{eid}` is a corpse: `!ent revive {eid}` brings it "
+                    f"back; `!ent info {eid}` reads it.")
+            raise NotFound(f"Entity '{eid}' not found.")
+        return await ctx.send("\n".join(m.alive_why(eid)))
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -16727,6 +16762,17 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "ent", "why",
+    usage="!ent why <id>",
+    desc=("#408 (hosts): why a unit counts as alive or not and what "
+          "would kill it: the alive_condition rule or the built-in test "
+          "and its result, its hp, the death condition it is judged by "
+          "(the rule, its own `__death_condition`, the mode) and its "
+          "result now, indestructibility and why, a body part's destroyed "
+          "latch, a death check held by a death under way, and what its "
+          "death leaves."),
+)
+registry.annotate_sub(
     "ent", "dump",
     usage="!ent dump <id>",
     desc=("Show ALL state stored on an entity (raw, template-free): every "
@@ -17138,6 +17184,39 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("\n".join(lines) if lines else "✅")
     if sub == "forecast":
         return await ctx.send(_turn_forecast_text(ctx, m, args[1:]))
+    if sub == "why":
+        # #367: a player read through the channel's view.
+        _check_tail(args, 2, (), "!turn why [<eid>]")
+        if len(args) > 1:
+            eid = _query_eid(ctx, m, args[1])
+        else:
+            eid = m.current_entity_id()
+            if not eid:
+                return await ctx.send("No turn is under way: name a unit "
+                                      "(`!turn why <eid>`).")
+            if _pov_hides(m, _query_pov(ctx, m), eid):
+                return await ctx.send("The unit whose turn it is can't be "
+                                      "seen from this channel.")
+        pov = _query_pov(ctx, m)
+
+        def _read(x: Entity, path: str) -> Any:
+            # Through the command's reader (#70) and a disguise's decoys.
+            miss = object()
+
+            def dig(d: Any) -> Any:
+                for seg in path.split("."):
+                    if not isinstance(d, dict) or seg not in d:
+                        return miss
+                    d = d[seg]
+                return d
+            got = dig(m.reader_vars(x, pov))
+            if got is miss:
+                return _private_text(m) if dig(x.vars) is not miss else None
+            return got
+
+        lines = m.turn_why(eid, shows=lambda u: not _pov_hides(m, pov, u),
+                           read=_read)
+        return await ctx.send("\n".join(lines))
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 2, "turn", "set"):
             return
@@ -17317,6 +17396,18 @@ registry.annotate_sub(
     desc=("Advance to the next entity's turn. When the cycle wraps "
           "(every entity has acted), increments the match's round_number "
           "and fires on_round_end / on_round_start hooks.")
+)
+registry.annotate_sub(
+    "turn", "why",
+    usage="!turn why [<eid>]",
+    desc=("#367: why a unit (default: the one whose turn it is) sits "
+          "where it does in the turn order: its slot, whether it acted "
+          "this round, its initiative and the rules sorting it "
+          "(direction, team grouping with its team's score, the tiebreak "
+          "var, the tiebreaker) and the units it ties with, a deferred "
+          "re-sort, queued extra turns and the statuses that skip its "
+          "turns; under ATB its bar, rate and threshold. Players may read "
+          "it; units the channel's view can't see read as missing."),
 )
 registry.annotate_sub(
     "turn", "forecast",
@@ -23549,6 +23640,26 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             m.entities[eid].mark_changed()
         return await ctx.send(reply)
 
+    if sub in ("enable", "disable"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "passive", sub):
+            return
+        _check_tail(args, 3, (), f"!passive {sub} <entity_id> <passive_id|all>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        e = m.entities[eid]
+        if args[2] not in e.passives and args[2].lower() not in ("all", "*"):
+            held = [src for src, hid, *_ in m.held_passive_entries(e)
+                    if hid == args[2]]
+            if held:
+                raise VTTError(
+                    f"`{args[2]}` is held by {held[0]}: set `enabled` "
+                    f"(true / false) in its record there.")
+        reply = _toggle_passives(e.passives, args[2], sub == "enable",
+                                 f"`{eid}`")
+        e.mark_changed()
+        return await ctx.send(reply)
+
     if sub == "extra_turns":
         if await return_help_if_not_enough_args(ctx, args, 4, "passive", "extra_turns"):
             return
@@ -23708,6 +23819,22 @@ registry.annotate_sub(
           "passives; equal priorities keep the order globals, team, own "
           "(each in the order added). Default 0; any number."),
 )
+for _cmd, _pre, _what in (("passive", "!passive {s} <entity_id> <passive_id|all>",
+                           "the unit's own passive (a status's or item's "
+                           "held one: set `enabled` in its record)"),
+                          ("gpassive", "!gpassive {s} <passive_id|all>",
+                           "a global passive"),
+                          ("defpassive", "!defpassive {s} <id|all>",
+                           "a default passive (its copies on units follow, "
+                           "as for any edit of the default)")):
+    for _s in ("enable", "disable"):
+        registry.annotate_sub(
+            _cmd, _s, usage=_pre.format(s=_s),
+            desc=(f"#55: switch {_what} {'on' if _s == 'enable' else 'off'}"
+                  f" (`all` = every one). A disabled passive stays listed "
+                  f"(marked `(off)`) and saved and fires on nothing; the "
+                  f"formulas passive_enable / gpassive_enable / "
+                  f"team_passive_enable do the same."))
 registry.annotate_sub(
     "passive", "remove",
     usage="!passive remove <entity_id> <passive_id>",
@@ -23810,6 +23937,13 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if new is not _UNCHANGED:
             p.sprite_effects = new
         return await ctx.send(reply)
+
+    if sub in ("enable", "disable"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "gpassive", sub):
+            return
+        _check_tail(args, 2, (), f"!gpassive {sub} <passive_id|all>")
+        return await ctx.send(_toggle_passives(
+            m.global_passives, args[1], sub == "enable", "the match (global)"))
 
     if sub == "extra_turns":
         if await return_help_if_not_enough_args(ctx, args, 3, "gpassive", "extra_turns"):
@@ -23942,7 +24076,7 @@ registry.annotate_sub(
 
 @registry.command(
     "clamp",
-    usage="!clamp <add|remove|list> ...",
+    usage="!clamp <add|remove|list|why> ...",
     desc=("Manage entity-scoped clamps. Entity clamps override system-level "
           "default_clamps on the same path. See `!clamp add` for full syntax."),
 )
@@ -23952,6 +24086,16 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
     sub = args[0].lower()
+
+    if sub == "why":
+        # #487: a host read (_HOST_READS).
+        if await return_help_if_not_enough_args(ctx, args, 3, "clamp", "why"):
+            return
+        _check_tail(args, 3, (), "!clamp why <eid> <path>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        return await ctx.send("\n".join(m.clamp_why(eid, args[2])))
 
     if sub == "add":
         # !clamp add <eid> <path> [max=...] [min=...] [mode=hard|soft]
@@ -24055,6 +24199,15 @@ registry.annotate_sub(
     "clamp", "remove",
     usage="!clamp remove <eid> <path>",
     desc="Remove an entity-level clamp. Aliases: del, rm.",
+)
+registry.annotate_sub(
+    "clamp", "why",
+    usage="!clamp why <eid> <path>",
+    desc=("#487 (hosts): the clamp on a unit's var: whether it is the "
+          "unit's own (`!clamp`, shadowing the system's) or the system's "
+          "default (`!gclamp`), each bound's value now (a var path that is "
+          "missing or not a number is no bound), the value and whether a "
+          "soft clamp is dormant."),
 )
 registry.annotate_sub(
     "clamp", "list",
@@ -24368,6 +24521,39 @@ async def _defpassive_on(ctx: ReplyContext, mgr: MatchManager,
             f"priority {prio} [refreshed {refreshed} live "
             f"match{'es' if refreshed != 1 else ''}]." + _reach())
 
+    if sub in ("enable", "disable"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "defpassive", sub):
+            return
+        _check_tail(args, 2, (), f"!defpassive {sub} <id|all>")
+        pid, on = args[1], sub == "enable"
+        every = pid.lower() in ("all", "*")
+        existing = _read_specs()
+        if not every and not any(isinstance(sp, dict) and sp.get("id") == pid
+                                 for sp in existing):
+            raise NotFound(
+                f"No default passive '{pid}' in system '{sys_name}'.")
+        new_list, n = [], 0
+        for spec in existing:
+            if isinstance(spec, dict) and (every or spec.get("id") == pid) \
+                    and (spec.get("enabled", True) is not False) != on:
+                spec = dict(spec)
+                if on:
+                    spec.pop("enabled", None)
+                else:
+                    spec["enabled"] = False
+                n += 1
+            new_list.append(spec)
+        word = "enabled" if on else "disabled"
+        if not n:
+            return await ctx.send(
+                f"Default passive{'s' if every else f' `{pid}`'} of system "
+                f"`{sys_name}` already {word}.")
+        refreshed = _write_specs(new_list)
+        return await ctx.send(
+            f"{n} default passive(s) of system `{sys_name}` {word} "
+            f"[refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]." + _reach())
+
     if sub == "extra_turns":
         if await return_help_if_not_enough_args(ctx, args, 3, "defpassive", "extra_turns"):
             return
@@ -24678,24 +24864,64 @@ registry.annotate_sub(
 def _schedule_line(s: Dict[str, Any]) -> str:
     name = s.get("name", "?")
     body = formula_text(s.get("body", ""))
+    rep = ""
+    if s.get("every"):
+        unit = {"round": "round(s)", "clock": "turn(s)"}.get(
+            str(s.get("kind")), "of its turns")
+        rep = f", every {s['every']} {unit}"
+        if s.get("times_left") is not None:
+            rep += f", {s['times_left']} firing(s) left"
+    if isinstance(s.get("args"), dict) and s["args"]:
+        rep += ", args " + ", ".join(f"{k}={json.dumps(v)}"
+                                     for k, v in s["args"].items())
     if s.get("kind") == "round":
-        return f"- `{name}` (match) @ round {s.get('fire_round')}: `{body}`"
+        return (f"- `{name}` (match) @ round {s.get('fire_round')}{rep}: "
+                f"`{body}`")
+    if s.get("kind") == "clock":
+        return (f"- `{name}` (match, turn clock) @ turn "
+                f"{s.get('fire_turn')}{rep}: `{body}`")
     return (
         f"- `{name}` on `{s.get('eid')}` @ in {s.get('turns_left')} "
-        f"turn(s): `{body}`"
+        f"turn(s){rep}: `{body}`"
     )
+
+
+def _schedule_opts(tokens: List[str]) -> Tuple[Optional[int], Optional[int],
+                                                str]:
+    """`every=<n>` / `times=<k>` before a schedule's body (#458), then the
+    body."""
+    every = times = None
+    i = 0
+    while i < len(tokens) and tokens[i].lower().startswith(("every=",
+                                                            "times=")):
+        k, _, v = tokens[i].partition("=")
+        try:
+            n = int(v)
+        except ValueError:
+            raise VTTError(f"`{k.lower()}=` takes a whole number, got `{v}`.")
+        if k.lower() == "every":
+            every = n
+        else:
+            times = n
+        i += 1
+    return every, times, " ".join(tokens[i:])
 
 
 @registry.command(
     "schedule",
-    usage="!schedule <list | cancel <name> | round <delay> <body> | turn <eid> <delay> <body>>",
+    usage="!schedule <list | cancel <name> | round <delay> [every=<n>] [times=<k>] <body> | turns <delay> [every=<n>] [times=<k>] <body> | turn <eid> <delay> [every=<n>] [times=<k>] <body>>",
     desc=(
         "Manage scheduled / delayed effects on the active match. `round "
         "<delay> <body>` queues a MATCH-level body to run at round-start "
         "<delay> rounds from now (no `self` bound). `turn <eid> <delay> "
         "<body>` queues an ENTITY-attached body to run at <eid>'s "
         "turn-start after <delay> of its turns (`self`=<eid>, dropped if "
-        "it dies). `list` shows pending; `cancel <name>` removes by name. "
+        "it dies). `turns <delay> <body>` queues a match-level body on the "
+        "turn clock: it runs as a turn begins <delay> turns from now, any "
+        "unit's turn, ATB too (#491). `every=<n>` fires it again every n "
+        "rounds / turns until cancelled, `times=<k>` stops after k firings "
+        "(#458). "
+        "`list` shows pending; `cancel <name>` removes by name. "
         "Command twin of the schedule() / schedule_on() / cancel_schedule() "
         "formula primitives. Use \\n in a body for multiple statements."
     ),
@@ -24727,22 +24953,35 @@ async def schedule_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Cancelled {n} scheduled effect(s) named `{args[1]}`."
         )
 
-    if sub == "round":
-        if await return_help_if_not_enough_args(ctx, args, 3, "schedule", "round"):
+    if sub in ("round", "turns"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "schedule", sub):
             return
         try:
             delay = int(args[1])
         except ValueError:
             return await ctx.send(f"❌ Delay must be an integer, got '{args[1]}'.")
-        body = " ".join(args[2:])
+        every, times, body = _schedule_opts(args[2:])
+        if sub == "round" and m.rules.get("atb_enabled"):
+            return await ctx.send(
+                "❌ Rounds don't run under ATB: `!schedule turns <delay> "
+                "<body>` counts turns.")
         try:
-            name = m.add_scheduled(delay, body)
+            name = m.add_scheduled(
+                delay, body, every=every, times=times,
+                clock="rounds" if sub == "round" else "turns")
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
+        entry = m.scheduled[-1]
+        note = m.schedule_self_note(entry.get("body", ""),
+                                    f"schedule `{name}`")
+        when = (f"round {m.round_number + delay}" if sub == "round" else
+                f"turn {m.turns_elapsed + delay} (counting every unit's "
+                f"turns)")
         return await ctx.send(
-            f"Scheduled match effect `{name}` for round "
-            f"{m.round_number + delay}."
-        )
+            f"Scheduled match effect `{name}` for {when}"
+            + (f", then every {every}" if every else "")
+            + (f", {times} time(s) in all" if times else "")
+            + "." + (f"\n{note}" if note else ""))
 
     if sub == "turn":
         if await return_help_if_not_enough_args(ctx, args, 4, "schedule", "turn"):
@@ -24752,19 +24991,21 @@ async def schedule_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             delay = int(args[2])
         except ValueError:
             return await ctx.send(f"❌ Delay must be an integer, got '{args[2]}'.")
-        body = " ".join(args[3:])
+        every, times, body = _schedule_opts(args[3:])
         try:
-            name = m.add_scheduled_on(eid, delay, body)
+            name = m.add_scheduled_on(eid, delay, body, every=every,
+                                      times=times)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
         return await ctx.send(
             f"Scheduled effect `{name}` on `{eid}` for {delay} turn(s) "
-            f"from now."
+            f"from now" + (f", then every {every}" if every else "")
+            + (f", {times} time(s) in all" if times else "") + "."
         )
 
     raise VTTError(
         f"Unknown !schedule subcommand '{sub}'. "
-        f"Use list / cancel / round / turn."
+        f"Use list / cancel / round / turns / turn."
     )
 
 
@@ -24780,7 +25021,7 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "schedule", "round",
-    usage="!schedule round <delay> <body>",
+    usage="!schedule round <delay> [every=<n>] [times=<k>] <body>",
     desc=(
         "Queue a MATCH-level effect: <body> runs at round-start <delay> "
         "rounds from now (delay>=1). No `self` bound — use explicit ids or "
@@ -24789,12 +25030,24 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "schedule", "turn",
-    usage="!schedule turn <eid> <delay> <body>",
+    usage="!schedule turn <eid> <delay> [every=<n>] [times=<k>] <body>",
     desc=(
         "Queue an ENTITY-attached effect: <body> runs at <eid>'s "
         "turn-start after <delay> of its turns (delay>=1), with `self`= "
-        "<eid>. Dropped if the entity dies/despawns first. Twin of the "
-        "schedule_on() formula primitive."
+        "<eid>. Dropped if the entity dies/despawns first. `every=<n>` "
+        "repeats it every n of its turns, `times=<k>` stops after k "
+        "firings. Twin of the schedule_on() formula primitive."
+    ),
+)
+registry.annotate_sub(
+    "schedule", "turns",
+    usage="!schedule turns <delay> [every=<n>] [times=<k>] <body>",
+    desc=(
+        "#491: queue a MATCH-level effect on the turn clock: <body> runs as "
+        "a turn begins <delay> turns from now (every unit's turns count, "
+        "ATB too). No `self` bound (a ⚠️ says so when the body names it): "
+        "`current` is the unit whose turn began. Twin of schedule(..., "
+        "clock='turns')."
     ),
 )
 
@@ -25169,7 +25422,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                             f"tile ({x},{y}){_on_map(m, mp)}",
                             "!tile {sub}", _match_program_check(m),
                             name_word="<x> <y>",
-                            inside="standing on it")
+                            inside="standing on it",
+                            defined=_defined_statuses(m))
         for k in keys:
             if k in target:
                 if not same_value(target[k], tile.get(k)):
@@ -25425,7 +25679,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 raise NotFound(f"No tile template `{args[2]}`.")
             return await ctx.send(_tile_template_grant_edit(
                 tpl, args[1:], f"tile template `{args[2]}`",
-                "!tile def {sub}", _match_program_check(m)))
+                "!tile def {sub}", _match_program_check(m),
+                defined=_defined_statuses(m)))
 
         if dsub == "new":
             # !tile def new <name>
@@ -26367,7 +26622,8 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if z is None:
             raise NotFound(f"No zone `{args[1]}`.")
         reply = _grant_edit(z, args, f"zone `{args[1]}`", "!zone {sub}",
-                            _match_program_check(m))
+                            _match_program_check(m),
+                            defined=_defined_statuses(m))
         m.zone_map(args[1]).zone_touch(args[1])    # its grants (#197)
         return await ctx.send(reply)
 
@@ -27101,8 +27357,20 @@ async def _zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["zone"], args[0] if args else None)
 
 
+def _defined_statuses(m: Optional[Match] = None, mgr: Any = None,
+                      s: Any = None) -> Tuple[Any, str]:
+    """(defined status names, status_definition_mode) of a match, else of
+    system `s` (#534), for a grant edit's check."""
+    if m is not None:
+        return (m.status_definitions,
+                str(m.rules.get("status_definition_mode", "warn")))
+    return (mgr.system_library(s, "status_definitions"),
+            str(mgr.system_value(s, "status_definition_mode")))
+
+
 def _tile_template_grant_edit(tpl: Any, args: List[str], label: str,
-                              usage: str, check) -> str:
+                              usage: str, check,
+                              defined: Any = None) -> str:
     """A grant subcommand (#290) on tile template `tpl` (SpecialTileTemplate):
     its `grants` and grant_condition / grant_bodies settings, read live by
     the tiles placed from it."""
@@ -27110,7 +27378,7 @@ def _tile_template_grant_edit(tpl: Any, args: List[str], label: str,
     if tpl.grants:
         target["grants"] = jcopy(tpl.grants)
     reply = _grant_edit(target, args, label, usage, check,
-                        inside="standing on its tiles")
+                        inside="standing on its tiles", defined=defined)
     tpl.grants = target.get("grants") or {}
     tpl.grant_settings = {k: target[k] for k in ("grant_condition",
                                                  "grant_bodies")
@@ -27126,7 +27394,7 @@ _GRANT_SUBS = {"grant": 3, "ungrant": 3, "grant_condition": 2,
 
 def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
                 usage: str, check, name_word: str = "<name>",
-                inside: str = "inside it") -> str:
+                inside: str = "inside it", defined: Any = None) -> str:
     """Run grant subcommand `args[0]` (args = <sub> <name> ...) on zone or
     zone definition dict `target`, named `label` in the reply; `usage` is
     the command the hints name (a format string over `sub`), `check(body,
@@ -27155,6 +27423,20 @@ def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
         if data:
             entry["data"] = data
         stored = check_zone_grant(status, entry)
+        undefined = ""
+        if defined is not None and status not in defined[0] \
+                and defined[1] != "off":
+            near = near_names(status, defined[0], 75)
+            hint = (" (did you mean " + " / ".join(f"`{n}`" for n in near)
+                    + "?)") if near else ""
+            if defined[1] == "refuse":
+                raise VTTError(f"`{status}` has no status definition{hint}; "
+                               f"status_definition_mode refuse refuses a "
+                               f"grant of it (`!status def {status}` defines "
+                               f"it).")
+            if warn_once(("status_def", status)):
+                undefined = (f"\n⚠️ `{status}` has no status "
+                             f"definition{hint} (status_definition_mode).")
         target.setdefault("grants", {})[status] = stored
         bits = [f"level {stored['level']}" if "level" in stored else None,
                 f"linger {stored['linger']} turn(s)"
@@ -27164,7 +27446,7 @@ def _grant_edit(target: Dict[str, Any], args: List[str], label: str,
         bits = [b for b in bits if b]
         return (f"{label} grants `{status}`"
                 + (f" ({', '.join(bits)})" if bits else "")
-                + f" to the units {inside}.")
+                + f" to the units {inside}." + undefined)
     if sub == "ungrant":
         _check_tail(args, 3, (), usage.format(sub="ungrant")
                     + " " + name_word + " <status>")
@@ -27305,7 +27587,9 @@ async def _zone_def_body(ctx: ReplyContext, args: List[str], m: Match,
                        f"`{prefix.format(sub='new')} {name}`.")
     if sub in _GRANT_SUBS:
         head, nl, warn = _grant_edit(d, args, f"zone definition `{name}`",
-                                     prefix, check).partition("\n")
+                                     prefix, check,
+                                     defined=_defined_statuses(m)
+                                     ).partition("\n")
         return (head + " Its zones read it live; a zone's own grant of a "
                 "status replaces it." + nl + warn)
     if sub == "reapply":
@@ -27728,6 +28012,25 @@ registry.annotate_sub(
     desc=("How this status's resisted level or duration rounds, over the "
           "status_resist_rounding rule (#232); an application's `rounding=` "
           "overrides it in turn. `-` goes back to the rule."),
+)
+registry.annotate_sub(
+    "status", "view",
+    usage="!status view <eid> <name>",
+    desc=("#486 (hosts): a status a unit holds, field by field as it "
+          "reads now at the instance's level, each with its origin: the "
+          "instance, a level entry (which one) or the definition; the "
+          "engine fields still on their rule's default are named last."),
+)
+registry.annotate_sub(
+    "status", "why",
+    usage="!status why <eid> <name>",
+    desc=("#366 (hosts): why a unit holds a status from a grant, or "
+          "doesn't: the instance now (its own, held by which grants, "
+          "lingering), then every zone, tile under its body and item that "
+          "grants the status, each with whether it reaches the unit (the "
+          "bodies rule, its grant_condition's result or error) and the "
+          "level it gives, then what the application would meet (a part "
+          "redirect or immunity, immunity, blocked_by, full resistance)."),
 )
 registry.annotate_sub(
     "status", "resist",
@@ -28712,6 +29015,53 @@ async def _status_def_body(ctx: ReplyContext, args: List[str], m: Match,
     return None
 
 
+def _status_view_text(m: Match, e: Entity, sname: str) -> str:
+    """#486: status `sname` on `e` field by field, each as it reads now
+    (status_field) with its origin: the instance, a level entry (which),
+    the definition, or a rule's default for the engine's fields."""
+    inst = e.status.get(sname)
+    if inst is None:
+        raise NotFound(f"`{e.id}` doesn't hold `{sname}`.")
+    level = m.status_level(inst)
+    sdef = m.status_definitions.get(sname)
+    defined = isinstance(sdef, dict)
+    lvl_data, lvl_src = m.status_level_data(sname, level)
+    keys: List[str] = []
+    for src in (inst if isinstance(inst, dict) else {}, sdef or {},
+                lvl_data):
+        for k in src:
+            if k not in keys and k != STATUS_LEVELS_FIELD:
+                keys.append(k)
+    lines = [f"**`{sname}` on `{e.id}`** (level {level}"
+             + ("" if defined else "; no definition: every field is the "
+                "instance's") + "):"]
+    rule_defaults = {"stack": "status_default_stack",
+                     "duration_mode": "status_default_duration_mode",
+                     "if_source_lost": "status_default_if_source_lost",
+                     "visibility_condition": "status_visibility_condition"}
+    empty = ("", None, [], {})
+    for k in keys:
+        if isinstance(inst, dict) and k in inst:
+            origin = "instance"
+        elif k in lvl_src:
+            origin = f"level entry `{lvl_src[k]}`"
+        else:
+            origin = "definition"
+            if m.status_field(inst, sname, k) in empty:
+                continue            # a definition's unset field
+        val = _hide_formula_fields({k: m.status_field(inst, sname, k)})[k]
+        txt = json.dumps(val, default=str, ensure_ascii=False)
+        if len(txt) > 160:
+            txt = txt[:157] + "..."
+        lines.append(f"- `{k}` = {txt} ({origin})")
+    unset = [f"`{k}` (rule {r}: {m.rules.get(r)!r})"
+             for k, r in rule_defaults.items()
+             if m.status_field(inst, sname, k) in empty]
+    if unset:
+        lines.append("From rules: " + ", ".join(unset) + ".")
+    return "\n".join(lines)
+
+
 @registry.command(
     "status",
     usage=("!status <def|drop|rename|copy|tick|hook|display|message|visibility|when|stack|maxlevel|maxduration|tick_priority|data|tags|"
@@ -28793,6 +29143,27 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                   _match_program_check(m))
     if reply is not None:
         return await ctx.send(reply) if reply else None
+
+    if sub == "why":
+        # #366 (hosts): why a unit holds a granted status or doesn't.
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "why"):
+            return
+        _check_tail(args, 3, (), "!status why <eid> <name>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        return await ctx.send("\n".join(m.grant_why(eid, args[2])))
+
+    if sub == "view":
+        # #486 (hosts): every effective field of an instance, with where
+        # it comes from.
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "view"):
+            return
+        _check_tail(args, 3, (), "!status view <eid> <name>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        return await ctx.send(_status_view_text(m, m.entities[eid], args[2]))
 
     if sub == "resist":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "resist"):
@@ -29320,14 +29691,15 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 for _subs, _usage in (
-        (('show',), '!mod show <eid> <stat> [base] [tag ...]'),):
+        (('show',), '!mod show <eid> <stat> [base] [tag ...]'),
+        (('list',), '!mod list <eid>')):
     registry.annotate_sub('mod', *_subs, usage=_usage)
 
 
 @registry.command(
     "mod",
     access="all",
-    usage="!mod show <eid> <stat> [base] [tag ...]",
+    usage="!mod show <eid> <stat> [base] [tag ...] | !mod list <eid>",
     desc=(
         "Inspect a derived/effective stat — the active modifiers and, given "
         "a numeric base, the folded result. Modifiers are NOT edited here: "
@@ -29405,6 +29777,54 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 + ", ".join(MODIFIER_OPS) + ".")
         if problems:
             lines.append("⚠️ left out: " + "; ".join(problems))
+        return await ctx.send("\n".join(lines))
+
+    if sub == "list":
+        # #425: every stat with modifier records on the unit, its records
+        # grouped under it, with their sources; `!mod show` folds one.
+        if await return_help_if_not_enough_args(ctx, args, 2, "mod", "list"):
+            return
+        _check_tail(args, 2, (), "!mod list <eid>")
+        eid = _query_eid(ctx, m, args[1])
+        e = m.entities[eid]
+        view = (m.private_view(VAR_READER.get()) if _effects_hidden(m)
+                else contextlib.nullcontext())
+        with view:
+            recs = m._raw_modifier_records(m.entities[eid])
+        by_stat: Dict[str, List[str]] = {}
+        odd: List[str] = []
+        for rec, src_text, _holder in recs:
+            stat = rec.get("stat") if isinstance(rec, dict) else None
+            src_text = str(src_text or "")
+            if src_text and not src_text.startswith(
+                    ("status:", "team:", "map:", "match.")) \
+                    and src_text != "match" and ":" not in src_text \
+                    and _path_private(m, e, src_text):
+                src_text = _private_text(m)
+            if not isinstance(stat, str) or not stat:
+                odd.append(src_text or "?")
+                continue
+            val = rec.get("value", 0)
+            shown = (f"{val:g}" if isinstance(val, (int, float))
+                     and not isinstance(val, bool)
+                     else f"`{formula_text(str(val))}`")
+            extra = ""
+            if rec.get("condition") not in (None, ""):
+                extra += " if " + f"`{formula_text(str(rec['condition']))}`"
+            if rec.get("tags"):
+                extra += f" tags={rec['tags']}"
+            by_stat.setdefault(stat, []).append(
+                f"    {rec.get('op', 'add')} {shown}{extra} [{src_text}]")
+        if not by_stat and not odd:
+            return await ctx.send(f"`{eid}` has no modifier records.")
+        lines = [f"**Modifier records on `{eid}`** (`!mod show {eid} "
+                 f"<stat> [base]` folds one):"]
+        for stat in sorted(by_stat):
+            lines.append(f"- `{stat}` ({len(by_stat[stat])}):")
+            lines.extend(by_stat[stat])
+        if odd:
+            lines.append("⚠️ records without a `stat` (never applied): "
+                         + ", ".join(f"`{o}`" for o in odd))
         return await ctx.send("\n".join(lines))
 
     return await _help_fallback(ctx, ["mod"], args[0] if args else None)
@@ -31906,6 +32326,8 @@ for _subs, _usage in (
         (('show',), '!watch show <name>'),
         (('held',), '!watch held <eid>'),
         (('remove',), '!watch remove <name>'),
+        (('enable',), '!watch enable <name|all>'),
+        (('disable',), '!watch disable <name|all>'),
         (('check',), '!watch check')):
     registry.annotate_sub('watch', *_subs, usage=_usage)
 
@@ -31970,12 +32392,14 @@ def _watcher_flags(w: Dict[str, Any]) -> str:
         flags.append("once")
     if w.get("once_each"):
         flags.append("once_each")
+    if w.get("enabled") is False:
+        flags.append("off")
     return f" ({', '.join(flags)})" if flags else ""
 
 
 @registry.command(
     "watch",
-    usage='!watch <add|remove|list|show|held|check> ...',
+    usage='!watch <add|remove|list|show|held|check|enable|disable> ...',
     desc=(
         "Condition-watchers: edge-triggered triggers re-checked after every "
         "command. `add <name> \"<condition>\" \"<effect>\" [once | "
@@ -31993,7 +32417,11 @@ def _watcher_flags(w: Dict[str, Any]) -> str:
         "read with self = the holder and `watcher_source` naming where it "
         "came from (`held <eid>` lists them). Systems hold watchers for "
         "new matches (`!system watch`). Also: remove <name> / list / show "
-        "<name> / check (poll now). Per-match, serialized."
+        "<name> / check (poll now). `disable <name|all>` keeps a watcher "
+        "but stops reading it; `enable` arms it again from the condition's "
+        "value then (one already true fires only after it turns false and "
+        "true again); a held watcher takes `enabled: false` in its record "
+        "(#55; formula watcher_enable). Per-match, serialized."
     ),
 )
 async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -32098,6 +32526,28 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"`{formula_text(spec.get('effect') or '')}`")
         return await ctx.send("\n".join(lines))
 
+    if sub in ("enable", "disable"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "watch", sub):
+            return
+        _check_tail(args, 2, (), f"!watch {sub} <name|all>")
+        on = sub == "enable"
+        names = (sorted(m.watchers) if args[1].lower() in ("all", "*")
+                 else [args[1]])
+        if not names:
+            return await ctx.send("No watchers defined.")
+        if args[1] not in m.watchers and len(names) == 1 \
+                and names[0] == args[1]:
+            return await ctx.send(f"❌ no watcher `{args[1]}`.")
+        changed = [n for n in names if m.set_watcher_enabled(n, on)]
+        word = "enabled" if on else "disabled"
+        if not changed:
+            return await ctx.send(f"Already {word}: "
+                                  + ", ".join(f"`{n}`" for n in names) + ".")
+        return await ctx.send(
+            f"Watcher(s) {word}: " + ", ".join(f"`{n}`" for n in changed)
+            + (" (armed from the condition's value now)." if on else
+               " (kept, not read until enabled)."))
+
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "watch", "remove"):
             return
@@ -32164,7 +32614,7 @@ for _subs, _usage in (
         (('get',), '!team get <team> <path>'),
         (('list',), '!team list [team]'),
         (('clear',), '!team clear <team> [path]'),
-        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n> | extra_turns <team> <pid> <on|off|default> | effect <team> <pid> <add <name> <effect> [<field>=<value> ...] | remove <name> | list | clear>>')):
+        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] [extra_turns=on|off] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n> | extra_turns <team> <pid> <on|off|default> | enable <team> <pid|all> | disable <team> <pid|all> | effect <team> <pid> <add <name> <effect> [<field>=<value> ...] | remove <name> | list | clear>>')):
     registry.annotate_sub('team', *_subs, usage=_usage)
 
 
@@ -32319,6 +32769,17 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if new is not _UNCHANGED:
                 p.sprite_effects = new
             return await ctx.send(reply)
+        if psub in ("enable", "disable"):
+            if await return_help_if_not_enough_args(ctx, args, 4, "team", "passive"):
+                return
+            _check_tail(args, 4, (), f"!team passive {psub} <team> "
+                                     f"<passive_id|all>")
+            team = args[2]
+            if team not in m.team_passives:
+                return await ctx.send(f"❌ team `{team}` has no passives.")
+            return await ctx.send(_toggle_passives(
+                m.team_passives[team], args[3], psub == "enable",
+                f"team `{team}`"))
         if psub == "extra_turns":
             if await return_help_if_not_enough_args(ctx, args, 5, "team", "passive"):
                 return
@@ -32349,7 +32810,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             for pid, p in bucket.items():
                 lines.append(_format_passive_line(pid, p))
             return await ctx.send("\n".join(lines))
-        return await ctx.send("❌ Usage: `!team passive <add|remove|list|priority|extra_turns> ...`")
+        return await ctx.send("❌ Usage: `!team passive <add|remove|list|priority|extra_turns|enable|disable|effect> ...`")
 
     return await _help_fallback(ctx, ["team"], args[0] if args else None)
 
@@ -32599,9 +33060,64 @@ async def assert_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         raise AssertionStop(
             f"Assertion failed: `{src}` couldn't be evaluated ({ex}){suffix}")
     if not val:
+        with m.private_view(VAR_READER.get()):
+            detail = _assert_detail(m, src, self_id)
         raise AssertionStop(
-            f"Assertion failed: `{src}` is {val!r}{suffix}")
+            f"Assertion failed: `{src}` is {val!r}{detail}{suffix}")
     return await ctx.send(f"✅ Assertion passed: `{src}`{suffix}")
+
+
+def _assert_detail(m: Match, src: str, self_id: Optional[str]) -> str:
+    """#426: the values behind a failed `!assert`: each comparison of the
+    expression's and / or / not structure that came out false, with the
+    value of every side that isn't a plain constant ("`entity[a].hp` is
+    10"). Empty when the expression holds no comparison."""
+    import ast as _ast
+    try:
+        tree = _ast.parse(src.strip(), mode="eval")
+    except SyntaxError:
+        return ""
+    text = src.strip()
+    comps: List[Any] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, _ast.BoolOp):
+            for v in node.values:
+                walk(v)
+        elif isinstance(node, _ast.UnaryOp) and isinstance(node.op, _ast.Not):
+            walk(node.operand)
+        elif isinstance(node, _ast.Compare):
+            comps.append(node)
+
+    walk(tree.body)
+    if not comps:
+        return ""
+
+    def value(seg: str) -> Any:
+        return FormulaEngine(m).eval_expression(
+            seg, EvalCtx(this=m.current_entity_id(), target=self_id))
+
+    parts: List[str] = []
+    for c in comps[:6]:
+        seg = _ast.get_source_segment(text, c)
+        if not seg:
+            continue
+        try:
+            if len(comps) > 1 and value(seg):
+                continue            # this one held; another failed
+            sides = []
+            for side in [c.left] + list(c.comparators):
+                if isinstance(side, _ast.Constant):
+                    continue
+                sseg = _ast.get_source_segment(text, side)
+                if sseg:
+                    sides.append(f"`{sseg}` is {value(sseg)!r}")
+        except FormulaError:
+            continue
+        if sides:
+            parts.append((f"`{seg}`: " if len(comps) > 1 else "")
+                         + ", ".join(sides))
+    return (" (" + "; ".join(parts) + ")") if parts else ""
 
 
 # ---- !action ---------------------------------------------------------
