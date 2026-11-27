@@ -3364,12 +3364,18 @@ hardcodes**.
   every cell would fire each turn; known limitation): a template holding
   one is refused as ground (`time_hooks_of`), one added later never fires
   from it. A template rename follows into the ground var; deleting the
-  template clears it. A render resolves a ground without `looks` once
-  (its glyph, colour and draw layer), and skips the per-cell
+  template clears it. A render reads the ground name once per map
+  (`ground_name` under the looks memo), builds each cell's look sources
+  once for glyph, colour, sprite and effects (`tile_render_look`), and
+  reads the ground cells' shared look once (`_ground_share`: unless a
+  `looks` condition needs the formula engine, which may read tile_x /
+  tile_y; a colour formula and sprite variants stay per cell, and the
+  text map's colour note names the ground); it skips the per-cell
   `tile_visible_to` for every tile when nothing can hide one
   (`_all_tiles_visible`: an omniscient view, or no fog on the map and an
-  empty tile_visibility_condition): a full text render of a 500x500
-  ground map takes ~0.35 s (1.8 s before), a 28x28 window 0.02 s.
+  empty tile_visibility_condition). A full render of a 500x500 ground
+  map: text ~0.45 s (3.5 s with data-test `looks` before), image scene
+  ~0.75 s (3.7 s before); a 28x28 window 0.02 s.
 - **Sprite variants** (#288, 1343): `sprite_variants` (a list or {key:
   weight}, `sprite_variants_problem`) on tile data, a template, a zone or a
   definition; `_facing_sprite` picks one per cell (`sprite_variant`: a
