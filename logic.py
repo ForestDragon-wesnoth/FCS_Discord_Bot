@@ -22325,6 +22325,16 @@ class Match:
         return self._visibility_visible(
             "entity_visibility_condition", pov_team, target=eid)
 
+    def _all_tiles_visible(self, pov_team: Optional[str], mp: "Map") -> bool:
+        """Whether every tile of map `mp` is visible to `pov_team` with no
+        per-cell test: an omniscient view, or no fog on the map and an
+        empty tile_visibility_condition. A render then skips
+        tile_visible_to for each tile and ground cell (#472)."""
+        return pov_team is None or (
+            not self.fog_on(mp)
+            and not str(self.rules.get("tile_visibility_condition",
+                                       "")).strip())
+
     def tile_visible_to(self, x: int, y: int, pov_team: Optional[str],
                         mp: Optional["Map"] = None) -> bool:
         """Whether the tile at (x, y) of map `mp` (None = the only map) — its
@@ -35405,9 +35415,13 @@ class Match:
         ground_same = gt is not None and not gt.data.get(LOOKS_KEY) \
             and not gt.data.get("glyphs")
         ground_look: Optional[Tuple[Any, ...]] = None
+        # Its draw layer is the sprite_layer_tile rule's on every cell.
+        ground_layer = self.tile_draw_layer(None)
+        all_tiles_seen = self._all_tiles_visible(pov_team, mp)
         for (tx, ty), data in (self._tile_render_items(mp, viewport)
                                if "tiles" not in hidden else ()):
-            if not self.tile_visible_to(tx, ty, pov_team, mp):
+            if not all_tiles_seen and not self.tile_visible_to(
+                    tx, ty, pov_team, mp):
                 continue
             if data is None and ground_same:
                 if ground_look is None:
@@ -35420,7 +35434,7 @@ class Match:
             has_glyph = glyph is not None
             if not has_glyph and tc is None:
                 continue
-            lay = self.tile_draw_layer(data)
+            lay = ground_layer if data is None else self.tile_draw_layer(data)
             if has_glyph:
                 if lay < g_layer.get((tx, ty), -math.inf):
                     continue
@@ -35976,9 +35990,12 @@ class Match:
                 placements.append(pl)
 
         # Tile layer (20).
+        ground_layer = self.tile_draw_layer(None)
+        all_tiles_seen = self._all_tiles_visible(pov_team, mp)
         for (tx, ty), data in (self._tile_render_items(mp, viewport)
                                if "tiles" not in hidden else ()):
-            if not self.tile_visible_to(tx, ty, pov_team, mp):
+            if not all_tiles_seen and not self.tile_visible_to(
+                    tx, ty, pov_team, mp):
                 continue
             sinfo = self.tile_sprite_info(tx, ty, mp)
             spr, fh, fv = sinfo if sinfo else (None, False, False)
@@ -35987,7 +36004,8 @@ class Match:
             if spr is None and g is None and tint is None:
                 continue
             # Per-tile override: a `sprite_layer` data field wins over the rule.
-            t_layer = self.tile_draw_layer(data)
+            t_layer = ground_layer if data is None \
+                else self.tile_draw_layer(data)
             placements.append({
                 "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
