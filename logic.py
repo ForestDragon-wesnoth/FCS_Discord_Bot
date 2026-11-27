@@ -5244,6 +5244,34 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "every map."
         ),
     },
+    "zone_outline_width": {
+        "default": 12,
+        "schema": {"type": "int", "min": 1, "max": 50},
+        "desc": (
+            "How thick an outlined zone's edge is drawn in images (#335, "
+            "`!zone draw <name> outline`), in percent of a cell's side. "
+            "The text map shows such a zone's glyph and colour on its edge "
+            "cells."
+        ),
+    },
+    "map_ground_var": {
+        "default": "ground",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var naming the map's default ground (#472, `!map ground "
+            "<template|none>`): a tile template every cell reads as its "
+            "template when its tile data names none (an ocean map, a cave "
+            "floor), with no tile stored per cell. The cell then shows the "
+            "template's look and takes its block, opaque, tags, grants and "
+            "movement hooks (on_enter / on_exit / on_stop), as a placed "
+            "tile would; tile_get / tile_has read its data on a cell "
+            "without tile data. Turn and round hooks are left out (every "
+            "cell of the map would fire them each turn): a template "
+            "holding one is refused as ground, and one added later never "
+            "fires from ground. `default_map_vars` can give new maps a "
+            "ground. Changing this rule renames the var on every map."
+        ),
+    },
     "map_unseen_var": {
         "default": "unseen",
         "schema": {"type": "str"},
@@ -7395,6 +7423,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "applies to requests already waiting."
         ),
     },
+    "approve_always_access": {
+        "default": "hosts",
+        "schema": {"type": "str", "choices": ["hosts", "owner", "off"]},
+        "desc": (
+            "Who may approve a request with `!approve <id> always` (#399), "
+            "which also stores a per-player access override so that player "
+            "runs the same command and subcommand without approval from "
+            "then on: `hosts` (default: any host of the match, since "
+            "approving is a host's job), `owner` (the match owner, who "
+            "alone sets `!host access` overrides) or `off` (nobody; "
+            "`always` is refused and the request stays queued). The "
+            "overrides stored earlier stay; `!host access clear <cmd> "
+            "user=<player>` takes one back."
+        ),
+    },
     "inline_args_access": {
         "default": "all",
         "schema": {"type": "enum", "choices": ["all", "host"]},
@@ -8082,7 +8125,26 @@ def _default_facing_for(
 # ---------- Special/reserved id registry (like how "this" or "current" is the entity whose turn it is right now, "self" is usually the entity directly affected ay a command regardless of turn order") ----------
 
 
-RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
+RESERVED_IDS: Set[str] = {"current", "this", "self", "parent", "me"}
+
+# The user whose `me` (#400) the running command means: its typer, the
+# requester of an approved command, the holder of a held one, a replayed
+# entry's author. None outside a command.
+ME_USER: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "vtt_me_user", default=None)
+
+
+def resolve_me(m: Any, token: Any) -> Any:
+    """`me` (any case) as the unit the command's user focused with `!ent
+    focus` on match `m` (#400); any other token as it is."""
+    if not isinstance(token, str) or token.strip().lower() != "me":
+        return token
+    user = ME_USER.get()
+    eid = (getattr(m, "unit_focus", None) or {}).get(user) if user else None
+    if not eid:
+        raise NotFound("`me` names the unit you focused, and you have none "
+                       "on this match: `!ent focus <unit>` sets it.")
+    return eid
 
 _UNREACHABLE_IDS: Optional[frozenset] = None
 
@@ -8146,7 +8208,7 @@ MAP_RESERVED_NAMES = frozenset({
     "scene", "image", "color", "teamcolor", "resize", "layer", "autoupdate",
     "legend", "coords", "pan", "center", "new", "list", "delete", "rename",
     "copy", "use", "var", "fog", "unseen", "attach", "detach", "void",
-    "shape", "raycast", "random"})
+    "shape", "raycast", "random", "ground"})
 
 
 def check_map_name(name: Any) -> None:
@@ -8604,6 +8666,135 @@ def _simple_var_test(cond: str, e: Any) -> Optional[bool]:
             "<": cur < n, ">": cur > n}[op]
 
 
+# ---- looks by state (#264, #402) ---------------------------------------
+# The fields a `looks` entry may set, on a unit, a tile (its data or its
+# template's), a zone or a zone definition. Each entry is {condition,
+# <fields>}; per field the first entry whose condition holds and that sets
+# the field decides it (user call), over the thing's own look.
+LOOK_FIELDS = ("glyph", "glyphs", "sprite", "sprites", "sprite_variants",
+               "color", "ascii_color", "legend")
+LOOKS_KEY = "looks"
+LOOKS_OVER_NOTE = ("⚠️ This map holds more `looks` conditions than one render "
+                   "reads (the owner limit look_condition_reads): the rest "
+                   "show their base look.")
+_LOOK_DATA_RE = re.compile(
+    r"^\s*data\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*(==|!=|<=|>=|<|>)\s*"
+    r"(true|false|True|False|none|None|-?\d+(?:\.\d+)?|'[^'\\]*'|"
+    r'"[^"\\]*")\s*$')
+
+
+def _look_literal(text: str) -> Any:
+    low = text.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low == "none":
+        return None
+    if text[:1] in "'\"":
+        return text[1:-1]
+    return float(text) if "." in text else int(text)
+
+
+def look_data_test(cond: str, data: Any) -> Optional[bool]:
+    """A look condition of the plain shape `data.<path> <op> <literal>`
+    read straight from `data` (no formula engine), else None. A missing
+    key reads None, as `data.<key>` reads in the formula."""
+    mo = _LOOK_DATA_RE.match(cond or "")
+    if mo is None or not isinstance(data, dict):
+        return None
+    cur: Any = data
+    for seg in mo.group(1).split("."):
+        cur = cur.get(seg) if isinstance(cur, dict) else None
+    want = _look_literal(mo.group(3))
+    op = mo.group(2)
+    if op == "==":
+        return same_value(cur, want)
+    if op == "!=":
+        return not same_value(cur, want)
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)) \
+            or isinstance(want, bool) or not isinstance(want, (int, float)):
+        return False
+    return {"<=": cur <= want, ">=": cur >= want, "<": cur < want,
+            ">": cur > want}[op]
+
+
+def sprite_variants_problem(value: Any) -> Optional[str]:
+    """What's wrong with a `sprite_variants` value (#288), else None: a
+    list of sprite keys, or {key: weight} with positive weights."""
+    if isinstance(value, list):
+        if value and all(isinstance(k, str) and k for k in value):
+            return None
+        return "sprite_variants is a list of sprite keys."
+    if isinstance(value, dict):
+        if value and all(isinstance(k, str) and k and not isinstance(w, bool)
+                         and isinstance(w, (int, float)) and w > 0
+                         and math.isfinite(w) for k, w in value.items()):
+            return None
+        return ("sprite_variants as a dict maps sprite keys to positive "
+                "weights.")
+    return "sprite_variants is a list of sprite keys or {key: weight}."
+
+
+def sprite_variant(value: Any, map_name: str, x: int, y: int
+                   ) -> Optional[str]:
+    """The variant a cell draws (#288): picked by a hash of (map, x, y), so
+    it stays the same between renders and restarts; weights from a dict.
+    None for a value that isn't usable."""
+    if sprite_variants_problem(value) is not None:
+        return None
+    import hashlib
+    h = int.from_bytes(hashlib.blake2s(
+        f"{map_name}:{x}:{y}".encode("utf-8"), digest_size=4).digest(), "big")
+    if isinstance(value, list):
+        return value[h % len(value)]
+    total = sum(float(w) for w in value.values())
+    point = (h / 4294967296.0) * total
+    acc = 0.0
+    for k, w in value.items():
+        acc += float(w)
+        if point < acc:
+            return k
+    return list(value)[-1]
+
+
+class LookData(dict):
+    """`data` in a look condition: the thing's data, keys read as
+    attributes (`data.open`), a missing key None."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        v = self.get(name)
+        return LookData(v) if type(v) is dict else v
+
+
+def check_looks(value: Any) -> Optional[str]:
+    """What's wrong with a `looks` value, else None: a list of dicts, each
+    holding at least one look field, a condition (an expression or a
+    bool) and nothing else."""
+    if not isinstance(value, list):
+        return "`looks` is a list of entries ({condition, glyph, ...})."
+    for i, ent in enumerate(value, 1):
+        if not isinstance(ent, dict):
+            return f"look {i} isn't an entry ({{condition, glyph, ...}})."
+        bad = [k for k in ent if k not in LOOK_FIELDS and k != "condition"]
+        if bad:
+            return (f"look {i} holds {', '.join(f'`{b}`' for b in bad)}: an "
+                    f"entry takes condition and "
+                    f"{', '.join(LOOK_FIELDS)}.")
+        if not any(k in ent for k in LOOK_FIELDS):
+            return f"look {i} sets no look field ({', '.join(LOOK_FIELDS)})."
+        c = ent.get("condition")
+        if c is not None and not isinstance(c, (bool, str)):
+            return f"look {i}'s condition is an expression or true / false."
+        g = ent.get("glyph")
+        if g is not None and glyph_problem(g):
+            return f"look {i}: {glyph_problem(g)}"
+        col = ent.get("color")
+        if col is not None and not (isinstance(col, str) or color_ok(col)):
+            return f"look {i}'s color isn't a colour."
+    return None
+
+
 # The largest total a status resistance fold may reach (E6): a level or a
 # duration past it means a record overflowed, so the record is skipped.
 RESIST_TOTAL_MAX = 1e15
@@ -8962,6 +9153,8 @@ def passive_hooks(when: Any) -> List[str]:
 # names are kept separate from HOOK_NAMES because entity / global
 # passives don't subscribe to them (only stored tile-side formulas
 # do). See Match.fire_tile_hook / Match.fire_tile_time_hooks.
+TILE_TIME_HOOKS = frozenset({"on_round_start", "on_round_end",
+                             "on_turn_start", "on_turn_end"})
 TILE_HOOK_NAMES: Set[str] = {
     # Movement
     "on_enter",   # entity arrived on this tile (fired post-position-change)
@@ -10501,7 +10694,8 @@ class SpecialTileTemplate:
 # shape normalize_zone_def gives.
 ZONE_LOOK_FIELDS: Tuple[str, ...] = ("glyph", "color", "sprite", "legend",
                                      "facing", "glyphs", "sprites",
-                                     "sprite_layer", "ascii_color")
+                                     "sprite_layer", "ascii_color", "draw",
+                                     "sprite_variants")
 # The per-facing look fields (#257) and the plain field each stands in for:
 # `glyphs.<facing>` / `sprites.<facing>` on units, tiles (data, template
 # data), zones and zone definitions.
@@ -10557,6 +10751,11 @@ def zone_look_value(key: str, value: Any) -> bool:
     if key == "ascii_color":
         # The text map's colour for the zone (W27): a palette name.
         return text_color_name(value) is not None
+    if key == "draw":
+        # #335: every cell, or the edge cells only.
+        return value in ("fill", "outline")
+    if key == "sprite_variants":
+        return sprite_variants_problem(value) is None
     if key == "color" and isinstance(value, list):
         return color_ok(value)
     return isinstance(value, str) and bool(value)
@@ -11049,6 +11248,16 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
                 "per-unit (`each`) watcher's units and every watcher units "
                 "hold counted together (~1 ms each); past it the rest keep "
                 "their state until the next command, with a warning.",
+    },
+    "look_condition_reads": {
+        "default": 2000, "min": 0, "max": 1000000,
+        "desc": "How many `looks` conditions (#264, #402) one map render "
+                "may read through the formula engine (about 1 ms each; a "
+                "plain `data.<key> <op> <value>` test or a unit's "
+                "`entity[self].<var> <op> <number>` costs nothing and isn't "
+                "counted). Past it the rest of the map draws its base looks "
+                "and the render says so; only what the window shows is "
+                "read.",
     },
     "turn_forecast_limit": {
         "default": 100, "min": 1, "max": 10000,
@@ -15354,6 +15563,15 @@ class Match:
     # lock down reads for a fog-of-war match without the next !system set
     # wiping it. Persisted with the match.
     access_overrides: Dict[str, str] = field(default_factory=dict)
+    # When an override above runs out (#466): its full key -> {"turn": the
+    # turns_elapsed it expires at, "round": the round it lasts through,
+    # "once": True = spent by the first command it lets through that
+    # changes the match}. Undo state.
+    access_limits: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Each user's focused unit (#400, `!ent focus`): user id -> unit id,
+    # which `me` names in their commands. Display state like `!map use`:
+    # saved, outside undo, journaled (a replay resolves `me`).
+    unit_focus: Dict[str, str] = field(default_factory=dict)
 
     # Channels bound to this match. channel_key -> metadata dict (an
     # optional free-form {"label": ...} reserved for the upcoming
@@ -15639,6 +15857,10 @@ class Match:
     # of one read-only cell-scanning pass (set/torn-down around render_ascii).
     # Never held across a mutation, so it cannot go stale. None = inactive.
     _vision_memo: Optional[Dict[Any, bool]] = field(
+        default=None, repr=False, compare=False)
+    # Transient memo for looks by state (#264, #402), active for one render:
+    # each thing's chosen look fields, the condition budget, the window.
+    _looks_memo: Optional[Dict[Any, Any]] = field(
         default=None, repr=False, compare=False)
     # Where every unit stands (UnitIndex, #154): cell lookups read it.
     # Runtime-only, rebuilt from the units on first use.
@@ -16302,10 +16524,9 @@ class Match:
         a status's entry. {} without any."""
         tile = mp.tiles.get((x, y))
         if not isinstance(tile, dict):
-            return {}
+            tile = {}
         out: Dict[str, Any] = {}
-        tpl = self.tile_templates.get(tile.get("_template")) \
-            if isinstance(tile.get("_template"), str) else None
+        tpl = self.cell_template(mp, tile)
         if tpl is not None and isinstance(tpl.grants, dict):
             out.update({k: v for k, v in tpl.grants.items()
                         if isinstance(v, dict)})
@@ -16322,10 +16543,9 @@ class Match:
         srcs: List[Any] = []
         if isinstance(tile, dict):
             srcs.append(tile)
-            tpl = self.tile_templates.get(tile.get("_template")) \
-                if isinstance(tile.get("_template"), str) else None
-            if tpl is not None:
-                srcs.append(tpl.grant_settings)
+        tpl = self.cell_template(mp, tile)
+        if tpl is not None:
+            srcs.append(tpl.grant_settings)
         return self._grant_setting_from(srcs, key)
 
     def _grant_setting_from(self, srcs: List[Any], key: str) -> Any:
@@ -16367,7 +16587,10 @@ class Match:
         granting = self._granting_tile_templates()
         for mp in self.maps.values():
             gcells = mp.grant_cells(granting)
-            if not gcells:
+            # Ground (#472): every cell without a template of its own
+            # grants what the ground template grants.
+            ground = self.ground_name(mp) in granting
+            if not gcells and not ground:
                 continue
             hits: Dict[str, Set[Tuple[int, int]]] = {}
             units = [e for e in self.entities.values() if e.map == mp.name
@@ -16376,7 +16599,9 @@ class Match:
                 if e.is_glued_part or not self._grant_eligible(e):
                     continue
                 for c in self.entity_cells(e):
-                    if c not in gcells:
+                    if c not in gcells and not (
+                            ground and self.from_ground(
+                                mp, mp.tiles.get(c))):
                         continue
                     if self.tile_grant_setting(mp, c[0], c[1],
                                                "grant_bodies") == "root":
@@ -16821,9 +17046,11 @@ class Match:
                                           for d in granting):
                 found = True
                 break
+        gt = self._granting_tile_templates()
         if not found:
-            gt = self._granting_tile_templates()
-            found = any(mp.grant_cells(gt) for mp in self.maps.values())
+            found = any(mp.grant_cells(gt) or (
+                gt and self.ground_name(mp) in gt)
+                for mp in self.maps.values())
         if not found:
             found = bool(self._uflags.holders_of(self, UnitFlags.ZONE_GRANT)
                          or self._uflags.holders_of(self,
@@ -16836,7 +17063,9 @@ class Match:
                 for inst in e.status.values()) or any(
                 self._holds_held_grants(e) for e in self.entities.values()
             ) or any(self.tile_grants_of(mp, x, y)
-                     for mp in self.maps.values() for (x, y) in mp.tiles)
+                     for mp in self.maps.values() for (x, y) in mp.tiles
+                     ) or any(gt and self.ground_name(mp) in gt
+                              for mp in self.maps.values())
             if want != found:
                 raise SpatialCheckError(f"grant index: _grants_present = "
                                         f"{found}, scan {want}")
@@ -17058,12 +17287,16 @@ class Match:
         self.tile_templates = {(new if k == old else k): v
                                for k, v in self.tile_templates.items()}
         n = 0
+        gvar = self.map_var_name("ground")
         for mp in self.maps.values():
             for c, cell in mp.tiles.items():
                 if isinstance(cell, dict) and cell.get("_template") == old:
                     cell["_template"] = new
                     mp.tile_touch(*c)
                     n += 1
+            if mp.vars.get(gvar) == old:
+                # A map's ground (#472) follows the template too.
+                mp.vars[gvar] = new
         return n
 
     def tile_tags(self, x: int, y: int, mp: Optional["Map"] = None
@@ -17072,10 +17305,11 @@ class Match:
         its own `tags` data (each once)."""
         mp = mp or self.get_map()
         cell = mp.tiles.get((x, y))
+        tpl = self.cell_template(mp, cell)
         if not isinstance(cell, dict):
-            return []
-        tpl = self.tile_templates.get(cell.get("_template")) \
-            if isinstance(cell.get("_template"), str) else None
+            if tpl is None or not mp.in_bounds(x, y):
+                return []
+            cell = {}
         return normalize_tags(list(tpl.tags if tpl is not None else [])
                               + normalize_tags(cell.get("tags")))
 
@@ -21345,13 +21579,11 @@ class Match:
             inst = cell.get("opaque")
             if inst not in (None, ""):
                 return inst
-            tpl_name = cell.get("_template")
-            if isinstance(tpl_name, str):
-                tpl = self.tile_templates.get(tpl_name)
-                if tpl is not None:
-                    t_op = tpl.data.get("opaque")
-                    if t_op not in (None, ""):
-                        return t_op
+        tpl = self.cell_template(mp, cell) if mp.vars or cell else None
+        if tpl is not None:
+            t_op = tpl.data.get("opaque")
+            if t_op not in (None, ""):
+                return t_op
         return self.rules.get("tile_opaque_condition", "")
 
     def _eval_opaque_spec(self, spec: Any, viewer_id: Optional[str],
@@ -22252,6 +22484,32 @@ class Match:
                 if self.request_expired(req)]
         return [self.pending_requests.pop(rid) for rid in gone]
 
+    # ---- expiring access overrides (#466) -----------------------------
+    def override_live(self, key: str) -> bool:
+        """Whether access override `key` (its full key) is still in force:
+        its `turns=` / `until=round_end` limit not reached."""
+        lim = self.access_limits.get(key)
+        if not lim:
+            return True
+        t = lim.get("turn")
+        if isinstance(t, int) and self.turns_elapsed >= t:
+            return False
+        r = lim.get("round")
+        if isinstance(r, int) and self.round_number > r:
+            return False
+        return True
+
+    def prune_access_overrides(self) -> List[str]:
+        """Drop the overrides whose limit ran out; their keys."""
+        gone = [k for k in self.access_limits if not self.override_live(k)]
+        for k in gone:
+            self.access_limits.pop(k, None)
+            self.access_overrides.pop(k, None)
+        for k in [k for k in self.access_limits
+                  if k not in self.access_overrides]:
+            self.access_limits.pop(k, None)
+        return gone
+
     # ---- tile-template registry --------------------------------------
     # Templates are the "kind" / "class" definitions; placed tiles in
     # self.tiles are the "instances". A placed tile may carry a reserved
@@ -22313,7 +22571,11 @@ class Match:
             raise NotFound(f"tile template '{name}' not found.")
         del self.tile_templates[name]
         detached = 0
+        gvar = self.map_var_name("ground")
         for mp in self.maps.values():
+            if mp.vars.get(gvar) == name:
+                # The map's ground (#472) goes with its template.
+                mp.vars.pop(gvar, None)
             for (x, y), tile in list(mp.tiles.items()):
                 if isinstance(tile, dict) and tile.get("_template") == name:
                     mp.tile_del_path(x, y, "_template")
@@ -22395,6 +22657,265 @@ class Match:
                     n += 1
         return n
 
+    # ---- zone outlines (#335) ---------------------------------------------
+    def zone_draw_cells(self, name: str, z: Any, mp: "Map"
+                        ) -> List[Tuple[Tuple[int, int], str]]:
+        """The cells zone `name` shows on, each with the sides of it that
+        face outside the zone ("" for a filled zone, else some of "nesw"):
+        every on-map cell, or with `draw: outline` (its own, else its
+        definition's) only the edge cells, those with a side neighbour
+        outside the zone. Both renderers draw these cells, images the
+        sides as lines."""
+        cells = [(int(c[0]), int(c[1])) for c in (z.get("cells") or ())
+                 if mp.in_bounds(c[0], c[1])]
+        if self.zone_look(z, "draw") != "outline":
+            return [(c, "") for c in cells]
+        cs = set(cells)
+        out = []
+        for (x, y) in cells:
+            sides = "".join(k for k, (dx, dy) in (("n", (0, -1)),
+                                                  ("e", (1, 0)),
+                                                  ("s", (0, 1)),
+                                                  ("w", (-1, 0)))
+                            if (x + dx, y + dy) not in cs)
+            if sides:
+                out.append(((x, y), sides))
+        return out
+
+    def ground_cells(self, mp: "Map",
+                     box: Optional[Tuple[int, int, int, int]] = None
+                     ) -> List[Tuple[int, int]]:
+        """The cells of map `mp` that draw its ground (#472): every on-map
+        cell without tile data, inside `box` (x0, y0, x1, y1) when given.
+        [] when the map has no ground."""
+        if self.ground_name(mp) is None:
+            return []
+        x0, y0, x1, y1 = box or (1, 1, mp.grid_width, mp.grid_height)
+        x0, y0 = max(1, x0), max(1, y0)
+        x1, y1 = min(mp.grid_width, x1), min(mp.grid_height, y1)
+        t = mp.tiles
+        return [(x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)
+                if (x, y) not in t and mp.in_bounds(x, y)]
+
+    # ---- looks by state (#264, #402) ------------------------------------
+    @contextlib.contextmanager
+    def looks_pass(self, viewport: Optional[Tuple[int, int, int, int]],
+                   mp: "Map"):
+        """One render's look memo: each thing's look read once, at most
+        the owner limit look_condition_reads conditions through the formula
+        engine, nothing read for what lies outside the window (`viewport`:
+        x, y, w, h). Yields the memo; its "over" says the limit cut the
+        reading."""
+        prev = self._looks_memo
+        if prev is not None:
+            yield prev
+            return
+        if viewport is not None:
+            vx, vy, vw, vh = viewport
+            box = (vx, vy, vx + vw - 1, vy + vh - 1)
+        else:
+            box = None
+        memo: Dict[Any, Any] = {"__box": box, "__map": mp.name,
+                                "__left": owner_limit("look_condition_reads"),
+                                "__over": False}
+        self._looks_memo = memo
+        try:
+            yield memo
+        finally:
+            self._looks_memo = None
+
+    def _looks_outside(self, mp_name: str, cells: Any) -> bool:
+        """Whether a render's window leaves out every cell in `cells`."""
+        memo = self._looks_memo
+        if memo is None or memo["__box"] is None \
+                or memo["__map"] != mp_name:
+            return False
+        x0, y0, x1, y1 = memo["__box"]
+        return not any(x0 <= c[0] <= x1 and y0 <= c[1] <= y1 for c in cells)
+
+    def look_overlay(self, key: Any, lists: List[Any], *,
+                     data: Any = None, extras: Optional[Dict[str, Any]] = None,
+                     target: Optional[str] = None, unit: Any = None,
+                     cells: Any = None, mp_name: str = ""
+                     ) -> Dict[str, Any]:
+        """The look fields chosen from `lists` (each a `looks` list, own
+        first): per field, the first entry whose condition holds and that
+        sets it. A condition is true / false, a plain data test (no formula
+        engine), else an expression (self = `target`, `extras` bound, `data`
+        read by attribute); one that fails reads as false. Memoized per
+        render under `key`; inside a render, a thing outside the window
+        and anything past the condition budget keep their base look."""
+        entries = [e for lst in lists if isinstance(lst, list) for e in lst
+                   if isinstance(e, dict)]
+        if not entries:
+            return {}
+        memo = self._looks_memo
+        if memo is not None:
+            if key in memo:
+                return memo[key]
+            if cells is not None and self._looks_outside(mp_name, cells):
+                memo[key] = {}
+                return {}
+        out: Dict[str, Any] = {}
+        for ent in entries:
+            new = [f for f in LOOK_FIELDS if f in ent and f not in out]
+            if not new:
+                continue
+            ok = self._look_condition(ent.get("condition"), data, extras,
+                                      target, unit)
+            if ok is None:          # the budget ran out
+                out = {}
+                break
+            if ok:
+                for f in new:
+                    out[f] = ent[f]
+        if memo is not None:
+            memo[key] = out
+        return out
+
+    def _look_condition(self, cond: Any, data: Any,
+                        extras: Optional[Dict[str, Any]], target: Optional[str],
+                        unit: Any) -> Optional[bool]:
+        if cond is None:
+            return True
+        if isinstance(cond, bool):
+            return cond
+        if not isinstance(cond, str) or not cond.strip():
+            return False
+        quick = look_data_test(cond, data)
+        if quick is None and unit is not None:
+            quick = _simple_var_test(cond, unit)
+        if quick is not None:
+            return quick
+        memo = self._looks_memo
+        if memo is not None:
+            if memo["__left"] <= 0:
+                memo["__over"] = True
+                return None
+            memo["__left"] -= 1
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        try:
+            res = FormulaEngine(self).eval_expression(
+                cond, EvalCtx(this=self.current_entity_id(), target=target,
+                              extras=dict(extras or {})),
+                attr_bindings={"data": LookData(
+                    data if isinstance(data, dict) else {})})
+        except (FormulaError, VTTError):
+            return False
+        return bool(res)
+
+    def tile_looks(self, x: int, y: int, mp: "Map", cell: Any = None,
+                   tpl: Any = None) -> Dict[str, Any]:
+        """The look fields a tile's `looks` choose now (its data's, then its
+        template's, the ground's for a cell naming none). Only cells the
+        look index names (own looks) or whose template holds looks are
+        read; any other tile costs nothing."""
+        own = cell.get(LOOKS_KEY) if isinstance(cell, dict) else None
+        tl = tpl.data.get(LOOKS_KEY) if tpl is not None else None
+        if not own and not tl:
+            return {}
+        lists = [own] + ([tl] if tl is not None
+                         and not same_value(tl, own) else [])
+        data = dict(tpl.data) if tpl is not None else {}
+        if isinstance(cell, dict):
+            data.update(cell)
+        return self.look_overlay(
+            ("tile", mp.name, x, y), lists, data=data,
+            extras={"tile_x": x, "tile_y": y, "tile_map": mp.name},
+            cells=((x, y),), mp_name=mp.name)
+
+    def zone_looks(self, name: str, z: Any, mp: "Map") -> Dict[str, Any]:
+        """The look fields a zone's `looks` choose now (its own, then its
+        definition's), read with zone_name / zone_map and its data."""
+        if not isinstance(z, dict):
+            return {}
+        d = self.zone_def_dict(z) or {}
+        own, dl = z.get(LOOKS_KEY), d.get(LOOKS_KEY)
+        if not own and not dl:
+            return {}
+        data = dict(d.get("data") or {})
+        data.update(z.get("data") or {})
+        return self.look_overlay(
+            ("zone", mp.name, name), [own, dl], data=data,
+            extras={"zone_name": name, "zone_map": mp.name},
+            cells=z.get("cells") or (), mp_name=mp.name)
+
+    def unit_looks(self, e: "Entity", dis: Optional[Dict[str, Any]] = None
+                   ) -> Dict[str, Any]:
+        """The look fields a unit's `looks` choose now (self = the unit,
+        `data` its vars); under a disguise fooling the view (`dis`), the
+        disguise's own `looks` only, `data` its decoy vars."""
+        if dis is not None:
+            lst = dis.get(LOOKS_KEY)
+            data = dis.get("vars") if isinstance(dis.get("vars"), dict) else {}
+            key = ("unit", e.id, "disguise")
+        else:
+            lst = e.vars.get(LOOKS_KEY)
+            data = e.vars
+            key = ("unit", e.id)
+        if not lst:
+            return {}
+        cells = None
+        if self._looks_memo is not None and self._looks_memo["__box"]:
+            cells = self.entity_cells(e)
+        return self.look_overlay(key, [lst], data=data, target=e.id,
+                                 unit=e if dis is None else None,
+                                 cells=cells, mp_name=e.map)
+
+    def _tile_render_items(self, mp: "Map",
+                           viewport: Optional[Tuple[int, int, int, int]]
+                           ) -> List[Tuple[Tuple[int, int], Any]]:
+        """The tiles a render draws: each on-map tile with its data, then
+        the cells drawing the map's ground (#472) with None, those inside
+        the window only."""
+        out = [((tx, ty), d) for (tx, ty), d in mp.tiles.items()
+               if mp.in_bounds(tx, ty)]
+        if self.ground_name(mp) is not None:
+            box = None
+            if viewport is not None:
+                vx, vy, vw, vh = viewport
+                box = (vx, vy, vx + vw - 1, vy + vh - 1)
+            out += [(c, None) for c in self.ground_cells(mp, box)]
+        return out
+
+    # ---- default ground (#472) ------------------------------------------
+    def ground_name(self, mp: Optional["Map"]) -> Optional[str]:
+        """The tile template map `mp`'s ground names (its ground map var),
+        when the match holds it; else None."""
+        if mp is None or not mp.vars:
+            return None
+        v = mp.vars.get(self.map_var_name("ground"))
+        return v if isinstance(v, str) and v in self.tile_templates else None
+
+    def ground_template(self, mp: Optional["Map"]
+                        ) -> Optional[SpecialTileTemplate]:
+        n = self.ground_name(mp)
+        return self.tile_templates[n] if n is not None else None
+
+    def cell_template(self, mp: Optional["Map"], cell: Any
+                      ) -> Optional[SpecialTileTemplate]:
+        """The template a cell's tile reads: the one its data names (None
+        when the match lacks it), else the map's ground (#472)."""
+        if isinstance(cell, dict):
+            n = cell.get("_template")
+            if isinstance(n, str):
+                return self.tile_templates.get(n)
+        return self.ground_template(mp)
+
+    def from_ground(self, mp: Optional["Map"], cell: Any) -> bool:
+        """Whether a cell reads the map's ground as its template."""
+        return not (isinstance(cell, dict)
+                    and isinstance(cell.get("_template"), str)) \
+            and self.ground_name(mp) is not None
+
+    @staticmethod
+    def time_hooks_of(tpl: Any) -> List[str]:
+        """The turn / round hooks a tile template holds (ground leaves them
+        out, #472)."""
+        hooks = getattr(tpl, "hooks", None) or {}
+        return sorted(k for k, v in hooks.items()
+                      if k in TILE_TIME_HOOKS and isinstance(v, str) and v)
+
     def tile_template_for(self, x: int, y: int, mp: Optional["Map"] = None
                           ) -> Optional[SpecialTileTemplate]:
         """Return the SpecialTileTemplate this tile was placed from, or
@@ -22406,13 +22927,7 @@ class Match:
         mp = mp or self.get_map()
         if not mp.in_bounds(x, y):
             return None
-        tile = mp.tiles.get((x, y))
-        if not isinstance(tile, dict):
-            return None
-        tpl_name = tile.get("_template")
-        if not isinstance(tpl_name, str):
-            return None
-        return self.tile_templates.get(tpl_name)
+        return self.cell_template(mp, mp.tiles.get((x, y)))
 
     # ---- formula-function registry -----------------------------------
     # User-defined formula functions live in self.formula_functions and
@@ -22791,13 +23306,11 @@ class Match:
             inst = cell.get("block")
             if inst not in (None, ""):
                 return inst
-            tpl_name = cell.get("_template")
-            if isinstance(tpl_name, str):
-                tpl = self.tile_templates.get(tpl_name)
-                if tpl is not None:
-                    t_block = tpl.data.get("block")
-                    if t_block not in (None, ""):
-                        return t_block
+        tpl = self.cell_template(mp, cell) if mp.vars or cell else None
+        if tpl is not None:
+            t_block = tpl.data.get("block")
+            if t_block not in (None, ""):
+                return t_block
         return self.rules.get("tile_block_condition", "")
 
     def _eval_block_spec(self, spec: Any, mover_id: str,
@@ -24282,6 +24795,8 @@ class Match:
         MatchHistory._turn_index. Kept as one helper rather than bumping the
         counter at each site so the two can't drift apart."""
         self.turns_elapsed += 1
+        if self.access_limits:
+            self.prune_access_overrides()
         self._note_actor()
         self._fire_reminders()
         if any(s.get("kind") == "clock" for s in self.scheduled):
@@ -25178,7 +25693,11 @@ class Match:
             return []
         data = mp.tiles.get((x, y))
         if not data:
-            return []
+            # Ground (#472): a cell without tile data takes the ground
+            # template's movement hooks, never its turn / round hooks.
+            if when in TILE_TIME_HOOKS or self.ground_name(mp) is None:
+                return []
+            data = {}
         # Resolution order: ad-hoc instance hook wins, falling back to
         # the template's hook for the same `when`. This lets the GM
         # place a template-backed tile and then locally override a
@@ -25192,6 +25711,8 @@ class Match:
                 formula_src = cand
         if formula_src is None:
             tpl_name = data.get("_template")
+            if not isinstance(tpl_name, str) and when not in TILE_TIME_HOOKS:
+                tpl_name = self.ground_name(mp)
             if isinstance(tpl_name, str):
                 tpl = self.tile_templates.get(tpl_name)
                 # Dangling template references (template deleted after
@@ -32798,6 +33319,8 @@ class Match:
             "link_stamps": dict(self.link_stamps),
             "uid": self.uid,
             "access_overrides": dict(self.access_overrides),
+            "access_limits": copy.deepcopy(self.access_limits),
+            "unit_focus": dict(self.unit_focus),
             "bound_channels": copy.deepcopy(self.bound_channels),
             "team_colors": dict(self.team_colors),
             "color_enabled": bool(self.color_enabled),
@@ -33135,6 +33658,15 @@ class Match:
             k: str(v) for k, v in raw_acc.items()
             if isinstance(k, str) and isinstance(v, str)
         } if isinstance(raw_acc, dict) else {}
+        raw_lim = d.get("access_limits")
+        m.access_limits = {
+            k: copy.deepcopy(v) for k, v in raw_lim.items()
+            if k in m.access_overrides and isinstance(v, dict)
+        } if isinstance(raw_lim, dict) else {}
+        raw_focus = d.get("unit_focus")
+        m.unit_focus = {
+            str(k): str(v) for k, v in raw_focus.items()
+            if isinstance(v, str)} if isinstance(raw_focus, dict) else {}
         raw_bound = d.get("bound_channels", {})
         m.bound_channels = {
             k: (copy.deepcopy(v) if isinstance(v, dict) else {})
@@ -33261,6 +33793,13 @@ class Match:
             if sg is not None:
                 return sg[0]
         dis = self._effective_disguise(e, pov_team)
+        # Looks by state (#264): what the unit's (or the disguise's) `looks`
+        # choose now come before its own fields.
+        lk = self.unit_looks(e, dis)
+        if lk:
+            g = self._facing_glyph([lk], facing)
+            if g is not None:
+                return g
         if dis is not None:
             dglyphs = dis.get("glyphs")
             if isinstance(dglyphs, dict):
@@ -33318,6 +33857,14 @@ class Match:
                     sc[0], self.status_field(inst, sc[1], "ascii_color"),
                     f"{what} ({sc[1]})")
         dis = self._effective_disguise(e, pov_team)
+        lk = self.unit_looks(e, dis)
+        if "color" in lk:
+            got = self._resolve_color_value(lk["color"],
+                                            {"pov_team": pov_team},
+                                            target=e.id)
+            if got is not None:
+                return text_color_for(got, lk.get("ascii_color"), what) \
+                    if text else got
         if dis is not None:
             dc = dis.get("color")
             if color_ok(dc):
@@ -33736,8 +34283,12 @@ class Match:
         disguise (its own `legend` key, else its name), never the real
         unit, so a label can't give a disguise away."""
         dis = self._effective_disguise(e, pov_team)
+        lk = self.unit_looks(e, dis)
         if dis is not None:
-            return self._legend_value(dis.get("legend"),
+            return self._legend_value(lk.get("legend", dis.get("legend")),
+                                      self.entity_display_name(e, pov_team))
+        if "legend" in lk:
+            return self._legend_value(lk["legend"],
                                       self.entity_display_name(e, pov_team))
         val = e.vars.get("legend")
         if val is not None and VAR_READER.get() is not None:
@@ -33753,12 +34304,20 @@ class Match:
             label = f"{label} ({', '.join(names)})"
         return label
 
-    def legend_label_tile(self, data: Any) -> Optional[str]:
-        """A tile's legend label: its own `legend` data, else its
-        template's, else `tile: <template>` / `tile`."""
+    def legend_label_tile(self, data: Any, mp: Optional["Map"] = None,
+                          looks: Optional[Dict[str, Any]] = None
+                          ) -> Optional[str]:
+        """A tile's legend label: a matching look's `legend`, its own
+        `legend` data, else its template's (the map's ground for a cell
+        naming none, #472), else `tile: <template>` / `tile`."""
         if not isinstance(data, dict):
-            return "tile"
+            data = {}
         tname = data.get("_template")
+        if not isinstance(tname, str) and mp is not None:
+            tname = self.ground_name(mp)
+        if looks and "legend" in looks:
+            return self._legend_value(looks["legend"],
+                                      f"tile: {tname}" if tname else "tile")
         default = (f"tile: {tname}" if isinstance(tname, str) and tname
                    else "tile")
         val = data.get("legend")
@@ -33775,7 +34334,9 @@ class Match:
         dname = z.get("def") if isinstance(z, dict) else None
         default = (f"zone: {dname}" if isinstance(dname, str) and
                    dname in self.zone_definitions else f"zone: {name}")
-        return self._legend_value(self.zone_look(z, "legend"), default)
+        lk = self.zone_looks(name, z, mp)
+        return self._legend_value(lk["legend"] if "legend" in lk
+                                  else self.zone_look(z, "legend"), default)
 
     def legend_label_corpse(self, eid: str) -> Optional[str]:
         c = self.find_corpse(eid)
@@ -33823,18 +34384,14 @@ class Match:
         unset/unresolved. With `text`, the palette name the text map shows
         (its `ascii_color` data, else its template's, else the colour's
         own or nearest name, W27)."""
-        cell = mp.tiles.get((x, y))
-        if not isinstance(cell, dict):
+        src = self._tile_look_sources(x, y, mp)
+        if not src:
             return None
-        val = cell.get("color")
-        ascii_c = cell.get("ascii_color")
-        tpl_name = cell.get("_template")
-        tpl = self.tile_templates.get(tpl_name) \
-            if isinstance(tpl_name, str) else None
-        if val in (None, "") and tpl is not None:
-            val = tpl.data.get("color")
-        if text_color_name(ascii_c) is None and tpl is not None:
-            ascii_c = tpl.data.get("ascii_color")
+        val = next((d.get("color") for d in src
+                    if d.get("color") not in (None, "")), None)
+        ascii_c = next((d.get("ascii_color") for d in src
+                        if text_color_name(d.get("ascii_color"))
+                        is not None), None)
         got = self._resolve_color_value(val, {"tile_x": x, "tile_y": y,
                                                "tile_map": mp.name})
         if not text:
@@ -33850,13 +34407,17 @@ class Match:
         z = mp.zones.get(name)
         if not isinstance(z, dict):
             return None
-        got = self._resolve_color_value(self.zone_look(z, "color"),
-                                        {"zone_name": name,
-                                         "zone_map": mp.name})
+        looks = self.zone_looks(name, z, mp)
+        got = self._resolve_color_value(
+            looks["color"] if "color" in looks else self.zone_look(z, "color"),
+            {"zone_name": name, "zone_map": mp.name})
         if not text:
             return got
-        return text_color_for(got, self.zone_look(z, "ascii_color"),
-                              f"zone `{name}`") if got is not None else None
+        asc = looks.get("ascii_color")
+        if text_color_name(asc) is None:
+            asc = self.zone_look(z, "ascii_color")
+        return text_color_for(got, asc, f"zone `{name}`") \
+            if got is not None else None
 
     # ---- sprite resolution (graphics render model) ------------------
     # Sprites are KEY strings stored in data, mirroring glyphs: a per-facing
@@ -33912,10 +34473,14 @@ class Match:
         return None
 
     def _facing_sprite(self, sources: List[Dict[str, Any]], facing: str,
-                       axes: frozenset) -> Optional[Tuple[str, bool, bool]]:
+                       axes: frozenset,
+                       cell: Optional[Tuple[int, int]] = None,
+                       mp: Optional["Map"] = None
+                       ) -> Optional[Tuple[str, bool, bool]]:
         """A tile's / zone's sprite from its look `sources` (own first):
         within each, `sprites.<facing>`, then a mirror of another facing,
-        then the plain `sprite`. (key, flip_h, flip_v) or None."""
+        then a pick of its `sprite_variants` for `cell` (#288), then the
+        plain `sprite`. (key, flip_h, flip_v) or None."""
         for src in sources:
             sprites = src.get("sprites")
             if isinstance(sprites, dict):
@@ -33925,6 +34490,12 @@ class Match:
                 mir = self._mirror_in(sprites, facing, axes)
                 if mir is not None:
                     return mir
+            var = src.get("sprite_variants")
+            if var and cell is not None:
+                k = sprite_variant(var, mp.name if mp is not None else "",
+                                   cell[0], cell[1])
+                if k is not None:
+                    return (k, False, False)
             k = src.get("sprite")
             if isinstance(k, str) and k:
                 return (k, False, False)
@@ -33958,6 +34529,9 @@ class Match:
         facing = getattr(e, "facing", "")
         sources: List[Dict[str, Any]] = []
         dis = self._effective_disguise(e, pov_team)
+        lk = self.unit_looks(e, dis)
+        if lk:
+            sources.append(lk)
         if isinstance(dis, dict):
             sources.append(dis)
         sources.append(e.vars)
@@ -34418,23 +34992,35 @@ class Match:
         """The dicts a tile's look reads, own first: its data, then its
         template's data. Empty when the cell has no tile data."""
         cell = mp.tiles.get((x, y))
+        tpl = self.cell_template(mp, cell)
         if not isinstance(cell, dict):
-            return []
-        out = [cell]
-        tpl_name = cell.get("_template")
-        if isinstance(tpl_name, str):
-            tpl = self.tile_templates.get(tpl_name)
-            if tpl is not None:
-                out.append(tpl.data)
-        return out
+            # Ground (#472): a cell without tile data reads as the ground
+            # template placed there.
+            if tpl is None or not mp.in_bounds(x, y):
+                return []
+            out: List[Dict[str, Any]] = []
+        else:
+            out = [cell]
+        if tpl is not None:
+            out.append(tpl.data)
+        looks = self.tile_looks(x, y, mp, cell, tpl)
+        return [looks] + out if looks else out
 
-    def _zone_look_sources(self, z: Any) -> List[Dict[str, Any]]:
-        """The dicts a zone's look reads, own first: the zone, then its
+    def _zone_look_sources(self, z: Any, name: Optional[str] = None,
+                           mp: Optional["Map"] = None
+                           ) -> List[Dict[str, Any]]:
+        """The dicts a zone's look reads, own first: what its `looks`
+        choose now (given its name and map), the zone, then its
         definition."""
         if not isinstance(z, dict):
             return []
         d = self.zone_def_dict(z)
-        return [z] + ([d] if d is not None else [])
+        out = [z] + ([d] if d is not None else [])
+        if name is not None and mp is not None:
+            looks = self.zone_looks(name, z, mp)
+            if looks:
+                out.insert(0, looks)
+        return out
 
     def tile_sprite_info(self, x: int, y: int, mp: "Map"
                          ) -> Optional[Tuple[str, bool, bool]]:
@@ -34446,7 +35032,8 @@ class Match:
         if not src:
             return None
         axes = self._mirror_axes(*(d.get("sprite_mirror") for d in src))
-        return self._facing_sprite(src, self.tile_facing(x, y, mp), axes)
+        return self._facing_sprite(src, self.tile_facing(x, y, mp), axes,
+                                   cell=(x, y), mp=mp)
 
     def tile_sprite(self, x: int, y: int, mp: "Map") -> Optional[str]:
         """The sprite key for the tile at (x, y) of map `mp` (see
@@ -34454,17 +35041,19 @@ class Match:
         info = self.tile_sprite_info(x, y, mp)
         return info[0] if info else None
 
-    def zone_sprite_info(self, name: str, mp: "Map"
+    def zone_sprite_info(self, name: str, mp: "Map",
+                         cell: Optional[Tuple[int, int]] = None
                          ) -> Optional[Tuple[str, bool, bool]]:
         """The sprite for zone `name` of map `mp` as (key, flip_h, flip_v),
         from the zone's then its definition's look fields; the mirror axes
         from the `sprite_mirror` data (zone, definition) > the rule."""
         z = mp.zones.get(name)
-        src = self._zone_look_sources(z)
+        src = self._zone_look_sources(z, name, mp)
         if not src:
             return None
         axes = self._mirror_axes(self.zone_data_spec(z, "sprite_mirror"))
-        return self._facing_sprite(src, self.zone_facing(name, mp), axes)
+        return self._facing_sprite(src, self.zone_facing(name, mp), axes,
+                                   cell=cell, mp=mp)
 
     def zone_sprite(self, name: str, mp: "Map") -> Optional[str]:
         """The sprite key for zone `name` of map `mp`, or None."""
@@ -34475,7 +35064,7 @@ class Match:
         """The glyph for zone `name` of map `mp`: `glyphs.<facing>` then
         `glyph`, the zone's before its definition's. None when unset."""
         z = mp.zones.get(name)
-        return self._facing_glyph(self._zone_look_sources(z),
+        return self._facing_glyph(self._zone_look_sources(z, name, mp),
                                   self.zone_facing(name, mp))
 
     def background_layer(self, mp: Optional["Map"] = None
@@ -34699,17 +35288,20 @@ class Match:
         notes: List[Tuple[str, str, Optional[str]]] = []
         token = TEXT_COLOR_NOTES.set(notes)
         try:
-            out = self._render_ascii_impl(pov_team, colorize, hidden,
-                                          viewport=viewport, legend=legend,
-                                          marks=marks, mark_glyph=mark_glyph,
-                                          coords=coords,
-                                          mp=mp or self.get_map())
+            with self.looks_pass(viewport, mp) as looks:
+                out = self._render_ascii_impl(pov_team, colorize, hidden,
+                                              viewport=viewport,
+                                              legend=legend, marks=marks,
+                                              mark_glyph=mark_glyph,
+                                              coords=coords, mp=mp)
         finally:
             TEXT_COLOR_NOTES.reset(token)
             self._vision_memo = prev
         if colorize and notes and bool(self.rules.get(
                 "ascii_color_warnings", True)):
             out += "\n" + self.text_color_warning(notes)
+        if looks.get("__over"):
+            out += "\n" + LOOKS_OVER_NOTE
         return out
 
     def text_color_warning(self, notes: List[Tuple[str, str, Optional[str]]]
@@ -34794,9 +35386,7 @@ class Match:
             if not has_glyph and zc is None:
                 continue
             lay = self.zone_draw_layer(z)
-            for (zx, zy) in z.get("cells", ()):
-                if not mp.in_bounds(zx, zy):
-                    continue
+            for (zx, zy), _sides in self.zone_draw_cells(zname, z, mp):
                 if has_glyph:
                     if lay < g_layer.get((zx, zy), -math.inf):
                         continue
@@ -34809,14 +35399,25 @@ class Match:
                     colors[zy][zx] = zc
                     c_layer[(zx, zy)] = lay
 
-        for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
-            if not mp.in_bounds(tx, ty):
-                continue
+        # A ground without `looks` (#472) shows the same on every cell it
+        # covers: resolved once.
+        gt = self.ground_template(mp)
+        ground_same = gt is not None and not gt.data.get(LOOKS_KEY) \
+            and not gt.data.get("glyphs")
+        ground_look: Optional[Tuple[Any, ...]] = None
+        for (tx, ty), data in (self._tile_render_items(mp, viewport)
+                               if "tiles" not in hidden else ()):
             if not self.tile_visible_to(tx, ty, pov_team, mp):
                 continue
-            glyph = self.tile_glyph(tx, ty, mp)
+            if data is None and ground_same:
+                if ground_look is None:
+                    ground_look = (self.tile_glyph(tx, ty, mp),
+                                   self.tile_color(tx, ty, mp, text=True))
+                glyph, tc = ground_look
+            else:
+                glyph = self.tile_glyph(tx, ty, mp)
+                tc = self.tile_color(tx, ty, mp, text=True)
             has_glyph = glyph is not None
-            tc = self.tile_color(tx, ty, mp, text=True)
             if not has_glyph and tc is None:
                 continue
             lay = self.tile_draw_layer(data)
@@ -34827,7 +35428,9 @@ class Match:
                 colors[ty][tx] = tc            # tile owns the cell (tc may be None)
                 g_layer[(tx, ty)] = c_layer[(tx, ty)] = lay
                 if meanings is not None:
-                    meanings[ty][tx] = self.legend_label_tile(data)
+                    meanings[ty][tx] = self.legend_label_tile(
+                        data, mp, self.tile_looks(
+                            tx, ty, mp, data, self.cell_template(mp, data)))
             elif lay >= c_layer.get((tx, ty), -math.inf):
                 colors[ty][tx] = tc
                 c_layer[(tx, ty)] = lay
@@ -35113,9 +35716,13 @@ class Match:
         if prev is None:
             self._vision_memo = {}
         try:
-            scene = self._render_scene_impl(pov_team, hidden, viewport, mp)
-            if legend:
-                scene["legend"] = self._scene_legend(scene, pov_team, mp)
+            with self.looks_pass(viewport, mp) as looks:
+                scene = self._render_scene_impl(pov_team, hidden, viewport,
+                                                mp)
+                if legend:
+                    scene["legend"] = self._scene_legend(scene, pov_team, mp)
+            if looks.get("__over"):
+                scene["notes"] = [LOOKS_OVER_NOTE]
             return scene
         finally:
             self._vision_memo = prev
@@ -35193,7 +35800,10 @@ class Match:
                 except ValueError:
                     tx = ty = None
                 data = mp.tiles.get((tx, ty)) if tx is not None else None
-                label = self.legend_label_tile(data)
+                label = self.legend_label_tile(
+                    data, mp, self.tile_looks(tx, ty, mp, data,
+                                              self.cell_template(mp, data))
+                    if tx is not None else None)
             elif kind == "zone":
                 label = self.legend_label_zone(ref, mp)
             elif kind == "corpse":
@@ -35347,20 +35957,28 @@ class Match:
                 continue
             z_layer = self.zone_draw_layer(z)
             z_fx = self.zone_sprite_effects(zname, z, pov_team)
-            for (zx, zy) in z.get("cells", ()):
-                if not mp.in_bounds(zx, zy):
-                    continue
-                placements.append({
+            # Sprite variants (#288) pick per cell.
+            varied = any(isinstance(src, dict) and src.get("sprite_variants")
+                         for src in self._zone_look_sources(z, zname, mp))
+            for (zx, zy), sides in self.zone_draw_cells(zname, z, mp):
+                if varied:
+                    ci = self.zone_sprite_info(zname, mp, (zx, zy))
+                    spr, fh, fv = ci if ci else (None, False, False)
+                pl = {
                     "kind": "zone", "ref": zname, "x": zx, "y": zy,
                     "w": 1, "h": 1, "mode": "single", "sprite": spr,
                     "glyph": g, "tint": tint, "opacity": 100,
                     "flip_h": fh, "flip_v": fv, "layer": z_layer,
-                    "effects": z_fx})
+                    "effects": z_fx}
+                if sides:
+                    # An outlined zone (#335): the sides facing outside.
+                    pl["edges"] = sides
+                placements.append(pl)
 
         # Tile layer (20).
-        for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
-            if not mp.in_bounds(tx, ty) or not self.tile_visible_to(
-                    tx, ty, pov_team, mp):
+        for (tx, ty), data in (self._tile_render_items(mp, viewport)
+                               if "tiles" not in hidden else ()):
+            if not self.tile_visible_to(tx, ty, pov_team, mp):
                 continue
             sinfo = self.tile_sprite_info(tx, ty, mp)
             spr, fh, fv = sinfo if sinfo else (None, False, False)
@@ -35511,6 +36129,8 @@ class Match:
             "sprite_cell_size": self._layer_rule("sprite_cell_size", 100),
             "tint_fill_opacity": max(0, min(100, self._layer_rule(
                 "tint_fill_opacity", 40))),
+            "zone_outline_width": max(1, min(50, self._layer_rule(
+                "zone_outline_width", 12))),
         }
 
     # ---- facing writes ----
@@ -37443,6 +38063,7 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
     "map_nested_vehicle_moves_var": ("nested_vehicle_moves",
                                      "nested_vehicle_moves"),
     "map_void_blocks_sight_var": ("void_blocks_sight", "void_blocks_sight"),
+    "map_ground_var": ("ground", None),
 }
 # setting -> its rule
 MAP_SETTING_RULES: Dict[str, str] = {v[0]: k for k, v in MAP_VAR_NAME_RULES.items()}
@@ -37488,6 +38109,11 @@ def map_setting_value(setting: str, value: Any) -> Any:
         return str(value).lower()
     if setting == "tags":
         return checked_tag_list(value, "The map's tags", engine_ok=True)
+    if setting == "ground":
+        if not isinstance(value, str) or not value.strip():
+            raise VTTError(f"The ground setting names a tile template, got "
+                           f"`{value}`.")
+        return value.strip()
     if setting == "hidden_layers":
         words = ([str(v) for v in value] if isinstance(value, list)
                  else [w.strip() for w in str(value).split(",") if w.strip()])
@@ -38637,6 +39263,7 @@ class MatchManager:
         m.bound_channels = {}
         m.channel_views = {}
         m.channel_maps = {}
+        m.unit_focus = {}
         m.pending_requests = {}
         # A pause belongs to the table that paused it; the copy starts live.
         m.paused = None

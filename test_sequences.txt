@@ -185,7 +185,7 @@ SCENARIO 8 — Save/load round-trips templates, passives, state
 !system set default entity_line_format "{name} HP:{hp} sword:{inventory.sword.damage}"
 !turn next
 !store save savetest.json
-!match delete m8
+!match delete m8 confirm
 !store load savetest.json
 !match use m8
 !list
@@ -438,7 +438,7 @@ SCENARIO 19 — Save/load preserves target/scope
 !passive add hero spy on_var_created target=inventory scope=children "entity[self].spy_log = changed_key"
 !passive info hero spy
 !store save m19_save.json
-!match delete m19
+!match delete m19 confirm
 !store load m19_save.json
 !match use m19
 !passive info hero spy
@@ -710,7 +710,7 @@ SCENARIO 30 — Match info and deletion
 !match use doomed
 !ent add x Xavier 20 1 1 5
 !match info
-!match delete doomed
+!match delete doomed confirm
 !match list
 
 Expected: !match info summarises the channel's match: system, grid size, round,
@@ -2168,7 +2168,7 @@ SCENARIO 108 — Full match round-trip
 !clamp add hero mana max=100 mode=soft
 !turn next
 !store save save108.json
-!match delete save108
+!match delete save108 confirm
 !store load save108.json
 !match use save108
 !list
@@ -2189,7 +2189,7 @@ SCENARIO 109 — Save/load preserves global passives
 !ent add hero Hero 30 3 3 10
 !gpassive add gas on_round_start "entity[self].hp = entity[self].hp - 1"
 !store save save109.json
-!match delete save109
+!match delete save109 confirm
 !store load save109.json
 !match use save109
 !gpassive list
@@ -2206,7 +2206,7 @@ SCENARIO 110 — Save/load preserves system-level clamps
 !gclamp add mp max=100 min=0 mode=soft
 !gclamp list
 !store save sl110.json
-!match delete sl110
+!match delete sl110 confirm
 !store load sl110.json
 !match use sl110
 !gclamp list
@@ -2225,8 +2225,8 @@ SCENARIO 111 — Saving multiple matches in one file
 !match use m111b
 !ent add b1 Bravo 25 2 2 8
 !store save multi111.json
-!match delete m111a
-!match delete m111b
+!match delete m111a confirm
+!match delete m111b confirm
 !store load multi111.json
 !match list
 !match use m111a
@@ -3328,7 +3328,7 @@ SCENARIO 166 — Save/load preserves groups
 !ent group add alpha b
 !ent group add beta a
 !store save groups_test.json
-!match delete mgrp6
+!match delete mgrp6 confirm
 !store load groups_test.json
 !match use mgrp6
 !ent group list
@@ -3542,11 +3542,11 @@ SCENARIO 173 — !store save with include_history round-trips autosaves
 !history save important
 !store save _hist_store_no.json
 !store save _hist_store_yes.json include_history=yes
-!match delete mhist6
+!match delete mhist6 confirm
 !store load _hist_store_no.json
 !match use mhist6
 !history list
-!match delete mhist6
+!match delete mhist6 confirm
 !store load _hist_store_yes.json
 !match use mhist6
 !history list
@@ -3934,7 +3934,7 @@ SCENARIO 181 — Tile data round-trips through !store save/load
 !tile set 4 4 ore.gold 500
 !tile list
 !store save _tile_store_test.json
-!match delete mtile3
+!match delete mtile3 confirm
 !store load _tile_store_test.json
 !match use mtile3
 !tile list
@@ -15031,7 +15031,7 @@ SCENARIO 574 — commands that name another match need host rights on it
 !match use alice
 !match bind alice
 !match rename alice Pwned
-!match delete alice
+!match delete alice confirm
 !match new mal MalMatch 6 6
 !match use mal
 !ent add bot Bot 10 1 1 5
@@ -19650,7 +19650,7 @@ SCENARIO 707 — !server wipe: typed confirmation, refusals, undo
 !match new w2 Two 5 5
 !server wipe undo
 ?? Remove them first: matches `w2`
-!match delete w2
+!match delete w2 confirm
 !server wipe undo
 ?? Undid the wipe (all): 1 match(es) back
 !system
@@ -21905,7 +21905,7 @@ SCENARIO 755 — GameSystem inheritance: refusals, flattening, persistence
 !assert "rule_get('fog_range_mode') == 'euclidean'"
 !system delete night
 ?? ❌ GameSystem 'night' is still used by 1 match(es): t755.
-!match delete t755
+!match delete t755 confirm
 !system delete skirm
 ?? ❌ GameSystem 'skirm' is inherited by `night`.
 !system delete night
@@ -22981,7 +22981,7 @@ SCENARIO 775 — !system undo refusals: blocking matches, var collisions, rename
 !match use s775
 !system undo
 ?? ❌ Can't undo: match `s775b` uses `other`, which didn't exist then. Move or delete those matches first.
-!match delete s775b
+!match delete s775b confirm
 !system undo
 ?? - system `other` removed
 !system set base var_name_collision refuse
@@ -23036,7 +23036,7 @@ SCENARIO 776 — Server audit log (!server audit)
 !template rename champ champion
 !template delete champion
 !match new s776b Other 4 4
-!match delete s776b
+!match delete s776b confirm
 !store save s776save
 !batch !system set base friendlyfire false ; !defvar add armor 2
 !server audit
@@ -24981,7 +24981,7 @@ SCENARIO 816 — Rollbacks drop the autosaves of the turns they undo; a strict b
 !ent hp g -2
 !history save keep
 !match use ua
-!batch strict match delete gone ; ent hp nobody -1
+!batch strict match delete gone confirm ; ent hp nobody -1
 ?? Deleted `gone`
 ?? 1 line(s) before it were undone
 !match use gone
@@ -26118,7 +26118,7 @@ SCENARIO 842 — transfer_entity: the destination opts in with !match link
 !match unlink town
 ?? no longer accepts units from `town`
 !match link town
-!match delete town
+!match delete town confirm
 !match links
 ?? accepts units from no other match
 
@@ -26783,7 +26783,7 @@ SCENARIO 854 — Replays keep the author's authority; links trust one match; ali
 !match link town
 !ent add d1 D1 5 1 1
 !match use town
-!match delete town
+!match delete town confirm
 !match new town Evil 6 6
 !match use dungeon
 !undo command
@@ -27015,7 +27015,7 @@ SCENARIO 859 — Teams stored as text; corpses vs place_random and resize; a str
 ?? the corpses of `c` were on the cut cells and are gone
 !assert "not has_corpse('c')"
 !ent hp a 5
-!batch strict match delete t859 ; match new t859 T2 4 4 ; ent hp nobody 3
+!batch strict match delete t859 confirm ; match new t859 T2 4 4 ; ent hp nobody 3
 ?? ⏹ strict batch stopped at line 3
 !match use t859
 !match journal
@@ -35505,7 +35505,7 @@ SCENARIO 1028 — The `host` capability limits match creation; `gm` is a host of
 ?? 42
 !host add bob
 ?? ❌ Only the match owner can do that.
-!match delete g1
+!match delete g1 confirm
 ?? ❌ Only the owner
 !macro set heal "!ent hp hero +1"
 !macro list
@@ -50535,3 +50535,431 @@ SCENARIO 1337 — Engine-shaped data the engine can't use: a near-miss `__` var,
 ?! ⚠️
 
 Expected: A `__` var one letter off an engine var (`__reaction_mod`) is named with the close name; a `__` var of the GM's own isn't. Values the engine can't use under an action's `target`, a modifier's `op`, a seat's `capacity` and a shield's `amount` (the 2x2 ogre's shield) are named as they are written; a usable value isn't. A unit arriving with formulas calling a `!func` the match lacks (a summoned snapshot, a partial template given) is named with the formula's path; once the function exists it isn't. In a channel with blue's view, a warning about the fogged ogre (its var, its copy summoned out of sight) is dropped, while a copy summoned beside the hero is named. With data_warnings off nothing is named.
+
+SCENARIO 1338 — Denial reasons reach the requester, `!approve always` (#398, #399)
+------------------------------------------------------------------------------
+
+!match new ap Ap 8 8
+!match use ap
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 40 5 5 3
+!as channel blue
+!match use ap
+!as player bob
+!ent hp hero -5
+?? needs host approval (request `r1`, by bob)
+!as host
+!as channel CLI
+!deny r1 out of range
+?? 🚫 Denied `r1` (!ent hp hero -5, by bob): out of range.
+?? 📨 to `blue`:
+?? 🚫 bob: your `!ent hp hero -5` (request `r1`) was denied by cli: out of range.
+!as channel blue
+!as player bob
+!ent tp hero 2 2
+!as host
+!deny r2
+?? 🚫 bob: your `!ent tp hero 2 2` (request `r2`) was denied by cli.
+?! 📨
+!as player bob
+!ent tp hero 2 2
+!as host
+!as channel CLI
+!approve r3 always
+?? ✅ Approved `r3`
+?? 🔓 bob may now run `!ent tp` here without approval (`!host access clear "ent tp" user=bob` takes it back).
+!host access list
+?? `ent tp` → all (for `bob` only)
+!as channel blue
+!as player bob
+!ent tp hero 3 3
+?! needs host approval
+!ent hp hero -1
+?? needs host approval (request `r4`
+!as host
+!as channel CLI
+!assert "entity[hero].x == 3 and entity[hero].y == 3"
+!system set default approve_always_access off
+!approve r4 always
+?? `always` is off on this match (approve_always_access off)
+!pending
+?? `r4` by bob
+!system set default approve_always_access owner
+!host add carol
+!as player carol
+!approve r4 always
+?? Only the match owner may approve with `always` here
+!approve r4
+?? ✅ Approved `r4`
+!as host
+!host access clear "ent tp" user=bob
+?? Cleared access override for `ent tp`
+!as channel blue
+!as player bob
+!ent tp hero 4 4
+?? needs host approval
+!assert "entity[hero].hp == 29"
+
+Expected: A denial's reason ends the host's reply, and the requester's channel gets its own line naming the command, the request, the host and the reason (posted to `blue`); denied from the requester's own channel, the reply is that line and nothing is posted elsewhere, and without a reason it ends at the host's name. `!approve r3 always` runs the request, then stores a per-player override for `ent tp`, named with the command that takes it back; bob's next `!ent tp` runs without approval, while his `!ent hp` still queues. approve_always_access off refuses `always` and leaves the request queued; under owner a co-host's `always` is refused and a plain approve works. Clearing the override sends bob's `!ent tp` back to the queue.
+
+SCENARIO 1339 — Access overrides that run out: turns=, until=round_end, once (#466)
+------------------------------------------------------------------------------
+
+!match new ov Ov 8 8
+!match use ov
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 40 5 5 3
+!host access set "ent tp" all turns=2 user=bob
+?? Access override set: `ent tp` → all for `bob` only [2 more turn changes].
+!host access set "ent hp" all once user=bob
+?? [one use]
+!host access set "ent face" all until=round_end
+?? [until the end of round 1]
+!host access set ent all once
+?? Access override set: `ent` → all [one use].
+!host access clear ent
+!as player bob
+!ent hp hero -100 extra
+?? ❌
+!host access list
+?! (no
+!as player bob
+!ent tp hero 9 9
+?! needs host approval
+!as host
+!host access list
+?? `ent hp` → all (for `bob` only) [one use]
+!as player bob
+!ent hp hero -4
+?? 🔒 The one-use access override `ent hp` for `bob` is used up.
+!ent hp hero -4
+?? needs host approval (request `r1`
+!ent face hero left
+?! needs host approval
+!as host
+!turn next
+!as player bob
+!ent tp hero 2 2
+?! needs host approval
+!as host
+!host access list
+?? `ent tp` → all (for `bob` only) [1 more turn change]
+!turn next
+!host access list
+?! ent tp
+?? `ent face` → all [until the end of round 1]
+!turn next
+!as player bob
+!ent tp hero 3 3
+?? needs host approval (request `r2`
+!ent face hero right
+?? needs host approval (request `r3`
+!as host
+!host access list
+?! ent tp
+?! ent face
+!undo command 3
+!host access list
+?? `ent hp` → all (for `bob` only) [one use]
+?? `ent face` → all [until the end of round 1]
+!assert "entity[hero].hp == 30 and entity[hero].x == 1 and facing_of('hero') != 'left'"
+!system set default atb_enabled true
+!host access set "ent face" all until=round_end
+?? until=round_end needs rounds
+!host access clear "ent hp" turns=2
+?? turns=, until= and once go with `!host access set`.
+
+Expected: Each limit shows beside its override. A refused command under a one-use override (a stray word) leaves it, and bob's off-map `!ent tp` passes the gate (no approval) and is refused on its own, spending nothing. bob's first `!ent hp` spends the one-use override (named as used up) and the next queues. `until=round_end` lets anyone face units through round 1; once the round wraps (three turn changes with two units) it's gone, as is the `turns=2` override after two more turn changes (the list counted 1 left after the first). Undoing the three command steps back past bob's `!ent hp` brings the one-use override back with the board, since overrides are part of what an undo restores. HARNESS-ALLOWS-ERRORS (the stray word). Under ATB `until=round_end` is refused; the limit words only go with `set`.
+
+SCENARIO 1340 — `me` and `!ent focus`, `!again` with swaps (#400, #499)
+------------------------------------------------------------------------------
+
+!match new mf Mf 8 8
+!match use mf
+!ent add hero Hero 30 1 1 5
+!ent add gob1 Goblin 10 4 4 3
+!ent add gob2 Goblin 10 5 4 3
+!ent add gob3 Goblin 10 6 4 3
+!ent add big Big 50 2 6 2
+!ent set_var big footprint_w 2
+!ent set_var big footprint_h 2
+!ent set_var gob1 actions.stab.target entity
+!ent set_var gob1 actions.stab.body "entity[target].hp -= 2"
+!ent set_var gob2 actions.stab.target entity
+!ent set_var gob2 actions.stab.body "entity[target].hp -= 2"
+!ent set_var gob3 actions.stab.target entity
+!ent set_var gob3 actions.stab.body "entity[target].hp -= 2"
+!ent info me
+?? `me` names the unit you focused, and you have none on this match
+!ent focus
+?? You have no focused unit here
+!ent focus big
+?? 🎯 Focused on **Big** (`big`)
+!ent move me 1 right
+!assert "entity[big].x == 3"
+!action gob1 stab me
+!again gob1=gob2
+?? 🔁 `!action gob2 stab me`
+!again gob1=gob3
+?? 🔁 `!action gob3 stab me`
+!again gob9=gob2
+?? `gob9` isn't one of the arguments of the command `!again` repeats (`!action gob1 stab me`)
+!again gob1
+?? Unexpected `gob1`
+!again gob1=gob2 me=hero
+?? 🔁 `!action gob2 stab hero`
+!assert "entity[big].hp == 44 and entity[hero].hp == 28"
+!ent add me Me 5 8 8 1
+?? reserved
+!ent hp hero 9 extra
+?? ❌
+!ent set_var hero note x
+!again note=hp
+?? 🔁 `!ent set_var hero hp x`
+!as player bob
+!ent focus gob1
+?? 🎯 Focused on **Goblin** (`gob1`)
+!ent info me
+?? Goblin
+!ent move me 1 down
+?? needs host approval (request `r1`
+!as host
+!approve r1
+!assert "entity[gob1].y == 5 and entity[big].y == 6"
+!ent focus
+?? 🎯 Your focused unit here is **Big** (`big`)
+!ent focus clear
+?? Focus cleared
+!as player bob
+!ent focus clear
+!ent info me
+?? you have none on this match
+
+Expected: `me` names the caller's focused unit (a 2x2 body here), in `!ent` and as an action target; without a focus it's refused, naming `!ent focus`. `!again gob1=gob2` reruns the remembered `!action gob1 stab me` with the actor swapped, and the next swap works from the same remembered command; a swap that matches no argument, or a word without `=`, is refused; a `me` argument can be swapped like any word. `me` can't be a new unit's id. Swapping `note=hp` replaces the exact argument only. HARNESS-ALLOWS-ERRORS (the stray words). bob focuses his own unit, and his approved `!ent move me` moves bob's focus (gob1), whoever approves it; each user's focus is their own, and clearing bob's leaves bob's `me` with none.
+
+SCENARIO 1341 — Deleted matches go to the trash; `!match restore` (#440)
+------------------------------------------------------------------------------
+
+!match new tr Tr 8 8
+!match use tr
+!ent add hero Hero 30 1 1 5
+!ent add ogre Ogre 40 5 5 3
+!ent set_var ogre footprint_w 2
+!turn next
+!ent hp hero -5
+!match bind
+!match delete tr
+?? Deleting **Tr** (`tr`) removes 2 units, 1 map
+?? and unbinds 1 channel. `!match delete tr confirm` goes ahead
+!match list
+?? tr
+!match delete tr confirm
+?? 🗑️ Deleted `tr`. It stays in the trash for 24 hours
+!match list
+?! `tr`
+!match trash
+?? `tr` **Tr**, owner
+!as restart
+!match trash
+?? `tr` **Tr**
+!as player bob
+!match restore tr
+?? Only the owner of `tr`
+!as host
+!match new tr Other 4 4
+!match restore tr
+?? A match `tr` exists now
+!match delete tr confirm
+!match trash
+?? - `tr` **Other**
+?? - `tr` 2 **Tr**
+!match restore tr 3
+?? The trash holds 2 deleted matches `tr`
+!match restore tr 2
+?? ♻️ `tr` (**Tr**) is back with its
+!match trash
+?? `tr` **Other**
+?! **Tr**
+!match use tr
+!assert "entity[hero].hp == 25 and footprint_width('ogre') == 2"
+!undo command
+!assert "entity[hero].hp == 30"
+!match channels
+?? tr
+!match restore nope
+?? No match `nope` was deleted in the last 24 hours
+!batch strict !match delete tr ; !ent hp hero 1
+?! Damaged
+?! Set
+
+Expected: The first `!match delete` lists what goes and needs `confirm` (a ❌, so the strict batch stops there and the second line never runs). Deleted, the match leaves the list and shows in `!match trash`, also after a restart (the trash is on disk). Only its owner or an administrator restores it, and not while another match holds the id; restored, it comes back with its undo history (an undo of the hp change works) and unbound. With two matches deleted under one id, `!match trash` numbers them newest first and `!match restore tr 2` picks the older; the other stays in the trash.
+
+SCENARIO 1342 — Default ground: an ocean map reads its water template on every cell without tile data (#472)
+------------------------------------------------------------------------------
+
+!match new gr Gr 6 4
+!match use gr
+!tile def new water
+!tile def data water glyph ~
+!tile def data water block "not entity[self].swims"
+!tile def tags water wet_ground
+!tile def hook water on_enter "entity[self].splashes += 1"
+!tile def data water depth 3
+!tile def grant water soaked
+!status def soaked
+!tile def new rock
+!tile def data rock glyph #
+!tile def new lava
+!tile def hook lava on_turn_start "entity[self].hp -= 1"
+!map ground lava
+?? holds turn / round hooks (`on_turn_start`)
+!map ground water
+?? Ground: `water`. Every cell without tile data reads it as its template
+!map ground
+?? Ground: `water` (cells without tile data read it).
+!defvar add swims false
+!defvar add splashes 0
+!ent add boat Boat 20 1 1 5
+!ent set_var boat swims true
+!ent set_var boat footprint_w 2
+!ent add cat Cat 10 6 4 3
+!tile place rock 4 1
+!tile set 5 1 note "a buoy"
+!map
+?? 1 v v ~ # ~ ~
+?? 2 ~ ~ ~ ~ ~ ~
+!assert "tile_get(2, 3, 'depth') == 3 and not tile_has(4, 1, 'depth') and tile_get(5, 1, 'depth') == 3 and tile_get(5, 1, 'note') == 'a buoy'"
+!assert "tile_has_tag(3, 3, 'wet_ground') and not tile_has_tag(4, 1, 'wet_ground')"
+!tile def hook water on_turn_start "entity[self].hp -= 1"
+!ent move cat 1 left
+?? Cell (5,4) blocks `cat`
+!ent move boat 1 down
+!assert "entity[boat].splashes == 2 and status_has('boat', 'soaked') and status_has('cat', 'soaked')"
+!turn next
+!turn next
+!assert "entity[cat].hp == 10 and entity[boat].hp == 20"
+!tile def rename water sea
+!map ground
+?? Ground: `sea`
+!tile def del sea
+!map ground
+?? Ground: none
+!map
+?! ~
+!assert "not status_has('boat', 'soaked') and not status_has('cat', 'soaked')"
+
+Expected: A template with turn / round hooks is refused as ground, naming them. With `water` as ground every cell without tile data shows `~`, reads the template's data through tile_get / tile_has and carries its tags, while a placed `rock` keeps its own look and a tile whose data names no template (the buoy) still reads the ground (its depth). The ground's block refuses the cat (it doesn't swim), the 2x2 boat's step fires the ground's on_enter once per cell it enters (2) and the ground grants `soaked` to every unit standing on it (the cat too); a turn hook added to the template after it became ground never fires from it (nobody loses hp over two turns, the buoy's cell included). Renaming the template takes the ground along; deleting it clears the map's ground, the map shows plain cells and the grant ends.
+
+SCENARIO 1343 — Sprite variants per cell, zones drawn as outlines (#288, #335)
+------------------------------------------------------------------------------
+
+!match new sv Sv 6 6
+!match use sv
+!tile def new grass
+!tile def variants grass g1 g2 g3
+?? draws one of `g1`, `g2`, `g3` per cell
+!tile place grass 1 1
+!tile place grass 2 1
+!tile place grass 3 1
+!tile place grass 4 1
+!tile place grass 5 1
+!tile place grass 6 1
+!map scene list
+?? tile `1,1` at (1,1) — sprite g
+!tile variants 1 1 bones:1 skull:0
+?? sprite_variants as a dict maps sprite keys to positive weights.
+!tile variants 1 1 bones
+!map scene list
+?? tile `1,1` at (1,1) — sprite bones
+!zone new aura
+!zone fill aura 2 2 5 5
+!zone glyph aura *
+!zone color aura red
+!zone draw aura outline
+?? Zone `aura` draws its edge cells only
+!ent add ogre Ogre 30 3 3 4
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!map
+?? 2 . * * * * .
+?? 3 . * ^ ^ * .
+!map scene list
+?? zone `aura` at (2,2) — glyph *, color red, outline edges nw
+?! zone `aura` at (3,3)
+!zone draw aura fill
+!map scene list
+?? zone `aura` at (3,3)
+!zone draw aura sideways
+?? draw is `fill`
+!zone def new ring
+!zone def draw ring outline
+!zone def glyph ring o
+!zone place ring 6 6
+!map scene list
+?? zone `ring` at (6,6) — glyph o, outline edges nesw
+
+Expected: A template's sprite_variants give each placed tile one of its sprites, picked per cell (the same pick every render); a tile's own single variant replaces its template's; a weight of 0 is refused. An outlined zone shows only on its edge cells, in the text map (its glyph around the 2x2 ogre, which stands inside) and in the scene, which names the sides facing outside for images to draw as lines; `fill` brings every cell back; a word other than fill / outline is refused. A definition's draw reaches its zones (a one-cell zone is all edge). HARNESS-ALLOWS-ERRORS (the refusals).
+
+SCENARIO 1344 — Looks by state: a bloodied ogre, an open door, a definition's looks, per-field picks, disguises and the condition budget (#264, #402)
+------------------------------------------------------------------------------
+
+!match new lk Lk 6 4
+!match use lk
+!ent add ogre Ogre 40 2 2 4
+!ent set_var ogre footprint_w 2
+!ent set_var ogre glyph O
+!ent looks ogre [{"condition": "entity[self].hp < 20", "color": "red", "glyph": "o"}, {"condition": "entity[self].hp < 30", "glyph": "W", "legend": "wounded ogre"}]
+?? 1. when `entity[self].hp < 20`: glyph "o", color "red"
+!map
+?? 2 . O O
+!ent hp ogre 25
+!map
+?? 2 . W W
+!ent hp ogre 10
+!map legend=on
+?? 2 . o o
+?? wounded ogre
+!ent looks ogre [{"glyph": "xy"}]
+?? look 1:
+!ent looks ogre [{"condition": "nope(self)", "glyph": "x"}]
+?? look 1's condition
+!zone def new door
+!zone def data door open false
+!zone def glyph door +
+!zone def looks door [{"condition": "data.open == true", "glyph": "|"}]
+!zone place door 5 2 name=d1
+!map
+?? +
+!zone set d1 open true
+!map
+?? |
+!zone looks d1 [{"condition": "zone_get(zone_name, 'open') == true", "color": "green"}]
+!map scene list
+?? zone `d1` at (5,2) — glyph |, color green
+!tile def new trap
+!tile def data trap armed true
+!tile def data trap glyph ^
+!tile def looks trap [{"condition": "data.armed == false", "glyph": "_"}]
+!tile place trap 1 4
+!tile set 1 4 armed false
+!map
+?? _
+!ent set_var ogre disguise.name Rock
+!ent set_var ogre disguise.glyph R
+!ent set_var ogre team red
+!ent add hero Hero 10 1 1 3
+!ent set_var hero team blue
+!map as=blue
+?? 2 . R R
+!eval "entity[ogre].disguise.looks = [{'glyph': 'r'}]"
+!map as=blue
+?? 2 . r r
+!owner ceiling look_condition_reads 0
+!map
+?? look_condition_reads
+?? +
+!owner ceiling look_condition_reads reset
+!map
+?! look_condition_reads
+
+Expected: A unit's looks pick per field: below 30 hp the second entry's glyph and legend, below 20 the first entry's glyph and colour (the first entry setting a field wins), drawn over the whole 2x1 body; a two-character glyph and a broken condition are refused. A zone definition's looks read the zone's data (`data.open`, with no formula engine), a zone's own looks come first (a formula condition reading zone_get), and a tile template's looks read the tile's data. Under a disguise fooling blue's view the real looks aren't read; the disguise's own looks are. With look_condition_reads at 0 the door's formula condition isn't read, so the door keeps its base look (`+`) and the map ends with the note; the trap's and the ogre's plain tests need no formula engine and still apply. HARNESS-ALLOWS-ERRORS (the broken condition).

@@ -6453,7 +6453,20 @@ class FormulaEngine:
                     f"{type(path).__name__}."
                 )
             try:
-                return _cur_map().tile_get_path(x, y, path)
+                mp = _cur_map()
+                g = _ground_data(mp, x, y)
+                if g is not None:
+                    # Ground (#472): a cell without tile data reads the
+                    # ground template's data.
+                    cur: Any = g
+                    for i, key in enumerate(path.split(".")):
+                        if not isinstance(cur, dict) or key not in cur:
+                            raise FormulaError(
+                                f"tile ({x},{y}) has no value at "
+                                f"'{'.'.join(path.split('.')[:i + 1])}'.")
+                        cur = cur[key]
+                    return copy.deepcopy(cur)
+                return mp.tile_get_path(x, y, path)
             except VTTError as ex:
                 # OutOfBounds / NotFound / empty-path errors from
                 # tile_get_path are all VTTError subclasses; surface
@@ -6479,7 +6492,30 @@ class FormulaEngine:
                     f"tile_has(x, y, path): path must be str, got "
                     f"{type(path).__name__}."
                 )
-            return _cur_map().tile_has_path(x, y, path)
+            mp = _cur_map()
+            g = _ground_data(mp, x, y)
+            if g is not None:
+                cur: Any = g
+                for key in path.split(".") if path else [""]:
+                    if not isinstance(cur, dict) or key not in cur:
+                        return False
+                    cur = cur[key]
+                return True
+            return mp.tile_has_path(x, y, path)
+
+        def _ground_data(mp: Any, x: int, y: int) -> Optional[Dict[str, Any]]:
+            """A cell reading the map's ground (#472): no tile data, or data
+            naming no template; the ground's data under the cell's own."""
+            if not mp.in_bounds(x, y):
+                return None
+            cell = mp.tiles.get((x, y))
+            if not match.from_ground(mp, cell):
+                return None
+            tpl = match.ground_template(mp)
+            if tpl is None:
+                return None
+            return {**tpl.data, **cell} if isinstance(cell, dict) \
+                else tpl.data
 
         ns["tile_get"] = _tile_get
         ns["tile_has"] = _tile_has
