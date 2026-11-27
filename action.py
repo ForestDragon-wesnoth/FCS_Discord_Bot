@@ -1783,6 +1783,9 @@ def _resolve_eid_for_action(token: str, match: "Match") -> str:
         if not eid:
             raise NotFound("No current entity (turn order is empty).")
         return eid
+    if t == "me":
+        from logic import resolve_me
+        return resolve_me(match, token)
     return token
 
 
@@ -3166,7 +3169,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
         "_dying_ids", "_death_recheck", "_death_depth", "_death_draining",
         "_death_check_deferred_ids", "_deleting_maps",
-        "_alive_eval_depth", "_vision_memo", "_spatial", "_uflags", "_size_touch",
+        "_alive_eval_depth", "_vision_memo", "_looks_memo", "_spatial", "_uflags", "_size_touch",
         "_request_seq", "pending_requests", "held_commands",
         # Wall clock of the open reaction window (expiry; runtime).
         "_reaction_opened",

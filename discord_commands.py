@@ -547,7 +547,9 @@ class DiscordCtxWrapper:
                 file=discord.File(io.BytesIO(data), filename=f"{m.id}.png"))
         except Exception as e:
             return f"❌ Could not post the image: {e}"
-        return ""  # the attachment is the reply
+        # The attachment is the reply, plus a render note (looks past
+        # look_condition_reads, #264).
+        return "\n".join(scene.get("notes") or [])
 
     async def send_approval(self, req: dict):
         """Post an approval request with clickable Approve/Deny buttons.

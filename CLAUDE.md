@@ -2727,6 +2727,11 @@ hardcodes**.
 - **`!again`** reruns the caller's last top-level command in the channel
   (runtime-only `mgr._last_commands`; never records `again` / `as` / clicks;
   refused inside dispatch_no_snapshot; always player-available) (639, 646).
+  `!again <word>=<new> ...` (#499, 1340) swaps an argument equal to the
+  word, or the value of a `key=<word>` argument (`_again_swapped`; a swap
+  matching nothing is refused), and the remembered command stays the one
+  typed (user call), so `!again gob1=gob2`, `!again gob1=gob3` work from
+  one attack.
 - **Aliases** (`!alias`, per match; system aliases via `!system alias`)
   resolve BEFORE the access gate; an alias can't take a command's name
   (refused at def / promote, ignored if saved). Command roots and aliases
@@ -3347,6 +3352,31 @@ hardcodes**.
 
 ### 7.12 Zones, tiles and auras
 
+- **Default ground** (#472, user design, 1342): the map var named by
+  `map_ground_var` (`!map ground <template|none>`, MAP_VAR_NAME_RULES,
+  so `default_map_vars` can set it) names a tile template that every cell
+  whose data names no template reads as its template (`Match.cell_template`
+  / `from_ground` / `ground_template`), as if placed there: look (both
+  renderers draw `ground_cells`, the window's only, `_tile_render_items`),
+  block, opaque, tags, grants (`_desired_tile_grants`, `_grants_present`)
+  and movement hooks (`fire_tile_hook`); `tile_get` / `tile_has` read its
+  data under the cell's own. Turn and round hooks are left out (user call:
+  every cell would fire each turn; known limitation): a template holding
+  one is refused as ground (`time_hooks_of`), one added later never fires
+  from it. A template rename follows into the ground var; deleting the
+  template clears it.
+- **Sprite variants** (#288, 1343): `sprite_variants` (a list or {key:
+  weight}, `sprite_variants_problem`) on tile data, a template, a zone or a
+  definition; `_facing_sprite` picks one per cell (`sprite_variant`: a
+  blake2s hash of map, x, y) after the per-facing sprites, before the
+  plain sprite. `!tile variants`, `!tile def variants`, `!zone variants`,
+  `!zone def variants`.
+- **Zone outlines** (#335, 1343): a zone's (or its definition's) `draw:
+  outline` (a ZONE_LOOK_FIELD; `!zone draw`, `!zone def draw`) shows it on
+  its edge cells only (`Match.zone_draw_cells`, with the sides facing
+  outside), the scene placement carrying `edges`, which
+  `SceneRenderer._draw_edges` draws as lines in the zone's colour,
+  `zone_outline_width` percent of a cell thick.
 - **Tiles:** per-cell data (`!tile set/place/line/fill/copy/...`), templates
   (`!tile def` per match, `!system tile` per system, §7.16), precedence instance > template > rule for
   glyph / color / sprite / block / opaque; tile hooks (on_enter / on_exit /
@@ -3664,7 +3694,39 @@ hardcodes**.
   would end that turn; L57, 1245). A request whose command an open reaction
   window holds stays queued (`approval_waits`: `!approve`, `!approve
   all` and the Discord button answer why it waits and use nothing up;
-  1164).
+  1164). `!deny <id|all> [reason ...]` (#398, 1338) also tells the
+  requester: a line naming the command, the request, the host and the
+  reason goes to the requester's channel through the R5 post queue
+  (`_deny_notice`, `mgr._window_posts`), or is the reply when the host
+  denies from that channel. `!approve <id|all> always` (#399) runs the
+  request, then stores the per-player override `@<user> <command sub>` =
+  all (`_always_key`: the subcommand when the first word is one, else the
+  command; `_approve_always`), journaled as a stored state of its own
+  (`_journal_outside`), since no command of the journal replays it. Who
+  may: the rule `approve_always_access` (hosts default, owner, off; user
+  call: any host, switchable off).
+- **Expiring overrides** (#466, 1339): `!host access set <cmd> <level>
+  [once] [turns=<n>] [until=round_end]` stores the limit in
+  `Match.access_limits` (full key -> {turn: the turns_elapsed it ends at,
+  round: the round it lasts through, once}, undo state). `_override_hit`
+  (the one override lookup, used by `_effective_access`) skips an override
+  past its limit (`Match.override_live`); `prune_access_overrides` drops
+  them at each turn boundary and in `list`. `once`: a non-host the
+  override let through spends it only when the command changed the match
+  by the undo test (user call: a refusal or a read keeps it); `_run_body`
+  takes the state before and pops it after the undo step, so undoing the
+  command brings it back. `until=round_end` is refused under ATB.
+- **`me`** (#400, 1340): `!ent focus [<unit> | clear]` (a player read
+  through the view) sets the caller's unit in `Match.unit_focus` (user id
+  -> unit id, per user per match, user call "for now"; saved, outside undo
+  like `channel_maps`, journaled: JOURNAL_IGNORED leaves it in).
+  `logic.resolve_me` reads `logic.ME_USER` (set in `CommandRegistry._run`
+  from `ctx.me_user` else the caller: an approved request's ctx carries
+  the requester's id, so an approved `!ent move me` moves the requester's
+  focus; a journal entry records `me` when it differs from its `uid`, and
+  replays set it) in `_resolve_eid`, action targets
+  (`_resolve_eid_for_action`) and `!ent`'s first unit slot. `me` is a
+  RESERVED_IDS entry; formulas keep `self`.
 - **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner
   only), plus every holder of the `gm` capability (§3 "Role
   capabilities"; `caller_hosts`). A check on the caller's host authority
@@ -3996,7 +4058,34 @@ hardcodes**.
   ground, border or fog; `void_sprite` when set), and under
   `void_under_fog fog` a void the view can't see is fog in both (the
   scene leaves it out of `voids`). Everything else must agree
-  (§2 parity pass) (530-535, 711-717).
+  (§2 parity pass) (530-535, 711-717). Sprite variants (#288) are images
+  only; an outlined zone (#335) shows on the same edge cells in both, its
+  sides drawn as lines in images. A random-board parity harness over
+  ground, outlines, looks (units, tiles, zones) and windows matched 1500 /
+  1500 (28,222 drawn cells).
+- **Looks by state** (#264, #402, user design, 1344): a `looks` list
+  (`logic.LOOK_FIELDS`: glyph, glyphs, sprite, sprites, sprite_variants,
+  color, ascii_color, legend; each entry with an optional `condition`) on
+  a unit (its var), tile data and a tile template's data, a zone and a
+  zone definition (own first). Per field the first entry whose condition
+  holds and sets it decides (user call), as a look source before the
+  thing's own fields (`unit_looks` / `tile_looks` / `zone_looks` ->
+  `Match.look_overlay`); for units after a status look, and under a
+  disguise fooling the view only the disguise's own `looks`. A condition
+  is true / false, or an expression (self = the unit; tile_x / tile_y /
+  tile_map or zone_name / zone_map bound; `data` = the thing's data, its
+  template's / definition's under it, a unit's vars, read by attribute,
+  `LookData`); `data.<path> <op> <literal>` (`look_data_test`) and
+  `entity[self].<var> <op> <number>` (`_simple_var_test`) skip the formula
+  engine. A render runs under `Match.looks_pass(viewport, mp)`
+  (`_looks_memo`, runtime, rollback-preserved): each thing read once,
+  nothing outside the window, only tiles whose data or template holds
+  `looks`, and at most the owner limit `look_condition_reads` (2000)
+  formula conditions; past it the rest keep their base look and the
+  render ends with `LOOKS_OVER_NOTE` (a scene's `notes`). Edited with
+  `!ent looks`, `!tile looks`, `!tile def looks`, `!zone looks`, `!zone
+  def looks` (`check_looks`, conditions validated; the JSON list is a raw
+  tail, `_RAW_LOOKS_TAIL`).
 
 ### 7.16 Matches, history and the table
 
@@ -4010,6 +4099,17 @@ hardcodes**.
   (`CON`, `NUL`, `COM1`, ...) the bot could not write on Windows; a match
   id differing from an existing one only by case is refused
   (`_check_match_id_case`: one file on Windows / macOS).
+- **Match trash** (#440, 1341): `!match delete <id>` first refuses with
+  what goes (`_match_delete_preview`: units, maps, undo snapshots, journal
+  entries, bound channels; a ❌, so a strict batch stops), `confirm`
+  deletes. The match is kept 24 h with its undo history
+  (`to_dict(include_history=True)`) and journal: a file in the server's
+  trash under `deleted_matches/` (`_match_trash_keep`, the rerun trash's
+  pattern; `!server wipe undo` ignores it), in memory with persistence
+  off. `!match trash` (a player read) lists them newest first, numbering
+  copies of one id; `!match restore <id> [n]` (its owner or an
+  administrator) brings one back unbound (user call), refused while an id
+  is taken or its system is gone.
 - **Systems and rules:** a `GameSystem` holds rule overrides, tile
   templates, functions, aliases, default vars / passives / clamps. A match
   copies its system's rules into `match.rules` at creation and on every
@@ -5526,6 +5626,11 @@ rejected already. Update this section in the PR that resolves an item.
 - **Dragged corpses fire no hooks** (user: a known limitation; code it
   when a game system needs it): `corpse_move` / `!ent tp <corpse>` cross
   tiles and zones without their enter / exit / stop hooks.
+
+- **Ground has no turn or round hooks** (user: document it as a known
+  limitation): a map's default ground (#472) gives its cells everything a
+  placed template does but its time hooks; a GM needing them places the
+  template with `!tile fill`.
 
 - **Stamped units ignore blocking tiles:** a prefab stamp (like every
   spawn) checks occupancy only, so a stamped unit can land on a cell whose

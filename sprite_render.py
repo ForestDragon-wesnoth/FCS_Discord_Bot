@@ -318,8 +318,11 @@ class SceneRenderer:
         canvas = Image.new("RGBA", (W, H), _BG_FILL)
         try:
             self._tint_fill = max(0, min(100, int(scene.get("tint_fill_opacity", 40))))
+            self._outline_pct = max(1, min(50, int(scene.get(
+                "zone_outline_width", 12))))
         except (TypeError, ValueError):
             self._tint_fill = 40
+            self._outline_pct = 12
         try:
             self._base = max(1, int(scene.get("sprite_cell_size", cell)))
         except (TypeError, ValueError):
@@ -659,6 +662,10 @@ class SceneRenderer:
                 # sprite, so a missing PNG there draws nothing.
                 if p.get("kind") not in ("zone", "tile"):
                     return
+                if p.get("edges"):
+                    # An outlined zone (#335): its edge, no fill.
+                    self._draw_edges(canvas, p, ox, oy)
+                    return
                 rgb = self._rgb(p.get("tint"))
                 fill = self._tint_fill * opacity // 100
                 if rgb is None or fill <= 0:
@@ -689,6 +696,35 @@ class SceneRenderer:
         bx, by = x0 + box[0], y0 + box[1]
         sx, sy = max(0, -bx), max(0, -by)
         canvas.alpha_composite(body, (bx + sx, by + sy), (sx, sy))
+        if p.get("edges"):
+            self._draw_edges(canvas, p, ox, oy)
+
+    def _draw_edges(self, canvas, p, ox, oy) -> None:
+        """An outlined zone cell's outside sides (#335, `edges`: some of
+        "nesw") as lines in the zone's colour (white without one), each
+        zone_outline_width percent of the cell thick, inside the cell."""
+        cell = self.cell
+        rgb = self._rgb(p.get("tint")) or (255, 255, 255)
+        t = max(1, round(cell * self._outline_pct / 100.0))
+        x0 = (int(p.get("x", 1)) - ox) * cell
+        y0 = (int(p.get("y", 1)) - oy) * cell
+        a = max(0, min(255, int(int(p.get("opacity", 100)) * 255 / 100)))
+        col = tuple(rgb[:3]) + (a,)
+        sides = str(p.get("edges") or "")
+        from PIL import ImageDraw
+        layer = Image.new("RGBA", (cell, cell), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        if "n" in sides:
+            d.rectangle((0, 0, cell - 1, t - 1), fill=col)
+        if "s" in sides:
+            d.rectangle((0, cell - t, cell - 1, cell - 1), fill=col)
+        if "w" in sides:
+            d.rectangle((0, 0, t - 1, cell - 1), fill=col)
+        if "e" in sides:
+            d.rectangle((cell - t, 0, cell - 1, cell - 1), fill=col)
+        sx, sy = max(0, -x0), max(0, -y0)
+        if sx < cell and sy < cell:
+            canvas.alpha_composite(layer, (x0 + sx, y0 + sy), (sx, sy))
 
     # -- sprite effects (#624) -------------------------------------------
     def _effect_rgb(self, rec: Dict[str, Any], team: Optional[Tuple[int, ...]]

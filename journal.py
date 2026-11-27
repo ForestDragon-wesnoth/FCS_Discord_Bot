@@ -40,10 +40,12 @@ JOURNAL_VERSION = 1
 # them out. channel_views / channel_maps are each channel's camera and
 # `!map use` choice: display state (a player panning took undo steps).
 UNDO_IGNORED = ("paused", "rules", "rng_seed", "rng_pos", "channel_views",
-                "channel_maps")
+                "channel_maps", "unit_focus")
 # The journal records a `!map use` all the same: a later `map=view` or a
 # strict edit's channel map reads it, so a replay needs it.
-JOURNAL_IGNORED = tuple(k for k in UNDO_IGNORED if k != "channel_maps")
+# `!ent focus` (#400) too: a later command's `me` reads it.
+JOURNAL_IGNORED = tuple(k for k in UNDO_IGNORED
+                        if k not in ("channel_maps", "unit_focus"))
 
 # Left out of the state hash too: say(private=True) lines waiting for a
 # host (#215). Where one goes follows the channel's view, which a CLI
