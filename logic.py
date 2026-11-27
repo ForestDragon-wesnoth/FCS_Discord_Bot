@@ -22325,6 +22325,16 @@ class Match:
         return self._visibility_visible(
             "entity_visibility_condition", pov_team, target=eid)
 
+    def _all_tiles_visible(self, pov_team: Optional[str], mp: "Map") -> bool:
+        """Whether every tile of map `mp` is visible to `pov_team` with no
+        per-cell test: an omniscient view, or no fog on the map and an
+        empty tile_visibility_condition. A render then skips
+        tile_visible_to for each tile and ground cell (#472)."""
+        return pov_team is None or (
+            not self.fog_on(mp)
+            and not str(self.rules.get("tile_visibility_condition",
+                                       "")).strip())
+
     def tile_visible_to(self, x: int, y: int, pov_team: Optional[str],
                         mp: Optional["Map"] = None) -> bool:
         """Whether the tile at (x, y) of map `mp` (None = the only map) — its
@@ -22884,8 +22894,18 @@ class Match:
         when the match holds it; else None."""
         if mp is None or not mp.vars:
             return None
+        memo = self._looks_memo
+        if memo is not None:
+            # A render reads it once per map (its cells ask about it
+            # several times each).
+            got = memo.setdefault("__ground", {})
+            if mp.name in got:
+                return got[mp.name]
         v = mp.vars.get(self.map_var_name("ground"))
-        return v if isinstance(v, str) and v in self.tile_templates else None
+        v = v if isinstance(v, str) and v in self.tile_templates else None
+        if memo is not None:
+            got[mp.name] = v
+        return v
 
     def ground_template(self, mp: Optional["Map"]
                         ) -> Optional[SpecialTileTemplate]:
@@ -34377,14 +34397,18 @@ class Match:
         return res if color_ok(res) else None
 
     def tile_color(self, x: int, y: int, mp: "Map",
-                   text: bool = False) -> Any:
+                   text: bool = False,
+                   src: Optional[List[Dict[str, Any]]] = None,
+                   what: Optional[str] = None) -> Any:
         """The resolved colour for the tile at (x, y) of map `mp`: its
         instance `color` data wins, else its template's `color`.
         Literal-or-formula (see _resolve_color_value). None when
         unset/unresolved. With `text`, the palette name the text map shows
         (its `ascii_color` data, else its template's, else the colour's
-        own or nearest name, W27)."""
-        src = self._tile_look_sources(x, y, mp)
+        own or nearest name, W27). `src`: its look sources when the
+        caller has them; `what`: how the text map's colour note names it."""
+        if src is None:
+            src = self._tile_look_sources(x, y, mp)
         if not src:
             return None
         val = next((d.get("color") for d in src
@@ -34396,7 +34420,7 @@ class Match:
                                                "tile_map": mp.name})
         if not text:
             return got
-        return text_color_for(got, ascii_c, f"tile ({x},{y})") \
+        return text_color_for(got, ascii_c, what or f"tile ({x},{y})") \
             if got is not None else None
 
     def zone_color(self, name: str, mp: "Map", text: bool = False) -> Any:
@@ -34865,13 +34889,16 @@ class Match:
 
     def tile_sprite_effects(self, x: int, y: int, mp: "Map",
                             pov_team: Optional[str] = None,
-                            problems: Optional[List[str]] = None
+                            problems: Optional[List[str]] = None,
+                            src: Optional[List[Dict[str, Any]]] = None
                             ) -> List[Dict[str, Any]]:
         """A tile's sprite effects: its template's `sprite_effects` data
         merged with its own (a name of its own replaces the template's, a
         name set to null takes it away; merged_effect_bundle), conditions
-        read with tile_x / tile_y / tile_map bound."""
-        src = self._tile_look_sources(x, y, mp)
+        read with tile_x / tile_y / tile_map bound. `src`: its look sources
+        when the caller has them."""
+        if src is None:
+            src = self._tile_look_sources(x, y, mp)
         if not src:
             return []
         bundles = [d.get(SPRITE_EFFECTS_KEY) for d in reversed(src)]
@@ -34989,22 +35016,32 @@ class Match:
 
     def _tile_look_sources(self, x: int, y: int, mp: "Map"
                            ) -> List[Dict[str, Any]]:
-        """The dicts a tile's look reads, own first: its data, then its
-        template's data. Empty when the cell has no tile data."""
-        cell = mp.tiles.get((x, y))
+        """The dicts a tile's look reads, own first: what its `looks`
+        choose now, its data, then its template's data. Empty when the cell
+        has no tile data and the map no ground."""
+        return self._tile_sources(x, y, mp)[1]
+
+    def _tile_sources(self, x: int, y: int, mp: "Map", cell: Any = _MISSING
+                      ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """(looks, sources) of the tile at (x, y): what its `looks` choose
+        and the dicts its look reads, own first (_tile_look_sources).
+        `cell` = its data when the caller has it (None for a cell
+        without)."""
+        if cell is _MISSING:
+            cell = mp.tiles.get((x, y))
         tpl = self.cell_template(mp, cell)
         if not isinstance(cell, dict):
             # Ground (#472): a cell without tile data reads as the ground
             # template placed there.
             if tpl is None or not mp.in_bounds(x, y):
-                return []
+                return {}, []
             out: List[Dict[str, Any]] = []
         else:
             out = [cell]
         if tpl is not None:
             out.append(tpl.data)
         looks = self.tile_looks(x, y, mp, cell, tpl)
-        return [looks] + out if looks else out
+        return looks, ([looks] + out if looks else out)
 
     def _zone_look_sources(self, z: Any, name: Optional[str] = None,
                            mp: Optional["Map"] = None
@@ -35022,18 +35059,23 @@ class Match:
                 out.insert(0, looks)
         return out
 
-    def tile_sprite_info(self, x: int, y: int, mp: "Map"
+    def tile_sprite_info(self, x: int, y: int, mp: "Map",
+                         src: Optional[List[Dict[str, Any]]] = None,
+                         facing: Optional[str] = None
                          ) -> Optional[Tuple[str, bool, bool]]:
         """The sprite for the tile at (x, y) of map `mp` as (key, flip_h,
         flip_v): `sprites.<facing>` / a mirror of another facing /
         `sprite`, the instance's data before the template's. None when
-        unset."""
-        src = self._tile_look_sources(x, y, mp)
+        unset. `src` / `facing`: its look sources and facing when the
+        caller has them."""
+        if src is None:
+            src = self._tile_look_sources(x, y, mp)
         if not src:
             return None
         axes = self._mirror_axes(*(d.get("sprite_mirror") for d in src))
-        return self._facing_sprite(src, self.tile_facing(x, y, mp), axes,
-                                   cell=(x, y), mp=mp)
+        return self._facing_sprite(
+            src, facing or self.tile_facing(x, y, mp), axes,
+            cell=(x, y), mp=mp)
 
     def tile_sprite(self, x: int, y: int, mp: "Map") -> Optional[str]:
         """The sprite key for the tile at (x, y) of map `mp` (see
@@ -35081,12 +35123,102 @@ class Match:
                 "mode": mode if mode in ("stretch", "tile", "center")
                 else "stretch"}
 
-    def tile_glyph(self, x: int, y: int, mp: "Map") -> Optional[str]:
+    def tile_glyph(self, x: int, y: int, mp: "Map",
+                   src: Optional[List[Dict[str, Any]]] = None,
+                   facing: Optional[str] = None) -> Optional[str]:
         """The glyph for the tile at (x, y) of map `mp`: `glyphs.<facing>`
         then `glyph`, the instance's data before the template's (both
-        renderers read it). None when unset."""
-        return self._facing_glyph(self._tile_look_sources(x, y, mp),
-                                  self.tile_facing(x, y, mp))
+        renderers read it). None when unset. `src` / `facing`: its look
+        sources and facing when the caller has them."""
+        return self._facing_glyph(
+            self._tile_look_sources(x, y, mp) if src is None else src,
+            facing or self.tile_facing(x, y, mp))
+
+    @staticmethod
+    def _cell_facing(cell: Any) -> str:
+        """A tile's facing from its data (tile_facing without the lookup)."""
+        f = cell.get(FACING_FIELD) if isinstance(cell, dict) else None
+        return f if isinstance(f, str) and f in ALLOWED_DIRECTIONS else "up"
+
+    def tile_render_look(self, x: int, y: int, mp: "Map", cell: Any,
+                         text: bool = False, sprite: bool = False
+                         ) -> Tuple[Any, ...]:
+        """One cell's tile look for a render, its sources built once:
+        (glyph, colour, sprite info, looks, sources). `cell` is its data
+        (None: a ground cell, #472); `text` = the text map's colour name;
+        `sprite` = read the sprite too (else None). Inside a render, every
+        ground cell reads the same look when nothing in it depends on the
+        cell (_ground_share): resolved once."""
+        if cell is None:
+            share = self._ground_share(mp, text)
+            if share is not None:
+                src = share["src"]
+                tc = share["color"]
+                if tc is _MISSING:
+                    tc = self.tile_color(x, y, mp, text=text, src=src)
+                sinfo = None
+                if sprite:
+                    sinfo = share["sprite"]
+                    if sinfo is _MISSING:
+                        sinfo = self._facing_sprite(src, "up", share["axes"],
+                                                    cell=(x, y), mp=mp)
+                return share["glyph"], tc, sinfo, share["looks"], src
+        looks, src = self._tile_sources(x, y, mp, cell)
+        if not src:
+            return None, None, None, looks, src
+        facing = self._cell_facing(cell)
+        g = self._facing_glyph(src, facing)
+        tc = self.tile_color(x, y, mp, text=text, src=src)
+        sinfo = (self.tile_sprite_info(x, y, mp, src=src, facing=facing)
+                 if sprite else None)
+        return g, tc, sinfo, looks, src
+
+    def _ground_share(self, mp: "Map", text: bool
+                      ) -> Optional[Dict[str, Any]]:
+        """The look every ground cell of map `mp` shares in this render, or
+        None when one may differ by cell (outside a render; a `looks`
+        condition the formula engine reads, which may name tile_x / tile_y).
+        A colour formula and sprite variants are left to each cell
+        (_MISSING); the colour note names the ground."""
+        memo = self._looks_memo
+        if memo is None:
+            return None
+        key = ("__ground_share", mp.name, text)
+        if key in memo:
+            return memo[key]
+        memo[key] = None
+        tpl = self.ground_template(mp)
+        if tpl is None:
+            return None
+        data = dict(tpl.data)
+        lst = data.get(LOOKS_KEY)
+        for ent in (lst if isinstance(lst, list) else ()):
+            cond = ent.get("condition") if isinstance(ent, dict) else None
+            if isinstance(cond, str) and cond.strip() \
+                    and look_data_test(cond, data) is None:
+                return None
+        looks = self.look_overlay(("ground", mp.name), [lst], data=data) \
+            if lst else {}
+        src = ([looks] if looks else []) + [tpl.data]
+        val = next((d.get("color") for d in src
+                    if d.get("color") not in (None, "")), None)
+        if val is None or color_ok(val):
+            # A literal colour (or none) is the same on every cell.
+            tc: Any = self.tile_color(
+                0, 0, mp, text=text, src=src,
+                what=f"ground `{self.ground_name(mp)}`")
+        else:
+            tc = _MISSING
+        axes = self._mirror_axes(*(d.get("sprite_mirror") for d in src))
+        variants = any(d.get("sprite_variants") for d in src)
+        share = {"src": src, "looks": looks, "color": tc, "axes": axes,
+                 "fx": any(d.get(SPRITE_EFFECTS_KEY) is not None
+                           for d in src),
+                 "glyph": self._facing_glyph(src, "up"),
+                 "sprite": _MISSING if variants
+                 else self._facing_sprite(src, "up", axes)}
+        memo[key] = share
+        return share
 
     def entity_has_custom_sprite(self, e: "Entity") -> bool:
         """True when `e` has a custom sprite (per-facing `sprites` or the base
@@ -35399,28 +35531,22 @@ class Match:
                     colors[zy][zx] = zc
                     c_layer[(zx, zy)] = lay
 
-        # A ground without `looks` (#472) shows the same on every cell it
-        # covers: resolved once.
-        gt = self.ground_template(mp)
-        ground_same = gt is not None and not gt.data.get(LOOKS_KEY) \
-            and not gt.data.get("glyphs")
-        ground_look: Optional[Tuple[Any, ...]] = None
+        # A ground cell (#472) draws at the sprite_layer_tile rule's layer;
+        # its look is read once when no cell can differ (tile_render_look).
+        ground_layer = self.tile_draw_layer(None)
+        ground_label: Any = _MISSING
+        all_tiles_seen = self._all_tiles_visible(pov_team, mp)
         for (tx, ty), data in (self._tile_render_items(mp, viewport)
                                if "tiles" not in hidden else ()):
-            if not self.tile_visible_to(tx, ty, pov_team, mp):
+            if not all_tiles_seen and not self.tile_visible_to(
+                    tx, ty, pov_team, mp):
                 continue
-            if data is None and ground_same:
-                if ground_look is None:
-                    ground_look = (self.tile_glyph(tx, ty, mp),
-                                   self.tile_color(tx, ty, mp, text=True))
-                glyph, tc = ground_look
-            else:
-                glyph = self.tile_glyph(tx, ty, mp)
-                tc = self.tile_color(tx, ty, mp, text=True)
+            glyph, tc, _s, tlooks, _src = self.tile_render_look(
+                tx, ty, mp, data, text=True)
             has_glyph = glyph is not None
             if not has_glyph and tc is None:
                 continue
-            lay = self.tile_draw_layer(data)
+            lay = ground_layer if data is None else self.tile_draw_layer(data)
             if has_glyph:
                 if lay < g_layer.get((tx, ty), -math.inf):
                     continue
@@ -35428,9 +35554,14 @@ class Match:
                 colors[ty][tx] = tc            # tile owns the cell (tc may be None)
                 g_layer[(tx, ty)] = c_layer[(tx, ty)] = lay
                 if meanings is not None:
-                    meanings[ty][tx] = self.legend_label_tile(
-                        data, mp, self.tile_looks(
-                            tx, ty, mp, data, self.cell_template(mp, data)))
+                    if data is None and self._ground_share(mp, True):
+                        if ground_label is _MISSING:
+                            ground_label = self.legend_label_tile(
+                                None, mp, tlooks)
+                        meanings[ty][tx] = ground_label
+                    else:
+                        meanings[ty][tx] = self.legend_label_tile(
+                            data, mp, tlooks)
             elif lay >= c_layer.get((tx, ty), -math.inf):
                 colors[ty][tx] = tc
                 c_layer[(tx, ty)] = lay
@@ -35976,24 +36107,41 @@ class Match:
                 placements.append(pl)
 
         # Tile layer (20).
+        ground_layer = self.tile_draw_layer(None)
+        gshare = self._ground_share(mp, False)
+        # A shared ground colour converts once; a ground without sprite
+        # effects reads none on any cell.
+        g_tint: Any = _MISSING
+        g_plain = gshare is not None and not gshare["fx"]
+        all_tiles_seen = self._all_tiles_visible(pov_team, mp)
         for (tx, ty), data in (self._tile_render_items(mp, viewport)
                                if "tiles" not in hidden else ()):
-            if not self.tile_visible_to(tx, ty, pov_team, mp):
+            if not all_tiles_seen and not self.tile_visible_to(
+                    tx, ty, pov_team, mp):
                 continue
-            sinfo = self.tile_sprite_info(tx, ty, mp)
+            g, tint, sinfo, _lk, tsrc = self.tile_render_look(
+                tx, ty, mp, data, sprite=True)
             spr, fh, fv = sinfo if sinfo else (None, False, False)
-            g = self.tile_glyph(tx, ty, mp)
-            tint = scene_color(self.tile_color(tx, ty, mp))
+            if data is None and gshare is not None \
+                    and gshare["color"] is not _MISSING:
+                if g_tint is _MISSING:
+                    g_tint = scene_color(tint)
+                tint = g_tint
+            else:
+                tint = scene_color(tint)
             if spr is None and g is None and tint is None:
                 continue
             # Per-tile override: a `sprite_layer` data field wins over the rule.
-            t_layer = self.tile_draw_layer(data)
+            t_layer = ground_layer if data is None \
+                else self.tile_draw_layer(data)
             placements.append({
                 "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
                 "glyph": g, "tint": tint, "opacity": 100,
                 "flip_h": fh, "flip_v": fv, "layer": t_layer,
-                "effects": self.tile_sprite_effects(tx, ty, mp, pov_team)})
+                "effects": [] if data is None and g_plain
+                else self.tile_sprite_effects(tx, ty, mp, pov_team,
+                                              src=tsrc)})
 
         # Corpse layer (25): the dead entity's stored sprite, drawn with
         # corpse_sprite_effects (greyed and faded by default) when it is
